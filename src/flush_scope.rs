@@ -11,10 +11,19 @@ use std::time::Duration;
 
 use wacore::runtime::{Runtime, Spawnable};
 
+/// Bit 0 of [`FlushScope::state`]: the scope is closed to new work.
+const CLOSED: usize = 1;
+/// One tracked unit of work, i.e. one live [`FlushGuard`]; the count lives in
+/// bits 1.. of the same word. Packing the flag next to the counter is what
+/// makes "refuse if closed, otherwise increment" a single read-modify-write,
+/// and that in turn is what upholds the promise `close` makes: once it
+/// returns, nothing further is tracked. Split across two atomics there would
+/// be a window between the two operations, and that window is the whole bug.
+const ONE_TRACKED: usize = 2;
+
 pub struct FlushScope {
-    count: AtomicUsize,
+    state: AtomicUsize,
     idle: event_listener::Event,
-    closed: std::sync::Mutex<bool>,
     #[cfg(test)]
     track_rejections: AtomicUsize,
 }
@@ -28,20 +37,23 @@ impl Default for FlushScope {
 impl FlushScope {
     pub fn new() -> Self {
         Self {
-            count: AtomicUsize::new(0),
+            state: AtomicUsize::new(0),
             idle: event_listener::Event::new(),
-            closed: std::sync::Mutex::new(false),
             #[cfg(test)]
             track_rejections: AtomicUsize::new(0),
         }
     }
 
+    // Relaxed on both flag writes: they publish no data, and the exclusion
+    // `try_track` relies on comes from every writer being a read-modify-write
+    // on one location, which the per-location modification order already
+    // totally orders regardless of the ordering argument.
     pub fn close(&self) {
-        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.state.fetch_or(CLOSED, Ordering::Relaxed);
     }
 
     pub fn reopen(&self) {
-        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.state.fetch_and(!CLOSED, Ordering::Relaxed);
     }
 
     /// Track a unit of outbound work without spawning a task (e.g. an item
@@ -49,14 +61,24 @@ impl FlushScope {
     /// closed — the work must be dropped, mirroring `spawn`. Dropping the
     /// guard marks the work as finished for `flush`.
     pub fn try_track(self: &Arc<Self>) -> Option<FlushGuard> {
+        // `checked_add` rather than a bare add: a wrap would clobber the closed
+        // flag in bit 0. It cannot be reached — the count only rises while a
+        // guard is alive, and usize::MAX/2 live guards is more Arcs than the
+        // address space holds — so refusing to track is a formality, handled
+        // the same way as a closed scope.
+        if self
+            .state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                if state & CLOSED != 0 {
+                    return None;
+                }
+                state.checked_add(ONE_TRACKED)
+            })
+            .is_err()
         {
-            let closed = self.closed.lock().unwrap_or_else(|e| e.into_inner());
-            if *closed {
-                #[cfg(test)]
-                self.track_rejections.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-            self.count.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            self.track_rejections.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
         Some(FlushGuard {
             scope: Arc::clone(self),
@@ -96,7 +118,7 @@ impl FlushScope {
         let deadline = Instant::now() + timeout;
         loop {
             let listener = self.idle.listen();
-            if self.count.load(Ordering::Relaxed) == 0 {
+            if self.tracked() == 0 {
                 return;
             }
 
@@ -108,16 +130,23 @@ impl FlushScope {
             {
                 log::warn!(
                     "FlushScope timed out with {} pending task(s)",
-                    self.count.load(Ordering::Relaxed)
+                    self.tracked()
                 );
                 return;
             }
         }
     }
 
+    /// Live guards. Acquire pairs with the guards' release decrements, so a
+    /// caller that tears the transport down once this reads zero has observed
+    /// everything the tracked work did.
+    fn tracked(&self) -> usize {
+        self.state.load(Ordering::Acquire) >> 1
+    }
+
     #[cfg(test)]
     pub fn pending(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
+        self.tracked()
     }
 
     /// Number of tasks parked inside [`Self::flush`]. `flush` registers its
@@ -142,7 +171,9 @@ pub struct FlushGuard {
 
 impl Drop for FlushGuard {
     fn drop(&mut self) {
-        if self.scope.count.fetch_sub(1, Ordering::Relaxed) == 1 {
+        // Release so the finished work is visible to whoever reads the counter
+        // down to zero; the flusher's acquire load closes the pair.
+        if self.scope.state.fetch_sub(ONE_TRACKED, Ordering::Release) >> 1 == 1 {
             self.scope.idle.notify(usize::MAX);
         }
     }
@@ -233,7 +264,7 @@ mod tests {
         use std::task::{Context, Poll};
 
         let scope = Arc::new(FlushScope::new());
-        scope.count.fetch_add(1, Ordering::Relaxed);
+        scope.state.fetch_add(ONE_TRACKED, Ordering::Relaxed);
 
         let scope_for_fut = Arc::clone(&scope);
         let mut fut: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
@@ -271,7 +302,7 @@ mod tests {
         // Emulate what spawn() does. The guard must be captured as an upvalue
         // so it's in the state machine from construction, not only after the
         // first poll.
-        scope.count.fetch_add(1, Ordering::Relaxed);
+        scope.state.fetch_add(ONE_TRACKED, Ordering::Relaxed);
         let guard = FlushGuard {
             scope: Arc::clone(&scope),
         };
@@ -333,6 +364,93 @@ mod tests {
         let guard = scope.try_track();
         assert!(guard.is_some(), "reopened scope must track again");
         assert_eq!(scope.pending(), 1);
+    }
+
+    /// The guarantee that decides the packed layout: once `close()` has
+    /// returned, no further guard is handed out. Exercised under a real race,
+    /// because the failure mode is a check-then-increment window that a serial
+    /// test cannot open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_wins_against_concurrent_try_track() {
+        for _ in 0..64 {
+            let scope = Arc::new(FlushScope::new());
+            let start = Arc::new(std::sync::Barrier::new(5));
+            // Published by the closer the instant `close()` returns. Read
+            // BEFORE each attempt: seeing it set means close already returned,
+            // so a grant that then succeeds is a violation on its own, with no
+            // shared count to launder it.
+            let closed = Arc::new(AtomicBool::new(false));
+
+            let trackers: Vec<_> = (0..4)
+                .map(|_| {
+                    let scope = Arc::clone(&scope);
+                    let start = Arc::clone(&start);
+                    let closed = Arc::clone(&closed);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let mut late = 0usize;
+                        // The guards are handed back rather than dropped here,
+                        // so the count the closer sampled stays comparable.
+                        let guards: Vec<_> = std::iter::from_fn(|| {
+                            let seen_closed = closed.load(Ordering::SeqCst);
+                            let guard = scope.try_track()?;
+                            if seen_closed {
+                                late += 1;
+                            }
+                            Some(guard)
+                        })
+                        .take(256)
+                        .collect();
+                        (guards, late)
+                    })
+                })
+                .collect();
+
+            start.wait();
+            scope.close();
+            // Sampled before the flag is published, so the two nets abut: a
+            // grant later than this sample is caught by the count, an earlier
+            // one by a racer that already saw the flag. Only a grant between
+            // close() returning and this single load escapes both.
+            let after_close = scope.pending();
+            closed.store(true, Ordering::SeqCst);
+
+            let results: Vec<_> = trackers
+                .into_iter()
+                .map(|t| t.join().expect("tracker thread"))
+                .collect();
+            let granted: usize = results.iter().map(|(guards, _)| guards.len()).sum();
+            let late: usize = results.iter().map(|(_, late)| late).sum();
+            assert_eq!(late, 0, "try_track granted a guard after close() returned");
+            assert_eq!(
+                granted, after_close,
+                "try_track granted a guard after close() returned"
+            );
+        }
+    }
+
+    /// A saturated counter must refuse rather than wrap into the closed flag.
+    #[tokio::test]
+    async fn try_track_refuses_when_the_counter_would_overflow() {
+        let scope = Arc::new(FlushScope::new());
+        scope.state.store(usize::MAX & !CLOSED, Ordering::Relaxed);
+
+        assert!(scope.try_track().is_none(), "saturated scope must refuse");
+        assert_eq!(
+            scope.state.load(Ordering::Relaxed) & CLOSED,
+            0,
+            "a refused track must not corrupt the closed flag"
+        );
+
+        // Room for exactly one more still tracks, so the refusal is the
+        // saturation point and not an off-by-one earlier.
+        scope
+            .state
+            .store((usize::MAX & !CLOSED) - ONE_TRACKED, Ordering::Relaxed);
+        assert!(
+            scope.try_track().is_some(),
+            "one slot left must still track"
+        );
     }
 
     #[tokio::test]

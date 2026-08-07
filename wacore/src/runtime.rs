@@ -124,12 +124,12 @@ impl AbortHandle {
 
     /// Explicitly abort the spawned task without waiting for drop.
     pub fn abort(&self) {
-        if let Some(f) = self
+        let abort_fn = self
             .abort_fn
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+            .take();
+        if let Some(f) = abort_fn {
             f();
         }
     }

@@ -103,7 +103,9 @@ divan = { workspace = true }
 # (zlib-rs directly), so flate2 stays out of the release dependency set.
 flate2 = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+# `rt-multi-thread` is test-only: the wire-gate race test needs two threads to
+# actually interleave a lease insert with the lock-free gate query.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [[bench]]
 name = "reporting_token_benchmark"

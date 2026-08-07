@@ -18,6 +18,18 @@ use wacore::runtime::BoxFuture;
 use wacore::sync_marker::MaybeSend;
 use wacore::time::Instant;
 
+/// How far an entry's recorded access time may lag the real access before
+/// [`PortableCache::get`] renews it under the write lock, as a divisor of the
+/// TTI.
+///
+/// Renewal only exists to keep an in-use entry from idling out, so it does not
+/// have to be exact. Skipping it leaves the stamp at most `tti / this` behind,
+/// which can only expire an entry that much *early*, never keep an expired one
+/// alive. In exchange a hot key leaves the read path only at a window boundary
+/// rather than on every lookup, so a read-saturated cache no longer serialises
+/// behind a writer.
+const TTI_RENEWAL_DIVISOR: u32 = 16;
+
 struct CacheEntry<V> {
     value: V,
     // Monotonic instants (not wall-clock) so TTL/TTI are immune to clock jumps,
@@ -52,6 +64,10 @@ pub struct PortableCache<K, V> {
     /// still holds (e.g. an `Arc<Mutex>` mid-lock), which would otherwise be
     /// FIFO-evicted and re-minted, letting two writers race the guarded resource.
     evict_guard: Option<fn(&V) -> bool>,
+    /// Stores made by the TTI renewal path. Lets a test assert that a burst of
+    /// concurrent lookups renews once rather than once per queued writer.
+    #[cfg(test)]
+    tti_renewals: Arc<portable_atomic::AtomicU64>,
 }
 
 struct CacheInner<K, V> {
@@ -298,12 +314,27 @@ where
         self
     }
 
+    /// Expire an entry once it has gone this long without a lookup.
+    ///
+    /// Approximate: a lookup refreshes the idle deadline lazily, so an entry can
+    /// expire up to a sixteenth of `tti` early. It is never served late.
     pub fn time_to_idle(mut self, tti: Duration) -> Self {
         self.tti = Some(tti);
         self
     }
 
+    /// # Panics
+    ///
+    /// If an [`evict_guard`](Self::evict_guard) is combined with a TTL or TTI.
     pub fn build(self) -> PortableCache<K, V> {
+        // An evict_guard marks a cache of live coordination objects. Expiry
+        // does not consult the guard, so a timeout would drop an entry a task
+        // still holds and let the next lookup mint a duplicate of it.
+        assert!(
+            self.evict_guard.is_none() || (self.ttl.is_none() && self.tti.is_none()),
+            "a cache with an evict_guard holds live coordination objects and must not expire by time"
+        );
+
         PortableCache {
             inner: Arc::new(RwLock::new(CacheInner::new())),
             init_locks: Arc::new(InitLocks::new()),
@@ -311,6 +342,8 @@ where
             ttl: self.ttl,
             tti: self.tti,
             evict_guard: self.evict_guard,
+            #[cfg(test)]
+            tti_renewals: Arc::new(portable_atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -360,13 +393,21 @@ where
         inner.map.get_key_value(key).map(|(k, _)| k.clone())
     }
 
+    /// Whether `entry`'s access stamp has aged past [`TTI_RENEWAL_DIVISOR`]'s
+    /// tolerance and is worth pushing forward under the write lock. A cache
+    /// without TTI never renews.
+    fn needs_tti_renewal(&self, entry: &CacheEntry<V>, now: Instant) -> bool {
+        self.tti.is_some_and(|tti| {
+            now.saturating_duration_since(entry.last_accessed_at) >= tti / TTI_RENEWAL_DIVISOR
+        })
+    }
+
     pub async fn get<Q>(&self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        // Fast path (no TTI): read lock only, no write needed.
-        if self.tti.is_none() {
+        let (value, renew_at) = {
             let guard = self.inner.read().await;
             let entry = guard.map.get(key)?;
             // Read the clock after the lookup: a miss has no timestamp to
@@ -374,30 +415,44 @@ where
             // (every negative registry probe, every warm-up).
             let now = self.entry_time();
             if self.is_expired(entry, now) {
+                // Identity of the entry judged expired: `seq` moves if the slot
+                // was re-inserted, `inserted_at` if the value was rewritten in
+                // place. Removing without it could drop a replacement written
+                // while the guard was down and judge it by a stale `now`.
+                let observed = (entry.seq, entry.inserted_at);
                 let owned_key = Self::find_key(&guard, key)?;
                 drop(guard);
                 let mut wguard = self.inner.write().await;
                 if let Some(e) = wguard.map.get(key)
+                    && (e.seq, e.inserted_at) == observed
                     && self.is_expired(e, now)
                 {
                     wguard.remove_key(&owned_key);
                 }
                 return None;
             }
-            return Some(entry.value.clone());
+            (
+                entry.value.clone(),
+                self.needs_tti_renewal(entry, now).then_some(now),
+            )
+        };
+
+        if let Some(now) = renew_at {
+            let mut guard = self.inner.write().await;
+            // Re-decide under the lock: the key may have been invalidated (the
+            // miss leaves it that way) or already refreshed by a racing renewal
+            // or insert, whose newer stamp this lookup must leave alone.
+            if let Some(entry) = guard.map.get_mut(key)
+                && self.needs_tti_renewal(entry, now)
+            {
+                entry.last_accessed_at = now;
+                #[cfg(test)]
+                self.tti_renewals
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
-        // TTI path: write lock to update last_accessed_at.
-        let mut guard = self.inner.write().await;
-        let entry = guard.map.get_mut(key)?;
-        let now = self.entry_time();
-        if self.is_expired(entry, now) {
-            let owned_key = Self::find_key(&guard, key)?;
-            guard.remove_key(&owned_key);
-            return None;
-        }
-        entry.last_accessed_at = now;
-        Some(entry.value.clone())
+        Some(value)
     }
 
     pub async fn insert(&self, key: K, value: V) {
@@ -690,6 +745,12 @@ where
         value
     }
 
+    /// Stores made by the TTI renewal path since construction.
+    #[cfg(test)]
+    fn tti_renewals(&self) -> u64 {
+        self.tti_renewals.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Evict expired entries and clean up unused init locks.
     pub async fn run_pending_tasks(&self) {
         let now = self.entry_time();
@@ -718,6 +779,8 @@ impl<K, V> Clone for PortableCache<K, V> {
             ttl: self.ttl,
             tti: self.tti,
             evict_guard: self.evict_guard,
+            #[cfg(test)]
+            tti_renewals: Arc::clone(&self.tti_renewals),
         }
     }
 }
@@ -725,7 +788,7 @@ impl<K, V> Clone for PortableCache<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn build_cache<K, V>() -> PortableCache<K, V>
     where
@@ -982,6 +1045,403 @@ mod tests {
             idle_free.is_expired(&entry, inserted + ttl),
             "TTL is inclusive"
         );
+    }
+
+    /// The renewal tolerance is a hard boundary, pinned against a supplied
+    /// instant so it does not depend on wall-clock timing.
+    #[test]
+    fn tti_renewal_tolerance_is_exact_under_a_controlled_clock() {
+        let tti = Duration::from_secs(3600);
+        let tolerance = tti / TTI_RENEWAL_DIVISOR;
+        let cache: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_idle(tti)
+            .build();
+
+        let stamped = Instant::ZERO + Duration::from_secs(1_000);
+        let entry = CacheEntry {
+            value: 1,
+            inserted_at: stamped,
+            last_accessed_at: stamped,
+            seq: 0,
+        };
+
+        assert!(!cache.needs_tti_renewal(&entry, stamped));
+        assert!(!cache.needs_tti_renewal(&entry, stamped + tolerance - Duration::from_nanos(1)));
+        assert!(
+            cache.needs_tti_renewal(&entry, stamped + tolerance),
+            "the renewal tolerance is inclusive, like the expiry boundary"
+        );
+
+        // Without TTI there is nothing to renew, so `get` never leaves the read
+        // path however stale the stamp is.
+        let ttl_only: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_live(tti)
+            .build();
+        assert!(!ttl_only.needs_tti_renewal(&entry, stamped + tti * 100));
+    }
+
+    /// The declared contract of the tolerance: a skipped renewal leaves the
+    /// stamp behind the real access, so an entry can expire up to one tolerance
+    /// window EARLY, and never a nanosecond late. Serving a long-expired entry
+    /// is the error direction this design must not have.
+    #[test]
+    fn a_skipped_renewal_expires_early_never_late() {
+        let tti = Duration::from_secs(3600);
+        let tolerance = tti / TTI_RENEWAL_DIVISOR;
+        let cache: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_idle(tti)
+            .build();
+
+        // Worst case: the real access landed a hair before the tolerance
+        // elapsed, so the recorded stamp lags it by (almost) a full window.
+        let stamped = Instant::ZERO + Duration::from_secs(1_000);
+        let real_access = stamped + tolerance - Duration::from_nanos(1);
+        let entry = CacheEntry {
+            value: 1,
+            inserted_at: stamped,
+            last_accessed_at: stamped,
+            seq: 0,
+        };
+
+        // Never late: gone by `real_access + tti` at the very latest.
+        assert!(cache.is_expired(&entry, real_access + tti));
+        // At most one tolerance window early, never more.
+        assert!(cache.is_expired(&entry, stamped + tti));
+        assert!(!cache.is_expired(&entry, real_access + tti - tolerance));
+
+        // A key used at least once per window is restamped well inside the
+        // TTI, so continuous use still keeps it alive indefinitely.
+        assert!(tolerance < tti);
+    }
+
+    /// The point of the design: repeated lookups of a hot key stay on the read
+    /// lock. Observed through the stamp, which only a write-lock renewal moves.
+    #[tokio::test]
+    async fn a_hot_key_is_not_restamped_on_every_get() {
+        // TTI far longer than this test runs, so no lookup comes near the
+        // renewal tolerance.
+        let cache: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_idle(Duration::from_secs(3600))
+            .build();
+        cache.insert("k".into(), 1).await;
+
+        let stamp = |cache: PortableCache<String, u32>| async move {
+            cache
+                .inner
+                .read()
+                .await
+                .map
+                .get("k")
+                .unwrap()
+                .last_accessed_at
+        };
+        let before = stamp(cache.clone()).await;
+
+        for _ in 0..1_000 {
+            assert_eq!(cache.get("k").await, Some(1));
+        }
+
+        assert_eq!(
+            stamp(cache.clone()).await,
+            before,
+            "a lookup inside the renewal tolerance must not take the write lock"
+        );
+        assert_eq!(cache.tti_renewals(), 0, "no lookup reached the write path");
+    }
+
+    /// The other half of the contract: once the stamp ages past the tolerance,
+    /// a lookup does promote to the write lock and renew it, so a continuously
+    /// used entry never idles out.
+    #[tokio::test]
+    async fn a_get_past_the_tolerance_renews_the_stamp() {
+        // 4s TTI => 250ms tolerance. Polling every 25ms renews long before the
+        // entry could idle out.
+        let cache: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_idle(Duration::from_secs(4))
+            .build();
+        cache.insert("k".into(), 1).await;
+
+        let stamp = |cache: PortableCache<String, u32>| async move {
+            cache
+                .inner
+                .read()
+                .await
+                .map
+                .get("k")
+                .unwrap()
+                .last_accessed_at
+        };
+        let before = stamp(cache.clone()).await;
+
+        let mut renewed = false;
+        for _ in 0..400 {
+            assert_eq!(cache.get("k").await, Some(1), "polling must keep it alive");
+            if stamp(cache.clone()).await > before {
+                renewed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(renewed, "a lookup past the tolerance must renew the stamp");
+    }
+
+    /// The expiry-removal path drops the guard before taking the write lock, so
+    /// it removes only the entry it judged, identified by `(seq, inserted_at)`.
+    /// That is sound only while every write path moves one of the two, so pin
+    /// which one each moves.
+    #[tokio::test]
+    async fn a_rewritten_entry_gets_a_new_identity() {
+        let cache: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_live(Duration::from_secs(3600))
+            .build();
+
+        let identity = |cache: PortableCache<String, u32>| async move {
+            let guard = cache.inner.read().await;
+            let e = guard.map.get("k").unwrap();
+            (e.seq, e.inserted_at)
+        };
+
+        cache.insert("k".into(), 1).await;
+        let first = identity(cache.clone()).await;
+
+        // Rewrite in place until the clock has visibly advanced, so this does
+        // not depend on the monotonic provider's granularity.
+        let mut rewritten = first;
+        for i in 0..400 {
+            cache.insert("k".into(), i).await;
+            rewritten = identity(cache.clone()).await;
+            if rewritten.1 != first.1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(rewritten.0, first.0, "an in-place rewrite keeps the slot");
+        assert_ne!(
+            rewritten.1, first.1,
+            "an in-place rewrite must move inserted_at, or an expiring lookup \
+             could remove the value it wrote"
+        );
+
+        // A removal plus a fresh insert takes a new slot instead.
+        cache.invalidate("k").await;
+        cache.insert("k".into(), 3).await;
+        assert_ne!(
+            identity(cache.clone()).await.0,
+            rewritten.0,
+            "a reinsert must take a new seq"
+        );
+    }
+
+    /// A burst of lookups crossing the tolerance together all decide to renew
+    /// under their read guards. Each re-decides under the write lock, so the
+    /// ones queued behind the first find the entry already fresh and leave its
+    /// stamp alone instead of each pushing it further forward.
+    ///
+    /// The pileup itself cannot be forced: the lock is writer-preferring, so
+    /// the window between the read-side decision and the first store closes as
+    /// soon as one writer registers. The count assertion is exact for correct
+    /// code and catches a regression only when the race does occur; what makes
+    /// the property hold is the write-lock re-check plus the exact tolerance
+    /// boundary pinned in `tti_renewal_tolerance_is_exact_under_a_controlled_clock`.
+    #[tokio::test]
+    async fn a_concurrent_burst_past_the_tolerance_renews_once() {
+        // 4s TTI => 250ms tolerance.
+        let cache: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_idle(Duration::from_secs(4))
+            .build();
+        cache.insert("k".into(), 1).await;
+
+        let stamp = |cache: PortableCache<String, u32>| async move {
+            cache
+                .inner
+                .read()
+                .await
+                .map
+                .get("k")
+                .unwrap()
+                .last_accessed_at
+        };
+        let before = stamp(cache.clone()).await;
+        assert_eq!(cache.tti_renewals(), 0);
+
+        // Idle past the tolerance without touching the cache, so the whole
+        // burst observes the same stale stamp.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache.get("k").await
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), Some(1), "every lookup is still served");
+        }
+
+        assert!(stamp(cache.clone()).await > before, "the stamp was renewed");
+        // The whole burst lands far inside the 250ms tolerance, so whichever
+        // writer stores first leaves the rest nothing to do. Comparing raw
+        // stamps instead would let every queued writer store in turn.
+        assert_eq!(
+            cache.tti_renewals(),
+            1,
+            "a burst must renew once, not once per queued writer"
+        );
+
+        // And the next lookup is back on the read path entirely.
+        assert_eq!(cache.get("k").await, Some(1));
+        assert_eq!(
+            cache.tti_renewals(),
+            1,
+            "a lookup inside the tolerance must not renew again"
+        );
+    }
+
+    /// Failure case: an entry that idled past its TTI must be removed and never
+    /// served, including when the burst of lookups that would have renewed it
+    /// arrives concurrently right at the boundary.
+    #[tokio::test]
+    async fn an_expired_entry_is_never_served_to_a_concurrent_burst() {
+        let tti = Duration::from_millis(120);
+        let cache: PortableCache<String, u32> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_idle(tti)
+            .build();
+        cache.insert("k".into(), 1).await;
+
+        // Idle it out without touching the cache, so nothing renews the stamp.
+        let deadline = Instant::now() + tti + Duration::from_millis(20);
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache.get("k").await
+            }));
+        }
+        for h in handles {
+            assert_eq!(
+                h.await.unwrap(),
+                None,
+                "an entry past its TTI must never be served"
+            );
+        }
+        assert!(
+            cache.get("k").await.is_none(),
+            "the expired entry must stay removed, not be resurrected by a renewal"
+        );
+    }
+
+    /// Failure case: `get` racing `insert` and `invalidate` on one key must
+    /// never observe a torn value, and its renewal write must never undo an
+    /// invalidation.
+    #[tokio::test]
+    async fn concurrent_get_insert_and_invalidate_never_tear_or_resurrect() {
+        // A short TTI makes the tolerance ~3ms, so nearly every lookup takes
+        // the renewal write path: maximum pressure on the race.
+        let cache: PortableCache<String, (u64, u64)> = PortableCache::builder()
+            .max_capacity(100)
+            .time_to_idle(Duration::from_millis(50))
+            .build();
+        cache.insert("k".into(), (0, 0)).await;
+
+        // Both halves of the value carry the same generation, so a torn read
+        // would show a mismatched pair.
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let stop = stop.clone();
+            readers.push(tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some((a, b)) = cache.get("k").await {
+                        assert_eq!(a, b, "get returned a torn value");
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        let writer = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                for i in 1..=2_000u64 {
+                    cache.insert("k".into(), (i, i)).await;
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let invalidator = tokio::spawn({
+            let cache = cache.clone();
+            async move {
+                for _ in 0..2_000 {
+                    cache.invalidate("k").await;
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        writer.await.unwrap();
+        invalidator.await.unwrap();
+
+        // Nothing inserts any more, so the key must stay gone while the readers
+        // keep hammering it; a renewal that re-inserted would bring it back.
+        cache.invalidate("k").await;
+        for _ in 0..200 {
+            assert!(
+                cache.get("k").await.is_none(),
+                "a get's renewal resurrected an invalidated entry"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.await.unwrap();
+        }
+    }
+
+    /// Named regression for the coordination caches (`session_locks`,
+    /// `chat_lanes`, `group_distribution_locks`): they are marked by their
+    /// `evict_guard`, and expiry does not consult it, so a timeout would drop a
+    /// lock a task still holds and let the next lookup mint a second one.
+    #[test]
+    #[should_panic(expected = "must not expire by time")]
+    fn a_coordination_cache_cannot_be_given_a_tti() {
+        let _: PortableCache<String, Arc<AsyncMutex<()>>> = PortableCache::builder()
+            .max_capacity(16)
+            .evict_guard(|m| Arc::strong_count(m) <= 1)
+            .time_to_idle(Duration::from_secs(60))
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "must not expire by time")]
+    fn a_coordination_cache_cannot_be_given_a_ttl() {
+        let _: PortableCache<String, Arc<AsyncMutex<()>>> = PortableCache::builder()
+            .max_capacity(16)
+            .evict_guard(|m| Arc::strong_count(m) <= 1)
+            .time_to_live(Duration::from_secs(60))
+            .build();
     }
 
     /// A lookup that finds nothing has no timestamp to compare, so it must not

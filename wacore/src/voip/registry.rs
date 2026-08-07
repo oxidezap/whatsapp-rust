@@ -437,6 +437,37 @@ impl CallRegistry {
         Self::default()
     }
 
+    /// The active-call map, recovering the guard from a poisoned mutex instead of panicking.
+    ///
+    /// Poisoning would be permanent and process-wide: one panic under any of these guards would
+    /// turn every later VoIP call into a panic, including [`abort_all`](Self::abort_all), the one
+    /// operation a caller needs after a failure -- and it would not undo whatever the panic left
+    /// behind. Recovery is sound because the damage an unwind can do is bounded to the one call it
+    /// was already failing: the map has no cross-entry invariant, entries are only ever removed
+    /// whole, and no individual field is ever left torn. A multi-field update can still stop
+    /// partway -- `set_video_channels` writes three fields, and a superseded value panicking in
+    /// `Drop` between them leaves that call's own update incomplete -- but every entry stays
+    /// individually well-formed, and reachable, which poisoning would not have preserved.
+    fn active_calls(&self) -> std::sync::MutexGuard<'_, HashMap<String, CallEntry>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The ringing-offer set. Poison policy as in [`active_calls`](Self::active_calls).
+    fn ringing_calls(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.ringing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The pre-offer control buffer. Poison policy as in [`active_calls`](Self::active_calls).
+    fn pending_controls(&self) -> std::sync::MutexGuard<'_, VecDeque<PendingInitialGroupControl>> {
+        self.pending_initial_group_controls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn ringing_group_update_fits(
         ringing: &HashSet<String>,
         map: &HashMap<String, CallEntry>,
@@ -486,7 +517,7 @@ impl CallRegistry {
         use crate::stats::HeapSize;
 
         let (active_entries, active_bytes) = {
-            let map = self.inner.lock().expect("registry lock poisoned");
+            let map = self.active_calls();
             let bytes = map
                 .iter()
                 .map(|(call_id, entry)| entry.retained_bytes(call_id))
@@ -494,10 +525,7 @@ impl CallRegistry {
             (map.len(), bytes)
         };
         let (pending_entries, pending_bytes) = {
-            let mut pending = self
-                .pending_initial_group_controls
-                .lock()
-                .expect("registry lock poisoned");
+            let mut pending = self.pending_controls();
             let now = crate::time::Instant::now();
             pending.retain(|queued| queued.expires_at > now);
             let bytes = pending
@@ -507,7 +535,7 @@ impl CallRegistry {
             (pending.len(), bytes)
         };
         let (ringing_entries, ringing_bytes) = {
-            let ringing = self.ringing.lock().expect("registry lock poisoned");
+            let ringing = self.ringing_calls();
             let bytes = ringing
                 .iter()
                 .map(|call_id| size_of::<String>() + call_id.heap_bytes())
@@ -542,18 +570,10 @@ impl CallRegistry {
             return false;
         }
 
-        let mut pending = self
-            .pending_initial_group_controls
-            .lock()
-            .expect("registry lock poisoned");
+        let mut pending = self.pending_controls();
         let now = crate::time::Instant::now();
         pending.retain(|queued| queued.expires_at > now);
-        if self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
-            .contains_key(call.action.call_id())
-        {
+        if self.active_calls().contains_key(call.action.call_id()) {
             return false;
         }
         if !call.stanza_id.is_empty()
@@ -636,10 +656,7 @@ impl CallRegistry {
         call_creator: &Jid,
     ) -> Vec<IncomingCall> {
         let creator = call_creator.to_non_ad();
-        let mut pending = self
-            .pending_initial_group_controls
-            .lock()
-            .expect("registry lock poisoned");
+        let mut pending = self.pending_controls();
         let now = crate::time::Instant::now();
         pending.retain(|queued| queued.expires_at > now);
         let mut retained = VecDeque::with_capacity(pending.len());
@@ -665,9 +682,7 @@ impl CallRegistry {
     /// Deliver a signaling event through the call's consumer queue.
     pub fn send_call_event(&self, call_id: &str, event: CallEvent) -> bool {
         let tx = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
+            .active_calls()
             .get(call_id)
             .and_then(|entry| entry.event_tx.clone());
         tx.is_some_and(|tx| tx.force_send(event))
@@ -681,9 +696,7 @@ impl CallRegistry {
         event: CallEvent,
     ) -> bool {
         let tx = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
+            .active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .and_then(|entry| entry.event_tx.clone());
@@ -712,39 +725,13 @@ impl CallRegistry {
         if super::engine::validate_group_relay_update(&update).is_err() {
             return GroupStateApply::InvalidSnapshot;
         }
+        // Held so the commit lookup survives `update` being moved into the preview.
+        let call_id = update.call_id.clone();
         let (applied, waiting_room_task, video_teardown, event) = {
-            let ringing = self.ringing.lock().expect("registry lock poisoned");
-            let mut map = self.inner.lock().expect("registry lock poisoned");
-            if let Some(entry) = map
-                .get(&update.call_id)
-                .filter(|entry| generation.is_none_or(|current| entry.generation == current))
-                .filter(|entry| entry.is_group_call && entry.session.phase() == CallPhase::Ringing)
-            {
-                let mut preview = entry.group.clone().unwrap_or_else(|| {
-                    GroupCallState::new(
-                        entry.session.call_id.clone(),
-                        entry.session.call_creator.clone(),
-                    )
-                });
-                if preview.apply_update(update.clone()) == GroupStateApply::Applied {
-                    let mut preview_session = entry.session.clone();
-                    preview_session.group = preview.snapshot().cloned();
-                    if !Self::ringing_group_update_fits(
-                        &ringing,
-                        &map,
-                        &update.call_id,
-                        entry,
-                        &preview,
-                        &preview_session,
-                    ) {
-                        // Preserve the transaction watermark so a corrected same-transaction
-                        // snapshot can still be accepted.
-                        return GroupStateApply::InvalidSnapshot;
-                    }
-                }
-            }
+            let ringing = self.ringing_calls();
+            let mut map = self.active_calls();
             let Some(entry) = map
-                .get_mut(&update.call_id)
+                .get(&call_id)
                 .filter(|entry| generation.is_none_or(|current| entry.generation == current))
             else {
                 return GroupStateApply::UnknownCall;
@@ -758,18 +745,52 @@ impl CallRegistry {
                 // remain admissible instead of splitting registry and driver state.
                 return GroupStateApply::InvalidSnapshot;
             }
+            let downgrades_video = update.media == "audio"
+                && (entry.session.is_video
+                    || entry
+                        .group
+                        .as_ref()
+                        .and_then(GroupCallState::snapshot)
+                        .is_some_and(|snapshot| snapshot.media == "video"));
+            let local_member = entry
+                .group_invite_self_device
+                .as_ref()
+                .is_some_and(|device| {
+                    Self::group_update_contains_connected_device(&update, &device.jid)
+                });
+            // One preview both decides admission and becomes the committed state. `apply_update`
+            // mutates nothing on a rejected transaction, so a preview that did not apply is still
+            // byte-identical to the entry's own state and can be stored back unconditionally.
             let mut preview = entry.group.clone().unwrap_or_else(|| {
                 GroupCallState::new(
                     entry.session.call_id.clone(),
                     entry.session.call_creator.clone(),
                 )
             });
-            if preview.apply_update(update.clone()) == GroupStateApply::Applied {
-                let committed = preview
-                    .snapshot()
-                    .expect("an applied preview owns a snapshot")
-                    .clone();
-                let control = GroupControl::Update(Box::new(committed));
+            let applied = preview.apply_update(update);
+            if applied == GroupStateApply::Applied {
+                if entry.is_group_call && entry.session.phase() == CallPhase::Ringing {
+                    let mut preview_session = entry.session.clone();
+                    preview_session.group = preview.snapshot().cloned();
+                    if !Self::ringing_group_update_fits(
+                        &ringing,
+                        &map,
+                        &call_id,
+                        entry,
+                        &preview,
+                        &preview_session,
+                    ) {
+                        // Preserve the transaction watermark so a corrected same-transaction
+                        // snapshot can still be accepted.
+                        return GroupStateApply::InvalidSnapshot;
+                    }
+                }
+                let control = GroupControl::Update(Box::new(
+                    preview
+                        .snapshot()
+                        .expect("an applied preview owns a snapshot")
+                        .clone(),
+                ));
                 let fits = entry.group_ctl_tx.as_ref().map_or(
                     !entry.is_call_link || {
                         GroupControlQueue::accepts_with_capacity(
@@ -786,20 +807,10 @@ impl CallRegistry {
                     return GroupStateApply::InvalidSnapshot;
                 }
             }
-            let downgrades_video = update.media == "audio"
-                && (entry.session.is_video
-                    || entry
-                        .group
-                        .as_ref()
-                        .and_then(GroupCallState::snapshot)
-                        .is_some_and(|snapshot| snapshot.media == "video"));
-            let local_member = entry
-                .group_invite_self_device
-                .as_ref()
-                .is_some_and(|device| {
-                    Self::group_update_contains_connected_device(&update, &device.jid)
-                });
-            let applied = entry.group_mut().apply_update(update);
+            let entry = map.get_mut(&call_id).expect("entry presence checked");
+            // `group_mut()`'s side effect: any update claims the call as group media, applied or not.
+            entry.is_group_call = true;
+            entry.group = Some(preview);
             let admitted = applied == GroupStateApply::Applied
                 && entry.is_call_link
                 && entry.session.phase() == CallPhase::WaitingRoom
@@ -867,7 +878,7 @@ impl CallRegistry {
         room: WaitingRoom,
         generation: Option<u64>,
     ) -> GroupStateApply {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(entry) = map
             .get_mut(&room.call_id)
             .filter(|entry| generation.is_none_or(|current| entry.generation == current))
@@ -892,9 +903,7 @@ impl CallRegistry {
         generation: u64,
         enabled: bool,
     ) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
             .and_then(|entry| entry.group.as_mut())
@@ -903,7 +912,7 @@ impl CallRegistry {
 
     /// Update one participant's persistent hand state for an active group call.
     pub fn set_raised_hand(&self, call_id: &str, participant: &Jid, raised: bool) -> bool {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(group) = map.get_mut(call_id).and_then(|entry| entry.group.as_mut()) else {
             return false;
         };
@@ -919,7 +928,7 @@ impl CallRegistry {
         participant: &Jid,
         raised: bool,
     ) -> bool {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(group) = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
@@ -938,7 +947,7 @@ impl CallRegistry {
         participant: &Jid,
         screen_share: ScreenShare,
     ) -> bool {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(group) = map.get_mut(call_id).and_then(|entry| entry.group.as_mut()) else {
             return false;
         };
@@ -954,7 +963,7 @@ impl CallRegistry {
         participant: &Jid,
         screen_share: ScreenShare,
     ) -> bool {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(group) = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
@@ -968,36 +977,28 @@ impl CallRegistry {
 
     /// Read a clone of the current group-call state.
     pub fn group_state(&self, call_id: &str) -> Option<GroupCallState> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .and_then(|entry| entry.group.clone())
     }
 
     /// Whether the registered call-id belongs to a group-call generation.
     pub fn is_group_call(&self, call_id: &str) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .is_some_and(|entry| entry.is_group_call)
     }
 
     /// Whether one exact call generation is registered as group media.
     pub fn is_group_call_if_current(&self, call_id: &str, generation: u64) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .is_some_and(|entry| entry.generation == generation && entry.is_group_call)
     }
 
     /// The exact ringing group generation matching its signaling creator.
     pub fn ringing_group_generation(&self, call_id: &str, call_creator: &Jid) -> Option<u64> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|entry| {
                 entry.is_group_call
@@ -1009,9 +1010,7 @@ impl CallRegistry {
 
     /// Read group state only when `generation` still owns this call-id.
     pub fn group_state_if_current(&self, call_id: &str, generation: u64) -> Option<GroupCallState> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .and_then(|entry| entry.group.clone())
@@ -1024,15 +1023,11 @@ impl CallRegistry {
         generation: u64,
         call_creator: &Jid,
     ) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get(call_id)
-            .is_some_and(|entry| {
-                entry.generation == generation
-                    && entry.is_group_call
-                    && entry.session.call_creator == *call_creator
-            })
+        self.active_calls().get(call_id).is_some_and(|entry| {
+            entry.generation == generation
+                && entry.is_group_call
+                && entry.session.call_creator == *call_creator
+        })
     }
 
     /// Whether a routed signaling sender is the creator or belongs to this exact active group call.
@@ -1042,9 +1037,7 @@ impl CallRegistry {
     pub fn group_sender_authorized(&self, call_id: &str, call_creator: &Jid, sender: &Jid) -> bool {
         if sender.to_non_ad() == call_creator.to_non_ad()
             && self
-                .inner
-                .lock()
-                .expect("registry lock poisoned")
+                .active_calls()
                 .get(call_id)
                 .is_some_and(|entry| entry.session.call_creator == *call_creator)
         {
@@ -1063,14 +1056,9 @@ impl CallRegistry {
         sender: &Jid,
     ) -> bool {
         if sender.to_non_ad() == call_creator.to_non_ad()
-            && self
-                .inner
-                .lock()
-                .expect("registry lock poisoned")
-                .get(call_id)
-                .is_some_and(|entry| {
-                    entry.generation == generation && entry.session.call_creator == *call_creator
-                })
+            && self.active_calls().get(call_id).is_some_and(|entry| {
+                entry.generation == generation && entry.session.call_creator == *call_creator
+            })
         {
             return true;
         }
@@ -1086,15 +1074,11 @@ impl CallRegistry {
         call_creator: &Jid,
         sender: &Jid,
     ) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get(call_id)
-            .is_some_and(|entry| {
-                entry.generation == generation
-                    && entry.session.call_creator == *call_creator
-                    && sender.to_non_ad() == call_creator.to_non_ad()
-            })
+        self.active_calls().get(call_id).is_some_and(|entry| {
+            entry.generation == generation
+                && entry.session.call_creator == *call_creator
+                && sender.to_non_ad() == call_creator.to_non_ad()
+        })
     }
 
     /// Resolve an authenticated routed sender to the roster's stable participant JID.
@@ -1107,7 +1091,7 @@ impl CallRegistry {
         call_creator: &Jid,
         sender: &Jid,
     ) -> Option<Jid> {
-        let map = self.inner.lock().expect("registry lock poisoned");
+        let map = self.active_calls();
         let entry = map
             .get(call_id)
             .filter(|entry| entry.session.call_creator == *call_creator)?;
@@ -1122,7 +1106,7 @@ impl CallRegistry {
         call_creator: &Jid,
         sender: &Jid,
     ) -> Option<Jid> {
-        let map = self.inner.lock().expect("registry lock poisoned");
+        let map = self.active_calls();
         let entry = map.get(call_id).filter(|entry| {
             entry.generation == generation && entry.session.call_creator == *call_creator
         })?;
@@ -1137,7 +1121,7 @@ impl CallRegistry {
         call_creator: &Jid,
         sender: &Jid,
     ) -> Option<Jid> {
-        let map = self.inner.lock().expect("registry lock poisoned");
+        let map = self.active_calls();
         let entry = map.get(call_id).filter(|entry| {
             entry.generation == generation && entry.session.call_creator == *call_creator
         })?;
@@ -1261,21 +1245,8 @@ impl CallRegistry {
         }
         let call_id = session.call_id.clone();
         let generation = {
-            let mut ringing = self.ringing.lock().expect("registry lock poisoned");
-            let mut map = self.inner.lock().expect("registry lock poisoned");
-            let (ringing_group_entries, ringing_group_bytes) = map
-                .iter()
-                .filter(|(call_id, entry)| {
-                    ringing.contains(*call_id)
-                        && entry.is_group_call
-                        && entry.session.phase() == CallPhase::Ringing
-                })
-                .fold((0usize, 0usize), |(entries, bytes), (call_id, entry)| {
-                    (
-                        entries.saturating_add(1),
-                        bytes.saturating_add(entry.retained_bytes(call_id)),
-                    )
-                });
+            let mut ringing = self.ringing_calls();
+            let mut map = self.active_calls();
             if let Some(entry) = map.get(&call_id) {
                 if entry.session.phase() != CallPhase::Ringing {
                     return Ok(None);
@@ -1327,6 +1298,21 @@ impl CallRegistry {
                 ringing.insert(call_id);
                 entry.generation
             } else {
+                // Only a brand-new registration is charged against the aggregate, so the walk over
+                // every ringing group call belongs here rather than ahead of the update branch.
+                let (ringing_group_entries, ringing_group_bytes) = map
+                    .iter()
+                    .filter(|(call_id, entry)| {
+                        ringing.contains(*call_id)
+                            && entry.is_group_call
+                            && entry.session.phase() == CallPhase::Ringing
+                    })
+                    .fold((0usize, 0usize), |(entries, bytes), (call_id, entry)| {
+                        (
+                            entries.saturating_add(1),
+                            bytes.saturating_add(entry.retained_bytes(call_id)),
+                        )
+                    });
                 let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
                 let entry = Self::new_entry(session, generation, true, false);
                 if ringing_group_entries >= MAX_RINGING_GROUP_CALLS
@@ -1359,7 +1345,7 @@ impl CallRegistry {
             self.take_ringing(&session.call_id);
         }
         let prev = {
-            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let mut map = self.active_calls();
             map.insert(
                 session.call_id.clone(),
                 Self::new_entry(session, generation, force_group, is_call_link),
@@ -1375,8 +1361,8 @@ impl CallRegistry {
 
     /// Accept exactly the ringing generation observed before the signaling await.
     pub fn accept_ringing_if_current(&self, call_id: &str, generation: u64) -> bool {
-        let mut ringing = self.ringing.lock().expect("registry lock poisoned");
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut ringing = self.ringing_calls();
+        let mut map = self.active_calls();
         let Some(entry) = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
@@ -1393,8 +1379,8 @@ impl CallRegistry {
     /// Remove exactly the ringing generation carried by a dispatched offer.
     pub fn reject_ringing_if_current(&self, call_id: &str, generation: u64) -> bool {
         let removed = {
-            let mut ringing = self.ringing.lock().expect("registry lock poisoned");
-            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let mut ringing = self.ringing_calls();
+            let mut map = self.active_calls();
             if map.get(call_id).is_some_and(|entry| {
                 entry.generation == generation && entry.session.phase() == CallPhase::Ringing
             }) {
@@ -1455,7 +1441,7 @@ impl CallRegistry {
     pub fn promote_ringing_group(&self, mut session: CallSession) -> Option<u64> {
         let call_id = session.call_id.clone();
         let generation = {
-            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let mut map = self.active_calls();
             let entry = map.get_mut(&call_id)?;
             if !matches!(
                 entry.session.phase(),
@@ -1488,8 +1474,8 @@ impl CallRegistry {
         generation: u64,
     ) -> bool {
         let call_id = session.call_id.clone();
-        let mut ringing = self.ringing.lock().expect("registry lock poisoned");
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut ringing = self.ringing_calls();
+        let mut map = self.active_calls();
         let Some(entry) = map.get_mut(&call_id).filter(|entry| {
             entry.generation == generation
                 && matches!(
@@ -1519,25 +1505,21 @@ impl CallRegistry {
     /// was removed or superseded by a newer generation, the handle is aborted immediately so its
     /// task can't outlive the call.
     pub fn set_media_task(&self, call_id: &str, generation: u64, handle: AbortHandle) {
-        match self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get_mut(call_id)
-        {
-            Some(entry) if entry.generation == generation => {
-                if let Some(old) = entry.media_task.replace(handle) {
-                    old.abort();
-                }
+        let aborted = {
+            let mut map = self.active_calls();
+            match map.get_mut(call_id) {
+                Some(entry) if entry.generation == generation => entry.media_task.replace(handle),
+                _ => Some(handle),
             }
-            _ => handle.abort(),
-        }
+        };
+        // Both exits abort off-lock, for the reason spelled out at `insert_inner`.
+        drop(aborted);
     }
 
     /// Attach the repeating waiting-room heartbeat to one call generation.
     pub fn set_waiting_room_task(&self, call_id: &str, generation: u64, handle: AbortHandle) {
         let replaced = {
-            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let mut map = self.active_calls();
             let Some(entry) = map.get_mut(call_id).filter(|entry| {
                 entry.generation == generation && entry.session.phase() == CallPhase::WaitingRoom
             }) else {
@@ -1556,9 +1538,7 @@ impl CallRegistry {
         call_id: &str,
         generation: u64,
     ) -> Option<event_listener::EventListener> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .map(|entry| entry.group_update_event.listen())
@@ -1572,7 +1552,7 @@ impl CallRegistry {
         device: GroupCallDevice,
     ) -> bool {
         let (waiting_room_task, event) = {
-            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let mut map = self.active_calls();
             let Some(entry) = map
                 .get_mut(call_id)
                 .filter(|entry| entry.generation == generation)
@@ -1613,9 +1593,7 @@ impl CallRegistry {
         generation: u64,
         device: GroupCallDevice,
     ) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
             .is_some_and(|entry| {
@@ -1637,9 +1615,7 @@ impl CallRegistry {
         generation: u64,
         device: Option<GroupCallDevice>,
     ) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
             .is_some_and(|entry| {
@@ -1663,9 +1639,7 @@ impl CallRegistry {
         generation: u64,
         accepting_device: &Jid,
     ) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
             .is_some_and(|entry| {
@@ -1690,7 +1664,7 @@ impl CallRegistry {
         call_id: &str,
         generation: u64,
     ) -> Option<Vec<GroupCallParticipant>> {
-        let map = self.inner.lock().expect("registry lock poisoned");
+        let map = self.active_calls();
         let entry = map
             .get(call_id)
             .filter(|entry| entry.generation == generation)?;
@@ -1719,10 +1693,7 @@ impl CallRegistry {
         generation: u64,
         notify: impl FnOnce() + Send + 'static,
     ) {
-        if let Some(entry) = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
+        if let Some(entry) = self.active_calls()
             .get_mut(call_id)
             && entry.generation == generation
             // Set-once: a second call for the same generation would otherwise drop (and fire) the
@@ -1742,11 +1713,7 @@ impl CallRegistry {
         generation: u64,
         tx: async_channel::Sender<String>,
     ) {
-        if let Some(entry) = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get_mut(call_id)
+        if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.generation == generation
         {
             entry.rekey_tx = Some(tx);
@@ -1765,11 +1732,7 @@ impl CallRegistry {
         video_ctl_tx: VideoControlSender,
         video_teardown: Box<dyn Fn() + Send + Sync>,
     ) {
-        if let Some(entry) = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get_mut(call_id)
+        if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.generation == generation
         {
             entry.event_tx = Some(CallEventQueue::new(event_tx));
@@ -1788,7 +1751,7 @@ impl CallRegistry {
     ) -> bool {
         // Publish and flush under one guard: a concurrent epoch router that observes the sender
         // cannot enqueue a newer epoch before the buffered startup epoch.
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(entry) = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
@@ -1882,7 +1845,7 @@ impl CallRegistry {
         update: GroupCallUpdate,
     ) -> bool {
         let delivery = {
-            let map = self.inner.lock().expect("registry lock poisoned");
+            let map = self.active_calls();
             let Some(entry) = map
                 .get(call_id)
                 .filter(|entry| entry.generation == generation)
@@ -1917,7 +1880,7 @@ impl CallRegistry {
     ) -> bool {
         let epoch = GroupRawEpoch::new(transaction_id, raw_epoch);
         let delivery = {
-            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let mut map = self.active_calls();
             let Some(entry) = map
                 .get_mut(call_id)
                 .filter(|entry| entry.generation == generation)
@@ -1946,9 +1909,7 @@ impl CallRegistry {
         call_id: &str,
         generation: u64,
     ) -> Option<u32> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .and_then(|entry| entry.pending_group_epoch.as_ref())
@@ -2037,9 +1998,7 @@ impl CallRegistry {
             return false;
         }
         let tx = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
+            .active_calls()
             .get(call_id)
             .filter(|entry| entry.group.is_some())
             .and_then(|entry| entry.group_ctl_tx.clone());
@@ -2057,9 +2016,7 @@ impl CallRegistry {
             return false;
         }
         let tx = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
+            .active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation && entry.group.is_some())
             .and_then(|entry| entry.group_ctl_tx.clone());
@@ -2073,7 +2030,7 @@ impl CallRegistry {
         generation: u64,
         video_teardown: Box<dyn Fn() + Send + Sync>,
     ) -> bool {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(entry) = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
@@ -2087,9 +2044,7 @@ impl CallRegistry {
     /// Release the local video endpoints once for the current call generation.
     pub fn run_video_teardown(&self, call_id: &str, generation: u64) -> bool {
         let hook = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
+            .active_calls()
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
             .and_then(|entry| entry.video_teardown.take());
@@ -2105,7 +2060,7 @@ impl CallRegistry {
     /// committed transition, so queue pressure cannot hide peer-visible state from the consumer.
     pub fn reserve_call_event(&self, call_id: &str) -> Option<CallEventPermit> {
         let (tx, reserved, generation) = {
-            let map = self.inner.lock().expect("registry lock poisoned");
+            let map = self.active_calls();
             let entry = map.get(call_id)?;
             (
                 entry.event_tx.clone()?,
@@ -2129,18 +2084,14 @@ impl CallRegistry {
 
     /// The current call generation and its shared video-transition lock.
     pub fn current_video_transition(&self, call_id: &str) -> Option<(u64, Arc<AsyncMutex<()>>)> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .map(|entry| (entry.generation, entry.video_transition_lock.clone()))
     }
 
     /// The current call generation and its shared group-transition lock.
     pub fn current_group_transition(&self, call_id: &str) -> Option<(u64, Arc<AsyncMutex<()>>)> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .map(|entry| (entry.generation, entry.group_transition_lock.clone()))
     }
@@ -2151,9 +2102,7 @@ impl CallRegistry {
         call_id: &str,
         generation: u64,
     ) -> Option<Arc<AsyncMutex<()>>> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .map(|entry| entry.group_transition_lock.clone())
@@ -2165,9 +2114,7 @@ impl CallRegistry {
         call_id: &str,
         generation: u64,
     ) -> Option<Arc<AsyncMutex<()>>> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .map(|entry| entry.video_transition_lock.clone())
@@ -2180,7 +2127,7 @@ impl CallRegistry {
         generation: u64,
         state: VideoState,
     ) -> PeerVideoTransition {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(entry) = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
@@ -2298,7 +2245,7 @@ impl CallRegistry {
 
     /// Begin a local upgrade and return its timeout epoch.
     pub fn begin_local_video_request(&self, call_id: &str, generation: u64) -> Option<u64> {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let entry = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)?;
@@ -2315,7 +2262,7 @@ impl CallRegistry {
 
     /// Complete a peer request only when the same request is still pending.
     pub fn complete_peer_video_request(&self, call_id: &str, token: VideoUpgradeToken) -> bool {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(entry) = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == token.generation)
@@ -2335,9 +2282,7 @@ impl CallRegistry {
     }
 
     pub fn peer_video_request_is_current(&self, call_id: &str, token: VideoUpgradeToken) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == token.generation)
             .is_some_and(|entry| {
@@ -2348,7 +2293,7 @@ impl CallRegistry {
 
     /// Roll back or expire one local request without touching a newer request.
     pub fn end_local_video_request(&self, call_id: &str, generation: u64, epoch: u64) -> bool {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(entry) = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
@@ -2370,7 +2315,7 @@ impl CallRegistry {
 
     /// Clear both directions after a failed handshake or full downgrade.
     pub fn reset_video(&self, call_id: &str, generation: u64) -> bool {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(entry) = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
@@ -2387,7 +2332,7 @@ impl CallRegistry {
 
     /// Mark only our direction stopped; the peer may keep sending video.
     pub fn stop_local_video(&self, call_id: &str, generation: u64) -> bool {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let Some(entry) = map
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
@@ -2401,9 +2346,7 @@ impl CallRegistry {
     }
 
     pub fn video_states(&self, call_id: &str, generation: u64) -> Option<(VideoState, VideoState)> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .map(|entry| (entry.video.self_state, entry.video.peer_state))
@@ -2412,9 +2355,7 @@ impl CallRegistry {
     /// Send a mid-call video-plane command to the current drive loop.
     pub fn send_video_ctl(&self, call_id: &str, generation: u64, ctl: VideoControl) {
         let tx = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
+            .active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .and_then(|e| e.video_ctl_tx.clone());
@@ -2426,11 +2367,7 @@ impl CallRegistry {
     /// Track whether the call currently has video negotiated (offer `<video>`, upgrade accepted, or
     /// downgraded back). No-op for an unknown call.
     pub fn set_is_video(&self, call_id: &str, generation: u64, is_video: bool) -> bool {
-        if let Some(entry) = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get_mut(call_id)
+        if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.generation == generation
         {
             entry.session.is_video = is_video;
@@ -2442,9 +2379,7 @@ impl CallRegistry {
     }
 
     pub fn is_current(&self, call_id: &str, generation: u64) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .is_some_and(|entry| entry.generation == generation)
     }
@@ -2454,9 +2389,7 @@ impl CallRegistry {
     /// Silently ignored when absent (no engine yet, an incoming call, or the call is torn down).
     pub fn send_rekey(&self, call_id: &str, answering_lid: String) {
         let tx = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
+            .active_calls()
             .get_mut(call_id)
             .and_then(|e| e.rekey_tx.take());
         if let Some(tx) = tx {
@@ -2469,11 +2402,7 @@ impl CallRegistry {
     /// answerer wins, matching the rekey and WA Web's accepted-elsewhere handling. No-op if the call is
     /// unknown or a device was already recorded.
     pub fn set_answering_device(&self, call_id: &str, device: Jid) {
-        if let Some(entry) = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get_mut(call_id)
+        if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.session.answering_device.is_none()
         {
             entry.session.answering_device = Some(device);
@@ -2484,9 +2413,7 @@ impl CallRegistry {
     /// addressing a `<terminate>`. Generation-guarded so a stale handle (superseded by a same-call-id
     /// replacement) can't read the newer call's device; it falls back to its own bare peer instead.
     pub fn answering_device_if_current(&self, call_id: &str, generation: u64) -> Option<Jid> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|e| e.generation == generation)
             .and_then(|e| e.session.answering_device.clone())
@@ -2495,26 +2422,16 @@ impl CallRegistry {
     /// The current generation token registered under `call_id`, or `None` if unknown. Lets a caller
     /// confirm its registration still owns the call (not superseded/removed) before attaching to it.
     pub fn generation_of(&self, call_id: &str) -> Option<u64> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get(call_id)
-            .map(|e| e.generation)
+        self.active_calls().get(call_id).map(|e| e.generation)
     }
 
     pub fn phase(&self, call_id: &str) -> Option<CallPhase> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get(call_id)
-            .map(|e| e.session.phase())
+        self.active_calls().get(call_id).map(|e| e.session.phase())
     }
 
     /// Read phase only while `generation` still owns this call-id.
     pub fn phase_if_current(&self, call_id: &str, generation: u64) -> Option<CallPhase> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .map(|entry| entry.session.phase())
@@ -2522,18 +2439,14 @@ impl CallRegistry {
 
     /// Advance a call's phase; returns false if the call is unknown or the transition is illegal.
     pub fn transition(&self, call_id: &str, next: CallPhase) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get_mut(call_id)
             .is_some_and(|e| e.session.transition_to(next))
     }
 
     /// Advance a call phase only while `generation` still owns this call-id.
     pub fn transition_if_current(&self, call_id: &str, generation: u64, next: CallPhase) -> bool {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
             .is_some_and(|entry| entry.session.transition_to(next))
@@ -2541,18 +2454,12 @@ impl CallRegistry {
 
     /// Read a clone of a call's session snapshot.
     pub fn snapshot(&self, call_id: &str) -> Option<CallSession> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
-            .get(call_id)
-            .map(|e| e.session.clone())
+        self.active_calls().get(call_id).map(|e| e.session.clone())
     }
 
     /// Read a call session only when `generation` still owns this call-id.
     pub fn snapshot_if_current(&self, call_id: &str, generation: u64) -> Option<CallSession> {
-        self.inner
-            .lock()
-            .expect("registry lock poisoned")
+        self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .map(|entry| entry.session.clone())
@@ -2565,7 +2472,7 @@ impl CallRegistry {
     /// Each device JID already names its user, so the bare peer is not returned (the dismiss
     /// terminate is addressed per device JID, not to the bare peer).
     pub fn take_dismiss_targets(&self, call_id: &str) -> Option<(Jid, Vec<Jid>)> {
-        let mut map = self.inner.lock().expect("registry lock poisoned");
+        let mut map = self.active_calls();
         let entry = map.get_mut(call_id)?;
         if entry.session.ring_devices.is_empty() {
             return None;
@@ -2575,7 +2482,7 @@ impl CallRegistry {
     }
 
     pub fn active_count(&self) -> usize {
-        self.inner.lock().expect("registry lock poisoned").len()
+        self.active_calls().len()
     }
 
     /// Record an incoming offer as ringing (not yet answered) so a later `<terminate>` for it can be
@@ -2583,10 +2490,7 @@ impl CallRegistry {
     /// on answer or terminate. Do not call for an offline-queued offer: that one is already surfaced
     /// as missed-offline and must not double-fire.
     pub fn mark_incoming_ringing(&self, call_id: &str) {
-        self.ringing
-            .lock()
-            .expect("registry lock poisoned")
-            .insert(call_id.to_string());
+        self.ringing_calls().insert(call_id.to_string());
     }
 
     /// Consume the ringing flag for `call_id`, returning whether it was still ringing. True means a
@@ -2594,19 +2498,12 @@ impl CallRegistry {
     /// was answered, was outgoing, or was already resolved (so a duplicate `<terminate>` is ended,
     /// never a second missed). One-shot.
     pub fn take_ringing(&self, call_id: &str) -> bool {
-        self.ringing
-            .lock()
-            .expect("registry lock poisoned")
-            .remove(call_id)
+        self.ringing_calls().remove(call_id)
     }
 
     /// Remove a call, aborting its media task. Returns true if it existed.
     pub fn remove(&self, call_id: &str) -> bool {
-        let removed = self
-            .inner
-            .lock()
-            .expect("registry lock poisoned")
-            .remove(call_id);
+        let removed = self.active_calls().remove(call_id);
         // `removed` drops here, after the lock guard: the media-task abort and on_terminal hook run
         // off-lock.
         removed.is_some()
@@ -2631,7 +2528,7 @@ impl CallRegistry {
         generation: u64,
     ) -> Option<CallPhase> {
         let removed = {
-            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let mut map = self.active_calls();
             if map.get(call_id).is_some_and(|e| e.generation == generation) {
                 map.remove(call_id)
             } else {
@@ -2646,13 +2543,10 @@ impl CallRegistry {
     /// Abort every call's media task and clear the registry. Returns the number cleared.
     /// Call this from your own disconnect/reconnect teardown; it is not wired into the client.
     pub fn abort_all(&self) -> usize {
-        self.ringing.lock().expect("registry lock poisoned").clear();
-        self.pending_initial_group_controls
-            .lock()
-            .expect("registry lock poisoned")
-            .clear();
+        self.ringing_calls().clear();
+        self.pending_controls().clear();
         let drained: Vec<CallEntry> = {
-            let mut map = self.inner.lock().expect("registry lock poisoned");
+            let mut map = self.active_calls();
             map.drain().map(|(_, entry)| entry).collect()
         };
         let n = drained.len();
@@ -2897,9 +2791,7 @@ mod tests {
                 creator.clone().with_device(1),
             )));
         }
-        reg.pending_initial_group_controls
-            .lock()
-            .expect("registry lock poisoned")
+        reg.pending_controls()
             .front_mut()
             .expect("one retained control")
             .expires_at = crate::time::Instant::ZERO;
@@ -3152,6 +3044,81 @@ mod tests {
             generic.apply_group_update_if_current(corrected, generic_generation),
             GroupStateApply::Applied,
             "a corrected same-transaction update must ignore group entries not in the ringing set"
+        );
+    }
+
+    /// The single preview that decides admission is the one that gets committed. Pins the admission
+    /// boundary and the accounted bytes on both sides of it, plus the claim-as-group-media side
+    /// effect a rejected transaction still carries.
+    #[test]
+    fn group_update_admission_boundary_and_accounting_are_unchanged_by_the_shared_preview() {
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let ringing_offer = || {
+            let mut session =
+                CallSession::new_incoming("GROUP-CALL", creator.clone(), creator.clone());
+            session.group = Some(group_update(1));
+            session
+        };
+
+        let reg = CallRegistry::new();
+        let generation = reg
+            .insert_ringing_group_if_inactive(ringing_offer())
+            .expect("valid initial offer")
+            .expect("offer registers");
+        let baseline_bytes = reg.memory_stats().bytes;
+
+        let mut oversized = group_update(2);
+        let mut relay = group_relay(2);
+        relay.tokens = vec![vec![9; MAX_RINGING_GROUP_CALL_BYTES]];
+        oversized.relay = Some(relay);
+        assert_eq!(
+            reg.apply_group_update_if_current(oversized, generation),
+            GroupStateApply::InvalidSnapshot
+        );
+        assert_eq!(
+            reg.group_state("GROUP-CALL")
+                .and_then(|state| state.snapshot().map(|update| update.transaction_id)),
+            Some(1),
+            "a rejected transaction must not be consumed"
+        );
+        assert_eq!(
+            reg.memory_stats().bytes,
+            baseline_bytes,
+            "a rejected preview must not be accounted"
+        );
+
+        assert_eq!(
+            reg.apply_group_update_if_current(group_update(2), generation),
+            GroupStateApply::Applied,
+            "a corrected same-transaction update stays admissible"
+        );
+        assert_eq!(
+            reg.group_state("GROUP-CALL")
+                .and_then(|state| state.snapshot().map(|update| update.transaction_id)),
+            Some(2)
+        );
+        assert_eq!(
+            reg.apply_group_update_if_current(group_update(2), generation),
+            GroupStateApply::Stale
+        );
+
+        // A non-applying update still claims the call as group media, exactly as routing the update
+        // through `group_mut()` did.
+        let plain = CallRegistry::new();
+        let plain_generation = plain.insert(session("CID"));
+        let mut foreign = group_update(1);
+        foreign.call_id = "CID".to_string();
+        foreign.call_creator = Jid::new("999999999999999", Server::Lid);
+        assert_eq!(
+            plain.apply_group_update_if_current(foreign, plain_generation),
+            GroupStateApply::IdentityMismatch
+        );
+        assert!(plain.is_group_call("CID"));
+        assert!(
+            plain
+                .group_state("CID")
+                .is_some_and(|state| state.snapshot().is_none()),
+            "the rejected transaction leaves an empty authoritative state behind"
         );
     }
 
@@ -5082,6 +5049,98 @@ mod tests {
         // Cleanup: removing the call aborts the replacement too.
         reg.remove("A");
         assert!(new.load(Ordering::SeqCst), "replacement aborted on remove");
+    }
+
+    /// A handle whose abort reads the registry back, modelling a `Runtime` that drops the task
+    /// synchronously so the task's own cleanup re-enters. `std::sync::Mutex` is not reentrant, so
+    /// any abort still holding the registry guard deadlocks instead of returning.
+    fn reentrant_handle(reg: &Arc<CallRegistry>) -> AbortHandle {
+        let reg = Arc::downgrade(reg);
+        AbortHandle::new(move || {
+            if let Some(reg) = reg.upgrade() {
+                let _ = reg.active_count();
+            }
+        })
+    }
+
+    /// Runs `body` on a worker thread and fails instead of hanging the suite if it deadlocks.
+    ///
+    /// Only a timeout means deadlock. A dropped sender means `body` panicked, so the worker is
+    /// joined and its payload re-raised rather than reported as a hang.
+    fn within_five_seconds(name: &str, body: impl FnOnce() + Send + 'static) {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            body();
+            let _ = done_tx.send(());
+        });
+        if done_rx.recv_timeout(Duration::from_secs(5)) == Err(RecvTimeoutError::Timeout) {
+            panic!("{name} deadlocked: the abort ran while the registry lock was held");
+        }
+        // Either the body signalled or it unwound and dropped the sender; joining covers both and
+        // re-raises the payload so a failed assertion inside the body is what the suite reports.
+        if let Err(payload) = worker.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn replacing_a_media_task_does_not_abort_under_the_registry_lock() {
+        within_five_seconds("replacing a media task", || {
+            let reg = Arc::new(CallRegistry::new());
+            let generation = reg.insert(session("CID"));
+            reg.set_media_task("CID", generation, reentrant_handle(&reg));
+            let installed = Arc::new(AtomicBool::new(false));
+            reg.set_media_task("CID", generation, flag_handle(&installed));
+            assert!(
+                !installed.load(Ordering::SeqCst),
+                "the replacement must stay live"
+            );
+            assert!(reg.remove_if_current("CID", generation));
+            assert!(installed.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn rejecting_a_stale_media_task_does_not_abort_under_the_registry_lock() {
+        within_five_seconds("rejecting a stale media task", || {
+            let reg = Arc::new(CallRegistry::new());
+            let stale = reg.insert(session("CID"));
+            let current = reg.insert(session("CID"));
+            assert_ne!(stale, current);
+            // The generation-mismatch exit aborts the handle it was given; so does the unknown-call
+            // exit. Both must run the abort after the guard is gone.
+            reg.set_media_task("CID", stale, reentrant_handle(&reg));
+            reg.set_media_task("GONE", 0, reentrant_handle(&reg));
+            assert_eq!(reg.active_count(), 1);
+        });
+    }
+
+    /// The registry recovers a poisoned guard, so one panic under the lock cannot disable VoIP for
+    /// the rest of the process -- including `abort_all`, the teardown a caller needs after a panic.
+    #[test]
+    fn a_panic_under_the_registry_lock_leaves_the_registry_usable() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        reg.mark_incoming_ringing("RINGING");
+
+        // The panic hook is left alone: silencing it is a process-wide mutation that would swallow
+        // a genuine panic from any test running in parallel, so this one announces itself instead.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _active = reg.active_calls();
+            let _ringing = reg.ringing_calls();
+            panic!(
+                "intentional panic under both registry guards; this test asserts on the recovery"
+            );
+        }));
+
+        assert!(outcome.is_err());
+        assert!(reg.inner.is_poisoned() && reg.ringing.is_poisoned());
+        assert_eq!(reg.active_count(), 1);
+        assert!(reg.is_current("CID", generation));
+        assert!(reg.take_ringing("RINGING"));
+        assert_eq!(reg.abort_all(), 1);
     }
 
     /// Attaching a media task to an already-removed call must abort the handle immediately so the

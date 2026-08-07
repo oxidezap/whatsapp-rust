@@ -16,7 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
-use portable_atomic::{AtomicBool, Ordering};
+use portable_atomic::{AtomicBool, AtomicUsize, Ordering};
 use zeroize::Zeroize;
 
 use crate::runtime::{BoxFuture, Runtime};
@@ -169,6 +169,10 @@ enum VideoControlMessage {
 #[derive(Default)]
 struct PendingParticipantOrientations {
     values: Mutex<HashMap<wacore_binary::Jid, u8>>,
+    /// `values.len()`, written inside its critical section. The drive loop consults it once per
+    /// iteration and the map is empty in every call that never routes a group video participant, so
+    /// the read must not cost a lock.
+    len: AtomicUsize,
     marker_queued: AtomicBool,
 }
 
@@ -185,6 +189,8 @@ pub struct VideoControlReceiver {
     orientation: async_channel::Receiver<u8>,
     participant_orientations: Arc<PendingParticipantOrientations>,
     ready_participant_orientations: Mutex<VecDeque<(wacore_binary::Jid, u8)>>,
+    /// `ready_participant_orientations.len()`, same role as [`PendingParticipantOrientations::len`].
+    ready_participant_orientations_len: AtomicUsize,
 }
 
 /// Build the control mailbox used by one call driver.
@@ -203,6 +209,7 @@ pub fn video_control_channel() -> (VideoControlSender, VideoControlReceiver) {
             orientation: orientation_rx,
             participant_orientations,
             ready_participant_orientations: Mutex::new(VecDeque::new()),
+            ready_participant_orientations_len: AtomicUsize::new(0),
         },
     )
 }
@@ -231,6 +238,9 @@ impl VideoControlSender {
                         pending.remove(&evicted);
                     }
                     pending.insert(participant, orientation);
+                    self.participant_orientations
+                        .len
+                        .store(pending.len(), Ordering::Relaxed);
                     !self
                         .participant_orientations
                         .marker_queued
@@ -246,11 +256,15 @@ impl VideoControlSender {
                 {
                     true
                 } else {
-                    self.participant_orientations
+                    let mut pending = self
+                        .participant_orientations
                         .values
                         .lock()
-                        .expect("participant orientation lock poisoned")
-                        .clear();
+                        .expect("participant orientation lock poisoned");
+                    pending.clear();
+                    self.participant_orientations
+                        .len
+                        .store(0, Ordering::Relaxed);
                     self.participant_orientations
                         .marker_queued
                         .store(false, Ordering::Relaxed);
@@ -308,6 +322,18 @@ impl VideoControlReceiver {
     }
 
     fn take_participant_orientation(&self) -> Option<VideoControl> {
+        // Both queues empty is the steady state (always, for a call with no routed group video), and
+        // this runs on every drive-loop iteration. A stale zero cannot swallow an orientation: the
+        // sender fills the map before publishing its marker, so the marker message wakes the loop
+        // again and the counter is visible by then.
+        if self
+            .ready_participant_orientations_len
+            .load(Ordering::Relaxed)
+            == 0
+            && self.participant_orientations.len.load(Ordering::Relaxed) == 0
+        {
+            return None;
+        }
         let mut ready = self
             .ready_participant_orientations
             .lock()
@@ -320,15 +346,21 @@ impl VideoControlReceiver {
                 .expect("participant orientation lock poisoned");
             ready.extend(pending.drain());
             self.participant_orientations
+                .len
+                .store(0, Ordering::Relaxed);
+            self.participant_orientations
                 .marker_queued
                 .store(false, Ordering::Relaxed);
         }
-        ready.pop_front().map(|(participant, orientation)| {
-            VideoControl::SetParticipantOrientation {
+        let taken = ready.pop_front();
+        self.ready_participant_orientations_len
+            .store(ready.len(), Ordering::Relaxed);
+        taken.map(
+            |(participant, orientation)| VideoControl::SetParticipantOrientation {
                 participant,
                 orientation,
-            }
-        })
+            },
+        )
     }
 
     /// Receive a ready state first, otherwise the latest orientation.
@@ -496,6 +528,10 @@ struct DroppedMedia {
 }
 
 type RelaySendFuture = Fuse<BoxFuture<'static, anyhow::Result<()>>>;
+
+/// The drive loop's engine-deadline timer. `Runtime::sleep` hands back an owned `'static` future, so
+/// the armed sleep outlives the iteration that armed it.
+type DeadlineTimer = Fuse<BoxFuture<'static, ()>>;
 
 struct InFlightSend {
     future: RelaySendFuture,
@@ -921,6 +957,9 @@ async fn run_call_with_clock_and_wallclock(
     // `BoxFuture` is `Send` natively but `?Send` on wasm (the transport is single-threaded there).
     let mut sending = InFlightSend::default();
 
+    let mut timer: DeadlineTimer = Fuse::terminated();
+    let mut armed_deadline: Option<engine::Millis> = None;
+
     'drive: loop {
         // Drain every intent the last mutation produced; stop at the terminal Timeout.
         let mut pending_video = Vec::new();
@@ -1012,6 +1051,10 @@ async fn run_call_with_clock_and_wallclock(
             relay_events = replacement_events;
             disconnect_relay_bounded(&*rt, &*retired).await;
             eng.relay_reconnected(now_ms());
+            // The reconnect restarts every deadline from `now`, so an armed sleep still points at the
+            // retired relay's schedule. Drop it and let the arming step below build the new one.
+            timer = Fuse::terminated();
+            armed_deadline = None;
         }
 
         // Start the next queued send when none is in flight. The future owns an Arc clone, so it is
@@ -1026,20 +1069,21 @@ async fn run_call_with_clock_and_wallclock(
             sending.kind = Some(kind);
         }
 
-        // Arm the timer for the engine's next deadline (or never, if it has none).
-        let deadline = eng.poll_timeout();
-        let now = now_ms();
-        let timer = async {
-            match deadline {
-                Some(at) if at != engine::NEVER => {
-                    rt.sleep(Duration::from_millis(at.saturating_sub(now)))
-                        .await;
-                }
-                _ => futures::future::pending::<()>().await,
-            }
+        // Deadlines are absolute, so a sleep already armed for this one still expires at the right
+        // instant and is reused rather than rebuilt (a rebuild is a boxed future plus a
+        // register/deregister in the runtime's timer wheel). Rearm when the engine moved the deadline,
+        // and after a fire: a spent `Fuse` never resolves again, which would leave the call with no
+        // keepalive and no playout.
+        let deadline = eng.poll_timeout().filter(|at| *at != engine::NEVER);
+        if deadline != armed_deadline || (deadline.is_some() && timer.is_terminated()) {
+            timer = match deadline {
+                Some(at) => rt
+                    .sleep(Duration::from_millis(at.saturating_sub(now_ms())))
+                    .fuse(),
+                None => Fuse::terminated(),
+            };
+            armed_deadline = deadline;
         }
-        .fuse();
-        futures::pin_mut!(timer);
 
         // Poll the mic only while its channel is open. A closed mic must NOT end the call: OS mute can
         // make the mic source (e.g. `pw-record`) EOF, closing this channel, and the keepalive + playout
@@ -1356,7 +1400,7 @@ async fn run_call_with_clock_and_wallclock(
                 // the call alive, exactly like the mic.
                 Err(_) => video_in_open = false,
             },
-            _ = timer => eng.handle_input(now_ms(), Input::Timeout),
+            _ = &mut timer => eng.handle_input(now_ms(), Input::Timeout),
         }
 
         // Post-select: the arm futures (which borrow the channels) have been dropped, so it is now
@@ -2178,10 +2222,12 @@ mod tests {
         );
     }
 
-    /// Runtime with an instant `sleep` that closes `relay_tx` once it has been armed `close_after`
-    /// times, so a driver loop that survives a closed mic still terminates deterministically -- via the
-    /// relay path, never the mic. `sleeps` counts the arms so a test can assert the loop kept arming
-    /// the keepalive/playout timer after the mic went away.
+    /// Runtime with an instant `sleep` that closes `relay_tx` once the `close_after`-th sleep has
+    /// *elapsed*, so a driver loop that survives a closed mic still terminates deterministically -- via
+    /// the relay path, never the mic. `sleeps` counts the arms so a test can assert the loop kept
+    /// arming the keepalive/playout timer after the mic went away. The close is deferred to the
+    /// returned future rather than done in `sleep()` itself: a real runtime's `sleep` has no
+    /// construction-time effect, and the driver arms its timer before it parks on the select.
     struct CloseRelayOnSleepRuntime {
         sleeps: Arc<AtomicUsize>,
         relay_tx: async_channel::Sender<RelayTransportEvent>,
@@ -2193,10 +2239,13 @@ mod tests {
             AbortHandle::noop()
         }
         fn sleep(&self, _d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-            if self.sleeps.fetch_add(1, Ordering::Relaxed) + 1 >= self.close_after {
-                self.relay_tx.close();
-            }
-            Box::pin(async {})
+            let close = self.sleeps.fetch_add(1, Ordering::Relaxed) + 1 >= self.close_after;
+            let relay_tx = self.relay_tx.clone();
+            Box::pin(async move {
+                if close {
+                    relay_tx.close();
+                }
+            })
         }
         fn spawn_blocking(
             &self,
@@ -3064,5 +3113,530 @@ mod tests {
         assert_eq!(dropped.video_access_units, 10);
         assert!(queued.front().is_some_and(|batch| batch.video_keyframe));
         assert!(!awaiting_keyframe, "a queued IDR is a valid recovery point");
+    }
+
+    /// Virtual-time runtime for the deadline-timer tests. `sleep` only records the arm; the clock
+    /// advances when the returned future is awaited, exactly like a real runtime, so an armed timer
+    /// that never fires cannot move time on its own. Once a sleep elapses at or past `horizon_ms` it
+    /// closes the relay, ending the drive loop deterministically.
+    struct ScheduleRuntime {
+        clock: Arc<AtomicU64>,
+        arms: Arc<Mutex<Vec<(u64, u64)>>>,
+        relay_tx: async_channel::Sender<RelayTransportEvent>,
+        horizon_ms: u64,
+    }
+
+    #[async_trait]
+    impl Runtime for ScheduleRuntime {
+        fn spawn(&self, _f: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            AbortHandle::noop()
+        }
+        fn sleep(&self, d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let duration = d.as_millis() as u64;
+            let armed_at = self.clock.load(Ordering::Relaxed);
+            self.arms.lock().unwrap().push((armed_at, duration));
+            let clock = self.clock.clone();
+            let relay_tx = self.relay_tx.clone();
+            let horizon_ms = self.horizon_ms;
+            Box::pin(async move {
+                let fired_at = armed_at.saturating_add(duration);
+                clock.fetch_max(fired_at, Ordering::Relaxed);
+                if fired_at >= horizon_ms {
+                    relay_tx.close();
+                }
+            })
+        }
+        fn spawn_blocking(
+            &self,
+            _f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    /// The distinct deadlines the loop armed for, in order. Rearming for the deadline already armed is
+    /// the work this suite's subject removes, so the schedule has to be compared with those collapsed.
+    fn armed_deadlines(arms: &[(u64, u64)]) -> Vec<u64> {
+        let mut deadlines: Vec<u64> = Vec::new();
+        for (armed_at, duration) in arms {
+            let deadline = armed_at.saturating_add(*duration);
+            if deadlines.last() != Some(&deadline) {
+                deadlines.push(deadline);
+            }
+        }
+        deadlines
+    }
+
+    /// Relay that timestamps every transmission against the virtual clock and behaves like the real
+    /// one: it accepts the first allocate (bringing the media plane and RTCP up) and then probes us
+    /// once for consent freshness, which the loop must answer with a Binding Success.
+    struct ScheduleRelay {
+        clock: Arc<AtomicU64>,
+        events: async_channel::Sender<RelayTransportEvent>,
+        sent: Mutex<Vec<(u64, Bytes)>>,
+        allocates: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RelayTransport for ScheduleRelay {
+        async fn send(&self, data: Bytes) -> anyhow::Result<()> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((self.clock.load(Ordering::Relaxed), data.clone()));
+            if stun::stun_message_type(&data) != Some(stun::MSG_ALLOCATE_REQUEST)
+                || self.allocates.fetch_add(1, Ordering::Relaxed) != 0
+            {
+                return Ok(());
+            }
+            let transaction_id: [u8; 12] = stun::stun_transaction_id(&data)
+                .expect("allocate transaction id")
+                .try_into()
+                .expect("STUN transaction IDs are 12 bytes");
+            let ok = stun::encode_stun_request(
+                stun::MSG_ALLOCATE_SUCCESS,
+                &transaction_id,
+                &[],
+                None,
+                false,
+            );
+            let _ = self
+                .events
+                .try_send(RelayTransportEvent::PacketReceived(Bytes::from(ok)));
+            let probe =
+                stun::encode_stun_request(stun::MSG_BINDING_REQUEST, &[7u8; 12], &[], None, false);
+            let _ = self
+                .events
+                .try_send(RelayTransportEvent::PacketReceived(Bytes::from(probe)));
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+    }
+
+    fn packet_kind(packet: &Bytes) -> &'static str {
+        match classify_relay_packet(packet) {
+            RelayPacketKind::Rtcp => "rtcp",
+            RelayPacketKind::Rtp => "rtp",
+            _ => match stun::stun_message_type(packet) {
+                Some(stun::MSG_ALLOCATE_REQUEST) => "allocate",
+                Some(stun::MSG_BINDING_SUCCESS) => "binding-success",
+                _ => "keepalive-ping",
+            },
+        }
+    }
+
+    /// Run a drive loop off the test thread and fail instead of hanging when it never ends: a timer
+    /// that stops rearming parks the loop on inputs that never arrive, and a hung test reports
+    /// nothing. The timeout is a watchdog, not a pacing device -- the loop runs on virtual time and
+    /// finishes in microseconds.
+    fn drive_bounded(drive: impl FnOnce() + Send + 'static) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drive();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the drive loop never ended: its deadline timer stopped rearming");
+    }
+
+    struct ScheduleHarness {
+        clock: Arc<AtomicU64>,
+        arms: Arc<Mutex<Vec<(u64, u64)>>>,
+        relay: Arc<ScheduleRelay>,
+        speaker: async_channel::Receiver<Vec<i16>>,
+        video_out: async_channel::Receiver<VideoFrame>,
+    }
+
+    /// Drive one audio-only call over virtual time until `horizon_ms`, with the video plane wired but
+    /// never enabled.
+    fn drive_schedule(horizon_ms: u64) -> ScheduleHarness {
+        let clock = Arc::new(AtomicU64::new(0));
+        let arms = Arc::new(Mutex::new(Vec::new()));
+        let (relay_tx, relay_rx) = async_channel::unbounded();
+        let rt: Arc<dyn Runtime> = Arc::new(ScheduleRuntime {
+            clock: clock.clone(),
+            arms: arms.clone(),
+            relay_tx: relay_tx.clone(),
+            horizon_ms,
+        });
+        let relay = Arc::new(ScheduleRelay {
+            clock: clock.clone(),
+            events: relay_tx,
+            sent: Mutex::new(Vec::new()),
+            allocates: AtomicUsize::new(0),
+        });
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, spk_rx) = async_channel::unbounded();
+        let (ev_tx, _ev_rx) = async_channel::unbounded();
+        let (vout_tx, vout_rx) = async_channel::unbounded::<VideoFrame>();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.video_out = vout_tx;
+
+        let eng = CallEngine::new(config(), Box::new(SequentialTxIds::new())).unwrap();
+        let drive_relay = relay.clone();
+        let drive_clock = clock.clone();
+        drive_bounded(move || {
+            futures::executor::block_on(run_call_with_clock(
+                rt,
+                drive_relay as Arc<dyn RelayTransport>,
+                relay_rx,
+                channels,
+                eng,
+                move || drive_clock.load(Ordering::Relaxed),
+            ));
+        });
+
+        ScheduleHarness {
+            clock,
+            arms,
+            relay,
+            speaker: spk_rx,
+            video_out: vout_rx,
+        }
+    }
+
+    // The happy path for the hoisted deadline timer: an armed sleep that survives across iterations
+    // must not shift a single tick. Both sequences below are invariant to how often the loop rearms --
+    // the deadlines it arms for and the stanzas the peer sees at each instant -- so they pin the
+    // schedule (playout every 20ms, keepalive every 1s, RTCP every 1.5s, consent answered inline)
+    // rather than the arming policy.
+    #[test]
+    fn hoisted_timer_keeps_the_call_schedule() {
+        const HORIZON_MS: u64 = 2_600;
+        let harness = drive_schedule(HORIZON_MS);
+
+        let deadlines = armed_deadlines(&harness.arms.lock().unwrap());
+        let playout_ticks: Vec<u64> = (1..=HORIZON_MS / engine::PLAYOUT_MS)
+            .map(|n| n * engine::PLAYOUT_MS)
+            .collect();
+        assert!(
+            deadlines.starts_with(&playout_ticks),
+            "every 20ms playout tick must be armed for, once, in order; got {deadlines:?}"
+        );
+        // Teardown may add one arm past the horizon: the fire that closed the relay rearms before the
+        // next select observes the closed channel.
+        assert!(deadlines.len() <= playout_ticks.len() + 1);
+
+        let stanzas: Vec<(u64, &'static str)> = harness
+            .relay
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(at, packet)| (*at, packet_kind(packet)))
+            .collect();
+        assert_eq!(
+            stanzas,
+            [
+                (0, "allocate"),
+                (0, "rtcp"),
+                (0, "binding-success"),
+                (1000, "allocate"),
+                (1000, "keepalive-ping"),
+                (1500, "rtcp"),
+                (2000, "allocate"),
+                (2000, "keepalive-ping"),
+            ],
+            "the peer-visible schedule must not move"
+        );
+
+        assert_eq!(
+            std::iter::from_fn(|| harness.speaker.try_recv().ok()).count() as u64,
+            HORIZON_MS / engine::PLAYOUT_MS,
+            "one playout frame per 20ms tick"
+        );
+        assert_eq!(harness.clock.load(Ordering::Relaxed), HORIZON_MS);
+    }
+
+    // A call with no video must stay entirely on the audio plane: nothing reaches the video sink and
+    // no H.264 packet is transmitted, while the audio schedule keeps running. The video-control fast
+    // path runs on every iteration of this call, so this is also its empty-queue case.
+    #[test]
+    fn audio_only_call_never_touches_the_video_plane() {
+        let harness = drive_schedule(1_200);
+
+        assert!(
+            harness.video_out.try_recv().is_err(),
+            "an audio-only call must not produce video frames"
+        );
+        let sent = harness.relay.sent.lock().unwrap();
+        assert!(
+            !sent.iter().any(|(_, packet)| parse_rtp_header(packet)
+                .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)),
+            "an audio-only call must not transmit H.264"
+        );
+        assert!(
+            sent.iter()
+                .filter(|(_, packet)| stun::stun_message_type(packet)
+                    == Some(stun::MSG_ALLOCATE_REQUEST))
+                .count()
+                >= 2,
+            "the keepalive must keep running on an audio-only call"
+        );
+    }
+
+    // Regression: the timer has to rearm after it fires. A `Fuse` that completed never resolves again,
+    // so a loop that reuses the armed sleep without rearming goes silent -- no playout, no keepalive,
+    // no consent -- and the relay drops the call. Two consecutive keepalive deadlines a second apart
+    // prove the rearm; with the bug the drive never reaches the second one at all.
+    #[test]
+    fn timer_rearms_after_every_fire() {
+        let harness = drive_schedule(2_200);
+
+        let deadlines = armed_deadlines(&harness.arms.lock().unwrap());
+        let keepalives: Vec<u64> = deadlines
+            .iter()
+            .copied()
+            .filter(|deadline| deadline % 1_000 == 0)
+            .collect();
+        assert_eq!(
+            keepalives,
+            [1_000, 2_000],
+            "the timer must rearm past its first deadline and keep the keepalive cadence"
+        );
+        assert_eq!(
+            harness
+                .relay
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, packet)| stun::stun_message_type(packet)
+                    == Some(stun::MSG_ALLOCATE_REQUEST))
+                .map(|(at, _)| *at)
+                .collect::<Vec<_>>(),
+            [0, 1_000, 2_000],
+            "each keepalive deadline must put its allocate on the wire"
+        );
+    }
+
+    /// Relay whose reconnect hands back a replacement that immediately reports Disconnected. It
+    /// records the virtual instant of the migration and how many timers had been armed by then, so
+    /// the test can look only at what the loop armed *after* it.
+    struct ClockedReconnectTransport {
+        clock: Arc<AtomicU64>,
+        arms: Arc<Mutex<Vec<(u64, u64)>>>,
+        migration: Mutex<Option<(u64, usize)>>,
+        replacement: Mutex<Option<ReplacementRelay>>,
+    }
+
+    #[async_trait]
+    impl RelayTransport for ClockedReconnectTransport {
+        async fn send(&self, _data: Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+        async fn reconnect(
+            &self,
+            _endpoint: std::net::SocketAddr,
+        ) -> anyhow::Result<ReplacementRelay> {
+            *self.migration.lock().unwrap() = Some((
+                self.clock.load(Ordering::Relaxed),
+                self.arms.lock().unwrap().len(),
+            ));
+            self.replacement
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("one reconnect only"))
+        }
+    }
+
+    /// Runtime for the migration test: virtual time as above, plus it hands the driver its relay
+    /// migration once the clock has passed `migrate_at_ms`, so the reconnect lands mid-call with a
+    /// timer already armed for the old schedule.
+    struct MigrationRuntime {
+        clock: Arc<AtomicU64>,
+        arms: Arc<Mutex<Vec<(u64, u64)>>>,
+        group_tx: async_channel::Sender<GroupControl>,
+        migrate_at_ms: u64,
+        migrated: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Runtime for MigrationRuntime {
+        fn spawn(&self, _f: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            AbortHandle::noop()
+        }
+        fn sleep(&self, d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let duration = d.as_millis() as u64;
+            let armed_at = self.clock.load(Ordering::Relaxed);
+            self.arms.lock().unwrap().push((armed_at, duration));
+            let clock = self.clock.clone();
+            let group_tx = self.group_tx.clone();
+            let migrate_at_ms = self.migrate_at_ms;
+            let migrated = self.migrated.clone();
+            Box::pin(async move {
+                let fired_at = armed_at.saturating_add(duration);
+                clock.fetch_max(fired_at, Ordering::Relaxed);
+                if fired_at >= migrate_at_ms && !migrated.swap(true, Ordering::Relaxed) {
+                    let _ = group_tx.try_send(GroupControl::Update(Box::new(group_update(
+                        8,
+                        "203.0.113.8",
+                        3481,
+                    ))));
+                }
+            })
+        }
+        fn spawn_blocking(
+            &self,
+            _f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    // Regression: a mid-call relay migration restarts every deadline from the reconnect instant, so an
+    // armed sleep still pointing at the retired relay's schedule has to go. If the loop kept it, the
+    // next fire would land on a deadline the engine no longer holds and the fresh keepalive/playout
+    // cadence would be off by however long the old timer had left.
+    #[test]
+    fn relay_reconnect_rearms_the_timer_from_the_new_schedule() {
+        const MIGRATE_AT_MS: u64 = 500;
+        let clock = Arc::new(AtomicU64::new(0));
+        let arms = Arc::new(Mutex::new(Vec::new()));
+        let (group_tx, group_rx) = async_channel::bounded(1);
+        let rt: Arc<dyn Runtime> = Arc::new(MigrationRuntime {
+            clock: clock.clone(),
+            arms: arms.clone(),
+            group_tx,
+            migrate_at_ms: MIGRATE_AT_MS,
+            migrated: Arc::new(AtomicBool::new(false)),
+        });
+
+        let replacement = Arc::new(RecordingTransport::default());
+        let (replacement_tx, replacement_rx) = async_channel::unbounded();
+        replacement_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        let transport = Arc::new(ClockedReconnectTransport {
+            clock: clock.clone(),
+            arms: arms.clone(),
+            migration: Mutex::new(None),
+            replacement: Mutex::new(Some((
+                replacement as Arc<dyn RelayTransport>,
+                replacement_rx,
+            ))),
+        });
+
+        let (_relay_tx, relay_rx) = async_channel::unbounded();
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded();
+        let (ev_tx, _ev_rx) = async_channel::unbounded();
+        let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
+        channels.group_ctl = Some(group_rx);
+
+        let drive_transport = transport.clone();
+        let drive_clock = clock.clone();
+        drive_bounded(move || {
+            futures::executor::block_on(run_call_with_clock(
+                rt,
+                drive_transport as Arc<dyn RelayTransport>,
+                relay_rx,
+                channels,
+                group_engine(),
+                move || drive_clock.load(Ordering::Relaxed),
+            ));
+        });
+
+        let (reconnect_at, arms_before) = transport
+            .migration
+            .lock()
+            .unwrap()
+            .expect("the group update must migrate the relay");
+        assert_eq!(reconnect_at, MIGRATE_AT_MS);
+        let after_migration = arms
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(arms_before)
+            .copied()
+            // The migration also arms its own bounded reconnect/disconnect timeouts; they are not the
+            // engine's deadline timer.
+            .find(|(_, duration)| *duration != RELAY_RECONNECT_TIMEOUT.as_millis() as u64)
+            .expect("the loop must arm the deadline timer again after the migration");
+        assert_eq!(
+            after_migration,
+            (reconnect_at, engine::PLAYOUT_MS),
+            "the first timer after a migration must be a full interval measured from the reconnect"
+        );
+    }
+
+    // Item 2's failure case: the lock-free empty check must never swallow an orientation that is
+    // actually queued, including one enqueued concurrently with the `try_recv` sitting in that check.
+    // The sender fills the map before publishing its wake marker, so the reader either sees the
+    // counter or is woken by the marker; a reader that trusted a stale zero forever would drop the
+    // participant's rotation for the rest of the call.
+    #[test]
+    fn queued_participant_orientation_survives_the_lock_free_empty_check() {
+        const ROUNDS: u8 = 64;
+        let participants: Vec<Jid> = (0..4)
+            .map(|n| Jid::new(format!("20000{n}"), Server::Lid).with_device(3))
+            .collect();
+
+        let (tx, rx) = video_control_channel();
+        let sender_participants = participants.clone();
+        let sender = std::thread::spawn(move || {
+            for round in 0..ROUNDS {
+                for participant in &sender_participants {
+                    assert!(tx.send(VideoControl::SetParticipantOrientation {
+                        participant: participant.clone(),
+                        orientation: round % 4,
+                    }));
+                }
+            }
+        });
+
+        // Race the sender: most of these calls land in the empty fast path, which is the point.
+        let mut observed: HashMap<Jid, u8> = HashMap::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match rx.try_recv() {
+                Ok(VideoControl::SetParticipantOrientation {
+                    participant,
+                    orientation,
+                }) => {
+                    observed.insert(participant, orientation);
+                }
+                Ok(other) => panic!("unexpected control {other:?}"),
+                Err(_) => {
+                    if sender.is_finished() && observed.len() == participants.len() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "an orientation was swallowed by the empty fast path: saw {observed:?}"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
+        sender.join().expect("sender thread");
+
+        // Drain whatever the last round left behind, then every participant must carry its last value.
+        while let Ok(VideoControl::SetParticipantOrientation {
+            participant,
+            orientation,
+        }) = rx.try_recv()
+        {
+            observed.insert(participant, orientation);
+        }
+        let last = (ROUNDS - 1) % 4;
+        for participant in &participants {
+            assert_eq!(
+                observed.get(participant),
+                Some(&last),
+                "the final orientation for {participant} must reach the drive loop"
+            );
+        }
     }
 }

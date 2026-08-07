@@ -78,6 +78,72 @@ fn high_watermark(max_entries: usize) -> usize {
     max_entries.saturating_add((max_entries / EVICTION_SLACK_DIVISOR).max(EVICTION_SLACK_FLOOR))
 }
 
+/// The set of addresses whose durability lease has not reached the backend,
+/// paired with a lock-free view of "is it non-empty?" so the pre-wire query can
+/// answer without taking the mutex that owns the set.
+///
+/// The two error directions are not symmetric. A flag reading `true` over an
+/// empty set costs one redundant flush and is always correct. A flag reading
+/// `false` over a non-empty set publishes ciphertext whose lease is only in
+/// memory, which is counter reuse after a restart. So the set is private and
+/// every mutator recomputes the flag from the set it just changed, under the
+/// lock that owns it: lowering the flag is only reachable from an observed
+/// empty set.
+struct PendingWireGate {
+    addresses: HashSet<Arc<str>>,
+    non_empty: Arc<AtomicBool>,
+}
+
+impl PendingWireGate {
+    fn new() -> Self {
+        Self {
+            addresses: HashSet::new(),
+            non_empty: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Handle for reading the gate without the owning lock.
+    fn flag(&self) -> Arc<AtomicBool> {
+        self.non_empty.clone()
+    }
+
+    fn insert(&mut self, address: Arc<str>) {
+        self.addresses.insert(address);
+        self.publish();
+    }
+
+    fn remove(&mut self, address: &str) {
+        self.addresses.remove(address);
+        self.publish();
+    }
+
+    fn clear(&mut self) {
+        self.addresses.clear();
+        self.publish();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.addresses.is_empty()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, address: &str) -> bool {
+        self.addresses.contains(address)
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.addresses.iter()
+    }
+
+    /// `Release` so a reader whose `Acquire` load sees the lowered flag also
+    /// sees the removals that emptied the set.
+    fn publish(&self) {
+        self.non_empty
+            .store(!self.addresses.is_empty(), Ordering::Release);
+    }
+}
+
 fn protocol_address_matches_user(address: &str, user: &str) -> bool {
     address
         .strip_prefix(user)
@@ -91,11 +157,16 @@ fn protocol_address_matches_user(address: &str, user: &str) -> bool {
 /// back to `max_entries` (amortized O(1) thanks to the slack early-out).
 pub struct SignalStoreCache {
     sessions: Mutex<SessionStoreState>,
+    /// The gates' own flags (see `PendingWireGate`), so a send answers
+    /// `needs_pre_wire_flush` without queueing behind a flush that holds either
+    /// store lock across its backend I/O.
+    session_wire_gate: Arc<AtomicBool>,
     session_recovery_generation: AtomicU64,
     has_pending_session_restores: AtomicBool,
     pending_session_restores: SyncMutex<Vec<PendingSessionRestore>>,
     identities: Mutex<ByteStoreState>,
     sender_keys: Mutex<SenderKeyStoreState>,
+    sender_key_wire_gate: Arc<AtomicBool>,
     /// Fast-path guard for the normally-empty pending distribution map. Warm
     /// group encrypts avoid a second sender-key mutex acquisition.
     has_pending_sender_key_distributions: AtomicBool,
@@ -159,7 +230,7 @@ struct SessionStoreState {
     /// before the wire. Entries leave only when a flush actually persists
     /// them or their tombstone. Always a subset of `dirty` + `deleted`, so
     /// eviction can never drop a pending entry.
-    reservation_pending: HashSet<Arc<str>>,
+    reservation_pending: PendingWireGate,
 }
 
 impl SessionStoreState {
@@ -171,7 +242,7 @@ impl SessionStoreState {
             cache: HashMap::new(),
             dirty: HashSet::new(),
             deleted: HashSet::new(),
-            reservation_pending: HashSet::new(),
+            reservation_pending: PendingWireGate::new(),
         }
     }
 
@@ -311,7 +382,7 @@ struct SenderKeyStoreState {
     /// Decrypt-side dirtiness deliberately does NOT enter this set (it
     /// re-derives forward),
     /// so unrelated group receives never force a sync flush onto a DM send.
-    wire_gate_pending: HashSet<Arc<str>>,
+    wire_gate_pending: PendingWireGate,
     /// Distributions created for a new outbound chain but not yet returned by
     /// a successful encryption call. A failed durability gate leaves the
     /// distribution here so a retry cannot emit ciphertext for an
@@ -325,7 +396,7 @@ impl SenderKeyStoreState {
             incarnation,
             cache: HashMap::new(),
             dirty: HashSet::new(),
-            wire_gate_pending: HashSet::new(),
+            wire_gate_pending: PendingWireGate::new(),
             pending_distributions: HashMap::new(),
         }
     }
@@ -457,13 +528,17 @@ impl SignalStoreCache {
     }
 
     fn with_max_entries_and_incarnation(max_entries: usize, incarnation: StoreIncarnation) -> Self {
+        let sessions = SessionStoreState::new(incarnation);
+        let sender_keys = SenderKeyStoreState::new(incarnation);
         Self {
-            sessions: Mutex::new(SessionStoreState::new(incarnation)),
+            session_wire_gate: sessions.reservation_pending.flag(),
+            sender_key_wire_gate: sender_keys.wire_gate_pending.flag(),
+            sessions: Mutex::new(sessions),
             session_recovery_generation: AtomicU64::new(0),
             has_pending_session_restores: AtomicBool::new(false),
             pending_session_restores: SyncMutex::new(Vec::new()),
             identities: Mutex::new(ByteStoreState::new()),
-            sender_keys: Mutex::new(SenderKeyStoreState::new(incarnation)),
+            sender_keys: Mutex::new(sender_keys),
             has_pending_sender_key_distributions: AtomicBool::new(false),
             removed_prekeys: Mutex::new(HashMap::new()),
             sender_key_locks: Mutex::new(HashMap::new()),
@@ -1389,11 +1464,31 @@ impl SignalStoreCache {
     /// synchronously only while this holds;
     /// everything else (decrypt advances, identities) safely rides the
     /// coalesced write-behind.
+    ///
+    /// Answered from the gates' flags so the common (open) case does not take
+    /// either store lock, which a flush holds across its backend I/O.
     pub async fn needs_pre_wire_flush(&self) -> bool {
-        if !self.lock_sessions().await.reservation_pending.is_empty() {
+        if self.wire_gates_raised() {
             return true;
         }
-        !self.sender_keys.lock().await.wire_gate_pending.is_empty()
+        // A restore that could not take the sessions lock is still holding its
+        // record, and with it any lease that record raised. Only the drain in
+        // `lock_sessions` moves it into the gate, so a queued restore is the
+        // one state the flags cannot describe.
+        if self.has_pending_session_restores.load(Ordering::Acquire) {
+            drop(self.lock_sessions().await);
+            return self.wire_gates_raised();
+        }
+        false
+    }
+
+    /// `Acquire` pairs with the gates' `Release` publish: observing a lowered
+    /// flag also observes the set mutation that lowered it. A `Relaxed` load
+    /// would let a send read "no lease pending" against a set another task has
+    /// not finished emptying, which is the unsafe direction.
+    fn wire_gates_raised(&self) -> bool {
+        self.session_wire_gate.load(Ordering::Acquire)
+            || self.sender_key_wire_gate.load(Ordering::Acquire)
     }
 
     /// Entry counts and estimated retained bytes for each store
@@ -3489,6 +3584,34 @@ mod pre_wire_gate_tests {
         record
     }
 
+    fn gated_sender_key() -> SenderKeyRecord {
+        let mut record = SenderKeyRecord::new_empty();
+        record.mark_wire_gated();
+        record
+    }
+
+    /// The lock-free flags only exist to answer `needs_pre_wire_flush`, so
+    /// every mutation of either pending set has to leave them agreeing with it.
+    async fn assert_gate_agrees(cache: &SignalStoreCache, after: &str) {
+        let session_set = !cache.lock_sessions().await.reservation_pending.is_empty();
+        let sender_set = !cache.sender_keys.lock().await.wire_gate_pending.is_empty();
+        assert_eq!(
+            cache.session_wire_gate.load(Ordering::Acquire),
+            session_set,
+            "session flag disagrees with its set after {after}"
+        );
+        assert_eq!(
+            cache.sender_key_wire_gate.load(Ordering::Acquire),
+            sender_set,
+            "sender-key flag disagrees with its set after {after}"
+        );
+        assert_eq!(
+            cache.needs_pre_wire_flush().await,
+            session_set || sender_set,
+            "wire-gate query disagrees with cache state after {after}"
+        );
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum DeleteTarget {
         Session,
@@ -4000,6 +4123,211 @@ mod pre_wire_gate_tests {
 
         cache.clear().await;
         assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    /// One case per mutation site of either pending set. A site that changes a
+    /// set without republishing its flag lets a send publish ciphertext whose
+    /// lease is only in memory, so the agreement is checked after each.
+    #[tokio::test]
+    async fn every_pending_set_mutation_keeps_its_flag_in_agreement() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let a = addr("15550000010");
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        // SessionStoreState::put_with_key
+        cache.put_session(&a, leased_record()).await;
+        assert!(cache.needs_pre_wire_flush().await);
+        assert_gate_agrees(&cache, "a session lease insert").await;
+
+        // flush: the written batch leaves the set
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert_gate_agrees(&cache, "a session flush").await;
+
+        // flush: a persisted tombstone leaves the set
+        cache.put_session(&a, leased_record()).await;
+        cache.delete_session(&a).await;
+        assert!(cache.needs_pre_wire_flush().await);
+        assert_gate_agrees(&cache, "a session tombstone").await;
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert_gate_agrees(&cache, "a session tombstone flush").await;
+
+        // SessionStoreState::clear
+        cache.put_session(&a, leased_record()).await;
+        cache.clear().await;
+        assert_gate_agrees(&cache, "a session clear").await;
+
+        // SenderKeyStoreState::put
+        cache.put_sender_key(&name, gated_sender_key()).await;
+        assert!(cache.needs_pre_wire_flush().await);
+        assert_gate_agrees(&cache, "a sender-key lease insert").await;
+
+        // flush: the written batch leaves the set
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert_gate_agrees(&cache, "a sender-key flush").await;
+
+        // flush: a persisted sender-key tombstone leaves the set
+        cache.put_sender_key(&name, gated_sender_key()).await;
+        cache.delete_sender_key(name.cache_key()).await;
+        assert!(cache.needs_pre_wire_flush().await);
+        assert_gate_agrees(&cache, "a sender-key tombstone").await;
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert_gate_agrees(&cache, "a sender-key tombstone flush").await;
+
+        // delete_sender_key_durable
+        cache.put_sender_key(&name, gated_sender_key()).await;
+        assert!(cache.needs_pre_wire_flush().await);
+        cache
+            .delete_sender_key_durable(&name, &backend)
+            .await
+            .unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert_gate_agrees(&cache, "a durable sender-key delete").await;
+
+        // SenderKeyStoreState::clear
+        cache.put_sender_key(&name, gated_sender_key()).await;
+        cache.clear().await;
+        assert_gate_agrees(&cache, "a sender-key clear").await;
+    }
+
+    /// A durable delete whose backend call failed never persisted the
+    /// tombstone, so the gate it inherited must survive the failure.
+    #[tokio::test]
+    async fn a_failed_durable_delete_keeps_the_gate_closed() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(DeleteBarrierBackend::new(DeleteTarget::SenderKey));
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        cache.put_sender_key(&name, gated_sender_key()).await;
+        assert!(cache.needs_pre_wire_flush().await);
+
+        let deletion = tokio::spawn({
+            let cache = cache.clone();
+            let backend = backend.clone();
+            let name = name.clone();
+            async move {
+                cache
+                    .delete_sender_key_durable(&name, backend.as_ref())
+                    .await
+            }
+        });
+        backend.entered.wait().await;
+        backend.release.wait().await;
+        assert!(deletion.await.expect("delete task").is_err());
+
+        assert!(
+            cache.needs_pre_wire_flush().await,
+            "an unpersisted tombstone must keep gating the wire"
+        );
+        assert_gate_agrees(&cache, "a failed durable delete").await;
+    }
+
+    /// A failed flush must leave the flag raised, not just the set: the flag is
+    /// what the send path actually reads.
+    #[tokio::test]
+    async fn a_failed_flush_leaves_both_flags_raised() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let name = SenderKeyName::from_parts("g@g.us", "u@s.whatsapp.net:0");
+
+        cache
+            .put_session(&addr("15550000011"), leased_record())
+            .await;
+        cache.put_sender_key(&name, gated_sender_key()).await;
+
+        backend.set_fail_session_writes(true);
+        assert!(cache.flush(&backend).await.is_err());
+        assert!(cache.session_wire_gate.load(Ordering::Acquire));
+        assert_gate_agrees(&cache, "a failed session flush").await;
+
+        backend.set_fail_session_writes(false);
+        backend.set_fail_sender_key_writes(true);
+        assert!(cache.flush(&backend).await.is_err());
+        assert!(cache.sender_key_wire_gate.load(Ordering::Acquire));
+        assert_gate_agrees(&cache, "a failed sender-key flush").await;
+
+        backend.set_fail_sender_key_writes(false);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert_gate_agrees(&cache, "a successful flush").await;
+    }
+
+    /// A restore that lost the race for the sessions lock is still holding its
+    /// record, and with it any lease that record raised. No flag has seen it,
+    /// so the query has to fall back to the drain.
+    #[tokio::test]
+    async fn a_queued_restore_holding_a_lease_keeps_the_gate_closed() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let a = addr("15550000012");
+
+        let (record, checkout) = cache.checkout_session(&a, &backend).await.unwrap();
+        assert!(record.is_none(), "no session was stored for this address");
+
+        let guard = cache.sessions.lock().await;
+        let SessionCheckoutStoreResult::Pending(completion) =
+            cache.restore_session_from_checkout(&a, leased_record(), checkout, false)
+        else {
+            panic!("a contended sessions lock must queue the restore");
+        };
+        drop(guard);
+
+        assert!(
+            !cache.session_wire_gate.load(Ordering::Acquire),
+            "the queued lease has not reached the set yet"
+        );
+        assert!(
+            cache.needs_pre_wire_flush().await,
+            "a queued restore's lease must keep gating the wire"
+        );
+        assert!(
+            completion.load(Ordering::Acquire),
+            "the restore was applied"
+        );
+        assert_gate_agrees(&cache, "a drained restore").await;
+    }
+
+    /// A lease insert that has completed can never be missed by a later query.
+    /// The reverse skew is fine: an early `true` only costs a flush.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completed_lease_insert_is_never_missed_by_a_concurrent_query() {
+        const ROUNDS: usize = 64;
+
+        for round in 0..ROUNDS {
+            let cache = Arc::new(SignalStoreCache::new());
+            let raised = Arc::new(AtomicBool::new(false));
+            let writer = tokio::spawn({
+                let cache = cache.clone();
+                let raised = raised.clone();
+                async move {
+                    cache
+                        .put_session(&addr(&format!("1555001{round:04}")), leased_record())
+                        .await;
+                    raised.store(true, Ordering::Release);
+                }
+            });
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    // Load first: if this reads `true`, the insert is ordered
+                    // before the query below, which therefore may not miss it.
+                    let announced = raised.load(Ordering::Acquire);
+                    let gate = cache.needs_pre_wire_flush().await;
+                    if announced {
+                        assert!(gate, "a completed lease insert left the gate open");
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the writer must finish");
+            writer.await.expect("writer task");
+        }
     }
 }
 

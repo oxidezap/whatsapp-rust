@@ -14,7 +14,7 @@ use std::any::{Any, TypeId};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -380,21 +380,23 @@ struct ConnectionTaskRegistry {
     trackers: HashMap<u64, Arc<TaskTracker>>,
 }
 
-#[derive(Default)]
-struct TaskTrackerState {
-    active: usize,
-    closed: bool,
-}
+/// Bit 0 of [`TaskTracker::state`]: the tracker is closed to new leases.
+const TRACKER_CLOSED: usize = 1;
+/// One live [`TaskLease`]; the count occupies bits 1.. of the same word.
+/// Packing the flag next to the count makes "refuse if closed, otherwise
+/// increment" a single read-modify-write, which is what guarantees no lease is
+/// handed out after `close()` returns.
+const ONE_TASK: usize = 2;
 
 struct TaskTracker {
-    state: Mutex<TaskTrackerState>,
+    state: AtomicUsize,
     idle: ShutdownNotifier,
 }
 
 impl TaskTracker {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(TaskTrackerState::default()),
+            state: AtomicUsize::new(0),
             idle: ShutdownNotifier::new(),
         })
     }
@@ -406,32 +408,38 @@ impl TaskTracker {
     }
 
     fn register(self: &Arc<Self>) -> Result<TaskLease, PluginResourceError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.closed {
-            return Err(PluginResourceError::ShuttingDown);
-        }
-        state.active = state
-            .active
-            .checked_add(1)
-            .ok_or(PluginResourceError::TaskCapacityExceeded)?;
+        // Relaxed: no data crosses here, and the exclusion against `close`
+        // comes from both being read-modify-writes on one location, which the
+        // per-location modification order already totally orders.
+        self.state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                if state & TRACKER_CLOSED != 0 {
+                    return None;
+                }
+                state.checked_add(ONE_TASK)
+            })
+            .map_err(|state| {
+                if state & TRACKER_CLOSED != 0 {
+                    PluginResourceError::ShuttingDown
+                } else {
+                    PluginResourceError::TaskCapacityExceeded
+                }
+            })?;
         Ok(TaskLease {
             tracker: Arc::clone(self),
         })
     }
 
     fn close(&self) {
-        let idle = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.closed = true;
-            state.active == 0
-        };
-        if idle {
+        // Without the lock, a concurrent last `TaskLease::drop` can reach the
+        // same idle edge and both sides notify. That is sound because
+        // `ShutdownNotifier::notify` is sticky and wakes every listener, so the
+        // second call changes nothing an observer can see.
+        //
+        // Acquire: whoever declares idle must have observed the work of every
+        // lease that finished before it, which is the happens-before the lock
+        // used to provide to the waiter it wakes.
+        if self.state.fetch_or(TRACKER_CLOSED, Ordering::Acquire) >> 1 == 0 {
             self.idle.notify();
         }
     }
@@ -441,10 +449,7 @@ impl TaskTracker {
     }
 
     fn active(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .active
+        self.state.load(Ordering::Acquire) >> 1
     }
 }
 
@@ -454,16 +459,11 @@ struct TaskLease {
 
 impl Drop for TaskLease {
     fn drop(&mut self) {
-        let idle = {
-            let mut state = self
-                .tracker
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.active = state.active.saturating_sub(1);
-            state.closed && state.active == 0
-        };
-        if idle {
+        // AcqRel: release publishes this task's work, acquire makes the thread
+        // that sees the idle edge observe every other lease's work too.
+        let previous = self.tracker.state.fetch_sub(ONE_TASK, Ordering::AcqRel);
+        debug_assert!(previous >> 1 > 0, "TaskLease outlived its registration");
+        if previous >> 1 == 1 && previous & TRACKER_CLOSED != 0 {
             self.tracker.idle.notify();
         }
     }
@@ -4527,6 +4527,174 @@ mod tests {
         assert_eq!(stats.plugins[0].task_drain_timeouts, 1);
         assert_eq!(stats.plugins[0].health, PluginHealth::Degraded);
         assert_eq!(stats.plugins[0].state, PluginState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn tracker_tracks_leases_and_signals_when_the_last_one_drains() {
+        let tracker = TaskTracker::new();
+        let signal = tracker.completion_signal();
+        let leases: Vec<_> = (0..3)
+            .map(|_| tracker.register().expect("open tracker must register"))
+            .collect();
+        assert_eq!(tracker.active(), 3);
+
+        tracker.close();
+        assert!(matches!(
+            tracker.register(),
+            Err(PluginResourceError::ShuttingDown)
+        ));
+        assert!(!signal.is_fired(), "leases are still outstanding");
+
+        drop(leases);
+        assert_eq!(tracker.active(), 0);
+        tokio::time::timeout(Duration::from_secs(1), wait_for_shutdown(&signal))
+            .await
+            .expect("draining the last lease must signal completion");
+    }
+
+    /// The guarantee that decides the packed layout: once `close()` has
+    /// returned, no further lease is handed out. Raced, because the failure
+    /// mode is a check-then-increment window a serial test cannot open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tracker_close_wins_against_concurrent_register() {
+        for _ in 0..64 {
+            let tracker = TaskTracker::new();
+            let start = Arc::new(Barrier::new(5));
+            // Published by the closer the instant `close()` returns. Read
+            // BEFORE each attempt: seeing it set means close already returned,
+            // so a registration that then succeeds is a violation on its own,
+            // with no shared count to launder it.
+            let closed = Arc::new(AtomicBool::new(false));
+
+            let registrars: Vec<_> = (0..4)
+                .map(|_| {
+                    let tracker = Arc::clone(&tracker);
+                    let start = Arc::clone(&start);
+                    let closed = Arc::clone(&closed);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let mut late = 0usize;
+                        // The leases are handed back rather than dropped here,
+                        // so the count the closer sampled stays comparable.
+                        let leases: Vec<_> = std::iter::from_fn(|| {
+                            let seen_closed = closed.load(Ordering::SeqCst);
+                            let lease = tracker.register().ok()?;
+                            if seen_closed {
+                                late += 1;
+                            }
+                            Some(lease)
+                        })
+                        .take(256)
+                        .collect();
+                        (leases, late)
+                    })
+                })
+                .collect();
+
+            start.wait();
+            tracker.close();
+            // Sampled before the flag is published, so the two nets abut: a
+            // grant later than this sample is caught by the count, an earlier
+            // one by a racer that already saw the flag. Only a grant between
+            // close() returning and this single load escapes both.
+            let after_close = tracker.active();
+            closed.store(true, Ordering::SeqCst);
+
+            let results: Vec<_> = registrars
+                .into_iter()
+                .map(|t| t.join().expect("registrar thread"))
+                .collect();
+            let granted: usize = results.iter().map(|(leases, _)| leases.len()).sum();
+            let late: usize = results.iter().map(|(_, late)| late).sum();
+            assert_eq!(late, 0, "register granted a lease after close() returned");
+            assert_eq!(
+                granted, after_close,
+                "register granted a lease after close() returned"
+            );
+        }
+    }
+
+    /// Dropping the lock lets `close` and the last `TaskLease::drop` both reach
+    /// the idle edge, so the notification can fire twice. What matters is that
+    /// it is a double notification and not a double observation: every
+    /// subscriber, early or late, still sees one sticky completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tracker_idle_notification_survives_a_close_drop_race() {
+        for _ in 0..64 {
+            let tracker = TaskTracker::new();
+            let lease = tracker.register().expect("open tracker must register");
+            let early = tracker.completion_signal();
+            let start = Arc::new(Barrier::new(2));
+
+            let closer = {
+                let tracker = Arc::clone(&tracker);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    tracker.close();
+                })
+            };
+            let dropper = {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    drop(lease);
+                })
+            };
+            closer.join().expect("closer thread");
+            dropper.join().expect("dropper thread");
+
+            assert_eq!(tracker.active(), 0);
+            let late = tracker.completion_signal();
+            for signal in [early, late] {
+                tokio::time::timeout(Duration::from_secs(1), wait_for_shutdown(&signal))
+                    .await
+                    .expect("idle must be signalled whichever side got there first");
+            }
+        }
+    }
+
+    /// The idempotence the racing notification rests on, asserted directly:
+    /// a repeated notify is invisible to subscribers taken before or after it.
+    #[tokio::test]
+    async fn tracker_idle_notification_is_idempotent() {
+        let tracker = TaskTracker::new();
+        let early = tracker.completion_signal();
+        tracker.idle.notify();
+        tracker.idle.notify();
+        let late = tracker.completion_signal();
+
+        for signal in [early, late] {
+            assert!(signal.is_fired());
+            tokio::time::timeout(Duration::from_secs(1), wait_for_shutdown(&signal))
+                .await
+                .expect("a repeated notify must not strand a subscriber");
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_reports_capacity_exceeded_at_saturation() {
+        let tracker = TaskTracker::new();
+        tracker
+            .state
+            .store(usize::MAX & !TRACKER_CLOSED, Ordering::Relaxed);
+        assert!(matches!(
+            tracker.register(),
+            Err(PluginResourceError::TaskCapacityExceeded)
+        ));
+        assert_eq!(
+            tracker.state.load(Ordering::Relaxed) & TRACKER_CLOSED,
+            0,
+            "a refused registration must not corrupt the closed flag"
+        );
+
+        // Closed still outranks saturation, as it did when both lived under
+        // the lock.
+        tracker.state.store(usize::MAX, Ordering::Relaxed);
+        assert!(matches!(
+            tracker.register(),
+            Err(PluginResourceError::ShuttingDown)
+        ));
     }
 
     #[tokio::test]

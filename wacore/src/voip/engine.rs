@@ -64,7 +64,7 @@ const RTCP_MS: Millis = 1500;
 /// (silently dropping the allocate), so surface a terminal timeout instead of keepaliving forever.
 const ALLOCATE_TIMEOUT_MS: Millis = 10_000;
 /// Playout drain cadence: hand the speaker a fixed slice every 20ms so it stays fed at 16kHz.
-const PLAYOUT_MS: Millis = 20;
+pub(crate) const PLAYOUT_MS: Millis = 20;
 const APP_DATA_RETRANSMIT_MS: Millis = 50;
 const APP_DATA_RETRANSMIT_COUNT: u8 = 10;
 const MAX_PENDING_REACTIONS: usize = 64;
