@@ -142,17 +142,20 @@ what a component can introspect — absent means "not reported", not zero):
   WebSocket transport fills best-effort static estimates (tokio-websockets and
   rustls don't surface live buffer sizes).
 - **HTTP** — `HttpClient::resource_report() -> Option<HttpResourceReport>`,
-  defaulted. The `ureq` client reports `Some(0)` connections and `Some(0)` pool
-  bytes until its first request, then its idle-pool buffer estimate (`None` from
-  that point on when built from a custom agent whose config is opaque). ureq
-  allocates per connection, not per agent (`LazyBuffers` and the pool both start
-  empty), so an agent that has never connected costs ~2.8 KiB of RSS against the
-  96 KiB the cap advertises, and reporting the cap there put ~28% of a session's
-  `total_estimated_bytes()` on memory that was not resident. `Some(0)` rather
-  than `None` because an empty pool is a measured fact, not an absence of
-  introspection. Once a request has gone out the cap is a floor, not a ceiling:
-  a pooled TLS connection measures ~98 KiB, of which the 32 KiB of ureq buffers
-  is all this field claims.
+  defaulted. With the default agent the `ureq` client reports `Some(0)`
+  connections and `Some(0)` pool bytes until its first request, then its
+  idle-pool buffer estimate. ureq allocates per connection, not per agent
+  (`LazyBuffers` and the pool both start empty), so an agent that has never
+  connected costs ~2.8 KiB of RSS against the 96 KiB the cap advertises, and
+  reporting the cap there put ~28% of a session's `total_estimated_bytes()` on
+  memory that was not resident. `Some(0)` rather than `None` because an empty
+  pool is a measured fact, not an absence of introspection. Once a request has
+  gone out the cap is a floor, not a ceiling: a pooled TLS connection measures
+  ~98 KiB, of which the 32 KiB of ureq buffers is all this field claims. A
+  custom agent reports `None` throughout — its buffer sizes are opaque, and
+  since agents share one pool with all their clones it may already have
+  connected before the client wrapped it, so its pool is not knowably empty
+  either.
 - **Alloc churn** — an `AllocSnapshot` from an `AllocMeter` (below), when one is
   installed.
 

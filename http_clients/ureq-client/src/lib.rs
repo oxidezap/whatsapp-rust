@@ -324,11 +324,17 @@ impl HttpClient for UreqHttpClient {
     /// 96 KiB the cap advertises. Reporting the cap there put a quarter of a
     /// session's estimate on memory that was not resident, and the client's
     /// `resource_report()` total promises a lower bound.
+    ///
+    /// Both answers need an agent we built. A caller-supplied one
+    /// ([`UreqHttpClient::with_agent`]) may already have connected before it
+    /// reached us, since agents share their pool with every clone, so its pool
+    /// is as opaque as its buffer sizes and stays unreported.
     fn resource_report(&self) -> Option<HttpResourceReport> {
+        let pool_report = self.pool_report?;
         if !self.requested.load(Ordering::Relaxed) {
             return Some(EMPTY_POOL_REPORT);
         }
-        self.pool_report
+        Some(pool_report)
     }
 }
 
@@ -592,7 +598,7 @@ mod tests {
         assert!(capped.resource_report().is_some());
     }
 
-    /// A client that has never connected holds no pool buffers, so it reports
+    /// An agent we built and never used holds no pool buffers, so it reports
     /// the measured `Some(0)` rather than the cap. `Some(0)` and not `None`
     /// because an empty pool is knowable here, unlike a component that cannot
     /// introspect itself at all.
@@ -601,7 +607,6 @@ mod tests {
         for client in [
             UreqHttpClient::new(),
             UreqHttpClient::new().with_max_body_bytes(1024),
-            UreqHttpClient::with_agent(build_agent()),
         ] {
             let report = client
                 .resource_report()
@@ -610,6 +615,31 @@ mod tests {
             assert_eq!(report.pool_buffer_bytes, Some(0));
             assert_eq!(report.total_bytes(), 0);
         }
+    }
+
+    /// A caller-supplied agent is opaque in both directions: its buffer sizes
+    /// are unknown, and it may already have connected before it reached us,
+    /// because every clone of an agent shares one pool. Answering `Some(0)`
+    /// there would understate a pool we cannot see.
+    #[test]
+    fn a_custom_agent_reports_nothing_even_before_the_first_request() {
+        let shared = build_agent();
+        assert!(
+            UreqHttpClient::with_agent(shared.clone())
+                .resource_report()
+                .is_none(),
+            "a pool this client did not create is not knowably empty"
+        );
+
+        // The case that makes it unknowable: the agent connected before we
+        // wrapped it, so its pool is already non-empty at construction.
+        let url = spawn_status_server(200, "OK");
+        let _ = shared.get(&url).call();
+        assert!(
+            UreqHttpClient::with_agent(shared)
+                .resource_report()
+                .is_none()
+        );
     }
 
     /// Cloning shares the agent and therefore the pool, so it has to share the
