@@ -53,10 +53,14 @@
 //! recycling. Both need `id` and `from`: without them there is nothing to
 //! address, and the client would not have answered either.
 //!
-//! A tag the client *does* model but answers some other way — a delivery
-//! `<receipt>` for a direct `<message>`, an `<iq type="result">` — is answered
-//! by nobody once claimed. A generic `<ack>` is not that answer, so the client
-//! does not send one. Claiming those means owing the reply.
+//! A tag the client *does* model but answers some other way is answered by
+//! nobody once claimed. A direct `<message>` draws a delivery `<receipt>` and
+//! an `<iq>` draws an `<iq type="result">`; a generic `<ack>` is neither, so
+//! the client does not send one. Claiming those means owing the reply.
+//!
+//! `<receipt>`, `<notification>` and `<call>` are not in that group: the client
+//! answers those with a transport `<ack>` already, so a claim leaves the ack
+//! exactly where it was.
 //!
 //! [`StanzaRouter::register`]: crate::handlers::router::StanzaRouter::register
 //!

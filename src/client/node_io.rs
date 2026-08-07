@@ -538,11 +538,12 @@ impl Client {
             // because someone did handle it — and answering nothing would leave
             // the stanza in the offline queue with the stream recycling.
             //
-            // A tag the client models but answers some other way — a delivery
-            // <receipt> for a direct <message>, an <iq type="result"> — gets
-            // nothing here. A generic <ack class="message"> is not that answer,
-            // and inventing one is worse than silence: whoever claimed the
-            // stanza took on the reply.
+            // A tag the client models but answers some other way gets nothing
+            // here: a direct <message> draws a delivery <receipt>, an <iq>
+            // draws an <iq type="result">, and a generic <ack class="message">
+            // is neither. Inventing one is worse than silence — whoever claimed
+            // the stanza took on the reply. The tags `should_ack` covers are
+            // unaffected; they were already answered above.
             //
             // Same identity requirement as the nack path: without `id` and
             // `from` there is nothing to address.
