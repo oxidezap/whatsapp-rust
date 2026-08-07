@@ -2448,14 +2448,21 @@ fn delete_pending_inbound_row(
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ProtocolStore for SqliteStore {
     async fn get_sender_key_devices(&self, group_jid: &str) -> Result<Vec<(String, bool)>> {
+        // On the write queue: the result initializes `sender_key_device_cache`,
+        // so a stale `has_key = true` is cached over a concurrent forget and the
+        // send drops the SKDM for a device that asked for redistribution.
+        let pool = self.pool.clone();
         let device_id = self.device_id;
         let group_jid = group_jid.to_string();
-        self.read_query(move |conn| {
+        self.with_semaphore(move || -> Result<Vec<(String, bool)>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
             let rows: Vec<(String, i32)> = sender_key_devices::table
                 .select((sender_key_devices::device_jid, sender_key_devices::has_key))
                 .filter(sender_key_devices::group_jid.eq(&group_jid))
                 .filter(sender_key_devices::device_id.eq(device_id))
-                .load(conn)
+                .load(&mut conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(rows
                 .into_iter()
@@ -2917,9 +2924,16 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn get_devices(&self, user: &str) -> Result<Option<DeviceListRecord>> {
+        // On the write queue: a miss here is promoted into
+        // `device_registry_cache` unconditionally, so a stale row overwrites a
+        // newer entry and later sends omit a linked device until a refresh.
+        let pool = self.pool.clone();
         let device_id = self.device_id;
         let user = user.to_string();
-        self.read_query(move |conn| {
+        self.with_semaphore(move || -> Result<Option<DeviceListRecord>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
             let row: Option<(String, String, i32, Option<String>, Option<i32>)> =
                 device_registry::table
                     .select((
@@ -2931,7 +2945,7 @@ impl ProtocolStore for SqliteStore {
                     ))
                     .filter(device_registry::user_id.eq(&user))
                     .filter(device_registry::device_id.eq(device_id))
-                    .first(conn)
+                    .first(&mut conn)
                     .optional()
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
             match row {
@@ -3045,9 +3059,16 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>> {
+        // On the write queue: `prepare_privacy_token` schedules off this
+        // timestamp, so reading before a concurrent touch commits issues a
+        // duplicate token and bypasses the configured interval.
+        let pool = self.pool.clone();
         let device_id = self.device_id;
         let jid = jid.to_string();
-        self.read_query(move |conn| {
+        self.with_semaphore(move || -> Result<Option<TcTokenEntry>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
             let row: Option<(Vec<u8>, i64, Option<i64>)> = tc_tokens::table
                 .select((
                     tc_tokens::token,
@@ -3056,7 +3077,7 @@ impl ProtocolStore for SqliteStore {
                 ))
                 .filter(tc_tokens::jid.eq(&jid))
                 .filter(tc_tokens::device_id.eq(device_id))
-                .first(conn)
+                .first(&mut conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(
@@ -6174,6 +6195,25 @@ mod read_routing_tests {
              cache in front on that path, so a stale miss loses the addon too",
         ),
         ("get_pn_mapping", "same as get_lid_mapping"),
+        // The rest share one shape: the row is promoted into a plain in-memory
+        // cache, or suppresses an action, so a stale read sticks instead of
+        // being retried. `SignalStoreCache` reconciles staleness and its reads
+        // do migrate; these caches overwrite whatever they are handed.
+        (
+            "get_sender_key_devices",
+            "initializes sender_key_device_cache: a stale has_key=true is cached \
+             over a concurrent forget and the send drops that device's SKDM",
+        ),
+        (
+            "get_devices",
+            "promoted into device_registry_cache unconditionally, so a stale row \
+             overwrites a newer entry and sends omit a linked device",
+        ),
+        (
+            "get_tc_token",
+            "prepare_privacy_token schedules off this timestamp, so a stale read \
+             issues a duplicate token and bypasses the configured interval",
+        ),
     ];
 
     /// Read-shaped methods that reach the database without going through
