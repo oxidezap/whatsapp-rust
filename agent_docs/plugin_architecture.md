@@ -11,16 +11,16 @@ The initial plugin model supports:
 
 - build-time registration and transactional installation;
 - type-safe Rust APIs exposed through a plugin marker;
-- capability-shaped access to core events, tasks, messaging, IQ, and custom
-  events;
+- capability-shaped access to core events, tasks, messaging, IQ, custom
+  events, and stanza interception;
 - install-scoped and connection-generation-scoped work;
 - bounded custom-event delivery with explicit backpressure;
 - on-demand health, resource, and queue snapshots.
 
-It does not support dynamic installation, ingress interception, pre-ack
-decisions, a foreign wire protocol, process isolation, or sandboxing. Those
-features must be justified by a real use case because they add materially
-stronger compatibility and durability contracts.
+It does not support dynamic installation, pre-ack decisions, a foreign wire
+protocol, process isolation, or sandboxing. Those features must be justified by
+a real use case because they add materially stronger compatibility and
+durability contracts.
 
 The host lives in the main `whatsapp-rust` crate, not `wacore`: plugins need
 high-level client operations and lifecycle coordination. It is enabled by the
@@ -155,6 +155,7 @@ capabilities, and `PluginContext` exposes only the corresponding small handles:
 | `messaging.send` | `PluginMessaging` | High-level message sends |
 | `iq.execute` | `PluginIq` | Typed `IqSpec` execution |
 | `events.plugin.publish` | `PluginEvents` | Publication only in the plugin's own namespace |
+| `stanza.intercept` | `PluginStanzaInterception` | Claiming a decoded stanza before the built-in pipeline |
 
 This is API shaping, not a security boundary: native code can use any other
 crate dependency available to its process. Runtime grant enforcement belongs
@@ -166,11 +167,48 @@ Capability handles keep `Weak<Client>` internally and reject calls before
 activation or after shutdown. This avoids `Client -> plugin API -> Client`
 cycles and gives terminal resource invalidation a synchronous boundary.
 
+`PluginStanzaInterception::register` returns the same shape of token. Both are
+indexed weakly, so terminal shutdown invalidates a token a plugin API retained
+without extending the lifetime of one the plugin already released.
+
 `PluginCoreEvents::subscribe` returns the ownership token for its registration.
 Dropping or explicitly unsubscribing that token removes the handler, any
 `RawNodeLease`, and its host registry entry immediately. The host indexes live
 tokens weakly so terminal shutdown can invalidate retained tokens without
 extending the lifetime of registrations that plugins already released.
+
+## Stanza interception
+
+`events.core.observe` lets a plugin watch; `stanza.intercept` lets it act. A
+plugin that models a stanza this client does not can claim it instead of
+watching it get nacked. `client/interceptor.rs` owns the contract — what is
+never offered, and the ack a claim still owes the server.
+
+The host adds two things on top of a directly registered interceptor:
+
+- **Panic isolation.** The trait asks implementations not to panic and trusts a
+  direct registration to honour it; the read loop calls it inline, so an unwind
+  takes the connection. A plugin is not trusted with that. A panicking
+  interceptor is counted, logged, and treated as `Pass`, which leaves the stanza
+  with the client — the outcome of the plugin not being there.
+- **Terminal invalidation.** Registrations are indexed weakly and closed on
+  shutdown, so a client that is shutting down is not still asking a plugin what
+  to do with its stanzas.
+
+### Interaction with Signal durability
+
+Interception runs before the built-in pipeline, so a claimed stanza is one the
+client did no Signal work on at all: nothing decrypted, no session mutated, no
+prekey consumed. There is no half-advanced state to reconcile — which is the
+property that makes claiming safe to reason about, and the reason this needs no
+new durability contract.
+
+What it does mean is that the claim is final. The ack that follows tells the
+server not to redeliver, so a claimed `<message>` stays undecrypted forever and
+a claimed `<notification type="encrypt">` is a prekey top-up that never happens.
+A plugin claiming stanzas that carry Signal state takes over that
+responsibility whole; see `signal_durability.md` for what that involves. Match
+narrowly.
 
 ## Lifecycle and task ownership
 
@@ -311,8 +349,9 @@ When extending the host:
 - isolate faults so one plugin cannot strand unrelated cleanup;
 - add plugin resource accounting and health degradation for new retained state
   or failure modes;
+- isolate panics from any plugin callback the read loop invokes inline;
 - validate native and `wasm32-unknown-unknown` builds;
 - measure both feature-disabled and enabled-with-no-plugin paths before claiming
   zero overhead;
-- defer interception/pre-ack work until its interaction with
-  `signal_durability.md` has a dedicated design.
+- defer pre-ack decisions until their interaction with `signal_durability.md`
+  has a dedicated design.

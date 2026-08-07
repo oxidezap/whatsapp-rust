@@ -32,17 +32,20 @@ use wacore_binary::Jid;
 use waproto::whatsapp::Message;
 
 use crate::Client;
+use crate::client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
 use crate::client::{
     ClientLifecycle, ConnectionScope, ConnectionScopeState, DecryptedPayloadLease, RawNodeLease,
 };
 use crate::request::IqError;
 use crate::send::{SendError, SendResult};
+use wacore_binary::node::OwnedNodeRef;
 
 const CAP_CORE_EVENTS: u64 = 1 << 0;
 const CAP_TASKS: u64 = 1 << 1;
 const CAP_MESSAGING: u64 = 1 << 2;
 const CAP_IQ: u64 = 1 << 3;
 const CAP_PLUGIN_EVENTS: u64 = 1 << 4;
+const CAP_STANZA_INTERCEPTION: u64 = 1 << 5;
 const DEFAULT_PLUGIN_INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PLUGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PLUGIN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,6 +59,7 @@ pub enum PluginCapability {
     Messaging,
     Iq,
     PluginEvents,
+    StanzaInterception,
 }
 
 impl PluginCapability {
@@ -66,6 +70,7 @@ impl PluginCapability {
             Self::Messaging => "messaging.send",
             Self::Iq => "iq.execute",
             Self::PluginEvents => "events.plugin.publish",
+            Self::StanzaInterception => "stanza.intercept",
         }
     }
 
@@ -76,6 +81,7 @@ impl PluginCapability {
             Self::Messaging => CAP_MESSAGING,
             Self::Iq => CAP_IQ,
             Self::PluginEvents => CAP_PLUGIN_EVENTS,
+            Self::StanzaInterception => CAP_STANZA_INTERCEPTION,
         }
     }
 }
@@ -350,6 +356,9 @@ pub struct PluginStats {
     pub connection_tasks: u64,
     pub connection_generations: u64,
     pub core_event_subscriptions: u64,
+    pub stanza_interceptors: u64,
+    /// Panics isolated before they could unwind through the read loop.
+    pub stanza_interception_panics: u64,
     pub events: Option<PluginEventPublisherStats>,
 }
 
@@ -373,6 +382,7 @@ struct PluginResources {
     install_tasks: Arc<TaskTracker>,
     connection_tasks: Mutex<ConnectionTaskRegistry>,
     subscriptions: Mutex<Vec<Weak<PluginCoreEventSubscriptionInner>>>,
+    interceptors: Mutex<Vec<Weak<PluginInterceptorRegistrationInner>>>,
     teardown_panics: AtomicU64,
 }
 
@@ -668,6 +678,7 @@ impl PluginResources {
             install_tasks: TaskTracker::new(),
             connection_tasks: Mutex::new(ConnectionTaskRegistry::default()),
             subscriptions: Mutex::new(Vec::new()),
+            interceptors: Mutex::new(Vec::new()),
             teardown_panics: AtomicU64::new(0),
         })
     }
@@ -745,6 +756,52 @@ impl PluginResources {
                 inner: registration,
             })
         }
+    }
+
+    fn retain_interceptor(
+        &self,
+        resources: Weak<PluginResources>,
+        handle: InterceptorHandle,
+    ) -> Result<PluginInterceptorRegistration, PluginResourceError> {
+        let registration = Arc::new(PluginInterceptorRegistrationInner {
+            resources,
+            handle: Mutex::new(Some(handle)),
+        });
+        let rejected = {
+            let mut interceptors = self
+                .interceptors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.closed.load(Ordering::Acquire) {
+                true
+            } else {
+                interceptors.retain(|interceptor| {
+                    interceptor
+                        .upgrade()
+                        .is_some_and(|interceptor| interceptor.is_active())
+                });
+                interceptors.push(Arc::downgrade(&registration));
+                false
+            }
+        };
+        if rejected {
+            registration.close();
+            Err(PluginResourceError::ShuttingDown)
+        } else {
+            Ok(PluginInterceptorRegistration {
+                inner: registration,
+            })
+        }
+    }
+
+    fn forget_interceptor(&self, registration: &PluginInterceptorRegistrationInner) {
+        let registration_ptr = std::ptr::from_ref(registration);
+        self.interceptors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|candidate| {
+                candidate.strong_count() != 0 && !std::ptr::eq(candidate.as_ptr(), registration_ptr)
+            });
     }
 
     fn forget_subscription(&self, subscription: &PluginCoreEventSubscriptionInner) {
@@ -865,6 +922,18 @@ impl PluginResources {
                 subscription.close();
             }
         }
+        let interceptors = {
+            let mut interceptors = self
+                .interceptors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *interceptors)
+        };
+        for interceptor in interceptors {
+            if let Some(interceptor) = interceptor.upgrade() {
+                interceptor.close();
+            }
+        }
     }
 }
 
@@ -904,6 +973,14 @@ impl PluginResources {
                 .filter_map(Weak::upgrade)
                 .filter(|subscription| subscription.is_active())
                 .count(),
+            stanza_interceptors: self
+                .interceptors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|interceptor| interceptor.is_active())
+                .count(),
             teardown_panics: self.teardown_panics.load(Ordering::Relaxed),
         }
     }
@@ -917,6 +994,7 @@ struct PluginResourceStats {
     connection_tasks: usize,
     connection_generations: usize,
     core_event_subscriptions: usize,
+    stanza_interceptors: usize,
     teardown_panics: u64,
 }
 
@@ -929,6 +1007,7 @@ struct PluginDiagnostics {
     task_panics: AtomicU64,
     core_events_delivered: AtomicU64,
     core_event_panics: AtomicU64,
+    stanza_interception_panics: AtomicU64,
     shutdown_complete: AtomicBool,
 }
 
@@ -943,6 +1022,7 @@ impl PluginDiagnostics {
             task_panics: AtomicU64::new(0),
             core_events_delivered: AtomicU64::new(0),
             core_event_panics: AtomicU64::new(0),
+            stanza_interception_panics: AtomicU64::new(0),
             shutdown_complete: AtomicBool::new(false),
         })
     }
@@ -1002,6 +1082,7 @@ impl PluginDiagnostics {
         let task_panics = self.task_panics.load(Ordering::Relaxed);
         let core_events_delivered = self.core_events_delivered.load(Ordering::Relaxed);
         let core_event_panics = self.core_event_panics.load(Ordering::Relaxed);
+        let stanza_interception_panics = self.stanza_interception_panics.load(Ordering::Relaxed);
         let state = if self.shutdown_complete.load(Ordering::Acquire) {
             PluginState::Stopped
         } else if resources.closed || terminal {
@@ -1019,6 +1100,7 @@ impl PluginDiagnostics {
             || task_drain_timeouts > 0
             || task_panics > 0
             || core_event_panics > 0
+            || stanza_interception_panics > 0
             || resources.teardown_panics > 0
             || event_degraded
         {
@@ -1044,6 +1126,8 @@ impl PluginDiagnostics {
                 .unwrap_or(u64::MAX),
             core_event_subscriptions: u64::try_from(resources.core_event_subscriptions)
                 .unwrap_or(u64::MAX),
+            stanza_interceptors: u64::try_from(resources.stanza_interceptors).unwrap_or(u64::MAX),
+            stanza_interception_panics,
             events,
         }
     }
@@ -1202,6 +1286,138 @@ impl PluginCoreEvents {
     }
 }
 
+/// Claiming a stanza before the built-in pipeline sees it.
+///
+/// Observation is [`PluginCoreEvents`]' job. This is the other half: a plugin
+/// that can *act* on a stanza the client does not model, instead of watching it
+/// get nacked. See [`crate::client::interceptor`] for what may be claimed and
+/// what the server is owed afterwards.
+///
+/// # What a claim skips
+///
+/// Interception runs before the built-in pipeline, so a claimed stanza is one
+/// the client did no work on at all — no decryption, no session mutation, no
+/// prekey consumed. Signal state is untouched rather than half-advanced, which
+/// is what makes claiming safe to reason about; but it also means claiming a
+/// `<message>` leaves it undecrypted forever, since the ack that follows tells
+/// the server not to redeliver. A plugin that claims stanzas carrying Signal
+/// state takes over that responsibility whole. Match narrowly.
+#[derive(Clone)]
+pub struct PluginStanzaInterception {
+    client: Weak<Client>,
+    resources: Arc<PluginResources>,
+    plugin_id: Arc<str>,
+    diagnostics: Arc<PluginDiagnostics>,
+}
+
+impl PluginStanzaInterception {
+    /// Register `interceptor` for the life of the returned token.
+    ///
+    /// Dropping the token removes it, and host shutdown invalidates a token a
+    /// plugin API retained.
+    pub fn register(
+        &self,
+        interceptor: Arc<dyn StanzaInterceptor>,
+    ) -> Result<PluginInterceptorRegistration, PluginResourceError> {
+        let client = self
+            .client
+            .upgrade()
+            .ok_or(PluginResourceError::ClientUnavailable)?;
+        if self.resources.closed.load(Ordering::Acquire) {
+            return Err(PluginResourceError::ShuttingDown);
+        }
+        let handle = client.add_stanza_interceptor(Arc::new(GuardedStanzaInterceptor {
+            plugin_id: Arc::clone(&self.plugin_id),
+            inner: interceptor,
+            diagnostics: Arc::clone(&self.diagnostics),
+        }));
+        self.resources
+            .retain_interceptor(Arc::downgrade(&self.resources), handle)
+    }
+}
+
+/// Wraps a plugin's interceptor so a panic cannot unwind through the read loop.
+///
+/// The trait asks implementations not to panic, and a directly registered
+/// interceptor is trusted to honour that. A plugin is not: one faulty plugin
+/// must not take the connection with it. A panicking interceptor passes, which
+/// leaves the stanza with the client — the same outcome as not being there.
+struct GuardedStanzaInterceptor {
+    plugin_id: Arc<str>,
+    inner: Arc<dyn StanzaInterceptor>,
+    diagnostics: Arc<PluginDiagnostics>,
+}
+
+impl StanzaInterceptor for GuardedStanzaInterceptor {
+    fn intercept(&self, node: &OwnedNodeRef) -> Interception {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| self.inner.intercept(node))) {
+            Ok(interception) => interception,
+            Err(_) => {
+                self.diagnostics
+                    .stanza_interception_panics
+                    .fetch_add(1, Ordering::Relaxed);
+                log::warn!("Plugin `{}` stanza interceptor panicked", self.plugin_id);
+                Interception::Pass
+            }
+        }
+    }
+}
+
+struct PluginInterceptorRegistrationInner {
+    resources: Weak<PluginResources>,
+    handle: Mutex<Option<InterceptorHandle>>,
+}
+
+impl PluginInterceptorRegistrationInner {
+    fn is_active(&self) -> bool {
+        self.handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn close(&self) -> bool {
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let active = handle.is_some();
+        drop(handle);
+        if let Some(resources) = self.resources.upgrade() {
+            resources.forget_interceptor(self);
+        }
+        active
+    }
+}
+
+/// Ownership token for one plugin stanza interceptor.
+///
+/// Dropping the token unregisters immediately. Host shutdown also invalidates a
+/// retained token, so keeping it in a plugin API cannot leave an interceptor
+/// deciding for a client that is shutting down.
+#[must_use = "dropping the token immediately unregisters the interceptor"]
+pub struct PluginInterceptorRegistration {
+    inner: Arc<PluginInterceptorRegistrationInner>,
+}
+
+impl PluginInterceptorRegistration {
+    pub fn is_active(&self) -> bool {
+        self.inner.is_active()
+    }
+
+    /// Unregister now instead of waiting for `Drop`.
+    pub fn unregister(&self) -> bool {
+        self.inner.close()
+    }
+}
+
+impl Drop for PluginInterceptorRegistration {
+    fn drop(&mut self) {
+        self.inner.close();
+    }
+}
+
 /// High-level message sending without exposing the raw client or backend.
 #[derive(Clone)]
 pub struct PluginMessaging {
@@ -1267,6 +1483,7 @@ pub struct PluginContext {
     messaging: Option<PluginMessaging>,
     iq: Option<PluginIq>,
     plugin_events: Option<PluginEvents>,
+    stanza_interception: Option<PluginStanzaInterception>,
 }
 
 impl PluginContext {
@@ -1299,6 +1516,10 @@ impl PluginContext {
 
     pub fn plugin_events(&self) -> Option<&PluginEvents> {
         self.plugin_events.as_ref()
+    }
+
+    pub fn stanza_interception(&self) -> Option<&PluginStanzaInterception> {
+        self.stanza_interception.as_ref()
     }
 }
 
@@ -2179,7 +2400,7 @@ impl PluginHost {
                     runtime: Arc::clone(&runtime),
                     resources: Arc::clone(&resources),
                     diagnostics: Arc::clone(&diagnostics),
-                    plugin_id,
+                    plugin_id: Arc::clone(&plugin_id),
                 }),
             messaging: capabilities.contains(PluginCapability::Messaging).then(|| {
                 PluginMessaging {
@@ -2192,6 +2413,14 @@ impl PluginHost {
                 .then(|| PluginIq {
                     client: client.clone(),
                     resources: Arc::clone(&resources),
+                }),
+            stanza_interception: capabilities
+                .contains(PluginCapability::StanzaInterception)
+                .then(|| PluginStanzaInterception {
+                    client: client.clone(),
+                    resources: Arc::clone(&resources),
+                    plugin_id,
+                    diagnostics: Arc::clone(&diagnostics),
                 }),
             plugin_events: self
                 .event_router
@@ -2908,6 +3137,7 @@ mod tests {
             PluginCapability::Messaging,
             PluginCapability::Iq,
             PluginCapability::PluginEvents,
+            PluginCapability::StanzaInterception,
         ];
         let combined = capabilities
             .into_iter()
@@ -5375,6 +5605,244 @@ mod tests {
         client.disconnect().await;
         assert!(!client.core.event_bus.has_handler_for(EventKind::Connected));
         assert!(!client.raw_node_forwarding_enabled());
+    }
+
+    // --- stanza interception ---------------------------------------------
+
+    /// Claims `<vendor:thing>` and records what it was offered.
+    struct RecordingInterceptor {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StanzaInterceptor for RecordingInterceptor {
+        fn intercept(&self, node: &OwnedNodeRef) -> Interception {
+            self.seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(node.tag().to_string());
+            if node.tag() == "vendor:thing" {
+                Interception::Handled
+            } else {
+                Interception::Pass
+            }
+        }
+    }
+
+    struct InterceptingPlugin;
+
+    struct InterceptingApi {
+        seen: Arc<Mutex<Vec<String>>>,
+        registration: PluginInterceptorRegistration,
+        /// A cloned capability handle, which plugin APIs are meant to keep.
+        interception: PluginStanzaInterception,
+    }
+
+    impl ClientPlugin for InterceptingPlugin {
+        type Api = InterceptingApi;
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("intercepting", "0.1.0")
+                .with_capability(PluginCapability::StanzaInterception)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async move {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let interception = context
+                    .stanza_interception()
+                    .ok_or_else(|| anyhow::anyhow!("interception capability missing"))?
+                    .clone();
+                let registration = interception.register(Arc::new(RecordingInterceptor {
+                    seen: Arc::clone(&seen),
+                }))?;
+                Ok(Arc::new(InterceptingApi {
+                    seen,
+                    registration,
+                    interception,
+                }))
+            })
+        }
+    }
+
+    struct PanickingInterceptor;
+
+    impl StanzaInterceptor for PanickingInterceptor {
+        fn intercept(&self, _node: &OwnedNodeRef) -> Interception {
+            panic!("injected stanza interceptor panic");
+        }
+    }
+
+    struct PanickingInterceptorPlugin;
+
+    impl ClientPlugin for PanickingInterceptorPlugin {
+        type Api = PluginInterceptorRegistration;
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("panicking-interceptor", "0.1.0")
+                .with_capability(PluginCapability::StanzaInterception)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async move {
+                let registration = context
+                    .stanza_interception()
+                    .ok_or_else(|| anyhow::anyhow!("interception capability missing"))?
+                    .register(Arc::new(PanickingInterceptor))?;
+                Ok(Arc::new(registration))
+            })
+        }
+    }
+
+    fn stanza(tag: &'static str) -> Arc<OwnedNodeRef> {
+        crate::test_utils::node_to_owned_ref(&wacore_binary::builder::NodeBuilder::new(tag).build())
+    }
+
+    #[tokio::test]
+    async fn a_plugin_without_the_capability_gets_no_handle() {
+        let client = complete_builder()
+            .await
+            .with_plugin(EventSubscriptionPlugin)
+            .build()
+            .await
+            .expect("event subscription plugin")
+            .into_client();
+        assert!(
+            !client.has_stanza_interceptors(),
+            "a plugin that did not ask cannot intercept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_interceptor_claims_the_stanzas_it_recognizes() {
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+        assert!(client.has_stanza_interceptors());
+        assert!(api.registration.is_active());
+
+        for tag in ["receipt", "vendor:thing"] {
+            client.process_node(stanza(tag)).await;
+        }
+        assert_eq!(
+            *api.seen.lock().expect("recorder lock"),
+            ["receipt", "vendor:thing"],
+            "offered both; only the second was claimed"
+        );
+
+        let stats = client.plugin_stats().expect("plugin stats");
+        let plugin = stats.plugins.first().expect("plugin stats entry");
+        assert_eq!(plugin.stanza_interceptors, 1);
+        assert_eq!(plugin.stanza_interception_panics, 0);
+        assert_eq!(plugin.health, PluginHealth::Healthy);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_plugin_interceptor_passes_instead_of_unwinding() {
+        // The read loop calls this directly, so an unwind would take the
+        // connection with it. Passing leaves the stanza with the client, which
+        // is what would have happened without the plugin at all.
+        let client = complete_builder()
+            .await
+            .with_plugin(PanickingInterceptorPlugin)
+            .build()
+            .await
+            .expect("panicking interceptor plugin")
+            .into_client();
+
+        client.process_node(stanza("receipt")).await;
+
+        let stats = client.plugin_stats().expect("plugin stats");
+        let plugin = stats.plugins.first().expect("plugin stats entry");
+        assert_eq!(plugin.stanza_interception_panics, 1);
+        assert_eq!(
+            plugin.health,
+            PluginHealth::Degraded,
+            "a panicking interceptor is not a healthy plugin"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_registration_unregisters_the_interceptor() {
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+
+        assert!(api.registration.unregister());
+        assert!(!api.registration.is_active());
+        assert!(!api.registration.unregister(), "idempotent");
+        assert!(!client.has_stanza_interceptors());
+
+        client.process_node(stanza("vendor:thing")).await;
+        assert!(
+            api.seen.lock().expect("recorder lock").is_empty(),
+            "an unregistered interceptor is offered nothing"
+        );
+        assert_eq!(
+            client
+                .plugin_stats()
+                .expect("plugin stats")
+                .plugins
+                .first()
+                .expect("plugin stats entry")
+                .stanza_interceptors,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_invalidates_a_retained_registration() {
+        // The plugin API holds the token, so nothing else would drop it. A
+        // client that is shutting down must not still be asking a plugin what
+        // to do with its stanzas.
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+
+        client.disconnect().await;
+        assert!(!api.registration.is_active());
+        assert!(!client.has_stanza_interceptors());
+    }
+
+    #[tokio::test]
+    async fn registering_after_shutdown_is_refused() {
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+
+        client.disconnect().await;
+        assert!(matches!(
+            api.interception.register(Arc::new(PanickingInterceptor)),
+            Err(PluginResourceError::ShuttingDown)
+        ));
+        assert!(!client.has_stanza_interceptors());
     }
 
     #[tokio::test]
