@@ -4593,8 +4593,12 @@ mod tests {
 
             start.wait();
             tracker.close();
-            closed.store(true, Ordering::SeqCst);
+            // Sampled before the flag is published, so the two nets abut: a
+            // grant later than this sample is caught by the count, an earlier
+            // one by a racer that already saw the flag. Only a grant between
+            // close() returning and this single load escapes both.
             let after_close = tracker.active();
+            closed.store(true, Ordering::SeqCst);
 
             let results: Vec<_> = registrars
                 .into_iter()
@@ -4603,8 +4607,6 @@ mod tests {
             let granted: usize = results.iter().map(|(leases, _)| leases.len()).sum();
             let late: usize = results.iter().map(|(_, late)| late).sum();
             assert_eq!(late, 0, "register granted a lease after close() returned");
-            // Second net, for a grant that slipped in before the flag above was
-            // published: the count may not grow past the post-close sample.
             assert_eq!(
                 granted, after_close,
                 "register granted a lease after close() returned"

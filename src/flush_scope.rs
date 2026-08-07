@@ -408,8 +408,12 @@ mod tests {
 
             start.wait();
             scope.close();
-            closed.store(true, Ordering::SeqCst);
+            // Sampled before the flag is published, so the two nets abut: a
+            // grant later than this sample is caught by the count, an earlier
+            // one by a racer that already saw the flag. Only a grant between
+            // close() returning and this single load escapes both.
             let after_close = scope.pending();
+            closed.store(true, Ordering::SeqCst);
 
             let results: Vec<_> = trackers
                 .into_iter()
@@ -418,8 +422,6 @@ mod tests {
             let granted: usize = results.iter().map(|(guards, _)| guards.len()).sum();
             let late: usize = results.iter().map(|(_, late)| late).sum();
             assert_eq!(late, 0, "try_track granted a guard after close() returned");
-            // Second net, for a grant that slipped in before the flag above was
-            // published: the count may not grow past the post-close sample.
             assert_eq!(
                 granted, after_close,
                 "try_track granted a guard after close() returned"
