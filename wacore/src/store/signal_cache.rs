@@ -134,6 +134,12 @@ impl<V> UserIndexedCache<V> {
     }
 
     fn has_user(&self, user: &str) -> bool {
+        // A user carrying a separator is not a value this index can hold, yet
+        // it could still prefix-match a stored address. Answering from the set
+        // would be the one false negative available here, so concede instead.
+        if user.contains(['@', ':']) {
+            return true;
+        }
         self.users.contains(user)
     }
 
@@ -2127,6 +2133,33 @@ mod sender_key_lock_tests {
         assert!(
             !cache
                 .has_state_for_user("19995559999", &backend)
+                .await
+                .unwrap()
+        );
+
+        // An addressed-device JID renders as `user:device@server.N`, so both
+        // `user` and `user:device` prefix-match it under the scan predicate.
+        // Only the first is an index key; the second must be conceded rather
+        // than denied, which is the one false negative available here.
+        let device_addr = ProtocolAddress::new("19995551006:5@c.us", 0.into());
+        cache
+            .put_session(&device_addr, SessionRecord::new_fresh())
+            .await;
+        assert!(
+            cache
+                .has_state_for_user("19995551006", &backend)
+                .await
+                .unwrap()
+        );
+
+        let with_device = "19995551006:5";
+        assert!(
+            protocol_address_matches_user(device_addr.as_str(), with_device),
+            "the scan predicate matches this user, so the index must not deny it"
+        );
+        assert!(
+            cache
+                .has_state_for_user(with_device, &backend)
                 .await
                 .unwrap()
         );
