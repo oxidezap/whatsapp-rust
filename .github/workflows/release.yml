@@ -33,12 +33,15 @@ jobs:
         id: version
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          # Deliberately no stricter than Cargo: a version Cargo accepts must
-          # not fail here, or the release stops between publish and tag. Forms
-          # Cargo itself rejects (leading zeros, empty prerelease identifiers)
-          # never reach the publish step, so they need no guard of their own.
-          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
-            echo "Refusing to release a malformed version: '$VERSION'" >&2
+          # Build metadata is rejected even though Cargo takes it. `+` is not a
+          # legal Docker tag character, so docker/metadata-action rewrites it to
+          # `-`: 0.7.0+build.5 would ship as the image 0.7.0-build.5, which is
+          # the tag a real prerelease of that name would claim. Being stricter
+          # than Cargo is only safe because this runs ahead of publish; as a
+          # post-publish check it would strand the release between crates.io
+          # and the tag.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Refusing to release '$VERSION': expected MAJOR.MINOR.PATCH[-prerelease], no build metadata" >&2
             exit 1
           fi
           echo "Releasing $VERSION"
