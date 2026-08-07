@@ -1825,6 +1825,9 @@ impl SignalStore for SqliteStore {
     }
 
     async fn has_session(&self, address: &str) -> Result<bool> {
+        // Not the cache's has_session, which reads get_session instead. This one
+        // is only reached through Device::contains_session, whose single caller
+        // logs the answer, so a stale one changes a log line.
         let device_id = self.device_id;
         let address_owned = address.to_string();
         self.read_query(move |conn| {
@@ -1846,7 +1849,15 @@ impl SignalStore for SqliteStore {
         // numeric PN/LID so it carries no LIKE wildcards.
         let pat_at = format!("{user}@%");
         let pat_dev = format!("{user}:%");
-        self.read_query(move |conn| {
+        // On the write queue: the only consumer, `has_state_for_user`, is the
+        // skip guard for the PN to LID session migration and has no cold-load
+        // re-check, so a stale absent answer skips a migration nothing retries.
+        let pool = self.pool.clone();
+        self.with_semaphore(move || -> Result<bool> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let conn = &mut conn;
             let has_session = diesel::select(diesel::dsl::exists(
                 sessions::table
                     .filter(sessions::device_id.eq(device_id))
@@ -6445,6 +6456,12 @@ mod read_routing_tests {
             "get_tc_token",
             "prepare_privacy_token schedules off this timestamp, so a stale read \
              issues a duplicate token and bypasses the configured interval",
+        ),
+        (
+            "has_signal_state_for_user",
+            "has_state_for_user gates the PN to LID session migration and has no \
+             cold-load re-check, so a stale absent answer skips a migration that \
+             nothing retries",
         ),
     ];
 
