@@ -632,9 +632,21 @@ mod tests {
         );
 
         // The case that makes it unknowable: the agent connected before we
-        // wrapped it, so its pool is already non-empty at construction.
-        let url = spawn_status_server(200, "OK");
-        let _ = shared.get(&url).call();
+        // wrapped it, so its pool is already non-empty at construction. The
+        // body has to be drained, or ureq drops the connection instead of
+        // pooling it and the scenario never happens.
+        let url = spawn_keep_alive_server();
+        let response = shared
+            .get(&url)
+            .call()
+            .expect("the warm-up request must reach the fixture");
+        assert_eq!(
+            response
+                .into_body()
+                .read_to_vec()
+                .expect("draining leaves a poolable connection"),
+            b"ok"
+        );
         assert!(
             UreqHttpClient::with_agent(shared)
                 .resource_report()
@@ -752,9 +764,9 @@ mod tests {
     async fn a_failed_request_still_switches_the_estimate_on() {
         let client = UreqHttpClient::new();
         client
-            .execute(get("http://127.0.0.1:1/nothing-listens".into()))
+            .execute(get(spawn_disconnecting_server()))
             .await
-            .expect_err("nothing is listening on port 1");
+            .expect_err("the peer hangs up before answering");
 
         assert_eq!(
             client.resource_report().and_then(|r| r.pool_connections),
@@ -764,6 +776,51 @@ mod tests {
 
     fn spawn_status_server(status: u16, reason: &str) -> String {
         spawn_status_server_with_body(status, reason, b"denied".to_vec())
+    }
+
+    /// Answers every request with a small 200 and leaves the connection open,
+    /// so a drained response goes back into the agent's pool.
+    fn spawn_keep_alive_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut tmp) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                        while let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            buf.drain(..pos + 4);
+                            if stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Accepts one connection and hangs up without answering. An owned port
+    /// rather than a well-known one nothing is expected to use, so the failure
+    /// is the fixture's doing and not the machine's.
+    fn spawn_disconnecting_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        format!("http://{addr}")
     }
 
     /// Answers one request with `status` and `body`. The request body is drained
