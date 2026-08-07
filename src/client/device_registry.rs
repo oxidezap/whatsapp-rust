@@ -3493,11 +3493,7 @@ mod tests {
 
         let hashed: Jid = format!("{contact_lid}@lid").parse().expect("jid");
         assert!(
-            client
-                .pending_device_sync
-                .take_all()
-                .await
-                .contains(&hashed),
+            client.pending_device_sync.take_all().contains(&hashed),
             "the hashed contact must be queued for a device-list refresh"
         );
     }
@@ -3522,7 +3518,7 @@ mod tests {
             .await;
 
         assert!(
-            client.pending_device_sync.take_all().await.is_empty(),
+            client.pending_device_sync.take_all().is_empty(),
             "an unresolvable hash must not refresh an unrelated contact"
         );
     }

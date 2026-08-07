@@ -54,10 +54,10 @@ impl Client {
     }
 
     /// Get the active noise socket, or error if not connected.
-    pub(crate) async fn get_noise_socket(&self) -> Result<Arc<NoiseSocket>, ClientError> {
+    pub(crate) fn get_noise_socket(&self) -> Result<Arc<NoiseSocket>, ClientError> {
         self.noise_socket
             .lock()
-            .await
+            .unwrap_or_else(|p| p.into_inner())
             .clone()
             .ok_or(ClientError::NotConnected)
     }

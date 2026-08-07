@@ -5539,7 +5539,7 @@ async fn capturing_client(
         write_key,
         read_key,
     );
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);
     seed_test_pn(&client).await;
     // Live-path semantics by default; drain tests re-enter drain state
@@ -8911,7 +8911,7 @@ async fn app_state_key_share_transport_retry_waits_for_reconnect() {
     // handshake and installs fresh keys and counters. Swap the socket to match,
     // since the one the failed frame poisoned dies with the old connection.
     client.connection_generation.fetch_add(1, Ordering::AcqRel);
-    *client.noise_socket.lock().await = Some(Arc::new(crate::socket::NoiseSocket::new(
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(crate::socket::NoiseSocket::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
         transport.clone() as Arc<dyn crate::transport::Transport>,
         wacore::handshake::NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),

@@ -343,7 +343,7 @@ impl Client {
             transport: Arc::new(Mutex::new(None)),
             transport_events: Arc::new(Mutex::new(None)),
             transport_factory,
-            noise_socket: Arc::new(Mutex::new(None)),
+            noise_socket: Arc::new(std::sync::Mutex::new(None)),
 
             response_waiters: Arc::new(std::sync::Mutex::new(ResponseWaiterMap::default())),
             node_waiters: std::sync::Mutex::new(Vec::new()),
@@ -378,7 +378,7 @@ impl Client {
                 cache_config.cache_stores.lid_pn_cache.clone(),
             )),
             ab_props: Arc::new(wacore::store::ab_props::AbPropsCache::new()),
-            group_cache: Mutex::new(None),
+            group_cache: std::sync::OnceLock::new(),
 
             expected_disconnect: Arc::new(AtomicBool::new(false)),
             intentional_reconnect: AtomicBool::new(false),
@@ -421,7 +421,7 @@ impl Client {
 
             needs_initial_full_sync: Arc::new(app_state::BootstrapGate::new(false)),
 
-            app_state_processor: Mutex::new(None),
+            app_state_processor: std::sync::OnceLock::new(),
             app_state_key_requests: Arc::new(Mutex::new(HashMap::new())),
             app_state_syncing: app_state::SyncInFlight::new(),
             app_state_send_lock: Arc::new(Mutex::new(())),
@@ -438,7 +438,7 @@ impl Client {
             outbound_flush: Arc::new(crate::flush_scope::FlushScope::new()),
             delivery_receipt_queue: std::sync::OnceLock::new(),
             transport_ack_queue: std::sync::OnceLock::new(),
-            presence_subscriptions: Arc::new(Mutex::new(HashSet::new())),
+            presence_subscriptions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             socket_ready_notifier: Arc::new(event_listener::Event::new()),
             is_ready: Arc::new(AtomicBool::new(false)),
             connected_notifier: Arc::new(event_listener::Event::new()),
@@ -460,10 +460,13 @@ impl Client {
             signal_flush_test_in_attempt: AtomicU32::new(0),
             #[cfg(test)]
             app_state_key_share_prepare_test_failures: AtomicU32::new(0),
+            #[cfg(test)]
+            chatstate_events_built: AtomicU32::new(0),
             custom_enc_handlers: std::sync::OnceLock::new(),
             inbound_durability_hook: std::sync::OnceLock::new(),
             retry_admission: std::sync::OnceLock::new(),
-            chatstate_handlers: Arc::new(RwLock::new(Vec::new())),
+            chatstate_handlers: Arc::new(std::sync::RwLock::new(Arc::from([]))),
+            chatstate_handler_count: AtomicUsize::new(0),
             pdo_pending_requests: cache_config.pdo_pending_requests.build_with_ttl(),
             pdo_requested: cache_config.pdo_requested.build_with_ttl(),
             device_registry_cache: device_topology::DeviceRegistryCache::new(
@@ -844,7 +847,7 @@ impl Client {
 
         *self.transport.lock().await = Some(transport);
         *self.transport_events.lock().await = Some(transport_events);
-        *self.noise_socket.lock().await = Some(noise_socket);
+        *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = Some(noise_socket);
         self.is_connected.store(true, Ordering::Release);
 
         // Notify waiters that socket is ready (before login)
@@ -1169,7 +1172,7 @@ impl Client {
             transport.disconnect().await;
         }
         *self.transport_events.lock().await = None;
-        *self.noise_socket.lock().await = None;
+        *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = None;
         // Authoritative point for the gauge: every disconnect (intentional or a
         // run-loop drop/reconnect) funnels through here, so disconnect()'s early
         // set is just a prompt redundant signal. (`is_connected` was already cleared above, before
@@ -1224,7 +1227,7 @@ impl Client {
         // Reset dead-socket timestamps so stale values from the previous
         // connection don't trigger an immediate reconnect on the next one.
         self.stats.reset_connection_activity();
-        self.pending_device_sync.clear().await;
+        self.pending_device_sync.clear();
         // Reset offline sync state for next connection
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
@@ -1286,7 +1289,7 @@ impl Client {
         *self.media_conn.write().await = None;
 
         // Clear app state key cache — keys will be re-fetched from DB on demand
-        if let Some(proc) = self.app_state_processor.lock().await.as_ref() {
+        if let Some(proc) = self.app_state_processor.get() {
             proc.clear_key_cache().await;
         }
         #[cfg(feature = "client-lifecycle")]

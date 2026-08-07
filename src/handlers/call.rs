@@ -2600,7 +2600,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
         (client, sends)
     }
 
@@ -2640,7 +2640,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
         (client, started_rx, release_tx)
     }
 
@@ -3883,7 +3883,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
 
         let node = node_to_owned_ref(&offer_stanza());
         let mut cancelled = false;
@@ -4594,7 +4594,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
 
         let (handler, rx) = ChannelEventHandler::new();
         client.subscribe_handler(handler).detach();

@@ -2011,7 +2011,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
         (client, count)
     }
 
@@ -2039,7 +2039,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
         client
     }
 
@@ -3590,7 +3590,7 @@ mod tests {
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(gated_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(gated_socket));
         crate::test_utils::answer_iq(
             &client,
             &request_id,
@@ -4731,7 +4731,7 @@ mod tests {
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
 
         let accept = tokio::spawn({
             let client = client.clone();
@@ -4854,7 +4854,7 @@ mod tests {
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(blocking_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(blocking_socket));
         crate::test_utils::answer_iq(
             &client,
             &request_id,
@@ -4997,7 +4997,7 @@ mod tests {
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(gated_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(gated_socket));
         crate::test_utils::answer_iq(
             &client,
             &request_id,

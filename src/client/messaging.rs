@@ -12,7 +12,7 @@ impl Client {
     /// This bypasses node logging and `sent_node_waiter` resolution — use
     /// [`send_node`](Client::send_node) for normal stanza sending.
     pub async fn send_raw_bytes(&self, plaintext: Vec<u8>) -> Result<(), ClientError> {
-        let noise_socket = self.get_noise_socket().await?;
+        let noise_socket = self.get_noise_socket()?;
         // Wire bytes and the last-sent timestamp are recorded by the noise
         // sender task at the actual transport write.
         noise_socket
@@ -53,7 +53,7 @@ impl Client {
         results: &mut Vec<crate::socket::error::EncryptSendResult>,
     ) -> Result<(), ClientError> {
         results.clear();
-        let noise_socket = match self.get_noise_socket().await {
+        let noise_socket = match self.get_noise_socket() {
             Ok(socket) => socket,
             Err(error) => {
                 frames.clear();
@@ -455,11 +455,19 @@ impl Client {
     /// Register a chatstate handler which will be invoked when a `<chatstate>` stanza is received.
     ///
     /// The handler receives a `ChatStateEvent` with the parsed chat state information.
-    pub async fn register_chatstate_handler(
-        &self,
-        handler: Arc<dyn Fn(ChatStateEvent) + Send + Sync>,
-    ) {
-        self.chatstate_handlers.write().await.push(handler);
+    pub fn register_chatstate_handler(&self, handler: Arc<dyn Fn(ChatStateEvent) + Send + Sync>) {
+        let mut guard = self
+            .chatstate_handlers
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut handlers = Vec::with_capacity(guard.len() + 1);
+        handlers.extend(guard.iter().cloned());
+        handlers.push(handler);
+        *guard = Arc::from(handlers);
+        // Published after the snapshot is in place, so a reader that sees a
+        // non-zero count always finds the handler behind it.
+        self.chatstate_handler_count
+            .store(guard.len(), Ordering::Release);
     }
 
     /// Dispatch a parsed chatstate stanza to registered handlers.
@@ -512,10 +520,20 @@ impl Client {
                 .build(),
         ));
 
-        // Invoke legacy callback handlers
+        // Invoke legacy callback handlers. Building the event is only worth it
+        // once something reads it, and the default registers nothing.
+        if self.chatstate_handler_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        #[cfg(test)]
+        self.chatstate_events_built.fetch_add(1, Ordering::Release);
         let event = ChatStateEvent::from_stanza(stanza);
-        let handlers = self.chatstate_handlers.read().await.clone();
-        for handler in handlers {
+        let handlers = self
+            .chatstate_handlers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for handler in handlers.iter().cloned() {
             let event_clone = event.clone();
             self.runtime
                 .spawn(Box::pin(async move {

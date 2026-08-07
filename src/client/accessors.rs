@@ -12,19 +12,15 @@ pub struct IdentityTags {
 }
 
 impl Client {
-    pub(crate) async fn get_group_cache(&self) -> Arc<GroupCache> {
-        let mut guard = self.group_cache.lock().await;
-        if let Some(cache) = guard.as_ref() {
-            return cache.clone();
-        }
-        debug!("Initializing Group Cache for the first time.");
-        let cache = Arc::new(
-            self.cache_config
-                .group_cache
-                .build_typed_ttl(self.cache_config.cache_stores.group_cache.clone(), "group"),
-        );
-        *guard = Some(cache.clone());
-        cache
+    pub(crate) fn get_group_cache(&self) -> &Arc<GroupCache> {
+        self.group_cache.get_or_init(|| {
+            debug!("Initializing Group Cache for the first time.");
+            Arc::new(
+                self.cache_config
+                    .group_cache
+                    .build_typed_ttl(self.cache_config.cache_stores.group_cache.clone(), "group"),
+            )
+        })
     }
 
     /// Subscribe an external event handler with an explicit event filter.
@@ -158,10 +154,9 @@ impl Client {
             .unwrap_or_else(|p| p.into_inner())
             .len();
 
-        // Only the Arc is taken under the mutex — the walk must not block
-        // get_group_cache(), which every group send goes through.
-        let group_cache_arc = self.group_cache.lock().await.clone();
-        let group_cache = match group_cache_arc {
+        // `get()`, not `get_group_cache()`: a report must not be what builds the
+        // cache, so an un-warmed client still reports zero entries.
+        let group_cache = match self.group_cache.get() {
             // Arc<T>'s HeapSize already includes size_of::<GroupInfo>().
             Some(cache) => {
                 cache
@@ -188,10 +183,14 @@ impl Client {
 
         // Each count read into a local so no two guards are ever held at once.
         let response_waiters = self.response_waiters_guard().len();
-        let presence_subscriptions = self.presence_subscriptions.lock().await.len();
+        let presence_subscriptions = self
+            .presence_subscriptions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
         let app_state_key_requests = self.app_state_key_requests.lock().await.len();
         let app_state_syncing = self.app_state_syncing.len();
-        let chatstate_handlers = self.chatstate_handlers.read().await.len();
+        let chatstate_handlers = self.chatstate_handler_count.load(Ordering::Acquire);
         let history_sync_activity = self.history_sync_activity.snapshot();
         let history_sync_tasks = CollectionStats::new(
             history_sync_activity.tasks as u64,

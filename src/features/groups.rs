@@ -350,13 +350,12 @@ pub(crate) struct GroupMetadataGuard<'a> {
 
 impl GroupMetadataGuard<'_> {
     pub(crate) async fn current(&self) -> Option<Arc<GroupInfo>> {
-        self.client.get_group_cache().await.get(self.jid).await
+        self.client.get_group_cache().get(self.jid).await
     }
 
     async fn cache(&self, info: Arc<GroupInfo>) {
         self.client
             .get_group_cache()
-            .await
             .insert(self.jid.clone(), info)
             .await;
     }
@@ -399,11 +398,7 @@ impl GroupMetadataGuard<'_> {
                 self.jid
             );
         }
-        self.client
-            .get_group_cache()
-            .await
-            .invalidate(self.jid)
-            .await;
+        self.client.get_group_cache().invalidate(self.jid).await;
     }
 }
 
@@ -445,7 +440,7 @@ impl<'a> Groups<'a> {
         jid: &Jid,
         freshness: crate::cache::Freshness,
     ) -> Result<Arc<GroupInfo>, GroupError> {
-        let cache = self.client.get_group_cache().await;
+        let cache = self.client.get_group_cache();
         let mut cached = cache.get(jid).await;
         if freshness == crate::cache::Freshness::CachePreferred
             && let Some(cached) = cached.take()
@@ -1751,7 +1746,7 @@ mod tests {
             ],
             AddressingMode::Pn,
         );
-        let cache = client.get_group_cache().await;
+        let cache = client.get_group_cache();
         cache.insert(group_jid.clone(), Arc::new(info)).await;
 
         let a = cache.get(&group_jid).await.expect("warm hit");
@@ -1771,7 +1766,7 @@ mod tests {
             vec!["12025550101@s.whatsapp.net".parse().unwrap()],
             AddressingMode::Pn,
         ));
-        let cache = client.get_group_cache().await;
+        let cache = client.get_group_cache();
         cache.insert(group.clone(), Arc::clone(&previous)).await;
 
         let result = client
@@ -1799,7 +1794,7 @@ mod tests {
         let parent: Jid = "120363000000000001@g.us".parse().unwrap();
         let unrelated: Jid = "120363000000000002@g.us".parse().unwrap();
         let removed: Jid = "12025550103@s.whatsapp.net".parse().unwrap();
-        let cache = client.get_group_cache().await;
+        let cache = client.get_group_cache();
         for jid in [&parent, &unrelated] {
             cache
                 .insert(

@@ -3358,14 +3358,14 @@ async fn test_is_connected_not_affected_by_mutex_contention() {
         write_key,
         read_key,
     );
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.is_connected.store(true, Ordering::Release);
 
     assert!(client.is_connected(), "should report connected");
 
     // Hold the noise_socket mutex — this used to make is_connected() return
     // false via try_lock() even though the socket was Some(...)
-    let _guard = client.noise_socket.lock().await;
+    let _guard = client.noise_socket.lock().unwrap();
     assert!(
         client.is_connected(),
         "is_connected() must return true even while noise_socket mutex is held"
@@ -3432,7 +3432,7 @@ async fn disconnect_does_not_signal_connection_cleanup_before_outbound_flush() {
     );
 
     *client.transport.lock().await = Some(transport);
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.is_connected.store(true, Ordering::Release);
 
     let cleanup_signal = client.connection_shutdown_signal();
@@ -3513,7 +3513,7 @@ async fn install_test_noise_socket(
         NoiseCipher::new(&key).expect("valid key"),
         NoiseCipher::new(&key).expect("valid key"),
     );
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);
 }
 
@@ -3818,7 +3818,7 @@ async fn delivery_receipt_worker_sends_and_releases_flush() {
         NoiseCipher::new(&key).expect("valid key"),
     );
     *client.transport.lock().await = Some(transport);
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.is_connected.store(true, Ordering::Release);
 
     client.ack_received_message(&receipt_test_info("RCPT-WORKER-1"));
@@ -3949,7 +3949,7 @@ async fn flush_waits_for_queued_delivery_receipts() {
         NoiseCipher::new(&key).expect("valid key"),
     );
     *client.transport.lock().await = Some(transport);
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.is_connected.store(true, Ordering::Release);
 
     client.ack_received_message(&receipt_test_info("RCPT-QUEUE-1"));
@@ -4749,5 +4749,148 @@ async fn a_terminal_connect_failure_releases_a_parked_wait() {
             .expect("and the wait must end on that decision")
             .expect("the waiter should not panic"),
         "reporting that no connection arrived"
+    );
+}
+
+/// The write-once cells (`group_cache`, `app_state_processor`) are read on the
+/// send and app-state paths on the strength of never being rebuilt. These prove
+/// the three ways that could break: a second call, a reconnect cleanup, and a
+/// racing first call.
+#[tokio::test]
+async fn write_once_cells_return_the_same_instance_across_calls() {
+    let client = crate::test_utils::create_test_client().await;
+
+    let group_cache = client.get_group_cache().clone();
+    let processor = client.get_app_state_processor().clone();
+
+    assert!(
+        Arc::ptr_eq(&group_cache, client.get_group_cache()),
+        "the group cache must not be rebuilt on a second read"
+    );
+    assert!(
+        Arc::ptr_eq(&processor, client.get_app_state_processor()),
+        "the app-state processor must not be rebuilt on a second read"
+    );
+}
+
+#[tokio::test]
+async fn reconnect_cleanup_leaves_the_write_once_cells_installed() {
+    let client = crate::test_utils::create_test_client().await;
+
+    let group_cache = client.get_group_cache().clone();
+    let processor = client.get_app_state_processor().clone();
+
+    client.cleanup_connection_state().await;
+
+    assert!(
+        Arc::ptr_eq(&group_cache, client.get_group_cache()),
+        "cleanup must not drop the group cache"
+    );
+    assert!(
+        Arc::ptr_eq(&processor, client.get_app_state_processor()),
+        "cleanup clears the processor's key cache in place, it does not replace it"
+    );
+    assert!(
+        client.group_cache.get().is_some() && client.app_state_processor.get().is_some(),
+        "and neither cell may fall back to uninitialized"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_readers_agree_on_one_instance() {
+    let client = crate::test_utils::create_test_client().await;
+
+    let readers: Vec<_> = (0..16)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                (
+                    client.get_group_cache().clone(),
+                    client.get_app_state_processor().clone(),
+                )
+            })
+        })
+        .collect();
+
+    let mut results = Vec::with_capacity(readers.len());
+    for reader in readers {
+        results.push(reader.await.expect("reader task should not panic"));
+    }
+
+    let (first_cache, first_processor) = &results[0];
+    for (cache, processor) in &results {
+        assert!(
+            Arc::ptr_eq(first_cache, cache),
+            "every racing reader must observe the same group cache"
+        );
+        assert!(
+            Arc::ptr_eq(first_processor, processor),
+            "every racing reader must observe the same app-state processor"
+        );
+    }
+}
+
+fn test_chatstate_stanza() -> wacore::iq::chatstate::ChatstateStanza {
+    use wacore::iq::chatstate::{ChatstateSource, ChatstateStanza, ReceivedChatState};
+
+    ChatstateStanza {
+        source: ChatstateSource::User {
+            from: "15550001111@s.whatsapp.net".parse().expect("valid jid"),
+        },
+        state: ReceivedChatState::Typing,
+    }
+}
+
+#[tokio::test]
+async fn chatstate_dispatch_skips_the_event_build_with_no_handlers() {
+    let client = crate::test_utils::create_test_client().await;
+
+    client
+        .dispatch_chatstate_event(test_chatstate_stanza())
+        .await;
+
+    assert_eq!(
+        client.chatstate_events_built.load(Ordering::Acquire),
+        0,
+        "the default registers no handler, so nothing should read the event"
+    );
+}
+
+#[tokio::test]
+async fn chatstate_dispatch_reaches_every_registered_handler() {
+    let client = crate::test_utils::create_test_client().await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    for tag in ["first", "second"] {
+        let seen = seen.clone();
+        client.register_chatstate_handler(Arc::new(move |event| {
+            seen.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((tag, event.chat.to_string()));
+        }));
+    }
+
+    client
+        .dispatch_chatstate_event(test_chatstate_stanza())
+        .await;
+
+    crate::test_utils::poll_until("both chatstate handlers ran", || {
+        seen.lock().unwrap_or_else(|p| p.into_inner()).len() == 2
+    })
+    .await;
+
+    let mut seen = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("first", "15550001111@s.whatsapp.net".to_string()),
+            ("second", "15550001111@s.whatsapp.net".to_string()),
+        ]
+    );
+    assert_eq!(
+        client.chatstate_events_built.load(Ordering::Acquire),
+        1,
+        "the event is built once and cloned per handler"
     );
 }

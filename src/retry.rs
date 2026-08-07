@@ -1692,7 +1692,7 @@ mod tests {
             NoiseCipher::new(&key).expect("write cipher"),
             NoiseCipher::new(&key).expect("read cipher"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(socket));
     }
 
     async fn seed_retry_lease(

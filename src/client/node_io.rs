@@ -163,7 +163,6 @@ impl Client {
         // so resolve it once instead of locking the mutex per frame.
         let noise_socket = self
             .get_noise_socket()
-            .await
             .map_err(|_| ReadLoopError::NotStarted("no noise socket"))?;
 
         // Frame decoder to parse incoming data

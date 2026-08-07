@@ -642,18 +642,14 @@ fn finalize_app_state_key_request_peers(
 }
 
 impl Client {
-    pub(crate) async fn get_app_state_processor(&self) -> Arc<AppStateProcessor> {
-        let mut guard = self.app_state_processor.lock().await;
-        if let Some(proc) = guard.as_ref() {
-            return proc.clone();
-        }
-        debug!("Initializing AppStateProcessor for the first time.");
-        let proc = Arc::new(AppStateProcessor::new(
-            self.persistence_manager.backend(),
-            self.runtime.clone(),
-        ));
-        *guard = Some(proc.clone());
-        proc
+    pub(crate) fn get_app_state_processor(&self) -> &Arc<AppStateProcessor> {
+        self.app_state_processor.get_or_init(|| {
+            debug!("Initializing AppStateProcessor for the first time.");
+            Arc::new(AppStateProcessor::new(
+                self.persistence_manager.backend(),
+                self.runtime.clone(),
+            ))
+        })
     }
 
     /// Pre-download every external blob (snapshots + patch external mutations)
@@ -1698,7 +1694,7 @@ impl Client {
                 });
             }
 
-            let proc = self.get_app_state_processor().await;
+            let proc = self.get_app_state_processor();
             // Pre-download all external blobs for all collections in the response,
             // concurrently (independent CDN GETs, keyed by directPath).
             let pre_downloaded = self.pre_download_external_blobs(&patch_lists).await;
@@ -2008,7 +2004,7 @@ impl Client {
             debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
                 name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
 
-            let proc = self.get_app_state_processor().await;
+            let proc = self.get_app_state_processor();
 
             // Pre-download all external blobs (snapshot and patch mutations),
             // concurrently, keyed by directPath.
@@ -2394,7 +2390,7 @@ impl Client {
             ),
             None => None,
         };
-        let proc = self.get_app_state_processor().await;
+        let proc = self.get_app_state_processor();
 
         for attempt in 1..=APP_STATE_PATCH_SEND_ATTEMPTS {
             // Cloned per attempt because a conflict rebuilds the patch against
@@ -2531,7 +2527,7 @@ impl Client {
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("external blob not pre-downloaded: {path}"))
             };
-            let proc = self.get_app_state_processor().await;
+            let proc = self.get_app_state_processor();
             match proc.process_parsed_patch_list(list, &download, true).await {
                 Ok((mutations, _, _)) => {
                     wacore::telemetry::appstate_mutations(mutations.len() as u64);

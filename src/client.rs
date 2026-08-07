@@ -973,7 +973,10 @@ pub struct Client {
     pub(crate) transport_events:
         Arc<Mutex<Option<async_channel::Receiver<crate::transport::TransportEvent>>>>,
     pub(crate) transport_factory: Arc<dyn crate::transport::TransportFactory>,
-    pub(crate) noise_socket: Arc<Mutex<Option<Arc<NoiseSocket>>>>,
+    /// Replaced per connection, so not a `OnceLock` — but every critical section
+    /// is a clone or a store, so a sync lock makes holding it across an `.await`
+    /// a compile error on the send path rather than a review question.
+    pub(crate) noise_socket: Arc<std::sync::Mutex<Option<Arc<NoiseSocket>>>>,
 
     /// Pending IQ/ack response waiters keyed by request id.
     ///
@@ -1027,7 +1030,9 @@ pub struct Client {
     pub(crate) lid_pn_cache: Arc<LidPnCache>,
     pub(crate) ab_props: Arc<wacore::store::ab_props::AbPropsCache>,
 
-    pub group_cache: Mutex<Option<Arc<GroupCache>>>,
+    /// Lazily built on the first group send and never replaced afterwards, so a
+    /// `OnceLock` keeps the read on that path down to an atomic load.
+    pub group_cache: std::sync::OnceLock<Arc<GroupCache>>,
 
     pub(crate) expected_disconnect: Arc<AtomicBool>,
     /// Set by `reconnect()` to suppress the "Message loop exited with an error" warning.
@@ -1093,7 +1098,9 @@ pub struct Client {
 
     pub(crate) needs_initial_full_sync: Arc<app_state::BootstrapGate>,
 
-    pub(crate) app_state_processor: Mutex<Option<Arc<AppStateProcessor>>>,
+    /// Built on first app-state use and never replaced: reconnect clears the
+    /// processor's key cache in place rather than swapping the processor.
+    pub(crate) app_state_processor: std::sync::OnceLock<Arc<AppStateProcessor>>,
     pub(crate) app_state_key_requests: Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>,
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
@@ -1159,7 +1166,7 @@ pub struct Client {
         )>,
     >,
     /// Contacts with active presence subscriptions that must be re-subscribed on reconnect.
-    pub(crate) presence_subscriptions: Arc<Mutex<HashSet<Jid>>>,
+    pub(crate) presence_subscriptions: Arc<std::sync::Mutex<HashSet<Jid>>>,
     /// Metrics for granular offline sync logging
     pub(crate) offline_sync_metrics: Arc<OfflineSyncMetrics>,
     /// Drives the WA Web pull-batch loop for offline backlog delivery.
@@ -1241,7 +1248,12 @@ pub struct Client {
 
     /// Chat state (typing indicator) handlers registered by external consumers.
     /// Each handler receives a `ChatStateEvent` describing the chat, optional participant and state.
-    pub(crate) chatstate_handlers: Arc<RwLock<Vec<ChatStateHandler>>>,
+    ///
+    /// Copy-on-write behind a sync lock, guarded by `chatstate_handler_count` so
+    /// the default (no handler registered) never takes the lock nor builds the
+    /// event that only a handler would read.
+    pub(crate) chatstate_handlers: Arc<std::sync::RwLock<Arc<[ChatStateHandler]>>>,
+    pub(crate) chatstate_handler_count: AtomicUsize,
 
     pub(crate) pdo_pending_requests: Cache<ChatMessageId, crate::pdo::PendingPdoRequest>,
 
@@ -1358,6 +1370,10 @@ pub struct Client {
     /// Keeps retry regressions deterministic without corrupting the test database.
     #[cfg(test)]
     pub(crate) app_state_key_share_prepare_test_failures: AtomicU32,
+    /// Counts `ChatStateEvent` constructions, so a test can prove the
+    /// no-handler fast path skips the build rather than just the invoke.
+    #[cfg(test)]
+    pub(crate) chatstate_events_built: AtomicU32,
 
     /// Holds the background saver's AbortHandle so the task lifetime follows
     /// `Arc<Client>` ref count instead of the Bot wrapper's. Set once by

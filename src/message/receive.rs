@@ -1410,7 +1410,7 @@ impl Client {
         is_offline: bool,
     ) {
         // Dedup: skip if we already have a sync pending/in-flight for this user
-        if !self.pending_device_sync.add(&user_jid).await {
+        if !self.pending_device_sync.add(&user_jid) {
             return;
         }
 
@@ -1857,7 +1857,7 @@ mod tests {
             .schedule_unknown_device_sync(user.clone(), true)
             .await;
 
-        let pending = client.pending_device_sync.take_all().await;
+        let pending = client.pending_device_sync.take_all();
         assert_eq!(pending, vec![user]);
     }
 }

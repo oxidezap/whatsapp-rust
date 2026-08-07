@@ -783,7 +783,7 @@ impl Client {
         use rand::Rng;
         use wacore::appstate::encode::encode_record;
 
-        let proc = self.get_app_state_processor().await;
+        let proc = self.get_app_state_processor();
         let key_id = proc
             .backend
             .get_latest_sync_key_id()

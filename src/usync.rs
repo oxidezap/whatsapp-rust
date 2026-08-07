@@ -487,7 +487,7 @@ impl Client {
         )
     )]
     pub(crate) async fn flush_pending_device_sync(&self) {
-        let pending = self.pending_device_sync.take_all().await;
+        let pending = self.pending_device_sync.take_all();
         if pending.is_empty() {
             return;
         }
@@ -513,7 +513,7 @@ impl Client {
                     pending.len()
                 );
                 for jid in &pending {
-                    self.pending_device_sync.add(jid).await;
+                    self.pending_device_sync.add(jid);
                 }
             }
         }

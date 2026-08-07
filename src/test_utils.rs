@@ -329,7 +329,7 @@ pub(crate) async fn create_iq_test_client() -> (
         NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
         Some(client.stats.clone()),
     );
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);
     client
         .is_running

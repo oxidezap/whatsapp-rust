@@ -3772,7 +3772,7 @@ mod tests {
             NoiseCipher::new(&key).expect("key"),
             NoiseCipher::new(&key).expect("key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     }
 
     struct GatedSendTransport {
@@ -3971,7 +3971,6 @@ mod tests {
         let group = Jid::new("120363000000000001", Server::Group);
         client
             .get_group_cache()
-            .await
             .insert(
                 group.clone(),
                 Arc::new(GroupInfo::new(
