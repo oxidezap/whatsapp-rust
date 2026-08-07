@@ -1471,7 +1471,7 @@ async fn fanout_group_epoch_for_generation(
             }
         }
         let plan = wacore::send::SessionPlan::assume_ready(recipients.len());
-        let mut adapter = client.signal_adapter().await;
+        let mut adapter = client.signal_adapter();
         let mut stores = adapter.as_signal_stores();
         let encrypted = wacore::send::encrypt_for_devices_with_sessions_raw(
             &*client.runtime,
@@ -1654,7 +1654,7 @@ async fn place_call(
         // encrypt against the existing sessions directly: a device whose session is somehow still
         // missing fails its encrypt and is skipped, exactly as the old per-device loop did.
         let plan = wacore::send::SessionPlan::assume_ready(devices.len());
-        let mut adapter = client.signal_adapter().await;
+        let mut adapter = client.signal_adapter();
         let mut stores = adapter.as_signal_stores();
         let raw = wacore::send::encrypt_for_devices_with_sessions_raw(
             &*client.runtime,

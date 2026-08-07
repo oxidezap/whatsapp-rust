@@ -778,7 +778,7 @@ async fn bobs_prekey_bundle_with_spk_id(client: &Arc<Client>, spk_id: u32) -> (P
     // Read/write prekeys through the same trait surface production uses
     // (see signal_adapter.rs). Avoids reaching past `PersistenceManager`
     // to mutate device storage directly.
-    let mut adapter = client.signal_adapter().await;
+    let mut adapter = client.signal_adapter();
     let spk_record = adapter
         .signed_pre_key_store
         .get_signed_pre_key(1.into())

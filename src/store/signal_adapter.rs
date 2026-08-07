@@ -1,6 +1,5 @@
 use crate::store::Device;
 use crate::store::signal_cache::SignalStoreCache;
-use async_lock::RwLock;
 use async_trait::async_trait;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{
@@ -33,9 +32,13 @@ type BoxFut<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + 'a>>;
 
 use std::future::{Future, ready};
 
+/// A snapshot, not a lock handle: `Device::backend` is set once in
+/// `Device::new` and never reassigned, so taking the write-preferring device
+/// lock only to reach it puts every Signal read behind any in-flight device
+/// write for the length of a backend round-trip.
 #[derive(Clone)]
 struct SharedDevice {
-    device: Arc<RwLock<Device>>,
+    device: Arc<Device>,
     cache: Arc<SignalStoreCache>,
 }
 
@@ -55,7 +58,7 @@ impl SenderKeyAdapter {
     /// Build a standalone sender-key store without constructing the full
     /// five-store [`SignalProtocolStoreAdapter`]. Used on the SKDM-processing
     /// path, which only needs the sender-key store.
-    pub fn new(device: Arc<RwLock<Device>>, cache: Arc<SignalStoreCache>) -> Self {
+    pub fn new(device: Arc<Device>, cache: Arc<SignalStoreCache>) -> Self {
         Self(SharedDevice { device, cache })
     }
 }
@@ -70,7 +73,7 @@ pub struct SignalProtocolStoreAdapter {
 }
 
 impl SignalProtocolStoreAdapter {
-    pub fn new(device: Arc<RwLock<Device>>, cache: Arc<SignalStoreCache>) -> Self {
+    pub fn new(device: Arc<Device>, cache: Arc<SignalStoreCache>) -> Self {
         let shared = SharedDevice { device, cache };
         Self {
             session_store: SessionAdapter(shared.clone()),
@@ -99,7 +102,7 @@ impl SessionStore for SessionAdapter {
         &self,
         address: &ProtocolAddress,
     ) -> Result<Option<SessionRecord>, SignalProtocolError> {
-        let device = self.0.device.read().await;
+        let device = self.0.device.as_ref();
         self.0
             .cache
             .peek_session(address, &*device.backend)
@@ -112,7 +115,7 @@ impl SessionStore for SessionAdapter {
         &self,
         address: &ProtocolAddress,
     ) -> Result<(Option<SessionRecord>, Option<SessionCheckoutKey>), SignalProtocolError> {
-        let device = self.0.device.read().await;
+        let device = self.0.device.as_ref();
         self.0
             .cache
             .checkout_session(address, &*device.backend)
@@ -184,7 +187,7 @@ impl SessionStore for SessionAdapter {
             return Box::pin(ready(answer));
         }
         Box::pin(async move {
-            let device = self.0.device.read().await;
+            let device = self.0.device.as_ref();
             self.0
                 .cache
                 .has_session(address, &*device.backend)
@@ -247,15 +250,15 @@ impl IdentityAdapter {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl IdentityKeyStore for IdentityAdapter {
     async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        IdentityKeyStore::get_identity_key_pair(&*device)
+        let device = self.0.device.as_ref();
+        IdentityKeyStore::get_identity_key_pair(device)
             .await
             .map_err(signal_err("get_identity_key_pair"))
     }
 
     async fn get_local_registration_id(&self) -> Result<u32, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        IdentityKeyStore::get_local_registration_id(&*device)
+        let device = self.0.device.as_ref();
+        IdentityKeyStore::get_local_registration_id(device)
             .await
             .map_err(signal_err("get_local_registration_id"))
     }
@@ -345,7 +348,7 @@ impl IdentityKeyStore for IdentityAdapter {
             return Box::pin(ready(parse_cached_identity(cached)));
         }
         Box::pin(async move {
-            let device = self.0.device.read().await;
+            let device = self.0.device.as_ref();
             let data = self
                 .0
                 .cache
@@ -376,8 +379,8 @@ fn parse_cached_identity(
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl PreKeyStore for PreKeyAdapter {
     async fn get_pre_key(&self, prekey_id: PreKeyId) -> Result<PreKeyRecord, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        WacorePreKeyStore::load_prekey(&*device, prekey_id.into())
+        let device = self.0.device.as_ref();
+        WacorePreKeyStore::load_prekey(device, prekey_id.into())
             .await
             .map_err(signal_err("backend"))?
             .ok_or(SignalProtocolError::InvalidPreKeyId)
@@ -388,9 +391,9 @@ impl PreKeyStore for PreKeyAdapter {
         prekey_id: PreKeyId,
         record: &PreKeyRecord,
     ) -> Result<(), SignalProtocolError> {
-        let device = self.0.device.read().await;
+        let device = self.0.device.as_ref();
         let structure = wacore_record::prekey_record_to_structure(record)?;
-        WacorePreKeyStore::store_prekey(&*device, prekey_id.into(), structure, false)
+        WacorePreKeyStore::store_prekey(device, prekey_id.into(), structure, false)
             .await
             .map_err(signal_err("backend"))
     }
@@ -399,7 +402,7 @@ impl PreKeyStore for PreKeyAdapter {
         // through here: message_decrypt reports the consumed prekey and the receive
         // path buffers it via buffer_consumed_prekey so the durable delete is
         // atomic with the session flush (matching WAWebSignalProtocolStoreUnifiedApi).
-        let device = self.0.device.read().await;
+        let device = self.0.device.as_ref();
         device
             .backend
             .remove_prekey(prekey_id.into())
@@ -429,8 +432,8 @@ impl SignedPreKeyStore for SignedPreKeyAdapter {
         &self,
         signed_prekey_id: SignedPreKeyId,
     ) -> Result<SignedPreKeyRecord, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        WacoreSignedPreKeyStore::load_signed_prekey(&*device, signed_prekey_id.into())
+        let device = self.0.device.as_ref();
+        WacoreSignedPreKeyStore::load_signed_prekey(device, signed_prekey_id.into())
             .await
             .map_err(signal_err("backend"))?
             .ok_or(SignalProtocolError::InvalidSignedPreKeyId)
@@ -463,7 +466,7 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
     ) -> wacore::libsignal::protocol::error::Result<
         Option<wacore::libsignal::protocol::SenderKeyRecord>,
     > {
-        let device = self.0.device.read().await;
+        let device = self.0.device.as_ref();
         // group_decrypt mutates the loaded record (catch-up + ratchet) and stores
         // it back, so the trait needs an owned copy. The cache keeps its `Arc`, so
         // this clones the inner record (unchanged from the prior behavior).
@@ -508,7 +511,7 @@ mod tests {
             .await
             .unwrap();
 
-        let device = Arc::new(RwLock::new(Device::new(backend.clone())));
+        let device = Arc::new(Device::new(backend.clone()));
         let cache = Arc::new(SignalStoreCache::new());
         let adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
 
@@ -544,7 +547,7 @@ mod tests {
             .await
             .unwrap();
 
-        let device = Arc::new(RwLock::new(Device::new(backend.clone())));
+        let device = Arc::new(Device::new(backend.clone()));
         let cache = Arc::new(SignalStoreCache::new());
         let mut adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
 
@@ -562,7 +565,7 @@ mod tests {
 
     fn test_adapter() -> SignalProtocolStoreAdapter {
         let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
-        let device = Arc::new(RwLock::new(Device::new(backend)));
+        let device = Arc::new(Device::new(backend));
         SignalProtocolStoreAdapter::new(device, Arc::new(SignalStoreCache::new()))
     }
 
@@ -650,7 +653,7 @@ mod tests {
             seed_durable,
         );
 
-        let device = Arc::new(RwLock::new(Device::new(backend.clone())));
+        let device = Arc::new(Device::new(backend.clone()));
         let mut session_store =
             SignalProtocolStoreAdapter::new(device, cache.clone()).session_store;
         let entered = Arc::new(async_lock::Barrier::new(2));
@@ -715,7 +718,7 @@ mod tests {
 
         let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
         let cache = Arc::new(SignalStoreCache::new());
-        let device = Arc::new(RwLock::new(Device::new(backend)));
+        let device = Arc::new(Device::new(backend));
         let mut adapter = SignalProtocolStoreAdapter::new(device, cache.clone());
         let address = ProtocolAddress::new("15550005555", 1.into());
         cache
@@ -846,7 +849,7 @@ mod hook_alloc_tests {
 
     fn adapter_for_test() -> SignalProtocolStoreAdapter {
         let backend: Arc<dyn crate::store::Backend> = Arc::new(InMemoryBackend::new());
-        let device = Arc::new(RwLock::new(Device::new(backend)));
+        let device = Arc::new(Device::new(backend));
         SignalProtocolStoreAdapter::new(device, Arc::new(SignalStoreCache::new()))
     }
 

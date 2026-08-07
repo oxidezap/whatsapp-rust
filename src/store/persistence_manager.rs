@@ -74,7 +74,7 @@ impl PersistenceManager {
         })
     }
 
-    /// Handle for store adapters that need `&mut Device` trait access.
+    /// Handle for callers that need `&mut Device` trait access directly.
     /// For plain reads, prefer [`get_device_snapshot`](Self::get_device_snapshot).
     pub async fn get_device_arc(&self) -> Arc<RwLock<Device>> {
         self.device.clone()

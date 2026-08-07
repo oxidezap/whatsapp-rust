@@ -31,11 +31,12 @@ fn new_store_incarnation() -> StoreIncarnation {
 /// that grows the map, including read-populate (cache-miss) inserts, so the cache
 /// stays bounded even under unique-key read floods; the early-out keeps it cheap.
 fn evict_clean_entries<V>(
-    cache: &mut HashMap<Arc<str>, Option<V>>,
+    cache: &mut UserIndexedCache<Option<V>>,
     dirty: &HashSet<Arc<str>>,
     deleted: Option<&HashSet<Arc<str>>>,
     max_entries: usize,
 ) {
+    compact_users_if_needed(cache, max_entries);
     if cache.len() <= high_watermark(max_entries) {
         return;
     }
@@ -62,6 +63,15 @@ fn evict_clean_entries<V>(
     }
 }
 
+/// Rebuild the user superset once eviction has let it drift a whole watermark
+/// past the entries backing it. A rebuild leaves it no larger than the live key
+/// count, so the next one is that many inserts away.
+fn compact_users_if_needed<V>(cache: &mut UserIndexedCache<V>, max_entries: usize) {
+    if cache.users_len() > high_watermark(max_entries) {
+        cache.compact_users();
+    }
+}
+
 /// Default max entries per store before clean entry eviction triggers.
 const DEFAULT_MAX_CACHE_ENTRIES: usize = 2_000;
 
@@ -82,6 +92,112 @@ fn protocol_address_matches_user(address: &str, user: &str) -> bool {
     address
         .strip_prefix(user)
         .is_some_and(|suffix| suffix.starts_with('@') || suffix.starts_with(':'))
+}
+
+/// The user half of a protocol address, matching the prefix
+/// [`protocol_address_matches_user`] tests.
+fn user_of_protocol_address(address: &str) -> &str {
+    match address.find(['@', ':']) {
+        Some(end) => &address[..end],
+        None => address,
+    }
+}
+
+/// A cache map that can answer "is any address here owned by this user?"
+/// without scanning every key.
+///
+/// The user set is a deliberate superset: removals leave it untouched, so its
+/// only error is a `true` for a user whose last entry is gone, costing one
+/// migration pass that finds nothing. It can never answer "no state" for a
+/// user that has some, which is the direction that would silently skip a
+/// migration. `insert` is the only way in, so an entry cannot reach the map
+/// without registering its user.
+struct UserIndexedCache<V> {
+    map: HashMap<Arc<str>, V>,
+    users: HashSet<Arc<str>>,
+}
+
+impl<V> UserIndexedCache<V> {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            users: HashSet::new(),
+        }
+    }
+
+    fn insert(&mut self, key: Arc<str>, value: V) -> Option<V> {
+        let user = user_of_protocol_address(&key);
+        if !self.users.contains(user) {
+            self.users.insert(Arc::from(user));
+        }
+        self.map.insert(key, value)
+    }
+
+    fn has_user(&self, user: &str) -> bool {
+        self.users.contains(user)
+    }
+
+    /// Drop users no longer backed by an entry. Bounds the superset's drift
+    /// after eviction; callers gate it on a watermark so it stays amortized.
+    fn compact_users(&mut self) {
+        self.users.clear();
+        let users: Vec<Arc<str>> = self
+            .map
+            .keys()
+            .map(|key| Arc::from(user_of_protocol_address(key)))
+            .collect();
+        self.users.extend(users);
+    }
+
+    fn users_len(&self) -> usize {
+        self.users.len()
+    }
+
+    fn get(&self, key: &str) -> Option<&V> {
+        self.map.get(key)
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.map.get_mut(key)
+    }
+
+    fn get_key_value(&self, key: &str) -> Option<(&Arc<str>, &V)> {
+        self.map.get_key_value(key)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.map.contains_key(key)
+    }
+
+    fn remove(&mut self, key: &str) -> Option<V> {
+        self.map.remove(key)
+    }
+
+    fn retain(&mut self, keep: impl FnMut(&Arc<str>, &mut V) -> bool) {
+        self.map.retain(keep);
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.users.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &V)> {
+        self.map.iter()
+    }
+
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.map.values()
+    }
 }
 
 /// In-memory write-back cache for Signal protocol state.
@@ -150,7 +266,7 @@ struct SessionStoreState {
     incarnation: StoreIncarnation,
     checkout_generation: u64,
     next_checkout_token: u64,
-    cache: HashMap<Arc<str>, SessionEntry>,
+    cache: UserIndexedCache<SessionEntry>,
     dirty: HashSet<Arc<str>>,
     deleted: HashSet<Arc<str>>,
     /// Sessions whose raised counter reservation has not reached the backend
@@ -168,7 +284,7 @@ impl SessionStoreState {
             incarnation,
             checkout_generation: 0,
             next_checkout_token: 1,
-            cache: HashMap::new(),
+            cache: UserIndexedCache::new(),
             dirty: HashSet::new(),
             deleted: HashSet::new(),
             reservation_pending: HashSet::new(),
@@ -258,6 +374,10 @@ impl SessionStoreState {
     fn clear_clean_entries(&mut self) {
         self.cache
             .retain(|_, entry| matches!(entry, SessionEntry::CheckedOut { .. }));
+        // Teardown drops nearly every entry at once and is not a hot path, so
+        // settle the user superset here instead of letting it drift until the
+        // watermark rebuild.
+        self.cache.compact_users();
     }
 
     fn discard(&mut self, incarnation: StoreIncarnation, generation: u64) {
@@ -267,6 +387,7 @@ impl SessionStoreState {
     }
 
     fn evict_if_needed(&mut self, max_entries: usize) {
+        compact_users_if_needed(&mut self.cache, max_entries);
         if self.cache.len() <= high_watermark(max_entries) {
             return;
         }
@@ -304,7 +425,7 @@ struct SenderKeyStoreState {
     // `Arc`-wrapped so a warm `get_sender_key` (the per-send peek reads and the
     // per-decrypt load) bumps a refcount instead of deep-cloning the record's
     // `VecDeque<SenderKeyState>` with up to `MAX_MESSAGE_KEYS` message keys each.
-    cache: HashMap<Arc<str>, Option<Arc<SenderKeyRecord>>>,
+    cache: UserIndexedCache<Option<Arc<SenderKeyRecord>>>,
     dirty: HashSet<Arc<str>>,
     /// Chains whose outbound iteration lease was raised but not yet persisted;
     /// the send path must flush before the wire while any entry is here.
@@ -323,7 +444,7 @@ impl SenderKeyStoreState {
     fn new(incarnation: StoreIncarnation) -> Self {
         Self {
             incarnation,
-            cache: HashMap::new(),
+            cache: UserIndexedCache::new(),
             dirty: HashSet::new(),
             wire_gate_pending: HashSet::new(),
             pending_distributions: HashMap::new(),
@@ -375,7 +496,7 @@ impl SenderKeyStoreState {
 
 struct ByteStoreState {
     /// Cached entries. `None` value = known-absent (negative cache).
-    cache: HashMap<Arc<str>, Option<Arc<[u8]>>>,
+    cache: UserIndexedCache<Option<Arc<[u8]>>>,
     dirty: HashSet<Arc<str>>,
     deleted: HashSet<Arc<str>>,
 }
@@ -383,7 +504,7 @@ struct ByteStoreState {
 impl ByteStoreState {
     fn new() -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: UserIndexedCache::new(),
             dirty: HashSet::new(),
             deleted: HashSet::new(),
         }
@@ -644,25 +765,11 @@ impl SignalStoreCache {
     /// (even a stale/checked-out marker), so it never reports "none" when state
     /// might exist.
     pub async fn has_state_for_user(&self, user: &str, backend: &dyn SignalStore) -> Result<bool> {
-        {
-            let state = self.lock_sessions().await;
-            if state
-                .cache
-                .keys()
-                .any(|address| protocol_address_matches_user(address, user))
-            {
-                return Ok(true);
-            }
+        if self.lock_sessions().await.cache.has_user(user) {
+            return Ok(true);
         }
-        {
-            let state = self.identities.lock().await;
-            if state
-                .cache
-                .keys()
-                .any(|address| protocol_address_matches_user(address, user))
-            {
-                return Ok(true);
-            }
+        if self.identities.lock().await.cache.has_user(user) {
+            return Ok(true);
         }
         Ok(backend.has_signal_state_for_user(user).await?)
     }
@@ -1014,11 +1121,26 @@ impl SignalStoreCache {
         backend: &dyn SignalStore,
     ) -> Result<Option<Arc<SenderKeyRecord>>> {
         let key = name.cache_key();
+        {
+            let state = self.sender_keys.lock().await;
+            if let Some(cached) = state.cache.get(key) {
+                return Ok(cached.clone());
+            }
+        }
+        // Backend I/O outside the lock
+        let backend_result = backend.get_sender_key(key).await?;
         let mut state = self.sender_keys.lock().await;
+        // A put or delete may have landed while we awaited. It describes the
+        // chain more recently than the bytes we just read, so it wins; we would
+        // otherwise resurrect a deleted chain or undo a fresher iteration.
         if let Some(cached) = state.cache.get(key) {
             return Ok(cached.clone());
         }
-        let record = match backend.get_sender_key(key).await? {
+        // Incarnation read after the re-lock: a lossy clear during the I/O
+        // installs a new one, and decoding under the pre-clear incarnation
+        // would claim an exact reload for counters that may already be on the
+        // wire instead of burning to the stored reservation ceiling.
+        let record = match backend_result {
             Some(bytes) => Some(Arc::new(SenderKeyRecord::deserialize_for_store(
                 &bytes,
                 &state.incarnation,
@@ -1652,6 +1774,427 @@ mod sender_key_lock_tests {
         async fn delete_sender_key(&self, _: &str) -> StoreResult<()> {
             unreachable!()
         }
+    }
+
+    /// Sender-key backend whose read parks until every expected reader has
+    /// arrived, so a test can prove that N cold readers reach it concurrently
+    /// rather than queueing on the global cache mutex.
+    struct GatedSenderKeyLookup {
+        arrived: async_lock::Barrier,
+        release: async_lock::Barrier,
+        hits: std::sync::atomic::AtomicUsize,
+        payload: Option<Vec<u8>>,
+    }
+
+    impl GatedSenderKeyLookup {
+        fn new(readers: usize, payload: Option<Vec<u8>>) -> Self {
+            Self {
+                // One extra party for the test task driving the race.
+                arrived: async_lock::Barrier::new(readers + 1),
+                release: async_lock::Barrier::new(readers + 1),
+                hits: std::sync::atomic::AtomicUsize::new(0),
+                payload,
+            }
+        }
+
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SignalStore for GatedSenderKeyLookup {
+        async fn get_sender_key(&self, _: &str) -> StoreResult<Option<Vec<u8>>> {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.arrived.wait().await;
+            self.release.wait().await;
+            Ok(self.payload.clone())
+        }
+
+        async fn put_identity(&self, _: &str, _: [u8; 32]) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn load_identity(&self, _: &str) -> StoreResult<Option<[u8; 32]>> {
+            unreachable!()
+        }
+        async fn delete_identity(&self, _: &str) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn get_session(&self, _: &str) -> StoreResult<Option<Bytes>> {
+            unreachable!()
+        }
+        async fn put_session(&self, _: &str, _: &[u8]) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn delete_session(&self, _: &str) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn store_prekey(&self, _: u32, _: &[u8], _: bool) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn load_prekey(&self, _: u32) -> StoreResult<Option<Bytes>> {
+            unreachable!()
+        }
+        async fn mark_prekeys_uploaded(&self, _: &[u32]) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn remove_prekey(&self, _: u32) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn get_max_prekey_id(&self) -> StoreResult<u32> {
+            unreachable!()
+        }
+        async fn store_signed_prekey(&self, _: u32, _: &[u8]) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn load_signed_prekey(&self, _: u32) -> StoreResult<Option<Vec<u8>>> {
+            unreachable!()
+        }
+        async fn load_all_signed_prekeys(&self) -> StoreResult<Vec<(u32, Vec<u8>)>> {
+            unreachable!()
+        }
+        async fn remove_signed_prekey(&self, _: u32) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn put_sender_key(&self, _: &str, _: &[u8]) -> StoreResult<()> {
+            unreachable!()
+        }
+        async fn delete_sender_key(&self, _: &str) -> StoreResult<()> {
+            unreachable!()
+        }
+    }
+
+    fn sender_key_record_with_chain(chain_id: u32) -> SenderKeyRecord {
+        use crate::libsignal::protocol::KeyPair;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let kp = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(
+                3,
+                chain_id,
+                0,
+                &[7u8; 32],
+                kp.public_key,
+                Some(kp.private_key),
+            )
+            .expect("valid sender key state");
+        record
+    }
+
+    fn chain_id_of(record: &SenderKeyRecord) -> u32 {
+        record
+            .sender_key_state()
+            .expect("record must carry a state")
+            .chain_id()
+    }
+
+    #[tokio::test]
+    async fn cold_sender_key_miss_loads_from_the_backend() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("19995550001@g.us", "19995550002@s.whatsapp.net:0");
+        let stored = sender_key_record_with_chain(7);
+        backend
+            .put_sender_key(
+                name.cache_key(),
+                &stored.serialize().expect("serialize record"),
+            )
+            .await
+            .expect("seed backend");
+
+        let loaded = cache
+            .get_sender_key(&name, &backend)
+            .await
+            .expect("cold load")
+            .expect("record present");
+        assert_eq!(chain_id_of(&loaded), 7);
+
+        // Second read is a cache hit and must agree with the first.
+        let warm = cache
+            .get_sender_key(&name, &backend)
+            .await
+            .expect("warm load")
+            .expect("record present");
+        assert_eq!(chain_id_of(&warm), 7);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_sender_key_readers_share_one_cached_value() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let stored = sender_key_record_with_chain(11);
+        let backend = Arc::new(GatedSenderKeyLookup::new(
+            2,
+            Some(stored.serialize().expect("serialize record")),
+        ));
+        let name = Arc::new(SenderKeyName::from_parts(
+            "19995550003@g.us",
+            "19995550004@s.whatsapp.net:0",
+        ));
+
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let (cache, backend, name) = (cache.clone(), backend.clone(), name.clone());
+                tokio::spawn(async move { cache.get_sender_key(&name, &*backend).await })
+            })
+            .collect();
+
+        // Both readers must reach the backend: with the lock held across the
+        // round-trip the second would still be queued and this would not
+        // rendezvous.
+        backend.arrived.wait().await;
+        backend.release.wait().await;
+
+        for reader in readers {
+            let record = reader
+                .await
+                .expect("reader task")
+                .expect("cold load")
+                .expect("record present");
+            assert_eq!(chain_id_of(&record), 11);
+        }
+        assert_eq!(backend.hits(), 2, "both readers should consult the backend");
+
+        let cached = cache
+            .get_sender_key(&name, &*backend)
+            .await
+            .expect("warm load")
+            .expect("record present");
+        assert_eq!(chain_id_of(&cached), 11, "cache must hold a single value");
+    }
+
+    #[tokio::test]
+    async fn a_late_sender_key_reader_does_not_overwrite_a_concurrent_put() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedSenderKeyLookup::new(
+            1,
+            Some(
+                sender_key_record_with_chain(1)
+                    .serialize()
+                    .expect("serialize record"),
+            ),
+        ));
+        let name = Arc::new(SenderKeyName::from_parts(
+            "19995550005@g.us",
+            "19995550006@s.whatsapp.net:0",
+        ));
+
+        let reader = tokio::spawn({
+            let (cache, backend, name) = (cache.clone(), backend.clone(), name.clone());
+            async move { cache.get_sender_key(&name, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        // The reader is parked inside the backend: a writer must be able to
+        // take the cache mutex right now, and must win the re-check.
+        cache
+            .put_sender_key(&name, sender_key_record_with_chain(2))
+            .await;
+        backend.release.wait().await;
+
+        let observed = reader
+            .await
+            .expect("reader task")
+            .expect("cold load")
+            .expect("record present");
+        assert_eq!(chain_id_of(&observed), 2, "reader must yield to the writer");
+
+        let cached = cache
+            .get_sender_key(&name, &*backend)
+            .await
+            .expect("warm load")
+            .expect("record present");
+        assert_eq!(chain_id_of(&cached), 2, "stale backend read must not land");
+    }
+
+    #[tokio::test]
+    async fn a_late_sender_key_reader_does_not_resurrect_a_concurrent_delete() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedSenderKeyLookup::new(
+            1,
+            Some(
+                sender_key_record_with_chain(3)
+                    .serialize()
+                    .expect("serialize record"),
+            ),
+        ));
+        let name = Arc::new(SenderKeyName::from_parts(
+            "19995550007@g.us",
+            "19995550008@s.whatsapp.net:0",
+        ));
+
+        let reader = tokio::spawn({
+            let (cache, backend, name) = (cache.clone(), backend.clone(), name.clone());
+            async move { cache.get_sender_key(&name, &*backend).await }
+        });
+
+        backend.arrived.wait().await;
+        cache.delete_sender_key(name.cache_key()).await;
+        backend.release.wait().await;
+
+        assert!(
+            reader
+                .await
+                .expect("reader task")
+                .expect("cold load")
+                .is_none(),
+            "reader must observe the delete, not the row it read before it"
+        );
+        assert!(
+            cache
+                .get_sender_key(&name, &*backend)
+                .await
+                .expect("warm load")
+                .is_none(),
+            "the tombstone must survive the late reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_user_index_never_misses_state_across_the_mutation_paths() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+
+        // Every public path that can put an address into either scanned store
+        // must leave the user answerable without a backend probe.
+        let session_user = "19995551001";
+        let session_addr =
+            ProtocolAddress::new(&format!("{session_user}@s.whatsapp.net"), 0.into());
+        cache
+            .put_session(&session_addr, SessionRecord::new_fresh())
+            .await;
+        assert!(
+            cache
+                .has_state_for_user(session_user, &backend)
+                .await
+                .unwrap()
+        );
+
+        let deleted_user = "19995551002";
+        let deleted_addr =
+            ProtocolAddress::new(&format!("{deleted_user}@s.whatsapp.net"), 0.into());
+        cache.delete_session(&deleted_addr).await;
+        assert!(
+            cache
+                .has_state_for_user(deleted_user, &backend)
+                .await
+                .unwrap()
+        );
+
+        let identity_user = "19995551003";
+        let identity_addr =
+            ProtocolAddress::new(&format!("{identity_user}@s.whatsapp.net"), 0.into());
+        cache.put_identity(&identity_addr, &[3u8; 32]).await;
+        assert!(
+            cache
+                .has_state_for_user(identity_user, &backend)
+                .await
+                .unwrap()
+        );
+
+        let probed_user = "19995551004";
+        let probed_addr = ProtocolAddress::new(&format!("{probed_user}@s.whatsapp.net"), 0.into());
+        cache.has_session(&probed_addr, &backend).await.unwrap();
+        assert!(
+            cache
+                .has_state_for_user(probed_user, &backend)
+                .await
+                .unwrap()
+        );
+
+        let checked_out_user = "19995551005";
+        let checked_out_addr =
+            ProtocolAddress::new(&format!("{checked_out_user}@s.whatsapp.net"), 0.into());
+        let (_, checkout) = cache
+            .checkout_session(&checked_out_addr, &backend)
+            .await
+            .unwrap();
+        assert!(
+            cache
+                .has_state_for_user(checked_out_user, &backend)
+                .await
+                .unwrap()
+        );
+        cache.cancel_session_checkout(&checked_out_addr, checkout);
+        assert!(
+            cache
+                .has_state_for_user(checked_out_user, &backend)
+                .await
+                .unwrap()
+        );
+
+        // A user with no state anywhere still answers false.
+        assert!(
+            !cache
+                .has_state_for_user("19995559999", &backend)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_user_index_survives_eviction_and_defers_to_the_backend_when_cold() {
+        let cache = SignalStoreCache::with_max_entries(4);
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+
+        // A dirty entry is never evicted, so this user must stay answerable
+        // from the index no matter how much churn follows.
+        let pinned_user = "19995552000";
+        let pinned_addr = ProtocolAddress::new(&format!("{pinned_user}@s.whatsapp.net"), 0.into());
+        cache
+            .put_session(&pinned_addr, SessionRecord::new_fresh())
+            .await;
+
+        // A user whose only entry is clean, so eviction can drop it. Give it
+        // durable state so the probe has something truthful to report.
+        let evicted_user = "19995552001";
+        let evicted_addr =
+            ProtocolAddress::new(&format!("{evicted_user}@s.whatsapp.net"), 0.into());
+        backend
+            .put_identity(evicted_addr.as_str(), [9u8; 32])
+            .await
+            .unwrap();
+        cache.has_session(&evicted_addr, &backend).await.unwrap();
+
+        // Churn well past the high watermark so eviction and index compaction
+        // both run repeatedly.
+        for i in 100..400 {
+            let addr = ProtocolAddress::new(&format!("1999555{i:04}@s.whatsapp.net"), 0.into());
+            cache.has_session(&addr, &backend).await.unwrap();
+        }
+
+        assert!(
+            cache
+                .has_state_for_user(pinned_user, &backend)
+                .await
+                .unwrap(),
+            "a still-cached user must stay answerable from the index"
+        );
+        assert!(
+            cache
+                .has_state_for_user(evicted_user, &backend)
+                .await
+                .unwrap(),
+            "an evicted user's durable state must still be found via the probe"
+        );
+        assert!(
+            !cache
+                .has_state_for_user("19995559998", &backend)
+                .await
+                .unwrap(),
+            "a user with no state anywhere must answer false"
+        );
+
+        // A lossy reset drops the index with the cache; the probe is then the
+        // only source of truth, and must still find durable state.
+        cache.clear().await;
+        assert!(
+            cache
+                .has_state_for_user(evicted_user, &backend)
+                .await
+                .unwrap(),
+            "durable state must be found through the probe with a cold index"
+        );
     }
 
     async fn wait_for_lock_waiter(lock: &Arc<Mutex<()>>, baseline: usize) {

@@ -233,7 +233,7 @@ pub async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
     .expect("bundle task")
     .expect("bundle");
 
-    let mut adapter = client.signal_adapter().await;
+    let mut adapter = client.signal_adapter();
     let mut rng = rand::make_rng::<rand::rngs::StdRng>();
     process_prekey_bundle(
         &peer.to_protocol_address(),

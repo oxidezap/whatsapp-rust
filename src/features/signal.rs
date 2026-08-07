@@ -182,7 +182,7 @@ impl<'a> Signal<'a> {
         let address = jid.to_protocol_address();
         let lock = self.client.session_lock_for(address.as_str()).await;
         let _guard = lock.lock().await;
-        let mut adapter = self.client.signal_adapter().await;
+        let mut adapter = self.client.signal_adapter();
         Ok(message_encrypt(
             plaintext,
             &address,
@@ -200,7 +200,7 @@ impl<'a> Signal<'a> {
         let address = jid.to_protocol_address();
         let lock = self.client.session_lock_for(address.as_str()).await;
         let _guard = lock.lock().await;
-        let mut adapter = self.client.signal_adapter().await;
+        let mut adapter = self.client.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let decrypted = message_decrypt(
             parsed,
@@ -242,7 +242,7 @@ impl<'a> Signal<'a> {
         bundle: &PreKeyBundle,
     ) -> Result<IdentityChange, SignalError> {
         let resolved = self.client.resolve_encryption_jid(jid).await;
-        let mut adapter = self.client.signal_adapter().await;
+        let mut adapter = self.client.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let identity_change = self
             .client
@@ -276,7 +276,7 @@ impl<'a> Signal<'a> {
         let distribution = decode_sender_key_distribution(distribution)?;
         let sender_address = sender_jid.to_non_ad().to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_address);
-        let mut store = self.client.sender_key_adapter().await;
+        let mut store = self.client.sender_key_adapter();
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
         let chain_guard = chain_lock.lock().await;
 
@@ -294,7 +294,7 @@ impl<'a> Signal<'a> {
     ) -> Result<Vec<u8>, SignalError> {
         let sender_address = sender_jid.to_non_ad().to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_address);
-        let mut store = self.client.sender_key_adapter().await;
+        let mut store = self.client.sender_key_adapter();
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
         let chain_guard = chain_lock.lock().await;
         let distribution = wacore::send::create_sender_key_distribution_message_for_group(
@@ -512,7 +512,7 @@ impl<'a> Signal<'a> {
             .await?
             .is_some();
 
-        let mut store = self.client.sender_key_adapter().await;
+        let mut store = self.client.sender_key_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
         let pending_distribution = self
@@ -574,7 +574,7 @@ impl<'a> Signal<'a> {
         let sender_key_name =
             make_sender_key_name(group_jid, &sender_jid.to_non_ad().to_protocol_address());
 
-        let mut store = self.client.sender_key_adapter().await;
+        let mut store = self.client.sender_key_adapter();
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
         let _chain_guard = chain_lock.lock().await;
 
@@ -652,7 +652,7 @@ impl<'a> Signal<'a> {
         let _session_guards = self.client.session_guards_for(&lock_jids).await;
 
         let plaintext = MessageUtils::encode_and_pad(message);
-        let mut adapter = self.client.signal_adapter().await;
+        let mut adapter = self.client.signal_adapter();
         let mediatype = wacore::send::media_type_from_message(message);
         let hide_decrypt_fail = wacore::send::should_hide_decrypt_fail(message);
 

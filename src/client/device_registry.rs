@@ -3318,7 +3318,7 @@ mod tests {
             "rotation must wait for the in-flight advance"
         );
 
-        let mut sender_key_store = client.sender_key_adapter().await;
+        let mut sender_key_store = client.sender_key_adapter();
         group_encrypt(
             &mut sender_key_store,
             &name,
