@@ -1151,14 +1151,17 @@ impl DeviceStore for InMemoryBackend {
 
         // `chat` and `sender` are deliberately one `Arc<str>` shared by every
         // row of a conversation, and `sender` often aliases `chat` outright, so
-        // a per-row sum would bill one allocation once per message. Dedup by
-        // data pointer counts each exactly once.
+        // a per-row sum would bill one allocation once per message. Dedup those
+        // two by data pointer; the set grows with distinct conversations, not
+        // with rows. `msg_id` names one message, so it is counted where found.
         bytes += hb_table_bytes(&state.msg_secrets);
         rows += state.msg_secrets.len() as u64;
-        let mut counted: std::collections::HashSet<*const u8> = std::collections::HashSet::new();
+        let mut conversations: std::collections::HashSet<*const u8> =
+            std::collections::HashSet::new();
         for key in state.msg_secrets.keys() {
-            for shared in [&key.chat, &key.sender, &key.msg_id] {
-                if counted.insert(shared.as_ptr()) {
+            bytes += key.msg_id.len();
+            for shared in [&key.chat, &key.sender] {
+                if conversations.insert(shared.as_ptr()) {
                     bytes += shared.len();
                 }
             }
