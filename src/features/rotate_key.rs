@@ -293,8 +293,10 @@ impl Client {
                             next_rotation_ms,
                         ))
                         .await;
-                    // A lost schedule write only costs an immediate retry, which is
-                    // exactly what not writing it at all would have done.
+                    // The command already updated the cached snapshot and left the
+                    // store dirty for the background saver, so a failed flush still
+                    // holds the delay; only losing the process first reverts to an
+                    // immediate retry, which is what not writing it would have done.
                     if let Err(e) = self.persistence_manager.flush().await {
                         log::warn!("failed to persist the signed pre-key rotation schedule: {e}");
                     }
