@@ -7,6 +7,9 @@ authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "SQLite-backed chat/message history store for whatsapp-rust"
+# Held back from crates.io: the schema and the query surface are still moving,
+# and publishing pins both. Drop this line to release it alongside the rest.
+publish = false
 
 [features]
 default = []
@@ -28,7 +31,7 @@ tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 waproto = { workspace = true }
-whatsapp-rust-sqlite-storage = { path = "../sqlite-storage", version = "0.6.0" }
+whatsapp-rust-sqlite-storage = { path = "../sqlite-storage", version = "0.7.0" }
 
 [dev-dependencies]
 flate2 = { workspace = true }

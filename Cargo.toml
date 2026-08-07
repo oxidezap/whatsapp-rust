@@ -1,7 +1,7 @@
 
 [package]
 name = "whatsapp-rust"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
@@ -124,13 +124,13 @@ uuid = { version = "1", default-features = false }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 
 # Internal workspace crates
-wacore = { path = "./wacore", default-features = false, version = "0.6.0" }
-wacore-appstate = { path = "./wacore/appstate", default-features = false, version = "0.6.0" }
-wacore-binary = { path = "./wacore/binary", default-features = false, version = "0.6.0" }
-wacore-derive = { path = "./wacore/derive", version = "0.6.0" }
-wacore-libsignal = { path = "./wacore/libsignal", version = "0.6.0" }
-wacore-noise = { path = "./wacore/noise", version = "0.6.0" }
-waproto = { path = "./waproto", version = "0.6.0" }
+wacore = { path = "./wacore", default-features = false, version = "0.7.0" }
+wacore-appstate = { path = "./wacore/appstate", default-features = false, version = "0.7.0" }
+wacore-binary = { path = "./wacore/binary", default-features = false, version = "0.7.0" }
+wacore-derive = { path = "./wacore/derive", version = "0.7.0" }
+wacore-libsignal = { path = "./wacore/libsignal", version = "0.7.0" }
+wacore-noise = { path = "./wacore/noise", version = "0.7.0" }
+waproto = { path = "./waproto", version = "0.7.0" }
 yoke = { version = "0.8", features = ["derive"] }
 zerocopy = { version = "0.8.55", default-features = false, features = ["derive"] }
 zlib-rs = { version = "0.6.6", default-features = false, features = ["std", "rust-allocator"] }
@@ -238,9 +238,9 @@ webrtc-dtls = { version = "0.12", optional = true }
 webrtc-sctp = { version = "0.17", optional = true }
 webrtc-util = { version = "0.17", optional = true }
 webrtc-util-011 = { package = "webrtc-util", version = "0.11", optional = true }
-whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.6.0", optional = true }
-whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.6.0", optional = true }
-whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.6.0", optional = true }
+whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.7.0", optional = true }
+whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.7.0", optional = true }
+whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.7.0", optional = true }
 
 # wasm32-unknown-unknown has no default getrandom backend, so make the browser
 # one available (the only valid choice there) to build the crate standalone:
