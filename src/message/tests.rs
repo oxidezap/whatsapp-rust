@@ -6152,6 +6152,230 @@ async fn explicit_retry_preserves_canonical_routing_shapes() {
     }
 }
 
+const FRESH_ID_SENDER: &str = "12025550111:7@s.whatsapp.net";
+
+/// One inbound status stanza from `FRESH_ID_SENDER`, addressed the way a status
+/// post reaches us: `from` is the broadcast chat, the author is `participant`.
+fn status_stanza(id: &str) -> wacore_binary::Node {
+    NodeBuilder::new("message")
+        .attr("id", id.to_string())
+        .attr("from", "status@broadcast")
+        .attr("participant", FRESH_ID_SENDER)
+        .attr("t", "1")
+        .build()
+}
+
+async fn client_with_account(
+    test_id: &str,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
+    let (client, transport) = capturing_client(test_id).await;
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity::default(),
+        )))
+        .await;
+    (client, transport)
+}
+
+// Characterization, not a desired outcome. Paired with
+// `redelivered_id_reaches_the_retry_key_bundle`: same origin, one repeated id,
+// and that one does reach the bundle.
+#[tokio::test]
+async fn fresh_message_ids_never_reach_the_retry_key_bundle() {
+    let (client, transport) = client_with_account("retry_fresh_ids").await;
+    let before = client.persistence_manager.get_device_snapshot();
+
+    let ids: Vec<String> = (0..10).map(|n| format!("FRESH-STATUS-{n}")).collect();
+    for id in &ids {
+        assert_eq!(
+            client
+                .request_message_retry(
+                    &status_stanza(id).as_node_ref(),
+                    crate::features::RetryRequestOptions::default(),
+                )
+                .await
+                .expect("status retry should send"),
+            crate::features::RetryRequestOutcome::Sent {
+                retry_count: 1,
+                included_keys: false,
+            },
+            "{id} must stay on the first retry attempt"
+        );
+    }
+
+    let frames = transport.sent();
+    for id in &ids {
+        let receipt = find_receipt_details(&frames, id).expect("status retry receipt");
+        assert_eq!(receipt.to, "status@broadcast");
+        assert!(!receipt.has_keys, "{id} must not carry a key bundle");
+    }
+
+    // The other half of the cost story: a receipt without a bundle reserves no
+    // one-time prekey, so this source never touches the pool or the upload window.
+    let after = client.persistence_manager.get_device_snapshot();
+    assert_eq!(after.next_pre_key_id, before.next_pre_key_id);
+    assert_eq!(
+        after.first_unupload_pre_key_id,
+        before.first_unupload_pre_key_id
+    );
+}
+
+// The contrast that isolates the cause. Same chat, same sender, same broadcast
+// origin as the test above; the only change is that the id comes back.
+#[tokio::test]
+async fn redelivered_id_reaches_the_retry_key_bundle() {
+    let (client, transport) = client_with_account("retry_redelivered_id").await;
+    let before = client.persistence_manager.get_device_snapshot();
+    let stanza = status_stanza("REDELIVERED-STATUS");
+
+    assert_eq!(
+        client
+            .request_message_retry(
+                &stanza.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("first retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 1,
+            included_keys: false,
+        }
+    );
+    assert_eq!(
+        client
+            .request_message_retry(
+                &stanza.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("second retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 2,
+            included_keys: true,
+        }
+    );
+
+    let receipt = find_receipt_details(&transport.sent(), "REDELIVERED-STATUS")
+        .expect("status retry receipt");
+    assert_eq!(receipt.to, "status@broadcast");
+
+    let after = client.persistence_manager.get_device_snapshot();
+    assert_ne!(after.next_pre_key_id, before.next_pre_key_id);
+    assert_eq!(
+        after.first_unupload_pre_key_id, after.next_pre_key_id,
+        "the directly distributed prekey must leave the upload window"
+    );
+}
+
+// The sender-echoed `<enc count>` is the other way the counter moves, and it is
+// the only one the official client has. Both ends of its range matter: a sender
+// that reports 0 must not shortcut the threshold, and one that reports past it
+// must not be clamped back down.
+#[tokio::test]
+async fn sender_echoed_count_bounds_the_key_decision() {
+    let (client, _transport) = client_with_account("retry_sender_count_bounds").await;
+
+    let enc_with_count = |id: &str, count: Option<&str>| {
+        let mut enc = NodeBuilder::new("enc").attr("type", "msg");
+        if let Some(count) = count {
+            enc = enc.attr("count", count.to_string());
+        }
+        NodeBuilder::new("message")
+            .attr("id", id.to_string())
+            .attr("from", FRESH_ID_SENDER)
+            .attr("t", "1")
+            .attr("type", "text")
+            .children([enc.bytes([0_u8]).build()])
+            .build()
+    };
+
+    for (id, count) in [("ECHO-ABSENT", None), ("ECHO-ZERO", Some("0"))] {
+        assert_eq!(
+            client
+                .request_message_retry(
+                    &enc_with_count(id, count).as_node_ref(),
+                    crate::features::RetryRequestOptions::default(),
+                )
+                .await
+                .expect("retry should send"),
+            crate::features::RetryRequestOutcome::Sent {
+                retry_count: 1,
+                included_keys: false,
+            },
+            "a sender reporting no progress must not skip the threshold ({id})"
+        );
+    }
+
+    assert_eq!(
+        client
+            .request_message_retry(
+                &enc_with_count("ECHO-HIGH", Some("3")).as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 4,
+            included_keys: true,
+        }
+    );
+}
+
+// Being pinned at 1 also keeps the source clear of the cap, so it never reaches
+// the PDO-only arm that a repeated id runs into after five attempts.
+#[tokio::test]
+async fn fresh_message_ids_never_reach_the_retry_cap() {
+    let (client, _transport) = client_with_account("retry_fresh_id_cap").await;
+
+    for n in 0..(MAX_DECRYPT_RETRIES as u16 + 2) {
+        assert_eq!(
+            client
+                .request_message_retry(
+                    &status_stanza(&format!("UNCAPPED-STATUS-{n}")).as_node_ref(),
+                    crate::features::RetryRequestOptions::default(),
+                )
+                .await
+                .expect("status retry should send"),
+            crate::features::RetryRequestOutcome::Sent {
+                retry_count: 1,
+                included_keys: false,
+            }
+        );
+    }
+
+    let repeated = status_stanza("CAPPED-STATUS");
+    for expected in 1..=MAX_DECRYPT_RETRIES {
+        let outcome = client
+            .request_message_retry(
+                &repeated.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("status retry should send");
+        assert_eq!(
+            outcome,
+            crate::features::RetryRequestOutcome::Sent {
+                retry_count: expected,
+                included_keys: expected >= 2,
+            }
+        );
+    }
+    assert_eq!(
+        client
+            .request_message_retry(
+                &repeated.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("the cap is an outcome, not an error"),
+        crate::features::RetryRequestOutcome::LimitReached
+    );
+}
+
 #[tokio::test]
 async fn explicit_retry_validates_input_and_reports_the_shared_limit() {
     let (client, transport) = capturing_client("explicit_retry_validation").await;
