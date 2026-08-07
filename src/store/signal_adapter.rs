@@ -443,15 +443,16 @@ impl PreKeyAdapter {
 
 /// Diagnostic for a signed pre-key id that resolves nowhere.
 ///
-/// Built here rather than inline so a test can prove the id survives into the
-/// message: `InvalidSignedPreKeyId` carries no payload, so this string is the
-/// only record of *which* id a peer asked for, and without it an incident cannot
-/// be told apart from a peer naming an id we never minted. Allocating is free in
-/// practice: an id that resolves never reaches this branch.
+/// Reports both ids and names no cause: below the current id means a key we
+/// rotated past, above it means one we never minted, and telling those two apart
+/// is the whole reason this line exists. Built here rather than inline so a test
+/// can prove both survive into the message, since `InvalidSignedPreKeyId` carries
+/// no payload. Allocating is free in practice: a resolvable id never reaches
+/// this branch.
 fn unaddressable_signed_pre_key_warning(requested: u32, current: u32) -> String {
     format!(
-        "signed pre-key {requested} is not addressable (current id {current}); \
-         the peer's prekey bundle predates our retention window"
+        "signed pre-key {requested} is not addressable; no retained record \
+         exists for it and the current id is {current}"
     )
 }
 
@@ -613,15 +614,19 @@ mod tests {
     /// A production incident with this error is only actionable if the log says
     /// which id was asked for and which one we hold: those two numbers are what
     /// separate "the peer's bundle aged past our retention" from "the peer named
-    /// an id we never minted".
+    /// an id we never minted". Ids picked so neither is a substring of the other
+    /// or of the surrounding prose.
     #[test]
     fn the_unaddressable_warning_names_both_ids() {
-        let warning = unaddressable_signed_pre_key_warning(2, 5);
+        let warning = unaddressable_signed_pre_key_warning(40_961, 40_968);
         assert!(
-            warning.contains('2'),
+            warning.contains("40961"),
             "must name the requested id: {warning}"
         );
-        assert!(warning.contains('5'), "must name the current id: {warning}");
+        assert!(
+            warning.contains("40968"),
+            "must name the current id: {warning}"
+        );
     }
 
     /// The diagnostic is built inside `ok_or_else`, so an id that resolves must

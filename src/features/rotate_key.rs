@@ -75,8 +75,10 @@ pub(crate) fn rotation_timestamp_after_failed_upload(now_ms: i64, error: &IqErro
             .saturating_sub(SIGNED_PRE_KEY_ROTATION_INTERVAL_MS)
             .saturating_add(retry_in)
     };
-    // 0 is the "cadence never seeded" sentinel, which does not rotate at all.
-    Some(scheduled.max(1))
+    // Dodge the exact "cadence never seeded" sentinel, which routes to the
+    // baseline path and never rotates. Only 0: clamping the whole negative range
+    // would turn a backdated retry into a full interval on a pre-epoch clock.
+    Some(if scheduled == 0 { 1 } else { scheduled })
 }
 
 /// Next id = current + 1, wrapping at the 24-bit border back to 1.
@@ -117,7 +119,7 @@ impl Client {
         }
 
         if should_rotate_signed_pre_key(last, now) {
-            self.rotate_signed_pre_key_inner().await?;
+            self.rotate_signed_pre_key_inner(true).await?;
         }
         Ok(())
     }
@@ -133,15 +135,20 @@ impl Client {
     /// ambiguous transport error (the server may have accepted `new_id`) leaves
     /// the staged key decryptable via the load fallback; a definitive rejection
     /// leaves the current key in place, never pruning the key the server still
-    /// hands out. What a failure does to the cadence is
-    /// [`rotation_timestamp_after_failed_upload`]. Calls are serialized with the
-    /// automatic rotation path.
+    /// hands out. A failure here leaves the automatic cadence exactly as it was:
+    /// this call did not consult that schedule, so it must not reprogram it.
+    /// Calls are serialized with the automatic rotation path.
     pub async fn rotate_signed_pre_key(&self) -> Result<(), SignalMaintenanceError> {
         let _guard = self.signed_pre_key_rotation_lock.lock().await;
-        self.rotate_signed_pre_key_inner().await
+        self.rotate_signed_pre_key_inner(false).await
     }
 
-    async fn rotate_signed_pre_key_inner(&self) -> Result<(), SignalMaintenanceError> {
+    /// `reschedule_on_failure` belongs to the cadence-driven caller alone; see
+    /// [`rotation_timestamp_after_failed_upload`] for what it then writes.
+    async fn rotate_signed_pre_key_inner(
+        &self,
+        reschedule_on_failure: bool,
+    ) -> Result<(), SignalMaintenanceError> {
         let snapshot = self.persistence_manager.get_device_snapshot();
         let now = wacore::time::now_millis();
         let backend = self.persistence_manager.backend();
@@ -287,6 +294,7 @@ impl Client {
                     );
                 }
                 if let Some(next_rotation_ms) = rotation_timestamp_after_failed_upload(now, &error)
+                    .filter(|_| reschedule_on_failure)
                 {
                     self.persistence_manager
                         .process_command(DeviceCommand::SetSignedPreKeyRotationBaseline(
@@ -424,26 +432,38 @@ mod tests {
         }
     }
 
+    /// The delay is a property of the backdated timestamp alone, so it must hold
+    /// wherever the clock sits. A clock below one interval makes the schedule
+    /// negative, which is exactly why the sentinel guard rejects only 0 rather
+    /// than clamping the range.
     #[test]
     fn the_server_error_backoff_defers_the_next_attempt_by_exactly_its_delay() {
-        let scheduled = rotation_timestamp_after_failed_upload(NOW, &server_error(503))
-            .expect("a 5xx schedules a retry");
-        assert!(!should_rotate_signed_pre_key(scheduled, NOW));
-        assert!(!should_rotate_signed_pre_key(
-            scheduled,
-            NOW + SIGNED_PRE_KEY_SERVER_ERROR_BACKOFF_MS - 1
-        ));
-        assert!(should_rotate_signed_pre_key(
-            scheduled,
-            NOW + SIGNED_PRE_KEY_SERVER_ERROR_BACKOFF_MS
-        ));
+        for now in [0, 1, SIGNED_PRE_KEY_ROTATION_INTERVAL_MS, NOW] {
+            let scheduled = rotation_timestamp_after_failed_upload(now, &server_error(503))
+                .expect("a 5xx schedules a retry");
+            assert!(!should_rotate_signed_pre_key(scheduled, now));
+            assert!(
+                !should_rotate_signed_pre_key(
+                    scheduled,
+                    now + SIGNED_PRE_KEY_SERVER_ERROR_BACKOFF_MS - 1
+                ),
+                "must still wait at now={now}"
+            );
+            assert!(
+                should_rotate_signed_pre_key(
+                    scheduled,
+                    now + SIGNED_PRE_KEY_SERVER_ERROR_BACKOFF_MS
+                ),
+                "must be due one backoff later at now={now}"
+            );
+        }
     }
 
     /// 0 means "cadence never seeded" and routes to the baseline path, which
     /// does not rotate. A schedule that lands on it would disable rotation.
     #[test]
     fn a_scheduled_retry_is_never_the_unseeded_sentinel() {
-        for now in [0, 1, SIGNED_PRE_KEY_ROTATION_INTERVAL_MS] {
+        for now in [0, 1, SIGNED_PRE_KEY_ROTATION_INTERVAL_MS, NOW] {
             for code in [406, 503] {
                 assert_ne!(
                     rotation_timestamp_after_failed_upload(now, &server_error(code)),
@@ -677,6 +697,48 @@ mod tests {
             1,
             "a reconnect inside the backoff must not upload again"
         );
+    }
+
+    /// `rotate_signed_pre_key()` forces a rotation without consulting the
+    /// cadence, so a failure there must not reprogram it in either direction: a
+    /// 5xx would otherwise drag a schedule weeks out forward to 24h, and a
+    /// definitive rejection would push an already-due rotation a full interval
+    /// away. Only the cadence-driven caller writes the cadence.
+    #[tokio::test]
+    async fn a_failed_manual_rotation_leaves_the_automatic_cadence_alone() {
+        for code in [503, 406] {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            // Not due: one interval away, which a reschedule would visibly move.
+            let baseline = wacore::time::now_millis();
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetSignedPreKeyRotationBaseline(baseline))
+                .await;
+            client
+                .persistence_manager
+                .flush()
+                .await
+                .expect("persist the baseline");
+
+            let attempt = {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move { client.rotate_signed_pre_key().await })
+            };
+            answer_rotation(&client, &transport, 0, |id| iq_error_response(id, code)).await;
+            attempt
+                .await
+                .expect("the rotation task must not panic")
+                .expect_err("the rejection must surface to the caller");
+
+            assert_eq!(
+                client
+                    .persistence_manager
+                    .get_device_snapshot()
+                    .last_signed_pre_key_rotation_ms,
+                baseline,
+                "a failed forced rotation (code {code}) must not move the cadence"
+            );
+        }
     }
 
     /// A definitive rejection is deterministic: the server will answer the same
