@@ -474,6 +474,10 @@ impl Client {
         use wacore::bot_message::{BotMessageContext, decrypt_bot_message};
         use wacore::protocol::nack::NackReason;
 
+        // Read off before the payload is consumed below.
+        let enc_index = payload.enc_index;
+        let enc_type = payload.enc_type.as_wire_str();
+
         let ms_msg = match waproto::codec::message_secret_message_decode(&payload.ciphertext) {
             Ok(m) => m,
             Err(e) => {
@@ -692,7 +696,23 @@ impl Client {
             },
         };
 
-        let msg = match waproto::codec::message_decode(plaintext.as_slice()) {
+        // Forwarded before decoding, like the Signal path: a bot payload that
+        // opens but does not decode is nacked and dropped, and the secret it
+        // was opened with is single-use, so nothing can ask for it again.
+        // `Bytes::from` takes the buffer over rather than copying it.
+        let plaintext = bytes::Bytes::from(plaintext);
+        if self.decrypted_payload_forwarding_enabled() {
+            self.core.event_bus.dispatch(Event::DecryptedPayload(
+                wacore::types::events::DecryptedPayload::builder()
+                    .info(Arc::clone(info))
+                    .enc_index(enc_index)
+                    .enc_type(enc_type)
+                    .payload(plaintext.clone())
+                    .build(),
+            ));
+        }
+
+        let msg = match waproto::codec::message_decode(&plaintext) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!(

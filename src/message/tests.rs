@@ -5236,7 +5236,7 @@ async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
         .attr("type", "msg")
         .bytes(signal_message.serialized().to_vec())
         .build();
-    let payload = EncPayload::from_node_ref(&enc.as_node_ref()).expect("session payload");
+    let payload = EncPayload::from_node_ref(&enc.as_node_ref(), 0).expect("session payload");
 
     client
         .clone()
@@ -5310,7 +5310,7 @@ async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
         .attr("type", "msg")
         .bytes(vec![0xFF, 0x00, 0x03])
         .build();
-    let payload = EncPayload::from_node_ref(&enc.as_node_ref()).expect("session payload");
+    let payload = EncPayload::from_node_ref(&enc.as_node_ref(), 0).expect("session payload");
 
     client
         .clone()
@@ -8816,6 +8816,71 @@ async fn unavailable_message_is_transport_acked() {
 }
 
 #[tokio::test]
+async fn fan_out_encs_are_numbered_after_the_direct_ones() {
+    // A fan-out stanza carries a copy per device under `<participants>`, and
+    // only this device's is ours to decrypt. The client enumerates direct
+    // children first and those second, so the index is a position in that
+    // concatenation and not a child index — which is exactly what a consumer
+    // resolving it back to a node has to reproduce.
+    let (client, _transport) = capturing_client("enc_index_fanout").await;
+    let own = client.pn().expect("test client has a PN");
+
+    let node = NodeBuilder::new("message")
+        .attr("from", "5511777776666@g.us")
+        .attr("participant", "5511999998888@s.whatsapp.net")
+        .attr("id", "FANOUT1")
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("enc")
+                .attr("type", "skmsg")
+                .bytes(vec![1u8; 8])
+                .build(),
+            NodeBuilder::new("participants")
+                .children([
+                    NodeBuilder::new("to")
+                        .attr("jid", "5500000000000:1@s.whatsapp.net")
+                        .children([NodeBuilder::new("enc")
+                            .attr("type", "pkmsg")
+                            .bytes(vec![2u8; 8])
+                            .build()])
+                        .build(),
+                    NodeBuilder::new("to")
+                        .attr("jid", own.to_string())
+                        .children([NodeBuilder::new("enc")
+                            .attr("type", "pkmsg")
+                            .bytes(vec![3u8; 8])
+                            .build()])
+                        .build(),
+                ])
+                .build(),
+        ])
+        .build();
+    let classified = client
+        .classify_incoming_message(&node_to_arc(node))
+        .await
+        .expect("both buckets have a payload");
+
+    assert_eq!(
+        classified
+            .group_payloads
+            .iter()
+            .map(|payload| payload.enc_index)
+            .collect::<Vec<_>>(),
+        [0],
+        "the direct skmsg is enumerated first"
+    );
+    assert_eq!(
+        classified
+            .session_payloads
+            .iter()
+            .map(|payload| payload.enc_index)
+            .collect::<Vec<_>>(),
+        [1],
+        "ours under <participants> comes next — another device's is not counted"
+    );
+}
+
+#[tokio::test]
 async fn enc_index_is_the_position_in_the_stanza_not_in_its_bucket() {
     // The common group shape: a pkmsg carrying the sender key, then the skmsg
     // it unlocks. They land in different buckets, so anything that counted
@@ -12001,6 +12066,111 @@ async fn msmsg_outbound_put_and_inbound_get_match_for_lid_bot() {
         got.is_some(),
         "outbound PUT and inbound GET must converge on LID for bot chats"
     );
+}
+
+#[tokio::test]
+async fn a_bot_payload_is_forwarded_like_any_other_plaintext() {
+    // The bot-secret path opens its payload with AES-GCM instead of Signal and
+    // decodes it in its own function, so it is the one place a plaintext could
+    // reach `Message` without the event seeing it. The secret is single-use, so
+    // a payload it drops is as unrecoverable as a ratcheted one.
+    use crate::store::commands::DeviceCommand;
+    use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+    use wacore::types::events::{ChannelEventHandler, Event, EventInterest, EventKind};
+
+    let (client, _transport) = capturing_client("msmsg_forwarding").await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(
+            "999888777666555:0@lid".parse().unwrap(),
+        )))
+        .await;
+    let (handler, events) = ChannelEventHandler::new();
+    client
+        .subscribe(EventInterest::of(&[EventKind::DecryptedPayload]), handler)
+        .detach();
+    let _lease = client.acquire_decrypted_payload_forwarding();
+
+    let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
+    let outbound_id = "OUT_FWD";
+    let bot_reply_id = "REPLY_FWD";
+    let our_lid = "999888777666555@lid";
+    let secret = [0x71u8; 32];
+
+    let sender_identity = client
+        .dm_sender_identity_for(&bot_chat)
+        .await
+        .expect("LID seeded");
+    client
+        .persist_outbound_msg_secret(
+            &bot_chat,
+            &sender_identity,
+            outbound_id,
+            &secret,
+            wacore::msg_secret::RetentionClass::Bot,
+            crate::send::SendInstant::now(),
+        )
+        .await;
+
+    let plaintext_msg = wa::Message {
+        conversation: Some("from the bot".to_string()),
+        ..Default::default()
+    };
+    let pt_bytes = {
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
+        v
+    };
+    let ctx = BotMessageContext {
+        msg_id: bot_reply_id,
+        target_sender_user_jid: our_lid,
+        bot_user_jid: "867051314767696@bot",
+    };
+    let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+
+    let node = NodeBuilder::new("message")
+        .attr("from", "867051314767696@bot")
+        .attr("id", bot_reply_id)
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("meta")
+                .attr("target_id", outbound_id)
+                .attr("target_sender_jid", our_lid)
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .attr("v", "2")
+                .bytes(encode_message_secret_message(&iv, &cipher))
+                .build(),
+        ])
+        .build();
+    client
+        .clone()
+        .handle_incoming_message(node_to_arc(node))
+        .await;
+
+    let mut received = None;
+    crate::test_utils::poll_until("the bot payload to be forwarded", || {
+        received = events.try_recv().ok();
+        received.is_some()
+    })
+    .await;
+    let event = received.expect("forwarded");
+    let Event::DecryptedPayload(payload) = &*event else {
+        panic!("expected a DecryptedPayload");
+    };
+    assert_eq!(
+        payload.payload.as_ref(),
+        pt_bytes.as_slice(),
+        "the opened bot payload, before this build tried to decode it"
+    );
+    assert_eq!(payload.enc_type, "msmsg");
+    assert_eq!(
+        payload.enc_index, 0,
+        "the stanza's first <enc>, whatever precedes it among the children"
+    );
+    assert_eq!(payload.info.id, bot_reply_id);
 }
 
 /// Regression for the AD_JID encoder bug: a `from="USER:0@bot"` stanza must

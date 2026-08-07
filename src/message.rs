@@ -71,7 +71,9 @@ pub(crate) struct EncPayload {
     pub ciphertext: bytes::Bytes,
     pub enc_type: EncType,
     pub padding_version: u8,
-    /// Position of this `<enc>` in the stanza, counting from zero.
+    /// Position in the order [`message_enc_nodes_for_device`] yields, counting
+    /// from zero: direct `<enc>` children first, then this device's under
+    /// `<participants><to>`.
     ///
     /// Recorded during classification because nothing downstream can recover
     /// it: payloads are split into per-kind buckets and encs that produce no

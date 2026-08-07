@@ -1665,10 +1665,14 @@ impl UnavailableType {
 pub struct DecryptedPayload {
     /// Which message this came from.
     pub info: Arc<MessageInfo>,
-    /// Position of the `<enc>` within the stanza, counting from zero.
+    /// Which `<enc>` of the stanza produced these bytes, counting from zero in
+    /// the order the client enumerates them.
     ///
-    /// A message to several devices carries several, and this says which one
-    /// produced these bytes.
+    /// That order is the stanza's direct `<enc>` children first, then the ones
+    /// under `<participants><to>` addressed to this device — the fan-out shape,
+    /// where a single stanza carries a copy per device and only ours is ours to
+    /// decrypt. It is *not* a child index: a consumer resolving this back to a
+    /// node has to walk the same two groups in the same order.
     pub enc_index: usize,
     /// The `type` attribute the `<enc>` carried: `msg`, `pkmsg`, `skmsg`, …
     pub enc_type: &'static str,
