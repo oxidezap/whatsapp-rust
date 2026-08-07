@@ -1472,7 +1472,7 @@ impl Client {
         }
 
         let (original_msg, history_sync_taken) =
-            wacore::messages::decode_plaintext_detached_history_sync(source)?;
+            wacore::messages::decode_unpadded_detached_history_sync(source)?;
         log::debug!(
             "[msg:{}] Successfully decrypted message from {}: type={} [batch path]",
             info.id,

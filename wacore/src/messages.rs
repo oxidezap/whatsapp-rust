@@ -571,6 +571,19 @@ impl From<wa::message::HistorySyncNotification> for DetachedHistorySyncNotificat
     }
 }
 
+/// Unpad a decrypted payload and decode it, detaching any inline history-sync
+/// payload.
+///
+/// The two halves are also available on their own — [`unpad_plaintext`] and
+/// [`decode_unpadded_detached_history_sync`] — for a caller that wants the
+/// plaintext bytes in between.
+pub fn decode_plaintext_detached_history_sync(
+    padded_plaintext: Vec<u8>,
+    padding_version: u8,
+) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>)> {
+    decode_unpadded_detached_history_sync(unpad_plaintext(padded_plaintext, padding_version)?)
+}
+
 /// Strip the padding a decrypted payload arrives with.
 ///
 /// Separate from decoding because the two fail for unrelated reasons and the
@@ -592,8 +605,9 @@ pub fn unpad_plaintext(padded_plaintext: Vec<u8>, padding_version: u8) -> Result
 /// generated implementation, keeping protobuf merge and unknown-field
 /// semantics in one place.
 ///
-/// Takes the plaintext already unpadded — see [`unpad_plaintext`].
-pub fn decode_plaintext_detached_history_sync(
+/// Takes the plaintext already unpadded — see [`unpad_plaintext`], or
+/// [`decode_plaintext_detached_history_sync`] to do both in one call.
+pub fn decode_unpadded_detached_history_sync(
     source: bytes::Bytes,
 ) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>)> {
     // Mirror `unwrap_device_sent`: once a DSM carries an inner message, only
@@ -1375,9 +1389,8 @@ mod plaintext_view_tests {
         let plaintext_start = padded.as_ptr() as usize;
         let plaintext_end = plaintext_start + padded.len();
 
-        let (decoded, detached) =
-            decode_plaintext_detached_history_sync(unpad_plaintext(padded, 2).expect("unpads"))
-                .expect("owned view decode should succeed");
+        let (decoded, detached) = decode_plaintext_detached_history_sync(padded, 2)
+            .expect("owned view decode should succeed");
         let detached = detached.expect("history notification should be detached");
         let payload = detached
             .inline_payload
@@ -1413,10 +1426,8 @@ mod plaintext_view_tests {
             ..Default::default()
         });
 
-        let (decoded, detached) = decode_plaintext_detached_history_sync(
-            unpad_plaintext(padded(&wrapped), 2).expect("unpads"),
-        )
-        .expect("device-sent message should decode");
+        let (decoded, detached) = decode_plaintext_detached_history_sync(padded(&wrapped), 2)
+            .expect("device-sent message should decode");
         let decoded = unwrap_device_sent(decoded);
         let detached = detached.expect("inner history notification should be detached");
 
