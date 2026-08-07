@@ -343,6 +343,12 @@ pub struct MemoryReport {
     // -- Misc --
     pub chatstate_handlers: usize,
     pub custom_enc_handlers: usize,
+    /// Interceptors currently registered.
+    ///
+    /// A handle that outlives its interest leaves one registered, and a leak
+    /// here costs a walk on every stanza — which the count is what makes
+    /// visible.
+    pub stanza_interceptors: usize,
 }
 
 impl MemoryReport {
@@ -506,6 +512,7 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "--- Misc ---")?;
         writeln!(f, "  chatstate_handlers:     {}", self.chatstate_handlers)?;
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
+        writeln!(f, "  stanza_interceptors:    {}", self.stanza_interceptors)?;
         writeln!(
             f,
             "  total estimated:        {} B",

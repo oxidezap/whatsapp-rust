@@ -383,6 +383,7 @@ impl Client {
             ),
             chatstate_handlers,
             custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
+            stanza_interceptors: self.stanza_interceptors().len(),
         }
     }
 
