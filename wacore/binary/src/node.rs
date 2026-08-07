@@ -926,6 +926,22 @@ impl OwnedNodeRef {
         self.inner.get().to_owned()
     }
 
+    /// The whole backing buffer, verbatim: exactly what [`Self::new`] consumed.
+    ///
+    /// A refcount bump, not a copy — the yoke already retains this buffer, and
+    /// [`Self::slice_bytes`] hands out views into the same allocation.
+    ///
+    /// Re-encoding through [`marshal_ref`] is the alternative and a worse one
+    /// for anything that forwards a stanza onward — to another process, a
+    /// recording, a replay harness. Re-encoding costs a second pass and is only
+    /// faithful while the token dictionaries match the ones that decoded it;
+    /// these bytes stay true whatever the dictionaries do.
+    ///
+    /// [`marshal_ref`]: crate::marshal::marshal_ref
+    pub fn backing_bytes(&self) -> Bytes {
+        self.inner.backing_cart().0.clone()
+    }
+
     /// Return a zero-copy `Bytes` sub-view for a slice that borrows from this
     /// node's backing buffer. Panics if `slice` does not point within the buffer.
     pub fn slice_bytes(&self, slice: &[u8]) -> Bytes {
@@ -1165,6 +1181,34 @@ mod owned_node_ref_tests {
 
         assert_eq!(view.as_ref(), b"payload");
         assert_eq!(view.as_ptr(), content.as_ptr(), "slice_bytes copied");
+    }
+
+    #[test]
+    fn backing_bytes_returns_what_was_decoded_verbatim() {
+        let encoded = encoded(&sample());
+        let owned = OwnedNodeRef::new(encoded.clone()).unwrap();
+
+        let backing = owned.backing_bytes();
+
+        assert_eq!(backing.as_ref(), encoded.as_ref());
+        // Decoding the returned bytes reproduces the same node, which is what
+        // lets an observer forward a stanza instead of re-encoding it.
+        let reparsed = OwnedNodeRef::new(backing).unwrap();
+        assert_eq!(reparsed.to_owned_node(), owned.to_owned_node());
+    }
+
+    #[test]
+    fn backing_bytes_shares_the_allocation_rather_than_copying() {
+        let owned = OwnedNodeRef::new(encoded(&sample())).unwrap();
+        let content = owned.content_bytes().unwrap();
+
+        let backing = owned.backing_bytes();
+
+        // `slice_bytes` views into this same buffer, so a payload borrowed from
+        // the node is a subrange of what `backing_bytes` returns.
+        assert_eq!(owned.slice_bytes(content).as_ptr(), content.as_ptr());
+        let offset = content.as_ptr() as usize - backing.as_ptr() as usize;
+        assert_eq!(&backing[offset..offset + content.len()], content);
     }
 }
 

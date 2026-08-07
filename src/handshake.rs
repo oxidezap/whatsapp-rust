@@ -334,7 +334,14 @@ async fn run_ik_handshake(
         }
         IkServerHelloOutcome::Fallback(inputs) => {
             *fallback_taken = true;
-            warn!(
+            // Not a failure of ours: the server declined the IK resume and
+            // answered with a full server hello, which XXfallback completes in
+            // the same round trip. WA Web logs this at its plain log level for
+            // the same reason (the "failed" wording is inherited from there).
+            // The outcome is already reported by the `info!` below, so this
+            // line only carries the reason and belongs with the other `[socket]`
+            // trace lines.
+            debug!(
                 "[socket] resumeNoiseHandshake failed: serverStaticCiphertext not null — \
                  doFallbackHandshake continuing handshake with given server hello"
             );

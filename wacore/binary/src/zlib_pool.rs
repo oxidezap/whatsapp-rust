@@ -12,11 +12,15 @@ thread_local! {
         Vec::with_capacity(4096),
     ));
 
-    // Free-list of streaming-reader state (inflate state ~48 KB + 64 KB buf). A
-    // connection's bootstrap history sync decompresses several blobs sequentially,
-    // each via a fresh `InflateReader`; reusing the state avoids re-initializing
-    // zlib and re-allocating the buffer per blob.
-    static INFLATE_POOL: RefCell<Vec<(Inflate, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+    // Free-list of inflate state (~46 KB each). A connection's bootstrap history
+    // sync decompresses several blobs sequentially, each via a fresh
+    // `InflateReader`; reusing the state avoids re-initializing zlib per blob.
+    //
+    // The output window is deliberately not part of the entry. It is the larger
+    // allocation of the two and costs one malloc to recreate, where zlib state
+    // costs an order of magnitude more, so retaining it bought little and left
+    // 64 KB alive per thread for the process's lifetime after a single sync.
+    static INFLATE_POOL: RefCell<Vec<Inflate>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Inflate straight into the vector's spare capacity, then extend its length by
@@ -61,35 +65,29 @@ pub struct InflateReader<'a> {
 }
 
 impl<'a> InflateReader<'a> {
-    /// Output decompress window per pump; also the compaction threshold.
+    /// Output decompress window per pump; also the compaction threshold. One
+    /// window is the steady state: the pump compacts a consumed prefix before
+    /// inflating, so the buffer only grows past `CHUNK` when one individual
+    /// record genuinely exceeds it. Allocated per reader, never retained.
     const CHUNK: usize = 64 * 1024;
-    /// Keep one output window between sequential streams. The pump compacts a
-    /// consumed prefix before inflating, so a second window is only needed when
-    /// one individual record genuinely exceeds `CHUNK`.
-    const RETAINED_CAPACITY: usize = Self::CHUNK;
     /// Cap on retained free-list entries, so concurrently-alive readers on one
-    /// thread don't grow the pool unbounded.
+    /// thread don't grow the pool unbounded. Sequential readers are the norm and
+    /// leave one entry parked; the cap only binds when readers nest.
     const POOL_MAX: usize = 4;
 
     pub fn new(input: &'a [u8], max: u64) -> Self {
-        let (decomp, buf) = INFLATE_POOL.with(|p| p.borrow_mut().pop()).map_or_else(
-            || {
-                (
-                    Inflate::new(ZLIB_HEADER, WINDOW_BITS),
-                    Vec::with_capacity(Self::CHUNK),
-                )
-            },
-            |(mut decomp, mut buf)| {
+        let decomp = INFLATE_POOL.with(|p| p.borrow_mut().pop()).map_or_else(
+            || Inflate::new(ZLIB_HEADER, WINDOW_BITS),
+            |mut decomp| {
                 decomp.reset(ZLIB_HEADER);
-                buf.clear();
-                (decomp, buf)
+                decomp
             },
         );
         Self {
             input,
             in_pos: 0,
             decomp: Some(decomp),
-            buf,
+            buf: Vec::with_capacity(Self::CHUNK),
             cursor: 0,
             total_out: 0,
             max,
@@ -223,22 +221,14 @@ impl<'a> InflateReader<'a> {
 
 impl Drop for InflateReader<'_> {
     fn drop(&mut self) {
-        // Return the decompressor + buffer to the per-thread free-list for reuse.
-        // `reset` on the next checkout makes prior stream state (incl. errors) moot.
+        // Return the decompressor to the per-thread free-list for reuse; `reset`
+        // on the next checkout makes prior stream state (incl. errors) moot. The
+        // window goes back to the allocator with the rest of the reader.
         if let Some(decomp) = self.decomp.take() {
-            let mut buf = std::mem::take(&mut self.buf);
-            // A large top-level record (e.g. a big conversation, up to `max`) can
-            // grow `buf` to many MB; don't retain that allocation in the pool for
-            // the thread's lifetime. Keep the one-window steady-state used by
-            // framed streams, but shrink genuinely oversized records.
-            buf.clear();
-            if buf.capacity() > Self::RETAINED_CAPACITY {
-                buf.shrink_to(Self::RETAINED_CAPACITY);
-            }
             INFLATE_POOL.with(|p| {
                 let mut pool = p.borrow_mut();
                 if pool.len() < Self::POOL_MAX {
-                    pool.push((decomp, buf));
+                    pool.push(decomp);
                 }
             });
         }
@@ -419,11 +409,11 @@ mod tests {
         out
     }
 
-    // Every other test here is sized in hundreds of KB to MB — the only way to
-    // reach window refill, the growth projection and shrink-on-return — which
-    // puts a full inflate cycle hours out of reach of Miri's interpreter, so
-    // they are `#[cfg_attr(miri, ignore)]`. This one keeps the `set_len` in
-    // `inflate_into_spare` under Miri on a fixture it can finish.
+    // Tests sized in hundreds of KB to MB reach window refill and the growth
+    // projection, which puts a full inflate cycle hours out of reach of Miri's
+    // interpreter, so those are `#[cfg_attr(miri, ignore)]`. This one and the
+    // truncated/corrupt pair keep the `set_len` in `inflate_into_spare` under
+    // Miri on fixtures it can finish.
     #[test]
     fn pooled_roundtrip_small_input() {
         let original = varied(1024);
@@ -467,7 +457,6 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn inflate_reader_keeps_one_window_for_smaller_records() {
-        INFLATE_POOL.with(|p| p.borrow_mut().clear());
         const RECORD: usize = 30 * 1024;
         let original = varied(RECORD * 8);
         let compressed = zlib(&original);
@@ -567,11 +556,10 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn drop_shrinks_oversized_buffer_before_pooling() {
-        // Buffering a large record grows `buf` to many MB; on return to the pool it
-        // must be shrunk back toward the bounded steady-state capacity, not parked
-        // at full size for the thread.
-        INFLATE_POOL.with(|p| p.borrow_mut().clear());
+    fn oversized_window_is_not_retained_for_the_thread() {
+        // Buffering a large record grows `buf` to many MB. The window is not part
+        // of a pool entry, so the next reader starts back at one window instead of
+        // inheriting the grown allocation.
         let big = varied(2 * 1024 * 1024);
         let compressed = zlib(&big);
         {
@@ -579,10 +567,50 @@ mod tests {
             assert!(r.ensure(big.len()).unwrap());
             assert!(r.buf.capacity() >= big.len(), "buf should grow while alive");
         }
-        let pooled = INFLATE_POOL.with(|p| p.borrow().last().map(|(_, b)| b.capacity()));
+        let next = InflateReader::new(&compressed, 64 * 1024 * 1024);
         assert!(
-            matches!(pooled, Some(cap) if cap <= InflateReader::RETAINED_CAPACITY),
-            "pooled buffer not shrunk: {pooled:?}"
+            next.buf.capacity() <= InflateReader::CHUNK,
+            "fresh reader inherited a {} byte window",
+            next.buf.capacity()
         );
+    }
+
+    /// Truncation is reported as EOF without a terminator, not as an error, and
+    /// the reader that picks the pooled state up next still decodes a full stream.
+    #[test]
+    fn truncated_stream_reports_missing_terminator() {
+        let original = varied(1024);
+        let compressed = stored_zlib(&original);
+        let truncated = &compressed[..compressed.len() - 300];
+
+        let mut r = InflateReader::new(truncated, 64 * 1024);
+        while r.ensure(1).unwrap() {
+            let n = r.available().len();
+            r.consume(n);
+        }
+        assert!(!r.stream_ended(), "truncated input reported a terminator");
+        assert!(r.is_done());
+        drop(r);
+
+        assert_eq!(drain_reader(&compressed, original.len()), original);
+    }
+
+    /// A corrupt stream fails with `InvalidData` and returns its half-used state
+    /// to the pool; the next checkout must reset it rather than inherit the fault.
+    #[test]
+    fn corrupt_stream_errors_without_poisoning_the_pool() {
+        let original = varied(1024);
+        let mut compressed = stored_zlib(&original);
+        // Break the stored block's LEN/!LEN complement pair, which inflate
+        // rejects outright rather than mis-decoding.
+        compressed[5] ^= 0xff;
+
+        let mut r = InflateReader::new(&compressed, 64 * 1024);
+        let err = r.ensure(1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        drop(r);
+
+        let good = stored_zlib(&original);
+        assert_eq!(drain_reader(&good, original.len()), original);
     }
 }

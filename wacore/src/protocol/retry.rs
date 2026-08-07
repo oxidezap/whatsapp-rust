@@ -358,6 +358,39 @@ mod tests {
         assert!(should_include_keys_with_policy(1, false, true));
     }
 
+    // The stateless escape hatch is the only input that can carry a bundle on a
+    // first retry without an explicit force. It is a destination category, not a
+    // chat kind: everything else has to earn the bundle by reaching the count
+    // threshold, which needs the same message id to come back.
+    #[test]
+    fn stateless_early_inclusion_covers_only_hosted_destinations() {
+        use wacore_binary::{Jid, JidExt as _};
+
+        for (raw, is_stateless) in [
+            ("5511999887766:99@s.whatsapp.net", true),
+            ("5511999887766:7@hosted", true),
+            ("100000012345678:7@hosted.lid", true),
+            ("status@broadcast", false),
+            ("120363021033254949@g.us", false),
+            ("5511999887766:7@s.whatsapp.net", false),
+            ("100000012345678:7@lid", false),
+        ] {
+            let jid: Jid = raw.parse().expect("test JID should be valid");
+            assert_eq!(jid.is_hosted(), is_stateless, "is_hosted() for {raw}");
+            assert_eq!(
+                should_include_keys_with_policy(1, false, jid.is_hosted()),
+                is_stateless,
+                "first-retry key inclusion for {raw}"
+            );
+            // Past the threshold every destination carries the bundle.
+            assert!(should_include_keys_with_policy(
+                MIN_RETRY_COUNT_FOR_KEYS,
+                false,
+                jid.is_hosted()
+            ));
+        }
+    }
+
     #[test]
     fn should_include_keys_at_retry_threshold() {
         assert!(should_include_keys(2, RetryReason::UnknownError));

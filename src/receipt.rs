@@ -215,7 +215,11 @@ fn group_delivery_receipts<'a>(
     }
 
     let mut index: std::collections::HashMap<Key, usize> = std::collections::HashMap::new();
-    let mut groups: Vec<DeliveryReceiptGroup> = Vec::new();
+    // An offline backlog is many messages over few chats, so growing each
+    // group's ids one entry at a time was this function's churn. Counting
+    // first lets every ids vec be allocated once at its final length.
+    let mut heads: Vec<(&'a MessageInfo, usize)> = Vec::new();
+    let mut slots: Vec<usize> = Vec::with_capacity(infos.len());
     for info in infos {
         let is_status = info.source.chat.is_status_broadcast();
         let is_group_like = info.source.is_group || is_status;
@@ -234,18 +238,28 @@ fn group_delivery_receipts<'a>(
                 None
             },
         };
-        match index.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => {
-                groups[*e.get()].ids.push(&info.id);
-            }
+        let slot = match index.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(groups.len());
-                groups.push(DeliveryReceiptGroup {
-                    rep: info,
-                    ids: vec![&info.id],
-                });
+                let slot = heads.len();
+                e.insert(slot);
+                heads.push((info, 0));
+                slot
             }
-        }
+        };
+        heads[slot].1 += 1;
+        slots.push(slot);
+    }
+
+    let mut groups: Vec<DeliveryReceiptGroup<'a>> = heads
+        .iter()
+        .map(|&(rep, count)| DeliveryReceiptGroup {
+            rep,
+            ids: Vec::with_capacity(count),
+        })
+        .collect();
+    for (info, &slot) in infos.iter().zip(&slots) {
+        groups[slot].ids.push(&info.id);
     }
     groups
 }
@@ -2808,6 +2822,79 @@ mod tests {
             nodes[1].children().is_none(),
             "a single-id chunk must not carry an empty <list>"
         );
+    }
+
+    #[test]
+    fn aggregate_delivery_receipts_handle_no_messages() {
+        assert!(group_delivery_receipts(&[], true).is_empty());
+    }
+
+    /// Pre-sizing the id vectors must not disturb what the grouping produces:
+    /// groups still come out in first-appearance order and each keeps its ids
+    /// in arrival order, at a batch size where the old code reallocated its
+    /// way up instead of allocating once.
+    #[test]
+    fn aggregate_delivery_receipts_keep_order_over_a_large_batch() {
+        let chats = [
+            "5511999990000@s.whatsapp.net",
+            "5511888880000@s.whatsapp.net",
+            "5511777770000@s.whatsapp.net",
+        ];
+        let infos: Vec<Arc<MessageInfo>> = (0..900)
+            .map(|i| {
+                let chat = chats[i % 3];
+                offline_info(&format!("M{i:04}"), chat, chat, false)
+            })
+            .collect();
+
+        let groups = group_delivery_receipts(&infos, true);
+
+        assert_eq!(groups.len(), 3);
+        for (offset, group) in groups.iter().enumerate() {
+            let expected: Vec<String> = (0..300)
+                .map(|n| format!("M{:04}", n * 3 + offset))
+                .collect();
+            assert_eq!(group.ids, expected);
+            assert_eq!(group.rep.id, expected[0]);
+        }
+    }
+
+    /// The shape this grouping is sized for: a backlog of many messages over
+    /// few chats must cost a handful of allocations, not one realloc per id.
+    #[test]
+    fn grouping_a_backlog_allocates_a_constant_number_of_blocks() {
+        let infos: Vec<Arc<MessageInfo>> = (0..1024)
+            .map(|i| {
+                let chat = format!("55119999{:05}@s.whatsapp.net", i % 8);
+                offline_info(&format!("M{i:05}"), &chat, &chat, false)
+            })
+            .collect();
+
+        // Slot list, group vec, one id vec per group, index map growth: 15.
+        let allocs = crate::test_alloc::min_allocs(16, || group_delivery_receipts(&infos, true));
+        assert!(
+            allocs <= 16,
+            "grouping 1024 messages over 8 chats took {allocs} allocations"
+        );
+    }
+
+    /// The opposite shape: every message lands in its own group, so no id
+    /// vector holds more than the single entry it was sized for.
+    #[test]
+    fn aggregate_delivery_receipts_handle_all_distinct_groups() {
+        let infos: Vec<Arc<MessageInfo>> = (0..64)
+            .map(|i| {
+                let chat = format!("55119999{i:05}@s.whatsapp.net");
+                offline_info(&format!("M{i:03}"), &chat, &chat, false)
+            })
+            .collect();
+
+        let groups = group_delivery_receipts(&infos, true);
+
+        assert_eq!(groups.len(), 64);
+        for (i, group) in groups.iter().enumerate() {
+            assert_eq!(group.ids, vec![format!("M{i:03}")]);
+        }
     }
 
     #[tokio::test]

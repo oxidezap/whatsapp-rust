@@ -5089,6 +5089,268 @@ async fn test_undecryptable_deduped_across_resends() {
     }
 }
 
+/// Buffers what `message::receive` announced, so a test can assert that a
+/// branch's log describes what the branch actually did.
+#[derive(Default)]
+struct ReceiveLogCapture {
+    records: std::sync::Mutex<Vec<(log::Level, String)>>,
+}
+
+impl log::Log for ReceiveLogCapture {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target() == "whatsapp_rust::message::receive"
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            self.records
+                .lock()
+                .unwrap()
+                .push((record.level(), record.args().to_string()));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static RECEIVE_LOG_CAPTURE: std::sync::LazyLock<ReceiveLogCapture> =
+    std::sync::LazyLock::new(ReceiveLogCapture::default);
+
+/// `true` once this process's logger is the capture above. Idempotent: the
+/// install is attempted once per process and the verdict cached.
+fn receive_log_capture_installed() -> bool {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INSTALLED.get_or_init(|| {
+        let installed = log::set_logger(&*RECEIVE_LOG_CAPTURE).is_ok();
+        if installed {
+            log::set_max_level(log::LevelFilter::Trace);
+        }
+        installed
+    })
+}
+
+/// Hands a test's log assertions to a fresh process when this one's `log` slot
+/// is already owned by a sibling test's `env_logger`. `log`'s global logger is
+/// install-once, so a threaded `cargo test --lib` run cannot be relied on to
+/// leave it free, and skipping the assertions there would let a regression in
+/// the very behaviour under test go unseen. `cargo nextest` gives every test
+/// its own process, so this never fires under CI.
+///
+/// `true` means the caller should return immediately: the child already ran the
+/// real assertions and its failure, if any, has been propagated.
+fn log_assertions_delegated_to_child(test_name: &str) -> bool {
+    const CHILD_MARKER: &str = "WA_RUST_OWNS_LOG_CAPTURE";
+
+    if receive_log_capture_installed() {
+        return false;
+    }
+    assert!(
+        std::env::var_os(CHILD_MARKER).is_none(),
+        "{test_name}: a single-test child must own the log capture, and did not",
+    );
+    let output =
+        std::process::Command::new(std::env::current_exe().expect("running test binary path"))
+            .args([test_name, "--exact", "--test-threads=1"])
+            .env(CHILD_MARKER, "1")
+            .output()
+            .expect("re-running the test in its own process");
+    // libtest exits 0 for a filter that matched nothing, so accepting the exit
+    // code alone would let a stale `test_name` (after a rename, say) restore the
+    // very skip this helper exists to remove. Demand the child's own result line
+    // for the test we asked it to run.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains(&format!("test {test_name} ... ok")),
+        "{test_name} did not run and pass in its own process:\n{stdout}{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    true
+}
+
+/// The captured `message::receive` records that name `msg_id`.
+fn receive_logs_for(msg_id: &str) -> Vec<(log::Level, String)> {
+    RECEIVE_LOG_CAPTURE
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, message)| message.contains(msg_id))
+        .cloned()
+        .collect()
+}
+
+const DISPATCH_ANNOUNCEMENT: &str = "Dispatching UndecryptableMessage event.";
+
+/// The ordinary shape: a message whose only payload is a session ciphertext
+/// that fails to decrypt, with no group content. `process_session_enc_batch`
+/// owns the dispatch here (every session failure routes through
+/// `handle_decrypt_failure`), so the no-group-content branch downstream must
+/// stay silent instead of announcing a dispatch it does not perform — the
+/// contradictory pair seen in production. The event still fires exactly once,
+/// which is what keeps the silencing from turning into a dropped failure.
+#[tokio::test]
+async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
+    use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SignalMessage};
+
+    if log_assertions_delegated_to_child(
+        "message::tests::undecryptable_receive_branch_stays_silent_when_batch_dispatched",
+    ) {
+        return;
+    }
+    let client = create_test_client_for_retry_with_id("undec_log_batch").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.subscribe_handler(recorder.clone()).detach();
+
+    let sender: Jid = "5511900000001@s.whatsapp.net"
+        .parse()
+        .expect("test JID should be valid");
+    let msg_id = "UNDEC_LOG_BATCH_OWNS_DISPATCH";
+    let info = Arc::new(MessageInfo {
+        id: msg_id.to_string(),
+        source: crate::types::message::MessageSource {
+            sender: sender.clone(),
+            chat: sender.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    // A well-formed SignalMessage for a session we have never established:
+    // parses, then fails to decrypt with SessionNotFound.
+    let sender_ratchet = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()).public_key;
+    let sender_identity = IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let receiver_identity = IdentityKeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+    let signal_message = SignalMessage::new(
+        4,
+        &[0u8; 32],
+        sender_ratchet,
+        0,
+        0,
+        b"test",
+        sender_identity.identity_key(),
+        receiver_identity.identity_key(),
+    )
+    .expect("SignalMessage::new should succeed with valid inputs");
+    let enc = NodeBuilder::new("enc")
+        .attr("type", "msg")
+        .bytes(signal_message.serialized().to_vec())
+        .build();
+    let payload = EncPayload::from_node_ref(&enc.as_node_ref()).expect("session payload");
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads: vec![payload],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.undecryptable().len(),
+        1,
+        "the batch's dispatch must still be the one UndecryptableMessage for this id",
+    );
+
+    let logs = receive_logs_for(msg_id);
+    assert!(
+        !logs.is_empty(),
+        "the decrypt failure must leave a receive-side record for this id",
+    );
+    assert!(
+        !logs.iter().any(|(_, m)| m.contains(DISPATCH_ANNOUNCEMENT)),
+        "nothing dispatches here, so nothing may announce a dispatch: {logs:?}",
+    );
+
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// The branch's own case: the session batch never ran (a group-addressed
+/// sender's session payloads are skipped, so its outcome carries no dispatch),
+/// leaving this branch as the dispatcher. Then the announcement is accurate,
+/// fires once, and keeps taking its level from `decrypt_fail_mode`.
+#[tokio::test]
+async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
+    if log_assertions_delegated_to_child(
+        "message::tests::undecryptable_receive_branch_announces_the_dispatch_it_performs",
+    ) {
+        return;
+    }
+    let client = create_test_client_for_retry_with_id("undec_log_branch").await;
+    let recorder = Arc::new(EventRecorder::default());
+    client.subscribe_handler(recorder.clone()).detach();
+
+    let group: Jid = "120363000000000001@g.us"
+        .parse()
+        .expect("test JID should be valid");
+    let participant: Jid = "5511900000002@s.whatsapp.net"
+        .parse()
+        .expect("test JID should be valid");
+    let msg_id = "UNDEC_LOG_BRANCH_DISPATCHES";
+    let info = Arc::new(MessageInfo {
+        id: msg_id.to_string(),
+        source: crate::types::message::MessageSource {
+            sender: participant,
+            chat: group.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    let enc = NodeBuilder::new("enc")
+        .attr("type", "msg")
+        .bytes(vec![0xFF, 0x00, 0x03])
+        .build();
+    let payload = EncPayload::from_node_ref(&enc.as_node_ref()).expect("session payload");
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: group,
+                session_payloads: vec![payload],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.undecryptable().len(),
+        1,
+        "the branch must dispatch exactly one UndecryptableMessage",
+    );
+
+    let announcements: Vec<_> = receive_logs_for(msg_id)
+        .into_iter()
+        .filter(|(_, m)| m.contains(DISPATCH_ANNOUNCEMENT))
+        .collect();
+    assert_eq!(
+        announcements.len(),
+        1,
+        "the performed dispatch must be announced exactly once: {announcements:?}",
+    );
+    assert_eq!(
+        announcements[0].0,
+        decrypt_fail_log_level(DecryptFailMode::Show),
+        "the announcement keeps taking its level from decrypt_fail_mode",
+    );
+
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
 /// Status posts must flow through PDO — excluding them drops any
 /// InvalidPreKeyId status permanently (WA Web recovers them).
 #[tokio::test]
@@ -6152,6 +6414,236 @@ async fn explicit_retry_preserves_canonical_routing_shapes() {
     }
 }
 
+const FRESH_ID_SENDER: &str = "12025550111:7@s.whatsapp.net";
+
+/// One inbound status stanza from `FRESH_ID_SENDER`, addressed the way a status
+/// post reaches us: `from` is the broadcast chat, the author is `participant`.
+fn status_stanza(id: &str) -> wacore_binary::Node {
+    NodeBuilder::new("message")
+        .attr("id", id.to_string())
+        .attr("from", "status@broadcast")
+        .attr("participant", FRESH_ID_SENDER)
+        .attr("t", "1")
+        .build()
+}
+
+async fn client_with_account(
+    test_id: &str,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
+    let (client, transport) = capturing_client(test_id).await;
+    client
+        .persistence_manager
+        .process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity::default(),
+        )))
+        .await;
+    (client, transport)
+}
+
+// Characterization, not a desired outcome. Paired with
+// `redelivered_id_reaches_the_retry_key_bundle`: same origin, one repeated id,
+// and that one does reach the bundle.
+#[tokio::test]
+async fn fresh_message_ids_never_reach_the_retry_key_bundle() {
+    let (client, transport) = client_with_account("retry_fresh_ids").await;
+    let before = client.persistence_manager.get_device_snapshot();
+
+    let ids: Vec<String> = (0..10).map(|n| format!("FRESH-STATUS-{n}")).collect();
+    for id in &ids {
+        assert_eq!(
+            client
+                .request_message_retry(
+                    &status_stanza(id).as_node_ref(),
+                    crate::features::RetryRequestOptions::default(),
+                )
+                .await
+                .expect("status retry should send"),
+            crate::features::RetryRequestOutcome::Sent {
+                retry_count: 1,
+                included_keys: false,
+            },
+            "{id} must stay on the first retry attempt"
+        );
+    }
+
+    let frames = transport.sent();
+    for id in &ids {
+        let receipt = find_receipt_details(&frames, id).expect("status retry receipt");
+        assert_eq!(receipt.to, "status@broadcast");
+        assert!(!receipt.has_keys, "{id} must not carry a key bundle");
+    }
+
+    // The other half of the cost story: a receipt without a bundle reserves no
+    // one-time prekey, so this source never touches the pool or the upload window.
+    let after = client.persistence_manager.get_device_snapshot();
+    assert_eq!(after.next_pre_key_id, before.next_pre_key_id);
+    assert_eq!(
+        after.first_unupload_pre_key_id,
+        before.first_unupload_pre_key_id
+    );
+}
+
+// The contrast that isolates the cause. Same chat, same sender, same broadcast
+// origin as the test above; the only change is that the id comes back.
+#[tokio::test]
+async fn redelivered_id_reaches_the_retry_key_bundle() {
+    let (client, transport) = client_with_account("retry_redelivered_id").await;
+    let before = client.persistence_manager.get_device_snapshot();
+    let stanza = status_stanza("REDELIVERED-STATUS");
+
+    assert_eq!(
+        client
+            .request_message_retry(
+                &stanza.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("first retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 1,
+            included_keys: false,
+        }
+    );
+    assert_eq!(
+        client
+            .request_message_retry(
+                &stanza.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("second retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 2,
+            included_keys: true,
+        }
+    );
+
+    let frames = transport.sent();
+    let receipt =
+        find_receipt_details(&frames, "REDELIVERED-STATUS").expect("status retry receipt");
+    assert_eq!(receipt.to, "status@broadcast");
+    // The outcome says inclusion was intended; this says it reached the wire.
+    assert_eq!(
+        retry_receipt_key_bundles_for(&frames, "REDELIVERED-STATUS"),
+        vec![false, true]
+    );
+
+    let after = client.persistence_manager.get_device_snapshot();
+    assert_ne!(after.next_pre_key_id, before.next_pre_key_id);
+    assert_eq!(
+        after.first_unupload_pre_key_id, after.next_pre_key_id,
+        "the directly distributed prekey must leave the upload window"
+    );
+}
+
+// The sender-echoed `<enc count>` is the other way the counter moves, and it is
+// the only one the official client has. Both ends of its range matter: a sender
+// that reports 0 must not shortcut the threshold, and one that reports past it
+// must not be clamped back down.
+#[tokio::test]
+async fn sender_echoed_count_bounds_the_key_decision() {
+    let (client, _transport) = client_with_account("retry_sender_count_bounds").await;
+
+    let enc_with_count = |id: &str, count: Option<&str>| {
+        let mut enc = NodeBuilder::new("enc").attr("type", "msg");
+        if let Some(count) = count {
+            enc = enc.attr("count", count.to_string());
+        }
+        NodeBuilder::new("message")
+            .attr("id", id.to_string())
+            .attr("from", FRESH_ID_SENDER)
+            .attr("t", "1")
+            .attr("type", "text")
+            .children([enc.bytes([0_u8]).build()])
+            .build()
+    };
+
+    for (id, count) in [("ECHO-ABSENT", None), ("ECHO-ZERO", Some("0"))] {
+        assert_eq!(
+            client
+                .request_message_retry(
+                    &enc_with_count(id, count).as_node_ref(),
+                    crate::features::RetryRequestOptions::default(),
+                )
+                .await
+                .expect("retry should send"),
+            crate::features::RetryRequestOutcome::Sent {
+                retry_count: 1,
+                included_keys: false,
+            },
+            "a sender reporting no progress must not skip the threshold ({id})"
+        );
+    }
+
+    assert_eq!(
+        client
+            .request_message_retry(
+                &enc_with_count("ECHO-HIGH", Some("3")).as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("retry should send"),
+        crate::features::RetryRequestOutcome::Sent {
+            retry_count: 4,
+            included_keys: true,
+        }
+    );
+}
+
+// Being pinned at 1 also keeps the source clear of the cap, so it never reaches
+// the PDO-only arm that a repeated id runs into after five attempts.
+#[tokio::test]
+async fn fresh_message_ids_never_reach_the_retry_cap() {
+    let (client, _transport) = client_with_account("retry_fresh_id_cap").await;
+
+    for n in 0..(MAX_DECRYPT_RETRIES as u16 + 2) {
+        assert_eq!(
+            client
+                .request_message_retry(
+                    &status_stanza(&format!("UNCAPPED-STATUS-{n}")).as_node_ref(),
+                    crate::features::RetryRequestOptions::default(),
+                )
+                .await
+                .expect("status retry should send"),
+            crate::features::RetryRequestOutcome::Sent {
+                retry_count: 1,
+                included_keys: false,
+            }
+        );
+    }
+
+    let repeated = status_stanza("CAPPED-STATUS");
+    for expected in 1..=MAX_DECRYPT_RETRIES {
+        let outcome = client
+            .request_message_retry(
+                &repeated.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("status retry should send");
+        assert_eq!(
+            outcome,
+            crate::features::RetryRequestOutcome::Sent {
+                retry_count: expected,
+                included_keys: expected >= 2,
+            }
+        );
+    }
+    assert_eq!(
+        client
+            .request_message_retry(
+                &repeated.as_node_ref(),
+                crate::features::RetryRequestOptions::default(),
+            )
+            .await
+            .expect("the cap is an outcome, not an error"),
+        crate::features::RetryRequestOutcome::LimitReached
+    );
+}
+
 #[tokio::test]
 async fn explicit_retry_validates_input_and_reports_the_shared_limit() {
     let (client, transport) = capturing_client("explicit_retry_validation").await;
@@ -6576,6 +7068,28 @@ struct SentReceipt {
     context: Option<String>,
     category: Option<String>,
     has_keys: bool,
+}
+
+/// Every retry receipt carrying `id`, in wire order, as whether it embedded a
+/// `<keys>` bundle. `find_receipt_details` stops at the first match, so it
+/// cannot describe a sequence of retries for one message.
+fn retry_receipt_key_bundles_for(frames: &[bytes::Bytes], id: &str) -> Vec<bool> {
+    let mut bundles = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let Some(buf) = decode_frame(i, frame) else {
+            continue;
+        };
+        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+            continue;
+        };
+        if node.tag.as_ref() == "receipt"
+            && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+            && node.get_attr("type").is_some_and(|v| v.as_str() == "retry")
+        {
+            bundles.push(node.get_optional_child("keys").is_some());
+        }
+    }
+    bundles
 }
 
 fn find_receipt_details(frames: &[bytes::Bytes], id: &str) -> Option<SentReceipt> {

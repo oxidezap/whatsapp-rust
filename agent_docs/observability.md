@@ -124,14 +124,17 @@ all of these into one estimate. Same design rules: runtime/platform-agnostic,
 zero cost when unused (LTO drops it), no PII.
 
 How big "per-session" is depends on the backend, and the two profiles differ
-enough that quoting one figure misleads (measured with the harness below;
-`memory_soak.rs` covers growth over time, `per_session_memory.rs` covers the
-marginal cost of one more client):
+enough that quoting one figure misleads (`memory_soak.rs` covers growth over
+time, `process_footprint.rs` below covers the marginal cost of one more
+client):
 
 | profile | marginal RSS per session |
 | --- | ---: |
 | `InMemoryBackend` | ~530 KiB |
 | `SqliteStore` (defaults) | ~530 KiB + ~512 KiB of storage |
+
+Those are gross RSS, which is the pessimistic number; read the next section for
+why the actionable part is `RssAnon` and how much smaller it is.
 
 So the SQLite page cache **is** the single largest chunk, but only on the
 SQLite profile, and it is roughly half the total rather than all of it. A
@@ -194,27 +197,58 @@ reliable signal and `freed`/`net` drift for buffers that outlive their poll.
 file-backed pages — useful for a process holding many small per-session DBs. WAL
 caveat: mmap covers reads of the main DB file; writes still go through the WAL.
 
-### Measuring it
+## Fixed process cost vs per-session cost
 
-`tests/e2e/tests/per_session_memory.rs` (`#[ignore]`, run with
-`--run-ignored all`) connects `SESSION_COUNT` clients, keeps them all alive, and
-prints each one's RSS growth next to what `resource_report()` attributed.
+A process that runs one session pays far more than a process that runs ten
+divided by ten. `tests/e2e/tests/process_footprint.rs` measures the split:
+`client_construction_footprint` (no mock server needed) for what a `Client`
+costs before it talks to anything, `session_footprint_fixed_vs_marginal` for a
+connected, paired, synced session. Both build N clients in one process
+(`FOOTPRINT_CLIENTS`, default 16) and log a per-client table plus first /
+second / median-marginal deltas.
 
-Four things make the difference between a number and a wrong number:
+Report the marginal and the fixed number, never the average over N: the average
+is dominated by the first client and hides the very asymmetry the split exists
+to expose.
 
-- **Report the marginal client, not the average.** The first client pays the
-  process-wide setup (crypto provider, lazily built statics, runtime threads),
-  which is ~28x the marginal cost. Averaging it in nearly triples the answer.
-- **RSS is not the report's target.** Measured against a counting allocator,
-  glibc's RSS runs ~1.10x live heap, so the report is a lower bound on RSS by
-  construction and closing the last 10% is not a goal.
+Read the `anon` column. `/proc/self/status` splits RSS into `RssAnon` and
+`RssFile`, and the first client's RSS delta is overwhelmingly `RssFile`: the
+executable's own text and rodata faulted in the first time each code path runs.
+That is bounded by the binary, shared by every session in the process, backed by
+the page cache rather than by the allocator, and roughly 3.5x smaller under the
+release profile than under `dev`. Anonymous growth is the part a consumer can
+act on, and it is two orders of magnitude smaller.
+
+Two consequences for anything measured this way:
+
+- A one-off RSS jump on a path's first execution is not a leak and not
+  attributable to the session that happened to run it first. Compare against a
+  control step that does no work at all; in `dev` builds a single `println!`
+  moves `RssFile` by ~2 MiB.
+- Static tables (the binary protocol token maps, `webpki-roots`) never appear in
+  `anon` at all, and the protobuf descriptor is consumed at build time, so none
+  of them scale with sessions. The lazily built codec tables under the `voip`
+  features do: they are `OnceLock` heap, process-wide, and only materialize once
+  a call is encoded.
+
+### Reading a heap profile next to it
+
+`--features dhat-heap` (in `tests/e2e`) attributes retained bytes to call
+sites, which the footprint numbers cannot. Three things about that profile are
+easy to read backwards:
+
 - **dhat sees only the Rust global allocator.** SQLite's page cache comes from
-  the amalgamation's own `malloc`, so it does not appear in a heap profile at
-  any size. The storage report and RSS are the only places it is visible.
-- **dhat's end-of-run `curr_bytes` is a leak metric.** The profiler is dropped
-  after the clients it was profiling, so that figure describes what survived
-  teardown, not what a live session costs. Residency is the peak-time snapshot
-  or a `resource_report()` taken while the clients are still connected.
+  the amalgamation's own `malloc`, so it never appears in a heap profile at any
+  size, and a profile taken on SQLite looks the same as one taken in memory.
+  The storage report and `RssAnon` are the only places it shows up.
+- **Its end-of-run `curr_bytes` is a leak metric, not residency.** The profiler
+  outlives the clients it profiled, so that figure describes what survived
+  teardown. Residency is the peak-time figure, or a `resource_report()` taken
+  while the clients are still connected.
+- **The report cannot reach RSS, by construction.** Against a counting global
+  allocator, glibc's anonymous RSS runs ~1.1x live heap, so
+  `total_estimated_bytes()` is a lower bound on `RssAnon` before any component
+  under-reports at all. Closing that last tenth is not a goal.
 
 Not everything is expressible. The noise sender task's batch buffer grows to
 `MAX_BATCH_WIRE_BYTES` and lives as a local inside a spawned task, so nothing
