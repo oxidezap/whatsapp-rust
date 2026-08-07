@@ -1912,7 +1912,7 @@ mod tests {
     #[tokio::test]
     async fn shared_msg_secret_strings_are_counted_once() {
         const ROWS: usize = 40;
-        const JID: &str = "15550000001@s.whatsapp.net";
+        const JID: &str = "12025550111@s.whatsapp.net";
 
         async fn report_for(chat_for: impl Fn(usize) -> Arc<str>) -> u64 {
             let backend = InMemoryBackend::new();

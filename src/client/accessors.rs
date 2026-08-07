@@ -276,6 +276,7 @@ impl Client {
             delivery_receipt_queue: self.delivery_receipt_queue.get().map_or(0, |tx| tx.len()),
             response_waiters,
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
+            sent_node_waiters: self.sent_node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,
             presence_subscriptions,
             app_state_key_requests,

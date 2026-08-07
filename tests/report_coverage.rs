@@ -83,6 +83,42 @@ fn mentions(text: &str, name: &str) -> bool {
     })
 }
 
+/// The body of `memory_report()`, brace-matched from its signature with line
+/// comments stripped first. Searching all of `accessors.rs` would let an
+/// unrelated getter, or a field named in a comment, stand in for the report
+/// actually walking it.
+fn memory_report_body(text: &str) -> String {
+    let stripped: String = text
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(at) => &line[..at],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    const SIGNATURE: &str = "pub async fn memory_report(";
+    let at = stripped
+        .find(SIGNATURE)
+        .expect("`memory_report` in src/client/accessors.rs");
+    let open = at + stripped[at..].find('{').expect("a body for memory_report");
+
+    let mut depth = 0usize;
+    for (offset, ch) in stripped[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return stripped[open..=open + offset].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unbalanced braces after `memory_report`");
+}
+
 fn client_struct(text: &str) -> syn::ItemStruct {
     let file = syn::parse_file(text).expect("parse src/client.rs");
     file.items
@@ -97,9 +133,7 @@ fn client_struct(text: &str) -> syn::ItemStruct {
 #[test]
 fn every_growable_client_field_reaches_the_memory_report() {
     let client = client_struct(&read("src/client.rs"));
-    // The report walks the fields here; a name mentioned anywhere in the file is
-    // reached by it, which is the property under test, not how it is rendered.
-    let accessors = read("src/client/accessors.rs");
+    let report = memory_report_body(&read("src/client/accessors.rs"));
 
     let mut missing = Vec::new();
     for field in &client.fields {
@@ -114,7 +148,7 @@ fn every_growable_client_field_reaches_the_memory_report() {
         if EXEMPT.iter().any(|(exempt, _)| *exempt == name) {
             continue;
         }
-        if !mentions(&accessors, &name) {
+        if !mentions(&report, &name) {
             missing.push(format!("  {name}: {}", idents.join("<")));
         }
     }

@@ -302,6 +302,9 @@ pub struct MemoryReport {
     pub delivery_receipt_queue: usize,
     pub response_waiters: usize,
     pub node_waiters: usize,
+    /// Waiters parked on outgoing nodes, the pre-encryption counterpart of
+    /// [`Self::node_waiters`]. Each retains a filter and a oneshot sender.
+    pub sent_node_waiters: usize,
     pub pending_retries: usize,
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
@@ -433,6 +436,7 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  response_waiters:       {}", self.response_waiters)?;
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
+        writeln!(f, "  sent_node_waiters:      {}", self.sent_node_waiters)?;
         writeln!(f, "  pending_retries:        {}", self.pending_retries)?;
         writeln!(
             f,
