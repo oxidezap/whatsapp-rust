@@ -441,9 +441,10 @@ impl CallRegistry {
     ///
     /// Poisoning would be permanent and process-wide: one panic under any of these guards would
     /// turn every later VoIP call into a panic, including [`abort_all`](Self::abort_all), the one
-    /// operation a caller needs after a failure. Recovery is sound because no critical section here
-    /// leaves a half-written entry: each one runs its invariant checks before touching the map and
-    /// then commits whole fields, so an unwind either changed nothing or finished the entry.
+    /// operation a caller needs after a failure -- and it would not undo whatever the panic left
+    /// behind. Recovery is sound because the damage an unwind can do is bounded to the one call it
+    /// was already failing: the map has no cross-entry invariant, entries are only ever removed
+    /// whole, and every mutation is a whole-field assignment, so nothing is left half-written.
     fn active_calls(&self) -> std::sync::MutexGuard<'_, HashMap<String, CallEntry>> {
         self.inner
             .lock()
@@ -5060,19 +5061,25 @@ mod tests {
     }
 
     /// Runs `body` on a worker thread and fails instead of hanging the suite if it deadlocks.
+    ///
+    /// Only a timeout means deadlock. A dropped sender means `body` panicked, so the worker is
+    /// joined and its payload re-raised rather than reported as a hang.
     fn within_five_seconds(name: &str, body: impl FnOnce() + Send + 'static) {
+        use std::sync::mpsc::RecvTimeoutError;
+
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             body();
             let _ = done_tx.send(());
         });
-        assert!(
-            done_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .is_ok(),
-            "{name} deadlocked: the abort ran while the registry lock was held"
-        );
-        worker.join().expect("worker thread panicked");
+        let outcome = done_rx.recv_timeout(Duration::from_secs(5));
+        if outcome == Err(RecvTimeoutError::Timeout) {
+            panic!("{name} deadlocked: the abort ran while the registry lock was held");
+        }
+        if let Err(payload) = worker.join() {
+            std::panic::resume_unwind(payload);
+        }
+        assert!(outcome.is_ok(), "{name} ended without signalling");
     }
 
     #[test]
@@ -5115,14 +5122,15 @@ mod tests {
         let generation = reg.insert(session("CID"));
         reg.mark_incoming_ringing("RINGING");
 
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // The panic hook is left alone: silencing it is a process-wide mutation that would swallow
+        // a genuine panic from any test running in parallel, so this one announces itself instead.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _active = reg.active_calls();
             let _ringing = reg.ringing_calls();
-            panic!("invariant violated inside a critical section");
+            panic!(
+                "intentional panic under both registry guards; this test asserts on the recovery"
+            );
         }));
-        std::panic::set_hook(previous_hook);
 
         assert!(outcome.is_err());
         assert!(reg.inner.is_poisoned() && reg.ringing.is_poisoned());
