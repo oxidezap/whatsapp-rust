@@ -1410,14 +1410,21 @@ impl SqliteStore {
         key_id: &[u8],
         device_id: i32,
     ) -> Result<Option<AppStateSyncKey>> {
+        // On the write queue: a stale absent answer is sent on the wire as an
+        // orphan reply to a peer's key request, so it is not a miss the caller
+        // retries.
+        let pool = self.pool.clone();
         let key_id = key_id.to_vec();
         let res: Option<Vec<u8>> = self
-            .read_query(move |conn| {
+            .with_semaphore(move || -> Result<Option<Vec<u8>>> {
+                let mut conn = pool
+                    .get()
+                    .map_err(|e| StoreError::Connection(Box::new(e)))?;
                 let res: Option<Vec<u8>> = app_state_keys::table
                     .select(app_state_keys::key_data)
                     .filter(app_state_keys::key_id.eq(&key_id))
                     .filter(app_state_keys::device_id.eq(device_id))
-                    .first(conn)
+                    .first(&mut conn)
                     .optional()
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
                 Ok(res)
@@ -1479,8 +1486,14 @@ impl SqliteStore {
         &self,
         device_id: i32,
     ) -> Result<Option<Vec<u8>>> {
+        // On the write queue: a stale absent answer becomes InvalidRequest and
+        // fails the user's app-state action outright.
+        let pool = self.pool.clone();
         let res: Option<Vec<u8>> = self
-            .read_query(move |conn| {
+            .with_semaphore(move || -> Result<Option<Vec<u8>>> {
+                let mut conn = pool
+                    .get()
+                    .map_err(|e| StoreError::Connection(Box::new(e)))?;
                 // Return the latest key whose blob actually decodes. A legacy bincode
                 // row (or a corrupt one) reads as absent via get_sync_key but still
                 // sits in the table with a possibly lexicographically-higher key_id;
@@ -1491,7 +1504,7 @@ impl SqliteStore {
                     .select((app_state_keys::key_id, app_state_keys::key_data))
                     .filter(app_state_keys::device_id.eq(device_id))
                     .order(app_state_keys::key_id.desc())
-                    .load(conn)
+                    .load(&mut conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
                 let res = candidates
                     .into_iter()
@@ -6338,6 +6351,16 @@ mod read_routing_tests {
              cache in front on that path, so a stale miss loses the addon too",
         ),
         ("get_pn_mapping", "same as get_lid_mapping"),
+        (
+            "get_app_state_sync_key_for_device",
+            "a stale absent answer is sent on the wire as an orphan reply to a \
+             peer's key request, not retried by the caller",
+        ),
+        (
+            "get_latest_app_state_sync_key_id_for_device",
+            "a stale absent answer becomes InvalidRequest and fails the user's \
+             app-state action outright",
+        ),
         (
             "get_all_lid_mappings",
             "the startup warm-up feeds these into LidPnCache::add_guarded, whose \
