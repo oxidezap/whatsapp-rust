@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard};
 
@@ -75,6 +75,12 @@ fn compact_users_if_needed<V>(cache: &mut UserIndexedCache<V>, max_entries: usiz
 /// Default max entries per store before clean entry eviction triggers.
 const DEFAULT_MAX_CACHE_ENTRIES: usize = 2_000;
 
+/// Removals retained for cold readers to consult. A reader that spans more
+/// than this many removals is told its key went, which costs a re-read; the
+/// window is what keeps the bookkeeping fixed-size and free of any per-reader
+/// state that a cancelled read could strand.
+const RECENT_REMOVALS: usize = 64;
+
 /// Unlocked cold sender-key reads to try before falling back to reading under
 /// the lock. Losing twice means a removal landed in both windows, which needs a
 /// flush plus an eviction each time; the fallback keeps that bounded.
@@ -120,15 +126,19 @@ fn user_of_protocol_address(address: &str) -> &str {
 struct UserIndexedCache<V> {
     map: HashMap<Arc<str>, V>,
     users: HashSet<Arc<str>>,
-    /// Cold reads in flight, by key. A reader that saw a slot absent, released
+    /// Counts removal events. A cold reader that saw a slot absent, released
     /// the lock, and finds it absent again cannot otherwise tell "never
     /// written" from "written, flushed, and evicted": a clean removal keeps the
     /// incarnation, so its pre-write bytes would be trusted as an exact reload.
-    /// Tracked per key, so churn on unrelated chains costs a reader nothing.
-    /// Bounded by concurrent cold misses, not by cache size.
-    cold_reads: HashMap<Arc<str>, u32>,
-    /// Keys removed while a cold read of that key was in flight.
-    invalidated_reads: HashSet<Arc<str>>,
+    removal_seq: u64,
+    /// The last `RECENT_REMOVALS` removals, newest last, so a reader can ask
+    /// about its own key rather than about cache-wide churn. A fixed window
+    /// needs no per-reader registration, so a cancelled read leaves nothing
+    /// behind; a reader older than the window is told "removed" instead.
+    recent_removals: VecDeque<(u64, Arc<str>)>,
+    /// Sequence of the last removal that could not name its keys (`clear`,
+    /// `retain`), which invalidates every reader older than it.
+    opaque_removal_seq: u64,
 }
 
 impl<V> UserIndexedCache<V> {
@@ -136,8 +146,9 @@ impl<V> UserIndexedCache<V> {
         Self {
             map: HashMap::new(),
             users: HashSet::new(),
-            cold_reads: HashMap::new(),
-            invalidated_reads: HashSet::new(),
+            removal_seq: 0,
+            recent_removals: VecDeque::new(),
+            opaque_removal_seq: 0,
         }
     }
 
@@ -146,52 +157,41 @@ impl<V> UserIndexedCache<V> {
         if !self.users.contains(user) {
             self.users.insert(Arc::from(user));
         }
-        // A populated slot is answered by the re-check, never by the mark, so
-        // clearing here cannot hide a removal: a mark that still matters is set
-        // by the removal that follows. It does let a mark stranded by a
-        // cancelled read heal instead of pinning that chain to the slow path.
-        self.invalidated_reads.remove(&key);
         self.map.insert(key, value)
     }
 
-    /// Register a cold read of `key` so a removal landing before it installs
-    /// is attributed to that key rather than to cache-wide churn.
-    fn begin_cold_read(&mut self, key: &str) {
-        match self.cold_reads.get_mut(key) {
-            Some(count) => *count += 1,
-            None => {
-                self.cold_reads.insert(Arc::from(key), 1);
-            }
-        }
+    /// Stamp to take before a cold read releases the lock.
+    fn removal_seq(&self) -> u64 {
+        self.removal_seq
     }
 
-    /// End a cold read, reporting whether this key was removed while it ran.
-    fn finish_cold_read(&mut self, key: &str) -> bool {
-        if let Some(count) = self.cold_reads.get_mut(key) {
-            *count -= 1;
-            if *count == 0 {
-                self.cold_reads.remove(key);
-            }
+    /// Whether `key` was removed after `since`. Conservative in two places: a
+    /// removal that could not name its keys, and a reader older than the
+    /// retained window. Both answer "removed", which costs a re-read rather
+    /// than admitting bytes that predate a write.
+    fn removed_since(&self, key: &str, since: u64) -> bool {
+        if self.opaque_removal_seq > since {
+            return true;
         }
-        // Only the last reader out clears the mark, so overlapping readers of
-        // the same key all learn about the removal.
-        if self.cold_reads.contains_key(key) {
-            self.invalidated_reads.contains(key)
-        } else {
-            self.invalidated_reads.remove(key)
+        if self.removal_seq.saturating_sub(since) > RECENT_REMOVALS as u64 {
+            return true;
         }
+        self.recent_removals
+            .iter()
+            .any(|(seq, removed)| *seq > since && removed.as_ref() == key)
     }
 
-    fn invalidate_cold_read(&mut self, key: &str) {
-        if let Some((key, _)) = self.cold_reads.get_key_value(key) {
-            let key = key.clone();
-            self.invalidated_reads.insert(key);
+    fn note_removal(&mut self, key: Arc<str>) {
+        self.removal_seq += 1;
+        if self.recent_removals.len() == RECENT_REMOVALS {
+            self.recent_removals.pop_front();
         }
+        self.recent_removals.push_back((self.removal_seq, key));
     }
 
-    fn invalidate_all_cold_reads(&mut self) {
-        let keys: Vec<Arc<str>> = self.cold_reads.keys().cloned().collect();
-        self.invalidated_reads.extend(keys);
+    fn note_opaque_removal(&mut self) {
+        self.removal_seq += 1;
+        self.opaque_removal_seq = self.removal_seq;
     }
 
     fn has_user(&self, user: &str) -> bool {
@@ -241,24 +241,26 @@ impl<V> UserIndexedCache<V> {
     }
 
     fn remove(&mut self, key: &str) -> Option<V> {
-        let removed = self.map.remove(key);
-        if removed.is_some() {
-            self.invalidate_cold_read(key);
-        }
-        removed
+        let (key, value) = self.map.remove_entry(key)?;
+        // Reuses the map's own `Arc<str>`, so recording a removal allocates
+        // nothing.
+        self.note_removal(key);
+        Some(value)
     }
 
     fn retain(&mut self, keep: impl FnMut(&Arc<str>, &mut V) -> bool) {
         let before = self.map.len();
         self.map.retain(keep);
         if self.map.len() != before {
-            // `retain` does not report which keys went, so concede all of them.
-            self.invalidate_all_cold_reads();
+            // `retain` does not report which keys went.
+            self.note_opaque_removal();
         }
     }
 
     fn clear(&mut self) {
-        self.invalidate_all_cold_reads();
+        if !self.map.is_empty() {
+            self.note_opaque_removal();
+        }
         self.map.clear();
         self.users.clear();
     }
@@ -1213,13 +1215,12 @@ impl SignalStoreCache {
     ) -> Result<Option<Arc<SenderKeyRecord>>> {
         let key = name.cache_key();
         for _ in 0..SENDER_KEY_UNLOCKED_READ_ATTEMPTS {
-            let incarnation = {
-                let mut state = self.sender_keys.lock().await;
+            let (incarnation, since) = {
+                let state = self.sender_keys.lock().await;
                 if let Some(cached) = state.cache.get(key) {
                     return Ok(cached.clone());
                 }
-                state.cache.begin_cold_read(key);
-                state.incarnation
+                (state.incarnation, state.cache.removal_seq())
             };
 
             // Decoding stays outside the lock too: a cold chain can carry
@@ -1237,7 +1238,6 @@ impl SignalStoreCache {
                 };
 
             let mut state = self.sender_keys.lock().await;
-            let invalidated = state.cache.finish_cold_read(key);
             // A put or delete that landed while we awaited describes the chain
             // more recently than the bytes we read, so it wins; we would
             // otherwise resurrect a deleted chain or undo a fresher iteration.
@@ -1249,7 +1249,7 @@ impl SignalStoreCache {
             // Either could mean a newer record was written and then dropped,
             // leaving our older bytes to be adopted as an exact reload and let
             // the chain resume an iteration that has already been published.
-            if !invalidated && state.incarnation == incarnation {
+            if state.incarnation == incarnation && !state.cache.removed_since(key, since) {
                 let record = decoded?;
                 state.cache.insert(Arc::from(key), record.clone());
                 state.evict_if_needed(self.max_entries);
@@ -2258,6 +2258,52 @@ mod sender_key_lock_tests {
             .expect("warm load")
             .expect("record present");
         assert_eq!(chain_id_of(&cached), 2, "a stale record must not be cached");
+    }
+
+    /// A cold read that is cancelled mid-backend must leave no bookkeeping
+    /// behind: the removal window is fixed-size and reader-agnostic, so a
+    /// dropped future cannot strand state that would pin its chain to the slow
+    /// path or grow the cache.
+    #[tokio::test]
+    async fn a_cancelled_cold_read_leaves_no_bookkeeping() {
+        let cache = Arc::new(SignalStoreCache::new());
+        let backend = Arc::new(GatedSenderKeyLookup::with_rounds(
+            1,
+            1,
+            Some(
+                sender_key_record_with_chain(4)
+                    .serialize()
+                    .expect("serialize record"),
+            ),
+        ));
+        let name = Arc::new(SenderKeyName::from_parts(
+            "19995550017@g.us",
+            "19995550018@s.whatsapp.net:0",
+        ));
+
+        let reader = tokio::spawn({
+            let (cache, backend, name) = (cache.clone(), backend.clone(), name.clone());
+            async move { cache.get_sender_key(&name, &*backend).await }
+        });
+        backend.arrived.wait().await;
+        // Drop the future while it is parked inside the backend.
+        reader.abort();
+        let _ = reader.await;
+
+        // A fresh read of the same chain must take the unlocked path and
+        // install on its first attempt, exactly as if nothing had happened.
+        let hits_before = backend.hits();
+        let observed = cache
+            .get_sender_key(&name, &*backend)
+            .await
+            .expect("cold load")
+            .expect("record present");
+        assert_eq!(chain_id_of(&observed), 4);
+        assert_eq!(
+            backend.hits() - hits_before,
+            1,
+            "a cancelled read must not push later reads onto the retry path"
+        );
     }
 
     /// The removal signal is per key: churn on other chains, which is the
