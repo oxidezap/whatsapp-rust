@@ -6049,19 +6049,60 @@ mod read_routing_tests {
         store.create_new_device().await.expect("device row");
         store.put_session(ADDR, b"blob").await.unwrap();
 
-        // has_signal_state_for_user issues two EXISTS; both must see one
-        // snapshot even though a second write connection is available.
-        assert!(
-            store
-                .has_signal_state_for_user("559990000001")
-                .await
-                .unwrap()
+        // Park between the two SELECTs and commit through the pool's *other*
+        // connection while parked. Without the deferred transaction the second
+        // query would pick the write up.
+        let (open_tx, mut open_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reader = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .read_query(move |conn| {
+                        let read_once = |conn: &mut SqliteConnection| {
+                            sessions::table
+                                .select(sessions::record)
+                                .filter(sessions::address.eq(ADDR))
+                                .first::<Vec<u8>>(conn)
+                                .optional()
+                                .map_err(|e| StoreError::Database(Box::new(e)))
+                        };
+                        let first = read_once(conn)?;
+                        let _ = open_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(20));
+                        let second = read_once(conn)?;
+                        Ok((first, second))
+                    })
+                    .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), open_rx.recv())
+            .await
+            .expect("the read must reach its first query")
+            .expect("reader alive");
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            store.put_session(ADDR, b"committed-mid-read"),
+        )
+        .await
+        .expect("the second connection must be free to write")
+        .expect("write commits");
+
+        let _ = release_tx.send(());
+        let (first, second) = reader.await.expect("join").expect("read");
+        assert_eq!(first.as_deref(), Some(&b"blob"[..]));
+        assert_eq!(
+            second.as_deref(),
+            Some(&b"blob"[..]),
+            "both queries must see one snapshot, not the write that landed between them"
         );
-        assert!(
-            !store
-                .has_signal_state_for_user("559990000009")
-                .await
-                .unwrap()
+
+        // And the committed value is visible to the next read.
+        assert_eq!(
+            store.get_session(ADDR).await.unwrap().as_deref(),
+            Some(&b"committed-mid-read"[..])
         );
     }
 
@@ -6238,6 +6279,9 @@ mod read_routing_tests {
                         "with_semaphore(",
                         "with_retry(",
                         "spawn_blocking(",
+                        // The sibling-crate write path; `shared().read(` is the
+                        // read one and is what `read_query` itself uses.
+                        "shared().run(",
                     ]
                     .iter()
                     .any(|token| body.contains(token));
@@ -6253,7 +6297,9 @@ mod read_routing_tests {
                     }
                     current = None;
                 } else {
-                    body.push_str(line);
+                    // Indentation dropped so a call rustfmt split across lines
+                    // (`self` / `.shared()` / `.run(`) still reads as one token.
+                    body.push_str(line.trim_start());
                 }
                 continue;
             }
@@ -6322,11 +6368,25 @@ impl SqliteStore {
     async fn get_something_routed(&self) -> Result<()> {
         self.read_query(move |_conn| Ok(())).await
     }
+
+    async fn load_via_the_shared_write_path(&self) -> Result<()> {
+        self
+            .shared()
+            .run(move |_conn| Ok(()))
+            .await
+    }
 }
 ";
         assert_eq!(
             misrouted_reads(regression),
-            (vec!["get_something_new".to_string()], Vec::new(), 2)
+            (
+                vec![
+                    "get_something_new".to_string(),
+                    "load_via_the_shared_write_path".to_string()
+                ],
+                Vec::new(),
+                3
+            )
         );
     }
 }
