@@ -1171,12 +1171,16 @@ impl Client {
         // `Client::disconnect()`). Transport impls make `disconnect()`
         // idempotent, so the redundant call from `Client::disconnect()` is
         // safe.
+        // All three slots are cleared before the close is awaited, not after. The guard on
+        // `transport` no longer spans that await, so a `connect()` racing this teardown can
+        // publish its own transport, events and socket while the close is in flight; clearing
+        // afterwards would strip the replacement connection instead of the one being torn down.
         let transport = self.transport.lock().await.take();
+        *self.transport_events.lock().await = None;
+        *self.noise_socket.lock().await = None;
         if let Some(transport) = transport {
             transport.disconnect().await;
         }
-        *self.transport_events.lock().await = None;
-        *self.noise_socket.lock().await = None;
         // Authoritative point for the gauge: every disconnect (intentional or a
         // run-loop drop/reconnect) funnels through here, so disconnect()'s early
         // set is just a prompt redundant signal. (`is_connected` was already cleared above, before
@@ -1663,6 +1667,45 @@ mod tests {
             .await
             .expect("cleanup must finish once the close returns")
             .expect("cleanup must not panic");
+    }
+
+    /// The other half of releasing the guard: now that a `connect()` can publish its own
+    /// connection while the old close is still in flight, cleanup must not come back and
+    /// strip the replacement's state. Everything cleanup clears, it clears before the close.
+    #[tokio::test]
+    async fn a_connection_published_during_cleanup_is_not_stripped_by_it() {
+        let client = crate::test_utils::create_test_client().await;
+        let (transport, entered_rx, release_tx, _closes) = parked_transport();
+        *client.transport.lock().await = Some(transport);
+        *client.transport_events.lock().await = Some(async_channel::bounded(1).1);
+
+        let cleanup = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.cleanup_connection_state().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("cleanup must reach the socket close")
+            .expect("the observer channel must stay open");
+
+        // The publish half of `connect_internal`, minus the handshake.
+        *client.transport.lock().await = Some(Arc::new(crate::transport::mock::MockTransport));
+        *client.transport_events.lock().await = Some(async_channel::bounded(1).1);
+
+        drop(release_tx);
+        tokio::time::timeout(Duration::from_secs(5), cleanup)
+            .await
+            .expect("cleanup must finish once the close returns")
+            .expect("cleanup must not panic");
+
+        assert!(
+            client.transport.lock().await.is_some(),
+            "the replacement transport must survive the teardown it did not belong to"
+        );
+        assert!(
+            client.transport_events.lock().await.is_some(),
+            "the replacement's event receiver must survive too, or its read loop never starts"
+        );
     }
 
     /// The happy path the fix must preserve: cleanup still closes the socket it owns and
