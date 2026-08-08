@@ -69,7 +69,20 @@ fn is_connection_critical(node: &wacore_binary::NodeRef<'_>) -> bool {
     matches!(
         node.tag.as_ref(),
         "success" | "failure" | "stream:error" | "ack"
-    )
+    ) || (node.tag.as_ref() == "iq" && is_ping_request(node))
+}
+
+/// A server-initiated ping, which this client owes a pong.
+///
+/// Type-agnostic on an absent type, like WA Web's `handleIq`, but never a
+/// `type="result"`/`"error"` ping — that is a response to our own ping, and
+/// ponging it back is wrong.
+fn is_ping_request(node: &wacore_binary::NodeRef<'_>) -> bool {
+    node.get_attr("type").is_none_or(|s| s.as_str() == "get")
+        && (node.get_optional_child("ping").is_some()
+            || node
+                .get_attr("xmlns")
+                .is_some_and(|s| s.as_str() == "urn:xmpp:ping"))
 }
 
 fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
@@ -2052,17 +2065,11 @@ impl Client {
         tracing::instrument(name = "wa.conn.iq_in", level = "debug", skip_all)
     )]
     pub(crate) async fn handle_iq(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
-        // Pong a server-initiated ping (a request: type="get" or, like WA Web's
-        // type-agnostic handleIq, an absent type), but not a type="result"/"error"
-        // ping — that's a response to our own ping, and ponging it back is wrong.
-        // The previous gate required type=="get" exactly, dropping an absent-type
-        // ping and risking a keepalive timeout/disconnect.
-        let is_ping_request = node.get_attr("type").is_none_or(|s| s.as_str() == "get")
-            && (node.get_optional_child("ping").is_some()
-                || node
-                    .get_attr("xmlns")
-                    .is_some_and(|s| s.as_str() == "urn:xmpp:ping"));
-        if is_ping_request {
+        // Pong a server-initiated ping. The gate is shared with
+        // `is_connection_critical`, which never offers one to an interceptor:
+        // a claimed ping is a pong never sent, and the server drops the
+        // connection for it.
+        if is_ping_request(node) {
             debug!("Received ping, sending pong.");
             let mut parser = node.attrs();
             let from_jid = parser.jid("from");

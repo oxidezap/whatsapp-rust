@@ -12,7 +12,10 @@
 //!
 //! An interceptor is that room. It runs where dispatch would have, and either
 //! steps aside or claims the stanza — in which case the built-in handler is
-//! skipped and the stanza is acknowledged, so the server does not redeliver it.
+//! skipped, and whatever answer the client owed the server becomes the
+//! claimant's to send. For most tags that answer is a transport ack and the
+//! client still sends it; see [Acknowledgement](#acknowledgement) for the ones
+//! where it is not.
 //!
 //! # What an interceptor sees
 //!
@@ -39,10 +42,14 @@
 //! response-waiter resolution run before dispatch and keep running whether or
 //! not a stanza is claimed.
 //!
-//! An `<iq>` the client answers on its own — a ping, a pairing step — *is*
-//! offered, because most `<iq>` traffic is exactly what a consumer would want
-//! to extend. Claiming one leaves the server without the reply it expects, so
-//! match narrowly.
+//! A server-initiated `<iq>` ping is not offered either, for the same reason as
+//! the four above: a claimed ping is a pong never sent, and the server drops
+//! the connection over it.
+//!
+//! Every other `<iq>` *is* offered, including ones the client answers on its
+//! own — a pairing step, a query it models. Most `<iq>` traffic is exactly what
+//! a consumer would want to extend. Claiming one leaves the server without the
+//! reply it expects, so match narrowly.
 //!
 //! # Acknowledgement
 //!
@@ -117,9 +124,11 @@ pub enum Interception {
     Pass,
     /// The interceptor took the stanza.
     ///
-    /// The built-in pipeline is skipped. The stanza is still acknowledged the
-    /// way it would have been, because the server is owed an ack either way —
-    /// withholding one leaves the stanza queued for redelivery.
+    /// The built-in pipeline is skipped. Where the client's answer was a
+    /// transport ack it still sends one; where the answer was something else —
+    /// a delivery `<receipt>` for a direct `<message>`, an `<iq type="result">`
+    /// — nothing is sent, and the claimant owes that reply. See the
+    /// [acknowledgement](index.html#acknowledgement) rules.
     Handled,
 }
 

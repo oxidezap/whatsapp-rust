@@ -5235,6 +5235,61 @@ async fn connection_critical_stanzas_are_never_offered_to_an_interceptor() {
 }
 
 #[tokio::test]
+async fn a_server_ping_is_never_offered_to_an_interceptor() {
+    // A claimed ping is a pong never sent, and the server closes the connection
+    // over it — the same class of harm as claiming `success` or `ack`, so the
+    // same protection. Every other <iq> stays offered: that is the traffic an
+    // interceptor exists to extend.
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("claims-everything-it-sees");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    for node in [
+        NodeBuilder::new("iq")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "PING-1")
+            .attr("type", "get")
+            .children([NodeBuilder::new("ping").build()])
+            .build(),
+        // WA Web's handleIq is type-agnostic, so an absent type is a ping too.
+        NodeBuilder::new("iq")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "PING-2")
+            .attr("xmlns", "urn:xmpp:ping")
+            .build(),
+    ] {
+        client.process_node(node_to_owned_ref(node)).await;
+    }
+    assert!(
+        seen.lock().expect("lock").is_empty(),
+        "a server ping must not reach an interceptor"
+    );
+
+    // A ping *response* is ours, not the server's, so it carries no pong
+    // obligation and stays offered.
+    let response = NodeBuilder::new("iq")
+        .attr("from", "s.whatsapp.net")
+        .attr("id", "PING-3")
+        .attr("type", "result")
+        .children([NodeBuilder::new("ping").build()])
+        .build();
+    client.process_node(node_to_owned_ref(response)).await;
+
+    let other = NodeBuilder::new("iq")
+        .attr("from", "s.whatsapp.net")
+        .attr("id", "IQ-1")
+        .attr("type", "get")
+        .children([NodeBuilder::new("query").build()])
+        .build();
+    client.process_node(node_to_owned_ref(other)).await;
+    assert_eq!(
+        seen.lock().expect("lock").len(),
+        2,
+        "a ping result and an ordinary <iq> are both still offered"
+    );
+}
+
+#[tokio::test]
 async fn a_closure_can_be_an_interceptor() {
     let client = create_interceptor_test_client().await;
     let calls = Arc::new(AtomicUsize::new(0));
