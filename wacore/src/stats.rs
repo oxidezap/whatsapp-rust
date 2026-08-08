@@ -937,6 +937,101 @@ mod tests {
         Pin::new(fut).poll(&mut Context::from_waker(waker))
     }
 
+    /// Inner runtime that records which spawn entry point the decorator used and
+    /// drives the future inline, so a test can tell forwarding apart from the
+    /// trait's `spawn`-based default body.
+    #[derive(Default)]
+    struct RecordingRuntime {
+        spawns: AtomicU64,
+        detached_spawns: AtomicU64,
+    }
+
+    impl RecordingRuntime {
+        fn drive(mut future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+            for _ in 0..8 {
+                if poll_once(&mut future).is_ready() {
+                    return;
+                }
+            }
+            panic!("spawned test future never settled");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for RecordingRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            self.spawns.fetch_add(1, Ordering::Relaxed);
+            Self::drive(future);
+            AbortHandle::noop()
+        }
+
+        fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+            self.detached_spawns.fetch_add(1, Ordering::Relaxed);
+            Self::drive(future);
+        }
+
+        fn sleep(&self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            f();
+            Box::pin(async {})
+        }
+
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    /// The decorator forwards `spawn_detached` to the inner runtime's own
+    /// detached path. Falling back to the trait default would reach `spawn`,
+    /// making the inner runtime build an `AbortHandle` nobody keeps.
+    #[test]
+    fn the_decorator_forwards_detached_spawns() {
+        let inner = Arc::new(RecordingRuntime::default());
+        let meter = Arc::new(CpuMeter::new());
+        let runtime = InstrumentedRuntime::new(
+            inner.clone() as Arc<dyn Runtime>,
+            meter.clone() as Arc<dyn TaskInstrument>,
+        );
+
+        runtime.spawn_detached(Box::pin(PendingOnce::new(())));
+
+        assert_eq!(inner.detached_spawns.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            inner.spawns.load(Ordering::Relaxed),
+            0,
+            "a detached spawn must not reach the handle-building path"
+        );
+        assert_eq!(
+            meter.snapshot().polls,
+            2,
+            "the forwarded future is still metered on every poll"
+        );
+    }
+
+    /// The undetached path keeps its handle: forwarding must not have leaked
+    /// into `spawn`.
+    #[test]
+    fn the_decorator_keeps_undetached_spawns_on_the_handle_path() {
+        let inner = Arc::new(RecordingRuntime::default());
+        let meter = Arc::new(CpuMeter::new());
+        let runtime = InstrumentedRuntime::new(
+            inner.clone() as Arc<dyn Runtime>,
+            meter.clone() as Arc<dyn TaskInstrument>,
+        );
+
+        runtime.spawn(Box::pin(PendingOnce::new(()))).detach();
+
+        assert_eq!(inner.spawns.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.detached_spawns.load(Ordering::Relaxed), 0);
+        assert_eq!(meter.snapshot().polls, 2);
+    }
+
     /// A stack-pinned future is `Unpin` through `Pin<&mut F>`, so the meter
     /// wraps a non-`Unpin` async block with no box. Same accounting as boxing it.
     #[test]
