@@ -46,33 +46,40 @@ impl EventHandler for SentFrameRecorder {
     }
 }
 
-/// Splits a run of length-prefixed noise frames and decrypts each under the
-/// counter its position implies, yielding the plaintexts in wire order.
+/// Decrypts captured noise frames under the counter each one's position implies,
+/// yielding the plaintexts in wire order.
+///
+/// Takes what [`CapturingMockTransport::sent`] yields: one framed frame per
+/// entry, prefix intact, already split out of whatever writes carried them. The
+/// length is checked rather than reparsed, so a caller passing raw writes (where
+/// one entry can hold several frames) fails here instead of decrypting garbage.
 ///
 /// The counter is the AES-GCM nonce, so this doubles as an order check: a frame
 /// read out of position cannot authenticate.
+///
+/// [`CapturingMockTransport::sent`]: crate::transport::mock::CapturingMockTransport::sent
 #[cfg(test)]
-pub(crate) fn decrypt_wire_frames(writes: &[bytes::Bytes], key: &[u8; 32]) -> Vec<Vec<u8>> {
-    use wacore::handshake::NoiseCipher;
+pub(crate) fn decrypt_wire_frames(frames: &[bytes::Bytes], key: &[u8; 32]) -> Vec<Vec<u8>> {
+    use wacore::framing::FRAME_LENGTH_SIZE;
+    use wacore::noise::NoiseCipher;
 
     let cipher = NoiseCipher::new(key).expect("32-byte key");
-    let mut plaintexts = Vec::new();
-    for write in writes {
-        let mut wire = &write[..];
-        while !wire.is_empty() {
-            let mut len = 0usize;
-            for byte in &wire[..wacore::framing::FRAME_LENGTH_SIZE] {
-                len = (len << 8) | *byte as usize;
-            }
-            let body =
-                &wire[wacore::framing::FRAME_LENGTH_SIZE..wacore::framing::FRAME_LENGTH_SIZE + len];
-            let mut body = bytes::BytesMut::from(body);
-            cipher
-                .decrypt_in_place_with_counter(plaintexts.len() as u32, &mut body)
-                .expect("each captured frame must decrypt under its own counter");
-            plaintexts.push(body.to_vec());
-            wire = &wire[wacore::framing::FRAME_LENGTH_SIZE + len..];
+    let mut plaintexts = Vec::with_capacity(frames.len());
+    for (counter, frame) in frames.iter().enumerate() {
+        let mut declared = 0usize;
+        for byte in &frame[..FRAME_LENGTH_SIZE] {
+            declared = (declared << 8) | *byte as usize;
         }
+        assert_eq!(
+            declared,
+            frame.len() - FRAME_LENGTH_SIZE,
+            "expected one frame per entry, as `sent()` yields them"
+        );
+        let mut body = bytes::BytesMut::from(&frame[FRAME_LENGTH_SIZE..]);
+        cipher
+            .decrypt_in_place_with_counter(counter as u32, &mut body)
+            .expect("each captured frame must decrypt under its own counter");
+        plaintexts.push(body.to_vec());
     }
     plaintexts
 }

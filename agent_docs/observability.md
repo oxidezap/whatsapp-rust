@@ -32,12 +32,14 @@ chokepoints:
   transport write — post-noise wire bytes (frame header + AEAD tag included).
 - **Received**: the read loop (`node_io.rs`) per `DataReceived` batch.
 
-That sent chokepoint is the *only* place every outbound frame crosses — five
-distinct send paths reach it (`send_node`, `send_raw_bytes`,
-`send_raw_bytes_burst`, and the ack/receipt workers through the burst), and
-`send_raw_bytes` deliberately bypasses node logging and sent-node waiters — so
-anything that has to see *everything* the client sends belongs there and nowhere
-else. `Event::SentFrame` is the other thing wired into it
+That sent chokepoint is the *only* place every outbound frame crosses. Two
+functions reach it — `send_raw_bytes` and `send_raw_bytes_burst` — and everything
+else funnels through one of those: `send_node` and every IQ through the first,
+the ack and delivery-receipt workers through the second. `send_raw_bytes`
+deliberately bypasses node logging and sent-node waiters, so anything that has to
+see *everything* the client sends belongs at the chokepoint and nowhere else.
+
+`Event::SentFrame` is the other thing wired into it
 (`Client::acquire_sent_frame_forwarding()`, lease-gated like `RawNode`): it hands
 over the marshaled plaintext of each frame the transport accepted. Both halves
 travel to the socket as `SendObservers`, so the next observer plugs in there
@@ -53,8 +55,8 @@ cost a clock read on every frame written, which is the client's hottest path
 and a call out of the module on wasm32/embedded. `frames_sent` answers "is it
 still sending?" for free. Message-level counters piggyback on the existing
 `telemetry::send`/`recv` chokepoints; reconnect attempts are counted in the
-run loop. VoIP relay sockets pass `None` and are not counted — this is the
-main WA session socket only.
+run loop. VoIP relay sockets pass `SendObservers::default()` and are not counted
+— this is the main WA session socket only.
 
 ### 2. `Client::memory_report()` — retained memory (on demand)
 

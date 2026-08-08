@@ -2061,8 +2061,10 @@ mod tests {
             idle <= 4,
             "an unwatched send must cost what it always did, got {idle}"
         );
+        // Signed: both are empirical minima off a process-global counter, and an
+        // inversion has to report the numbers rather than panic on underflow.
         assert_eq!(
-            watched - idle,
+            watched as i64 - idle as i64,
             2,
             "watching must cost a constant per frame (idle {idle}, watched {watched})"
         );

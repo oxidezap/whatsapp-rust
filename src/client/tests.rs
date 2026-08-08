@@ -3514,7 +3514,7 @@ async fn install_test_noise_socket(
         transport,
         NoiseCipher::new(&key).expect("valid key"),
         NoiseCipher::new(&key).expect("valid key"),
-        crate::socket::noise_socket::SendObservers::default()
+        crate::socket::noise_socket::SendObservers::with_stats(client.stats.clone())
             .with_sent_frames(client.sent_frame_tap.clone()),
     );
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
