@@ -24,6 +24,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
+use tracing_subscriber::registry::LookupSpan;
+
 use wacore::handshake::NoiseHandshake;
 use wacore::libsignal::protocol::KeyPair;
 use wacore::runtime::{AbortHandle, Runtime};
@@ -35,14 +37,28 @@ use whatsapp_rust::waproto::whatsapp as wa;
 
 const HANDSHAKE_SPAN: &str = "wa.conn.handshake";
 
-/// Name of the innermost entered span, or `None` outside any span.
-fn current_span_name() -> Option<&'static str> {
-    tracing::Span::current().metadata().map(|m| m.name())
+/// The entered span and its ancestors, innermost first; empty outside any span.
+///
+/// The whole chain, not just the innermost name: what a propagating consumer
+/// charges a span for is its entire subtree, so `wa.conn.handshake.xx` is as
+/// much "inside the handshake span" as `wa.conn.handshake` itself.
+fn current_span_scope() -> Vec<&'static str> {
+    tracing::dispatcher::get_default(|dispatch| {
+        let Some(id) = dispatch.current_span().id().cloned() else {
+            return Vec::new();
+        };
+        let Some(registry) = dispatch.downcast_ref::<tracing_subscriber::Registry>() else {
+            panic!("the tests install a bare Registry");
+        };
+        registry
+            .span(&id)
+            .map(|span| span.scope().map(|ancestor| ancestor.name()).collect())
+            .unwrap_or_default()
+    })
 }
 
-/// Span names observed at a series of call sites, `None` where no span was
-/// entered.
-type SpanLog = Arc<StdMutex<Vec<Option<&'static str>>>>;
+/// Span scopes observed at a series of call sites.
+type SpanLog = Arc<StdMutex<Vec<Vec<&'static str>>>>;
 
 /// Records the span current at every `spawn`, which is the span a propagating
 /// consumer makes the parent of that task.
@@ -65,7 +81,10 @@ impl SpanWatchingRuntime {
 #[async_trait]
 impl Runtime for SpanWatchingRuntime {
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
-        self.spawn_parents.lock().unwrap().push(current_span_name());
+        self.spawn_parents
+            .lock()
+            .unwrap()
+            .push(current_span_scope());
         let handle = tokio::spawn(future);
         AbortHandle::new(move || handle.abort())
     }
@@ -98,7 +117,7 @@ struct SpanWatchingTransport {
 #[async_trait]
 impl Transport for SpanWatchingTransport {
     async fn send(&self, data: Bytes) -> anyhow::Result<()> {
-        self.send_spans.lock().unwrap().push(current_span_name());
+        self.send_spans.lock().unwrap().push(current_span_scope());
         self.sent.lock().unwrap().push(data);
         Ok(())
     }
@@ -236,9 +255,18 @@ async fn paired_pm() -> Arc<whatsapp_rust::store::persistence_manager::Persisten
 }
 
 struct Observed {
-    spawn_parents: Vec<Option<&'static str>>,
-    send_spans: Vec<Option<&'static str>>,
+    spawn_parents: Vec<Vec<&'static str>>,
+    send_spans: Vec<Vec<&'static str>>,
     handshake_ok: bool,
+}
+
+impl Observed {
+    fn spawns_inside_handshake(&self) -> Vec<&Vec<&'static str>> {
+        self.spawn_parents
+            .iter()
+            .filter(|scope| scope.contains(&HANDSHAKE_SPAN))
+            .collect()
+    }
 }
 
 /// One XX handshake against the in-process responder, reporting where tasks
@@ -305,10 +333,10 @@ async fn no_task_outliving_the_handshake_is_spawned_inside_its_span() {
         !observed.spawn_parents.is_empty(),
         "the connection's sender task must still be spawned, or this proves nothing"
     );
+    let inside = observed.spawns_inside_handshake();
     assert!(
-        !observed.spawn_parents.contains(&Some(HANDSHAKE_SPAN)),
-        "a task was spawned inside {HANDSHAKE_SPAN}: {:?}",
-        observed.spawn_parents
+        inside.is_empty(),
+        "a task was spawned inside {HANDSHAKE_SPAN}: {inside:?}"
     );
 }
 
@@ -325,11 +353,10 @@ async fn the_handshake_span_still_covers_the_noise_exchange() {
         2,
         "XX writes a ClientHello and a ClientFinish"
     );
-    for span in &observed.send_spans {
-        assert_eq!(
-            *span,
-            Some("wa.conn.handshake.xx"),
-            "every handshake frame must be written inside the handshake span tree"
+    for scope in &observed.send_spans {
+        assert!(
+            scope.contains(&HANDSHAKE_SPAN),
+            "a handshake frame was written outside {HANDSHAKE_SPAN}: {scope:?}"
         );
     }
 }
@@ -345,9 +372,9 @@ async fn a_failed_handshake_spawns_nothing_inside_its_span() {
         !observed.handshake_ok,
         "an unanswered ClientHello must not complete"
     );
+    let inside = observed.spawns_inside_handshake();
     assert!(
-        !observed.spawn_parents.contains(&Some(HANDSHAKE_SPAN)),
-        "a task was spawned inside {HANDSHAKE_SPAN}: {:?}",
-        observed.spawn_parents
+        inside.is_empty(),
+        "a task was spawned inside {HANDSHAKE_SPAN}: {inside:?}"
     );
 }
