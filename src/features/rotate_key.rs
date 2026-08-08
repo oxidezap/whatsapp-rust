@@ -383,12 +383,7 @@ mod tests {
     }
 
     fn server_error(code: u16) -> IqError {
-        IqError::ServerError {
-            code,
-            text: "test".to_string(),
-            error_type: None,
-            backoff: None,
-        }
+        crate::test_utils::server_error_iq(code, "test", None, None)
     }
 
     const NOW: i64 = 1_700_000_000_000;
