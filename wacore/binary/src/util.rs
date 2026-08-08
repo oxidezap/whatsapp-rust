@@ -19,15 +19,21 @@ pub const FORMAT_PLAIN: u8 = 0;
 /// Only inbound payloads ever set it.
 pub const FORMAT_COMPRESSED: u8 = 2;
 
-/// Whether `data` is shaped like a packed payload: a format byte that sets no
-/// undefined bit, followed by node bytes.
+/// Check that `data` is shaped like a packed payload: a format byte that sets no
+/// undefined bit, followed by at least one node byte.
 ///
-/// A shape check, not validation. It exists because passing node bytes where a
+/// A shape check, not a decode. It exists because passing node bytes where a
 /// packed payload is expected fails nowhere locally: the peer reads the first
 /// node byte as flags and drops the connection.
-pub fn is_packed_payload(data: &[u8]) -> bool {
-    data.first()
-        .is_some_and(|&format| format & !FORMAT_COMPRESSED == 0)
+pub fn check_packed_payload(data: &[u8]) -> Result<()> {
+    match data.split_first() {
+        Some((&format, _)) if format & !FORMAT_COMPRESSED != 0 => {
+            Err(BinaryError::UnexpectedFormatByte(format))
+        }
+        Some((_, node_bytes)) if !node_bytes.is_empty() => Ok(()),
+        // No format byte at all, or one with nothing behind it.
+        _ => Err(BinaryError::EmptyData),
+    }
 }
 
 /// Prefix node bytes with the format byte: the inverse of [`unpack`], turning a
@@ -197,9 +203,21 @@ mod tests {
         let packed = marshal(&node).expect("marshal");
         let node_bytes = unpack(&packed).expect("unpack").into_owned();
 
-        assert!(is_packed_payload(&packed));
-        assert!(!is_packed_payload(&node_bytes));
-        assert!(!is_packed_payload(&[]));
+        assert!(check_packed_payload(&packed).is_ok());
+        assert!(matches!(
+            check_packed_payload(&node_bytes),
+            Err(BinaryError::UnexpectedFormatByte(byte)) if byte == node_bytes[0]
+        ));
+        // No format byte, and a format byte with no stanza behind it: both are
+        // shaped like a packed payload only if the length is not checked.
+        assert!(matches!(
+            check_packed_payload(&[]),
+            Err(BinaryError::EmptyData)
+        ));
+        assert!(matches!(
+            check_packed_payload(&[FORMAT_PLAIN]),
+            Err(BinaryError::EmptyData)
+        ));
 
         assert!(unmarshal_packed_ref(&packed).is_ok());
         assert!(matches!(

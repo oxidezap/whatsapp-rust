@@ -5386,15 +5386,17 @@ async fn send_raw_bytes_refuses_a_payload_without_its_format_byte() {
         ),
         "unexpected error: {error:?}"
     );
-    assert!(
-        matches!(
-            client.send_raw_bytes(Vec::new()).await,
-            Err(ClientError::Socket(SocketError::Marshal(
-                wacore_binary::BinaryError::EmptyData
-            )))
-        ),
-        "an empty payload has no format byte either"
-    );
+    for empty in [Vec::new(), vec![wacore_binary::util::FORMAT_PLAIN]] {
+        assert!(
+            matches!(
+                client.send_raw_bytes(empty).await,
+                Err(ClientError::Socket(SocketError::Marshal(
+                    wacore_binary::BinaryError::EmptyData
+                )))
+            ),
+            "a payload with no stanza in it carries nothing to send"
+        );
+    }
     assert!(
         transport.sent().is_empty(),
         "a refused payload must not reach the transport"
