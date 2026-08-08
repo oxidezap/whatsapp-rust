@@ -102,6 +102,10 @@ impl<'a> QuickReplies<'a> {
         }
         // Don't log the shortcut or message (user content); the id is enough to trace.
         debug!("Setting quick reply {id} (count={count})");
+        // `associatedLabelIds` is left empty on purpose, not by omission: both of
+        // WA Web's builders hardcode `associatedLabelIds: []`, and its receiving
+        // side never reads the field. A repeated field left at its default
+        // encodes to the same bytes, so this is what the official client sends.
         let value = quick_reply_value(wa::sync_action_value::QuickReplyAction {
             shortcut: Some(shortcut.to_string()),
             message: Some(message.to_string()),
