@@ -172,9 +172,8 @@ mod tests {
         );
     }
 
-    /// The fetch runs once a day per device, but a pooled connection is held
-    /// for the session's lifetime, and nothing at the call site shows that. A
-    /// client that pools by default has to be told not to for this request.
+    /// The header is the whole saving, so pin both halves: that the fetch
+    /// sends it, and that a version still resolves with it set.
     #[tokio::test]
     async fn the_version_fetch_declines_to_leave_a_pooled_connection() {
         let capturing = Arc::new(HeaderCapturingHttpClient::default());

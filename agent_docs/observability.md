@@ -142,8 +142,8 @@ process on a remote or in-memory backend still pays the other ~530 KiB, of
 which the largest named pieces are the prekey window the backend retains
 (~102 KiB for the default 812 keys) and the transport's WebSocket + TLS buffers
 (64 KiB). The HTTP idle pool used to belong on that list; the version fetch no
-longer leaves one behind (see below), so a session that downloads no media pays
-nothing for it.
+longer leaves one behind (see below), so a session whose only HTTP traffic is
+that fetch pays nothing for it.
 
 The pieces (each an `Option`-only struct in `wacore::stats`, filled only with
 what a component can introspect — absent means "not reported", not zero):
@@ -208,12 +208,16 @@ range request cheap.
 
 `mark_if_dispatchable` treats such a request as non-pooling, so a session whose
 only HTTP traffic is the version fetch keeps reporting an empty pool instead of
-latching onto the 96 KiB cap.
+latching onto the 96 KiB cap. It matches ureq's rule byte for byte rather than
+RFC 9110's token list: ureq compares the whole `Connection` value to `close`, so
+reading `keep-alive, close` as closing would report an empty pool for a
+connection ureq had in fact pooled.
 
 ### Sharing one HTTP client across sessions
 
-Still available, and now worth it only for a media-heavy process: build one
-`UreqHttpClient` and hand a clone to each `BotBuilder::with_http_client`. Cloning
+Still available, and now worth it for a process with pooled HTTP traffic —
+media, in practice: build one `UreqHttpClient` and hand a clone to each
+`BotBuilder::with_http_client`. Cloning
 shares the `ureq::Agent`, and therefore the connection pool, so idle CDN
 connections are paid once for the process instead of once per session.
 
