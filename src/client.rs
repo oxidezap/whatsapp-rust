@@ -705,6 +705,10 @@ pub enum ConnectError {
     /// Construction never completed, so the attempt was rejected before any I/O.
     #[error("client construction did not activate")]
     NotActivated,
+    /// The client was shut down. Shutdown is final, so build a new client
+    /// rather than reconnecting this one.
+    #[error("client has been shut down")]
+    Shutdown,
     /// A step of the connect flow ran out of time.
     #[error("{stage} timed out after {timeout:?}")]
     Timeout {
@@ -768,6 +772,7 @@ impl ConnectError {
             ConnectError::Handshake(handshake) => handshake.is_timeout(),
             ConnectError::AlreadyConnected
             | ConnectError::NotActivated
+            | ConnectError::Shutdown
             | ConnectError::Version(_)
             | ConnectError::Transport(_) => false,
         }

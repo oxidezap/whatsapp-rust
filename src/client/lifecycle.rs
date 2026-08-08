@@ -712,6 +712,12 @@ impl Client {
         {
             return Err(ConnectError::NotActivated);
         }
+        // Same refusal `run` makes: a shutdown is published once and for good,
+        // and a connection established after it would be one the application
+        // has already been told does not exist. A new client is the way back.
+        if self.shutdown_signal().is_fired() {
+            return Err(ConnectError::Shutdown);
+        }
         self.connect_boxed().await
     }
 
@@ -728,6 +734,15 @@ impl Client {
     /// single-connection [`Connection::read_until_disconnected`], so the two
     /// cannot drift on what a connection ending means.
     async fn drive_connection(self: &Arc<Self>) -> Option<DisconnectReason> {
+        // Started here rather than at the end of connect: its ping goes through
+        // `can_reach_server`, so a tick taken before anything reads is refused
+        // as NotConnected, which the loop classifies as fatal and exits on,
+        // leaving the connection with no idle ping and no dead-socket watchdog.
+        let keepalive = self.clone();
+        self.runtime
+            .spawn(Box::pin(async move { keepalive.keepalive_loop().await }))
+            .detach();
+
         let loop_result = self.read_messages_loop().await;
         // Consume intentional_reconnect on EVERY exit, reading it AFTER the loop
         // ends (reconnect() sets it while the loop runs, then tears down via the
@@ -924,11 +939,6 @@ impl Client {
 
         // Notify waiters that socket is ready (before login)
         self.socket_ready_notifier.notify(usize::MAX);
-
-        let client_clone = self.clone();
-        self.runtime
-            .spawn(Box::pin(async move { client_clone.keepalive_loop().await }))
-            .detach();
 
         Ok(Connection { client: self })
     }
@@ -1679,6 +1689,21 @@ mod tests {
             fixture.client.transport_events.lock().await.is_some(),
             "the reader's inlet must be untouched"
         );
+    }
+
+    /// Shutdown is published once and for good, and `run` refuses to start
+    /// after it. Connecting has to refuse too, or the connection this hands
+    /// back revives a client the application was told was finished.
+    #[tokio::test]
+    async fn connecting_is_refused_after_the_client_is_shut_down() {
+        let client = crate::test_utils::create_test_client().await;
+        client.disconnect().await;
+
+        let error = tokio::time::timeout(Duration::from_millis(500), client.connect())
+            .await
+            .expect("the refusal must be immediate, with no I/O attempted")
+            .expect_err("a shut-down client must refuse to connect");
+        assert!(matches!(error, ConnectError::Shutdown));
     }
 
     /// The post-pairing 515 ends a connection with `expected_disconnect` set,
