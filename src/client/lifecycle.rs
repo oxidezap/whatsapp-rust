@@ -1499,6 +1499,12 @@ impl Connection<'_> {
     /// as `Event::Disconnected` just before returning), or `None` when the
     /// connection ended on request. No reconnect happens here: once this
     /// returns the client is offline and stays offline.
+    ///
+    /// Dropping this future stops the read without tearing the connection
+    /// down, exactly as dropping [`Client::run`] does: the socket stays open
+    /// and the client stays connected until [`Client::disconnect`] releases
+    /// it. Only the reader flag is given back, so a later `run` is not refused
+    /// as already running.
     pub async fn read_until_disconnected(self) -> Option<DisconnectReason> {
         // Reading is what the Drop warning asks for, so the drop that ends this
         // call must not fire it.
