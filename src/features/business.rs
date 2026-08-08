@@ -18,6 +18,21 @@
 //! and `bool`, so the catalog and collection queries build their variables with
 //! `json!` instead; the order query, whose dimensions really are numbers, uses
 //! the generated type.
+//!
+//! **Catalog-side variant data is not requested, and so is never returned.**
+//! `variant_info` on a catalog or collection product is opt-in: the server
+//! populates it only when the request carries `variant_info_fields`, a
+//! comma-separated field list whose full form WhatsApp Web spells
+//! `"listing_details,types,availability,variant_properties"`
+//! (`WAWebCatalogVariantHelper.FULL_VARIANT_INFO_FIELDS`, alongside a
+//! `VARIANT_THUMBNAIL_IMAGE_SIZE` of 100 for the `variant_thumbnail_*`
+//! dimensions). WA Web itself only asks for it when `shouldRequestVariantInfo`
+//! passes — a linked catalog with variant viewing enabled. Adding it here means
+//! sending that field list *and* modelling the option types, availability
+//! listings and per-variant pricing it returns; requesting without parsing, or
+//! parsing without requesting, would both be dead weight. Orders are the
+//! opposite case and are handled: `variant_info.variant_properties` comes back
+//! on a plain order query, so [`OrderProduct::variant_properties`] carries it.
 
 use crate::client::Client;
 use crate::features::mex::{MexError, mex_request};
