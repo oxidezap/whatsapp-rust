@@ -371,15 +371,23 @@ impl ProtocolNode for BotList {
             .get_optional_child("default")
             .map(BotDefault::try_from_node_ref)
             .transpose()?;
-        // `v="2"` makes <default> mandatory; the official parser rejects the whole
-        // variant without it. It is optional in `v="3"`, and an unknown version is
-        // an unknown contract, so neither is held to the v2 rule.
-        if version == BotListVersion::V2 && default_bot.is_none() {
-            return Err(anyhow!("<bot v=\"2\"> is missing its <default> child"));
+        let bhash = optional_attr(node, "bhash").map(|v| v.to_string());
+        // Each version has one attribute the other does not require, and the official
+        // parser rejects its whole variant when that one is absent: <default> for v2,
+        // bhash for v3. An unknown version is an unknown contract, so it is held to
+        // neither rule.
+        match version {
+            BotListVersion::V2 if default_bot.is_none() => {
+                return Err(anyhow!("<bot v=\"2\"> is missing its <default> child"));
+            }
+            BotListVersion::V3 if bhash.is_none() => {
+                return Err(anyhow!("<bot v=\"3\"> is missing the bhash attribute"));
+            }
+            _ => {}
         }
         Ok(Self {
             version,
-            bhash: optional_attr(node, "bhash").map(|v| v.to_string()),
+            bhash,
             default_bot,
             sections: node
                 .get_children_by_tag("section")
@@ -642,6 +650,39 @@ mod tests {
         let list = parse(&iq).expect("v3 makes <default> optional");
         assert_eq!(list.default_bot, None);
         assert_eq!(list.flatten().len(), 1);
+    }
+
+    #[test]
+    fn v3_response_without_a_bhash_is_an_error() {
+        // bhash is required by the official v3 parser the same way <default> is
+        // required by v2, so a v3 response without it is one no client accepts.
+        let iq = iq_with(
+            NodeBuilder::new("bot")
+                .attr("v", "3")
+                .children([NodeBuilder::new("section")
+                    .attr("type", "all")
+                    .children([bot_node("10000000000000@bot", "persona-all").build()])
+                    .build()])
+                .build(),
+        );
+        let err = parse(&iq).expect_err("a v3 list with no bhash must fail");
+        assert!(err.to_string().contains("bhash"), "got: {err}");
+    }
+
+    #[test]
+    fn v2_response_without_a_bhash_is_accepted() {
+        // The v2 variant has no bhash at all; the v3 rule must not leak into it.
+        let iq = iq_with(
+            NodeBuilder::new("bot")
+                .attr("v", "2")
+                .children([NodeBuilder::new("default")
+                    .attr("jid", "10000000000000@bot")
+                    .attr("persona_id", "persona-default")
+                    .build()])
+                .build(),
+        );
+        let list = parse(&iq).expect("v2 carries no bhash");
+        assert_eq!(list.bhash, None);
     }
 
     #[test]
