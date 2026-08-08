@@ -1,6 +1,7 @@
 //! Client construction and connection lifecycle: connect, run, reconnect, shutdown.
 
 use super::*;
+use wacore::net::DisconnectReason;
 
 /// Max groups with a cached resolved-device snapshot. LRU eviction covers
 /// accounts in more groups; an evicted entry just recomputes on next send.
@@ -114,9 +115,9 @@ impl Client {
     /// and set `expected_disconnect` together, which is what tells them apart
     /// from an application merely turning auto-reconnect off.
     ///
-    /// Not `is_running` on its own: that tracks whether `run()`'s supervision
-    /// loop is active, which a direct-connect client never starts, so a healthy
-    /// one would look permanently stopped the moment its application expressed a
+    /// Not `is_running` on its own: that tracks whether anything is driving the
+    /// client, which a client that only connected never has, so a healthy one
+    /// would look permanently stopped the moment its application expressed a
     /// reconnect preference.
     ///
     /// Every transition that can make this true fires
@@ -157,7 +158,8 @@ impl Client {
         self.session_state_notifier.notify(usize::MAX);
     }
 
-    /// The supervision loop giving up for good.
+    /// The reader of this client (the supervision loop, or a directly driven
+    /// connection) stopping for good.
     ///
     /// A named transition rather than two stores at the branch, because the
     /// notify is not optional here and there is nowhere else to learn of it:
@@ -315,6 +317,7 @@ impl Client {
         let (tx, rx) = async_channel::bounded(32);
 
         let device_topology = device_topology::DeviceTopology::new();
+        let sent_frame_tap = Arc::new(SentFrameTap::new(core.event_bus.clone()));
         let this = Self {
             runtime: runtime.clone(),
             core,
@@ -507,6 +510,7 @@ impl Client {
             alloc_meter: std::sync::OnceLock::new(),
             raw_node_forwarding: AtomicUsize::new(0),
             decrypted_payload_forwarding: AtomicUsize::new(0),
+            sent_frame_tap,
             stanza_interceptors: std::sync::RwLock::new(Arc::new(Vec::new())),
             stanza_interceptor_count: AtomicUsize::new(0),
             next_interceptor_id: AtomicU64::new(0),
@@ -545,6 +549,16 @@ impl Client {
             .detach();
     }
 
+    /// Run the session: connect, read the socket until the connection ends,
+    /// reconnect, repeat.
+    ///
+    /// This is the call that reads. [`connect`](Self::connect) only establishes
+    /// the socket and hands back a [`Connection`]; until that connection is
+    /// driven, by this loop or by [`Connection::read_until_disconnected`], no
+    /// frame is decoded and no event is emitted.
+    ///
+    /// Returns when the session is over for good: [`disconnect`](Self::disconnect),
+    /// [`logout`](Self::logout), or a connection ending with auto-reconnect off.
     // Deliberately NOT instrumented: this span would live for the entire client
     // lifetime, distorting duration/throughput metrics just like the removed
     // keepalive-loop span. Identity (lid/pn) attribution comes from the
@@ -582,66 +596,24 @@ impl Client {
             first_connect = false;
             self.expected_disconnect.store(false, Ordering::Relaxed);
 
-            if let Err(connect_err) = self.connect().await {
-                wacore::telemetry::connect("fail");
-                let is_transient = matches!(
-                    &connect_err,
-                    ConnectError::Handshake(e) if e.is_transient()
-                );
-                if is_transient {
-                    debug!("Transient connect failure, will retry: {connect_err:#}");
-                } else {
-                    error!("Failed to connect: {connect_err:#}. Will retry...");
+            match self.connect().await {
+                Err(connect_err) => {
+                    wacore::telemetry::connect("fail");
+                    match &connect_err {
+                        // The loop is about to exit on the same shutdown, so this
+                        // is the teardown reporting itself, not a failure.
+                        ConnectError::Shutdown => {
+                            debug!("Connect abandoned, the client is shutting down.");
+                        }
+                        ConnectError::Handshake(e) if e.is_transient() => {
+                            debug!("Transient connect failure, will retry: {connect_err:#}");
+                        }
+                        _ => error!("Failed to connect: {connect_err:#}. Will retry..."),
+                    }
                 }
-            } else {
-                wacore::telemetry::connect("ok");
-                let loop_result = self.read_messages_loop().await;
-                // Consume intentional_reconnect on EVERY exit, reading it AFTER the loop
-                // ends (reconnect() sets it while the loop runs, then tears down via the
-                // shutdown signal — the Expected path). Consuming it only on some paths
-                // left it stale for the next connection, misclassifying the next genuine
-                // disconnect as intentional and swallowing its Disconnected event.
-                let intentional = self.intentional_reconnect.swap(false, Ordering::Relaxed);
-                // Some(reason) = unexpected disconnect worth a `Disconnected` event; the
-                // reason distinguishes a routine server recycle from a real failure so
-                // consumers don't have to.
-                let unexpected_disconnect = match loop_result {
-                    Ok(node_io::ReadLoopExit::Expected) => {
-                        debug!("Message loop exited gracefully (expected disconnect).");
-                        None
-                    }
-                    Ok(node_io::ReadLoopExit::ServerRecycle(reason)) => {
-                        if self.expected_disconnect.load(Ordering::Relaxed) || intentional {
-                            debug!("Message loop exited during expected disconnect.");
-                            None
-                        } else {
-                            // read_messages_loop already logged this at info; a clean
-                            // recycle stays quiet here too.
-                            Some(reason)
-                        }
-                    }
-                    Err(e) => {
-                        if self.expected_disconnect.load(Ordering::Relaxed) || intentional {
-                            debug!("Message loop exited during expected disconnect.");
-                            None
-                        } else {
-                            // read_messages_loop already logged the cause at warn; keep
-                            // this at debug to avoid double-reporting.
-                            debug!("Message loop exited, will reconnect if enabled: {e:#}");
-                            Some(e.into_reason())
-                        }
-                    }
-                };
-
-                self.cleanup_connection_state().await;
-
-                // Dispatch after cleanup so handlers see cleared connection state.
-                if let Some(reason) = unexpected_disconnect {
-                    self.core.event_bus.dispatch(Event::Disconnected(
-                        crate::types::events::Disconnected::builder()
-                            .reason(reason)
-                            .build(),
-                    ));
+                Ok(connection) => {
+                    wacore::telemetry::connect("ok");
+                    let _ = connection.read_until_disconnected().await;
                 }
             }
 
@@ -704,22 +676,132 @@ impl Client {
         info!("Client run loop has shut down.");
     }
 
+    /// Open one connection and hand it back for the caller to read.
+    ///
+    /// The handshake is done when this returns and that is all it does: the
+    /// server's frames queue in the transport channel until the returned
+    /// [`Connection`] is driven. [`run`](Self::run) is that read plus the
+    /// reconnect loop, and is what a session normally wants.
+    ///
+    /// This used to resolve to `Result<(), ConnectError>`, and a caller that
+    /// awaited it and then waited for events waited forever. The old call is
+    /// now an `unused_must_use`:
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// # use std::sync::Arc;
+    /// # use whatsapp_rust::{Client, ConnectError};
+    /// # async fn before(client: &Arc<Client>) -> Result<(), ConnectError> {
+    /// client.connect().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use whatsapp_rust::{Client, ConnectError};
+    /// # async fn after(client: &Arc<Client>) -> Result<(), ConnectError> {
+    /// client.connect().await?.read_until_disconnected().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// Boxed barrier: see [`crate::bot::Bot::run`]. Coroutines are LocalCopy
     /// across crates, so consumers awaiting the connect graph directly would
     /// re-codegen it; the box makes them poll through a vtable instead.
-    pub async fn connect(self: &Arc<Self>) -> Result<(), ConnectError> {
+    pub async fn connect(self: &Arc<Self>) -> Result<Connection<'_>, ConnectError> {
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle
             && !lifecycle.wait_until_active().await
         {
             return Err(ConnectError::NotActivated);
         }
+        // Same refusal `run` makes: a shutdown is published once and for good,
+        // and a connection established after it would be one the application
+        // has already been told does not exist. A new client is the way back.
+        if self.shutdown_signal().is_fired() {
+            return Err(ConnectError::Shutdown);
+        }
         self.connect_boxed().await
     }
 
     #[inline(never)]
-    fn connect_boxed(self: &Arc<Self>) -> wacore::runtime::BoxFuture<'_, Result<(), ConnectError>> {
+    fn connect_boxed(
+        self: &Arc<Self>,
+    ) -> wacore::runtime::BoxFuture<'_, Result<Connection<'_>, ConnectError>> {
         Box::pin(self.connect_graph())
+    }
+
+    /// One connection from its first frame to its teardown: read until the
+    /// socket ends, clear the connection state, and announce an end nobody
+    /// asked for. Shared by [`run`](Self::run)'s loop body and by the
+    /// single-connection [`Connection::read_until_disconnected`], so the two
+    /// cannot drift on what a connection ending means.
+    async fn drive_connection(self: &Arc<Self>) -> Option<DisconnectReason> {
+        // Started here rather than at the end of connect: its ping goes through
+        // `can_reach_server`, so a tick taken before anything reads is refused
+        // as NotConnected, which the loop classifies as fatal and exits on,
+        // leaving the connection with no idle ping and no dead-socket watchdog.
+        let keepalive = self.clone();
+        self.runtime
+            .spawn(Box::pin(async move { keepalive.keepalive_loop().await }))
+            .detach();
+
+        let loop_result = self.read_messages_loop().await;
+        // Consume intentional_reconnect on EVERY exit, reading it AFTER the loop
+        // ends (reconnect() sets it while the loop runs, then tears down via the
+        // shutdown signal — the Expected path). Consuming it only on some paths
+        // left it stale for the next connection, misclassifying the next genuine
+        // disconnect as intentional and swallowing its Disconnected event.
+        let intentional = self.intentional_reconnect.swap(false, Ordering::Relaxed);
+        // Some(reason) = unexpected disconnect worth a `Disconnected` event; the
+        // reason distinguishes a routine server recycle from a real failure so
+        // consumers don't have to.
+        let unexpected_disconnect = match loop_result {
+            Ok(node_io::ReadLoopExit::Expected) => {
+                debug!("Message loop exited gracefully (expected disconnect).");
+                None
+            }
+            Ok(node_io::ReadLoopExit::ServerRecycle(reason)) => {
+                if self.expected_disconnect.load(Ordering::Relaxed) || intentional {
+                    debug!("Message loop exited during expected disconnect.");
+                    None
+                } else {
+                    // read_messages_loop already logged this at info; a clean
+                    // recycle stays quiet here too.
+                    Some(reason)
+                }
+            }
+            Err(e) => {
+                if self.expected_disconnect.load(Ordering::Relaxed) || intentional {
+                    debug!("Message loop exited during expected disconnect.");
+                    None
+                } else {
+                    // read_messages_loop already logged the cause at warn; keep
+                    // this at debug to avoid double-reporting.
+                    debug!("Message loop exited, will reconnect if enabled: {e:#}");
+                    Some(e.into_reason())
+                }
+            }
+        };
+
+        self.cleanup_connection_state().await;
+
+        // Dispatch after cleanup so handlers see cleared connection state.
+        if let Some(reason) = unexpected_disconnect.clone() {
+            self.core.event_bus.dispatch(Event::Disconnected(
+                crate::types::events::Disconnected::builder()
+                    .reason(reason)
+                    .build(),
+            ));
+        }
+        unexpected_disconnect
+    }
+
+    /// Hand a connection to a test without a server to handshake with.
+    #[cfg(test)]
+    pub(crate) fn connection_for_test(self: &Arc<Self>) -> Connection<'_> {
+        Connection { client: self }
     }
 
     // err(level = "warn", ...): run()'s caller already classifies failures here itself
@@ -737,7 +819,7 @@ impl Client {
             err(level = "warn", Debug)
         )
     )]
-    async fn connect_graph(self: &Arc<Self>) -> Result<(), ConnectError> {
+    async fn connect_graph(self: &Arc<Self>) -> Result<Connection<'_>, ConnectError> {
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
 
@@ -760,6 +842,11 @@ impl Client {
         self.is_logged_in.store(false, Ordering::Relaxed);
         self.is_ready.store(false, Ordering::Relaxed);
         self.is_connected.store(false, Ordering::Relaxed);
+        // The retired connection's verdict, not this one's. Inherited, it makes
+        // the read loop exit on the first frame it decodes and `handle_success`
+        // refuse the login. `run` already clears it before each attempt; a
+        // caller driving connections itself has nowhere else to learn of it.
+        self.expected_disconnect.store(false, Ordering::Relaxed);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
             .store(false, Ordering::Relaxed);
@@ -817,13 +904,24 @@ impl Client {
             .map_err(ConnectError::Transport)?;
         debug!("Version fetch and transport connection established.");
 
+        // The check in `connect` cannot stand for the whole attempt: a version
+        // fetch, a transport and a handshake are awaited after it, and a
+        // shutdown landing in that window would otherwise be published over.
+        // Re-read before each remaining step, and hand back the socket opened
+        // for a client that is no longer there.
+        if self.shutdown_signal().is_fired() {
+            transport.disconnect().await;
+            return Err(ConnectError::Shutdown);
+        }
+
         let noise_socket = match handshake::do_handshake(
             self.runtime.clone(),
             &self.persistence_manager,
             &self.ik_handshake_failures,
             transport.clone(),
             &mut transport_events,
-            Some(self.stats.clone()),
+            crate::socket::noise_socket::SendObservers::with_stats(self.stats.clone())
+                .with_sent_frames(self.sent_frame_tap.clone()),
         )
         .await
         {
@@ -833,6 +931,11 @@ impl Client {
                 return Err(e.into());
             }
         };
+
+        if self.shutdown_signal().is_fired() {
+            transport.disconnect().await;
+            return Err(ConnectError::Shutdown);
+        }
 
         // Fresh per-connection shutdown so subscribers registered during this
         // connection see a clean signal; the previous notifier was already
@@ -852,17 +955,27 @@ impl Client {
         *self.transport.lock().await = Some(transport);
         *self.transport_events.lock().await = Some(transport_events);
         *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = Some(noise_socket);
+
+        // The last word, because the slot locks above are the final awaits a
+        // shutdown could land across, and `signal_shutdown_sync` runs no
+        // cleanup of its own. Nothing has been announced yet, so undoing the
+        // publish here is the whole retraction.
+        if self.shutdown_signal().is_fired() {
+            let orphan = self.transport.lock().await.take();
+            *self.transport_events.lock().await = None;
+            *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            if let Some(orphan) = orphan {
+                orphan.disconnect().await;
+            }
+            return Err(ConnectError::Shutdown);
+        }
+
         self.is_connected.store(true, Ordering::Release);
 
         // Notify waiters that socket is ready (before login)
         self.socket_ready_notifier.notify(usize::MAX);
 
-        let client_clone = self.clone();
-        self.runtime
-            .spawn(Box::pin(async move { client_clone.keepalive_loop().await }))
-            .detach();
-
-        Ok(())
+        Ok(Connection { client: self })
     }
 
     /// Deregister this companion device and disconnect.
@@ -1390,9 +1503,9 @@ impl Client {
     /// alone admits a request that cannot come back: a socket, so there is
     /// somewhere to send it; authentication, because `<success>` both makes the
     /// server willing to answer and fixes the generation the answer is admitted
-    /// under; and a supervision loop, because `send_and_wait_iq` refuses without
-    /// one — a direct-connect client has no reader, so its every request would
-    /// time out.
+    /// under; and a reader, because an answer nobody decodes is a request that
+    /// times out. `is_running` is set by `run` and by
+    /// `Connection::read_until_disconnected`, the two calls that read.
     ///
     /// Authentication is read as *the generation is final*, not as
     /// `is_logged_in` alone: that flag is set by the duplicate-`<success>` guard
@@ -1413,10 +1526,277 @@ impl Client {
     }
 }
 
+/// An established connection that nothing is reading yet.
+///
+/// [`Client::connect`] stops at the handshake. The frames the server sends next
+/// sit in the transport channel, and it takes
+/// [`read_until_disconnected`](Self::read_until_disconnected) to turn them into
+/// nodes and events. Hence `#[must_use]`: a connection nobody drives fails by
+/// staying silent, with no timeout, error or log to say so.
+///
+/// [`Client::run`] does the same read inside its reconnect loop. Reach for this
+/// instead when the session must not outlive its first connection.
+#[must_use = "this connection is not being read: nothing decodes frames or emits events until \
+              `read_until_disconnected` drives it (or use `Client::run`)"]
+pub struct Connection<'a> {
+    client: &'a Arc<Client>,
+}
+
+impl Connection<'_> {
+    /// Read this connection until it ends, then tear it down.
+    ///
+    /// Returns the reason an unexpected end carried (the same one dispatched
+    /// as `Event::Disconnected` just before returning), or `None` when the end
+    /// was not one to report: a requested disconnect, or a protocol step that
+    /// ends the stream on purpose, such as the 515 that follows pairing and
+    /// expects another connection. No reconnect happens here either way, so a
+    /// caller that wants one connects again.
+    ///
+    /// Dropping this future stops the read without tearing the connection
+    /// down, exactly as dropping [`Client::run`] does: the socket stays open
+    /// and the client keeps reporting itself connected, so the next
+    /// [`Client::connect`] is refused until [`Client::disconnect`] releases
+    /// it. Only the reader flag is given back, so a later `run` is not refused
+    /// as already running.
+    pub async fn read_until_disconnected(self) -> Option<DisconnectReason> {
+        // Reading is what the Drop warning asks for, so the drop that ends this
+        // call must not fire it.
+        let this = std::mem::ManuallyDrop::new(self);
+        // `is_running` is how the rest of the client asks whether anything is
+        // reading (`can_reach_server`, `is_terminal`). Left false, a request
+        // sent over this connection would be refused for want of the reader
+        // that is right here. `run` sets it before connecting and owns clearing
+        // it, so only a directly driven connection claims it.
+        // Guarded, not a store after the await: a caller that drops this future
+        // (a wrapping timeout, an aborted task) stops reading too, and a flag
+        // left standing would advertise a reader that no longer exists.
+        let owns_reader = !this.client.is_running.swap(true, Ordering::SeqCst);
+        let _release_reader = owns_reader.then(|| {
+            scopeguard::guard((), |_| {
+                this.client.stop_supervision_loop();
+            })
+        });
+        this.client.drive_connection().await
+    }
+}
+
+impl std::fmt::Debug for Connection<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection").finish_non_exhaustive()
+    }
+}
+
+impl Drop for Connection<'_> {
+    fn drop(&mut self) {
+        warn!(
+            "Connection dropped without being read; nothing will be decoded from it. Drive it with `read_until_disconnected`, or use `Client::run`."
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// A connection with one frame already waiting on it, and everything needed
+    /// to see whether that frame ever becomes a node.
+    ///
+    /// The frame is one the client encrypted itself: both directions run the
+    /// same test key on independent counters, so the first write decrypts as
+    /// the first read.
+    struct PendingFrame {
+        client: Arc<Client>,
+        events: async_channel::Sender<crate::transport::TransportEvent>,
+        decoded: Arc<crate::test_utils::TestEventCollector>,
+        _raw_nodes: RawNodeLease,
+    }
+
+    impl PendingFrame {
+        async fn new() -> Self {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let decoded = Arc::new(crate::test_utils::TestEventCollector::default());
+            client
+                .core
+                .event_bus
+                .subscribe_handler(decoded.clone())
+                .detach();
+            let raw_nodes = client.acquire_raw_node_forwarding();
+
+            client
+                .send_node(NodeBuilder::new("ib").build())
+                .await
+                .expect("the fixture frame must reach the mock transport");
+            crate::test_utils::poll_until("the fixture frame to be written", || {
+                transport.sent_count() >= 1
+            })
+            .await;
+            let frame = transport.sent().remove(0);
+
+            let (events, receiver) = async_channel::bounded(4);
+            *client.transport_events.lock().await = Some(receiver);
+            events
+                .send(crate::transport::TransportEvent::DataReceived(frame))
+                .await
+                .expect("the fixture channel must accept the frame");
+
+            Self {
+                client,
+                events,
+                decoded,
+                _raw_nodes: raw_nodes,
+            }
+        }
+
+        fn decoded_tags(&self) -> Vec<String> {
+            self.decoded
+                .events()
+                .iter()
+                .filter_map(|event| match &**event {
+                    Event::RawNode(node) => Some(node.tag().to_string()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// The symptom this contract exists for: the connection is up, the server's
+    /// bytes have arrived, and reading them is what turns them into a node.
+    #[tokio::test]
+    async fn a_driven_connection_decodes_the_first_frame_and_reports_its_end() {
+        let fixture = PendingFrame::new().await;
+        fixture
+            .events
+            .send(crate::transport::TransportEvent::Disconnected(
+                DisconnectReason::StreamEnded,
+            ))
+            .await
+            .expect("the fixture channel must accept the close");
+
+        let reason = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture
+                .client
+                .connection_for_test()
+                .read_until_disconnected(),
+        )
+        .await
+        .expect("reading must end once the transport reports the close");
+
+        assert_eq!(
+            fixture.decoded_tags(),
+            vec!["ib".to_string()],
+            "the first frame of a driven connection must be decoded"
+        );
+        assert!(
+            matches!(reason, Some(DisconnectReason::StreamEnded)),
+            "an unannounced close must come back as the reason, got {reason:?}"
+        );
+    }
+
+    /// The other half of the contract: connecting alone still guarantees a live
+    /// socket, and guarantees nothing about reading it. The frame stays queued,
+    /// no node is decoded, and no error says so, which is why the connection
+    /// is `#[must_use]`.
+    #[tokio::test]
+    async fn a_connection_nobody_reads_leaves_the_frame_queued() {
+        let fixture = PendingFrame::new().await;
+
+        drop(fixture.client.connection_for_test());
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            fixture.client.is_connected(),
+            "connecting alone still leaves the socket up"
+        );
+        assert!(
+            fixture.decoded_tags().is_empty(),
+            "nothing may decode a frame while no reader is running"
+        );
+        assert_eq!(
+            fixture.events.len(),
+            1,
+            "the frame must still be waiting for a reader"
+        );
+        assert!(
+            fixture.client.transport_events.lock().await.is_some(),
+            "the reader's inlet must be untouched"
+        );
+    }
+
+    /// Shutdown is published once and for good, and `run` refuses to start
+    /// after it. Connecting has to refuse too, or the connection this hands
+    /// back revives a client the application was told was finished.
+    #[tokio::test]
+    async fn connecting_is_refused_after_the_client_is_shut_down() {
+        let client = crate::test_utils::create_test_client().await;
+        client.disconnect().await;
+
+        let error = tokio::time::timeout(Duration::from_millis(500), client.connect())
+            .await
+            .expect("the refusal must be immediate, with no I/O attempted")
+            .expect_err("a shut-down client must refuse to connect");
+        assert!(matches!(error, ConnectError::Shutdown));
+    }
+
+    /// The post-pairing 515 ends a connection with `expected_disconnect` set,
+    /// and the read loop exits on the first frame it decodes while that holds.
+    /// `run` clears it at the top of each attempt; a caller driving connections
+    /// itself gets the same start, or its second connection dies on arrival.
+    #[tokio::test]
+    async fn connecting_clears_the_retired_connection_expected_disconnect() {
+        let client = crate::test_utils::create_test_client().await;
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+
+        // The reset runs before any I/O, so the attempt itself need not finish.
+        let _ = tokio::time::timeout(Duration::from_millis(500), client.connect()).await;
+
+        assert!(
+            !client.expected_disconnect.load(Ordering::Relaxed),
+            "a new connection must not inherit the previous one's disconnect verdict"
+        );
+    }
+
+    /// A read that is dropped mid-connection has stopped reading, so the flag
+    /// that says otherwise has to come back. Left standing it would refuse the
+    /// next `run()` as already running and admit requests to a dead reader.
+    #[tokio::test]
+    async fn a_cancelled_read_gives_the_reader_flag_back() {
+        let fixture = PendingFrame::new().await;
+        // The fixture client is pre-marked as driven; this one does the driving.
+        fixture.client.is_running.store(false, Ordering::SeqCst);
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            fixture
+                .client
+                .connection_for_test()
+                .read_until_disconnected(),
+        )
+        .await;
+
+        assert!(
+            cancelled.is_err(),
+            "the read must still be waiting for frames when the timeout cancels it"
+        );
+        assert!(
+            !fixture.client.is_running.load(Ordering::SeqCst),
+            "a cancelled read must not leave the client advertising a reader"
+        );
+    }
+
+    /// The connection handed back by `connect` is a borrow, so the happy path
+    /// carries the same bytes and the same allocations it did when connecting
+    /// resolved to `()`.
+    #[test]
+    fn handing_back_a_connection_costs_the_caller_nothing() {
+        assert_eq!(
+            size_of::<Result<Connection<'static>, ConnectError>>(),
+            size_of::<Result<(), ConnectError>>()
+        );
+    }
 
     #[tokio::test]
     async fn wait_for_socket_resolves_immediately_once_connected() {

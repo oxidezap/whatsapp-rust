@@ -3671,15 +3671,208 @@ async fn install_test_noise_socket(
     use crate::socket::NoiseSocket;
     use wacore::handshake::NoiseCipher;
 
-    let key = [0u8; 32];
-    let noise_socket = NoiseSocket::new(
+    let key = TEST_NOISE_KEY;
+    // Wired to the client's own observers, like the real socket: a test that
+    // watches its sends needs the same plumbing production has.
+    let noise_socket = NoiseSocket::with_observers(
         runtime,
         transport,
         NoiseCipher::new(&key).expect("valid key"),
         NoiseCipher::new(&key).expect("valid key"),
+        crate::socket::noise_socket::SendObservers::with_stats(client.stats.clone())
+            .with_sent_frames(client.sent_frame_tap.clone()),
     );
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);
+}
+
+/// The key `install_test_noise_socket` builds its socket with, so a test can
+/// decrypt what the client wrote.
+const TEST_NOISE_KEY: [u8; 32] = [0u8; 32];
+
+/// Every distinct way a stanza leaves the client, driven end to end, with the
+/// observer's view compared against the transport's.
+///
+/// `send_node` marshals and resolves sent-node waiters; the ack, receipt and
+/// direct-encoded IQ paths hand pre-marshaled bytes straight to the socket and
+/// were invisible to those waiters; the ack and receipt workers reach the wire
+/// only through the burst. All of them cross the noise sender, which is why one
+/// observation point covers the lot.
+#[tokio::test]
+async fn every_send_path_is_observed_exactly_as_it_reached_the_wire() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+
+    // 1. send_node: the only path that builds a Node the caller could inspect.
+    let presence = NodeBuilder::new("presence")
+        .attr("type", "available")
+        .attr("name", "observer")
+        .build();
+    client
+        .send_node(presence.clone())
+        .await
+        .expect("presence must send");
+
+    // 2. send_raw_bytes, through a real caller of it: the ack path documents
+    //    that it bypasses node logging and sent-node waiters.
+    let incoming = NodeBuilder::new("notification")
+        .attr("id", "OBSERVED-1")
+        .attr("type", "w:gp2")
+        .attr("from", "5550000@g.us")
+        .build();
+    client
+        .send_ack_for(&incoming.as_node_ref())
+        .await
+        .expect("ack must send");
+
+    // 3. send_raw_bytes_burst, the shape the ack and receipt workers use: two
+    //    frames coalesced into a single transport write.
+    let mut frames = vec![
+        wacore_binary::marshal::marshal_exact(
+            &NodeBuilder::new("iq").attr("id", "BURST-1").build(),
+        )
+        .expect("marshal"),
+        wacore_binary::marshal::marshal_exact(
+            &NodeBuilder::new("iq").attr("id", "BURST-2").build(),
+        )
+        .expect("marshal"),
+    ];
+    let mut results = Vec::new();
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
+        .await
+        .expect("burst must send");
+    assert!(results.iter().all(|result| result.is_ok()));
+
+    let wire = crate::test_utils::decrypt_wire_frames(&transport.sent(), &TEST_NOISE_KEY);
+    assert_eq!(wire.len(), 4, "four frames must have reached the transport");
+    let observed: Vec<Vec<u8>> = recorder
+        .frames()
+        .iter()
+        .map(|frame| frame.to_vec())
+        .collect();
+    assert_eq!(
+        observed, wire,
+        "every send path must be observed, byte for byte and in wire order"
+    );
+
+    // The bytes are the stanza, not a rendering of it: the first frame decodes
+    // back to the node that was sent.
+    let decoded = wacore_binary::marshal::unmarshal_packed_ref(&observed[0])
+        .expect("an observed frame must decode as the stanza it carried");
+    assert_eq!(decoded.tag.as_ref(), "presence");
+    assert_eq!(
+        decoded.attrs().optional_string("name").as_deref(),
+        Some("observer")
+    );
+}
+
+/// While nobody holds a lease the send path publishes nothing and builds
+/// nothing, and releasing the last lease puts it back to that state.
+#[tokio::test]
+async fn sends_are_unobserved_until_a_consumer_asks() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+
+    assert!(
+        !client.sent_frame_forwarding_enabled(),
+        "forwarding must be off until a consumer acquires it"
+    );
+    client
+        .send_node(NodeBuilder::new("presence").build())
+        .await
+        .expect("presence must send");
+    assert_eq!(client.sent_frame_tap.published(), 0);
+    assert!(recorder.frames().is_empty());
+
+    let lease = client.acquire_sent_frame_forwarding();
+    assert!(client.sent_frame_forwarding_enabled());
+    client
+        .send_node(NodeBuilder::new("presence").build())
+        .await
+        .expect("presence must send");
+    assert_eq!(recorder.frames().len(), 1);
+
+    drop(lease);
+    assert!(
+        !client.sent_frame_forwarding_enabled(),
+        "the last lease dropping must disable forwarding again"
+    );
+    client
+        .send_node(NodeBuilder::new("presence").build())
+        .await
+        .expect("presence must send");
+    assert_eq!(
+        recorder.frames().len(),
+        1,
+        "no frame may be observed after the lease is gone"
+    );
+    assert_eq!(client.sent_frame_tap.published(), 1);
+}
+
+/// An observer that panics must not cost the client its send path: the dispatch
+/// runs on the noise sender task, and an unwinding panic there would end every
+/// send on the connection.
+#[tokio::test]
+async fn a_panicking_observer_leaves_the_client_sending() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    struct PanickingObserver;
+    impl wacore::types::events::EventHandler for PanickingObserver {
+        fn handle_event(&self, _event: Arc<Event>) {
+            panic!("observer panics on every frame");
+        }
+        fn interest(&self) -> wacore::types::events::EventInterest {
+            wacore::types::events::EventInterest::of(&[wacore::types::events::EventKind::SentFrame])
+        }
+    }
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    let _subscription = client.subscribe_handler(Arc::new(PanickingObserver));
+    let _lease = client.acquire_sent_frame_forwarding();
+
+    for attempt in 0..3 {
+        client
+            .send_node(NodeBuilder::new("presence").attr("t", attempt).build())
+            .await
+            .unwrap_or_else(|e| panic!("send {attempt} must survive the observer: {e:?}"));
+    }
+    assert_eq!(
+        transport.sent_count(),
+        3,
+        "every stanza must still reach the wire"
+    );
 }
 
 fn receipt_test_info(id: &str) -> Arc<crate::types::message::MessageInfo> {

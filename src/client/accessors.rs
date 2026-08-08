@@ -88,6 +88,33 @@ impl Client {
         self.decrypted_payload_forwarding.load(Ordering::Relaxed) != 0
     }
 
+    /// Acquire sent-frame forwarding for one consumer.
+    ///
+    /// [`Event::SentFrame`] stays enabled until every acquired lease is dropped.
+    /// While none is held nothing is emitted and nothing is cloned: the send
+    /// path costs one relaxed atomic load.
+    ///
+    /// This is the outbound counterpart of
+    /// [`acquire_raw_node_forwarding`](Self::acquire_raw_node_forwarding), and
+    /// unlike [`wait_for_sent_node`](Self::wait_for_sent_node) it is neither
+    /// filtered nor one-shot and covers every send path, including the ones that
+    /// never build a `Node`.
+    ///
+    /// [`Event::SentFrame`]: wacore::types::events::Event::SentFrame
+    pub fn acquire_sent_frame_forwarding(self: &Arc<Self>) -> SentFrameLease {
+        self.sent_frame_tap.acquire();
+        SentFrameLease {
+            client: Arc::downgrade(self),
+        }
+    }
+
+    /// Only tests ask this: the send path reads the gate through the tap the
+    /// noise sender already holds, not through the client.
+    #[cfg(test)]
+    pub(crate) fn sent_frame_forwarding_enabled(&self) -> bool {
+        self.sent_frame_tap.enabled()
+    }
+
     /// Register an interceptor that sees each decoded stanza before the
     /// built-in pipeline, and may take it.
     ///

@@ -25,6 +25,7 @@ use extension_lifecycle::LifecycleRegistration;
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+pub use lifecycle::Connection;
 pub use voip::{CallError, Voip};
 
 use crate::cache::Cache;
@@ -100,6 +101,113 @@ impl Drop for RawNodeLease {
         };
         let previous = client.raw_node_forwarding.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(previous > 0, "raw-node forwarding lease underflow");
+    }
+}
+
+/// Lease that keeps sent-frame events enabled for one consumer.
+///
+/// Dropping the final lease disables forwarding. The lease holds only a weak
+/// client reference, so it cannot keep the client alive.
+///
+/// It gates, it does not fence, and one aggregate count gates them all rather
+/// than one per lease: a frame captured while any lease was alive can still
+/// arrive just after this one drops, and which handlers receive it is a matter of
+/// subscription, not of who holds a lease. Every gated kind works this way.
+/// Making the drop wait for in-flight dispatches to drain would instead deadlock
+/// an observer that drops its lease from inside its own handler, which is the
+/// natural way to record one frame and stop.
+#[must_use = "dropping the lease immediately releases sent-frame forwarding"]
+pub struct SentFrameLease {
+    client: std::sync::Weak<Client>,
+}
+
+impl Drop for SentFrameLease {
+    fn drop(&mut self) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        client.sent_frame_tap.release();
+    }
+}
+
+/// Publishes the plaintext frames that reached the transport as
+/// [`Event::SentFrame`](wacore::types::events::Event::SentFrame).
+///
+/// The client owns it and hands the noise sender a clone of the `Arc`, the same
+/// way it hands over [`SessionStats`](wacore::stats::SessionStats): the gate has
+/// to be readable from the one point every send crosses, and that task cannot
+/// hold the client without keeping it alive.
+pub(crate) struct SentFrameTap {
+    /// Number of consumers currently requesting the event.
+    forwarding: AtomicUsize,
+    bus: wacore::types::events::CoreEventBus,
+    /// Proves the no-lease path builds nothing, rather than only that it
+    /// dispatches nothing.
+    #[cfg(test)]
+    published: AtomicUsize,
+}
+
+impl SentFrameTap {
+    pub(crate) fn new(bus: wacore::types::events::CoreEventBus) -> Self {
+        Self {
+            forwarding: AtomicUsize::new(0),
+            bus,
+            #[cfg(test)]
+            published: AtomicUsize::new(0),
+        }
+    }
+
+    /// Enable forwarding for one consumer. The public door is
+    /// [`Client::acquire_sent_frame_forwarding`], which pairs this with a lease
+    /// that releases it on drop; a caller here owns that pairing itself.
+    pub(crate) fn acquire(&self) {
+        let incremented = self
+            .forwarding
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            })
+            .is_ok();
+        assert!(incremented, "sent-frame forwarding lease counter overflow");
+    }
+
+    pub(crate) fn release(&self) {
+        let previous = self.forwarding.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "sent-frame forwarding lease underflow");
+    }
+
+    #[inline]
+    pub(crate) fn enabled(&self) -> bool {
+        self.forwarding.load(Ordering::Relaxed) != 0
+    }
+
+    /// Hand one frame to the observers.
+    ///
+    /// The dispatch is caught: a consumer that only watches must not be able to
+    /// take the send pipeline down with it, and this runs on the noise sender
+    /// task, whose death would end every send on the connection. Containment is
+    /// per dispatch, not per handler, so a panicking observer costs this frame
+    /// for the observers behind it — the bus offers no per-handler isolation for
+    /// any kind, and plugins already wrap their own handlers. A handler that
+    /// *blocks* still stalls sends, the contract every handler has on the read
+    /// loop.
+    pub(crate) fn publish(&self, plaintext: bytes::Bytes) {
+        #[cfg(test)]
+        self.published.fetch_add(1, Ordering::Relaxed);
+        let dispatch = std::panic::AssertUnwindSafe(|| {
+            self.bus.dispatch(Event::SentFrame(
+                wacore::types::events::SentFrame::builder()
+                    .plaintext(plaintext)
+                    .build(),
+            ));
+        });
+        if std::panic::catch_unwind(dispatch).is_err() {
+            warn!("A sent-frame observer panicked; the send pipeline is unaffected.");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn published(&self) -> usize {
+        self.published.load(Ordering::Relaxed)
     }
 }
 
@@ -704,6 +812,10 @@ pub enum ConnectError {
     /// Construction never completed, so the attempt was rejected before any I/O.
     #[error("client construction did not activate")]
     NotActivated,
+    /// The client was shut down. Shutdown is final, so build a new client
+    /// rather than reconnecting this one.
+    #[error("client has been shut down")]
+    Shutdown,
     /// A step of the connect flow ran out of time.
     #[error("{stage} timed out after {timeout:?}")]
     Timeout {
@@ -767,6 +879,7 @@ impl ConnectError {
             ConnectError::Handshake(handshake) => handshake.is_timeout(),
             ConnectError::AlreadyConnected
             | ConnectError::NotActivated
+            | ConnectError::Shutdown
             | ConnectError::Version(_)
             | ConnectError::Transport(_) => false,
         }
@@ -1452,6 +1565,10 @@ pub struct Client {
     /// Number of consumers currently requesting `Event::DecryptedPayload`
     /// forwarding.
     decrypted_payload_forwarding: AtomicUsize,
+
+    /// Gate and publisher for `Event::SentFrame`. Behind an `Arc` because the
+    /// noise sender task reads it; see [`SentFrameTap`].
+    pub(crate) sent_frame_tap: Arc<SentFrameTap>,
 
     /// Stanza interceptors, behind the same copy-on-write snapshot the event
     /// bus uses: reading one costs a refcount bump, so the read loop allocates

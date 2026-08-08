@@ -14,7 +14,9 @@ impl Client {
     /// the connection, which is why the format byte is checked here.
     ///
     /// This bypasses node logging and `sent_node_waiter` resolution — use
-    /// [`send_node`](Client::send_node) for normal stanza sending.
+    /// [`send_node`](Client::send_node) for normal stanza sending. It is still
+    /// observed: `Event::SentFrame` is emitted from the noise sender, past every
+    /// bypass here.
     pub async fn send_raw_bytes(&self, plaintext: Vec<u8>) -> Result<(), ClientError> {
         wacore_binary::util::check_plain_payload(&plaintext).map_err(SocketError::Marshal)?;
         let noise_socket = self.get_noise_socket()?;

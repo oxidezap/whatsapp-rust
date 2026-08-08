@@ -28,9 +28,24 @@ must follow.
 `wacore::stats::SessionStats`, owned by each `Client`. Recorded at exactly two
 chokepoints:
 
-- **Sent**: the noise sender task (`NoiseSocket::with_stats`) after the
+- **Sent**: the noise sender task (`NoiseSocket::with_observers`) after the
   transport write — post-noise wire bytes (frame header + AEAD tag included).
 - **Received**: the read loop (`node_io.rs`) per `DataReceived` batch.
+
+That sent chokepoint is the *only* place every post-handshake frame crosses (the
+XX/IK exchange writes to the transport directly, before this socket exists). Two
+functions reach it — `send_raw_bytes` and `send_raw_bytes_burst` — and everything
+else funnels through one of those: `send_node` and every IQ through the first,
+the ack and delivery-receipt workers through the second. `send_raw_bytes`
+deliberately bypasses node logging and sent-node waiters, so anything that has to
+see everything the client sends on the session socket belongs at the chokepoint
+and nowhere else.
+
+`Event::SentFrame` is the other thing wired into it
+(`Client::acquire_sent_frame_forwarding()`, lease-gated like `RawNode`): it hands
+over the marshaled plaintext of each frame the transport accepted. Both halves
+travel to the socket as `SendObservers`, so the next observer plugs in there
+instead of widening `do_handshake` again.
 
 It also owns the activity timestamps the keepalive dead-socket watchdog reads:
 `last_data_received_ms` (one clock read per received transport event, plus one
@@ -42,8 +57,8 @@ cost a clock read on every frame written, which is the client's hottest path
 and a call out of the module on wasm32/embedded. `frames_sent` answers "is it
 still sending?" for free. Message-level counters piggyback on the existing
 `telemetry::send`/`recv` chokepoints; reconnect attempts are counted in the
-run loop. VoIP relay sockets pass `None` and are not counted — this is the
-main WA session socket only.
+run loop. VoIP relay sockets pass `SendObservers::default()` and are not counted
+— this is the main WA session socket only.
 
 ### 2. `Client::memory_report()` — retained memory (on demand)
 

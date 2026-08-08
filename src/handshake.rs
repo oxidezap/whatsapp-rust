@@ -174,7 +174,7 @@ pub async fn do_handshake(
     ik_handshake_failures: &AtomicU32,
     transport: Arc<dyn Transport>,
     transport_events: &mut async_channel::Receiver<TransportEvent>,
-    stats: Option<Arc<wacore::stats::SessionStats>>,
+    observers: crate::socket::noise_socket::SendObservers,
 ) -> Result<Arc<NoiseSocket>> {
     let (write_cipher, read_cipher) = negotiate(
         &runtime,
@@ -188,12 +188,12 @@ pub async fn do_handshake(
     // Built outside the handshake span: the socket spawns the connection's
     // sender task, which encrypts every outbound frame until the connection
     // ends. Inside, that per-frame work is rooted at a one-shot span.
-    Ok(Arc::new(NoiseSocket::with_stats(
+    Ok(Arc::new(NoiseSocket::with_observers(
         runtime,
         transport,
         write_cipher,
         read_cipher,
-        stats,
+        observers,
     )))
 }
 

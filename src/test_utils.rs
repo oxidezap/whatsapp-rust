@@ -11,6 +11,76 @@ pub fn node_to_owned_ref(node: &Node) -> Arc<OwnedNodeRef> {
     Arc::new(OwnedNodeRef::new(node_bytes.into_owned()).expect("OwnedNodeRef::new should succeed"))
 }
 
+/// Records every [`Event::SentFrame`]
+/// it is dispatched, keeping the `Bytes` it arrived with so a test can check the
+/// pointer as well as the contents.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SentFrameRecorder {
+    frames: Mutex<Vec<bytes::Bytes>>,
+}
+
+#[cfg(test)]
+impl SentFrameRecorder {
+    pub(crate) fn frames(&self) -> Vec<bytes::Bytes> {
+        self.frames.lock().expect("recorded frames mutex").clone()
+    }
+}
+
+#[cfg(test)]
+impl EventHandler for SentFrameRecorder {
+    fn handle_event(&self, event: Arc<Event>) {
+        if let Event::SentFrame(sent) = &*event {
+            self.frames
+                .lock()
+                .expect("recorded frames mutex")
+                .push(sent.plaintext.clone());
+        }
+    }
+
+    fn interest(&self) -> EventInterest {
+        EventInterest::of(&[EventKind::SentFrame])
+    }
+}
+
+/// Decrypts captured noise frames under the counter each one's position implies,
+/// yielding the plaintexts in wire order.
+///
+/// Takes what [`CapturingMockTransport::sent`] yields: one framed frame per
+/// entry, prefix intact, already split out of whatever writes carried them. The
+/// length is checked rather than reparsed, so a caller passing raw writes (where
+/// one entry can hold several frames) fails here instead of decrypting garbage.
+///
+/// The counter is the AES-GCM nonce, so this doubles as an order check: a frame
+/// read out of position cannot authenticate.
+///
+/// [`CapturingMockTransport::sent`]: crate::transport::mock::CapturingMockTransport::sent
+#[cfg(test)]
+pub(crate) fn decrypt_wire_frames(frames: &[bytes::Bytes], key: &[u8; 32]) -> Vec<Vec<u8>> {
+    use wacore::framing::FRAME_LENGTH_SIZE;
+    use wacore::noise::NoiseCipher;
+
+    let cipher = NoiseCipher::new(key).expect("32-byte key");
+    let mut plaintexts = Vec::with_capacity(frames.len());
+    for (counter, frame) in frames.iter().enumerate() {
+        let mut declared = 0usize;
+        for byte in &frame[..FRAME_LENGTH_SIZE] {
+            declared = (declared << 8) | *byte as usize;
+        }
+        assert_eq!(
+            declared,
+            frame.len() - FRAME_LENGTH_SIZE,
+            "expected one frame per entry, as `sent()` yields them"
+        );
+        let mut body = bytes::BytesMut::from(&frame[FRAME_LENGTH_SIZE..]);
+        cipher
+            .decrypt_in_place_with_counter(counter as u32, &mut body)
+            .expect("each captured frame must decrypt under its own counter");
+        plaintexts.push(body.to_vec());
+    }
+    plaintexts
+}
+
 /// The [`crate::request::IqError::ServerError`] an `<iq type="error">` carrying these
 /// attributes produces, built by the same parse the receive path runs so a test never
 /// states the variant's shape by hand.
@@ -277,7 +347,7 @@ pub async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
 }
 
 use std::sync::Mutex;
-use wacore::types::events::{Event, EventHandler};
+use wacore::types::events::{Event, EventHandler, EventInterest, EventKind};
 
 #[derive(Default)]
 pub struct TestEventCollector {
@@ -349,14 +419,15 @@ pub(crate) async fn create_iq_test_client() -> (
     )
     .await;
 
-    // Wired to the client's stats like the real socket is, so per-frame
-    // bookkeeping is part of what tests observe.
-    let noise_socket = crate::socket::NoiseSocket::with_stats(
+    // Wired to the client's own observers like the real socket is, so per-frame
+    // bookkeeping and sent-frame forwarding are part of what tests observe.
+    let noise_socket = crate::socket::NoiseSocket::with_observers(
         Arc::new(TokioRuntime),
         transport.clone() as Arc<dyn crate::transport::Transport>,
         NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
         NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
-        Some(client.stats.clone()),
+        crate::socket::noise_socket::SendObservers::with_stats(client.stats.clone())
+            .with_sent_frames(client.sent_frame_tap.clone()),
     );
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);
