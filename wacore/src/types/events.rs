@@ -1698,7 +1698,7 @@ pub struct DecryptedPayload {
 }
 
 /// Payload of [`Event::SentFrame`]: one marshaled stanza, exactly as it was
-/// encrypted and written.
+/// handed to the noise frame encryption.
 ///
 /// The send side had no observer at all. [`Event::RawNode`] hands over every
 /// decoded stanza that arrives, but the only thing watching what leaves was a
@@ -1725,6 +1725,11 @@ pub struct SentFrame {
     /// The marshaled stanza, keeping the leading format byte the binary
     /// protocol writes, so decoding it is
     /// `wacore_binary::marshal::unmarshal_ref(&plaintext[1..])`.
+    ///
+    /// Plaintext, as the name says, not a transport frame: the length prefix and
+    /// the AEAD tag are added after this, and only
+    /// [`Client::stats`](crate::stats::SessionStats) accounts for those. Replay
+    /// it as a stanza, not as bytes to put on a socket.
     ///
     /// A `Bytes`, so forwarding it costs a refcount bump rather than a copy.
     ///
