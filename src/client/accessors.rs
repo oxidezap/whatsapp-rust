@@ -492,17 +492,22 @@ impl Client {
     /// Shared so every identity-tagged span leaves a field absent (not `""`) when unknown —
     /// duplicating this per call site would drift out of sync. Skips the snapshot read when
     /// the span is disabled.
+    ///
+    /// Records the JIDs borrowed from the held snapshot rather than through
+    /// [`Self::identity_tags`]: the tags struct renders both into owned `String`s,
+    /// and every send crosses several identity-tagged spans, so the formatting is
+    /// left to the subscriber that may not even want the field.
     #[cfg(feature = "tracing")]
     pub(crate) fn record_identity_on_span(&self, span: &tracing::Span) {
         if span.is_disabled() {
             return;
         }
-        let tags = self.identity_tags();
-        if let Some(lid) = tags.lid {
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        if let Some(lid) = snapshot.lid.as_ref() {
             span.record("lid", tracing::field::display(lid));
         }
-        if let Some(pn) = tags.pn {
-            span.record("pn", tracing::field::display(pn));
+        if let Some(pn) = snapshot.pn.as_ref() {
+            span.record("pn", tracing::field::display(pn.observe()));
         }
     }
 
@@ -768,5 +773,167 @@ mod send_checks {
     #[allow(dead_code)]
     fn resource_report_future_is_send(c: &super::Client) {
         assert_send(&c.resource_report());
+    }
+}
+
+#[cfg(all(test, feature = "tracing"))]
+mod identity_span_tests {
+    use std::sync::Mutex;
+    use wacore::store::commands::DeviceCommand;
+
+    /// Captures what a subscriber would render for the `lid`/`pn` span fields,
+    /// so the recorded values can be asserted without a real fmt layer.
+    #[derive(Default)]
+    struct Captured(Mutex<Vec<(String, String)>>);
+
+    impl tracing::field::Visit for &Captured {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .lock()
+                .expect("capture mutex")
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    /// `None` visits nothing, for the allocation guard below.
+    struct CapturingSubscriber(Option<std::sync::Arc<Captured>>);
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::Id, values: &tracing::span::Record<'_>) {
+            if let Some(captured) = self.0.as_ref() {
+                values.record(&mut &**captured);
+            }
+        }
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
+    fn recorded(captured: &Captured, field: &str) -> Option<String> {
+        captured
+            .0
+            .lock()
+            .expect("capture mutex")
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, value)| value.clone())
+    }
+
+    #[tokio::test]
+    async fn identity_fields_render_lid_raw_and_pn_redacted() {
+        let client = crate::test_utils::create_test_client().await;
+        let pn: wacore_binary::Jid = "551199990000.0:1@s.whatsapp.net".parse().expect("pn");
+        let lid: wacore_binary::Jid = "199990000000000.0:1@lid".parse().expect("lid");
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(pn.clone())))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(lid.clone())))
+            .await;
+
+        let captured = std::sync::Arc::new(Captured::default());
+        let subscriber = CapturingSubscriber(Some(std::sync::Arc::clone(&captured)));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!(
+                "test.identity",
+                lid = tracing::field::Empty,
+                pn = tracing::field::Empty
+            );
+            client.record_identity_on_span(&span);
+        });
+
+        // The recorded values must still match what rendering the JIDs eagerly
+        // produced: LID in full, PN through the redacting wrapper.
+        assert_eq!(
+            recorded(&captured, "lid").as_deref(),
+            Some(lid.to_string().as_str()),
+            "lid field must render the LID in full"
+        );
+        assert_eq!(
+            recorded(&captured, "pn").as_deref(),
+            Some(pn.observe().to_string().as_str()),
+            "pn field must render through the redacting wrapper, not raw"
+        );
+        assert!(
+            !recorded(&captured, "pn")
+                .expect("pn recorded")
+                .contains("551199990000"),
+            "the raw phone number must never reach the span field"
+        );
+    }
+
+    /// Failure shape: an unpaired device leaves both fields absent rather than
+    /// recording an empty string, which is the contract the shared helper exists
+    /// to keep.
+    #[tokio::test]
+    async fn identity_fields_stay_absent_before_pairing() {
+        let client = crate::test_utils::create_test_client().await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(None))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(None))
+            .await;
+
+        let captured = std::sync::Arc::new(Captured::default());
+        let subscriber = CapturingSubscriber(Some(std::sync::Arc::clone(&captured)));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!(
+                "test.identity",
+                lid = tracing::field::Empty,
+                pn = tracing::field::Empty
+            );
+            client.record_identity_on_span(&span);
+        });
+
+        assert_eq!(recorded(&captured, "lid"), None);
+        assert_eq!(recorded(&captured, "pn"), None);
+    }
+
+    /// Locks the reason this helper stopped going through `identity_tags`: on a
+    /// paired client it rendered two owned `String`s per identity-tagged span,
+    /// and a send crosses several of them.
+    #[tokio::test]
+    async fn recording_identity_does_not_heap_allocate() {
+        let client = crate::test_utils::create_test_client().await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(
+                "551199990000.0:1@s.whatsapp.net".parse().expect("pn"),
+            )))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "199990000000000.0:1@lid".parse().expect("lid"),
+            )))
+            .await;
+
+        // A subscriber that enables the span but does not visit the fields: what
+        // this locks is that the crate itself renders nothing, leaving the cost
+        // to whichever layer actually wants the value.
+        let min_delta = tracing::subscriber::with_default(CapturingSubscriber(None), || {
+            let span = tracing::debug_span!(
+                "test.identity",
+                lid = tracing::field::Empty,
+                pn = tracing::field::Empty
+            );
+            crate::test_alloc::min_allocs(0, || client.record_identity_on_span(&span))
+        });
+        assert_eq!(
+            min_delta, 0,
+            "recording identity on a span must not allocate on the crate side"
+        );
     }
 }

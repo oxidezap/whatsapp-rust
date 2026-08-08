@@ -1,16 +1,13 @@
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::marshal::{marshal, unmarshal_ref};
+use wacore_binary::marshal::{marshal, unmarshal_packed_ref, unmarshal_ref};
 
 #[test]
 fn test_simple_node_roundtrip_with_ref() {
     let original_node = NodeBuilder::new("test").build();
 
-    // marshal() adds a leading flag byte (0 for uncompressed)
     let marshaled_with_flag = marshal(&original_node).expect("Marshal failed");
-
-    // unmarshal_ref() expects the data *without* the flag byte.
-    // It returns a borrowed `NodeRef`.
-    let unmarshaled_ref = unmarshal_ref(&marshaled_with_flag[1..]).expect("unmarshal_ref failed");
+    let unmarshaled_ref =
+        unmarshal_packed_ref(&marshaled_with_flag).expect("unmarshal_packed_ref failed");
 
     // Convert the borrowed `NodeRef` back to an owned `Node` for comparison.
     assert_eq!(original_node, unmarshaled_ref.to_owned());
@@ -24,7 +21,8 @@ fn test_node_with_attributes_and_content_with_ref() {
         .build();
 
     let marshaled_with_flag = marshal(&original_node).expect("Marshal failed");
-    let unmarshaled_ref = unmarshal_ref(&marshaled_with_flag[1..]).expect("unmarshal_ref failed");
+    let unmarshaled_ref =
+        unmarshal_packed_ref(&marshaled_with_flag).expect("unmarshal_packed_ref failed");
 
     assert_eq!(original_node, unmarshaled_ref.to_owned());
 }
@@ -36,7 +34,7 @@ fn test_attr_parser_ref_zero_copy_access() {
         .build();
 
     let marshaled_with_flag = marshal(&original_node).expect("Marshal failed");
-    let node_ref = unmarshal_ref(&marshaled_with_flag[1..]).expect("unmarshal_ref failed");
+    let node_ref = unmarshal_packed_ref(&marshaled_with_flag).expect("unmarshal_packed_ref failed");
 
     let mut parser = node_ref.attrs();
     assert_eq!(parser.optional_string("xmlns").as_deref(), Some("test"));
@@ -61,7 +59,8 @@ fn test_node_with_children_with_ref() {
         .build();
 
     let marshaled_with_flag = marshal(&parent_node).expect("Marshal failed");
-    let unmarshaled_ref = unmarshal_ref(&marshaled_with_flag[1..]).expect("unmarshal_ref failed");
+    let unmarshaled_ref =
+        unmarshal_packed_ref(&marshaled_with_flag).expect("unmarshal_packed_ref failed");
 
     assert_eq!(parent_node, unmarshaled_ref.to_owned());
 }

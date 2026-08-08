@@ -223,13 +223,12 @@ async fn test_ack_without_matching_waiter() {
     );
 }
 
-/// Round-trip a built `Node` into the raw-bytes shape `unpack()` produces
-/// from the network (marshal_ref prepends a 0x00 format byte that
-/// `OwnedNodeRef::new` does not expect).
+/// Round-trip a built `Node` into the shape the receive path holds: node bytes,
+/// as `unpack` hands them over once the format byte is off.
 fn to_owned_node(node: &Node) -> OwnedNodeRef {
-    wacore_binary::marshal::marshal_ref(&node.as_node_ref())
-        .and_then(|buf| OwnedNodeRef::new(bytes::Bytes::from(buf).slice(1..)))
-        .expect("valid node")
+    let marshaled = wacore_binary::marshal::marshal_ref(&node.as_node_ref()).expect("valid node");
+    let node_bytes = wacore_binary::util::unpack(&marshaled).expect("packed payload");
+    OwnedNodeRef::new(node_bytes.into_owned()).expect("valid node")
 }
 
 fn owned_ack_node(id: &str) -> OwnedNodeRef {
@@ -397,6 +396,174 @@ async fn test_ack_dispatches_server_ack_event() {
             Event::ServerAck(ack) if ack.id == "ack-evt-3"
         )),
         "Event::ServerAck should fire even when a waiter consumes the ack"
+    );
+}
+
+/// `from` arrives as a JID token, so reading it must take the JID the decoder
+/// already built rather than rendering and re-parsing it. Two things ride on
+/// that: the render is pure churn on every acked message, and it silently drops
+/// the interop `integrator`, which the wire does carry.
+#[tokio::test]
+async fn server_ack_from_preserves_the_wire_jid() {
+    use wacore::types::events::{Event, EventHandler};
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    // An addressed device JID: same value the render-and-reparse produced.
+    let device: Jid = "551199990001:3@s.whatsapp.net".parse().expect("device jid");
+    let ack = NodeBuilder::new("ack")
+        .attr("id", "ack-from-ad")
+        .attr("class", "message")
+        .attr("from", device.clone())
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(a) if a.id == "ack-from-ad" && a.from.as_ref() == Some(&device)
+        )),
+        "an addressed `from` must reach the event unchanged"
+    );
+
+    // A `from` that reached the node as a plain string still parses, so the
+    // switch does not narrow what is accepted.
+    let string_ack = NodeBuilder::new("ack")
+        .attr("id", "ack-from-str")
+        .attr("from", "not-a-phone-user@g.us")
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&string_ack)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(a)
+                if a.id == "ack-from-str"
+                    && a.from.as_ref().is_some_and(|j| j.to_string() == "not-a-phone-user@g.us")
+        )),
+        "a string-form `from` must still parse into the event"
+    );
+}
+
+/// The allocation guard for the same call. `from` reaching the event is not by
+/// itself evidence the display form is gone, since both spellings produce the
+/// same JID for everything our own encoder can emit; the count is.
+///
+/// Baseline three: the event's owned `id` and `class` strings, and the `Arc`
+/// `dispatch` wraps the event in. A user too long to sit inline in its
+/// `CompactString` adds exactly one for that copy, and no more: it is owning the
+/// JID that costs, not rendering it. Re-introducing the render moves both.
+#[tokio::test]
+async fn server_ack_event_build_does_not_render_the_from_jid() {
+    use wacore::types::events::EventHandler;
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    // Both arrive as JID tokens, which is how `from` comes off the wire: that is
+    // the case where rendering it costs a String the parse then throws away. The
+    // long one is a legacy group id, whose `<creator>-<timestamp>` user is the
+    // real shape that outgrows the inline buffer.
+    let ack_with_from = |from: Jid| {
+        let node = Arc::new(to_owned_node(
+            &NodeBuilder::new("ack")
+                .attr("class", "message")
+                .attr("from", from)
+                .attr("id", "3EB0A1B2C3D4E5F60718")
+                .attr("t", "1758000000")
+                .build(),
+        ));
+        assert!(
+            node.get()
+                .get_attr("from")
+                .is_some_and(|v| v.as_jid().is_some()),
+            "the fixture must reach the handler as a JID token, not a string"
+        );
+        node
+    };
+
+    let inline_user = ack_with_from("551199990001@s.whatsapp.net".parse().expect("jid"));
+    let heap_user = ack_with_from("5511999988887-1600000000123456@g.us".parse().expect("jid"));
+
+    let inline_delta = crate::test_alloc::min_allocs(3, || {
+        assert!(!client.handle_ack_response_arc(&inline_user));
+    });
+    assert_eq!(
+        inline_delta, 3,
+        "the ServerAck build must allocate only its two owned strings and the event Arc"
+    );
+
+    let heap_delta = crate::test_alloc::min_allocs(4, || {
+        assert!(!client.handle_ack_response_arc(&heap_user));
+    });
+    assert_eq!(
+        heap_delta,
+        inline_delta + 1,
+        "a heap-backed JID user must cost its own copy and nothing else"
+    );
+}
+
+/// The other half of the reason `from` stopped going through the display form:
+/// an interop JID's `integrator` is carried on the wire but is not part of the
+/// rendered JID, so rendering and re-parsing silently dropped it.
+#[test]
+fn jid_attr_display_round_trip_drops_the_interop_integrator() {
+    use wacore_binary::node::{NodeStr, ValueRef};
+    use wacore_binary::{JidRef, Server};
+
+    let value = ValueRef::Jid(JidRef {
+        user: NodeStr::Borrowed("551199990002"),
+        server: Server::Interop,
+        agent: 0,
+        device: 1,
+        integrator: 7,
+    });
+
+    let via_display: Option<Jid> = value.as_str().parse().ok();
+    assert_eq!(
+        via_display.map(|j| j.integrator),
+        Some(0),
+        "the display form carries no integrator, which is what the old path lost"
+    );
+    assert_eq!(
+        value.to_jid().map(|j| j.integrator),
+        Some(7),
+        "to_jid takes the decoded JID as-is"
+    );
+}
+
+/// Failure shape: a `from` that is not a JID still yields `None` rather than a
+/// partially-parsed value, and the ack is otherwise handled as before.
+#[tokio::test]
+async fn server_ack_from_stays_none_for_a_malformed_jid() {
+    use wacore::types::events::{Event, EventHandler};
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    let ack = NodeBuilder::new("ack")
+        .attr("id", "ack-from-bad")
+        .attr("class", "message")
+        .attr("from", "not a jid at all")
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(a)
+                if a.id == "ack-from-bad"
+                    && a.from.is_none()
+                    && a.class.as_deref() == Some("message")
+        )),
+        "an unparseable `from` must land as None without disturbing the rest"
     );
 }
 
@@ -2519,10 +2686,8 @@ fn test_encode_ack_bytes_roundtrip_recipient() {
         AckParticipantPolicy::Preserve,
     )
     .expect("encode_ack_bytes should produce bytes");
-    // The Encoder prepends a leading format byte (see `marshal`); the
-    // decoder wants raw protocol bytes — same handling as `node_to_owned_ref`.
     let decoded =
-        wacore_binary::marshal::unmarshal_ref(&buf[1..]).expect("encoded ack should decode");
+        wacore_binary::marshal::unmarshal_packed_ref(&buf).expect("encoded ack should decode");
     assert_eq!(decoded.tag, "ack");
     assert!(
         decoded
@@ -2556,7 +2721,7 @@ fn test_encode_ack_bytes_roundtrip_recipient() {
     )
     .expect("encode_ack_bytes should produce bytes");
     let decoded =
-        wacore_binary::marshal::unmarshal_ref(&buf[1..]).expect("encoded ack should decode");
+        wacore_binary::marshal::unmarshal_packed_ref(&buf).expect("encoded ack should decode");
     assert!(
         decoded.get_attr("recipient").is_none(),
         "encode_ack_bytes must not synthesise `recipient` when absent"
@@ -2644,7 +2809,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         AckParticipantPolicy::OmitReceiptDestinationDuplicate,
     )
     .expect("complete receipt should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded receipt ack should decode");
 
     assert!(
@@ -2672,7 +2837,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         AckParticipantPolicy::OmitReceiptDestinationDuplicate,
     )
     .expect("group receipt should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded group receipt ack should decode");
     assert!(
         ack.get_attr("participant")
@@ -2691,7 +2856,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         AckParticipantPolicy::Preserve,
     )
     .expect("complete message should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded message ack should decode");
     assert!(
         ack.get_attr("participant")
@@ -2726,7 +2891,7 @@ fn test_encode_ack_bytes_compares_jid_participants_by_display() {
         AckParticipantPolicy::OmitReceiptDestinationDuplicate,
     )
     .expect("complete receipt should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded receipt ack should decode");
 
     assert!(
@@ -2749,7 +2914,7 @@ fn test_encode_ack_bytes_drops_encrypt_identity_notification_type() {
         AckParticipantPolicy::Preserve,
     )
     .expect("complete notification should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded notification ack should decode");
 
     assert!(
@@ -2769,8 +2934,8 @@ fn test_encode_ack_bytes_preserves_call_class_and_type() {
         .build();
     let bytes = encode_ack_bytes(&call.as_node_ref(), None, AckParticipantPolicy::Preserve)
         .expect("complete call should produce an ack");
-    let ack =
-        wacore_binary::marshal::unmarshal_ref(&bytes[1..]).expect("encoded call ack should decode");
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
+        .expect("encoded call ack should decode");
 
     assert!(
         ack.get_attr("class")
@@ -5396,4 +5561,92 @@ async fn a_handle_outliving_its_client_does_not_keep_it_alive() {
         handle
     };
     drop(handle);
+}
+
+/// A stanza that arrived can be sent back out as it stands: pack what the
+/// decoder holds and the bytes reaching the transport are the ones the marshal
+/// produced, no re-encode involved. This is the round trip a forwarding or
+/// replay consumer performs, asserted at the point the frame leaves.
+#[tokio::test]
+async fn a_received_stanza_forwards_as_the_bytes_it_arrived_as() {
+    use wacore::handshake::NoiseCipher;
+
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+    let node = NodeBuilder::new("message")
+        .attr("to", "15551234567@s.whatsapp.net")
+        .attr("id", "FORWARD-1")
+        .children([NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .bytes(vec![0xAB; 64])
+            .build()])
+        .build();
+    let marshaled = wacore_binary::marshal::marshal(&node).expect("marshal");
+    let received = to_owned_node(&node);
+
+    client
+        .send_raw_bytes(wacore_binary::util::pack(&received.backing_bytes()))
+        .await
+        .expect("installed socket");
+
+    crate::test_utils::poll_until("the forwarded frame to reach the transport", || {
+        !transport.sent().is_empty()
+    })
+    .await;
+    let cipher = NoiseCipher::new(&[0u8; 32]).expect("32-byte key");
+    let mut sent = transport.sent()[0][3..].to_vec();
+    cipher
+        .decrypt_in_place_with_counter(0, &mut sent)
+        .expect("captured frame should decrypt");
+
+    assert_eq!(
+        sent, marshaled,
+        "the forwarded frame must carry the original marshal output"
+    );
+}
+
+/// The other half: node bytes handed to the send path are refused here rather
+/// than accepted and answered by the server closing the connection.
+#[tokio::test]
+async fn send_raw_bytes_refuses_a_payload_without_its_format_byte() {
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+    let node = NodeBuilder::new("iq").attr("id", "REJECT-1").build();
+    let node_bytes = to_owned_node(&node).backing_bytes().to_vec();
+
+    let error = client
+        .send_raw_bytes(node_bytes.clone())
+        .await
+        .expect_err("node bytes are not a packed payload");
+    assert!(
+        matches!(
+            error,
+            ClientError::Socket(SocketError::Marshal(
+                wacore_binary::BinaryError::UnexpectedFormatByte(byte)
+            )) if byte == node_bytes[0]
+        ),
+        "unexpected error: {error:?}"
+    );
+    for empty in [Vec::new(), vec![wacore_binary::util::FORMAT_PLAIN]] {
+        assert!(
+            matches!(
+                client.send_raw_bytes(empty).await,
+                Err(ClientError::Socket(SocketError::Marshal(
+                    wacore_binary::BinaryError::EmptyData
+                )))
+            ),
+            "a payload with no stanza in it carries nothing to send"
+        );
+    }
+    assert!(
+        transport.sent().is_empty(),
+        "a refused payload must not reach the transport"
+    );
+
+    // The same stanza, packed, goes out.
+    client
+        .send_raw_bytes(wacore_binary::util::pack(&node_bytes))
+        .await
+        .expect("installed socket");
+    assert_eq!(transport.sent().len(), 1);
 }

@@ -3,15 +3,12 @@ use std::sync::Arc;
 use crate::Client;
 use wacore_binary::{Jid, Node, OwnedNodeRef};
 
-/// Marshal a `Node` into an `Arc<OwnedNodeRef>` for use in tests.
+/// Marshal a `Node` into an `Arc<OwnedNodeRef>` for use in tests, through the
+/// same unpack step the receive path takes.
 pub fn node_to_owned_ref(node: &Node) -> Arc<OwnedNodeRef> {
-    let bytes = wacore_binary::marshal::marshal(node).expect("marshal should succeed");
-    // marshal() prepends a leading format byte; OwnedNodeRef::new expects raw protocol bytes
-    {
-        let mut bytes = bytes;
-        bytes.remove(0);
-        Arc::new(OwnedNodeRef::new(bytes).expect("OwnedNodeRef::new should succeed"))
-    }
+    let packed = wacore_binary::marshal::marshal(node).expect("marshal should succeed");
+    let node_bytes = wacore_binary::util::unpack(&packed).expect("packed payload");
+    Arc::new(OwnedNodeRef::new(node_bytes.into_owned()).expect("OwnedNodeRef::new should succeed"))
 }
 
 pub async fn wait_for_lock_waiter(lock: &Arc<async_lock::Mutex<()>>, baseline: usize) {
@@ -371,8 +368,9 @@ pub(crate) async fn decode_sent_iq(
     cipher
         .decrypt_in_place_with_counter(index as u32, &mut buf)
         .expect("captured frame should decrypt");
-    // The decrypted payload keeps marshal()'s leading format byte.
-    Arc::new(OwnedNodeRef::new(buf[1..].to_vec()).expect("captured frame should decode"))
+    // The decrypted payload is a packed payload, exactly as the read loop sees it.
+    let node_bytes = wacore_binary::util::unpack(&buf).expect("captured frame should unpack");
+    Arc::new(OwnedNodeRef::new(node_bytes.into_owned()).expect("captured frame should decode"))
 }
 
 /// Deliver `response` to the pending IQ waiter registered under `request_id`.

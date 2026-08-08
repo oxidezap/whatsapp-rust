@@ -519,7 +519,7 @@ impl Client {
         // Simple receipt: collect `<list><item id=.../>` items plus the stanza
         // id (for non-view receipts), matching the JS p() branch.
         let message_ids =
-            wacore::stanza::receipt::collect_simple_message_ids(nr, &stanza_id, is_view);
+            wacore::stanza::receipt::collect_simple_message_ids(nr, stanza_id, is_view);
 
         debug!(
             "Received receipt type '{receipt_type:?}' for {} message(s) from {}",
@@ -2085,6 +2085,58 @@ mod tests {
         assert_eq!(receipt_events[0].message_ids, vec!["3EB0AABBCCDD"]);
     }
 
+    /// The ordinary listless delivery receipt: its stanza id is the single
+    /// entry in `message_ids`, and the id string is moved into that vector
+    /// rather than copied into it.
+    #[tokio::test]
+    async fn simple_delivery_receipt_carries_only_its_stanza_id() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        let node = node_to_arc(
+            NodeBuilder::new("receipt")
+                .attr("from", "5511999999999@s.whatsapp.net")
+                .attr("id", "3EB0A1B2C3D4E5F60718")
+                .attr("t", "1758000000")
+                .build(),
+        );
+        client.handle_receipt(node).await;
+
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &**e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(receipts.len(), 1, "one receipt event");
+        assert_eq!(receipts[0].message_ids, vec!["3EB0A1B2C3D4E5F60718"]);
+        assert_eq!(receipts[0].r#type, ReceiptType::Delivered);
+    }
+
+    /// Failure shape: a receipt with no `id` is still dropped without an event,
+    /// which is what the id string being consumed downstream must not change.
+    #[tokio::test]
+    async fn receipt_without_an_id_dispatches_nothing() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        let node = node_to_arc(
+            NodeBuilder::new("receipt")
+                .attr("from", "5511999999999@s.whatsapp.net")
+                .attr("t", "1758000000")
+                .build(),
+        );
+        client.handle_receipt(node).await;
+
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::Receipt(_))),
+            "an id-less receipt must not reach consumers"
+        );
+    }
+
     /// Verify that enc_rekey_retry without <enc_rekey> child still dispatches
     /// the Receipt event (graceful degradation, no crash).
     #[tokio::test]
@@ -2784,7 +2836,11 @@ mod tests {
         // The shape must round-trip through our own ingest parser (the same
         // form WA Web sends us): list items first, stanza id appended last.
         let owned = node_to_arc(node.clone());
-        let parsed = wacore::stanza::receipt::collect_simple_message_ids(owned.get(), "M1", false);
+        let parsed = wacore::stanza::receipt::collect_simple_message_ids(
+            owned.get(),
+            "M1".to_string(),
+            false,
+        );
         assert_eq!(
             parsed,
             vec!["M2".to_string(), "M3".to_string(), "M1".to_string()]
