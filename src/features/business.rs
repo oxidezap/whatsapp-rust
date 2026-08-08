@@ -178,6 +178,12 @@ pub struct Product {
     pub name: Option<String>,
     pub description: Option<String>,
     pub url: Option<String>,
+    /// The link-shimmed form of `url`, sent alongside it rather than instead of
+    /// it. Both are surfaced as received: which one to open is a policy call
+    /// (the shim adds interstitial handling), and WhatsApp Web picks per
+    /// surface, so choosing one here would bake in a preference the wire does
+    /// not express.
+    pub shimmed_url: Option<String>,
     pub price: Option<Price>,
     pub sale_price: Option<SalePrice>,
     /// Hidden products stay in the catalog but are not shown to customers.
@@ -236,6 +242,14 @@ pub struct Catalog {
 pub struct Collection {
     pub id: Option<String>,
     pub name: Option<String>,
+    /// The first [`CollectionOptions::item_limit`] products, inline.
+    ///
+    /// **This list can be truncated and says so only by its length.** The
+    /// collections query returns a prefix and carries no per-collection cursor,
+    /// so `products.len() == item_limit` is the signal that more may exist.
+    /// Reading a collection to the end needs a different operation —
+    /// `WAWebQueryProductSingleCollectionQuery`, which takes its own `after`
+    /// cursor and is vendored but not yet wired up here.
     pub products: Vec<Product>,
     pub review_status: Option<String>,
     /// Whether a rejected collection can still be appealed.
@@ -677,6 +691,7 @@ fn parse_product(value: &Value, operation: &'static str) -> Result<Product, Busi
         name: opt_str(&value["name"]),
         description: opt_str(&value["description"]),
         url: opt_str(&value["url"]),
+        shimmed_url: opt_str(&value["shimmed_url"]),
         price: parse_price(&value["price"], currency.as_deref()),
         sale_price,
         is_hidden: opt_bool(&value["is_hidden"]),
@@ -1597,6 +1612,31 @@ mod tests {
         }));
         assert_eq!(both.start_date.as_deref(), Some("1700000000"));
         assert_eq!(both.end_date.as_deref(), Some("1700600000"));
+    }
+
+    /// `shimmed_url` is sent alongside `url`, not instead of it, and arrives
+    /// with no opt-in — so dropping it lost a server-provided link.
+    #[test]
+    fn products_keep_both_url_forms() {
+        let product = &parse_catalog(&json!({
+            "xwa_product_catalog_get_product_catalog": { "product_catalog": { "products": [{
+                "id": "1000000000000001",
+                "url": "https://shop.example.invalid/red-notebook",
+                "shimmed_url": "https://l.example.invalid/?u=red-notebook"
+            }] } }
+        }))
+        .unwrap()
+        .products
+        .swap_remove(0);
+
+        assert_eq!(
+            product.url.as_deref(),
+            Some("https://shop.example.invalid/red-notebook")
+        );
+        assert_eq!(
+            product.shimmed_url.as_deref(),
+            Some("https://l.example.invalid/?u=red-notebook")
+        );
     }
 
     #[test]
