@@ -591,20 +591,15 @@ fn parse_variant_properties(
             "variant_info is not an object",
         ));
     }
-    let properties = &variant_info["variant_properties"];
-    if properties.is_null() {
-        return Ok(Vec::new());
-    }
-    let properties = properties.as_array().ok_or_else(|| {
-        BusinessError::malformed(operation, "variant_info.variant_properties is not an array")
-    })?;
-    Ok(properties
-        .iter()
-        .map(|property| VariantProperty {
-            name: opt_str(&property["name"]),
-            value: opt_str(&property["value"]),
-        })
-        .collect())
+    Ok(
+        object_entries(operation, variant_info, "variant_properties")?
+            .into_iter()
+            .map(|property| VariantProperty {
+                name: opt_str(&property["name"]),
+                value: opt_str(&property["value"]),
+            })
+            .collect(),
+    )
 }
 
 fn opt_i64(value: &Value) -> Option<i64> {
@@ -616,36 +611,32 @@ fn opt_i64(value: &Value) -> Option<i64> {
     }
 }
 
-fn parse_images(media: &Value) -> Vec<ProductImage> {
-    media["images"]
-        .as_array()
-        .map(|images| {
-            images
-                .iter()
-                .map(|image| ProductImage {
-                    id: opt_str(&image["id"]),
-                    request_image_url: opt_str(&image["request_image_url"]),
-                    original_image_url: opt_str(&image["original_image_url"]),
-                })
-                .collect()
+fn parse_images(
+    operation: &'static str,
+    media: &Value,
+) -> Result<Vec<ProductImage>, BusinessError> {
+    Ok(object_entries(operation, media, "images")?
+        .into_iter()
+        .map(|image| ProductImage {
+            id: opt_str(&image["id"]),
+            request_image_url: opt_str(&image["request_image_url"]),
+            original_image_url: opt_str(&image["original_image_url"]),
         })
-        .unwrap_or_default()
+        .collect())
 }
 
-fn parse_videos(media: &Value) -> Vec<ProductVideo> {
-    media["videos"]
-        .as_array()
-        .map(|videos| {
-            videos
-                .iter()
-                .map(|video| ProductVideo {
-                    id: opt_str(&video["id"]),
-                    original_video_url: opt_str(&video["original_video_url"]),
-                    thumbnail_url: opt_str(&video["thumbnail_url"]),
-                })
-                .collect()
+fn parse_videos(
+    operation: &'static str,
+    media: &Value,
+) -> Result<Vec<ProductVideo>, BusinessError> {
+    Ok(object_entries(operation, media, "videos")?
+        .into_iter()
+        .map(|video| ProductVideo {
+            id: opt_str(&video["id"]),
+            original_video_url: opt_str(&video["original_video_url"]),
+            thumbnail_url: opt_str(&video["thumbnail_url"]),
         })
-        .unwrap_or_default()
+        .collect())
 }
 
 fn parse_product(value: &Value, operation: &'static str) -> Result<Product, BusinessError> {
@@ -656,8 +647,10 @@ fn parse_product(value: &Value, operation: &'static str) -> Result<Product, Busi
         .ok_or_else(|| BusinessError::malformed(operation, "product entry has no id"))?;
 
     let currency = opt_str(&value["currency"]);
-    let compliance = &value["compliance_info"];
-    let sale = &value["sale_price"];
+    let compliance = object(operation, value, "compliance_info")?;
+    let status = object(operation, value, "status_info")?;
+    let media = object(operation, value, "media")?;
+    let sale = object(operation, value, "sale_price")?;
     let sale_price = parse_price(&sale["price"], currency.as_deref()).map(|price| SalePrice {
         price,
         start_date: opt_str(&sale["start_date"]),
@@ -677,21 +670,71 @@ fn parse_product(value: &Value, operation: &'static str) -> Result<Product, Busi
         max_available: opt_i64(&value["max_available"]),
         availability: opt_str(&value["product_availability"])
             .map(|a| ProductAvailability::from(a.as_str())),
-        review_status: opt_str(&value["status_info"]["status"]),
-        can_appeal: opt_bool(&value["status_info"]["can_appeal"]),
+        review_status: opt_str(&status["status"]),
+        can_appeal: opt_bool(&status["can_appeal"]),
         belongs_to: opt_bool(&value["belongs_to"]),
-        images: parse_images(&value["media"]),
-        videos: parse_videos(&value["media"]),
+        images: parse_images(operation, media)?,
+        videos: parse_videos(operation, media)?,
         compliance_category: opt_str(&value["compliance_category"]),
         country_code_origin: opt_str(&compliance["country_code_origin"]),
         importer_name: opt_str(&compliance["importer_name"]),
-        importer_address: parse_importer_address(&compliance["importer_address"]),
+        importer_address: parse_importer_address(object(
+            operation,
+            compliance,
+            "importer_address",
+        )?)?,
     })
 }
 
-/// Reads `compliance_info.importer_address`. Absent, or present with every part
-/// missing, is `None` — an address with nothing in it is not an address.
-fn parse_importer_address(value: &Value) -> Option<ImporterAddress> {
+/// A nested object, borrowed for reading.
+///
+/// Absent is fine and reads as an object with nothing in it; a *present*
+/// non-object is not. This distinction has to be drawn explicitly everywhere,
+/// because indexing a scalar yields `Null` for every child — so without the
+/// check, malformed data is indistinguishable from absent data and degrades
+/// into plausible-looking empty values instead of an error.
+fn object<'a>(
+    operation: &'static str,
+    parent: &'a Value,
+    field: &'static str,
+) -> Result<&'a Value, BusinessError> {
+    let value = &parent[field];
+    if value.is_null() || value.is_object() {
+        Ok(value)
+    } else {
+        Err(BusinessError::malformed(
+            operation,
+            format!("{field} is not an object"),
+        ))
+    }
+}
+
+/// The entries of an array of objects. Absent is an empty list; a present
+/// non-array, or an entry that is not an object, is malformed.
+fn object_entries<'a>(
+    operation: &'static str,
+    parent: &'a Value,
+    field: &'static str,
+) -> Result<Vec<&'a Value>, BusinessError> {
+    let value = &parent[field];
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let entries = value
+        .as_array()
+        .ok_or_else(|| BusinessError::malformed(operation, format!("{field} is not an array")))?;
+    if entries.iter().any(|entry| !entry.is_object()) {
+        return Err(BusinessError::malformed(
+            operation,
+            format!("{field} has an entry that is not an object"),
+        ));
+    }
+    Ok(entries.iter().collect())
+}
+
+/// Reads `compliance_info.importer_address`. Present with every part missing is
+/// `None` — an address with nothing in it is not an address.
+fn parse_importer_address(value: &Value) -> Result<Option<ImporterAddress>, BusinessError> {
     let address = ImporterAddress {
         street1: opt_str(&value["street1"]),
         street2: opt_str(&value["street2"]),
@@ -706,7 +749,7 @@ fn parse_importer_address(value: &Value) -> Option<ImporterAddress> {
         && address.region.is_none()
         && address.postal_code.is_none()
         && address.country_code.is_none();
-    (!empty).then_some(address)
+    Ok((!empty).then_some(address))
 }
 
 fn parse_catalog(data: &Value) -> Result<Catalog, BusinessError> {
@@ -727,10 +770,14 @@ fn parse_catalog(data: &Value) -> Result<Catalog, BusinessError> {
         .map(|p| parse_product(p, OP))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // A malformed paging object would otherwise read as "no more pages" and
+    // silently truncate the catalog at whatever page it appeared on.
+    let paging = object(OP, catalog, "paging")?;
+
     Ok(Catalog {
         products,
-        after_cursor: opt_str(&catalog["paging"]["after"]),
-        before_cursor: opt_str(&catalog["paging"]["before"]),
+        after_cursor: opt_str(&paging["after"]),
+        before_cursor: opt_str(&paging["before"]),
     })
 }
 
@@ -775,7 +822,7 @@ fn parse_collections(data: &Value) -> Result<Collections, BusinessError> {
                 }
             };
 
-            let status = &collection["status_info"];
+            let status = object(OP, collection, "status_info")?;
             Ok(Collection {
                 id: opt_str(&collection["id"]),
                 name: opt_str(&collection["name"]),
@@ -790,7 +837,7 @@ fn parse_collections(data: &Value) -> Result<Collections, BusinessError> {
 
     Ok(Collections {
         collections,
-        after_cursor: opt_str(&root["paging"]["after"]),
+        after_cursor: opt_str(&object(OP, root, "paging")?["after"]),
     })
 }
 
@@ -822,13 +869,16 @@ fn parse_order(data: &Value) -> Result<Order, BusinessError> {
                 name: opt_str(&product["name"]),
                 price: parse_price(&product["price"], currency.as_deref()),
                 quantity: opt_i64(&product["quantity"]),
-                images: parse_images(&product["media"]),
-                variant_properties: parse_variant_properties(OP, &product["variant_info"])?,
+                images: parse_images(OP, object(OP, product, "media")?)?,
+                variant_properties: parse_variant_properties(
+                    OP,
+                    object(OP, product, "variant_info")?,
+                )?,
             })
         })
         .collect::<Result<Vec<_>, BusinessError>>()?;
 
-    let details = &order["price_details"];
+    let details = object(OP, order, "price_details")?;
     let price_details = details.is_object().then(|| {
         let currency = opt_str(&details["currency"]);
         OrderPriceDetails {
@@ -1012,6 +1062,20 @@ mod tests {
         assert_eq!(product.country_code_origin.as_deref(), Some("BR"));
         assert_eq!(product.importer_name, None);
         assert_eq!(product.importer_address, None);
+
+        // A non-object address indexes to Null on every part, so without its own
+        // check it would be indistinguishable from a product with no importer.
+        assert!(
+            parse_catalog(&json!({
+                "xwa_product_catalog_get_product_catalog": {
+                    "product_catalog": { "products": [{
+                        "id": "1000000000000001",
+                        "compliance_info": { "importer_address": "nope" }
+                    }] }
+                }
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1415,6 +1479,47 @@ mod tests {
                 "xwa_checkout_get_order_info": { "order": { "products": ["not-an-object"] } }
             }))
             .is_err()
+        );
+    }
+
+    /// Every nested object in a response is guarded the same way, because
+    /// indexing a scalar yields Null for each child — so a malformed object
+    /// would otherwise be indistinguishable from an absent one and degrade into
+    /// plausible empty values. The paging and price cases are the ones that
+    /// silently lose data: a bad `paging` truncates the catalog at that page,
+    /// and a bad `price_details` returns an order with no totals.
+    #[test]
+    fn malformed_nested_objects_are_errors() {
+        let catalog = |body| {
+            parse_catalog(&json!({
+                "xwa_product_catalog_get_product_catalog": { "product_catalog": body }
+            }))
+        };
+        assert!(catalog(json!({ "products": [], "paging": "nope" })).is_err());
+        assert!(catalog(json!({ "products": [{ "id": "1", "media": "nope" }] })).is_err());
+        assert!(catalog(json!({ "products": [{ "id": "1", "status_info": 7 }] })).is_err());
+        assert!(catalog(json!({ "products": [{ "id": "1", "compliance_info": [] }] })).is_err());
+        assert!(
+            catalog(json!({ "products": [{ "id": "1", "media": { "images": ["x"] } }] })).is_err()
+        );
+
+        // Absent stays absent — the guard must not turn a missing object into
+        // an error.
+        assert!(catalog(json!({ "products": [{ "id": "1" }] })).is_ok());
+
+        assert!(
+            parse_collections(&json!({
+                "xwa_product_catalog_get_collections": { "collections": [], "paging": 3 }
+            }))
+            .is_err()
+        );
+
+        let order =
+            |body| parse_order(&json!({ "xwa_checkout_get_order_info": { "order": body } }));
+        assert!(order(json!({ "products": [], "price_details": "nope" })).is_err());
+        assert!(
+            order(json!({ "products": [{ "variant_info": { "variant_properties": [1] } }] }))
+                .is_err()
         );
     }
 
