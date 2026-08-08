@@ -1229,6 +1229,9 @@ mod tests {
 
         const BIG: usize = OUT_BUF_IDLE_CAPACITY + 1;
         const SMALL: usize = 64;
+        /// A capacity a burst plausibly grew the buffer to, tied to the
+        /// threshold so it cannot drift under it.
+        const GROWN_CAPACITY: usize = OUT_BUF_IDLE_CAPACITY * 16;
 
         /// Drives `count` small batches and returns how many asked for a release.
         fn quiet(count: usize, capacity: usize, grown: &mut bool, small: &mut usize) -> usize {
@@ -1279,7 +1282,7 @@ mod tests {
             let (mut grown, mut small) = (false, 0);
             assert!(!should_release_batch_buffer(
                 0,
-                64 * 1024,
+                GROWN_CAPACITY,
                 &mut grown,
                 &mut small
             ));
@@ -1288,7 +1291,7 @@ mod tests {
             assert_eq!(
                 quiet(
                     SMALL_BATCHES_BEFORE_SHRINK - 1,
-                    64 * 1024,
+                    GROWN_CAPACITY,
                     &mut grown,
                     &mut small
                 ),
@@ -1296,7 +1299,7 @@ mod tests {
             );
             assert!(should_release_batch_buffer(
                 SMALL,
-                64 * 1024,
+                GROWN_CAPACITY,
                 &mut grown,
                 &mut small
             ));
