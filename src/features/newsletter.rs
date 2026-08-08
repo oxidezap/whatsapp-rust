@@ -11,8 +11,10 @@ use crate::features::mex::{MexError, mex_request};
 use crate::request::IqError;
 use thiserror::Error;
 use wacore::iq::mex_operations::{
-    create_newsletter, fetch_all_newsletters_metadata, fetch_newsletter, join_newsletter,
-    leave_newsletter, update_newsletter, update_newsletter_user_setting,
+    change_newsletter_owner, create_newsletter, delete_newsletter, demote_newsletter_admin,
+    fetch_all_newsletters_metadata, fetch_newsletter, fetch_newsletter_admin_info,
+    fetch_newsletter_followers, join_newsletter, leave_newsletter, update_newsletter,
+    update_newsletter_user_setting,
 };
 use wacore::iq::newsletter::NEWSLETTER_XMLNS;
 use wacore::request::InfoQuery;
@@ -125,6 +127,48 @@ pub struct NewsletterMetadata {
     pub invite_code: Option<String>,
     pub role: Option<NewsletterRole>,
     pub creation_time: Option<u64>,
+}
+
+/// An admin's public profile within a newsletter.
+///
+/// `id` is the profile's own identifier, not a JID: the server hands it back as
+/// an opaque string and WA Web never parses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewsletterAdminProfile {
+    pub id: Option<String>,
+    pub name: String,
+    pub picture_id: Option<String>,
+    pub picture_direct_path: Option<String>,
+}
+
+/// Admin-side information about a newsletter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewsletterAdminInfo {
+    /// How many admins the newsletter has. The server only answers this for
+    /// admins and owners, so it is absent for everyone else.
+    pub admin_count: Option<u32>,
+    /// The viewer's own admin profile, present once they have set one up.
+    pub admin_profile: Option<NewsletterAdminProfile>,
+    /// Whether admin profiles are enabled for this newsletter.
+    pub admin_profiles_enabled: Option<bool>,
+}
+
+/// A follower (subscriber) of a newsletter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewsletterFollower {
+    /// The follower's identity JID — a LID on accounts that have migrated.
+    pub jid: Jid,
+    /// The follower's phone-number JID, withheld by the server when the
+    /// follower's privacy settings hide it.
+    pub phone_jid: Option<Jid>,
+    pub display_name: Option<String>,
+    pub username: Option<String>,
+    /// The follower's role in the newsletter.
+    pub role: Option<NewsletterRole>,
+    /// When the follower subscribed (Unix seconds).
+    pub follow_time: Option<u64>,
+    /// Set when the follower is an admin who published a profile.
+    pub admin_profile: Option<NewsletterAdminProfile>,
 }
 
 /// A reaction count on a newsletter message.
@@ -317,17 +361,144 @@ impl<'a> Newsletter<'a> {
             }))
             .await?;
 
-        let data = response
-            .data
-            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
-        let newsletter = &data["xwa2_newsletter_update"];
-        if newsletter.is_null() {
-            return Err(NewsletterError::InvalidRequest(format!(
-                "failed to update newsletter: {}",
-                jid
-            )));
-        }
-        parse_newsletter_metadata(newsletter)
+        let newsletter = take_data_field(response.data, "xwa2_newsletter_update")?;
+        parse_newsletter_metadata(&newsletter)
+    }
+
+    /// Replace a newsletter's picture with `jpeg`.
+    ///
+    /// Carried by the same mutation as [`Newsletter::update`] — WA Web edits the
+    /// picture through `updates.picture`, base64-encoded — so the response is the
+    /// newsletter's refreshed metadata.
+    pub async fn set_picture(
+        &self,
+        jid: &Jid,
+        jpeg: &[u8],
+    ) -> Result<NewsletterMetadata, NewsletterError> {
+        self.update_picture(jid, Some(jpeg)).await
+    }
+
+    /// Remove a newsletter's picture.
+    pub async fn remove_picture(&self, jid: &Jid) -> Result<NewsletterMetadata, NewsletterError> {
+        self.update_picture(jid, None).await
+    }
+
+    async fn update_picture(
+        &self,
+        jid: &Jid,
+        jpeg: Option<&[u8]>,
+    ) -> Result<NewsletterMetadata, NewsletterError> {
+        let response = self
+            .client
+            .mex()
+            .mutate(mex_request!(
+                update_newsletter,
+                picture_update_variables(jid, jpeg)
+            ))
+            .await?;
+
+        let newsletter = take_data_field(response.data, "xwa2_newsletter_update")?;
+        parse_newsletter_metadata(&newsletter)
+    }
+
+    /// Delete a newsletter. Owner-only.
+    pub async fn delete(&self, jid: &Jid) -> Result<(), NewsletterError> {
+        let response = self
+            .client
+            .mex()
+            .mutate(mex_request!(delete_newsletter, delete_variables(jid)))
+            .await?;
+
+        take_data_field(response.data, "xwa2_newsletter_delete_v2")?;
+        Ok(())
+    }
+
+    /// Transfer a newsletter's ownership to `user`. Owner-only.
+    ///
+    /// `user` may be a LID or a phone-number JID; the latter is resolved to its
+    /// LID first, since that is the only form the server addresses admins by.
+    pub async fn change_owner(&self, jid: &Jid, user: &Jid) -> Result<(), NewsletterError> {
+        let user = self.resolve_admin_target(user).await?;
+        let response = self
+            .client
+            .mex()
+            .mutate(mex_request!(
+                change_newsletter_owner,
+                change_owner_variables(jid, &user)
+            ))
+            .await?;
+
+        take_data_field(response.data, "xwa2_newsletter_change_owner")?;
+        Ok(())
+    }
+
+    /// Demote an admin of a newsletter back to subscriber. Owner-only.
+    ///
+    /// Same LID resolution as [`Newsletter::change_owner`].
+    pub async fn demote_admin(&self, jid: &Jid, user: &Jid) -> Result<(), NewsletterError> {
+        let user = self.resolve_admin_target(user).await?;
+        let response = self
+            .client
+            .mex()
+            .mutate(mex_request!(
+                demote_newsletter_admin,
+                demote_admin_variables(jid, &user)
+            ))
+            .await?;
+
+        take_data_field(response.data, "xwa2_newsletter_admin_demote")?;
+        Ok(())
+    }
+
+    /// Mirror of WA Web's `toUserLidOrThrow`: the admin mutations refuse a target
+    /// that has no known LID rather than sending a PN the server cannot address.
+    async fn resolve_admin_target(&self, user: &Jid) -> Result<Jid, NewsletterError> {
+        self.client
+            .resolve_recipient_to_lid(user)
+            .await
+            .ok_or_else(|| {
+                NewsletterError::InvalidRequest(format!("no known LID for newsletter admin {user}"))
+            })
+    }
+
+    /// Fetch a newsletter's admin-side information, including its admin count.
+    ///
+    /// The admin count has no query of its own: it rides along with the admin
+    /// profile and the admin-profiles setting in this one response.
+    pub async fn get_admin_info(&self, jid: &Jid) -> Result<NewsletterAdminInfo, NewsletterError> {
+        let response = self
+            .client
+            .mex()
+            .query(mex_request!(
+                fetch_newsletter_admin_info,
+                admin_info_variables(jid)
+            ))
+            .await?;
+
+        let admin = take_data_field(response.data, "xwa2_newsletter_admin")?;
+        Ok(parse_newsletter_admin_info(&admin))
+    }
+
+    /// List up to `count` of a newsletter's followers.
+    ///
+    /// The operation takes no cursor — WA Web asks for one page clamped to its
+    /// subscriber-list limit — so `count` is the whole request.
+    pub async fn get_followers(
+        &self,
+        jid: &Jid,
+        count: u32,
+    ) -> Result<Vec<NewsletterFollower>, NewsletterError> {
+        let response = self
+            .client
+            .mex()
+            .query(mex_request!(
+                fetch_newsletter_followers,
+                followers_variables(jid, count)
+            ))
+            .await?;
+
+        let followers = take_data_field(response.data, "xwa2_newsletter_followers")?;
+        parse_newsletter_followers(&followers)
     }
 
     /// Mute or unmute a newsletter's follower-activity notifications
@@ -549,6 +720,106 @@ impl Client {
 
 // JSON parsing helper
 
+/// Take a top-level field out of a MEX response body, rejecting a `null` one.
+/// WA Web reads the same absence as a server failure rather than an empty result
+/// (`WAWebMexDeleteNewsletterJob` raises a 500 on a null payload).
+fn take_data_field(
+    data: Option<serde_json::Value>,
+    field: &str,
+) -> Result<serde_json::Value, NewsletterError> {
+    let mut data = data.ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
+    match data.get_mut(field).map(serde_json::Value::take) {
+        Some(value) if !value.is_null() => Ok(value),
+        _ => Err(NewsletterError::InvalidRequest(format!(
+            "newsletter response missing {field}"
+        ))),
+    }
+}
+
+/// `viewer_metadata` spells the role lowercase while the follower list spells it
+/// uppercase, so the comparison has to ignore case.
+fn parse_newsletter_role(raw: &str) -> Option<NewsletterRole> {
+    if raw.eq_ignore_ascii_case("owner") {
+        Some(NewsletterRole::Owner)
+    } else if raw.eq_ignore_ascii_case("admin") {
+        Some(NewsletterRole::Admin)
+    } else if raw.eq_ignore_ascii_case("subscriber") {
+        Some(NewsletterRole::Subscriber)
+    } else if raw.eq_ignore_ascii_case("guest") {
+        Some(NewsletterRole::Guest)
+    } else {
+        None
+    }
+}
+
+/// A profile exists only once it carries a name; WA Web drops a nameless one.
+fn parse_admin_profile(value: &serde_json::Value) -> Option<NewsletterAdminProfile> {
+    let name = value["name"].as_str()?;
+    Some(NewsletterAdminProfile {
+        id: value["id"].as_str().map(str::to_string),
+        name: name.to_string(),
+        picture_id: value["picture"]["id"].as_str().map(str::to_string),
+        picture_direct_path: value["picture"]["direct_path"].as_str().map(str::to_string),
+    })
+}
+
+fn parse_newsletter_admin_info(value: &serde_json::Value) -> NewsletterAdminInfo {
+    NewsletterAdminInfo {
+        admin_count: parse_json_u64(&value["admin_count"]).and_then(|c| u32::try_from(c).ok()),
+        admin_profile: parse_admin_profile(&value["admin_profile"]),
+        admin_profiles_enabled: value["admin_settings"]["admin_profiles_enabled"].as_bool(),
+    }
+}
+
+fn parse_newsletter_followers(
+    value: &serde_json::Value,
+) -> Result<Vec<NewsletterFollower>, NewsletterError> {
+    // An absent `edges` is an empty page, not a failure — the follower list is
+    // only withheld wholesale, and that already failed in `take_data_field`.
+    let Some(edges) = value["followers"]["edges"].as_array() else {
+        return Ok(Vec::new());
+    };
+
+    let mut followers = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let node = &edge["node"];
+        // WA Web drops an edge with no id: there is nobody to address.
+        let Some(jid) = node["id"].as_str() else {
+            continue;
+        };
+        let jid: Jid = jid
+            .parse()
+            .map_err(|e| NewsletterError::InvalidRequest(format!("invalid follower id: {e}")))?;
+        let phone_jid = match node["pn"].as_str() {
+            Some(pn) => Some(pn.parse().map_err(|e| {
+                NewsletterError::InvalidRequest(format!("invalid follower pn: {e}"))
+            })?),
+            None => None,
+        };
+
+        followers.push(NewsletterFollower {
+            jid,
+            phone_jid,
+            display_name: node["display_name"].as_str().map(str::to_string),
+            username: node["username_info"]["username"]
+                .as_str()
+                .map(str::to_string),
+            role: edge["role"].as_str().and_then(parse_newsletter_role),
+            follow_time: parse_json_u64(&edge["follow_time"]),
+            admin_profile: parse_admin_profile(&edge["admin_profile"]),
+        });
+    }
+    Ok(followers)
+}
+
+/// MEX numbers reach us as either JSON numbers or decimal strings depending on
+/// the field's server-side width, and the IR types are too loose to tell which.
+fn parse_json_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+}
+
 fn parse_newsletter_metadata(
     value: &serde_json::Value,
 ) -> Result<NewsletterMetadata, NewsletterError> {
@@ -597,13 +868,7 @@ fn parse_newsletter_metadata(
 
     let role = value["viewer_metadata"]["role"]
         .as_str()
-        .and_then(|r| match r {
-            "owner" => Some(NewsletterRole::Owner),
-            "admin" => Some(NewsletterRole::Admin),
-            "subscriber" => Some(NewsletterRole::Subscriber),
-            "guest" => Some(NewsletterRole::Guest),
-            _ => None,
-        });
+        .and_then(parse_newsletter_role);
 
     Ok(NewsletterMetadata {
         jid,
@@ -741,6 +1006,61 @@ fn parse_newsletter_messages_response(
 /// with value ON/OFF; the mute-expiration is local DB state, never on the wire. The
 /// generated op's input type is opaque (a bare string), so the structured object is
 /// passed directly as variables.
+/// Build the MEX variables for a picture-only `update_newsletter`. WA Web edits
+/// each field through a "changed?" flag whose null value collapses to an empty
+/// string, which is what clears the picture server-side.
+fn picture_update_variables(jid: &Jid, jpeg: Option<&[u8]>) -> update_newsletter::Variables {
+    use base64::Engine as _;
+
+    let picture = jpeg
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+        .unwrap_or_default();
+    update_newsletter::Variables {
+        newsletter_id: Some(jid.to_string()),
+        updates: Some(update_newsletter::Updates {
+            name: None,
+            description: None,
+            picture: Some(picture),
+            settings: None,
+        }),
+    }
+}
+
+fn delete_variables(jid: &Jid) -> delete_newsletter::Variables {
+    delete_newsletter::Variables {
+        newsletter_id: Some(jid.to_string()),
+    }
+}
+
+fn change_owner_variables(jid: &Jid, user: &Jid) -> change_newsletter_owner::Variables {
+    change_newsletter_owner::Variables {
+        newsletter_id: Some(jid.to_string()),
+        user_id: Some(user.to_string()),
+    }
+}
+
+fn demote_admin_variables(jid: &Jid, user: &Jid) -> demote_newsletter_admin::Variables {
+    demote_newsletter_admin::Variables {
+        newsletter_id: Some(jid.to_string()),
+        user_id: Some(user.to_string()),
+    }
+}
+
+fn admin_info_variables(jid: &Jid) -> fetch_newsletter_admin_info::Variables {
+    fetch_newsletter_admin_info::Variables {
+        newsletter_id: Some(jid.to_string()),
+    }
+}
+
+fn followers_variables(jid: &Jid, count: u32) -> fetch_newsletter_followers::Variables {
+    fetch_newsletter_followers::Variables {
+        input: Some(fetch_newsletter_followers::Input {
+            newsletter_id: Some(jid.to_string()),
+            count: Some(count.into()),
+        }),
+    }
+}
+
 fn mute_user_setting_variables(jid: &Jid, mute_type: &str, muted: bool) -> serde_json::Value {
     serde_json::json!({
         "input": {
@@ -754,6 +1074,7 @@ fn mute_user_setting_variables(jid: &Jid, mute_type: &str, muted: bool) -> serde
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use wacore_binary::builder::NodeBuilder;
 
     #[test]
@@ -767,6 +1088,364 @@ mod tests {
         let off = mute_user_setting_variables(&jid, "MUTE_ADMIN_ACTIVITY", false);
         assert_eq!(off["input"]["type"], "MUTE_ADMIN_ACTIVITY");
         assert_eq!(off["input"]["value"], "OFF");
+    }
+
+    fn newsletter_jid() -> Jid {
+        "120363000000000001@newsletter".parse().expect("jid")
+    }
+
+    fn user_lid() -> Jid {
+        "111111111111111@lid".parse().expect("jid")
+    }
+
+    #[test]
+    fn delete_variables_match_wa_web_shape() {
+        let vars = serde_json::to_value(delete_variables(&newsletter_jid())).expect("serialize");
+        assert_eq!(
+            vars,
+            json!({ "newsletter_id": "120363000000000001@newsletter" })
+        );
+    }
+
+    #[test]
+    fn delete_response_is_accepted_and_a_null_payload_is_an_error() {
+        let ok = take_data_field(
+            Some(json!({
+                "xwa2_newsletter_delete_v2": {
+                    "id": "120363000000000001@newsletter",
+                    "state": { "type": "DELETED" }
+                }
+            })),
+            "xwa2_newsletter_delete_v2",
+        )
+        .expect("delete payload");
+        assert_eq!(ok["state"]["type"], "DELETED");
+
+        assert!(matches!(
+            take_data_field(
+                Some(json!({ "xwa2_newsletter_delete_v2": null })),
+                "xwa2_newsletter_delete_v2",
+            ),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            take_data_field(Some(json!({})), "xwa2_newsletter_delete_v2"),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            take_data_field(None, "xwa2_newsletter_delete_v2"),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn change_owner_variables_match_wa_web_shape() {
+        let vars = serde_json::to_value(change_owner_variables(&newsletter_jid(), &user_lid()))
+            .expect("serialize");
+        assert_eq!(
+            vars,
+            json!({
+                "newsletter_id": "120363000000000001@newsletter",
+                "user_id": "111111111111111@lid",
+            })
+        );
+    }
+
+    #[test]
+    fn change_owner_response_is_accepted_and_a_null_payload_is_an_error() {
+        let ok = take_data_field(
+            Some(json!({
+                "xwa2_newsletter_change_owner": {
+                    "__typename": "XWA2Newsletter",
+                    "id": "120363000000000001@newsletter"
+                }
+            })),
+            "xwa2_newsletter_change_owner",
+        )
+        .expect("change owner payload");
+        assert_eq!(ok["id"], "120363000000000001@newsletter");
+
+        assert!(matches!(
+            take_data_field(
+                Some(json!({ "xwa2_newsletter_change_owner": null })),
+                "xwa2_newsletter_change_owner",
+            ),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn admin_mutations_refuse_a_target_with_no_known_lid() {
+        let client = crate::test_utils::create_test_client().await;
+        let unmapped = Jid::pn("12025550111");
+
+        // A disconnected client fails with `Iq(NotConnected)` once it reaches the
+        // wire, so `InvalidRequest` here proves the target was rejected before it.
+        let err = client
+            .newsletter()
+            .change_owner(&newsletter_jid(), &unmapped)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NewsletterError::InvalidRequest(_)));
+
+        let err = client
+            .newsletter()
+            .demote_admin(&newsletter_jid(), &unmapped)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NewsletterError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn demote_admin_variables_match_wa_web_shape() {
+        let vars = serde_json::to_value(demote_admin_variables(&newsletter_jid(), &user_lid()))
+            .expect("serialize");
+        assert_eq!(
+            vars,
+            json!({
+                "newsletter_id": "120363000000000001@newsletter",
+                "user_id": "111111111111111@lid",
+            })
+        );
+    }
+
+    #[test]
+    fn demote_admin_response_is_accepted_and_a_null_payload_is_an_error() {
+        let ok = take_data_field(
+            Some(json!({
+                "xwa2_newsletter_admin_demote": {
+                    "__typename": "XWA2Newsletter",
+                    "id": "120363000000000001@newsletter"
+                }
+            })),
+            "xwa2_newsletter_admin_demote",
+        )
+        .expect("demote payload");
+        assert_eq!(ok["id"], "120363000000000001@newsletter");
+
+        assert!(matches!(
+            take_data_field(
+                Some(json!({ "xwa2_newsletter_admin_demote": null })),
+                "xwa2_newsletter_admin_demote",
+            ),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn admin_info_variables_match_wa_web_shape() {
+        let vars =
+            serde_json::to_value(admin_info_variables(&newsletter_jid())).expect("serialize");
+        assert_eq!(
+            vars,
+            json!({ "newsletter_id": "120363000000000001@newsletter" })
+        );
+    }
+
+    #[test]
+    fn admin_info_carries_the_admin_count_and_profile() {
+        let admin = take_data_field(
+            Some(json!({
+                "xwa2_newsletter_admin": {
+                    "id": "120363000000000001@newsletter",
+                    "admin_count": 3,
+                    "admin_profile": {
+                        "id": "9990001",
+                        "name": "Test Admin",
+                        "picture": { "id": "1700000000", "direct_path": "/v/t61.0-24/pic.enc" }
+                    },
+                    "admin_settings": { "admin_profiles_enabled": true }
+                }
+            })),
+            "xwa2_newsletter_admin",
+        )
+        .expect("admin payload");
+
+        let info = parse_newsletter_admin_info(&admin);
+        assert_eq!(info.admin_count, Some(3));
+        assert_eq!(info.admin_profiles_enabled, Some(true));
+        let profile = info.admin_profile.expect("admin profile");
+        assert_eq!(profile.name, "Test Admin");
+        assert_eq!(profile.id.as_deref(), Some("9990001"));
+        assert_eq!(profile.picture_id.as_deref(), Some("1700000000"));
+    }
+
+    #[test]
+    fn admin_info_leaves_absent_fields_unset_and_a_null_payload_is_an_error() {
+        // Non-admins get the envelope without a count; nothing here may fall
+        // back to a zero that reads as "this newsletter has no admins".
+        let info = parse_newsletter_admin_info(&json!({
+            "id": "120363000000000001@newsletter",
+            "admin_profile": { "id": "9990001" }
+        }));
+        assert_eq!(info.admin_count, None);
+        assert_eq!(info.admin_profiles_enabled, None);
+        assert!(info.admin_profile.is_none());
+
+        assert!(matches!(
+            take_data_field(
+                Some(json!({ "xwa2_newsletter_admin": null })),
+                "xwa2_newsletter_admin",
+            ),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn followers_variables_match_wa_web_shape() {
+        let vars =
+            serde_json::to_value(followers_variables(&newsletter_jid(), 100)).expect("serialize");
+        assert_eq!(
+            vars,
+            json!({
+                "input": {
+                    "newsletter_id": "120363000000000001@newsletter",
+                    "count": 100,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn followers_response_is_parsed_into_domain_types() {
+        let followers = take_data_field(
+            Some(json!({
+                "xwa2_newsletter_followers": {
+                    "followers": {
+                        "edges": [
+                            {
+                                "node": {
+                                    "id": "111111111111111@lid",
+                                    "display_name": "Test Owner",
+                                    "pn": "12025550111@s.whatsapp.net",
+                                    "username_info": {
+                                        "__typename": "XWA2Username",
+                                        "username": "test.owner"
+                                    }
+                                },
+                                "follow_time": "1700000000",
+                                "role": "OWNER",
+                                "admin_profile": {
+                                    "id": "9990001",
+                                    "name": "Test Owner",
+                                    "picture": { "id": "1", "direct_path": "/v/t61.0-24/pic.enc" }
+                                }
+                            },
+                            {
+                                "node": {
+                                    "id": "222222222222222@lid",
+                                    "display_name": null,
+                                    "pn": null,
+                                    "username_info": null
+                                },
+                                "follow_time": 1700000001i64,
+                                "role": "SUBSCRIBER",
+                                "admin_profile": null
+                            },
+                            { "node": { "id": null }, "role": "SUBSCRIBER" }
+                        ]
+                    }
+                }
+            })),
+            "xwa2_newsletter_followers",
+        )
+        .expect("followers payload");
+
+        let followers = parse_newsletter_followers(&followers).expect("parsed");
+        // The id-less edge is dropped: there is nobody to address.
+        assert_eq!(followers.len(), 2);
+
+        assert_eq!(followers[0].jid, user_lid());
+        assert_eq!(followers[0].role, Some(NewsletterRole::Owner));
+        assert_eq!(followers[0].follow_time, Some(1700000000));
+        assert_eq!(followers[0].username.as_deref(), Some("test.owner"));
+        assert_eq!(
+            followers[0].phone_jid,
+            Some("12025550111@s.whatsapp.net".parse().expect("jid"))
+        );
+        assert_eq!(
+            followers[0].admin_profile.as_ref().map(|p| p.name.as_str()),
+            Some("Test Owner")
+        );
+
+        assert_eq!(followers[1].role, Some(NewsletterRole::Subscriber));
+        assert_eq!(followers[1].follow_time, Some(1700000001));
+        assert!(followers[1].phone_jid.is_none());
+        assert!(followers[1].display_name.is_none());
+        assert!(followers[1].admin_profile.is_none());
+    }
+
+    #[test]
+    fn followers_null_payload_is_an_error_and_an_absent_edge_list_is_empty() {
+        assert!(matches!(
+            take_data_field(
+                Some(json!({ "xwa2_newsletter_followers": null })),
+                "xwa2_newsletter_followers",
+            ),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
+
+        let empty = parse_newsletter_followers(&json!({ "followers": null })).expect("parsed");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn follower_roles_are_matched_case_insensitively() {
+        // The follower list spells roles uppercase; viewer_metadata lowercase.
+        assert_eq!(parse_newsletter_role("ADMIN"), Some(NewsletterRole::Admin));
+        assert_eq!(parse_newsletter_role("admin"), Some(NewsletterRole::Admin));
+        assert_eq!(parse_newsletter_role("GUEST"), Some(NewsletterRole::Guest));
+        assert_eq!(parse_newsletter_role("unknown"), None);
+    }
+
+    #[test]
+    fn set_picture_sends_base64_and_remove_sends_an_empty_string() {
+        let jid = newsletter_jid();
+        let set = serde_json::to_value(picture_update_variables(&jid, Some(b"\xff\xd8jpeg-bytes")))
+            .expect("serialize");
+        assert_eq!(set["updates"]["picture"], "/9hqcGVnLWJ5dGVz");
+        assert!(set["updates"].get("name").is_none());
+        assert!(set["updates"].get("description").is_none());
+
+        // Removal is an explicitly-present empty string. Dropping the field
+        // instead would leave the current picture in place.
+        let removed =
+            serde_json::to_value(picture_update_variables(&jid, None)).expect("serialize");
+        assert_eq!(removed["updates"]["picture"], "");
+        assert!(removed["updates"].get("picture").is_some());
+    }
+
+    #[test]
+    fn picture_update_response_is_metadata_and_a_null_payload_is_an_error() {
+        let updated = take_data_field(
+            Some(json!({
+                "xwa2_newsletter_update": {
+                    "id": "120363000000000001@newsletter",
+                    "state": { "type": "ACTIVE" },
+                    "thread_metadata": {
+                        "name": { "text": "Test Channel" },
+                        "description": { "text": "" },
+                        "picture": { "direct_path": "/v/t61.0-24/pic.enc", "id": "1" },
+                        "verification": "UNVERIFIED"
+                    }
+                }
+            })),
+            "xwa2_newsletter_update",
+        )
+        .expect("update payload");
+
+        let metadata = parse_newsletter_metadata(&updated).expect("metadata");
+        assert_eq!(metadata.jid, newsletter_jid());
+        assert_eq!(metadata.name, "Test Channel");
+        assert_eq!(metadata.picture_url.as_deref(), Some("/v/t61.0-24/pic.enc"));
+
+        assert!(matches!(
+            take_data_field(
+                Some(json!({ "xwa2_newsletter_update": null })),
+                "xwa2_newsletter_update",
+            ),
+            Err(NewsletterError::InvalidRequest(_))
+        ));
     }
 
     #[test]

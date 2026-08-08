@@ -97,6 +97,10 @@ work. Wiring: `build()` wraps the runtime in `InstrumentedRuntime`, so all
 spawns through the `Runtime` trait are covered without touching call sites.
 The `Option` is resolved once at `build()` — `None` (default) leaves the
 runtime untouched, so there is no per-spawn or per-poll cost when unset.
+Installed, the decorator costs one allocation per spawn: `Runtime::spawn`
+takes and returns an erased future, so wrapping it changes the type and needs
+a fresh box. Nothing else on the path allocates: `MeteredFuture` is generic
+over the future it wraps, and `Bot::run` stack-pins its own.
 
 - `CpuMeter` (built-in): busy time (direct CPU proxy) + poll count via
   `wacore::time::Instant`. Works on wasm/embedded once a monotonic provider
@@ -140,10 +144,84 @@ So the SQLite page cache **is** the single largest chunk, but only on the
 SQLite profile, and it is roughly half the total rather than all of it. A
 process on a remote or in-memory backend still pays the other ~530 KiB, of
 which the largest named pieces are the prekey window the backend retains
-(~102 KiB for the default 812 keys) and the transport's WebSocket + TLS buffers
-(64 KiB). The HTTP idle pool used to belong on that list; the version fetch no
-longer leaves one behind (see below), so a session whose only HTTP traffic is
-that fetch pays nothing for it.
+(~104 KiB for the default 812 keys, but see the caveat below: that figure is
+`InMemoryBackend`-only) and the transport's WebSocket + TLS buffers (64 KiB).
+The HTTP idle pool used to belong on that list; the version fetch no longer
+leaves one behind (see below), so a session whose only HTTP traffic is that
+fetch pays nothing for it.
+
+### Four measured per-session costs, and which of them survive scrutiny
+
+Each of these was measured as marginal `RssAnon` in release against a control
+that does everything except the thing being measured. Two of the four figures
+that a call-site heap profile suggested did not survive that control, which is
+the reason for measuring against one.
+
+| what | measured | now |
+| --- | ---: | ---: |
+| HTTP: pooled TLS connection from the version fetch | 88 KiB | 0 KiB (#1243) |
+| noise: batch buffer after one 60 KiB frame | 60 KiB, vs 8 KiB small-traffic | 8 KiB (#1246) |
+| transport: retained `ClientConfig` | 14 KiB | 9 KiB (#1245) |
+| topology log preallocation | 4 KiB | 0 KiB (#1244) |
+
+**The prekey window is a backend artifact, not a per-session cost.** Building a
+client and generating the default 812 prekeys, against a control that builds the
+same client and generates none: `InMemoryBackend` 28 → 132 KiB, file-backed
+`SqliteStore` 432 → 448 KiB. So the keys cost ~104 KiB of heap in memory and
+~16 KiB on SQLite, but the SQLite client starts 404 KiB higher, so moving
+backends relocates the cost rather than removing it, into page cache that
+`RssAnon` counts and does not reclaim. The 104 KiB is also not waste: 58.7 KiB
+of it is the single `Vec::with_capacity(gen_count * 74)` in `upload_pre_keys_pass`
+staying alive because the `Bytes` slices handed to `store_prekeys_batch` *are*
+what the backend stores (one allocation instead of 812), and 41 KiB is that
+map's `RawTable` at 1024 buckets. Nothing to optimise; do not re-derive it.
+
+**The rustls session cache is 5 KiB, not 44.** A whole retained
+`default_tls_connector()` measures 14.0 KiB; disabling resumption entirely takes
+it to 9.0 KiB, and sizing the store for the one host a factory dials takes it to
+9.4 KiB. The other 9 KiB is the config plus the webpki root store.
+
+### Should a residency probe be permanent?
+
+No, and the reason generalises. Every finding above that was worth guarding
+turned out to have a **deterministic** guard available, and each of those is
+strictly better than an `RssAnon` assertion:
+
+- the HTTP pool, by counting accepted TCP connections against a keep-alive
+  fixture (`an_ordinary_request_reuses_the_pooled_connection` and its
+  `Connection: close` twin);
+- the noise batch buffer, by extracting the release decision into
+  `should_release_batch_buffer` (#1246) and testing it directly; the wire-level
+  test could not see the buffer at all, and passed with the whole feature
+  deleted;
+- the topology log, by asserting the bound and the floor rather than the bytes.
+
+An `RssAnon` assertion is page-quantised (the topology log's 8 KiB allocation
+shows up as a 4 KiB delta, because `with_capacity` reserves without writing),
+allocator-dependent, and needs a ceiling wide enough that it only catches
+order-of-magnitude regressions. The probe's value was in *finding* the numbers,
+not in re-checking them. Write one when you need a number; reach for a
+deterministic observable when you need a guard.
+
+To rebuild one: read `/proc/self/status`, construct N of the thing under test in
+a loop while holding them all alive, and read the tail.
+
+Keep the **median** there, as `process_footprint.rs` does, whenever the
+per-step delta is comfortably above the 4 KiB page: it resists the outlier
+steps, and the 88 KiB, 60 KiB and 14 KiB figures above are medians and are not
+affected by what follows. It stops working once the per-step delta is within a
+small multiple of the page, because then every step rounds to the same one or
+two page counts and the median reports that rounding rather than the cost. The
+topology log is the example: 8 KiB allocated, deltas alternating 32 and 36 KiB,
+median moving by exactly one page. The **mean over the same tail** is the
+sharper read there, and the two still agree on the answer: the median put the
+saving at 36 -> 32 KiB, the mean at 34.9 -> 31.1 KiB.
+
+Give each variant its own process (`--exact`, or nextest, which forks per
+test): RSS never shrinks, so a second variant measured in the same process
+reuses the first one's freed heap and reads as ~0. That one is not a rounding
+artifact but a wrong answer, and it made a real 14 KiB cost look like 0.4 KiB
+until the variants were re-run separately.
 
 The pieces (each an `Option`-only struct in `wacore::stats`, filled only with
 what a component can introspect — absent means "not reported", not zero):

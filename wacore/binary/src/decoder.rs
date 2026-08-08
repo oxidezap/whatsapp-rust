@@ -749,6 +749,48 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Attribute storage capacity must not change how a broken attribute list
+    /// is rejected: a truncated pair, a non-string key and a declared count the
+    /// frame cannot back all fail the same way they did before.
+    #[test]
+    fn malformed_attribute_lists_keep_their_errors() {
+        // <message> claiming one attribute, cut off after the key.
+        let truncated = [
+            token::LIST_8,
+            3,
+            token::DICTIONARY_0,
+            0,
+            token::BINARY_8,
+            2,
+            b'i',
+            b'd',
+        ];
+        assert!(matches!(
+            Decoder::new(&truncated).read_node_ref(),
+            Err(BinaryError::UnexpectedEof)
+        ));
+
+        // An empty list where a string key is required.
+        let non_string_key = [token::LIST_8, 3, token::DICTIONARY_0, 0, token::LIST_EMPTY];
+        assert!(matches!(
+            Decoder::new(&non_string_key).read_node_ref(),
+            Err(BinaryError::NonStringKey)
+        ));
+
+        // Declares 4 attributes, carries none.
+        let overlong_count = [token::LIST_8, 9, token::DICTIONARY_0, 0];
+        assert!(matches!(
+            Decoder::new(&overlong_count).read_node_ref(),
+            Err(BinaryError::UnexpectedEof)
+        ));
+
+        // A list size of zero has no room even for the tag.
+        assert!(matches!(
+            Decoder::new(&[token::LIST_EMPTY]).read_node_ref(),
+            Err(BinaryError::InvalidNode)
+        ));
+    }
+
     /// Test invalid token value
     #[test]
     fn test_invalid_token() {

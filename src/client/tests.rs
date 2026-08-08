@@ -4525,6 +4525,79 @@ async fn instrumented_runtime_reports_to_cpu_meter() {
     );
 }
 
+/// `spawn_detached` is the fire-and-forget path most of the read loop uses. The
+/// decorator forwards it instead of falling back to `spawn`, so it must still
+/// meter every poll of the task.
+#[tokio::test]
+async fn instrumented_runtime_meters_detached_spawns() {
+    use wacore::runtime::Runtime as _;
+    use wacore::stats::{CpuMeter, InstrumentedRuntime};
+
+    let meter = Arc::new(CpuMeter::new());
+    let runtime =
+        InstrumentedRuntime::new(Arc::new(crate::runtime_impl::TokioRuntime), meter.clone());
+
+    let (tx, rx) = oneshot::channel::<()>();
+    runtime.spawn_detached(Box::pin(async move {
+        tokio::task::yield_now().await;
+        let _ = tx.send(());
+    }));
+    rx.await.expect("detached future ran");
+
+    assert!(
+        meter.snapshot().polls >= 2,
+        "a detached task is metered on every poll, got {}",
+        meter.snapshot().polls
+    );
+}
+
+/// Cancellation through the decorator: aborting a metered task mid-flight must
+/// leave the meter balanced, so work that runs afterwards is still attributed
+/// to whoever actually did it.
+#[tokio::test]
+async fn aborting_a_metered_task_keeps_the_meter_balanced() {
+    use wacore::runtime::Runtime as _;
+    use wacore::stats::{AllocMeter, InstrumentedRuntime, TaskInstrument};
+
+    let meter = AllocMeter::new();
+    let instrument: Arc<dyn TaskInstrument> = Arc::new(meter.clone());
+    let runtime = InstrumentedRuntime::new(
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        Arc::clone(&instrument),
+    );
+
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let handle = runtime.spawn(Box::pin(async move {
+        let _ = started_tx.send(());
+        std::future::pending::<()>().await;
+    }));
+    started_rx.await.expect("task started");
+    handle.abort();
+    tokio::task::yield_now().await;
+
+    // `#[tokio::test]` drives a current-thread runtime, so the aborted task ran
+    // on this very thread: a scope it failed to close would charge this probe.
+    let after_abort = meter.snapshot();
+    AllocMeter::on_alloc(4096);
+    assert_eq!(
+        meter.snapshot().allocations,
+        after_abort.allocations,
+        "the aborted task must not still be the active scope"
+    );
+
+    // And the meter still attributes work that follows.
+    let (tx, rx) = oneshot::channel::<()>();
+    runtime.spawn_detached(Box::pin(async move {
+        AllocMeter::on_alloc(512);
+        let _ = tx.send(());
+    }));
+    rx.await.expect("follow-up task ran");
+    assert!(
+        meter.snapshot().allocated_bytes >= after_abort.allocated_bytes + 512,
+        "the follow-up task is still charged"
+    );
+}
+
 /// A status@broadcast stanza feeds the same per-chat queue a `<message>` does,
 /// so its enqueue must keep the read loop's arrival order.
 #[tokio::test]

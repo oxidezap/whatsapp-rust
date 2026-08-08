@@ -56,4 +56,8 @@ These lines mirror WA Web's `[socket]` output, which makes a captured session an
 [socket] continueFullHandshakeCore client finish and deriving secrets
 ```
 
+## Span scope
+
+The `wa.conn.handshake` span covers `negotiate` only, not the `NoiseSocket` that `do_handshake` builds from the ciphers it returns. That socket spawns the connection's outbound sender task, so a consumer that propagates `Span::current()` into spawned tasks (what `tracing` prescribes) would make a one-shot span the parent of every frame the connection writes. Anything added to `do_handshake` that outlives the handshake belongs on the same side of that line.
+
 Every line above is `debug`, including `resumeNoiseHandshake failed`: a server that declines the IK resume is the ordinary trigger for XXfallback, not a failure of ours. The pattern that actually completed is what gets reported at `info`, as "Handshake complete (IK|XX|XXfallback)". None of these pattern diagnostics warns; other parts of connection setup still do on their own terms (an oversized `edge_routing_info` being dropped, for one).
