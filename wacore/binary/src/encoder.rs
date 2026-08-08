@@ -635,7 +635,7 @@ impl<W: Write> Encoder<'static, IoByteWriter<W>> {
             writer: IoByteWriter::new(writer),
             string_hints: None,
         };
-        enc.write_u8(0)?;
+        enc.write_u8(crate::util::FORMAT_PLAIN)?;
         Ok(enc)
     }
 }
@@ -647,7 +647,7 @@ impl<'v> Encoder<'static, VecByteWriter<'v>> {
             writer: VecByteWriter::new(buffer),
             string_hints: None,
         };
-        enc.write_u8(0)?;
+        enc.write_u8(crate::util::FORMAT_PLAIN)?;
         Ok(enc)
     }
 }
@@ -661,7 +661,7 @@ impl<'a> Encoder<'a, SliceByteWriter<'a>> {
             writer: SliceByteWriter::new(buffer),
             string_hints,
         };
-        enc.write_u8(0)?;
+        enc.write_u8(crate::util::FORMAT_PLAIN)?;
         Ok(enc)
     }
 

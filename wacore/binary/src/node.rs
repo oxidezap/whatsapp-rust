@@ -905,9 +905,9 @@ pub struct OwnedNodeRef {
 }
 
 impl OwnedNodeRef {
-    /// Decode a node from an owned buffer. The buffer should be the raw
-    /// binary-protocol bytes (after decompression, without the leading
-    /// format byte which `unpack` already strips).
+    /// Decode a node from an owned buffer of node bytes: after decompression and
+    /// without the format byte, which [`unpack`](crate::util::unpack) strips.
+    /// A buffer that still carries it goes through `unpack` first.
     pub fn new(buffer: impl Into<Bytes>) -> crate::error::Result<Self> {
         let inner = Yoke::try_attach_to_cart(BytesCart(buffer.into()), |buf| {
             crate::marshal::unmarshal_ref(buf)
@@ -931,6 +931,12 @@ impl OwnedNodeRef {
     ///
     /// A refcount bump, not a copy — the yoke already retains this buffer, and
     /// [`Self::slice_bytes`] hands out views into the same allocation.
+    ///
+    /// These are node bytes, so they are **not** a sendable frame: send paths
+    /// take a packed payload, one format byte in front of the node bytes, which
+    /// [`unpack`](crate::util::unpack) stripped on the way in. Put it back with
+    /// [`pack`](crate::util::pack) before forwarding these bytes anywhere that
+    /// expects marshal output.
     ///
     /// Re-encoding through [`marshal_ref`] is the alternative and a worse one
     /// for anything that forwards a stanza onward — to another process, a
@@ -1141,11 +1147,11 @@ mod value_ref_compare_tests {
 mod owned_node_ref_tests {
     use super::*;
 
-    /// Raw binary-protocol bytes, as `OwnedNodeRef::new` wants them: `marshal`
-    /// writes a leading format byte that `unmarshal_ref` does not expect.
+    /// Node bytes, as `OwnedNodeRef::new` wants them: marshal output with the
+    /// format byte taken off, the way the receive path gets them.
     fn encoded(node: &Node) -> Bytes {
-        let bytes = crate::marshal::marshal(node).unwrap();
-        Bytes::from(bytes[1..].to_vec())
+        let packed = crate::marshal::marshal(node).unwrap();
+        Bytes::from(crate::util::unpack(&packed).unwrap().into_owned())
     }
 
     fn sample() -> Node {
@@ -1381,9 +1387,9 @@ mod serde_tests {
             Some(NodeContent::String("payload".into())),
         );
 
-        let bytes = crate::marshal::marshal(&node).unwrap();
-        // marshal writes a leading format byte that unmarshal_ref doesn't expect
-        let owned_ref = OwnedNodeRef::new(Bytes::from(bytes[1..].to_vec())).unwrap();
+        let packed = crate::marshal::marshal(&node).unwrap();
+        let node_bytes = crate::util::unpack(&packed).unwrap().into_owned();
+        let owned_ref = OwnedNodeRef::new(Bytes::from(node_bytes)).unwrap();
 
         let from_ref = serde_json::to_value(&owned_ref).unwrap();
         let from_owned = serde_json::to_value(owned_ref.to_owned_node()).unwrap();

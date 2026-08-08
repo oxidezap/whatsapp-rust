@@ -1,12 +1,12 @@
 //! The packed-value tables must decode exactly what the scalar nibble/hex
 //! walk did, including where an invalid nibble reports the failure.
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::marshal::{marshal, unmarshal_ref};
+use wacore_binary::marshal::{marshal, unmarshal_packed_ref, unmarshal_ref};
 
 fn roundtrip_attr(value: &str) -> String {
     let node = NodeBuilder::new("t").attr("v", value).build();
     let bytes = marshal(&node).unwrap();
-    let decoded = unmarshal_ref(&bytes[1..]).unwrap();
+    let decoded = unmarshal_packed_ref(&bytes).unwrap();
     match decoded.get_attr("v").unwrap() {
         wacore_binary::node::ValueRef::String(s) => s.to_string(),
         other => panic!("unexpected value {other:?}"),

@@ -24,6 +24,10 @@ pub enum BinaryError {
     /// or hint-tape consumption) — an internal encoder bug, distinct from a
     /// malformed input node, surfaced instead of shipping corrupt bytes.
     PlanMismatch,
+    /// A packed payload did not start with an uncompressed format byte, so it
+    /// is not what `marshal` produces. Most often node bytes handed to a path
+    /// that expects the format byte in front of them.
+    UnexpectedFormatByte(u8),
 }
 
 impl fmt::Display for BinaryError {
@@ -46,6 +50,10 @@ impl fmt::Display for BinaryError {
             BinaryError::LeftoverData(n) => write!(f, "Leftover data after decoding: {n} bytes"),
             BinaryError::AttrList(list) => write!(f, "Multiple attribute parsing errors: {list:?}"),
             BinaryError::MaxDepthExceeded => write!(f, "Node nesting exceeded the maximum depth"),
+            BinaryError::UnexpectedFormatByte(b) => write!(
+                f,
+                "Packed payload starts with format byte {b:#04x}, expected an uncompressed 0x00"
+            ),
         }
     }
 }
@@ -94,6 +102,7 @@ impl Clone for BinaryError {
             BinaryError::AttrList(list) => BinaryError::AttrList(list.clone()),
             BinaryError::MaxDepthExceeded => BinaryError::MaxDepthExceeded,
             BinaryError::PlanMismatch => BinaryError::PlanMismatch,
+            BinaryError::UnexpectedFormatByte(b) => BinaryError::UnexpectedFormatByte(*b),
         }
     }
 }
