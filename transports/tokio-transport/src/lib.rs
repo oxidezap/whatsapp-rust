@@ -44,9 +44,10 @@ fn transport_resource_estimate() -> wacore::stats::TransportResourceReport {
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
 /// A factory dials one URL, so its resumption store only ever needs one server
-/// name; rustls sizes for 32 by default and preallocates the table. Eight is
-/// rustls's per-server ticket maximum, so this is one full slot, not a
-/// reduction in what can be resumed for the host actually dialled.
+/// name. rustls's default asks for 256 sessions, which it turns into a
+/// preallocated table of `⌈256/8⌉ = 32` server names. Eight is its per-server
+/// ticket maximum, so one slot here is a full slot, not a reduction in what can
+/// be resumed for the host actually dialled.
 const RESUMPTION_TICKETS: usize = 8;
 
 /// Applies the single-host resumption sizing to a freshly built config.
@@ -60,10 +61,10 @@ fn size_for_one_host(mut config: rustls::ClientConfig) -> rustls::ClientConfig {
 /// Useful as a starting point when users need to inspect or replicate the
 /// default TLS configuration before customizing it via [`TokioWebSocketTransportFactory::with_connector`].
 ///
-/// Its session-resumption store is sized for the one host a factory dials, not
-/// for rustls's default 32. Reused across several hosts it still works, but
-/// only the most recent one keeps its tickets; size it back up if that is the
-/// shape you need.
+/// Its session-resumption store is sized for the one host a factory dials,
+/// rather than the many rustls provisions for by default. Reused across several
+/// hosts it still works, but only the most recent ones keep their tickets; size
+/// it back up if that is the shape you need.
 ///
 /// On first call, installs `ring` as the global rustls crypto provider
 /// (no-op if one is already installed).
