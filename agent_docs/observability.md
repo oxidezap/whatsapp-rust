@@ -139,9 +139,11 @@ why the actionable part is `RssAnon` and how much smaller it is.
 So the SQLite page cache **is** the single largest chunk, but only on the
 SQLite profile, and it is roughly half the total rather than all of it. A
 process on a remote or in-memory backend still pays the other ~530 KiB, of
-which the largest named pieces are the HTTP idle pool (96 KiB), the prekey
-window the backend retains (~102 KiB for the default 812 keys), and the
-transport's WebSocket + TLS buffers (64 KiB).
+which the largest named pieces are the prekey window the backend retains
+(~102 KiB for the default 812 keys) and the transport's WebSocket + TLS buffers
+(64 KiB). The HTTP idle pool used to belong on that list; the version fetch no
+longer leaves one behind (see below), so a session that downloads no media pays
+nothing for it.
 
 The pieces (each an `Option`-only struct in `wacore::stats`, filled only with
 what a component can introspect — absent means "not reported", not zero):
@@ -186,27 +188,42 @@ what a component can introspect — absent means "not reported", not zero):
 guard in `accessors.rs`, per #964) so multi-session consumers can await it off a
 worker.
 
+### The version fetch does not leave a connection behind
+
+`connect()` fetches `sw.js` over TLS through `version::resolve_and_update_version`
+unless `with_version` is set or the cached version is under 24h old, so a session
+that never touches media still opens one TLS connection. A pooled connection is
+retained until something touches the pool again — ureq's `max_idle_age` never
+fires, because `Connection::age()` returns zero — and the next fetch for that
+device is a day away, so the connection would sit resident for the whole session
+buying nothing. Measured at **88 KiB of `RssAnon` per session** (median over 16
+agents, release, against a keep-alive TLS server).
+
+`fetch_latest_app_version` therefore sends `Connection: close`, which ureq acts
+on itself rather than waiting for the server to agree: `ureq-proto` records a
+`ClientConnectionClose` reason at request-build time and drops the connection at
+cleanup instead of pooling it. Measured marginal after the change: **0 KiB**.
+Media requests are deliberately untouched — there the pool is what makes the next
+range request cheap.
+
+`mark_if_dispatchable` treats such a request as non-pooling, so a session whose
+only HTTP traffic is the version fetch keeps reporting an empty pool instead of
+latching onto the 96 KiB cap.
+
 ### Sharing one HTTP client across sessions
 
-A process running many sessions should build **one** `UreqHttpClient` and hand a
-clone to each `BotBuilder::with_http_client`. Cloning shares the `ureq::Agent`,
-and therefore the connection pool, so the pooled connections are paid once for
-the process instead of once per session.
+Still available, and now worth it only for a media-heavy process: build one
+`UreqHttpClient` and hand a clone to each `BotBuilder::with_http_client`. Cloning
+shares the `ureq::Agent`, and therefore the connection pool, so idle CDN
+connections are paid once for the process instead of once per session.
 
-That is worth doing because `connect()` fetches `sw.js` over TLS through
-`version::resolve_and_update_version` unless `with_version` is set or the cached
-version is under 24h old. A session that never touches media still opens one TLS
-connection, and ureq retains it: its pool purges on age only when the pool is
-next touched, and `max_idle_age` never fires anyway because `Connection::age()`
-returns zero. Measured at ~98 KiB held for the session's lifetime, against a
-~440 KiB marginal RSS per client, so sharing takes back about a fifth of it from
-roughly ten sessions up.
-
-Isolation: `sw.js` is unauthenticated and identical for every session, and media
-URLs carry their auth per request, so a shared connection carries nothing between
-sessions that the shared source IP does not already carry. Concurrency is
-unaffected, because ureq opens a new connection whenever no idle one matches the
-authority. The pool caps idle retention, not throughput.
+Isolation: media URLs carry their auth per request and the client sends no
+cookies (the `cookies` feature is off), so a shared connection carries nothing
+between sessions that the shared source IP does not already carry — except TLS
+session resumption, which lets a server link two sessions even across a source-IP
+change. That is the reason sharing stays opt-in rather than the default.
+Concurrency is unaffected: ureq opens a new connection whenever no idle one
+matches the authority, so the pool caps idle retention, not throughput.
 
 ### `AllocMeter` — per-client allocation attribution (opt-in)
 

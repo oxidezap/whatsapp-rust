@@ -64,14 +64,22 @@ const EMPTY_POOL_REPORT: HttpResourceReport = HttpResourceReport {
 /// reached the wire. Anything ureq refuses to build never opens a socket, so
 /// the pool stays provably empty; everything past this point is its business.
 ///
-/// The two refusals: `headers_ref` reports a builder carrying a bad header name
-/// or value, and ureq rejects a URI with no host or no known scheme. Erring
-/// towards "not dispatchable" if that rule ever widens keeps the estimate a
+/// The three refusals: `headers_ref` reports a builder carrying a bad header
+/// name or value, ureq rejects a URI with no host or no known scheme, and a
+/// request carrying `Connection: close` returns its socket to nobody. Erring
+/// towards "not dispatchable" if those rules ever widen keeps the estimate a
 /// lower bound, which is the direction that stays honest.
 ///
 /// Relaxed: the flag feeds an on-demand estimate, not a happens-before.
 fn mark_if_dispatchable<Any>(requested: &AtomicBool, req: &ureq::RequestBuilder<Any>, url: &str) {
-    let dispatchable = req.headers_ref().is_some()
+    let Some(headers) = req.headers_ref() else {
+        return;
+    };
+    let pools = !headers
+        .get_all(ureq::http::header::CONNECTION)
+        .iter()
+        .any(|value| value.as_bytes().eq_ignore_ascii_case(b"close"));
+    let dispatchable = pools
         && ureq::http::Uri::try_from(url).is_ok_and(|uri| {
             uri.authority().is_some() && matches!(uri.scheme_str(), Some("http" | "https"))
         });
@@ -737,6 +745,56 @@ mod tests {
             client.resource_report().and_then(|r| r.pool_buffer_bytes),
             Some(0),
             "nothing was built, so nothing connected"
+        );
+    }
+
+    /// The pool is what makes repeated media requests cheap, so an ordinary
+    /// request must keep landing on the connection the previous one left behind.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ordinary_request_reuses_the_pooled_connection() {
+        let (url, accepted) = spawn_keep_alive_server();
+        let client = UreqHttpClient::new();
+        for _ in 0..2 {
+            client
+                .execute(get(url.clone()))
+                .await
+                .expect("the request to answer");
+        }
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "the second request opened its own connection instead of reusing the pooled one"
+        );
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_connections),
+            Some(MAX_IDLE_CONNECTIONS)
+        );
+    }
+
+    /// `Connection: close` is how a one-shot caller declines to leave an idle
+    /// connection resident for the rest of the session — and, since nothing is
+    /// pooled, the report must stay empty too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connection_close_request_pools_nothing_and_reports_nothing() {
+        let (url, accepted) = spawn_keep_alive_server();
+        let client = UreqHttpClient::new();
+        for _ in 0..2 {
+            client
+                .execute(get(url.clone()).with_header("connection", "close"))
+                .await
+                .expect("the request to answer");
+        }
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            2,
+            "a connection the caller asked to close was pooled and reused"
+        );
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_buffer_bytes),
+            Some(0),
+            "nothing was pooled, so the estimate must not claim the cap"
         );
     }
 

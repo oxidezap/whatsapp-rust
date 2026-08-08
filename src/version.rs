@@ -12,7 +12,11 @@ const SW_URL: &str = "https://web.whatsapp.com/sw.js";
 pub async fn fetch_latest_app_version(
     http_client: &Arc<dyn HttpClient>,
 ) -> Result<(u32, u32, u32)> {
+    // `Connection: close` because this fetch runs at most once a day per
+    // device: a pooled idle TLS connection would be retained for the rest of
+    // the session and buys nothing back before it is purged.
     let request = HttpRequest::get(SW_URL).with_header("sec-fetch-site", "none")
+    .with_header("connection", "close")
     .with_header(
         "user-agent",
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -98,6 +102,22 @@ mod tests {
 
     struct StatusOnlyHttpClient(u16);
 
+    #[derive(Default)]
+    struct HeaderCapturingHttpClient {
+        seen: std::sync::Mutex<Option<std::collections::HashMap<String, String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for HeaderCapturingHttpClient {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+            *self.seen.lock().unwrap() = Some(request.headers);
+            Ok(HttpResponse {
+                status_code: 200,
+                body: b"client_revision:12345;".to_vec(),
+            })
+        }
+    }
+
     #[async_trait::async_trait]
     impl HttpClient for StatusOnlyHttpClient {
         async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse> {
@@ -149,6 +169,32 @@ mod tests {
         assert!(
             err.to_string().contains("403"),
             "the error must name the status, got: {err}"
+        );
+    }
+
+    /// The fetch runs once a day per device, but a pooled connection is held
+    /// for the session's lifetime, and nothing at the call site shows that. A
+    /// client that pools by default has to be told not to for this request.
+    #[tokio::test]
+    async fn the_version_fetch_declines_to_leave_a_pooled_connection() {
+        let capturing = Arc::new(HeaderCapturingHttpClient::default());
+        let http_client: Arc<dyn HttpClient> = capturing.clone();
+
+        let version = fetch_latest_app_version(&http_client)
+            .await
+            .expect("a 200 sw.js resolves a version");
+
+        assert_eq!(version, (2, 3000, 12345));
+        let headers = capturing
+            .seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the fetch issued a request");
+        assert_eq!(
+            headers.get("connection").map(String::as_str),
+            Some("close"),
+            "got: {headers:?}"
         );
     }
 
