@@ -140,10 +140,70 @@ So the SQLite page cache **is** the single largest chunk, but only on the
 SQLite profile, and it is roughly half the total rather than all of it. A
 process on a remote or in-memory backend still pays the other ~530 KiB, of
 which the largest named pieces are the prekey window the backend retains
-(~102 KiB for the default 812 keys) and the transport's WebSocket + TLS buffers
-(64 KiB). The HTTP idle pool used to belong on that list; the version fetch no
-longer leaves one behind (see below), so a session whose only HTTP traffic is
-that fetch pays nothing for it.
+(~104 KiB for the default 812 keys, but see the caveat below: that figure is
+`InMemoryBackend`-only) and the transport's WebSocket + TLS buffers (64 KiB).
+The HTTP idle pool used to belong on that list; the version fetch no longer
+leaves one behind (see below), so a session whose only HTTP traffic is that
+fetch pays nothing for it.
+
+### Four measured per-session costs, and which of them survive scrutiny
+
+Each of these was measured as marginal `RssAnon` in release against a control
+that does everything except the thing being measured. Two of the four figures
+that a call-site heap profile suggested did not survive that control, which is
+the reason for measuring against one.
+
+| what | measured | now |
+| --- | ---: | ---: |
+| HTTP: pooled TLS connection from the version fetch | 88 KiB | 0 KiB (#1243) |
+| noise: batch buffer after one 60 KiB frame | 60 KiB, vs 8 KiB small-traffic | 8 KiB (#1246) |
+| transport: retained `ClientConfig` | 14 KiB | 9 KiB (#1245) |
+| topology log preallocation | 4 KiB | 0 KiB (#1244) |
+
+**The prekey window is a backend artifact, not a per-session cost.** Building a
+client and generating the default 812 prekeys, against a control that builds the
+same client and generates none: `InMemoryBackend` 28 → 132 KiB, file-backed
+`SqliteStore` 432 → 448 KiB. So the keys cost ~104 KiB of heap in memory and
+~16 KiB on SQLite, but the SQLite client starts 404 KiB higher, so moving
+backends relocates the cost rather than removing it, into page cache that
+`RssAnon` counts and does not reclaim. The 104 KiB is also not waste: 58.7 KiB
+of it is the single `Vec::with_capacity(gen_count * 74)` in `upload_pre_keys_pass`
+staying alive because the `Bytes` slices handed to `store_prekeys_batch` *are*
+what the backend stores (one allocation instead of 812), and 41 KiB is that
+map's `RawTable` at 1024 buckets. Nothing to optimise; do not re-derive it.
+
+**The rustls session cache is 5 KiB, not 44.** A whole retained
+`default_tls_connector()` measures 14.0 KiB; disabling resumption entirely takes
+it to 9.0 KiB, and sizing the store for the one host a factory dials takes it to
+9.4 KiB. The other 9 KiB is the config plus the webpki root store.
+
+### Should a residency probe be permanent?
+
+No, and the reason generalises. Every finding above that was worth guarding
+turned out to have a **deterministic** guard available, and each of those is
+strictly better than an `RssAnon` assertion:
+
+- the HTTP pool, by counting accepted TCP connections against a keep-alive
+  fixture (`an_ordinary_request_reuses_the_pooled_connection` and its
+  `Connection: close` twin);
+- the noise batch buffer, by extracting the release decision into
+  `should_release_batch_buffer` and testing it directly; the wire-level test
+  could not see the buffer at all, and passed with the whole feature deleted;
+- the topology log, by asserting the bound and the floor rather than the bytes.
+
+An `RssAnon` assertion is page-quantised (the topology log's 8 KiB allocation
+shows up as a 4 KiB delta, because `with_capacity` reserves without writing),
+allocator-dependent, and needs a ceiling wide enough that it only catches
+order-of-magnitude regressions. The probe's value was in *finding* the numbers,
+not in re-checking them. Write one when you need a number; reach for a
+deterministic observable when you need a guard.
+
+To rebuild one: read `/proc/self/status`, construct N of the thing under test in
+a loop while holding them all alive, and take the **mean over the tail** rather
+than the median, because at these sizes the median quantises to the page. Give each
+variant its own process (`--exact`, or nextest): RSS never shrinks, so a second
+measurement in the same process reads ~0 as it reuses the first one's freed
+heap. That mistake makes a real cost look free.
 
 The pieces (each an `Option`-only struct in `wacore::stats`, filled only with
 what a component can introspect — absent means "not reported", not zero):
