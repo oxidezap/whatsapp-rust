@@ -71,6 +71,44 @@ const OUT_BUF_IDLE_CAPACITY: usize = 4096;
 /// interrupted to reallocate mid-flight.
 const SMALL_BATCHES_BEFORE_SHRINK: usize = 32;
 
+/// Whether the batch buffer should be swapped for an idle-sized one, advancing
+/// the burst-tracking state.
+///
+/// A free function because the buffer lives inside the sender task, where no
+/// test can reach it: the decision is only checkable if it is separable from
+/// the loop that acts on it.
+///
+/// `buffer_capacity` is read as well as the wire length because a frame that
+/// fails mid-encrypt is truncated back out of the buffer, leaving the
+/// allocation it grew with no wire bytes to notice it by. Only large traffic
+/// counts as the burst still running, though — a merely large buffer must not
+/// keep resetting the countdown that releases it.
+fn should_release_batch_buffer(
+    batch_wire_len: usize,
+    buffer_capacity: usize,
+    grown: &mut bool,
+    small_batches: &mut usize,
+) -> bool {
+    if batch_wire_len > OUT_BUF_IDLE_CAPACITY || buffer_capacity > OUT_BUF_IDLE_CAPACITY {
+        *grown = true;
+    }
+    if batch_wire_len > OUT_BUF_IDLE_CAPACITY {
+        *small_batches = 0;
+        return false;
+    }
+    // An empty batch wrote nothing, so it is not evidence of anything.
+    if !*grown || batch_wire_len == 0 {
+        return false;
+    }
+    *small_batches += 1;
+    if *small_batches < SMALL_BATCHES_BEFORE_SHRINK {
+        return false;
+    }
+    *grown = false;
+    *small_batches = 0;
+    true
+}
+
 /// Result type for send operations.
 type SendResult = std::result::Result<(), EncryptSendError>;
 
@@ -353,16 +391,13 @@ impl NoiseSocket {
             // Release the grown allocation once the burst is over. Nothing above
             // reads `out_buf` across iterations — `split()` left it empty — so
             // replacing it here cannot affect a batching decision.
-            if batch_wire_len > OUT_BUF_IDLE_CAPACITY {
-                out_buf_grown = true;
-                small_batches = 0;
-            } else if out_buf_grown && batch_wire_len > 0 {
-                small_batches += 1;
-                if small_batches >= SMALL_BATCHES_BEFORE_SHRINK {
-                    out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
-                    out_buf_grown = false;
-                    small_batches = 0;
-                }
+            if should_release_batch_buffer(
+                batch_wire_len,
+                out_buf.capacity(),
+                &mut out_buf_grown,
+                &mut small_batches,
+            ) {
+                out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
             }
         }
     }
@@ -1182,6 +1217,106 @@ mod tests {
             Ok(())
         }
         async fn disconnect(&self) {}
+    }
+
+    /// The wire-level test below cannot see the buffer, so the release decision
+    /// is checked here directly: without this, deleting the whole shrink would
+    /// leave every other assertion in this file green.
+    mod releasing_the_batch_buffer {
+        use super::super::{
+            OUT_BUF_IDLE_CAPACITY, SMALL_BATCHES_BEFORE_SHRINK, should_release_batch_buffer,
+        };
+
+        const BIG: usize = OUT_BUF_IDLE_CAPACITY + 1;
+        const SMALL: usize = 64;
+
+        /// Drives `count` small batches and returns how many asked for a release.
+        fn quiet(count: usize, capacity: usize, grown: &mut bool, small: &mut usize) -> usize {
+            (0..count)
+                .filter(|_| should_release_batch_buffer(SMALL, capacity, grown, small))
+                .count()
+        }
+
+        #[test]
+        fn a_grown_buffer_is_released_once_the_burst_has_been_quiet() {
+            let (mut grown, mut small) = (false, 0);
+            assert!(!should_release_batch_buffer(BIG, 0, &mut grown, &mut small));
+            assert!(grown, "a large batch must mark the buffer grown");
+
+            assert_eq!(
+                quiet(SMALL_BATCHES_BEFORE_SHRINK - 1, 0, &mut grown, &mut small),
+                0,
+                "released before the burst was over"
+            );
+            assert!(should_release_batch_buffer(
+                SMALL, 0, &mut grown, &mut small
+            ));
+            assert!(!grown, "the release must clear the grown flag");
+        }
+
+        /// The countdown is consecutive: traffic that is still large restarts it.
+        #[test]
+        fn a_large_batch_restarts_the_countdown() {
+            let (mut grown, mut small) = (false, 0);
+            should_release_batch_buffer(BIG, 0, &mut grown, &mut small);
+            quiet(SMALL_BATCHES_BEFORE_SHRINK - 1, 0, &mut grown, &mut small);
+
+            should_release_batch_buffer(BIG, 0, &mut grown, &mut small);
+
+            assert_eq!(
+                quiet(SMALL_BATCHES_BEFORE_SHRINK - 1, 0, &mut grown, &mut small),
+                0,
+                "the countdown carried over across a large batch"
+            );
+        }
+
+        /// A frame that fails mid-encrypt is truncated out of the buffer, so the
+        /// allocation it grew is left with no wire bytes naming it. Capacity is
+        /// the only remaining evidence, and it must not itself keep resetting
+        /// the countdown or the buffer would never be released at all.
+        #[test]
+        fn a_buffer_grown_by_a_truncated_frame_is_still_released() {
+            let (mut grown, mut small) = (false, 0);
+            assert!(!should_release_batch_buffer(
+                0,
+                64 * 1024,
+                &mut grown,
+                &mut small
+            ));
+            assert!(grown, "capacity alone must mark the buffer grown");
+
+            assert_eq!(
+                quiet(
+                    SMALL_BATCHES_BEFORE_SHRINK - 1,
+                    64 * 1024,
+                    &mut grown,
+                    &mut small
+                ),
+                0
+            );
+            assert!(should_release_batch_buffer(
+                SMALL,
+                64 * 1024,
+                &mut grown,
+                &mut small
+            ));
+        }
+
+        /// A socket that never sent anything large must never pay a realloc.
+        #[test]
+        fn a_buffer_that_never_grew_is_never_released() {
+            let (mut grown, mut small) = (false, 0);
+            assert_eq!(
+                quiet(
+                    SMALL_BATCHES_BEFORE_SHRINK * 4,
+                    OUT_BUF_IDLE_CAPACITY,
+                    &mut grown,
+                    &mut small
+                ),
+                0
+            );
+            assert!(!grown);
+        }
     }
 
     /// Releasing the grown buffer must be invisible on the wire: a burst after
