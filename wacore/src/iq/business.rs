@@ -281,7 +281,7 @@ pub struct BusinessProfileUpdate {
     pub business_hours: Option<BusinessHoursUpdate>,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 #[non_exhaustive]
 pub enum BusinessProfileUpdateError {
     /// A delta with no fields set would be a round trip that changes nothing.
@@ -291,6 +291,32 @@ pub enum BusinessProfileUpdateError {
         "business profile accepts at most {BUSINESS_PROFILE_MAX_WEBSITES} websites, got {count}"
     )]
     TooManyWebsites { count: usize },
+    /// `f64::to_string` would render a non-finite or out-of-range coordinate as
+    /// `NaN`/`inf`, or as a latitude no point on earth has. The server rejects
+    /// the whole delta in that case, so the other fields in the same update
+    /// would be silently lost too.
+    #[error("{axis} {value} is not a finite coordinate within ±{limit}")]
+    InvalidCoordinate {
+        axis: &'static str,
+        value: f64,
+        limit: f64,
+    },
+}
+
+const LATITUDE_LIMIT: f64 = 90.0;
+const LONGITUDE_LIMIT: f64 = 180.0;
+
+fn check_coordinate(
+    axis: &'static str,
+    value: f64,
+    limit: f64,
+) -> Result<(), BusinessProfileUpdateError> {
+    // Rejects NaN too: every comparison against NaN is false, so `abs() <=`
+    // fails for it without a separate is_nan check.
+    if value.abs() <= limit {
+        return Ok(());
+    }
+    Err(BusinessProfileUpdateError::InvalidCoordinate { axis, value, limit })
 }
 
 impl BusinessProfileUpdate {
@@ -316,6 +342,12 @@ impl BusinessProfileUpdate {
             return Err(BusinessProfileUpdateError::TooManyWebsites {
                 count: websites.len(),
             });
+        }
+        if let Some(latitude) = self.latitude {
+            check_coordinate("latitude", latitude, LATITUDE_LIMIT)?;
+        }
+        if let Some(longitude) = self.longitude {
+            check_coordinate("longitude", longitude, LONGITUDE_LIMIT)?;
         }
 
         let mut nodes = Vec::new();
@@ -749,6 +781,68 @@ mod tests {
             BusinessProfileUpdateSpec::new(&update).unwrap_err(),
             BusinessProfileUpdateError::TooManyWebsites { count: 3 }
         );
+    }
+
+    #[test]
+    fn coordinates_are_emitted_when_in_range() {
+        let update = BusinessProfileUpdate {
+            latitude: Some(-23.55052),
+            longitude: Some(-46.633308),
+            ..Default::default()
+        };
+        let children =
+            mutation_children(&BusinessProfileUpdateSpec::new(&update).unwrap().build_iq());
+
+        assert_eq!(children[0].tag.as_ref(), "latitude");
+        assert_eq!(child_text(&children[0]).as_deref(), Some("-23.55052"));
+        assert_eq!(children[1].tag.as_ref(), "longitude");
+        assert_eq!(child_text(&children[1]).as_deref(), Some("-46.633308"));
+    }
+
+    /// `f64::to_string` renders these as `NaN`/`inf`, which the server rejects —
+    /// taking the rest of the delta down with it.
+    #[test]
+    fn non_finite_and_out_of_range_coordinates_are_rejected() {
+        for latitude in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 90.5, -91.0] {
+            let update = BusinessProfileUpdate {
+                latitude: Some(latitude),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    BusinessProfileUpdateSpec::new(&update),
+                    Err(BusinessProfileUpdateError::InvalidCoordinate {
+                        axis: "latitude",
+                        ..
+                    })
+                ),
+                "latitude {latitude} should be rejected"
+            );
+        }
+
+        // Longitude has the wider bound: 100 is fine here, illegal as a latitude.
+        for longitude in [f64::NAN, 180.5, -181.0] {
+            let update = BusinessProfileUpdate {
+                longitude: Some(longitude),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    BusinessProfileUpdateSpec::new(&update),
+                    Err(BusinessProfileUpdateError::InvalidCoordinate {
+                        axis: "longitude",
+                        ..
+                    })
+                ),
+                "longitude {longitude} should be rejected"
+            );
+        }
+
+        let wide = BusinessProfileUpdate {
+            longitude: Some(150.0),
+            ..Default::default()
+        };
+        assert!(BusinessProfileUpdateSpec::new(&wide).is_ok());
     }
 
     #[test]

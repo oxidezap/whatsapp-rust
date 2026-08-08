@@ -25,12 +25,18 @@ use crate::request::IqError;
 use serde_json::{Value, json};
 use thiserror::Error;
 use wacore::WireEnum;
-use wacore::iq::business::{
-    BusinessProfileUpdate, BusinessProfileUpdateError, BusinessProfileUpdateSpec, CoverPhotoUpload,
-    RemoveCoverPhotoSpec, SetCoverPhotoSpec,
-};
+use wacore::iq::business::{BusinessProfileUpdateSpec, RemoveCoverPhotoSpec, SetCoverPhotoSpec};
 use wacore::iq::mex_operations::{biz_query_order, query_catalog, query_product_collections};
 use wacore_binary::Jid;
+
+// The profile types are protocol types and live in wacore, but they are the
+// arguments and error of this feature's public methods, so they belong on the
+// feature's public surface rather than making callers reach into wacore.
+pub use wacore::iq::business::{
+    BUSINESS_PROFILE_MAX_WEBSITES, BusinessHourMode, BusinessHoursConfig, BusinessHoursUpdate,
+    BusinessProfile, BusinessProfileUpdate, BusinessProfileUpdateError, CoverPhotoUpload,
+    DayOfWeek,
+};
 
 // The three defaults below are this client's choice, not values read off
 // WhatsApp Web. WA Web computes each of them at the call site from the surface
@@ -193,6 +199,19 @@ pub struct Collection {
     pub review_status: Option<String>,
 }
 
+/// One page of a business's collections.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Collections {
+    pub collections: Vec<Collection>,
+    /// Cursor for the next page; `None` on the last page. Pass it back as
+    /// [`CollectionOptions::after`].
+    ///
+    /// Unlike the catalog, this response carries a forward cursor only — there
+    /// is no `before` in the collections paging object.
+    pub after_cursor: Option<String>,
+}
+
 /// A line item on an order, which is a snapshot rather than a live product:
 /// the price is what was quoted when the order was placed.
 #[derive(Debug, Clone)]
@@ -307,12 +326,16 @@ impl<'a> Business<'a> {
         parse_catalog(&response_data(response.data, "catalog")?)
     }
 
-    /// Fetch a business's product collections, each with its products inline.
+    /// Fetch one page of a business's product collections, each with its
+    /// products inline.
+    ///
+    /// Paginate by feeding [`Collections::after_cursor`] back through
+    /// [`CollectionOptions::after`] until it comes back `None`.
     pub async fn get_collections(
         &self,
         jid: &Jid,
         options: &CollectionOptions,
-    ) -> Result<Vec<Collection>, BusinessError> {
+    ) -> Result<Collections, BusinessError> {
         let response = self
             .client
             .mex()
@@ -592,31 +615,46 @@ fn parse_catalog(data: &Value) -> Result<Catalog, BusinessError> {
     })
 }
 
-fn parse_collections(data: &Value) -> Result<Vec<Collection>, BusinessError> {
+fn parse_collections(data: &Value) -> Result<Collections, BusinessError> {
     const OP: &str = "collections";
 
-    let collections = data["xwa_product_catalog_get_collections"]["collections"]
-        .as_array()
-        .ok_or_else(|| {
-            BusinessError::malformed(
-                OP,
-                "missing xwa_product_catalog_get_collections.collections array",
-            )
-        })?;
+    let root = &data["xwa_product_catalog_get_collections"];
+    let collections = root["collections"].as_array().ok_or_else(|| {
+        BusinessError::malformed(
+            OP,
+            "missing xwa_product_catalog_get_collections.collections array",
+        )
+    })?;
 
-    collections
+    let collections = collections
         .iter()
         .map(|collection| {
-            let products = collection["products"]
-                .as_array()
-                .map(|products| {
-                    products
-                        .iter()
-                        .map(|p| parse_product(p, OP))
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .transpose()?
-                .unwrap_or_default();
+            // Indexing a non-object yields Null for every field, which would
+            // turn a malformed entry into a plausible-looking nameless
+            // collection instead of surfacing the bad response.
+            if !collection.is_object() {
+                return Err(BusinessError::malformed(
+                    OP,
+                    "collection entry is not an object",
+                ));
+            }
+
+            // A collection with no `products` key is legitimately empty, but a
+            // `products` that is present and not an array is malformed — the
+            // same distinction the catalog path makes.
+            let products = match &collection["products"] {
+                Value::Null => Vec::new(),
+                Value::Array(products) => products
+                    .iter()
+                    .map(|p| parse_product(p, OP))
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => {
+                    return Err(BusinessError::malformed(
+                        OP,
+                        "collection.products is not an array",
+                    ));
+                }
+            };
 
             Ok(Collection {
                 id: opt_str(&collection["id"]),
@@ -625,7 +663,12 @@ fn parse_collections(data: &Value) -> Result<Vec<Collection>, BusinessError> {
                 review_status: opt_str(&collection["status_info"]["status"]),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, BusinessError>>()?;
+
+    Ok(Collections {
+        collections,
+        after_cursor: opt_str(&root["paging"]["after"]),
+    })
 }
 
 fn parse_order(data: &Value) -> Result<Order, BusinessError> {
@@ -939,6 +982,7 @@ mod tests {
     fn parses_collections_with_inline_products() {
         let response = json!({
             "xwa_product_catalog_get_collections": {
+                "paging": { "after": "collections-page-2" },
                 "collections": [{
                     "id": "collection-1",
                     "name": "Stationery",
@@ -951,7 +995,8 @@ mod tests {
             }
         });
 
-        let collections = parse_collections(&response).unwrap();
+        let page = parse_collections(&response).unwrap();
+        let collections = &page.collections;
         assert_eq!(collections.len(), 2);
         assert_eq!(collections[0].name.as_deref(), Some("Stationery"));
         assert_eq!(collections[0].review_status.as_deref(), Some("APPROVED"));
@@ -966,6 +1011,59 @@ mod tests {
         );
         // A collection with no products key is empty, not malformed.
         assert!(collections[1].products.is_empty());
+    }
+
+    /// Without the cursor a caller cannot reach page 2, so a business with more
+    /// collections than `collection_limit` would silently look complete.
+    #[test]
+    fn collections_carry_the_continuation_cursor() {
+        let response = json!({
+            "xwa_product_catalog_get_collections": {
+                "paging": { "after": "collections-page-2" },
+                "collections": []
+            }
+        });
+        assert_eq!(
+            parse_collections(&response)
+                .unwrap()
+                .after_cursor
+                .as_deref(),
+            Some("collections-page-2")
+        );
+    }
+
+    #[test]
+    fn collections_last_page_has_no_cursor() {
+        // Absent paging object, and an empty cursor string, both mean "no more".
+        let absent = json!({ "xwa_product_catalog_get_collections": { "collections": [] } });
+        assert_eq!(parse_collections(&absent).unwrap().after_cursor, None);
+
+        let blank = json!({
+            "xwa_product_catalog_get_collections": { "paging": { "after": "" }, "collections": [] }
+        });
+        assert_eq!(parse_collections(&blank).unwrap().after_cursor, None);
+    }
+
+    /// A non-object entry would otherwise index to Null on every field and
+    /// surface as a real-looking nameless, empty collection.
+    #[test]
+    fn non_object_collection_entry_is_an_error() {
+        let response = json!({
+            "xwa_product_catalog_get_collections": { "collections": ["not-an-object"] }
+        });
+        assert!(parse_collections(&response).is_err());
+    }
+
+    /// Absent `products` is an empty collection, but a present non-array is
+    /// malformed — the same distinction the catalog path makes.
+    #[test]
+    fn non_array_collection_products_is_an_error() {
+        let response = json!({
+            "xwa_product_catalog_get_collections": {
+                "collections": [{ "id": "collection-1", "products": "nope" }]
+            }
+        });
+        assert!(parse_collections(&response).is_err());
     }
 
     #[test]
