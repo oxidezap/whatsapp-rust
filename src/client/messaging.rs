@@ -10,7 +10,9 @@ impl Client {
     /// cause the server to close the connection.
     ///
     /// This bypasses node logging and `sent_node_waiter` resolution — use
-    /// [`send_node`](Client::send_node) for normal stanza sending.
+    /// [`send_node`](Client::send_node) for normal stanza sending. It is still
+    /// observed: `Event::SentFrame` is emitted from the noise sender, past every
+    /// bypass here.
     pub async fn send_raw_bytes(&self, plaintext: Vec<u8>) -> Result<(), ClientError> {
         let noise_socket = self.get_noise_socket()?;
         // Wire bytes and the last-sent timestamp are recorded by the noise

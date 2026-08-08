@@ -14,6 +14,69 @@ pub fn node_to_owned_ref(node: &Node) -> Arc<OwnedNodeRef> {
     }
 }
 
+/// Records every [`Event::SentFrame`]
+/// it is dispatched, keeping the `Bytes` it arrived with so a test can check the
+/// pointer as well as the contents.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SentFrameRecorder {
+    frames: Mutex<Vec<bytes::Bytes>>,
+}
+
+#[cfg(test)]
+impl SentFrameRecorder {
+    pub(crate) fn frames(&self) -> Vec<bytes::Bytes> {
+        self.frames.lock().expect("recorded frames mutex").clone()
+    }
+}
+
+#[cfg(test)]
+impl EventHandler for SentFrameRecorder {
+    fn handle_event(&self, event: Arc<Event>) {
+        if let Event::SentFrame(sent) = &*event {
+            self.frames
+                .lock()
+                .expect("recorded frames mutex")
+                .push(sent.plaintext.clone());
+        }
+    }
+
+    fn interest(&self) -> EventInterest {
+        EventInterest::of(&[EventKind::SentFrame])
+    }
+}
+
+/// Splits a run of length-prefixed noise frames and decrypts each under the
+/// counter its position implies, yielding the plaintexts in wire order.
+///
+/// The counter is the AES-GCM nonce, so this doubles as an order check: a frame
+/// read out of position cannot authenticate.
+#[cfg(test)]
+pub(crate) fn decrypt_wire_frames(writes: &[bytes::Bytes], key: &[u8; 32]) -> Vec<Vec<u8>> {
+    use wacore::handshake::NoiseCipher;
+
+    let cipher = NoiseCipher::new(key).expect("32-byte key");
+    let mut plaintexts = Vec::new();
+    for write in writes {
+        let mut wire = &write[..];
+        while !wire.is_empty() {
+            let mut len = 0usize;
+            for byte in &wire[..wacore::framing::FRAME_LENGTH_SIZE] {
+                len = (len << 8) | *byte as usize;
+            }
+            let body =
+                &wire[wacore::framing::FRAME_LENGTH_SIZE..wacore::framing::FRAME_LENGTH_SIZE + len];
+            let mut body = bytes::BytesMut::from(body);
+            cipher
+                .decrypt_in_place_with_counter(plaintexts.len() as u32, &mut body)
+                .expect("each captured frame must decrypt under its own counter");
+            plaintexts.push(body.to_vec());
+            wire = &wire[wacore::framing::FRAME_LENGTH_SIZE + len..];
+        }
+    }
+    plaintexts
+}
+
 pub async fn wait_for_lock_waiter(lock: &Arc<async_lock::Mutex<()>>, baseline: usize) {
     poll_until("a task to reach the contested lock", || {
         Arc::strong_count(lock) > baseline
@@ -248,7 +311,7 @@ pub async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
 }
 
 use std::sync::Mutex;
-use wacore::types::events::{Event, EventHandler};
+use wacore::types::events::{Event, EventHandler, EventInterest, EventKind};
 
 #[derive(Default)]
 pub struct TestEventCollector {
@@ -320,14 +383,15 @@ pub(crate) async fn create_iq_test_client() -> (
     )
     .await;
 
-    // Wired to the client's stats like the real socket is, so per-frame
-    // bookkeeping is part of what tests observe.
-    let noise_socket = crate::socket::NoiseSocket::with_stats(
+    // Wired to the client's own observers like the real socket is, so per-frame
+    // bookkeeping and sent-frame forwarding are part of what tests observe.
+    let noise_socket = crate::socket::NoiseSocket::with_observers(
         Arc::new(TokioRuntime),
         transport.clone() as Arc<dyn crate::transport::Transport>,
         NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
         NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
-        Some(client.stats.clone()),
+        crate::socket::noise_socket::SendObservers::with_stats(client.stats.clone())
+            .with_sent_frames(client.sent_frame_tap.clone()),
     );
     *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);

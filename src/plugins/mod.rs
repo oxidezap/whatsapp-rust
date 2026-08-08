@@ -35,6 +35,7 @@ use crate::Client;
 use crate::client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
 use crate::client::{
     ClientLifecycle, ConnectionScope, ConnectionScopeState, DecryptedPayloadLease, RawNodeLease,
+    SentFrameLease,
 };
 use crate::request::IqError;
 use crate::send::{SendError, SendResult};
@@ -492,6 +493,7 @@ impl Drop for TaskLease {
 struct GatedForwarding {
     raw_node: Option<RawNodeLease>,
     decrypted_payload: Option<DecryptedPayloadLease>,
+    sent_frame: Option<SentFrameLease>,
 }
 
 impl GatedForwarding {
@@ -502,6 +504,7 @@ impl GatedForwarding {
     fn is_short_for(&self, interest: EventInterest) -> bool {
         (interest.wants(EventKind::RawNode) && self.raw_node.is_none())
             || (interest.wants(EventKind::DecryptedPayload) && self.decrypted_payload.is_none())
+            || (interest.wants(EventKind::SentFrame) && self.sent_frame.is_none())
     }
 
     /// Acquire what `interest` needs and this does not hold yet.
@@ -515,6 +518,8 @@ impl GatedForwarding {
             decrypted_payload: (interest.wants(EventKind::DecryptedPayload)
                 && self.decrypted_payload.is_none())
             .then(|| client.acquire_decrypted_payload_forwarding()),
+            sent_frame: (interest.wants(EventKind::SentFrame) && self.sent_frame.is_none())
+                .then(|| client.acquire_sent_frame_forwarding()),
         }
     }
 
@@ -522,6 +527,7 @@ impl GatedForwarding {
     fn commit(&mut self, acquired: Self) {
         self.raw_node = self.raw_node.take().or(acquired.raw_node);
         self.decrypted_payload = self.decrypted_payload.take().or(acquired.decrypted_payload);
+        self.sent_frame = self.sent_frame.take().or(acquired.sent_frame);
     }
 
     /// Give up what `interest` no longer asks for.
@@ -536,6 +542,9 @@ impl GatedForwarding {
                 .flatten(),
             decrypted_payload: (!interest.wants(EventKind::DecryptedPayload))
                 .then(|| self.decrypted_payload.take())
+                .flatten(),
+            sent_frame: (!interest.wants(EventKind::SentFrame))
+                .then(|| self.sent_frame.take())
                 .flatten(),
         }
     }
@@ -5996,17 +6005,19 @@ mod tests {
             "the kind that is no longer wanted releases its own lease"
         );
 
-        // Both at once, then each removed on its own.
+        // All at once, then each removed on its own.
         assert!(
             subscription
                 .update_interest(EventInterest::of(&[
                     EventKind::RawNode,
                     EventKind::DecryptedPayload,
+                    EventKind::SentFrame,
                 ]))
                 .expect("interest update")
         );
         assert!(client.raw_node_forwarding_enabled());
         assert!(client.decrypted_payload_forwarding_enabled());
+        assert!(client.sent_frame_forwarding_enabled());
 
         assert!(
             subscription
@@ -6015,10 +6026,20 @@ mod tests {
         );
         assert!(client.raw_node_forwarding_enabled(), "kept");
         assert!(!client.decrypted_payload_forwarding_enabled(), "released");
+        assert!(!client.sent_frame_forwarding_enabled(), "released");
+
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::SentFrame]))
+                .expect("interest update")
+        );
+        assert!(client.sent_frame_forwarding_enabled());
+        assert!(!client.raw_node_forwarding_enabled(), "released");
 
         assert!(subscription.unsubscribe());
         assert!(!client.raw_node_forwarding_enabled());
         assert!(!client.decrypted_payload_forwarding_enabled());
+        assert!(!client.sent_frame_forwarding_enabled());
     }
 
     #[tokio::test]

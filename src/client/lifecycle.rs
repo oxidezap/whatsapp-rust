@@ -315,6 +315,7 @@ impl Client {
         let (tx, rx) = async_channel::bounded(32);
 
         let device_topology = device_topology::DeviceTopology::new();
+        let sent_frame_tap = Arc::new(SentFrameTap::new(core.event_bus.clone()));
         let this = Self {
             runtime: runtime.clone(),
             core,
@@ -507,6 +508,7 @@ impl Client {
             alloc_meter: std::sync::OnceLock::new(),
             raw_node_forwarding: AtomicUsize::new(0),
             decrypted_payload_forwarding: AtomicUsize::new(0),
+            sent_frame_tap,
             stanza_interceptors: std::sync::RwLock::new(Arc::new(Vec::new())),
             stanza_interceptor_count: AtomicUsize::new(0),
             next_interceptor_id: AtomicU64::new(0),
@@ -823,7 +825,8 @@ impl Client {
             &self.ik_handshake_failures,
             transport.clone(),
             &mut transport_events,
-            Some(self.stats.clone()),
+            crate::socket::noise_socket::SendObservers::with_stats(self.stats.clone())
+                .with_sent_frames(self.sent_frame_tap.clone()),
         )
         .await
         {

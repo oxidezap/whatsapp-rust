@@ -128,6 +128,7 @@ pub use client::{
 pub use client::{CallError, Voip};
 pub use client::{
     Client, ClientBuild, ClientBuilder, ClientBuilderError, DecryptedPayloadLease, RawNodeLease,
+    SentFrameLease,
 };
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
@@ -238,7 +239,8 @@ pub mod version;
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
     pub use crate::client::{
-        Client, ClientBuilder, ClientBuilderError, ClientError, DecryptedPayloadLease, RawNodeLease,
+        Client, ClientBuilder, ClientBuilderError, ClientError, DecryptedPayloadLease,
+        RawNodeLease, SentFrameLease,
     };
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]

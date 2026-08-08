@@ -92,6 +92,36 @@ struct SendJob {
     response_tx: oneshot::Sender<SendResult>,
 }
 
+/// What a socket reports its sends to. Both halves belong to the `Client`; a
+/// VoIP relay socket and most tests pass [`Default`], reporting to neither.
+///
+/// One struct rather than one parameter each: the observation point is shared,
+/// so the next thing that wants to watch sends plugs in here instead of widening
+/// every constructor between here and `connect()` again.
+#[derive(Default, Clone)]
+pub struct SendObservers {
+    /// Wire-byte accounting, recorded after the transport write.
+    stats: Option<Arc<wacore::stats::SessionStats>>,
+    /// Publisher for the plaintext of each frame that reached the transport.
+    sent_frames: Option<Arc<crate::client::SentFrameTap>>,
+}
+
+impl SendObservers {
+    /// Report wire bytes into `stats` and nothing else.
+    pub fn with_stats(stats: Arc<wacore::stats::SessionStats>) -> Self {
+        Self {
+            stats: Some(stats),
+            sent_frames: None,
+        }
+    }
+
+    /// Also publish each sent frame's plaintext through `tap`.
+    pub(crate) fn with_sent_frames(mut self, tap: Arc<crate::client::SentFrameTap>) -> Self {
+        self.sent_frames = Some(tap);
+        self
+    }
+}
+
 pub struct NoiseSocket {
     read_key: Arc<NoiseCipher>,
     read_counter: Arc<AtomicU32>,
@@ -112,18 +142,24 @@ impl NoiseSocket {
         write_key: NoiseCipher,
         read_key: NoiseCipher,
     ) -> Self {
-        Self::with_stats(runtime, transport, write_key, read_key, None)
+        Self::with_observers(
+            runtime,
+            transport,
+            write_key,
+            read_key,
+            SendObservers::default(),
+        )
     }
 
-    /// Like [`Self::new`], recording sent frames into `stats` (the main WA
-    /// session socket passes the client's [`SessionStats`](wacore::stats::SessionStats); VoIP relay
-    /// sockets and tests pass `None`).
-    pub fn with_stats(
+    /// Like [`Self::new`], reporting each send to `observers` (the main WA
+    /// session socket passes the client's; VoIP relay sockets and most tests
+    /// report to nothing).
+    pub fn with_observers(
         runtime: Arc<dyn Runtime>,
         transport: Arc<dyn Transport>,
         write_key: NoiseCipher,
         read_key: NoiseCipher,
-        stats: Option<Arc<wacore::stats::SessionStats>>,
+        observers: SendObservers,
     ) -> Self {
         let write_key = Arc::new(write_key);
         let read_key = Arc::new(read_key);
@@ -142,7 +178,7 @@ impl NoiseSocket {
             transport_clone,
             write_key_clone,
             send_job_rx,
-            stats,
+            observers,
         )));
 
         Self {
@@ -161,8 +197,9 @@ impl NoiseSocket {
         transport: Arc<dyn Transport>,
         write_key: Arc<NoiseCipher>,
         send_job_rx: async_channel::Receiver<SendJob>,
-        stats: Option<Arc<wacore::stats::SessionStats>>,
+        observers: SendObservers,
     ) {
+        let SendObservers { stats, sent_frames } = observers;
         let mut write_counter: u32 = 0;
         // BytesMut: split().freeze() yields a zero-copy Bytes while retaining
         // the underlying allocation for the next frame.
@@ -182,6 +219,12 @@ impl NoiseSocket {
         // drops its response channel, which the caller sees as a closed sender:
         // a held-over job can be lost, but it can never hang its caller.
         let mut carry_over: Option<SendJob> = None;
+        // Plaintexts of this batch's frames, held only while a consumer is
+        // watching: each entry is a refcount bump on the buffer the caller
+        // marshalled, and the whole `Vec` stays empty (unallocated) otherwise.
+        // They are kept until after the write so what is published is what the
+        // transport actually accepted.
+        let mut observed: Vec<bytes::Bytes> = Vec::new();
 
         loop {
             let job = match carry_over.take() {
@@ -207,6 +250,12 @@ impl NoiseSocket {
             let mut job = job;
             loop {
                 let response_tx = job.response_tx;
+                // Cloned before the plaintext is consumed, dropped again if the
+                // frame never makes it into the buffer.
+                let to_observe = match sent_frames.as_deref() {
+                    Some(tap) if tap.enabled() => Some(job.plaintext.clone()),
+                    _ => None,
+                };
                 match Self::encrypt_frame_into(
                     &runtime,
                     &write_key,
@@ -216,7 +265,12 @@ impl NoiseSocket {
                 )
                 .await
                 {
-                    Ok(wire_bytes) => waiters.push((response_tx, wire_bytes)),
+                    Ok(wire_bytes) => {
+                        waiters.push((response_tx, wire_bytes));
+                        if let Some(plaintext) = to_observe {
+                            observed.push(plaintext);
+                        }
+                    }
                     Err(e) => {
                         // The counter is untouched on this frame, and every
                         // frame already in the buffer must still go out so the
@@ -268,11 +322,19 @@ impl NoiseSocket {
                                 stats.record_frame_sent(*wire_bytes);
                             }
                         }
+                        if let Some(tap) = sent_frames.as_deref() {
+                            for plaintext in observed.drain(..) {
+                                tap.publish(plaintext);
+                            }
+                        }
                         Ok(())
                     }
                     Err(e) => Err(EncryptSendError::transport(e)),
                 }
             };
+            // A write that failed says nothing about what the peer received, so
+            // its frames are not reported as sent.
+            observed.clear();
 
             {
                 // Crypto and framing failures are rejected before any byte
@@ -1436,12 +1498,12 @@ mod tests {
         let key = [0u8; 32];
         let stats = Arc::new(wacore::stats::SessionStats::new());
 
-        let socket = NoiseSocket::with_stats(
+        let socket = NoiseSocket::with_observers(
             Arc::new(crate::runtime_impl::TokioRuntime),
             transport.clone(),
             NoiseCipher::new(&key).expect("32-byte key"),
             NoiseCipher::new(&key).expect("32-byte key"),
-            Some(stats.clone()),
+            SendObservers::with_stats(stats.clone()),
         );
 
         for size in [0usize, 100, 5000] {
@@ -1506,6 +1568,198 @@ mod tests {
         assert!(
             result.is_ok(),
             "Payload above inline threshold should encrypt successfully"
+        );
+    }
+
+    use crate::test_utils::SentFrameRecorder;
+
+    /// A tap wired to a fresh bus, forwarding enabled, plus the observer behind
+    /// it and the subscription that has to outlive the test.
+    fn watched_tap() -> (
+        Arc<crate::client::SentFrameTap>,
+        Arc<SentFrameRecorder>,
+        wacore::types::events::Subscription,
+    ) {
+        let bus = wacore::types::events::CoreEventBus::new();
+        let observer = Arc::new(SentFrameRecorder::default());
+        let subscription = bus.subscribe_handler(observer.clone());
+        let tap = Arc::new(crate::client::SentFrameTap::new(bus));
+        tap.acquire();
+        (tap, observer, subscription)
+    }
+
+    fn socket_watched_by(
+        transport: Arc<dyn Transport>,
+        tap: Arc<crate::client::SentFrameTap>,
+    ) -> NoiseSocket {
+        let key = [0x9Cu8; 32];
+        NoiseSocket::with_observers(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            transport,
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            SendObservers::default().with_sent_frames(tap),
+        )
+    }
+
+    /// The observer receives the caller's own buffer. Handing over a copy would
+    /// double the cost of every send the moment anyone watched, which is the
+    /// difference between a recorder a consumer can leave on and one it cannot.
+    #[tokio::test]
+    async fn an_observed_frame_is_the_buffer_the_caller_handed_over() {
+        let (tap, observer, _subscription) = watched_tap();
+        let socket =
+            socket_watched_by(Arc::new(crate::transport::mock::MockTransport), tap.clone());
+
+        let payload = bytes::Bytes::from(vec![0x5Au8; 4096]);
+        let payload_ptr = payload.as_ptr();
+        socket
+            .encrypt_and_send(payload.clone())
+            .await
+            .expect("send must succeed");
+
+        let observed = observer.frames();
+        assert_eq!(observed.len(), 1, "the frame must be observed exactly once");
+        assert_eq!(
+            observed[0].as_ptr(),
+            payload_ptr,
+            "the observer must receive the sent buffer itself, not a copy of it"
+        );
+        assert_eq!(&observed[0][..], &payload[..]);
+    }
+
+    /// Nothing is observed while no consumer holds forwarding, and nothing is
+    /// built either: the tap counts its publications, so this also fails on a
+    /// build that is merely thrown away.
+    #[tokio::test]
+    async fn an_unwatched_send_publishes_nothing() {
+        let bus = wacore::types::events::CoreEventBus::new();
+        let observer = Arc::new(SentFrameRecorder::default());
+        let _subscription = bus.subscribe_handler(observer.clone());
+        let tap = Arc::new(crate::client::SentFrameTap::new(bus));
+        let socket =
+            socket_watched_by(Arc::new(crate::transport::mock::MockTransport), tap.clone());
+
+        assert!(!tap.enabled(), "no lease has been acquired");
+        for _ in 0..4 {
+            socket
+                .encrypt_and_send(bytes::Bytes::from(vec![1u8; 64]))
+                .await
+                .expect("send must succeed");
+        }
+
+        assert_eq!(
+            tap.published(),
+            0,
+            "nothing may be built without a consumer"
+        );
+        assert!(observer.frames().is_empty());
+    }
+
+    /// A frame the transport refused is not reported as sent: observing after
+    /// the write is what makes what arrives equal what left.
+    #[tokio::test]
+    async fn a_refused_write_is_not_observed() {
+        let (tap, observer, _subscription) = watched_tap();
+        let transport = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+        transport.fail_next_sends(1);
+        let socket = socket_watched_by(transport.clone(), tap.clone());
+
+        socket
+            .encrypt_and_send(bytes::Bytes::from(vec![2u8; 64]))
+            .await
+            .expect_err("injected transport failure");
+
+        assert_eq!(tap.published(), 0);
+        assert!(observer.frames().is_empty());
+    }
+
+    /// An observer that panics must not take the sender task with it, or one
+    /// consumer watching would end every send on the connection.
+    #[tokio::test]
+    async fn a_panicking_observer_does_not_break_the_send() {
+        struct PanickingObserver;
+        impl wacore::types::events::EventHandler for PanickingObserver {
+            fn handle_event(&self, _event: Arc<wacore::types::events::Event>) {
+                panic!("observer panics on every frame");
+            }
+            fn interest(&self) -> wacore::types::events::EventInterest {
+                wacore::types::events::EventInterest::of(&[
+                    wacore::types::events::EventKind::SentFrame,
+                ])
+            }
+        }
+
+        let bus = wacore::types::events::CoreEventBus::new();
+        let _subscription = bus.subscribe_handler(Arc::new(PanickingObserver));
+        let tap = Arc::new(crate::client::SentFrameTap::new(bus));
+        tap.acquire();
+        let transport = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+        let socket = socket_watched_by(transport.clone(), tap);
+
+        for attempt in 0..3u8 {
+            socket
+                .encrypt_and_send(bytes::Bytes::from(vec![attempt; 32]))
+                .await
+                .unwrap_or_else(|e| panic!("send {attempt} must survive the observer: {e:?}"));
+        }
+        assert_eq!(
+            transport.sent_count(),
+            3,
+            "every frame must still reach the transport"
+        );
+    }
+
+    /// What watching costs per frame, measured rather than argued. The idle path
+    /// must not move at all, and a watched send must not copy the payload: the
+    /// delta is the `Bytes` promotion to a shared handle plus the `Arc<Event>`
+    /// the bus dispatches, neither of which scales with the stanza.
+    #[tokio::test]
+    async fn watching_costs_a_constant_per_frame_and_idling_costs_nothing() {
+        async fn min_allocs_per_send(socket: &NoiseSocket, payload_len: usize) -> u64 {
+            let mut min = u64::MAX;
+            // Enough windows that one lands without a sibling test thread
+            // allocating inside it; the buffers the sender reuses have long
+            // stopped growing by then.
+            for _ in 0..2_000 {
+                let before = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
+                socket
+                    .encrypt_and_send(bytes::Bytes::from(vec![3u8; payload_len]))
+                    .await
+                    .expect("send must succeed");
+                let after = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
+                min = min.min(after - before);
+            }
+            min
+        }
+
+        let (tap, _observer, _subscription) = watched_tap();
+        let idle_tap = Arc::new(crate::client::SentFrameTap::new(
+            wacore::types::events::CoreEventBus::new(),
+        ));
+
+        let idle = min_allocs_per_send(
+            &socket_watched_by(Arc::new(crate::transport::mock::MockTransport), idle_tap),
+            256,
+        )
+        .await;
+        let watched = min_allocs_per_send(
+            &socket_watched_by(Arc::new(crate::transport::mock::MockTransport), tap),
+            256,
+        )
+        .await;
+
+        // 4 = the payload each window allocates for itself, plus the three the
+        // send path already cost before any of this existed. A ceiling rather
+        // than an equality: this must fail on a regression, not on a saving.
+        assert!(
+            idle <= 4,
+            "an unwatched send must cost what it always did, got {idle}"
+        );
+        assert_eq!(
+            watched - idle,
+            2,
+            "watching must cost a constant per frame (idle {idle}, watched {watched})"
         );
     }
 }

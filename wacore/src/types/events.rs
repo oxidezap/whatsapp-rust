@@ -276,6 +276,7 @@ pub enum EventKind {
     PairingCodeError,
     AppStateSyncFailed,
     DecryptedPayload,
+    SentFrame,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -289,7 +290,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::DecryptedPayload as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::SentFrame as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -992,6 +993,13 @@ pub enum Event {
     /// Last, like every new variant: a binary `Serialize` format writes the
     /// variant index, so inserting in the middle renumbers everything after it.
     DecryptedPayload(DecryptedPayload),
+
+    /// One marshaled stanza that reached the transport, emitted after the write.
+    ///
+    /// The outbound counterpart of [`Event::RawNode`]. Library extension — no WA
+    /// Web equivalent. Gated by `Client::acquire_sent_frame_forwarding()` so
+    /// nothing is cloned while unused.
+    SentFrame(SentFrame),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1095,6 +1103,7 @@ impl Event {
             Event::NewsletterLiveUpdate(_) => EventKind::NewsletterLiveUpdate,
             Event::RawNode(_) => EventKind::RawNode,
             Event::DecryptedPayload(_) => EventKind::DecryptedPayload,
+            Event::SentFrame(_) => EventKind::SentFrame,
             Event::MexNotification(_) => EventKind::MexNotification,
             Event::PairPasskeyRequest(_) => EventKind::PairPasskeyRequest,
             Event::PairPasskeyConfirmation(_) => EventKind::PairPasskeyConfirmation,
@@ -1686,6 +1695,44 @@ pub struct DecryptedPayload {
     /// hand and can frame them however its sink expects.
     #[serde(skip)]
     pub payload: Bytes,
+}
+
+/// Payload of [`Event::SentFrame`]: one marshaled stanza, exactly as it was
+/// encrypted and written.
+///
+/// The send side had no observer at all. [`Event::RawNode`] hands over every
+/// decoded stanza that arrives, but the only thing watching what leaves was a
+/// filtered one-shot waiter for a single expected stanza, and the paths that
+/// never build a `Node` at all (acks, delivery receipts, direct-encoded IQs)
+/// were invisible even to that. So a test could not assert what went to the wire
+/// without wrapping the transport, and a malformed stanza in production could not
+/// be read back without a rebuild.
+///
+/// Reasons to want it: recording a session for replay, asserting the wire form in
+/// an integration test, and diagnosing a stanza the server rejected.
+///
+/// Emitted from the noise sender once the transport accepted the write, which is
+/// the single point every send crosses. A frame that failed to encrypt or to
+/// write never appears here, and neither do the pre-noise handshake frames. It is
+/// dispatched before the send it belongs to resolves, so a caller that awaited a
+/// send can already see its frame.
+///
+/// Gated by `Client::acquire_sent_frame_forwarding()`: nothing is emitted, and
+/// nothing is cloned, while no consumer holds a lease.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct SentFrame {
+    /// The marshaled stanza, keeping the leading format byte the binary
+    /// protocol writes, so decoding it is
+    /// `wacore_binary::marshal::unmarshal_ref(&plaintext[1..])`.
+    ///
+    /// A `Bytes`, so forwarding it costs a refcount bump rather than a copy.
+    ///
+    /// **Not serialized**, for the same reason as
+    /// [`DecryptedPayload::payload`]: no text format carries raw bytes without
+    /// an encoding choice this type has no business making.
+    #[serde(skip)]
+    pub plaintext: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]

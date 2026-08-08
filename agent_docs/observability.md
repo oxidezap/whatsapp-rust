@@ -32,6 +32,17 @@ chokepoints:
   transport write — post-noise wire bytes (frame header + AEAD tag included).
 - **Received**: the read loop (`node_io.rs`) per `DataReceived` batch.
 
+That sent chokepoint is the *only* place every outbound frame crosses — five
+distinct send paths reach it (`send_node`, `send_raw_bytes`,
+`send_raw_bytes_burst`, and the ack/receipt workers through the burst), and
+`send_raw_bytes` deliberately bypasses node logging and sent-node waiters — so
+anything that has to see *everything* the client sends belongs there and nowhere
+else. `Event::SentFrame` is the other thing wired into it
+(`Client::acquire_sent_frame_forwarding()`, lease-gated like `RawNode`): it hands
+over the marshaled plaintext of each frame the transport accepted. Both halves
+travel to the socket as `SendObservers`, so the next observer plugs in there
+instead of widening `do_handshake` again.
+
 It also owns the activity timestamps the keepalive dead-socket watchdog reads:
 `last_data_received_ms` (one clock read per received transport event, plus one
 more when that event carries several frames, so a slow drain is not read as
