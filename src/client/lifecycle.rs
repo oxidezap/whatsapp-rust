@@ -823,6 +823,11 @@ impl Client {
         self.is_logged_in.store(false, Ordering::Relaxed);
         self.is_ready.store(false, Ordering::Relaxed);
         self.is_connected.store(false, Ordering::Relaxed);
+        // The retired connection's verdict, not this one's. Inherited, it makes
+        // the read loop exit on the first frame it decodes and `handle_success`
+        // refuse the login. `run` already clears it before each attempt; a
+        // caller driving connections itself has nowhere else to learn of it.
+        self.expected_disconnect.store(false, Ordering::Relaxed);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
             .store(false, Ordering::Relaxed);
@@ -1496,13 +1501,16 @@ impl Connection<'_> {
     /// Read this connection until it ends, then tear it down.
     ///
     /// Returns the reason an unexpected end carried (the same one dispatched
-    /// as `Event::Disconnected` just before returning), or `None` when the
-    /// connection ended on request. No reconnect happens here: once this
-    /// returns the client is offline and stays offline.
+    /// as `Event::Disconnected` just before returning), or `None` when the end
+    /// was not one to report: a requested disconnect, or a protocol step that
+    /// ends the stream on purpose, such as the 515 that follows pairing and
+    /// expects another connection. No reconnect happens here either way, so a
+    /// caller that wants one connects again.
     ///
     /// Dropping this future stops the read without tearing the connection
     /// down, exactly as dropping [`Client::run`] does: the socket stays open
-    /// and the client stays connected until [`Client::disconnect`] releases
+    /// and the client keeps reporting itself connected, so the next
+    /// [`Client::connect`] is refused until [`Client::disconnect`] releases
     /// it. Only the reader flag is given back, so a later `run` is not refused
     /// as already running.
     pub async fn read_until_disconnected(self) -> Option<DisconnectReason> {
@@ -1670,6 +1678,24 @@ mod tests {
         assert!(
             fixture.client.transport_events.lock().await.is_some(),
             "the reader's inlet must be untouched"
+        );
+    }
+
+    /// The post-pairing 515 ends a connection with `expected_disconnect` set,
+    /// and the read loop exits on the first frame it decodes while that holds.
+    /// `run` clears it at the top of each attempt; a caller driving connections
+    /// itself gets the same start, or its second connection dies on arrival.
+    #[tokio::test]
+    async fn connecting_clears_the_retired_connection_expected_disconnect() {
+        let client = crate::test_utils::create_test_client().await;
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+
+        // The reset runs before any I/O, so the attempt itself need not finish.
+        let _ = tokio::time::timeout(Duration::from_millis(500), client.connect()).await;
+
+        assert!(
+            !client.expected_disconnect.load(Ordering::Relaxed),
+            "a new connection must not inherit the previous one's disconnect verdict"
         );
     }
 
