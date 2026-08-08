@@ -57,6 +57,20 @@ impl GcmInPlaceBuffer for FrameBody<'_> {
 const MAX_BATCH_FRAMES: usize = 16;
 const MAX_BATCH_WIRE_BYTES: usize = 64 * 1024;
 
+/// What the batch buffer holds between bursts: a few small stanzas coalesced.
+///
+/// One large stanza grows the buffer to its own size, and the allocation then
+/// outlives the burst that needed it, so a single media-sized send costs the
+/// session tens of KiB for the rest of the connection. Measured at 60 KiB
+/// resident per socket after one 60 KiB frame, against 8 KiB for a socket that
+/// only ever sends small ones.
+const OUT_BUF_IDLE_CAPACITY: usize = 4096;
+
+/// Consecutive small batches that mark a burst as finished. Only then is the
+/// grown buffer released, so a burst spread over several batches is never
+/// interrupted to reallocate mid-flight.
+const SMALL_BATCHES_BEFORE_SHRINK: usize = 32;
+
 /// Result type for send operations.
 type SendResult = std::result::Result<(), EncryptSendError>;
 
@@ -166,7 +180,11 @@ impl NoiseSocket {
         let mut write_counter: u32 = 0;
         // BytesMut: split().freeze() yields a zero-copy Bytes while retaining
         // the underlying allocation for the next frame.
-        let mut out_buf = BytesMut::with_capacity(4096);
+        let mut out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
+        // Whether `out_buf` is still holding an allocation a burst grew, and how
+        // many small batches have gone out since.
+        let mut out_buf_grown = false;
+        let mut small_batches: usize = 0;
         // A failed transport write says nothing about how much of the frame the
         // peer received, so the counter that frame consumed can neither be
         // reused (nonce reuse under the same write key) nor confidently skipped
@@ -245,12 +263,14 @@ impl NoiseSocket {
                 }
             }
 
+            let mut batch_wire_len = 0usize;
             let outcome = if out_buf.is_empty() {
                 Ok(())
             } else {
                 // Zero-copy: split() hands the written bytes over and out_buf
                 // keeps its capacity for the next batch.
                 let wire = out_buf.split().freeze();
+                batch_wire_len = wire.len();
                 if waiters.len() > 1 {
                     // The only externally visible sign that a batch happened.
                     // Without it, "does the peer accept several frames in one
@@ -328,6 +348,21 @@ impl NoiseSocket {
             }
             if let Some((response_tx, err)) = encrypt_failure {
                 let _ = response_tx.send(Err(err));
+            }
+
+            // Release the grown allocation once the burst is over. Nothing above
+            // reads `out_buf` across iterations — `split()` left it empty — so
+            // replacing it here cannot affect a batching decision.
+            if batch_wire_len > OUT_BUF_IDLE_CAPACITY {
+                out_buf_grown = true;
+                small_batches = 0;
+            } else if out_buf_grown && batch_wire_len > 0 {
+                small_batches += 1;
+                if small_batches >= SMALL_BATCHES_BEFORE_SHRINK {
+                    out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
+                    out_buf_grown = false;
+                    small_batches = 0;
+                }
             }
         }
     }
@@ -1147,6 +1182,86 @@ mod tests {
             Ok(())
         }
         async fn disconnect(&self) {}
+    }
+
+    /// Releasing the grown buffer must be invisible on the wire: a burst after
+    /// the shrink has to regrow, coalesce and decrypt exactly as the first one
+    /// did, with counter order intact across the whole connection.
+    #[tokio::test]
+    async fn a_burst_after_the_buffer_shrinks_still_batches_and_round_trips() {
+        let key = [0x5au8; 32];
+        let transport = GatedTransport::closed();
+        let socket = Arc::new(NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            transport.clone(),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        ));
+
+        // A frame big enough to grow the buffer well past its idle capacity.
+        const BIG: usize = 40 * 1024;
+        const SMALL: usize = 64;
+        let mut expected: Vec<Vec<u8>> = Vec::new();
+
+        // Grow, then quieten past the shrink threshold. Sent one at a time so
+        // each is its own batch, which is what the threshold counts — and so
+        // the order is the send order, which concurrent sends past the
+        // channel's capacity would not guarantee.
+        transport.gate.add_permits(SMALL_BATCHES_BEFORE_SHRINK + 1);
+        for payload in std::iter::once(vec![0xAAu8; BIG])
+            .chain((0..SMALL_BATCHES_BEFORE_SHRINK).map(|i| vec![i as u8; SMALL]))
+        {
+            expected.push(payload.clone());
+            socket
+                .encrypt_and_send(bytes::Bytes::from(payload))
+                .await
+                .expect("warm-up send must succeed");
+        }
+
+        // The buffer is back to idle size; this burst has to regrow it.
+        const BURST: usize = 5;
+        const BURST_BYTES: usize = 20 * 1024;
+        let payloads: Vec<Vec<u8>> = (0..BURST)
+            .map(|i| vec![0xB0 | i as u8; BURST_BYTES])
+            .collect();
+        expected.extend(payloads.iter().cloned());
+        let mut sends = queue_all(&socket, payloads.into_iter().map(bytes::Bytes::from));
+        transport.gate.add_permits(BURST);
+        for result in (&mut sends).await {
+            result.expect("post-shrink send must succeed");
+        }
+
+        let writes = transport.writes();
+        for write in &writes {
+            let frames = split_frames(write);
+            assert!(
+                frames.len() == 1 || write.len() <= MAX_BATCH_WIRE_BYTES,
+                "the ceiling must still hold after a shrink: {} bytes in {} frames",
+                write.len(),
+                frames.len()
+            );
+        }
+        assert!(
+            writes
+                .iter()
+                .skip_while(|w| split_frames(w).len() <= 1)
+                .any(|w| split_frames(w).len() > 1),
+            "the regrown buffer must still coalesce, otherwise the shrink cost batching"
+        );
+
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let bodies: Vec<Vec<u8>> = writes.iter().flat_map(|w| split_frames(w)).collect();
+        assert_eq!(
+            bodies.len(),
+            expected.len(),
+            "every frame must reach the wire"
+        );
+        for (counter, (mut body, want)) in bodies.into_iter().zip(expected).enumerate() {
+            read_key
+                .decrypt_in_place_with_counter(counter as u32, &mut body)
+                .expect("a shrink must not disturb counter order");
+            assert_eq!(body, want, "frame {counter} did not round-trip");
+        }
     }
 
     /// Queues every payload on `socket` and returns the joined sends, still
