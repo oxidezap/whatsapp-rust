@@ -223,13 +223,12 @@ async fn test_ack_without_matching_waiter() {
     );
 }
 
-/// Round-trip a built `Node` into the raw-bytes shape `unpack()` produces
-/// from the network (marshal_ref prepends a 0x00 format byte that
-/// `OwnedNodeRef::new` does not expect).
+/// Round-trip a built `Node` into the shape the receive path holds: node bytes,
+/// as `unpack` hands them over once the format byte is off.
 fn to_owned_node(node: &Node) -> OwnedNodeRef {
-    wacore_binary::marshal::marshal_ref(&node.as_node_ref())
-        .and_then(|buf| OwnedNodeRef::new(bytes::Bytes::from(buf).slice(1..)))
-        .expect("valid node")
+    let marshaled = wacore_binary::marshal::marshal_ref(&node.as_node_ref()).expect("valid node");
+    let node_bytes = wacore_binary::util::unpack(&marshaled).expect("packed payload");
+    OwnedNodeRef::new(node_bytes.into_owned()).expect("valid node")
 }
 
 fn owned_ack_node(id: &str) -> OwnedNodeRef {
@@ -2519,10 +2518,8 @@ fn test_encode_ack_bytes_roundtrip_recipient() {
         AckParticipantPolicy::Preserve,
     )
     .expect("encode_ack_bytes should produce bytes");
-    // The Encoder prepends a leading format byte (see `marshal`); the
-    // decoder wants raw protocol bytes — same handling as `node_to_owned_ref`.
     let decoded =
-        wacore_binary::marshal::unmarshal_ref(&buf[1..]).expect("encoded ack should decode");
+        wacore_binary::marshal::unmarshal_packed_ref(&buf).expect("encoded ack should decode");
     assert_eq!(decoded.tag, "ack");
     assert!(
         decoded
@@ -2556,7 +2553,7 @@ fn test_encode_ack_bytes_roundtrip_recipient() {
     )
     .expect("encode_ack_bytes should produce bytes");
     let decoded =
-        wacore_binary::marshal::unmarshal_ref(&buf[1..]).expect("encoded ack should decode");
+        wacore_binary::marshal::unmarshal_packed_ref(&buf).expect("encoded ack should decode");
     assert!(
         decoded.get_attr("recipient").is_none(),
         "encode_ack_bytes must not synthesise `recipient` when absent"
@@ -2644,7 +2641,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         AckParticipantPolicy::OmitReceiptDestinationDuplicate,
     )
     .expect("complete receipt should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded receipt ack should decode");
 
     assert!(
@@ -2672,7 +2669,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         AckParticipantPolicy::OmitReceiptDestinationDuplicate,
     )
     .expect("group receipt should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded group receipt ack should decode");
     assert!(
         ack.get_attr("participant")
@@ -2691,7 +2688,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         AckParticipantPolicy::Preserve,
     )
     .expect("complete message should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded message ack should decode");
     assert!(
         ack.get_attr("participant")
@@ -2726,7 +2723,7 @@ fn test_encode_ack_bytes_compares_jid_participants_by_display() {
         AckParticipantPolicy::OmitReceiptDestinationDuplicate,
     )
     .expect("complete receipt should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded receipt ack should decode");
 
     assert!(
@@ -2749,7 +2746,7 @@ fn test_encode_ack_bytes_drops_encrypt_identity_notification_type() {
         AckParticipantPolicy::Preserve,
     )
     .expect("complete notification should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded notification ack should decode");
 
     assert!(
@@ -2769,8 +2766,8 @@ fn test_encode_ack_bytes_preserves_call_class_and_type() {
         .build();
     let bytes = encode_ack_bytes(&call.as_node_ref(), None, AckParticipantPolicy::Preserve)
         .expect("complete call should produce an ack");
-    let ack =
-        wacore_binary::marshal::unmarshal_ref(&bytes[1..]).expect("encoded call ack should decode");
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
+        .expect("encoded call ack should decode");
 
     assert!(
         ack.get_attr("class")
@@ -5323,4 +5320,90 @@ async fn a_handle_outliving_its_client_does_not_keep_it_alive() {
         handle
     };
     drop(handle);
+}
+
+/// A stanza that arrived can be sent back out as it stands: pack what the
+/// decoder holds and the bytes reaching the transport are the ones the marshal
+/// produced, no re-encode involved. This is the round trip a forwarding or
+/// replay consumer performs, asserted at the point the frame leaves.
+#[tokio::test]
+async fn a_received_stanza_forwards_as_the_bytes_it_arrived_as() {
+    use wacore::handshake::NoiseCipher;
+
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+    let node = NodeBuilder::new("message")
+        .attr("to", "15551234567@s.whatsapp.net")
+        .attr("id", "FORWARD-1")
+        .children([NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .bytes(vec![0xAB; 64])
+            .build()])
+        .build();
+    let marshaled = wacore_binary::marshal::marshal(&node).expect("marshal");
+    let received = to_owned_node(&node);
+
+    client
+        .send_raw_bytes(wacore_binary::util::pack(&received.backing_bytes()))
+        .await
+        .expect("installed socket");
+
+    crate::test_utils::poll_until("the forwarded frame to reach the transport", || {
+        !transport.sent().is_empty()
+    })
+    .await;
+    let cipher = NoiseCipher::new(&[0u8; 32]).expect("32-byte key");
+    let mut sent = transport.sent()[0][3..].to_vec();
+    cipher
+        .decrypt_in_place_with_counter(0, &mut sent)
+        .expect("captured frame should decrypt");
+
+    assert_eq!(
+        sent, marshaled,
+        "the forwarded frame must carry the original marshal output"
+    );
+}
+
+/// The other half: node bytes handed to the send path are refused here rather
+/// than accepted and answered by the server closing the connection.
+#[tokio::test]
+async fn send_raw_bytes_refuses_a_payload_without_its_format_byte() {
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+    let node = NodeBuilder::new("iq").attr("id", "REJECT-1").build();
+    let node_bytes = to_owned_node(&node).backing_bytes().to_vec();
+
+    let error = client
+        .send_raw_bytes(node_bytes.clone())
+        .await
+        .expect_err("node bytes are not a packed payload");
+    assert!(
+        matches!(
+            error,
+            ClientError::Socket(SocketError::Marshal(
+                wacore_binary::BinaryError::UnexpectedFormatByte(byte)
+            )) if byte == node_bytes[0]
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        matches!(
+            client.send_raw_bytes(Vec::new()).await,
+            Err(ClientError::Socket(SocketError::Marshal(
+                wacore_binary::BinaryError::EmptyData
+            )))
+        ),
+        "an empty payload has no format byte either"
+    );
+    assert!(
+        transport.sent().is_empty(),
+        "a refused payload must not reach the transport"
+    );
+
+    // The same stanza, packed, goes out.
+    client
+        .send_raw_bytes(wacore_binary::util::pack(&node_bytes))
+        .await
+        .expect("installed socket");
+    assert_eq!(transport.sent().len(), 1);
 }

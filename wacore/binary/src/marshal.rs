@@ -17,6 +17,10 @@ const AUTO_ATTR_ESTIMATE: usize = 24;
 const AUTO_CHILD_ESTIMATE: usize = 96;
 const AUTO_GRANDCHILD_ESTIMATE: usize = 40;
 
+/// Decode node bytes: the buffer without the format byte, which is what the
+/// receive path holds after [`unpack`](crate::util::unpack) and what
+/// `OwnedNodeRef` stores. For a buffer that still carries the format byte, as
+/// [`marshal`] writes it, use [`unmarshal_packed_ref`].
 pub fn unmarshal_ref(data: &[u8]) -> Result<NodeRef<'_>> {
     let mut decoder = Decoder::new(data);
     let node = decoder.read_node_ref()?;
@@ -25,6 +29,22 @@ pub fn unmarshal_ref(data: &[u8]) -> Result<NodeRef<'_>> {
         Ok(node)
     } else {
         Err(BinaryError::LeftoverData(decoder.bytes_left()))
+    }
+}
+
+/// Decode a packed payload: the format byte plus node bytes, exactly what
+/// [`marshal`] produces and what a frame carries before `unpack`.
+///
+/// Only the uncompressed form is accepted. The returned node borrows from
+/// `data`, and decompressed bytes would have nowhere to live; reach for
+/// [`unpack`](crate::util::unpack) plus [`unmarshal_ref`] there.
+pub fn unmarshal_packed_ref(data: &[u8]) -> Result<NodeRef<'_>> {
+    match data.split_first() {
+        None => Err(BinaryError::EmptyData),
+        Some((&format, node_bytes)) if format == crate::util::FORMAT_PLAIN => {
+            unmarshal_ref(node_bytes)
+        }
+        Some((&format, _)) => Err(BinaryError::UnexpectedFormatByte(format)),
     }
 }
 
@@ -349,7 +369,7 @@ mod tests {
             !bytes.contains(&crate::token::INTEROP_JID),
             "no integrator, no INTEROP_JID token"
         );
-        let decoded = unmarshal_ref(&bytes[1..])?;
+        let decoded = unmarshal_packed_ref(&bytes)?;
         let back = decoded
             .attrs
             .iter()
@@ -384,9 +404,8 @@ mod tests {
             attrs.push("jid".to_string(), NodeValue::Jid(original.clone()));
             let node = Node::new("iq", attrs, None);
 
-            // marshal writes a leading format byte that unmarshal_ref does not expect.
             let bytes = marshal(&node)?;
-            let decoded = unmarshal_ref(&bytes[1..])?;
+            let decoded = unmarshal_packed_ref(&bytes)?;
             let from_wire = decoded
                 .attrs
                 .iter()

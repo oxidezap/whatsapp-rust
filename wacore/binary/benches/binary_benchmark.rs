@@ -8,7 +8,7 @@ use wacore_binary::marshal::{
     marshal_to, unmarshal_ref,
 };
 use wacore_binary::node::Node;
-use wacore_binary::util::unpack;
+use wacore_binary::util::{FORMAT_COMPRESSED, unpack};
 
 fn main() {
     divan::main();
@@ -264,57 +264,61 @@ fn bench_marshal_to_reused_buffer_large(bencher: divan::Bencher) {
         });
 }
 
-// Setup functions for unmarshal benchmarks - pre-compute marshaled data
-// Note: marshal() adds a flag byte at position 0, unmarshal_ref expects data without it
-fn setup_small_marshaled() -> Vec<u8> {
-    marshal(&create_small_node()).unwrap()
+// Setup functions for unmarshal benchmarks: `unmarshal_ref` takes node bytes,
+// so the format byte comes off in setup rather than inside the timed region.
+fn node_bytes(node: &Node) -> Vec<u8> {
+    unpack(&marshal(node).unwrap()).unwrap().into_owned()
 }
 
-fn setup_large_marshaled() -> Vec<u8> {
-    marshal(&create_large_node()).unwrap()
+fn setup_small_node_bytes() -> Vec<u8> {
+    node_bytes(&create_small_node())
+}
+
+fn setup_large_node_bytes() -> Vec<u8> {
+    node_bytes(&create_large_node())
 }
 
 #[divan::bench]
 fn bench_unmarshal_small(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_small_marshaled)
-        .bench_refs(|marshaled| {
-            black_box(unmarshal_ref(black_box(&marshaled[1..])).unwrap());
+        .with_inputs(setup_small_node_bytes)
+        .bench_refs(|bytes| {
+            black_box(unmarshal_ref(black_box(bytes)).unwrap());
         });
 }
 
-fn setup_ack_marshaled() -> Vec<u8> {
-    marshal(&create_ack_node()).unwrap()
+fn setup_ack_node_bytes() -> Vec<u8> {
+    node_bytes(&create_ack_node())
 }
 
-fn setup_fanout_marshaled() -> Vec<u8> {
-    marshal(&create_fanout_node()).unwrap()
+fn setup_fanout_node_bytes() -> Vec<u8> {
+    node_bytes(&create_fanout_node())
 }
 
 #[divan::bench]
 fn bench_unmarshal_ack(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_ack_marshaled)
-        .bench_refs(|marshaled| {
-            black_box(unmarshal_ref(black_box(&marshaled[1..])).unwrap());
+        .with_inputs(setup_ack_node_bytes)
+        .bench_refs(|bytes| {
+            black_box(unmarshal_ref(black_box(bytes)).unwrap());
         });
 }
 
 #[divan::bench]
 fn bench_unmarshal_fanout(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_fanout_marshaled)
-        .bench_refs(|marshaled| {
-            black_box(unmarshal_ref(black_box(&marshaled[1..])).unwrap());
+        .with_inputs(setup_fanout_node_bytes)
+        .bench_refs(|bytes| {
+            black_box(unmarshal_ref(black_box(bytes)).unwrap());
         });
 }
 
 #[divan::bench]
 fn bench_unmarshal_large(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_large_marshaled)
-        .bench_refs(|marshaled| {
-            black_box(unmarshal_ref(black_box(&marshaled[1..])).unwrap());
+        .with_inputs(setup_large_node_bytes)
+        .bench_refs(|bytes| {
+            black_box(unmarshal_ref(black_box(bytes)).unwrap());
         });
 }
 
@@ -323,16 +327,14 @@ fn bench_unmarshal_large(bencher: divan::Bencher) {
 // compressed body is a realistic multi-KB frame (the marshaled usync-like
 // node), matching what the server actually compresses.
 fn setup_uncompressed_payload() -> Vec<u8> {
-    let mut payload = vec![0u8];
-    payload.extend_from_slice(&marshal(&create_large_node()).unwrap()[1..]);
-    payload
+    marshal(&create_large_node()).unwrap()
 }
 
 fn setup_compressed_payload() -> Vec<u8> {
-    let body = marshal(&create_usync_like_node()).unwrap();
-    let mut payload = vec![2u8];
+    let body = node_bytes(&create_usync_like_node());
+    let mut payload = vec![FORMAT_COMPRESSED];
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&body[1..]).unwrap();
+    encoder.write_all(&body).unwrap();
     payload.extend_from_slice(&encoder.finish().unwrap());
     payload
 }
@@ -355,9 +357,9 @@ fn bench_unpack_compressed(bencher: divan::Bencher) {
         });
 }
 
-// Setup function for attr_parser benchmark - pre-compute marshaled data
-fn setup_attr_marshaled() -> Vec<u8> {
-    marshal(&create_attr_node()).unwrap()
+// Setup function for attr_parser benchmark - pre-compute node bytes
+fn setup_attr_node_bytes() -> Vec<u8> {
+    node_bytes(&create_attr_node())
 }
 
 // Measures decode + attr access together: a NodeRef borrows its wire buffer,
@@ -365,10 +367,9 @@ fn setup_attr_marshaled() -> Vec<u8> {
 #[divan::bench]
 fn bench_attr_parser(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_attr_marshaled)
-        .bench_refs(|marshaled| {
-            // Skip the flag byte at position 0
-            let node_ref = unmarshal_ref(&marshaled[1..]).unwrap();
+        .with_inputs(setup_attr_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(bytes).unwrap();
 
             let mut parser = node_ref.attrs();
             black_box(parser.optional_string("xmlns"));
@@ -385,10 +386,9 @@ fn bench_attr_parser(bencher: divan::Bencher) {
 #[divan::bench]
 fn bench_roundtrip_small(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_small_marshaled)
-        .bench_refs(|marshaled| {
-            // Skip the flag byte at position 0
-            let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
+        .with_inputs(setup_small_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
             black_box(marshal_ref(&node_ref).unwrap())
         });
 }
@@ -396,10 +396,9 @@ fn bench_roundtrip_small(bencher: divan::Bencher) {
 #[divan::bench]
 fn bench_roundtrip_large(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_large_marshaled)
-        .bench_refs(|marshaled| {
-            // Skip the flag byte at position 0
-            let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
+        .with_inputs(setup_large_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
             black_box(marshal_ref(&node_ref).unwrap())
         });
 }
@@ -407,10 +406,9 @@ fn bench_roundtrip_large(bencher: divan::Bencher) {
 #[divan::bench]
 fn bench_roundtrip_auto_small(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_small_marshaled)
-        .bench_refs(|marshaled| {
-            // Skip the flag byte at position 0
-            let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
+        .with_inputs(setup_small_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
             black_box(marshal_ref_auto(&node_ref).unwrap())
         });
 }
@@ -418,10 +416,9 @@ fn bench_roundtrip_auto_small(bencher: divan::Bencher) {
 #[divan::bench]
 fn bench_roundtrip_auto_large(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_large_marshaled)
-        .bench_refs(|marshaled| {
-            // Skip the flag byte at position 0
-            let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
+        .with_inputs(setup_large_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
             black_box(marshal_ref_auto(&node_ref).unwrap())
         });
 }
@@ -429,10 +426,9 @@ fn bench_roundtrip_auto_large(bencher: divan::Bencher) {
 #[divan::bench]
 fn bench_roundtrip_exact_small(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_small_marshaled)
-        .bench_refs(|marshaled| {
-            // Skip the flag byte at position 0
-            let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
+        .with_inputs(setup_small_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
             black_box(marshal_ref_exact(&node_ref).unwrap())
         });
 }
@@ -440,10 +436,9 @@ fn bench_roundtrip_exact_small(bencher: divan::Bencher) {
 #[divan::bench]
 fn bench_roundtrip_exact_large(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_large_marshaled)
-        .bench_refs(|marshaled| {
-            // Skip the flag byte at position 0
-            let node_ref = unmarshal_ref(black_box(&marshaled[1..])).unwrap();
+        .with_inputs(setup_large_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(black_box(bytes)).unwrap();
             black_box(marshal_ref_exact(&node_ref).unwrap())
         });
 }
@@ -472,9 +467,9 @@ fn bench_get_children_by_tag(bencher: divan::Bencher) {
         });
 }
 
-// Setup function for JID optimization benchmark - pre-compute marshaled JID-heavy data
-fn setup_jid_heavy_marshaled() -> Vec<u8> {
-    marshal(&create_jid_heavy_node()).unwrap()
+// Setup function for JID optimization benchmark - pre-compute JID-heavy node bytes
+fn setup_jid_heavy_node_bytes() -> Vec<u8> {
+    node_bytes(&create_jid_heavy_node())
 }
 
 // Benchmark that measures the JID attribute optimization.
@@ -486,10 +481,9 @@ fn setup_jid_heavy_marshaled() -> Vec<u8> {
 #[divan::bench]
 fn bench_jid_to_owned_access(bencher: divan::Bencher) {
     bencher
-        .with_inputs(setup_jid_heavy_marshaled)
-        .bench_refs(|marshaled| {
-            // Skip the flag byte at position 0
-            let node_ref = unmarshal_ref(&marshaled[1..]).unwrap();
+        .with_inputs(setup_jid_heavy_node_bytes)
+        .bench_refs(|bytes| {
+            let node_ref = unmarshal_ref(bytes).unwrap();
 
             // Convert to owned Node - this is where JIDs are preserved (optimization)
             let node = node_ref.to_owned();

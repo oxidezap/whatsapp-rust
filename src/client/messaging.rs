@@ -3,15 +3,26 @@
 use super::*;
 
 impl Client {
-    /// Send pre-marshaled plaintext bytes through the noise socket.
+    /// Send a pre-marshaled stanza through the noise socket.
     ///
-    /// The bytes must be a valid WABinary-marshaled stanza (as produced by
-    /// `wacore_binary::marshal::marshal_to`). Sending malformed data will
-    /// cause the server to close the connection.
+    /// The bytes must be a packed payload: the format byte followed by the node
+    /// bytes, which is what every `wacore_binary::marshal::marshal*` function
+    /// writes. A stanza that came off the wire is one byte short of that, since
+    /// `OwnedNodeRef::backing_bytes()` returns node bytes only and the receive
+    /// path stripped the format byte, so forward it through
+    /// `wacore_binary::util::pack`. Anything else the server answers by closing
+    /// the connection, which is why the format byte is checked here.
     ///
     /// This bypasses node logging and `sent_node_waiter` resolution — use
     /// [`send_node`](Client::send_node) for normal stanza sending.
     pub async fn send_raw_bytes(&self, plaintext: Vec<u8>) -> Result<(), ClientError> {
+        if !wacore_binary::util::is_packed_payload(&plaintext) {
+            let error = match plaintext.first() {
+                Some(&format) => wacore_binary::BinaryError::UnexpectedFormatByte(format),
+                None => wacore_binary::BinaryError::EmptyData,
+            };
+            return Err(SocketError::Marshal(error).into());
+        }
         let noise_socket = self.get_noise_socket()?;
         // Wire bytes and the last-sent timestamp are recorded by the noise
         // sender task at the actual transport write.
