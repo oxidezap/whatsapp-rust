@@ -25,6 +25,7 @@ use extension_lifecycle::LifecycleRegistration;
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+pub use lifecycle::Connection;
 pub use voip::{CallError, Voip};
 
 use crate::cache::Cache;
