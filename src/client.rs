@@ -175,9 +175,12 @@ impl SentFrameTap {
     ///
     /// The dispatch is caught: a consumer that only watches must not be able to
     /// take the send pipeline down with it, and this runs on the noise sender
-    /// task, whose death would end every send on the connection. A handler that
-    /// *blocks* still stalls sends, which is the same contract every event
-    /// handler already has on the read loop.
+    /// task, whose death would end every send on the connection. Containment is
+    /// per dispatch, not per handler, so a panicking observer costs this frame
+    /// for the observers behind it — the bus offers no per-handler isolation for
+    /// any kind, and plugins already wrap their own handlers. A handler that
+    /// *blocks* still stalls sends, the contract every handler has on the read
+    /// loop.
     pub(crate) fn publish(&self, plaintext: bytes::Bytes) {
         #[cfg(test)]
         self.published.fetch_add(1, Ordering::Relaxed);

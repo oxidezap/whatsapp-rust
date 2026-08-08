@@ -322,7 +322,12 @@ impl NoiseSocket {
                                 stats.record_frame_sent(*wire_bytes);
                             }
                         }
-                        if let Some(tap) = sent_frames.as_deref() {
+                        // Re-read the gate rather than trusting the one read at
+                        // capture time: a lease released while this batch was in
+                        // flight must not see a frame arrive after it let go.
+                        if let Some(tap) = sent_frames.as_deref()
+                            && tap.enabled()
+                        {
                             for plaintext in observed.drain(..) {
                                 tap.publish(plaintext);
                             }
@@ -1184,6 +1189,10 @@ mod tests {
     struct GatedTransport {
         writes: std::sync::Mutex<Vec<bytes::Bytes>>,
         gate: tokio::sync::Semaphore,
+        /// Writes that have reached the gate, counted before it is awaited: the
+        /// only way a test can tell "the sender is parked mid-write" from "the
+        /// sender has not started yet".
+        arrivals: std::sync::atomic::AtomicUsize,
     }
 
     impl GatedTransport {
@@ -1191,11 +1200,16 @@ mod tests {
             Arc::new(Self {
                 writes: std::sync::Mutex::new(Vec::new()),
                 gate: tokio::sync::Semaphore::new(0),
+                arrivals: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
         fn writes(&self) -> Vec<bytes::Bytes> {
             self.writes.lock().expect("writes mutex").clone()
+        }
+
+        fn arrivals(&self) -> usize {
+            self.arrivals.load(Ordering::SeqCst)
         }
     }
 
@@ -1203,6 +1217,7 @@ mod tests {
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl Transport for GatedTransport {
         async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
             let permit = self.gate.acquire().await.expect("gate open");
             permit.forget();
             self.writes.lock().expect("writes mutex").push(data);
@@ -1671,6 +1686,42 @@ mod tests {
             .expect_err("injected transport failure");
 
         assert_eq!(tap.published(), 0);
+        assert!(observer.frames().is_empty());
+    }
+
+    /// A lease released while a frame is already encrypted and waiting on the
+    /// transport must still turn the frame away: the gate is read at capture
+    /// time, so without the second read at publish time a consumer that stopped
+    /// watching would get one more frame after it let go. The gated transport
+    /// holds the write open across the release, which is the whole window.
+    #[tokio::test]
+    async fn a_lease_released_mid_write_turns_its_frame_away() {
+        let (tap, observer, _subscription) = watched_tap();
+        let transport = GatedTransport::closed();
+        let socket = Arc::new(socket_watched_by(transport.clone(), tap.clone()));
+
+        let mut send = queue_all(&socket, [bytes::Bytes::from(vec![4u8; 64])].into_iter());
+        // Parked inside the write, which is past capture and past encryption:
+        // releasing before this point would prove nothing, since the frame
+        // would never have been captured at all.
+        crate::test_utils::poll_until("the write to reach the gate", || transport.arrivals() == 1)
+            .await;
+        tap.release();
+        transport.gate.add_permits(1);
+        for result in (&mut send).await {
+            result.expect("the send itself must still succeed");
+        }
+
+        assert_eq!(
+            transport.writes().len(),
+            1,
+            "the frame must still reach the wire"
+        );
+        assert_eq!(
+            tap.published(),
+            0,
+            "a frame must not be published after the last lease is released"
+        );
         assert!(observer.frames().is_empty());
     }
 
