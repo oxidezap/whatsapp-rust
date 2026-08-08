@@ -798,7 +798,7 @@ mod tests {
     // reads, with fictitious ids, names and JIDs.
 
     fn biz_jid() -> Jid {
-        "15550000000@s.whatsapp.net".parse().unwrap()
+        "12025550111@s.whatsapp.net".parse().unwrap()
     }
 
     /// Every numeric catalog variable is a *string* on the wire. Sending JSON
@@ -808,7 +808,7 @@ mod tests {
         let vars = catalog_variables(&biz_jid(), &CatalogOptions::default());
         let request = &vars["request"]["product_catalog"];
 
-        assert_eq!(request["jid"], json!("15550000000@s.whatsapp.net"));
+        assert_eq!(request["jid"], json!("12025550111@s.whatsapp.net"));
         assert_eq!(request["limit"], json!("10"));
         assert_eq!(request["width"], json!("100"));
         assert_eq!(request["height"], json!("100"));
@@ -841,7 +841,7 @@ mod tests {
         let request = &vars["request"]["collections"];
 
         // The collections query keys the business on `biz_jid`, not `jid`.
-        assert_eq!(request["biz_jid"], json!("15550000000@s.whatsapp.net"));
+        assert_eq!(request["biz_jid"], json!("12025550111@s.whatsapp.net"));
         assert!(request.get("jid").is_none());
         assert_eq!(request["collection_limit"], json!("51"));
         assert_eq!(request["item_limit"], json!("51"));
@@ -857,7 +857,7 @@ mod tests {
         let request = &value["request"]["order"];
 
         assert_eq!(request["id"], json!("order-1"));
-        assert_eq!(request["jid"], json!("15550000000@s.whatsapp.net"));
+        assert_eq!(request["jid"], json!("12025550111@s.whatsapp.net"));
         assert_eq!(
             request["token"]["sensitive_string_value"],
             json!("b3JkZXItdG9rZW4=")
