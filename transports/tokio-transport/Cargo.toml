@@ -36,7 +36,7 @@ webpki-roots = "1.0.9"
 [dev-dependencies]
 # The upgrade-header tests read the request off a local socket. Dev-only, so the
 # release dependency set — and the binary-size gate — are unaffected.
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
 
 [lints]
 workspace = true

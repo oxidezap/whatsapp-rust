@@ -168,10 +168,6 @@ fn should_persist_cert_chain(device: &wacore::store::Device) -> bool {
     device.is_registered()
 }
 
-#[cfg_attr(
-    feature = "tracing",
-    tracing::instrument(name = "wa.conn.handshake", level = "debug", skip_all, err(Debug))
-)]
 pub async fn do_handshake(
     runtime: Arc<dyn Runtime>,
     persistence_manager: &PersistenceManager,
@@ -180,6 +176,41 @@ pub async fn do_handshake(
     transport_events: &mut async_channel::Receiver<TransportEvent>,
     stats: Option<Arc<wacore::stats::SessionStats>>,
 ) -> Result<Arc<NoiseSocket>> {
+    let (write_cipher, read_cipher) = negotiate(
+        &runtime,
+        persistence_manager,
+        ik_handshake_failures,
+        &transport,
+        transport_events,
+    )
+    .await?;
+
+    // Built outside the handshake span: the socket spawns the connection's
+    // sender task, which encrypts every outbound frame until the connection
+    // ends. Inside, that per-frame work is rooted at a one-shot span.
+    Ok(Arc::new(NoiseSocket::with_stats(
+        runtime,
+        transport,
+        write_cipher,
+        read_cipher,
+        stats,
+    )))
+}
+
+/// Runs the Noise handshake and returns the transport cipher pair it derived.
+/// The cert chain never leaves this function: persisting it is part of the
+/// handshake, using it is not.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.conn.handshake", level = "debug", skip_all, err(Debug))
+)]
+async fn negotiate(
+    runtime: &Arc<dyn Runtime>,
+    persistence_manager: &PersistenceManager,
+    ik_handshake_failures: &AtomicU32,
+    transport: &Arc<dyn Transport>,
+    transport_events: &mut async_channel::Receiver<TransportEvent>,
+) -> Result<(NoiseCipher, NoiseCipher)> {
     let device_snapshot = persistence_manager.get_device_snapshot();
     let now_secs = wacore::time::now_secs();
     let pattern = select_pattern(
@@ -194,7 +225,7 @@ pub async fn do_handshake(
         HandshakePattern::Xx => {
             debug!("[socket] doFullHandshake: openChatSocket send hello");
             run_xx_handshake(
-                &runtime,
+                runtime,
                 &device_snapshot,
                 transport.clone(),
                 transport_events,
@@ -204,7 +235,7 @@ pub async fn do_handshake(
         HandshakePattern::Ik(server_static_pub) => {
             debug!("[socket] resumeNoiseHandshake started");
             run_ik_handshake(
-                &runtime,
+                runtime,
                 &device_snapshot,
                 server_static_pub,
                 transport.clone(),
@@ -225,13 +256,7 @@ pub async fn do_handshake(
                     .await;
             }
             ik_handshake_failures.store(0, Ordering::Release);
-            Ok(Arc::new(NoiseSocket::with_stats(
-                runtime,
-                transport,
-                success.write_cipher,
-                success.read_cipher,
-                stats,
-            )))
+            Ok((success.write_cipher, success.read_cipher))
         }
         Err(e) => {
             // Skip invalidation past the XXfallback pivot: by that point the
