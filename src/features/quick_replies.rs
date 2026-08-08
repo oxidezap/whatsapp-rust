@@ -105,6 +105,14 @@ impl<'a> QuickReplies<'a> {
                 "quick reply message cannot be empty".into(),
             ));
         }
+        // `count` is a usage tally WA Web only ever increments, so a negative one
+        // is a caller bug with no wire behind it. The proto field is a signed
+        // `int32` and would carry it to every linked device unremarked.
+        if count < 0 {
+            return Err(AppStateError::InvalidRequest(
+                "quick reply count cannot be negative".into(),
+            ));
+        }
         // Don't log the shortcut or message (user content); the id is enough to trace.
         debug!("Setting quick reply {id} (count={count})");
         // `associatedLabelIds` is left empty on purpose, not by omission: both of
@@ -443,6 +451,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("message cannot be empty"));
+
+        let err = qr
+            .set_quick_reply("1", "hi", "Hi there", Vec::new(), -1)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("count cannot be negative"));
+
+        // Zero is the documented starting value, not a rejected one. It fails
+        // later, on the app-state send, which is past the guards under test.
+        let err = qr
+            .set_quick_reply("1", "hi", "Hi there", Vec::new(), 0)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("count cannot be negative"));
 
         assert!(qr.delete_quick_reply("").await.is_err());
     }
