@@ -952,6 +952,21 @@ impl Client {
         *self.transport.lock().await = Some(transport);
         *self.transport_events.lock().await = Some(transport_events);
         *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = Some(noise_socket);
+
+        // The last word, because the slot locks above are the final awaits a
+        // shutdown could land across, and `signal_shutdown_sync` runs no
+        // cleanup of its own. Nothing has been announced yet, so undoing the
+        // publish here is the whole retraction.
+        if self.shutdown_signal().is_fired() {
+            let orphan = self.transport.lock().await.take();
+            *self.transport_events.lock().await = None;
+            *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            if let Some(orphan) = orphan {
+                orphan.disconnect().await;
+            }
+            return Err(ConnectError::Shutdown);
+        }
+
         self.is_connected.store(true, Ordering::Release);
 
         // Notify waiters that socket is ready (before login)
