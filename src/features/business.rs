@@ -139,7 +139,9 @@ pub struct Price {
 #[non_exhaustive]
 pub struct SalePrice {
     pub price: Price,
-    /// WhatsApp Web only treats the window as set when *both* ends are present.
+    /// Both ends or neither: WhatsApp Web only treats the window as set when
+    /// both are present, and the parser normalises a lone endpoint away rather
+    /// than surfacing a period the official client does not honour.
     pub start_date: Option<String>,
     pub end_date: Option<String>,
 }
@@ -651,10 +653,22 @@ fn parse_product(value: &Value, operation: &'static str) -> Result<Product, Busi
     let status = object(operation, value, "status_info")?;
     let media = object(operation, value, "media")?;
     let sale = object(operation, value, "sale_price")?;
-    let sale_price = parse_price(&sale["price"], currency.as_deref()).map(|price| SalePrice {
-        price,
-        start_date: opt_str(&sale["start_date"]),
-        end_date: opt_str(&sale["end_date"]),
+    // The window is both dates or neither, the way WhatsApp Web reads it:
+    // `start_date != null && end_date != null ? {...} : null` on the MEX path,
+    // and `hasChild("start_date") && hasChild("end_date")` on the IQ one. A lone
+    // endpoint is not a period, and surfacing one would invite a caller to
+    // schedule a promotion the official client does not consider scheduled.
+    let window = opt_str(&sale["start_date"]).zip(opt_str(&sale["end_date"]));
+    let sale_price = parse_price(&sale["price"], currency.as_deref()).map(|price| {
+        let (start_date, end_date) = match window {
+            Some((start, end)) => (Some(start), Some(end)),
+            None => (None, None),
+        };
+        SalePrice {
+            price,
+            start_date,
+            end_date,
+        }
     });
 
     Ok(Product {
@@ -1547,6 +1561,42 @@ mod tests {
         ] {
             assert!(order(body).is_err(), "order {field} must be rejected");
         }
+    }
+
+    /// WhatsApp Web gates the whole window on both ends being present
+    /// (`start_date != null && end_date != null ? {...} : null`), so half a
+    /// window is not a period and must not reach a caller as one.
+    #[test]
+    fn a_half_open_sale_window_is_dropped() {
+        let with_sale = |sale| {
+            parse_catalog(&json!({
+                "xwa_product_catalog_get_product_catalog": { "product_catalog": { "products": [{
+                    "id": "1000000000000001", "currency": "BRL", "sale_price": sale
+                }] } }
+            }))
+            .unwrap()
+            .products
+            .swap_remove(0)
+            .sale_price
+            .unwrap()
+        };
+
+        for sale in [
+            json!({ "price": "9990", "start_date": "1700000000" }),
+            json!({ "price": "9990", "end_date": "1700600000" }),
+        ] {
+            let sale_price = with_sale(sale);
+            // The price itself still stands; only the window is dropped.
+            assert_eq!(sale_price.price.amount_1000, 9990);
+            assert_eq!(sale_price.start_date, None);
+            assert_eq!(sale_price.end_date, None);
+        }
+
+        let both = with_sale(json!({
+            "price": "9990", "start_date": "1700000000", "end_date": "1700600000"
+        }));
+        assert_eq!(both.start_date.as_deref(), Some("1700000000"));
+        assert_eq!(both.end_date.as_deref(), Some("1700600000"));
     }
 
     #[test]
