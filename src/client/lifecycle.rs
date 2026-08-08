@@ -1508,12 +1508,16 @@ impl Connection<'_> {
         // sent over this connection would be refused for want of the reader
         // that is right here. `run` sets it before connecting and owns clearing
         // it, so only a directly driven connection claims it.
+        // Guarded, not a store after the await: a caller that drops this future
+        // (a wrapping timeout, an aborted task) stops reading too, and a flag
+        // left standing would advertise a reader that no longer exists.
         let owns_reader = !this.client.is_running.swap(true, Ordering::SeqCst);
-        let reason = this.client.drive_connection().await;
-        if owns_reader {
-            this.client.stop_supervision_loop();
-        }
-        reason
+        let _release_reader = owns_reader.then(|| {
+            scopeguard::guard((), |_| {
+                this.client.stop_supervision_loop();
+            })
+        });
+        this.client.drive_connection().await
     }
 }
 
@@ -1660,6 +1664,34 @@ mod tests {
         assert!(
             fixture.client.transport_events.lock().await.is_some(),
             "the reader's inlet must be untouched"
+        );
+    }
+
+    /// A read that is dropped mid-connection has stopped reading, so the flag
+    /// that says otherwise has to come back. Left standing it would refuse the
+    /// next `run()` as already running and admit requests to a dead reader.
+    #[tokio::test]
+    async fn a_cancelled_read_gives_the_reader_flag_back() {
+        let fixture = PendingFrame::new().await;
+        // The fixture client is pre-marked as driven; this one does the driving.
+        fixture.client.is_running.store(false, Ordering::SeqCst);
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            fixture
+                .client
+                .connection_for_test()
+                .read_until_disconnected(),
+        )
+        .await;
+
+        assert!(
+            cancelled.is_err(),
+            "the read must still be waiting for frames when the timeout cancels it"
+        );
+        assert!(
+            !fixture.client.is_running.load(Ordering::SeqCst),
+            "a cancelled read must not leave the client advertising a reader"
         );
     }
 
