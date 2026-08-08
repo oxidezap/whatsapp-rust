@@ -311,6 +311,11 @@ pub enum BusinessProfileUpdateError {
         mode: String,
         expectation: &'static str,
     },
+    /// WhatsApp Web writes `open_time` and `close_time` together, from one
+    /// `[open, close]` pair, so half of a range is a shape it never emits —
+    /// whatever the mode.
+    #[error("{day} has only one of open_time and close_time")]
+    IncompleteBusinessHourRange { day: String },
     /// `f64::to_string` would render a non-finite or out-of-range coordinate as
     /// `NaN`/`inf`, or as a latitude no point on earth has. The server rejects
     /// the whole delta in that case, so the other fields in the same update
@@ -355,7 +360,19 @@ fn check_coordinate(
 /// exists so a mode WhatsApp adds later degrades to a passthrough, and
 /// guessing its arity here would turn that into a hard failure.
 fn check_mode_pairing(config: &BusinessHoursConfig) -> Result<(), BusinessProfileUpdateError> {
-    let has_range = config.open_time.is_some() || config.close_time.is_some();
+    // A half-open range is malformed whatever the mode — including one this
+    // crate does not know — because WhatsApp Web only ever emits the two times
+    // together, from a single `[open, close]` pair. So it is settled before the
+    // mode is consulted at all.
+    let has_range = match (config.open_time, config.close_time) {
+        (Some(_), Some(_)) => true,
+        (None, None) => false,
+        _ => {
+            return Err(BusinessProfileUpdateError::IncompleteBusinessHourRange {
+                day: config.day_of_week.as_str().to_string(),
+            });
+        }
+    };
     let expectation = match (&config.mode, has_range) {
         (BusinessHourMode::SpecificHours, false) => "needs an opening and closing time",
         (BusinessHourMode::Open24H | BusinessHourMode::AppointmentOnly, true) => {
@@ -1014,6 +1031,39 @@ mod tests {
                 ),
                 "{config:?} should be rejected"
             );
+        }
+    }
+
+    /// WA Web writes the two times together from one `[open, close]` pair, so
+    /// half a range is malformed under every mode — including an unknown one,
+    /// where the shape is broken regardless of what arity the mode implies.
+    #[test]
+    fn half_open_business_hour_range_is_rejected_under_any_mode() {
+        for mode in [
+            BusinessHourMode::SpecificHours,
+            BusinessHourMode::Open24H,
+            BusinessHourMode::Other("seasonal".into()),
+        ] {
+            for (open, close) in [(Some(540), None), (None, Some(1020))] {
+                let mut config = BusinessHoursConfig::new(DayOfWeek::Monday, mode.clone());
+                config.open_time = open;
+                config.close_time = close;
+                let update = BusinessProfileUpdate {
+                    business_hours: Some(BusinessHoursUpdate {
+                        note: None,
+                        timezone: None,
+                        config: vec![config],
+                    }),
+                    ..Default::default()
+                };
+                assert!(
+                    matches!(
+                        BusinessProfileUpdateSpec::new(&update),
+                        Err(BusinessProfileUpdateError::IncompleteBusinessHourRange { .. })
+                    ),
+                    "{mode:?} with {open:?}/{close:?} should be rejected"
+                );
+            }
         }
     }
 

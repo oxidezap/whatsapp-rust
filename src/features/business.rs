@@ -537,20 +537,27 @@ fn opt_bool(value: &Value) -> Option<bool> {
 }
 
 /// Reads `variant_info.variant_properties`. A product with no variants omits
-/// the object entirely, which is an empty list rather than an error.
-fn parse_variant_properties(variant_info: &Value) -> Vec<VariantProperty> {
-    variant_info["variant_properties"]
-        .as_array()
-        .map(|properties| {
-            properties
-                .iter()
-                .map(|property| VariantProperty {
-                    name: opt_str(&property["name"]),
-                    value: opt_str(&property["value"]),
-                })
-                .collect()
+/// the object entirely, which is an empty list rather than an error — but a
+/// field that is present and not an array is malformed, and reporting it as
+/// variant-free would hide an order that cannot be fulfilled.
+fn parse_variant_properties(
+    operation: &'static str,
+    variant_info: &Value,
+) -> Result<Vec<VariantProperty>, BusinessError> {
+    let properties = &variant_info["variant_properties"];
+    if properties.is_null() {
+        return Ok(Vec::new());
+    }
+    let properties = properties.as_array().ok_or_else(|| {
+        BusinessError::malformed(operation, "variant_info.variant_properties is not an array")
+    })?;
+    Ok(properties
+        .iter()
+        .map(|property| VariantProperty {
+            name: opt_str(&property["name"]),
+            value: opt_str(&property["value"]),
         })
-        .unwrap_or_default()
+        .collect())
 }
 
 fn opt_i64(value: &Value) -> Option<i64> {
@@ -746,7 +753,7 @@ fn parse_order(data: &Value) -> Result<Order, BusinessError> {
                 price: parse_price(&product["price"], currency.as_deref()),
                 quantity: opt_i64(&product["quantity"]),
                 images: parse_images(&product["media"]),
-                variant_properties: parse_variant_properties(&product["variant_info"]),
+                variant_properties: parse_variant_properties(OP, &product["variant_info"])?,
             })
         })
         .collect::<Result<Vec<_>, BusinessError>>()?;
@@ -1234,6 +1241,31 @@ mod tests {
     fn order_without_payload_is_an_error() {
         assert!(parse_order(&json!({})).is_err());
         assert!(parse_order(&json!({ "xwa_checkout_get_order_info": { "order": {} } })).is_err());
+    }
+
+    /// Absent means no variants, but a present non-array is malformed — and
+    /// silently reading it as variant-free would hide an unfulfillable order.
+    #[test]
+    fn non_array_variant_properties_is_an_error() {
+        assert!(
+            parse_order(&json!({
+                "xwa_checkout_get_order_info": { "order": { "products": [{
+                    "id": "1000000000000001",
+                    "variant_info": { "variant_properties": "nope" }
+                }] } }
+            }))
+            .is_err()
+        );
+
+        // variant_info present but carrying no properties is still variant-free.
+        let order = parse_order(&json!({
+            "xwa_checkout_get_order_info": { "order": { "products": [{
+                "id": "1000000000000001",
+                "variant_info": {}
+            }] } }
+        }))
+        .unwrap();
+        assert!(order.products[0].variant_properties.is_empty());
     }
 
     /// A non-object line item would otherwise index to `Null` on every field
