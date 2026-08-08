@@ -452,8 +452,10 @@ async fn server_ack_from_preserves_the_wire_jid() {
 /// itself evidence the display form is gone, since both spellings produce the
 /// same JID for everything our own encoder can emit; the count is.
 ///
-/// Three allocations: the event's owned `id` and `class` strings, and the `Arc`
-/// `dispatch` wraps the event in. A fourth means `from` is being rendered again.
+/// Baseline three: the event's owned `id` and `class` strings, and the `Arc`
+/// `dispatch` wraps the event in. A user too long to sit inline in its
+/// `CompactString` adds exactly one for that copy, and no more: it is owning the
+/// JID that costs, not rendering it. Re-introducing the render moves both.
 #[tokio::test]
 async fn server_ack_event_build_does_not_render_the_from_jid() {
     use wacore::types::events::EventHandler;
@@ -464,32 +466,46 @@ async fn server_ack_event_build_does_not_render_the_from_jid() {
         .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
         .detach();
 
-    // `from` as a JID token, which is how it arrives off the wire: this is the
-    // case where rendering it costs a String the parse then throws away.
-    let node = Arc::new(to_owned_node(
-        &NodeBuilder::new("ack")
-            .attr("class", "message")
-            .attr(
-                "from",
-                "551199990001@s.whatsapp.net".parse::<Jid>().expect("jid"),
-            )
-            .attr("id", "3EB0A1B2C3D4E5F60718")
-            .attr("t", "1758000000")
-            .build(),
-    ));
-    assert!(
-        node.get()
-            .get_attr("from")
-            .is_some_and(|v| v.as_jid().is_some()),
-        "the fixture must reach the handler as a JID token, not a string"
-    );
+    // Both arrive as JID tokens, which is how `from` comes off the wire: that is
+    // the case where rendering it costs a String the parse then throws away. The
+    // long one is a legacy group id, whose `<creator>-<timestamp>` user is the
+    // real shape that outgrows the inline buffer.
+    let ack_with_from = |from: Jid| {
+        let node = Arc::new(to_owned_node(
+            &NodeBuilder::new("ack")
+                .attr("class", "message")
+                .attr("from", from)
+                .attr("id", "3EB0A1B2C3D4E5F60718")
+                .attr("t", "1758000000")
+                .build(),
+        ));
+        assert!(
+            node.get()
+                .get_attr("from")
+                .is_some_and(|v| v.as_jid().is_some()),
+            "the fixture must reach the handler as a JID token, not a string"
+        );
+        node
+    };
 
-    let min_delta = crate::test_alloc::min_allocs(3, || {
-        assert!(!client.handle_ack_response_arc(&node));
+    let inline_user = ack_with_from("551199990001@s.whatsapp.net".parse().expect("jid"));
+    let heap_user = ack_with_from("5511999988887-1600000000123456@g.us".parse().expect("jid"));
+
+    let inline_delta = crate::test_alloc::min_allocs(3, || {
+        assert!(!client.handle_ack_response_arc(&inline_user));
     });
     assert_eq!(
-        min_delta, 3,
+        inline_delta, 3,
         "the ServerAck build must allocate only its two owned strings and the event Arc"
+    );
+
+    let heap_delta = crate::test_alloc::min_allocs(4, || {
+        assert!(!client.handle_ack_response_arc(&heap_user));
+    });
+    assert_eq!(
+        heap_delta,
+        inline_delta + 1,
+        "a heap-backed JID user must cost its own copy and nothing else"
     );
 }
 
