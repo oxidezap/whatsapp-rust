@@ -282,7 +282,7 @@ impl RequestUtils {
                 let backoff = parser
                     .optional_u64("backoff")
                     .and_then(|b| u32::try_from(b).ok());
-                warn_on_dropped_error_detail(error_node);
+                warn_on_unread_error_detail(error_node);
                 return Err(IqError::ServerError {
                     code,
                     text,
@@ -311,7 +311,7 @@ impl RequestUtils {
 /// read. Names only, never values: a value can hold a JID, and this is reported at a level
 /// production enables.
 #[derive(Debug, PartialEq, Eq)]
-struct DroppedErrorDetail<'a> {
+struct UnreadErrorDetail<'a> {
     /// Attribute names outside [`PARSED_ERROR_ATTRS`].
     attrs: Vec<&'a str>,
     /// Tags of the child nodes, such as the `<text>`/application-condition elements XMPP
@@ -323,7 +323,7 @@ struct DroppedErrorDetail<'a> {
 }
 
 /// What [`RequestUtils::parse_iq_response`] reads off an `<error>` node, mirrored so
-/// [`dropped_error_detail`] can name the rest. Reading a fifth attribute there means adding it
+/// [`unread_error_detail`] can name the rest. Reading a fifth attribute there means adding it
 /// here, or every response starts reporting the new attribute as unread.
 const PARSED_ERROR_ATTRS: [&str; 4] = ["code", "text", "type", "backoff"];
 
@@ -331,10 +331,10 @@ const PARSED_ERROR_ATTRS: [&str; 4] = ["code", "text", "type", "backoff"];
 ///
 /// Those four are what WA Web's `parseIqResponse` keeps, so reading only them is the right
 /// default. What was never checked is whether the server sends more: a bare `bad-request` gives
-/// no way to tell an empty error from a detailed one this parser discarded. WA Web's escape hatch
-/// for that case is `parseIqResponse`'s third argument, a parser over the same node; this probe
-/// is what would say a call site needs the equivalent.
-fn dropped_error_detail<'a>(error_node: &'a NodeRef<'_>) -> Option<DroppedErrorDetail<'a>> {
+/// no way to tell an empty error from a detailed one this parser read nothing of. WA Web's escape
+/// hatch for that case is `parseIqResponse`'s third argument, a parser over the same node; this
+/// probe is what would say a call site needs the equivalent.
+fn unread_error_detail<'a>(error_node: &'a NodeRef<'_>) -> Option<UnreadErrorDetail<'a>> {
     let attrs: Vec<&str> = error_node
         .attrs
         .iter()
@@ -344,7 +344,7 @@ fn dropped_error_detail<'a>(error_node: &'a NodeRef<'_>) -> Option<DroppedErrorD
 
     let mut children = Vec::new();
     let mut payload = None;
-    // Not `children()`: it answers `None` for a byte or string payload, which is dropped just
+    // Not `children()`: it answers `None` for a byte or string payload, which goes unread just
     // the same.
     match error_node.content.as_ref() {
         Some(NodeContentRef::Nodes(nodes)) => {
@@ -358,7 +358,7 @@ fn dropped_error_detail<'a>(error_node: &'a NodeRef<'_>) -> Option<DroppedErrorD
     if attrs.is_empty() && children.is_empty() && payload.is_none() {
         return None;
     }
-    Some(DroppedErrorDetail {
+    Some(UnreadErrorDetail {
         attrs,
         children,
         payload,
@@ -366,30 +366,32 @@ fn dropped_error_detail<'a>(error_node: &'a NodeRef<'_>) -> Option<DroppedErrorD
 }
 
 /// Reported once per process. The finding is a note to this library's maintainers rather than
-/// something the calling application can act on, and rejected IQs arrive in bursts (usync,
-/// prekey and app-state fan-outs all retry), so warning per occurrence would be noise at exactly
-/// the moment the log matters.
-static DROPPED_ERROR_DETAIL_WARNED: AtomicBool = AtomicBool::new(false);
+/// something the calling application has to act on — every caller hands in the node and still
+/// holds it, so what goes unread here is unread, not lost — and rejected IQs arrive in bursts
+/// (usync, prekey and app-state fan-outs all retry), so warning per occurrence would be noise at
+/// exactly the moment the log matters.
+static UNREAD_ERROR_DETAIL_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// `#[cold]` so the probe stays out of the caller's body: `parse_iq_response` is on the receive
 /// path and its code size is gated in CI.
 #[cold]
-fn warn_on_dropped_error_detail(error_node: &NodeRef<'_>) {
+fn warn_on_unread_error_detail(error_node: &NodeRef<'_>) {
     // Both guards come before the scan, not after: once the warning is out, or with warnings
     // filtered off, every further rejected IQ costs one relaxed load instead of walking the node.
-    if DROPPED_ERROR_DETAIL_WARNED.load(Ordering::Relaxed) || !log::log_enabled!(log::Level::Warn) {
+    if UNREAD_ERROR_DETAIL_WARNED.load(Ordering::Relaxed) || !log::log_enabled!(log::Level::Warn) {
         return;
     }
-    let Some(detail) = dropped_error_detail(error_node) else {
+    let Some(detail) = unread_error_detail(error_node) else {
         return;
     };
     // Racing callers both reach here; the swap picks the single one that logs.
-    if DROPPED_ERROR_DETAIL_WARNED.swap(true, Ordering::Relaxed) {
+    if UNREAD_ERROR_DETAIL_WARNED.swap(true, Ordering::Relaxed) {
         return;
     }
     log::warn!(
-        "IQ error carries detail this parser drops: attributes={:?} children={:?} payload={:?}. \
-         Names only, no values, since a value can hold a JID. Reported once per process.",
+        "IQ error carries detail this parser does not read: attributes={:?} children={:?} \
+         payload={:?}. Not lost — read them off the stanza itself. Names only, no values, since \
+         a value can hold a JID. Reported once per process.",
         detail.attrs,
         detail.children,
         detail.payload,
@@ -539,12 +541,12 @@ mod message_id_tests {
 }
 
 #[cfg(test)]
-mod dropped_error_detail_tests {
-    use super::dropped_error_detail;
+mod unread_error_detail_tests {
+    use super::unread_error_detail;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::node::{Node, NodeContent};
 
-    /// The shape every rejected IQ observed so far has: nothing is dropped, so the probe has
+    /// The shape every rejected IQ observed so far has: nothing goes unread, so the probe has
     /// nothing to say.
     #[test]
     fn a_fully_parsed_error_reports_nothing() {
@@ -555,14 +557,14 @@ mod dropped_error_detail_tests {
             .attr("backoff", "30")
             .build();
         let node_ref = node.as_node_ref();
-        assert_eq!(dropped_error_detail(&node_ref), None);
+        assert_eq!(unread_error_detail(&node_ref), None);
     }
 
     #[test]
     fn an_empty_error_reports_nothing() {
         let node = NodeBuilder::new("error").build();
         let node_ref = node.as_node_ref();
-        assert_eq!(dropped_error_detail(&node_ref), None);
+        assert_eq!(unread_error_detail(&node_ref), None);
     }
 
     #[test]
@@ -572,7 +574,7 @@ mod dropped_error_detail_tests {
             .attr("xmlns", "w:profile:picture")
             .build();
         let node_ref = node.as_node_ref();
-        let detail = dropped_error_detail(&node_ref).expect("xmlns is not parsed");
+        let detail = unread_error_detail(&node_ref).expect("xmlns is not parsed");
         assert_eq!(detail.attrs, ["xmlns"]);
         assert!(detail.children.is_empty());
         assert_eq!(detail.payload, None);
@@ -588,7 +590,7 @@ mod dropped_error_detail_tests {
             ])
             .build();
         let node_ref = node.as_node_ref();
-        let detail = dropped_error_detail(&node_ref).expect("children are not parsed");
+        let detail = unread_error_detail(&node_ref).expect("children are not parsed");
         assert!(detail.attrs.is_empty());
         assert_eq!(detail.children, ["bad-request", "text"]);
         assert_eq!(detail.payload, None);
@@ -603,7 +605,7 @@ mod dropped_error_detail_tests {
             Some(NodeContent::Bytes(vec![1, 2, 3])),
         );
         let bytes_ref = bytes_node.as_node_ref();
-        let detail = dropped_error_detail(&bytes_ref).expect("a payload is not parsed");
+        let detail = unread_error_detail(&bytes_ref).expect("a payload is not parsed");
         assert_eq!(detail.payload, Some("bytes"));
 
         let text_node = Node::new(
@@ -612,7 +614,7 @@ mod dropped_error_detail_tests {
             Some(NodeContent::String("x".into())),
         );
         let text_ref = text_node.as_node_ref();
-        let detail = dropped_error_detail(&text_ref).expect("a payload is not parsed");
+        let detail = unread_error_detail(&text_ref).expect("a payload is not parsed");
         assert_eq!(detail.payload, Some("text"));
     }
 
@@ -625,6 +627,6 @@ mod dropped_error_detail_tests {
             Some(NodeContent::Bytes(vec![])),
         );
         let node_ref = node.as_node_ref();
-        assert_eq!(dropped_error_detail(&node_ref), None);
+        assert_eq!(unread_error_detail(&node_ref), None);
     }
 }

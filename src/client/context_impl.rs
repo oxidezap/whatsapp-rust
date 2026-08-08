@@ -36,6 +36,7 @@ impl SendContextResolver for Client {
                     text,
                     error_type,
                     backoff,
+                    ..
                 }) = e.downcast_ref::<crate::request::IqError>()
                 {
                     return anyhow::Error::new(wacore::request::ServerErrorCode {

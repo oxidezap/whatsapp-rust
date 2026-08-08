@@ -1,4 +1,5 @@
 mod blocking;
+mod bots;
 pub(crate) mod chat_actions;
 mod chatstate;
 mod comments;
@@ -22,6 +23,11 @@ pub(crate) mod status;
 mod tctoken;
 
 pub use blocking::{Blocking, BlockingError, BlocklistEntry};
+
+pub use bots::{
+    BotDefault, BotList, BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType,
+    BotSectionType, BotTheme, BotThemeMode, Bots,
+};
 
 pub use chat_actions::{
     AppStateError, ChatActions, SyncActionMessageRange, message_key, message_range,
@@ -61,7 +67,8 @@ pub use media_reupload::{
 pub use message_edit::{EncryptedEdit, MessageEditError, SecretEncKind, SecretEncrypted};
 
 pub use mex::{
-    Mex, MexError, MexErrorExtensions, MexGraphQLError, MexRequest, MexResponse, ReachoutTimelock,
+    CappingMvStatus, CappingOteStatus, CappingStatus, Mex, MexError, MexErrorExtensions,
+    MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, ReachoutTimelock,
 };
 
 pub use newsletter::{

@@ -629,12 +629,12 @@ mod tests {
         // `fetch_pre_keys` directly and receives the first, while the fan-out
         // goes through `SendContextResolver`, which re-wraps it as the second.
         let as_iq_error = |code| {
-            anyhow::Error::new(crate::request::IqError::ServerError {
+            anyhow::Error::new(crate::test_utils::server_error_iq(
                 code,
-                text: "not-acceptable".to_string(),
-                error_type: None,
-                backoff: None,
-            })
+                "not-acceptable",
+                None,
+                None,
+            ))
         };
         let as_shared = |code| {
             anyhow::Error::new(wacore::request::ServerErrorCode {

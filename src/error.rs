@@ -215,6 +215,7 @@ fn server_rejection_of<'a>(cause: &'a (dyn StdError + 'static)) -> Option<Server
         text,
         error_type,
         backoff,
+        ..
     }) = cause.downcast_ref::<ClientIqError>()
     {
         return Some(ServerRejection {
