@@ -210,7 +210,8 @@ small multiple of the page, because then every step rounds to the same one or
 two page counts and the median reports that rounding rather than the cost. The
 topology log is the example: 8 KiB allocated, deltas alternating 32 and 36 KiB,
 median moving by exactly one page. The **mean over the same tail** is the
-sharper read there, and it agreed with the median to within 0.1 KiB.
+sharper read there, and the two still agree on the answer: the median put the
+saving at 36 -> 32 KiB, the mean at 34.9 -> 31.1 KiB.
 
 Give each variant its own process (`--exact`, or nextest, which forks per
 test): RSS never shrinks, so a second variant measured in the same process
