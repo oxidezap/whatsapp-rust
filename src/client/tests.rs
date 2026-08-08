@@ -448,6 +448,51 @@ async fn server_ack_from_preserves_the_wire_jid() {
     );
 }
 
+/// The allocation guard for the same call. `from` reaching the event is not by
+/// itself evidence the display form is gone, since both spellings produce the
+/// same JID for everything our own encoder can emit; the count is.
+///
+/// Three allocations: the event's owned `id` and `class` strings, and the `Arc`
+/// `dispatch` wraps the event in. A fourth means `from` is being rendered again.
+#[tokio::test]
+async fn server_ack_event_build_does_not_render_the_from_jid() {
+    use wacore::types::events::EventHandler;
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    // `from` as a JID token, which is how it arrives off the wire: this is the
+    // case where rendering it costs a String the parse then throws away.
+    let node = Arc::new(to_owned_node(
+        &NodeBuilder::new("ack")
+            .attr("class", "message")
+            .attr(
+                "from",
+                "551199990001@s.whatsapp.net".parse::<Jid>().expect("jid"),
+            )
+            .attr("id", "3EB0A1B2C3D4E5F60718")
+            .attr("t", "1758000000")
+            .build(),
+    ));
+    assert!(
+        node.get()
+            .get_attr("from")
+            .is_some_and(|v| v.as_jid().is_some()),
+        "the fixture must reach the handler as a JID token, not a string"
+    );
+
+    let min_delta = crate::test_alloc::min_allocs(3, || {
+        assert!(!client.handle_ack_response_arc(&node));
+    });
+    assert_eq!(
+        min_delta, 3,
+        "the ServerAck build must allocate only its two owned strings and the event Arc"
+    );
+}
+
 /// The other half of the reason `from` stopped going through the display form:
 /// an interop JID's `integrator` is carried on the wire but is not part of the
 /// rendered JID, so rendering and re-parsing silently dropped it.

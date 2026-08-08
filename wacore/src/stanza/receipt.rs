@@ -488,12 +488,22 @@ mod tests {
     /// The listless receipt is the common one, and its vector is handed straight
     /// to the event: sizing it to the growth default left three unused slots on
     /// every receipt.
+    ///
+    /// Asserted as "below the growth default" rather than "exactly one": an
+    /// allocator is free to hand back a larger block than `reserve_exact` asked
+    /// for, so an exact figure would be testing the allocator. Growing from
+    /// empty lands on 4 for a `String` element, so this still fails if the
+    /// reservation goes away.
     #[test]
     fn listless_receipt_ids_are_sized_to_what_they_hold() {
         let node = NodeBuilder::new("receipt").attr("id", "SOLO").build();
         let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO".to_string(), false);
         assert_eq!(ids.len(), 1);
-        assert_eq!(ids.capacity(), 1, "no spare capacity for a single id");
+        assert!(
+            ids.capacity() < 4,
+            "one id must not take the growth default, got capacity {}",
+            ids.capacity()
+        );
     }
 
     /// Failure shape: a view receipt whose items carry no `server_id` yields an
