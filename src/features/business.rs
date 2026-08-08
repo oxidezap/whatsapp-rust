@@ -682,7 +682,7 @@ fn parse_product(value: &Value, operation: &'static str) -> Result<Product, Busi
             operation,
             compliance,
             "importer_address",
-        )?)?,
+        )?),
     })
 }
 
@@ -734,7 +734,7 @@ fn object_entries<'a>(
 
 /// Reads `compliance_info.importer_address`. Present with every part missing is
 /// `None` — an address with nothing in it is not an address.
-fn parse_importer_address(value: &Value) -> Result<Option<ImporterAddress>, BusinessError> {
+fn parse_importer_address(value: &Value) -> Option<ImporterAddress> {
     let address = ImporterAddress {
         street1: opt_str(&value["street1"]),
         street2: opt_str(&value["street2"]),
@@ -749,7 +749,7 @@ fn parse_importer_address(value: &Value) -> Result<Option<ImporterAddress>, Busi
         && address.region.is_none()
         && address.postal_code.is_none()
         && address.country_code.is_none();
-    Ok((!empty).then_some(address))
+    (!empty).then_some(address)
 }
 
 fn parse_catalog(data: &Value) -> Result<Catalog, BusinessError> {
@@ -1495,13 +1495,31 @@ mod tests {
                 "xwa_product_catalog_get_product_catalog": { "product_catalog": body }
             }))
         };
-        assert!(catalog(json!({ "products": [], "paging": "nope" })).is_err());
-        assert!(catalog(json!({ "products": [{ "id": "1", "media": "nope" }] })).is_err());
-        assert!(catalog(json!({ "products": [{ "id": "1", "status_info": 7 }] })).is_err());
-        assert!(catalog(json!({ "products": [{ "id": "1", "compliance_info": [] }] })).is_err());
-        assert!(
-            catalog(json!({ "products": [{ "id": "1", "media": { "images": ["x"] } }] })).is_err()
-        );
+        for (field, body) in [
+            ("paging", json!({ "products": [], "paging": "nope" })),
+            (
+                "media",
+                json!({ "products": [{ "id": "1", "media": "nope" }] }),
+            ),
+            (
+                "status_info",
+                json!({ "products": [{ "id": "1", "status_info": 7 }] }),
+            ),
+            (
+                "compliance_info",
+                json!({ "products": [{ "id": "1", "compliance_info": [] }] }),
+            ),
+            (
+                "media.images entry",
+                json!({ "products": [{ "id": "1", "media": { "images": ["x"] } }] }),
+            ),
+            (
+                "compliance_info.importer_address",
+                json!({ "products": [{ "id": "1", "compliance_info": { "importer_address": 1 } }] }),
+            ),
+        ] {
+            assert!(catalog(body).is_err(), "catalog {field} must be rejected");
+        }
 
         // Absent stays absent — the guard must not turn a missing object into
         // an error.
@@ -1511,16 +1529,24 @@ mod tests {
             parse_collections(&json!({
                 "xwa_product_catalog_get_collections": { "collections": [], "paging": 3 }
             }))
-            .is_err()
+            .is_err(),
+            "collections paging must be rejected"
         );
 
         let order =
             |body| parse_order(&json!({ "xwa_checkout_get_order_info": { "order": body } }));
-        assert!(order(json!({ "products": [], "price_details": "nope" })).is_err());
-        assert!(
-            order(json!({ "products": [{ "variant_info": { "variant_properties": [1] } }] }))
-                .is_err()
-        );
+        for (field, body) in [
+            (
+                "price_details",
+                json!({ "products": [], "price_details": "nope" }),
+            ),
+            (
+                "variant_properties entry",
+                json!({ "products": [{ "variant_info": { "variant_properties": [1] } }] }),
+            ),
+        ] {
+            assert!(order(body).is_err(), "order {field} must be rejected");
+        }
     }
 
     #[test]
