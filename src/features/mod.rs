@@ -1,3 +1,4 @@
+pub(crate) mod app_state_settings;
 mod blocking;
 pub(crate) mod chat_actions;
 mod chatstate;
@@ -14,12 +15,15 @@ pub(crate) mod newsletter;
 mod polls;
 mod presence;
 mod profile;
+pub(crate) mod quick_replies;
 mod reaction;
 mod rotate_key;
 mod signal;
 mod stanza;
 pub(crate) mod status;
 mod tctoken;
+
+pub use app_state_settings::AppStateSettings;
 
 pub use blocking::{Blocking, BlockingError, BlocklistEntry};
 
@@ -74,6 +78,8 @@ pub use polls::{PollError, PollOptionResult, PollVoteCiphertext, Polls};
 pub use presence::{Presence, PresenceError, PresenceStatus};
 
 pub use profile::{Profile, ProfileError, SetProfilePictureResponse};
+
+pub use quick_replies::QuickReplies;
 
 pub use status::{Status, StatusPrivacySetting, StatusSendOptions};
 

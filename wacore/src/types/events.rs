@@ -276,6 +276,10 @@ pub enum EventKind {
     PairingCodeError,
     AppStateSyncFailed,
     DecryptedPayload,
+    MessageLabelAssociationUpdate,
+    QuickReplyUpdate,
+    DisableLinkPreviewsUpdate,
+    ContactRemoved,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -289,7 +293,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::DecryptedPayload as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::ContactRemoved as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -992,6 +996,23 @@ pub enum Event {
     /// Last, like every new variant: a binary `Serialize` format writes the
     /// variant index, so inserting in the middle renumbers everything after it.
     DecryptedPayload(DecryptedPayload),
+
+    /// A label was associated with or removed from a single *message* on a
+    /// linked device (`label_message`), as opposed to a whole chat
+    /// ([`LabelAssociationUpdate`]).
+    MessageLabelAssociationUpdate(MessageLabelAssociationUpdate),
+
+    /// A quick reply was created, edited, or deleted on a linked device.
+    QuickReplyUpdate(QuickReplyUpdate),
+
+    /// The account-wide "disable link previews" privacy setting changed on a
+    /// linked device.
+    DisableLinkPreviewsUpdate(DisableLinkPreviewsUpdate),
+
+    /// A saved contact was deleted on a linked device. Distinct from
+    /// [`ContactUpdate`]: the mutation arrives as a syncd `Remove`, carries no
+    /// meaningful action payload, and means the contact left the address book.
+    ContactRemoved(ContactRemoved),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1080,6 +1101,10 @@ impl Event {
             Event::DeleteMessageForMeUpdate(_) => EventKind::DeleteMessageForMeUpdate,
             Event::LabelEditUpdate(_) => EventKind::LabelEditUpdate,
             Event::LabelAssociationUpdate(_) => EventKind::LabelAssociationUpdate,
+            Event::MessageLabelAssociationUpdate(_) => EventKind::MessageLabelAssociationUpdate,
+            Event::QuickReplyUpdate(_) => EventKind::QuickReplyUpdate,
+            Event::DisableLinkPreviewsUpdate(_) => EventKind::DisableLinkPreviewsUpdate,
+            Event::ContactRemoved(_) => EventKind::ContactRemoved,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -2025,6 +2050,65 @@ pub struct LabelAssociationUpdate {
     pub chat_jid: Jid,
     pub timestamp: DateTime<Utc>,
     pub action: Box<wa::sync_action_value::LabelAssociationAction>,
+    pub from_full_sync: bool,
+}
+
+/// A label was associated with or removed from a single message on a linked
+/// device (`label_message`). `action.labeled == Some(true)` means the label was
+/// added.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct MessageLabelAssociationUpdate {
+    /// The label identifier.
+    pub label_id: String,
+    /// The chat holding the labelled message.
+    pub chat_jid: Jid,
+    /// The labelled message's id.
+    pub message_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::LabelAssociationAction>,
+    pub from_full_sync: bool,
+}
+
+/// A quick reply was created, edited, or deleted on a linked device.
+///
+/// Deletion is the same mutation with `action.deleted == Some(true)`, not a
+/// syncd `Remove`, so a consumer must check that flag rather than assume the
+/// event always describes a live quick reply.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct QuickReplyUpdate {
+    /// The quick reply's identifier (the index key, not a JID).
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::QuickReplyAction>,
+    pub from_full_sync: bool,
+}
+
+/// The account-wide "disable link previews" privacy setting changed on a linked
+/// device (`setting_disableLinkPreviews`).
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct DisableLinkPreviewsUpdate {
+    /// `true` when link previews are now disabled. Only emitted when the wire
+    /// carried the flag; WA Web treats an absent one as a malformed mutation.
+    pub previews_disabled: bool,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction>,
+    pub from_full_sync: bool,
+}
+
+/// A saved contact was deleted on a linked device.
+///
+/// Carries no action payload: the mutation is a syncd `Remove`, and WA Web's
+/// `WAWebContactSync` ignores the value on that branch and simply drops the
+/// contact from the address book.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct ContactRemoved {
+    /// The contact that is no longer saved.
+    pub jid: Jid,
+    pub timestamp: DateTime<Utc>,
     pub from_full_sync: bool,
 }
 

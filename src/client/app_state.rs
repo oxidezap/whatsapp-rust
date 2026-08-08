@@ -2596,20 +2596,39 @@ impl Client {
             return;
         }
 
-        // All remaining mutations only care about Set operations
-        if m.operation != wa::syncd_mutation::SyncdOperation::Set {
+        // Delegate chat-related mutations (mute, pin, archive, star, contact, etc.).
+        // Runs before the Set-only gate below because contact deletion arrives as
+        // a `Remove`; the handler claims nothing else on that operation.
+        if crate::features::chat_actions::dispatch_chat_mutation(&self.core.event_bus, m, full_sync)
+        {
             return;
         }
 
-        // Delegate chat-related mutations (mute, pin, archive, star, contact, etc.)
-        if crate::features::chat_actions::dispatch_chat_mutation(&self.core.event_bus, m, full_sync)
-        {
+        // All remaining mutations only care about Set operations
+        if m.operation != wa::syncd_mutation::SyncdOperation::Set {
             return;
         }
 
         // Label mutations have their own index shape (labelId, not a chat JID at
         // index[1]), so they are dispatched separately from chat actions.
         if crate::features::labels::dispatch_label_mutation(&self.core.event_bus, m, full_sync) {
+            return;
+        }
+
+        // Quick replies and account-level syncd settings key on their own index
+        // shapes (an opaque id, or no argument at all).
+        if crate::features::quick_replies::dispatch_quick_reply_mutation(
+            &self.core.event_bus,
+            m,
+            full_sync,
+        ) {
+            return;
+        }
+        if crate::features::app_state_settings::dispatch_app_state_setting_mutation(
+            &self.core.event_bus,
+            m,
+            full_sync,
+        ) {
             return;
         }
 

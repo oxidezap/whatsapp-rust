@@ -200,8 +200,8 @@ pub mod usync;
 
 pub mod features;
 pub use features::{
-    AppStateError, BatchGroupResult, Blocking, BlockingError, BlocklistEntry, ChatActions,
-    ChatStateError, ChatStateType, Chatstate, Comments, Community, CommunityError,
+    AppStateError, AppStateSettings, BatchGroupResult, Blocking, BlockingError, BlocklistEntry,
+    ChatActions, ChatStateError, ChatStateType, Chatstate, Comments, Community, CommunityError,
     CommunitySubgroup, ContactError, Contacts, CreateCommunityOptions, CreateCommunityResult,
     CreateGroupResult, EncType, EncryptedEdit, EventCreationParams, EventResponseType, Events,
     GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings, GroupError,
@@ -215,12 +215,13 @@ pub use features::{
     NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
     NewsletterState, NewsletterVerification, ParticipantChangeResponse, ParticipantType,
     PictureType, PollError, PollOptionResult, PollVoteCiphertext, Polls, Presence, PresenceError,
-    PresenceStatus, PreviousDescription, Profile, ProfileError, ProfilePicture, ReachoutTimelock,
-    RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome, SecretEncKind,
-    SecretEncrypted, SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo,
-    SignalSessionMigration, StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting,
-    StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult,
-    UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
+    PresenceStatus, PreviousDescription, Profile, ProfileError, ProfilePicture, QuickReplies,
+    ReachoutTimelock, RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome,
+    SecretEncKind, SecretEncrypted, SetProfilePictureResponse, Signal, SignalError,
+    SignalSessionInfo, SignalSessionMigration, StanzaRejection, StanzaResponseError, Status,
+    StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError,
+    UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key,
+    message_range,
 };
 
 pub mod bot;
