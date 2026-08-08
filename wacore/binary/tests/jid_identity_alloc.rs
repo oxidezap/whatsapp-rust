@@ -108,10 +108,10 @@ const ATTRS: &[&str] = &["from", "participant", "recipient", "id", "t"];
 /// on that side of it the subtraction below would expect zero on the only host
 /// CI has, and would pass whether or not the allocating branch still works.
 ///
-/// The short spellings are four and five characters rather than one or two
-/// because the encoder checks the token dictionary before it packs, and a
-/// single digit is a token: it would come back borrowed and put the control on
-/// a different decoder route. `value_shapes` is what holds them to that.
+/// None of the short spellings is a bare one or two digit run, because the
+/// encoder checks the token dictionary before it packs and those are tokens:
+/// they would come back borrowed and put the control on a different decoder
+/// route. `value_shapes` is what holds them to that.
 const MATERIALIZED: &[(&str, &str)] = &[
     ("120363000000000001", "9876"),
     ("5511987650002", "5511"),
