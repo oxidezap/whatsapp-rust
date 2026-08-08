@@ -118,9 +118,9 @@ pub enum IqError {
         error_type: Option<String>,
         /// Server-directed retry delay in seconds from the `backoff` attr; `None` if absent.
         backoff: Option<u32>,
-        /// The rejection stanza verbatim, as a `type="result"` one reaches the caller. What
-        /// matters in a protocol error is the caller's judgement, so the summary above does not
-        /// replace it: unmodelled attributes, `<error>` children and the bytes stay readable.
+        /// The `type="error"` stanza verbatim, handed over whole the way a `type="result"`
+        /// one is. What matters in a protocol error is the caller's judgement, so the summary
+        /// above does not replace it: unread attributes, children and bytes stay readable.
         response: Arc<wacore_binary::OwnedNodeRef>,
     },
     #[error("received unexpected IQ response type: {got:?}")]
@@ -628,7 +628,7 @@ mod tests {
             .optional_string(IQ_ID_ATTR)
             .expect("the request carries an id")
             .into_owned();
-        crate::test_utils::answer_iq(
+        let delivered = crate::test_utils::answer_iq(
             &client,
             &request_id,
             &NodeBuilder::new(IQ_TAG)
@@ -666,6 +666,10 @@ mod tests {
         assert_eq!(text, "forbidden");
         assert_eq!(error_type.as_deref(), Some("cancel"));
         assert_eq!(backoff, Some(30));
+        assert!(
+            Arc::ptr_eq(&response, &delivered),
+            "the rejection must carry the decoded node itself, not a copy of it"
+        );
 
         let response = response.get();
         assert_eq!(
