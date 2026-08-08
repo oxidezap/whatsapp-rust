@@ -390,6 +390,24 @@ mod tests {
     }
 
     #[test]
+    fn missing_action_value_is_claimed_but_not_dispatched() {
+        // The id is present, so this reaches the branch the missing-id test
+        // never gets to: a well-indexed mutation with no quickReplyAction. It
+        // must be claimed (nothing else can read it) and warned about, but must
+        // not become an event describing a quick reply we know nothing about.
+        for action_value in [Some(wa::SyncActionValue::default()), None] {
+            let m = Mutation {
+                index: vec!["quick_reply".into(), "1700000000".into()],
+                operation: wa::syncd_mutation::SyncdOperation::Set,
+                action_value,
+            };
+            let (handled, events) = run(&m);
+            assert!(handled);
+            assert!(events.is_empty());
+        }
+    }
+
+    #[test]
     fn other_kinds_are_not_claimed() {
         let m = Mutation {
             index: vec!["label_edit".into(), "5".into()],

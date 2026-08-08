@@ -1209,11 +1209,30 @@ mod registry_tests {
         )
         .await;
 
+        let sent_at = mutation
+            .action_value
+            .as_ref()
+            .and_then(|v| v.timestamp)
+            .expect("the removal stamps its value with a timestamp");
+
         let (handled, events) = dispatch_into_recorder(&mutation);
         assert!(handled);
         assert_eq!(events.len(), 1);
         match &*events[0] {
-            Event::ContactRemoved(u) => assert_eq!(u.jid, jid),
+            Event::ContactRemoved(u) => {
+                assert_eq!(u.jid, jid);
+                // The whole payload, not just the JID: the event carries the
+                // mutation's own timestamp, not the moment it was dispatched.
+                assert_eq!(u.timestamp, wacore::time::from_millis_or_now(sent_at));
+                assert!(!u.from_full_sync, "this arrived as an incremental patch");
+            }
+            other => panic!("expected ContactRemoved, got {other:?}"),
+        }
+
+        // ...and a full-sync replay is marked as one.
+        let (_, events) = dispatch_into_recorder_with(&mutation, true);
+        match &*events[0] {
+            Event::ContactRemoved(u) => assert!(u.from_full_sync),
             other => panic!("expected ContactRemoved, got {other:?}"),
         }
     }
@@ -1268,6 +1287,13 @@ mod registry_tests {
     }
 
     fn dispatch_into_recorder(m: &Mutation) -> (bool, Vec<std::sync::Arc<Event>>) {
+        dispatch_into_recorder_with(m, false)
+    }
+
+    fn dispatch_into_recorder_with(
+        m: &Mutation,
+        full_sync: bool,
+    ) -> (bool, Vec<std::sync::Arc<Event>>) {
         use std::sync::{Arc, Mutex};
         use wacore::types::events::{CoreEventBus, EventHandler, EventInterest};
 
@@ -1285,7 +1311,7 @@ mod registry_tests {
         let seen: Arc<Mutex<Vec<Arc<Event>>>> = Arc::new(Mutex::new(Vec::new()));
         bus.subscribe_handler(Arc::new(Recorder(seen.clone())))
             .detach();
-        let handled = dispatch_chat_mutation(&bus, m, false);
+        let handled = dispatch_chat_mutation(&bus, m, full_sync);
         let events = seen.lock().unwrap().clone();
         (handled, events)
     }
