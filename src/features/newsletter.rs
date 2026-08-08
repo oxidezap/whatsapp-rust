@@ -361,17 +361,8 @@ impl<'a> Newsletter<'a> {
             }))
             .await?;
 
-        let data = response
-            .data
-            .ok_or_else(|| NewsletterError::InvalidRequest("missing data".into()))?;
-        let newsletter = &data["xwa2_newsletter_update"];
-        if newsletter.is_null() {
-            return Err(NewsletterError::InvalidRequest(format!(
-                "failed to update newsletter: {}",
-                jid
-            )));
-        }
-        parse_newsletter_metadata(newsletter)
+        let newsletter = take_data_field(response.data, "xwa2_newsletter_update")?;
+        parse_newsletter_metadata(&newsletter)
     }
 
     /// Replace a newsletter's picture with `jpeg`.
