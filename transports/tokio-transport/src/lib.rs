@@ -43,6 +43,18 @@ fn transport_resource_estimate() -> wacore::stats::TransportResourceReport {
 
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
+/// A factory dials one URL, so its resumption store only ever needs one server
+/// name; rustls sizes for 32 by default and preallocates the table. Eight is
+/// rustls's per-server ticket maximum, so this is one full slot, not a
+/// reduction in what can be resumed for the host actually dialled.
+const RESUMPTION_TICKETS: usize = 8;
+
+/// Applies the single-host resumption sizing to a freshly built config.
+fn size_for_one_host(mut config: rustls::ClientConfig) -> rustls::ClientConfig {
+    config.resumption = rustls::client::Resumption::in_memory_sessions(RESUMPTION_TICKETS);
+    config
+}
+
 /// Returns the default TLS connector used by [`TokioWebSocketTransportFactory`].
 ///
 /// Useful as a starting point when users need to inspect or replicate the
@@ -113,10 +125,12 @@ pub fn default_tls_connector() -> Connector {
             }
         }
 
-        let config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(StdArc::new(NoVerifier))
-            .with_no_client_auth();
+        let config = size_for_one_host(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(StdArc::new(NoVerifier))
+                .with_no_client_auth(),
+        );
 
         Connector::Rustls(TlsConnector::from(StdArc::new(config)))
     }
@@ -129,9 +143,11 @@ pub fn default_tls_connector() -> Connector {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let config = size_for_one_host(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
 
         Connector::Rustls(TlsConnector::from(StdArc::new(config)))
     }
@@ -276,6 +292,10 @@ where
 pub struct TokioWebSocketTransportFactory {
     url: String,
     connector: Option<Connector>,
+    /// Built on the first dial and kept. Rebuilding it per connection cost a
+    /// fresh TLS config every reconnect and left the resumption store inside
+    /// it permanently empty, so resumption could never fire.
+    default_connector: std::sync::OnceLock<Connector>,
     origin: Option<String>,
 }
 
@@ -284,6 +304,7 @@ impl TokioWebSocketTransportFactory {
         Self {
             url: WHATSAPP_WEB_WS_URL.to_string(),
             connector: None,
+            default_connector: std::sync::OnceLock::new(),
             origin: Some(WHATSAPP_WEB_ORIGIN.to_string()),
         }
     }
@@ -339,13 +360,9 @@ impl TransportFactory for TokioWebSocketTransportFactory {
             .parse()
             .map_err(|e| anyhow::anyhow!("Failed to parse URL: {e}"))?;
 
-        let default_connector;
         let connector = match &self.connector {
             Some(c) => c,
-            None => {
-                default_connector = default_tls_connector();
-                &default_connector
-            }
+            None => self.default_connector.get_or_init(default_tls_connector),
         };
 
         let mut builder = ClientBuilder::from_uri(uri).connector(connector);
@@ -382,6 +399,44 @@ mod tests {
         assert_eq!(
             report.total_bytes(),
             EST_READ_BUFFER_BYTES + EST_WRITE_BUFFER_BYTES + EST_TLS_STATE_BYTES
+        );
+    }
+
+    /// A reconnect must not rebuild the TLS config. Nothing was retained
+    /// before, which is why the resumption store inside it was always empty.
+    /// `ws://` keeps the dial cheap; the connector is chosen before the scheme
+    /// is looked at, and the connect itself is refused.
+    #[tokio::test]
+    async fn the_default_connector_is_retained_across_dials() {
+        let factory = TokioWebSocketTransportFactory::new().with_url("ws://127.0.0.1:1/ws/chat");
+        assert!(factory.default_connector.get().is_none());
+
+        let _ = factory.create_transport().await;
+        assert!(
+            factory.default_connector.get().is_some(),
+            "the first dial built a connector and dropped it"
+        );
+
+        let _ = factory.create_transport().await;
+        assert!(
+            factory.default_connector.get().is_some(),
+            "a second dial must reuse the retained connector"
+        );
+    }
+
+    /// The retained default must stay unbuilt when the caller supplied one:
+    /// building it anyway would pay for a TLS config nothing ever dials with.
+    #[tokio::test]
+    async fn a_custom_connector_leaves_the_default_unbuilt() {
+        let factory = TokioWebSocketTransportFactory::new()
+            .with_url("ws://127.0.0.1:1/ws/chat")
+            .with_connector(default_tls_connector());
+
+        let _ = factory.create_transport().await;
+
+        assert!(
+            factory.default_connector.get().is_none(),
+            "a caller-supplied connector was bypassed"
         );
     }
 
