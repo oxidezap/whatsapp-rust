@@ -522,9 +522,9 @@ fn identity_agent(server: Server, agent: u8) -> u8 {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default)]
 pub struct Jid {
-    /// Inline for every identity the wire carries on a 64-bit host, where
-    /// `CompactString`'s budget is `size_of::<String>()` = 24 bytes; the
-    /// wasm32/32-bit builds get 12 and allocate. See `tests/jid_identity_alloc`.
+    /// Inline while it fits in `size_of::<String>()`: 24 bytes on a 64-bit host,
+    /// which covers every identity the wire carries, but 12 on the wasm32/32-bit
+    /// builds, where the longer ones allocate. See `tests/jid_identity_alloc`.
     pub user: CompactString,
     pub server: Server,
     pub agent: u8,

@@ -15,6 +15,13 @@
 //! every expected count is derived from `size_of::<String>()` rather than
 //! hardcoded, so the assertions stay true on whichever target runs them.
 //!
+//! CI only runs this on the 64-bit host: the wasm job builds the library and
+//! does not execute integration tests, and there is no 32-bit runner. So the
+//! 12-byte budget is never measured here, only derived. What is checked on
+//! every run is that the fixtures still straddle it, since a mix that drifted
+//! to all-short values would keep passing while measuring nothing that matters
+//! to the target the question came from.
+//!
 //! Single test fn on purpose, as in `jid_non_ad_arc_alloc`: the counting
 //! allocator is process-global, so a concurrently running sibling test would
 //! bleed its allocations into the measurement.
@@ -29,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::jid::Jid;
 use wacore_binary::marshal::marshal;
-use wacore_binary::node::OwnedNodeRef;
+use wacore_binary::node::{OwnedNodeRef, ValueRef};
 
 struct CountingAlloc;
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -67,6 +74,10 @@ fn inline_capacity() -> usize {
     size_of::<String>()
 }
 
+/// The budget on a 32-bit target, which no runner here has. Used to keep the
+/// fixtures honest rather than to measure anything.
+const SMALL_TARGET_BUDGET: usize = 12;
+
 /// The mix a live stream carries, since it is the *length* of each identity
 /// that decides inline against heap: user JIDs with and without a device, both
 /// namespaces, a modern group id, the legacy `<creator>-<timestamp>` form that
@@ -84,14 +95,16 @@ const TRAFFIC: &[&str] = &[
     "status@broadcast",
 ];
 
-/// Values the decoder cannot borrow out of the frame, because the wire packs
-/// two characters per byte: a group id, a phone user, a stanza id and a
-/// timestamp, which is the set every `<message>` carries.
-const MATERIALIZED: &[&str] = &[
-    "120363000000000001",
-    "5511987650002",
-    "3EB0A1B2C3D4E5F60718",
-    "1770000000",
+/// The four values in a `<message>` the decoder cannot borrow out of the frame,
+/// because the wire packs two characters per byte: a group id, a phone user, a
+/// stanza id and a timestamp. Paired with a short spelling of the same value,
+/// which travels the identical decoder branch and fits inline everywhere, so
+/// the two stanzas below differ in length and in nothing else.
+const MATERIALIZED: &[(&str, &str)] = &[
+    ("120363000000000001", "1"),
+    ("5511987650002", "2"),
+    ("3EB0A1B2C3D4E5F60718", "3EB0"),
+    ("1770000000", "17"),
 ];
 
 /// The user part of a rendered JID, which is the only piece a `Jid` owns.
@@ -105,43 +118,92 @@ fn expected_per_user(rendered: &str) -> u64 {
     u64::from(user_of(rendered).len() > inline_capacity())
 }
 
-/// Two stanzas of the same shape: one whose values the decoder has to
-/// materialise, one whose values it can borrow straight out of the frame. The
-/// container allocations are identical, so the difference between them is
-/// exactly the materialised strings that did not fit inline.
-fn stanza(materialized: bool) -> bytes::Bytes {
-    let node = if materialized {
-        NodeBuilder::new("message")
-            .attr("from", Jid::from_str("120363000000000001@g.us").unwrap())
-            .attr(
-                "participant",
-                Jid::from_str("5511987650002:12@s.whatsapp.net").unwrap(),
-            )
-            .attr("id", MATERIALIZED[2])
-            .attr("t", MATERIALIZED[3])
-            .build()
-    } else {
-        NodeBuilder::new("message")
-            .attr("from", "ab")
-            .attr("participant", "cd")
-            .attr("id", "ef")
-            .attr("t", "gh")
-            .build()
+/// A `<message>` built from either the long or the short spelling of each
+/// value. Both go through the same four decoder branches (two JID tokens, a
+/// hex-packed id, a nibble-packed timestamp), so subtracting one from the other
+/// leaves exactly the materialised strings that did not fit inline.
+fn stanza(long: bool) -> bytes::Bytes {
+    let pick = |i: usize| {
+        if long {
+            MATERIALIZED[i].0
+        } else {
+            MATERIALIZED[i].1
+        }
     };
+    let node = NodeBuilder::new("message")
+        .attr("from", Jid::group(pick(0)))
+        .attr("participant", Jid::pn_device(pick(1), 12))
+        .attr("id", pick(2))
+        .attr("t", pick(3))
+        .build();
     let mut raw = marshal(&node).expect("marshal");
     // `unmarshal_ref` does not expect the leading format byte `marshal` writes.
     raw.remove(0);
     bytes::Bytes::from(raw)
 }
 
+/// Which decoder branch each attribute value came back on. The subtraction in
+/// `decoding_a_stanza_allocates_only_what_it_cannot_borrow` is only meaningful
+/// while the two stanzas agree on this, so it is asserted rather than assumed.
+fn value_kinds(bytes: &bytes::Bytes) -> Vec<&'static str> {
+    let decoded = OwnedNodeRef::new(bytes.clone()).expect("decode");
+    ["from", "participant", "id", "t"]
+        .iter()
+        .map(|key| match decoded.get_attr(key).expect("attr") {
+            ValueRef::Jid(_) => "jid",
+            ValueRef::String(_) => "string",
+        })
+        .collect()
+}
+
 /// One test fn covering four properties, because the counting allocator is
 /// process-global and sibling tests would run against it concurrently.
 #[test]
 fn per_message_identities_stay_off_the_heap() {
+    the_fixtures_straddle_both_budgets();
     identities_parse_derive_and_render_unchanged();
     rendering_costs_an_allocation_each();
     decoding_a_stanza_allocates_only_what_it_cannot_borrow();
     the_inline_boundary_sits_exactly_at_size_of_string();
+}
+
+/// The fixtures have to contain values on both sides of the 12-byte budget, or
+/// the counts this file derives would be trivially zero on the target that
+/// motivated it and nobody would notice.
+fn the_fixtures_straddle_both_budgets() {
+    assert!(
+        SMALL_TARGET_BUDGET < inline_capacity(),
+        "this host is not the wide target these fixtures are calibrated against"
+    );
+
+    let crossing = TRAFFIC
+        .iter()
+        .filter(|raw| {
+            let len = user_of(raw).len();
+            len > SMALL_TARGET_BUDGET && len <= inline_capacity()
+        })
+        .count();
+    assert!(
+        crossing >= 5,
+        "the traffic mix must keep identities that are inline at \
+         {} bytes and heap at {SMALL_TARGET_BUDGET}, found {crossing}",
+        inline_capacity()
+    );
+
+    let materialized_crossing = MATERIALIZED
+        .iter()
+        .filter(|(value, _)| value.len() > SMALL_TARGET_BUDGET)
+        .count();
+    assert_eq!(
+        materialized_crossing, 3,
+        "the stanza must keep three values a 32-bit decode would allocate"
+    );
+    assert!(
+        MATERIALIZED
+            .iter()
+            .all(|(_, short)| short.len() <= SMALL_TARGET_BUDGET),
+        "the short spelling of every value must fit inline on every target"
+    );
 }
 
 fn identities_parse_derive_and_render_unchanged() {
@@ -201,18 +263,24 @@ fn rendering_costs_an_allocation_each() {
 }
 
 fn decoding_a_stanza_allocates_only_what_it_cannot_borrow() {
-    let materialized = stanza(true);
-    let borrowed = stanza(false);
+    let long = stanza(true);
+    let short = stanza(false);
 
-    let decoded = OwnedNodeRef::new(materialized.clone()).expect("decode");
+    let decoded = OwnedNodeRef::new(long.clone()).expect("decode");
     assert!(decoded.get_attr("from").unwrap() == "120363000000000001@g.us");
-    assert!(decoded.get_attr("id").unwrap() == MATERIALIZED[2]);
+    assert!(decoded.get_attr("id").unwrap() == MATERIALIZED[2].0);
+    // Attribute values go through `read_value`, so a JID token stays a
+    // `ValueRef::Jid` and only its packed user is materialised. Both stanzas
+    // have to land on the same branches or the subtraction below means nothing.
+    let expected_kinds = ["jid", "jid", "string", "string"];
+    assert_eq!(value_kinds(&long), expected_kinds);
+    assert_eq!(value_kinds(&short), expected_kinds);
 
-    let with = min_allocs(200, || OwnedNodeRef::new(materialized.clone()).unwrap());
-    let without = min_allocs(200, || OwnedNodeRef::new(borrowed.clone()).unwrap());
+    let with = min_allocs(200, || OwnedNodeRef::new(long.clone()).unwrap());
+    let without = min_allocs(200, || OwnedNodeRef::new(short.clone()).unwrap());
     let expected = MATERIALIZED
         .iter()
-        .filter(|value| value.len() > inline_capacity())
+        .filter(|(value, _)| value.len() > inline_capacity())
         .count() as u64;
 
     assert_eq!(
