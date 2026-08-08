@@ -28,9 +28,9 @@ pub use business::{
     BUSINESS_PROFILE_MAX_WEBSITES, Business, BusinessCategory, BusinessError, BusinessHourMode,
     BusinessHours, BusinessHoursConfig, BusinessHoursUpdate, BusinessProfile,
     BusinessProfileUpdate, BusinessProfileUpdateError, Catalog, CatalogOptions, Collection,
-    CollectionOptions, Collections, CoverPhotoUpload, DayOfWeek, Order, OrderPriceDetails,
-    OrderProduct, Price, Product, ProductAvailability, ProductImage, ProductVideo, SalePrice,
-    VariantProperty,
+    CollectionOptions, Collections, CoverPhotoUpload, DayOfWeek, ImporterAddress, Order,
+    OrderPriceDetails, OrderProduct, Price, Product, ProductAvailability, ProductImage,
+    ProductVideo, SalePrice, VariantProperty,
 };
 
 pub use chat_actions::{

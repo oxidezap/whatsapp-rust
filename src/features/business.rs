@@ -193,6 +193,27 @@ pub struct Product {
     pub videos: Vec<ProductVideo>,
     pub compliance_category: Option<String>,
     pub country_code_origin: Option<String>,
+    /// Importer of record, sent alongside [`Product::importer_address`] for
+    /// products carrying an importer disclosure.
+    pub importer_name: Option<String>,
+    /// Importer's address. Some markets require this to be shown next to the
+    /// product, so it is surfaced whole rather than reduced to a country code.
+    pub importer_address: Option<ImporterAddress>,
+}
+
+/// A postal address, as sent for a product's importer of record.
+///
+/// Every part is optional: the server omits what it does not hold rather than
+/// sending an empty string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ImporterAddress {
+    pub street1: Option<String>,
+    pub street2: Option<String>,
+    pub city: Option<String>,
+    pub region: Option<String>,
+    pub postal_code: Option<String>,
+    pub country_code: Option<String>,
 }
 
 /// One page of a business catalog.
@@ -559,6 +580,17 @@ fn parse_variant_properties(
     operation: &'static str,
     variant_info: &Value,
 ) -> Result<Vec<VariantProperty>, BusinessError> {
+    if variant_info.is_null() {
+        return Ok(Vec::new());
+    }
+    // Indexing a non-object yields Null, so without this the corrupt case would
+    // be indistinguishable from a product that simply has no variants.
+    if !variant_info.is_object() {
+        return Err(BusinessError::malformed(
+            operation,
+            "variant_info is not an object",
+        ));
+    }
     let properties = &variant_info["variant_properties"];
     if properties.is_null() {
         return Ok(Vec::new());
@@ -624,6 +656,7 @@ fn parse_product(value: &Value, operation: &'static str) -> Result<Product, Busi
         .ok_or_else(|| BusinessError::malformed(operation, "product entry has no id"))?;
 
     let currency = opt_str(&value["currency"]);
+    let compliance = &value["compliance_info"];
     let sale = &value["sale_price"];
     let sale_price = parse_price(&sale["price"], currency.as_deref()).map(|price| SalePrice {
         price,
@@ -650,8 +683,30 @@ fn parse_product(value: &Value, operation: &'static str) -> Result<Product, Busi
         images: parse_images(&value["media"]),
         videos: parse_videos(&value["media"]),
         compliance_category: opt_str(&value["compliance_category"]),
-        country_code_origin: opt_str(&value["compliance_info"]["country_code_origin"]),
+        country_code_origin: opt_str(&compliance["country_code_origin"]),
+        importer_name: opt_str(&compliance["importer_name"]),
+        importer_address: parse_importer_address(&compliance["importer_address"]),
     })
+}
+
+/// Reads `compliance_info.importer_address`. Absent, or present with every part
+/// missing, is `None` — an address with nothing in it is not an address.
+fn parse_importer_address(value: &Value) -> Option<ImporterAddress> {
+    let address = ImporterAddress {
+        street1: opt_str(&value["street1"]),
+        street2: opt_str(&value["street2"]),
+        city: opt_str(&value["city"]),
+        region: opt_str(&value["region"]),
+        postal_code: opt_str(&value["postal_code"]),
+        country_code: opt_str(&value["country_code"]),
+    };
+    let empty = address.street1.is_none()
+        && address.street2.is_none()
+        && address.city.is_none()
+        && address.region.is_none()
+        && address.postal_code.is_none()
+        && address.country_code.is_none();
+    (!empty).then_some(address)
 }
 
 fn parse_catalog(data: &Value) -> Result<Catalog, BusinessError> {
@@ -901,6 +956,62 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// Importer disclosures arrive unconditionally — there is no opt-in field
+    /// for them the way there is for variant data — and some markets require
+    /// them shown, so the whole address is kept rather than the origin alone.
+    #[test]
+    fn products_keep_the_importer_disclosure() {
+        let response = json!({
+            "xwa_product_catalog_get_product_catalog": {
+                "product_catalog": { "products": [{
+                    "id": "1000000000000001",
+                    "compliance_info": {
+                        "country_code_origin": "CN",
+                        "importer_name": "Example Imports Ltda",
+                        "importer_address": {
+                            "street1": "Rua das Flores 100",
+                            "city": "São Paulo",
+                            "region": "SP",
+                            "postal_code": "01000-000",
+                            "country_code": "BR"
+                        }
+                    }
+                }] }
+            }
+        });
+
+        let product = &parse_catalog(&response).unwrap().products[0];
+        assert_eq!(product.country_code_origin.as_deref(), Some("CN"));
+        assert_eq!(
+            product.importer_name.as_deref(),
+            Some("Example Imports Ltda")
+        );
+        let address = product.importer_address.as_ref().unwrap();
+        assert_eq!(address.city.as_deref(), Some("São Paulo"));
+        assert_eq!(address.postal_code.as_deref(), Some("01000-000"));
+        // Absent parts stay absent rather than becoming empty strings.
+        assert_eq!(address.street2, None);
+    }
+
+    /// An origin-only disclosure carries no address, and an address with
+    /// nothing in it is not an address.
+    #[test]
+    fn absent_importer_address_is_none() {
+        let response = json!({
+            "xwa_product_catalog_get_product_catalog": {
+                "product_catalog": { "products": [{
+                    "id": "1000000000000001",
+                    "compliance_info": { "country_code_origin": "BR" }
+                }] }
+            }
+        });
+
+        let product = &parse_catalog(&response).unwrap().products[0];
+        assert_eq!(product.country_code_origin.as_deref(), Some("BR"));
+        assert_eq!(product.importer_name, None);
+        assert_eq!(product.importer_address, None);
     }
 
     #[test]
@@ -1267,6 +1378,18 @@ mod tests {
                 "xwa_checkout_get_order_info": { "order": { "products": [{
                     "id": "1000000000000001",
                     "variant_info": { "variant_properties": "nope" }
+                }] } }
+            }))
+            .is_err()
+        );
+
+        // A non-object variant_info indexes to Null, so without its own check it
+        // would be indistinguishable from a product that has no variants.
+        assert!(
+            parse_order(&json!({
+                "xwa_checkout_get_order_info": { "order": { "products": [{
+                    "id": "1000000000000001",
+                    "variant_info": "nope"
                 }] } }
             }))
             .is_err()
