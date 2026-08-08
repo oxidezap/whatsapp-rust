@@ -25,8 +25,8 @@ mod tctoken;
 pub use blocking::{Blocking, BlockingError, BlocklistEntry};
 
 pub use bots::{
-    BotList, BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType, BotSectionType,
-    BotTheme, BotThemeMode, Bots,
+    BotDefault, BotList, BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType,
+    BotSectionType, BotTheme, BotThemeMode, Bots,
 };
 
 pub use chat_actions::{

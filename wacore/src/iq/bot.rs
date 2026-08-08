@@ -273,6 +273,29 @@ impl ProtocolNode for BotListSection {
     }
 }
 
+/// The bot the client offers by default.
+///
+/// A distinct type from [`BotListEntry`] because `<default>` carries exactly
+/// these two attributes on the wire in both response versions — it has no
+/// `card_title`, `count` or themes to lose.
+///
+/// Wire format: `<default jid="…" persona_id="…"/>`
+#[derive(Debug, Clone, PartialEq, Eq, crate::ProtocolNode)]
+#[protocol(tag = "default")]
+#[non_exhaustive]
+pub struct BotDefault {
+    #[attr(name = "jid", jid)]
+    pub jid: Jid,
+    #[attr(name = "persona_id")]
+    pub persona_id: String,
+}
+
+impl BotDefault {
+    pub fn new(jid: Jid, persona_id: String) -> Self {
+        Self { jid, persona_id }
+    }
+}
+
 /// The whole bot directory as the server returned it.
 ///
 /// Sections are kept as sent. WhatsApp Web reads bots out of every section and
@@ -287,7 +310,7 @@ pub struct BotList {
     pub bhash: Option<String>,
     /// The bot the client should offer by default. Mandatory in `v="2"`,
     /// optional in `v="3"`, and not necessarily repeated inside a section.
-    pub default_bot: Option<BotListEntry>,
+    pub default_bot: Option<BotDefault>,
     pub sections: Vec<BotListSection>,
 }
 
@@ -295,16 +318,23 @@ impl BotList {
     /// Every bot in the directory, in section order, with the default bot first
     /// when the sections do not already contain it. This is the flattening
     /// WhatsApp Web applies before it fetches bot profiles.
-    pub fn flatten(&self) -> Vec<&BotListEntry> {
-        let mut out: Vec<&BotListEntry> = self
+    ///
+    /// A default bot that no section carries has only the two attributes
+    /// `<default>` holds, so it arrives here with no card title, count or themes.
+    pub fn flatten(&self) -> Vec<BotListEntry> {
+        let mut out: Vec<BotListEntry> = self
             .sections
             .iter()
             .flat_map(|section| section.bots.iter())
+            .cloned()
             .collect();
         if let Some(default_bot) = self.default_bot.as_ref()
             && !out.iter().any(|bot| bot.jid == default_bot.jid)
         {
-            out.insert(0, default_bot);
+            out.insert(
+                0,
+                BotListEntry::new(default_bot.jid.clone(), default_bot.persona_id.clone()),
+            );
         }
         out
     }
@@ -327,12 +357,7 @@ impl ProtocolNode for BotList {
         }
         let mut children = Vec::with_capacity(self.sections.len() + 1);
         if let Some(default_bot) = self.default_bot {
-            children.push(
-                NodeBuilder::new("default")
-                    .attr("jid", default_bot.jid.to_string())
-                    .attr("persona_id", &default_bot.persona_id)
-                    .build(),
-            );
+            children.push(default_bot.into_node());
         }
         children.extend(self.sections.into_iter().map(ProtocolNode::into_node));
         builder.children(children).build()
@@ -341,20 +366,19 @@ impl ProtocolNode for BotList {
     fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
         let version =
             optional_attr(node, "v").ok_or_else(|| anyhow!("<bot> is missing the v attribute"))?;
-        let default_bot = match node.get_optional_child("default") {
-            Some(default_node) => {
-                let mut attrs = default_node.attrs();
-                let jid = attrs.required_jid("jid")?;
-                let persona_id = attrs
-                    .optional_string("persona_id")
-                    .ok_or_else(|| anyhow!("<default> is missing the persona_id attribute"))?
-                    .to_string();
-                Some(BotListEntry::new(jid, persona_id))
-            }
-            None => None,
-        };
+        let version = BotListVersion::from(version.as_ref());
+        let default_bot = node
+            .get_optional_child("default")
+            .map(BotDefault::try_from_node_ref)
+            .transpose()?;
+        // `v="2"` makes <default> mandatory; the official parser rejects the whole
+        // variant without it. It is optional in `v="3"`, and an unknown version is
+        // an unknown contract, so neither is held to the v2 rule.
+        if version == BotListVersion::V2 && default_bot.is_none() {
+            return Err(anyhow!("<bot v=\"2\"> is missing its <default> child"));
+        }
         Ok(Self {
-            version: BotListVersion::from(version.as_ref()),
+            version,
             bhash: optional_attr(node, "bhash").map(|v| v.to_string()),
             default_bot,
             sections: node
@@ -544,6 +568,10 @@ mod tests {
             NodeBuilder::new("bot")
                 .attr("v", "2")
                 .children([
+                    NodeBuilder::new("default")
+                        .attr("jid", "10000000000000@bot")
+                        .attr("persona_id", "persona-default")
+                        .build(),
                     NodeBuilder::new("section")
                         .attr("type", "all")
                         .children([bot_node("10000000000000@bot", "persona-all").build()])
@@ -563,19 +591,71 @@ mod tests {
             BotSectionType::Other("carousel_v9".to_string())
         );
         // The bot only the unknown section carries is still reachable.
-        let personas: Vec<&str> = list
+        let personas: Vec<String> = list
             .flatten()
-            .iter()
-            .map(|bot| bot.persona_id.as_str())
+            .into_iter()
+            .map(|bot| bot.persona_id)
             .collect();
         assert_eq!(personas, vec!["persona-all", "persona-new"]);
     }
 
     #[test]
     fn keeps_an_unknown_protocol_version() {
+        // An unknown version is an unknown contract, so v2's <default> rule
+        // must not be applied to it.
         let iq = iq_with(NodeBuilder::new("bot").attr("v", "4").build());
         let list = parse(&iq).expect("unknown version must not fail the parse");
         assert_eq!(list.version, BotListVersion::Other("4".to_string()));
+        assert_eq!(list.default_bot, None);
+    }
+
+    #[test]
+    fn v2_response_without_a_default_is_an_error() {
+        // The official v2 parser requires <default>; a response without one makes
+        // it fall through to v3, which then fails on the missing bhash.
+        let iq = iq_with(
+            NodeBuilder::new("bot")
+                .attr("v", "2")
+                .children([NodeBuilder::new("section")
+                    .attr("type", "all")
+                    .children([bot_node("10000000000000@bot", "persona-all").build()])
+                    .build()])
+                .build(),
+        );
+        let err = parse(&iq).expect_err("a v2 list with no <default> must fail");
+        assert!(err.to_string().contains("<default>"), "got: {err}");
+    }
+
+    #[test]
+    fn v3_response_without_a_default_is_accepted() {
+        let iq = iq_with(
+            NodeBuilder::new("bot")
+                .attr("v", "3")
+                .attr("bhash", "cafebabe")
+                .children([NodeBuilder::new("section")
+                    .attr("type", "all")
+                    .attr("display_type", "listview")
+                    .children([bot_node("10000000000000@bot", "persona-all").build()])
+                    .build()])
+                .build(),
+        );
+        let list = parse(&iq).expect("v3 makes <default> optional");
+        assert_eq!(list.default_bot, None);
+        assert_eq!(list.flatten().len(), 1);
+    }
+
+    #[test]
+    fn default_without_persona_id_is_an_error() {
+        let iq = iq_with(
+            NodeBuilder::new("bot")
+                .attr("v", "2")
+                .children([NodeBuilder::new("default")
+                    .attr("jid", "10000000000000@bot")
+                    .build()])
+                .build(),
+        );
+        let err = parse(&iq).expect_err("a <default> with no persona_id must fail");
+        assert!(err.to_string().contains("persona_id"), "got: {err}");
     }
 
     #[test]
@@ -613,12 +693,18 @@ mod tests {
         let iq = iq_with(
             NodeBuilder::new("bot")
                 .attr("v", "2")
-                .children([NodeBuilder::new("section")
-                    .attr("type", "all")
-                    .children([NodeBuilder::new("bot")
+                .children([
+                    NodeBuilder::new("default")
                         .attr("jid", "10000000000000@bot")
-                        .build()])
-                    .build()])
+                        .attr("persona_id", "persona-default")
+                        .build(),
+                    NodeBuilder::new("section")
+                        .attr("type", "all")
+                        .children([NodeBuilder::new("bot")
+                            .attr("jid", "10000000000000@bot")
+                            .build()])
+                        .build(),
+                ])
                 .build(),
         );
         let err = parse(&iq).expect_err("a <bot> with no persona_id must fail");
@@ -630,7 +716,13 @@ mod tests {
         let iq = iq_with(
             NodeBuilder::new("bot")
                 .attr("v", "2")
-                .children([NodeBuilder::new("section").attr("name", "All").build()])
+                .children([
+                    NodeBuilder::new("default")
+                        .attr("jid", "10000000000000@bot")
+                        .attr("persona_id", "persona-default")
+                        .build(),
+                    NodeBuilder::new("section").attr("name", "All").build(),
+                ])
                 .build(),
         );
         let err = parse(&iq).expect_err("a <section> with no type must fail");
@@ -642,7 +734,7 @@ mod tests {
         let list = BotList {
             version: BotListVersion::V3,
             bhash: Some("cafebabe".to_string()),
-            default_bot: Some(BotListEntry::new(
+            default_bot: Some(BotDefault::new(
                 "10000000000000@bot".parse().expect("jid"),
                 "persona-default".to_string(),
             )),

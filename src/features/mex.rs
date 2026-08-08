@@ -290,9 +290,12 @@ fn decode_new_chat_message_capping(
     let info = data.get("xwa2_message_capping_info").ok_or_else(|| {
         MexError::PayloadParsing("new chat message capping response missing capping info".into())
     })?;
-    if info.is_null() {
+    // Anything that is not an object — null included — would read as an all-absent
+    // cap, which a caller cannot tell apart from a genuinely sparse one. WhatsApp
+    // Web raises a 500 on the null case; treat every other non-object the same way.
+    if !info.is_object() {
         return Err(MexError::PayloadParsing(
-            "new chat message capping response has null capping info".into(),
+            "new chat message capping response has a non-object capping info".into(),
         ));
     }
 
@@ -569,6 +572,18 @@ mod tests {
             decode_new_chat_message_capping(Some(json!({ "xwa2_message_capping_info": null }))),
             Err(MexError::PayloadParsing(_))
         ));
+        // Any other non-object would otherwise read as a cap with every field absent.
+        for malformed in [json!("CAPPED"), json!(0), json!([]), json!(true)] {
+            assert!(
+                matches!(
+                    decode_new_chat_message_capping(Some(
+                        json!({ "xwa2_message_capping_info": malformed })
+                    )),
+                    Err(MexError::PayloadParsing(_))
+                ),
+                "expected a parse error for {malformed}"
+            );
+        }
     }
 
     #[test]

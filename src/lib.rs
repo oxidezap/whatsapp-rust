@@ -200,7 +200,7 @@ pub mod usync;
 
 pub mod features;
 pub use features::{
-    AppStateError, BatchGroupResult, Blocking, BlockingError, BlocklistEntry, BotList,
+    AppStateError, BatchGroupResult, Blocking, BlockingError, BlocklistEntry, BotDefault, BotList,
     BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType, BotSectionType, BotTheme,
     BotThemeMode, Bots, CappingMvStatus, CappingOteStatus, CappingStatus, ChatActions,
     ChatStateError, ChatStateType, Chatstate, Comments, Community, CommunityError,

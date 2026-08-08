@@ -10,8 +10,8 @@ use crate::request::IqError;
 use log::debug;
 use wacore::iq::bot::GetBotListSpec;
 pub use wacore::iq::bot::{
-    BotList, BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType, BotSectionType,
-    BotTheme, BotThemeMode,
+    BotDefault, BotList, BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType,
+    BotSectionType, BotTheme, BotThemeMode,
 };
 
 /// Feature handle for bot directory operations.
