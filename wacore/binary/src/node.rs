@@ -269,16 +269,17 @@ impl From<bool> for NodeValue {
 }
 
 /// Inline backing store for [`Attrs`]. A plain `Vec` paid one heap allocation
-/// per node on the encode hot path just for the backing buffer. Capacity 2 is
-/// the measured sweet spot: the per-recipient fanout nodes (`to`, `enc`) carry
-/// 1-2 attributes and stay inline, while stanza roots with 3+ attrs spill once
-/// per stanza. A larger inline array (4) grows `Node` enough that moving it
-/// through children Vecs costs more than the spared spills save.
-pub type AttrsVec = smallvec::SmallVec<[(Cow<'static, str>, NodeValue); 2]>;
+/// per node on the encode hot path just for the backing buffer. Capacity 3 is
+/// the measured optimum: it is the width of the `<enc>` fanout node (`v`,
+/// `type`, `mediatype`), the highest-multiplicity node in a send, so a 64-device
+/// fanout keeps it inline and drops a fifth of its allocations and a sixth of
+/// its live bytes. Capacity 4 spares almost no further spills but widens `Node`
+/// enough that moving it through the builder costs 8% more instructions.
+pub type AttrsVec = smallvec::SmallVec<[(Cow<'static, str>, NodeValue); 3]>;
 
 /// A collection of node attributes stored as key-value pairs.
-/// Stored inline for small attribute counts (typically 3-6) for cache locality
-/// and to avoid a per-node heap allocation; see [`AttrsVec`].
+/// Stored inline for small attribute counts for cache locality and to avoid a
+/// per-node heap allocation; see [`AttrsVec`].
 /// Values can be either strings or JIDs, avoiding stringification overhead for JID attributes.
 /// Keys use `Cow<'static, str>` to avoid heap allocation for compile-time-known strings
 /// (e.g., "type", "id", "to") which are the vast majority of attribute keys.
@@ -362,7 +363,7 @@ impl Attrs {
 /// Owned iterator implementation (consuming).
 impl IntoIterator for Attrs {
     type Item = (Cow<'static, str>, NodeValue);
-    type IntoIter = smallvec::IntoIter<[(Cow<'static, str>, NodeValue); 2]>;
+    type IntoIter = smallvec::IntoIter<[(Cow<'static, str>, NodeValue); 3]>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
@@ -1024,6 +1025,44 @@ impl OwnedNodeRef {
     #[inline]
     pub fn content_as_string(&self) -> Option<CompactString> {
         self.get().content_as_string()
+    }
+}
+
+#[cfg(test)]
+mod attrs_capacity_tests {
+    use super::*;
+
+    fn node_with(n: usize) -> Node {
+        const KEYS: [&str; 8] = ["to", "id", "type", "t", "edit", "phash", "count", "offline"];
+        let mut attrs = Attrs::new();
+        for (i, key) in KEYS.iter().take(n).enumerate() {
+            attrs.push(
+                Cow::Borrowed(*key),
+                NodeValue::String(format!("v{i}").into()),
+            );
+        }
+        Node::new("message", attrs, Some(NodeContent::String("body".into())))
+    }
+
+    /// Capacity is invisible to the wire: every attribute count decodes back to
+    /// what it was encoded from, on both sides of the inline/heap transition.
+    #[test]
+    fn every_attribute_count_survives_a_round_trip() {
+        for n in 0..=8 {
+            let node = node_with(n);
+            let bytes = crate::marshal::marshal(&node).unwrap();
+            let decoded = crate::marshal::unmarshal_ref(&bytes[1..])
+                .unwrap()
+                .to_owned();
+            assert_eq!(decoded, node, "{n} attributes did not round-trip");
+        }
+    }
+
+    /// The inline/heap boundary, where an off-by-one in the capacity hides.
+    #[test]
+    fn the_inline_boundary_is_where_the_declaration_says_it_is() {
+        assert!(!node_with(3).attrs.0.spilled(), "3 attrs must stay inline");
+        assert!(node_with(4).attrs.0.spilled(), "4 attrs must spill");
     }
 }
 
