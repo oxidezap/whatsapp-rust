@@ -546,7 +546,7 @@ mod unread_error_detail_tests {
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::node::{Node, NodeContent};
 
-    /// The shape every rejected IQ observed so far has: nothing is dropped, so the probe has
+    /// The shape every rejected IQ observed so far has: nothing goes unread, so the probe has
     /// nothing to say.
     #[test]
     fn a_fully_parsed_error_reports_nothing() {
