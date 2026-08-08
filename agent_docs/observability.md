@@ -28,7 +28,7 @@ must follow.
 `wacore::stats::SessionStats`, owned by each `Client`. Recorded at exactly two
 chokepoints:
 
-- **Sent**: the noise sender task (`NoiseSocket::with_stats`) after the
+- **Sent**: the noise sender task (`NoiseSocket::with_observers`) after the
   transport write — post-noise wire bytes (frame header + AEAD tag included).
 - **Received**: the read loop (`node_io.rs`) per `DataReceived` batch.
 
@@ -108,6 +108,10 @@ work. Wiring: `build()` wraps the runtime in `InstrumentedRuntime`, so all
 spawns through the `Runtime` trait are covered without touching call sites.
 The `Option` is resolved once at `build()` — `None` (default) leaves the
 runtime untouched, so there is no per-spawn or per-poll cost when unset.
+Installed, the decorator costs one allocation per spawn: `Runtime::spawn`
+takes and returns an erased future, so wrapping it changes the type and needs
+a fresh box. Nothing else on the path allocates: `MeteredFuture` is generic
+over the future it wraps, and `Bot::run` stack-pins its own.
 
 - `CpuMeter` (built-in): busy time (direct CPU proxy) + poll count via
   `wacore::time::Instant`. Works on wasm/embedded once a monotonic provider

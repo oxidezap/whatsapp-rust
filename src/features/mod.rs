@@ -65,8 +65,9 @@ pub use mex::{
 };
 
 pub use newsletter::{
-    Newsletter, NewsletterError, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
-    NewsletterReactionCount, NewsletterRole, NewsletterState, NewsletterVerification,
+    Newsletter, NewsletterAdminInfo, NewsletterAdminProfile, NewsletterError, NewsletterFollower,
+    NewsletterMessage, NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount,
+    NewsletterRole, NewsletterState, NewsletterVerification,
 };
 
 pub use polls::{PollError, PollOptionResult, PollVoteCiphertext, Polls};

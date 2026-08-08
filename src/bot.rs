@@ -439,7 +439,9 @@ async fn run_metered<F: std::future::Future<Output = ()>>(
     instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
 ) {
     match instrument {
-        Some(i) => wacore::stats::MeteredFuture::new(Box::pin(fut), i).await,
+        // Stack-pinned, not boxed: `MeteredFuture` only needs an `Unpin` inner,
+        // and `Pin<&mut F>` is one without an allocation.
+        Some(i) => wacore::stats::MeteredFuture::new(core::pin::pin!(fut), i).await,
         None => fut.await,
     }
 }
@@ -2244,5 +2246,37 @@ mod tests {
 
         // No instrument: plain passthrough must still drive to completion.
         run_metered(async {}, None).await;
+    }
+
+    /// Cancellation: a `Bot::run` future dropped mid-flight (the caller's task
+    /// went away) must not leave a metering scope open, which would charge every
+    /// later allocation on that thread to the dead session's meter.
+    #[tokio::test]
+    async fn cancelling_run_metered_leaves_no_open_scope() {
+        use wacore::stats::{AllocMeter, TaskInstrument};
+
+        let meter = AllocMeter::new();
+        let instrument: Arc<dyn TaskInstrument> = Arc::new(meter.clone());
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut running = Box::pin(run_metered(
+            async move {
+                let _ = rx.await;
+            },
+            Some(instrument),
+        ));
+        assert!(
+            futures::poll!(running.as_mut()).is_pending(),
+            "the run loop parks on the channel"
+        );
+        drop(running);
+        drop(tx);
+
+        AllocMeter::on_alloc(4096);
+        assert_eq!(
+            meter.snapshot().allocations,
+            0,
+            "the cancelled run loop must not still be the active scope"
+        );
     }
 }
