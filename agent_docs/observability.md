@@ -187,8 +187,9 @@ strictly better than an `RssAnon` assertion:
   fixture (`an_ordinary_request_reuses_the_pooled_connection` and its
   `Connection: close` twin);
 - the noise batch buffer, by extracting the release decision into
-  `should_release_batch_buffer` and testing it directly; the wire-level test
-  could not see the buffer at all, and passed with the whole feature deleted;
+  `should_release_batch_buffer` (#1246) and testing it directly; the wire-level
+  test could not see the buffer at all, and passed with the whole feature
+  deleted;
 - the topology log, by asserting the bound and the floor rather than the bytes.
 
 An `RssAnon` assertion is page-quantised (the topology log's 8 KiB allocation
@@ -199,11 +200,23 @@ not in re-checking them. Write one when you need a number; reach for a
 deterministic observable when you need a guard.
 
 To rebuild one: read `/proc/self/status`, construct N of the thing under test in
-a loop while holding them all alive, and take the **mean over the tail** rather
-than the median, because at these sizes the median quantises to the page. Give each
-variant its own process (`--exact`, or nextest): RSS never shrinks, so a second
-measurement in the same process reads ~0 as it reuses the first one's freed
-heap. That mistake makes a real cost look free.
+a loop while holding them all alive, and read the tail.
+
+Keep the **median** there, as `process_footprint.rs` does, whenever the
+per-step delta is comfortably above the 4 KiB page: it resists the outlier
+steps, and the 88 KiB, 60 KiB and 14 KiB figures above are medians and are not
+affected by what follows. It stops working once the per-step delta is within a
+small multiple of the page, because then every step rounds to the same one or
+two page counts and the median reports that rounding rather than the cost. The
+topology log is the example: 8 KiB allocated, deltas alternating 32 and 36 KiB,
+median moving by exactly one page. The **mean over the same tail** is the
+sharper read there, and it agreed with the median to within 0.1 KiB.
+
+Give each variant its own process (`--exact`, or nextest, which forks per
+test): RSS never shrinks, so a second variant measured in the same process
+reuses the first one's freed heap and reads as ~0. That one is not a rounding
+artifact but a wrong answer, and it made a real 14 KiB cost look like 0.4 KiB
+until the variants were re-run separately.
 
 The pieces (each an `Option`-only struct in `wacore::stats`, filled only with
 what a component can introspect — absent means "not reported", not zero):
