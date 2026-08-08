@@ -25,11 +25,12 @@ mod tctoken;
 pub use blocking::{Blocking, BlockingError, BlocklistEntry};
 
 pub use business::{
-    BUSINESS_PROFILE_MAX_WEBSITES, Business, BusinessError, BusinessHourMode, BusinessHoursConfig,
-    BusinessHoursUpdate, BusinessProfile, BusinessProfileUpdate, BusinessProfileUpdateError,
-    Catalog, CatalogOptions, Collection, CollectionOptions, Collections, CoverPhotoUpload,
-    DayOfWeek, Order, OrderPriceDetails, OrderProduct, Price, Product, ProductAvailability,
-    ProductImage, ProductVideo, SalePrice,
+    BUSINESS_PROFILE_MAX_WEBSITES, Business, BusinessCategory, BusinessError, BusinessHourMode,
+    BusinessHours, BusinessHoursConfig, BusinessHoursUpdate, BusinessProfile,
+    BusinessProfileUpdate, BusinessProfileUpdateError, Catalog, CatalogOptions, Collection,
+    CollectionOptions, Collections, CoverPhotoUpload, DayOfWeek, Order, OrderPriceDetails,
+    OrderProduct, Price, Product, ProductAvailability, ProductImage, ProductVideo, SalePrice,
+    VariantProperty,
 };
 
 pub use chat_actions::{

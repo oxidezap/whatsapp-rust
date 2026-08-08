@@ -30,12 +30,15 @@ use wacore::iq::mex_operations::{biz_query_order, query_catalog, query_product_c
 use wacore_binary::Jid;
 
 // The profile types are protocol types and live in wacore, but they are the
-// arguments and error of this feature's public methods, so they belong on the
-// feature's public surface rather than making callers reach into wacore.
+// arguments, results and error of this feature's public methods, so they belong
+// on the feature's public surface rather than making callers reach into wacore.
+// That includes the types nested inside `BusinessProfile` — naming its
+// `business_hours` or `categories` in a signature must not require the
+// dependency either.
 pub use wacore::iq::business::{
-    BUSINESS_PROFILE_MAX_WEBSITES, BusinessHourMode, BusinessHoursConfig, BusinessHoursUpdate,
-    BusinessProfile, BusinessProfileUpdate, BusinessProfileUpdateError, CoverPhotoUpload,
-    DayOfWeek,
+    BUSINESS_PROFILE_MAX_WEBSITES, BusinessCategory, BusinessHourMode, BusinessHours,
+    BusinessHoursConfig, BusinessHoursUpdate, BusinessProfile, BusinessProfileUpdate,
+    BusinessProfileUpdateError, CoverPhotoUpload, DayOfWeek,
 };
 
 // The three defaults below are this client's choice, not values read off
@@ -197,6 +200,14 @@ pub struct Collection {
     pub name: Option<String>,
     pub products: Vec<Product>,
     pub review_status: Option<String>,
+    /// Whether a rejected collection can still be appealed.
+    pub can_appeal: Option<bool>,
+    /// Why the collection was rejected. Present only on a rejection, and
+    /// carried by collections alone — a product's `status_info` has no
+    /// equivalent, which is why [`Product`] exposes no counterpart.
+    pub reject_reason: Option<String>,
+    /// Where to review or appeal the decision.
+    pub commerce_url: Option<String>,
 }
 
 /// One page of a business's collections.
@@ -222,6 +233,20 @@ pub struct OrderProduct {
     pub price: Option<Price>,
     pub quantity: Option<i64>,
     pub images: Vec<ProductImage>,
+    /// The variant the customer actually chose — size, colour and the like.
+    /// Empty for a product with no variants. Without it an order for a
+    /// variant product cannot be fulfilled: `id`, `name` and `price` are the
+    /// same across the variants of one listing.
+    pub variant_properties: Vec<VariantProperty>,
+}
+
+/// One dimension of a chosen product variant, e.g. `name: "Size"`,
+/// `value: "Large"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VariantProperty {
+    pub name: Option<String>,
+    pub value: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -511,6 +536,23 @@ fn opt_bool(value: &Value) -> Option<bool> {
     }
 }
 
+/// Reads `variant_info.variant_properties`. A product with no variants omits
+/// the object entirely, which is an empty list rather than an error.
+fn parse_variant_properties(variant_info: &Value) -> Vec<VariantProperty> {
+    variant_info["variant_properties"]
+        .as_array()
+        .map(|properties| {
+            properties
+                .iter()
+                .map(|property| VariantProperty {
+                    name: opt_str(&property["name"]),
+                    value: opt_str(&property["value"]),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn opt_i64(value: &Value) -> Option<i64> {
     match value {
         Value::Number(n) => n.as_i64(),
@@ -656,11 +698,15 @@ fn parse_collections(data: &Value) -> Result<Collections, BusinessError> {
                 }
             };
 
+            let status = &collection["status_info"];
             Ok(Collection {
                 id: opt_str(&collection["id"]),
                 name: opt_str(&collection["name"]),
                 products,
-                review_status: opt_str(&collection["status_info"]["status"]),
+                review_status: opt_str(&status["status"]),
+                can_appeal: opt_bool(&status["can_appeal"]),
+                reject_reason: opt_str(&status["reject_reason"]),
+                commerce_url: opt_str(&status["commerce_url"]),
             })
         })
         .collect::<Result<Vec<_>, BusinessError>>()?;
@@ -687,16 +733,23 @@ fn parse_order(data: &Value) -> Result<Order, BusinessError> {
         .ok_or_else(|| BusinessError::malformed(OP, "order.products is not an array"))?
         .iter()
         .map(|product| {
+            if !product.is_object() {
+                return Err(BusinessError::malformed(
+                    OP,
+                    "order.products entry is not an object",
+                ));
+            }
             let currency = opt_str(&product["currency"]);
-            OrderProduct {
+            Ok(OrderProduct {
                 id: opt_str(&product["id"]),
                 name: opt_str(&product["name"]),
                 price: parse_price(&product["price"], currency.as_deref()),
                 quantity: opt_i64(&product["quantity"]),
                 images: parse_images(&product["media"]),
-            }
+                variant_properties: parse_variant_properties(&product["variant_info"]),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, BusinessError>>()?;
 
     let details = &order["price_details"];
     let price_details = details.is_object().then(|| {
@@ -1044,6 +1097,35 @@ mod tests {
         assert_eq!(parse_collections(&blank).unwrap().after_cursor, None);
     }
 
+    /// A rejection is only actionable with the reason and the appeal route;
+    /// `reject_reason` and `commerce_url` exist on a collection's `status_info`
+    /// and have no counterpart on a product's.
+    #[test]
+    fn collections_keep_the_full_moderation_status() {
+        let response = json!({
+            "xwa_product_catalog_get_collections": {
+                "collections": [{
+                    "id": "collection-1",
+                    "status_info": {
+                        "status": "REJECTED",
+                        "can_appeal": true,
+                        "reject_reason": "PROHIBITED_ITEM",
+                        "commerce_url": "https://business.example.invalid/appeal"
+                    }
+                }]
+            }
+        });
+
+        let collection = &parse_collections(&response).unwrap().collections[0];
+        assert_eq!(collection.review_status.as_deref(), Some("REJECTED"));
+        assert_eq!(collection.can_appeal, Some(true));
+        assert_eq!(collection.reject_reason.as_deref(), Some("PROHIBITED_ITEM"));
+        assert_eq!(
+            collection.commerce_url.as_deref(),
+            Some("https://business.example.invalid/appeal")
+        );
+    }
+
     /// A non-object entry would otherwise index to Null on every field and
     /// surface as a real-looking nameless, empty collection.
     #[test]
@@ -1107,12 +1189,63 @@ mod tests {
         assert_eq!(product.quantity, Some(2));
         assert_eq!(product.price.as_ref().unwrap().amount_1000, 12990);
         assert_eq!(product.images.len(), 1);
+        // No variant_info on the wire is a product without variants, not a
+        // malformed one.
+        assert!(product.variant_properties.is_empty());
+    }
+
+    /// Without the chosen variant an order cannot be fulfilled: every variant
+    /// of one listing shares an `id`, `name` and `price`.
+    #[test]
+    fn order_line_items_keep_the_chosen_variant() {
+        let response = json!({
+            "xwa_checkout_get_order_info": {
+                "order": {
+                    "products": [{
+                        "id": "1000000000000001",
+                        "variant_info": {
+                            "variant_properties": [
+                                { "name": "Size", "value": "Large" },
+                                { "name": "Colour", "value": "Red" }
+                            ]
+                        }
+                    }]
+                }
+            }
+        });
+
+        let order = parse_order(&response).unwrap();
+        assert_eq!(
+            order.products[0].variant_properties,
+            vec![
+                VariantProperty {
+                    name: Some("Size".into()),
+                    value: Some("Large".into()),
+                },
+                VariantProperty {
+                    name: Some("Colour".into()),
+                    value: Some("Red".into()),
+                },
+            ]
+        );
     }
 
     #[test]
     fn order_without_payload_is_an_error() {
         assert!(parse_order(&json!({})).is_err());
         assert!(parse_order(&json!({ "xwa_checkout_get_order_info": { "order": {} } })).is_err());
+    }
+
+    /// A non-object line item would otherwise index to `Null` on every field
+    /// and read back as a plausible product with everything absent.
+    #[test]
+    fn non_object_order_line_item_is_an_error() {
+        assert!(
+            parse_order(&json!({
+                "xwa_checkout_get_order_info": { "order": { "products": ["not-an-object"] } }
+            }))
+            .is_err()
+        );
     }
 
     #[test]

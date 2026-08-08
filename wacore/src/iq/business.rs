@@ -300,6 +300,17 @@ pub enum BusinessProfileUpdateError {
         field: &'static str,
         value: u32,
     },
+    /// Times and `specific_hours` go together. WhatsApp Web emits `open_time`
+    /// and `close_time` exactly when a day has a range, and reads them back
+    /// only for `specific_hours` — so a ranged `open_24h`, or a
+    /// `specific_hours` day with no range, is a stanza it never produces.
+    /// A mode this crate does not know is left alone rather than guessed at.
+    #[error("{day} is {mode}, which {expectation}")]
+    MismatchedBusinessHourMode {
+        day: String,
+        mode: String,
+        expectation: &'static str,
+    },
     /// `f64::to_string` would render a non-finite or out-of-range coordinate as
     /// `NaN`/`inf`, or as a latitude no point on earth has. The server rejects
     /// the whole delta in that case, so the other fields in the same update
@@ -336,6 +347,27 @@ fn check_coordinate(
         return Ok(());
     }
     Err(BusinessProfileUpdateError::InvalidCoordinate { axis, value, limit })
+}
+
+/// A day carries a range exactly when its mode is `specific_hours`.
+///
+/// An unrecognised mode is accepted either way: `BusinessHourMode::Other`
+/// exists so a mode WhatsApp adds later degrades to a passthrough, and
+/// guessing its arity here would turn that into a hard failure.
+fn check_mode_pairing(config: &BusinessHoursConfig) -> Result<(), BusinessProfileUpdateError> {
+    let has_range = config.open_time.is_some() || config.close_time.is_some();
+    let expectation = match (&config.mode, has_range) {
+        (BusinessHourMode::SpecificHours, false) => "needs an opening and closing time",
+        (BusinessHourMode::Open24H | BusinessHourMode::AppointmentOnly, true) => {
+            "carries no opening or closing time"
+        }
+        _ => return Ok(()),
+    };
+    Err(BusinessProfileUpdateError::MismatchedBusinessHourMode {
+        day: config.day_of_week.as_str().to_string(),
+        mode: config.mode.as_str().to_string(),
+        expectation,
+    })
 }
 
 fn check_minutes(
@@ -391,6 +423,7 @@ impl BusinessProfileUpdate {
                 if let Some(close_time) = config.close_time {
                     check_minutes(&config.day_of_week, "close_time", close_time)?;
                 }
+                check_mode_pairing(config)?;
             }
         }
 
@@ -948,6 +981,67 @@ mod tests {
                 BusinessProfileUpdateSpec::new(&update).is_ok(),
                 "{open}-{close} should be accepted"
             );
+        }
+    }
+
+    /// WhatsApp Web emits times exactly when a day has a range, and reads them
+    /// back only for `specific_hours`, so the two other shapes are stanzas it
+    /// never produces.
+    #[test]
+    fn business_hour_mode_must_match_the_presence_of_a_range() {
+        let ranged_but_not_specific = BusinessHoursConfig::with_hours(
+            DayOfWeek::Monday,
+            BusinessHourMode::Open24H,
+            540,
+            1020,
+        );
+        let specific_without_range =
+            BusinessHoursConfig::new(DayOfWeek::Tuesday, BusinessHourMode::SpecificHours);
+
+        for config in [ranged_but_not_specific, specific_without_range] {
+            let update = BusinessProfileUpdate {
+                business_hours: Some(BusinessHoursUpdate {
+                    note: None,
+                    timezone: None,
+                    config: vec![config.clone()],
+                }),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    BusinessProfileUpdateSpec::new(&update),
+                    Err(BusinessProfileUpdateError::MismatchedBusinessHourMode { .. })
+                ),
+                "{config:?} should be rejected"
+            );
+        }
+    }
+
+    /// `Other` exists so a mode WhatsApp adds later still round-trips; guessing
+    /// whether it takes a range would turn that passthrough into a failure.
+    #[test]
+    fn unknown_business_hour_mode_is_left_alone() {
+        for config in [
+            BusinessHoursConfig::new(
+                DayOfWeek::Monday,
+                BusinessHourMode::Other("seasonal".into()),
+            ),
+            BusinessHoursConfig::with_hours(
+                DayOfWeek::Monday,
+                BusinessHourMode::Other("seasonal".into()),
+                540,
+                1020,
+            ),
+        ] {
+            let update = BusinessProfileUpdate {
+                business_hours: Some(BusinessHoursUpdate {
+                    note: None,
+                    timezone: None,
+                    config: vec![config],
+                }),
+                ..Default::default()
+            };
+            assert!(BusinessProfileUpdateSpec::new(&update).is_ok());
         }
     }
 
