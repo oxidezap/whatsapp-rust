@@ -127,8 +127,8 @@ pub use client::{
 };
 pub use client::{CallError, Voip};
 pub use client::{
-    Client, ClientBuild, ClientBuilder, ClientBuilderError, DecryptedPayloadLease, RawNodeLease,
-    SentFrameLease,
+    Client, ClientBuild, ClientBuilder, ClientBuilderError, Connection, DecryptedPayloadLease,
+    RawNodeLease, SentFrameLease,
 };
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
@@ -201,15 +201,19 @@ pub mod usync;
 
 pub mod features;
 pub use features::{
-    AppStateError, BatchGroupResult, Blocking, BlockingError, BlocklistEntry, BotDefault, BotList,
-    BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType, BotSectionType, BotTheme,
-    BotThemeMode, Bots, CappingMvStatus, CappingOteStatus, CappingStatus, ChatActions,
-    ChatStateError, ChatStateType, Chatstate, Comments, Community, CommunityError,
-    CommunitySubgroup, ContactError, Contacts, CreateCommunityOptions, CreateCommunityResult,
-    CreateGroupResult, EncType, EncryptedEdit, EventCreationParams, EventResponseType, Events,
-    GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings, GroupError,
-    GroupJoinError, GroupMetadata, GroupParticipant, GroupParticipantDetails,
-    GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo,
+    AppStateError, BUSINESS_PROFILE_MAX_WEBSITES, BatchGroupResult, Blocking, BlockingError,
+    BlocklistEntry, BotDefault, BotList, BotListEntry, BotListSection, BotListVersion,
+    BotSectionDisplayType, BotSectionType, BotTheme, BotThemeMode, Bots, Business,
+    BusinessCategory, BusinessError, BusinessHourMode, BusinessHours, BusinessHoursConfig,
+    BusinessHoursUpdate, BusinessProfile, BusinessProfileUpdate, BusinessProfileUpdateError,
+    CappingMvStatus, CappingOteStatus, CappingStatus, Catalog, CatalogOptions, ChatActions,
+    ChatStateError, ChatStateType, Chatstate, Collection, CollectionOptions, Collections, Comments,
+    Community, CommunityError, CommunitySubgroup, ContactError, Contacts, CoverPhotoUpload,
+    CreateCommunityOptions, CreateCommunityResult, CreateGroupResult, DayOfWeek, EncType,
+    EncryptedEdit, EventCreationParams, EventResponseType, Events, GroupAppealStatus,
+    GroupCreateOptions, GroupDescription, GroupEphemeralSettings, GroupError, GroupJoinError,
+    GroupMetadata, GroupParticipant, GroupParticipantDetails, GroupParticipantOptions,
+    GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo, ImporterAddress,
     InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult,
     MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
     MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
@@ -217,14 +221,16 @@ pub use features::{
     MexRequest, MexResponse, NackReason, NewChatMessageCapping, Newsletter, NewsletterAdminInfo,
     NewsletterAdminProfile, NewsletterError, NewsletterFollower, NewsletterMessage,
     NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
-    NewsletterState, NewsletterVerification, ParticipantChangeResponse, ParticipantType,
-    PictureType, PollError, PollOptionResult, PollVoteCiphertext, Polls, Presence, PresenceError,
-    PresenceStatus, PreviousDescription, Profile, ProfileError, ProfilePicture, ReachoutTimelock,
-    RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome, SecretEncKind,
-    SecretEncrypted, SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo,
-    SignalSessionMigration, StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting,
-    StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult,
-    UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
+    NewsletterState, NewsletterVerification, Order, OrderPriceDetails, OrderProduct,
+    ParticipantChangeResponse, ParticipantType, PictureType, PollError, PollOptionResult,
+    PollVoteCiphertext, Polls, Presence, PresenceError, PresenceStatus, PreviousDescription, Price,
+    Product, ProductAvailability, ProductImage, ProductVideo, Profile, ProfileError,
+    ProfilePicture, ReachoutTimelock, RetryReason, RetryRequestError, RetryRequestOptions,
+    RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted, SetProfilePictureResponse,
+    Signal, SignalError, SignalSessionInfo, SignalSessionMigration, StanzaRejection,
+    StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange,
+    TcToken, TcTokenError, UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError, VariantProperty,
+    VerifiedName, group_type, message_key, message_range,
 };
 
 pub mod bot;
@@ -242,7 +248,7 @@ pub mod version;
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
     pub use crate::client::{
-        Client, ClientBuilder, ClientBuilderError, ClientError, DecryptedPayloadLease,
+        Client, ClientBuilder, ClientBuilderError, ClientError, Connection, DecryptedPayloadLease,
         RawNodeLease, SentFrameLease,
     };
     #[cfg(feature = "client-lifecycle")]
