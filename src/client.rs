@@ -107,6 +107,14 @@ impl Drop for RawNodeLease {
 ///
 /// Dropping the final lease disables forwarding. The lease holds only a weak
 /// client reference, so it cannot keep the client alive.
+///
+/// It gates, it does not fence, and one aggregate count gates them all rather
+/// than one per lease: a frame captured while any lease was alive can still
+/// arrive just after this one drops, and which handlers receive it is a matter of
+/// subscription, not of who holds a lease. Every gated kind works this way.
+/// Making the drop wait for in-flight dispatches to drain would instead deadlock
+/// an observer that drops its lease from inside its own handler, which is the
+/// natural way to record one frame and stop.
 #[must_use = "dropping the lease immediately releases sent-frame forwarding"]
 pub struct SentFrameLease {
     client: std::sync::Weak<Client>,

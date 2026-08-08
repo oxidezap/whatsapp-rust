@@ -322,9 +322,10 @@ impl NoiseSocket {
                                 stats.record_frame_sent(*wire_bytes);
                             }
                         }
-                        // Re-read the gate rather than trusting the one read at
-                        // capture time: a lease released while this batch was in
-                        // flight must not see a frame arrive after it let go.
+                        // Re-read the gate rather than trusting the read at
+                        // capture time, so a batch that outlived its last lease
+                        // stays quiet. A release racing this instant may still
+                        // lose: the lease gates, it does not fence.
                         if let Some(tap) = sent_frames.as_deref()
                             && tap.enabled()
                         {
