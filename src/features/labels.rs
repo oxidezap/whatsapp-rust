@@ -71,8 +71,11 @@ pub(crate) fn dispatch_label_mutation(
             let Some(chat_jid) = parse_association_chat_jid(kind, &m.index) else {
                 return true;
             };
-            let Some(message_id) = m.index.get(3).cloned() else {
-                log::warn!("Skipping label_message mutation: missing message id in index");
+            // Empty is as unusable as absent: the id is what the association
+            // hangs off, and an event carrying "" points at no message. The
+            // outbound side rejects it for the same reason.
+            let Some(message_id) = m.index.get(3).filter(|id| !id.is_empty()).cloned() else {
+                log::warn!("Skipping label_message mutation: missing or empty message id in index");
                 return true;
             };
             if let Some(val) = &m.action_value
@@ -412,7 +415,7 @@ mod tests {
     #[test]
     fn label_jid_dispatches_association() {
         let m = set_mutation(
-            vec!["label_jid", "5", "15551112222@s.whatsapp.net"],
+            vec!["label_jid", "5", "12025550111@s.whatsapp.net"],
             wa::SyncActionValue {
                 label_association_action: buffa::MessageField::some(
                     wa::sync_action_value::LabelAssociationAction {
@@ -430,7 +433,7 @@ mod tests {
         match &*events[0] {
             Event::LabelAssociationUpdate(u) => {
                 assert_eq!(u.label_id, "5");
-                assert_eq!(u.chat_jid.to_string(), "15551112222@s.whatsapp.net");
+                assert_eq!(u.chat_jid.to_string(), "12025550111@s.whatsapp.net");
                 assert_eq!(u.action.labeled, Some(true));
             }
             other => panic!("expected LabelAssociationUpdate, got {other:?}"),
@@ -442,7 +445,7 @@ mod tests {
         // Validation fires before any network/app-state work, so a key-less test
         // client still exercises the guard.
         let client = crate::test_utils::create_test_client().await;
-        let jid: Jid = "15551112222@s.whatsapp.net".parse().unwrap();
+        let jid: Jid = "12025550111@s.whatsapp.net".parse().unwrap();
 
         let err = client
             .labels()
@@ -467,7 +470,7 @@ mod tests {
     /// this doesn't fail anywhere in CI; it corrupts the user's synced state.
     #[tokio::test]
     async fn message_label_index_and_value_match_the_wire() {
-        let chat: Jid = "15551112222@s.whatsapp.net".parse().expect("test JID");
+        let chat: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
         let collection =
             crate::features::chat_actions::collection_patch_name(LABEL_MESSAGE.collection);
         assert_eq!(collection, WAPatchName::Regular);
@@ -488,13 +491,13 @@ mod tests {
             vec![
                 "label_message",
                 "5",
-                "15551112222@s.whatsapp.net",
+                "12025550111@s.whatsapp.net",
                 "3EB0MSGID",
                 "0",
                 "0",
             ]
         );
-        assert_eq!(added.operation, wa::syncd_mutation::SyncdOperation::SET);
+        assert_eq!(added.operation, wa::syncd_mutation::SyncdOperation::Set);
         assert_eq!(
             added
                 .action_value
@@ -519,7 +522,7 @@ mod tests {
             removed.index, added.index,
             "removal is the same index with labeled=false, not a syncd Remove"
         );
-        assert_eq!(removed.operation, wa::syncd_mutation::SyncdOperation::SET);
+        assert_eq!(removed.operation, wa::syncd_mutation::SyncdOperation::Set);
         assert_eq!(
             removed
                 .action_value
@@ -533,7 +536,7 @@ mod tests {
     /// What we emit, a linked device must be able to hand back.
     #[tokio::test]
     async fn message_label_round_trips_through_the_inbound_dispatch() {
-        let chat: Jid = "15551112222@s.whatsapp.net".parse().expect("test JID");
+        let chat: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
         let mutation = capture(
             crate::features::chat_actions::collection_patch_name(LABEL_MESSAGE.collection).as_str(),
             {
@@ -583,7 +586,7 @@ mod tests {
     #[tokio::test]
     async fn message_label_methods_reject_empty_ids() {
         let client = crate::test_utils::create_test_client().await;
-        let jid: Jid = "15551112222@s.whatsapp.net".parse().unwrap();
+        let jid: Jid = "12025550111@s.whatsapp.net".parse().unwrap();
 
         let err = client
             .labels()
@@ -620,7 +623,16 @@ mod tests {
         for index in [
             vec!["label_message", "5"],
             vec!["label_message", "5", "not a jid", "MSGID", "0", "0"],
-            vec!["label_message", "5", "15551112222@s.whatsapp.net"],
+            vec!["label_message", "5", "12025550111@s.whatsapp.net"],
+            // Present but empty: an association keyed off no message at all.
+            vec![
+                "label_message",
+                "5",
+                "12025550111@s.whatsapp.net",
+                "",
+                "0",
+                "0",
+            ],
         ] {
             let m = set_mutation(
                 index.clone(),
@@ -644,7 +656,7 @@ mod tests {
     fn non_label_kind_is_not_claimed() {
         // A chat-action mutation must fall through so its own handler runs.
         let m = set_mutation(
-            vec!["mute", "15551112222@s.whatsapp.net"],
+            vec!["mute", "12025550111@s.whatsapp.net"],
             wa::SyncActionValue::default(),
         );
         let (handled, events) = run(&m);

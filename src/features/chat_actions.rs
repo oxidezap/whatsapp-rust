@@ -1153,7 +1153,7 @@ mod registry_tests {
     /// `Set` with empty names would be applied as a rename instead.
     #[tokio::test]
     async fn remove_contact_sends_a_remove_and_save_contact_a_set() {
-        let jid: Jid = "15551112222@s.whatsapp.net".parse().expect("test JID");
+        let jid: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
         let collection = collection_patch_name(schemas::CONTACT.collection);
 
         let removed = capture_app_state_mutation(collection.as_str(), {
@@ -1166,7 +1166,7 @@ mod registry_tests {
             wa::syncd_mutation::SyncdOperation::REMOVE,
             "contact deletion must be a Remove, not a Set with an empty action"
         );
-        assert_eq!(removed.index, vec!["contact", "15551112222@s.whatsapp.net"]);
+        assert_eq!(removed.index, vec!["contact", "12025550111@s.whatsapp.net"]);
 
         let saved = capture_app_state_mutation(collection.as_str(), {
             let jid = jid.clone();
@@ -1199,7 +1199,7 @@ mod registry_tests {
     /// silently dropped it.
     #[tokio::test]
     async fn contact_removal_round_trips_to_an_event() {
-        let jid: Jid = "15551112222@s.whatsapp.net".parse().expect("test JID");
+        let jid: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
         let mutation = capture_app_state_mutation(
             collection_patch_name(schemas::CONTACT.collection).as_str(),
             {
@@ -1222,8 +1222,8 @@ mod registry_tests {
     fn a_contact_set_still_dispatches_an_update_not_a_removal() {
         // The Remove arm must not swallow the Set one.
         let m = Mutation {
-            index: vec!["contact".into(), "15551112222@s.whatsapp.net".into()],
-            operation: wa::syncd_mutation::SyncdOperation::Set,
+            index: vec!["contact".into(), "12025550111@s.whatsapp.net".into()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
             action_value: Some(wa::SyncActionValue {
                 contact_action: buffa::MessageField::some(wa::sync_action_value::ContactAction {
                     full_name: Some("Alex Doe".into()),
@@ -1243,7 +1243,7 @@ mod registry_tests {
         // must fall through untouched rather than be read as its Set.
         for kind in ["mute", "pin", "archive", "star"] {
             let m = Mutation {
-                index: vec![kind.into(), "15551112222@s.whatsapp.net".into()],
+                index: vec![kind.into(), "12025550111@s.whatsapp.net".into()],
                 operation: wa::syncd_mutation::SyncdOperation::REMOVE,
                 action_value: Some(wa::SyncActionValue::default()),
             };

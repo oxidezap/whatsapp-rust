@@ -49,6 +49,10 @@ pub(crate) fn dispatch_app_state_setting_mutation(
                 .from_full_sync(full_sync)
                 .build(),
         ));
+    } else {
+        log::warn!(
+            "Skipping setting_disableLinkPreviews mutation: missing isPreviewsDisabled flag"
+        );
     }
     true
 }
@@ -173,7 +177,7 @@ mod tests {
             })
             .await;
             assert_eq!(mutation.index, vec!["setting_disableLinkPreviews"]);
-            assert_eq!(mutation.operation, wa::syncd_mutation::SyncdOperation::SET);
+            assert_eq!(mutation.operation, wa::syncd_mutation::SyncdOperation::Set);
             assert_eq!(
                 mutation
                     .action_value

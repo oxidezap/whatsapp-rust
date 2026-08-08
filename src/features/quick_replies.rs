@@ -54,6 +54,11 @@ pub(crate) fn dispatch_quick_reply_mutation(
                 .from_full_sync(full_sync)
                 .build(),
         ));
+    } else {
+        // Claimed but undeliverable. WA Web counts the same shape as a
+        // malformed action value and logs it; without this the mutation would
+        // vanish with no signal at all. The id is opaque, not user content.
+        log::warn!("Skipping quick_reply mutation {id}: missing quickReplyAction value");
     }
     true
 }
@@ -264,7 +269,7 @@ mod tests {
         })
         .await;
         assert_eq!(set.index, vec!["quick_reply", "1700000000"]);
-        assert_eq!(set.operation, wa::syncd_mutation::SyncdOperation::SET);
+        assert_eq!(set.operation, wa::syncd_mutation::SyncdOperation::Set);
         let act = set
             .action_value
             .as_ref()
@@ -285,7 +290,7 @@ mod tests {
         .await;
         assert_eq!(
             deleted.operation,
-            wa::syncd_mutation::SyncdOperation::SET,
+            wa::syncd_mutation::SyncdOperation::Set,
             "deletion is a Set carrying `deleted`, not a syncd Remove"
         );
         assert_eq!(deleted.index, set.index, "both key the same index");
