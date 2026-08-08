@@ -295,6 +295,15 @@ pub enum BusinessProfileUpdateError {
     /// `NaN`/`inf`, or as a latitude no point on earth has. The server rejects
     /// the whole delta in that case, so the other fields in the same update
     /// would be silently lost too.
+    /// `open_time`/`close_time` are minutes past local midnight. A value at or
+    /// past the end of the day is serialized verbatim, and the server rejects
+    /// the whole delta for it — losing the other fields in the same update.
+    #[error("{day} {field} {value} is not a minute of the day (must be < {MINUTES_PER_DAY})")]
+    InvalidBusinessHourTime {
+        day: String,
+        field: &'static str,
+        value: u32,
+    },
     #[error("{axis} {value} is not a finite coordinate within ±{limit}")]
     InvalidCoordinate {
         axis: &'static str,
@@ -305,6 +314,16 @@ pub enum BusinessProfileUpdateError {
 
 const LATITUDE_LIMIT: f64 = 90.0;
 const LONGITUDE_LIMIT: f64 = 180.0;
+
+/// Minutes in a day, and the exclusive upper bound on an opening time.
+///
+/// WhatsApp Web renders these with `startOf("day").add(n, "minutes")` and only
+/// ever produces them by parsing a within-day time string, so 1439 (23:59) is
+/// the largest value it emits. Ranges that cross midnight are deliberately
+/// *not* rejected here: WA Web's own editor coerces `open > close` in the
+/// picker, but that is a UI affordance rather than a wire constraint, and other
+/// clients may legitimately send such a range.
+const MINUTES_PER_DAY: u32 = 1440;
 
 fn check_coordinate(
     axis: &'static str,
@@ -317,6 +336,21 @@ fn check_coordinate(
         return Ok(());
     }
     Err(BusinessProfileUpdateError::InvalidCoordinate { axis, value, limit })
+}
+
+fn check_minutes(
+    day: &DayOfWeek,
+    field: &'static str,
+    value: u32,
+) -> Result<(), BusinessProfileUpdateError> {
+    if value < MINUTES_PER_DAY {
+        return Ok(());
+    }
+    Err(BusinessProfileUpdateError::InvalidBusinessHourTime {
+        day: day.as_str().to_string(),
+        field,
+        value,
+    })
 }
 
 impl BusinessProfileUpdate {
@@ -348,6 +382,16 @@ impl BusinessProfileUpdate {
         }
         if let Some(longitude) = self.longitude {
             check_coordinate("longitude", longitude, LONGITUDE_LIMIT)?;
+        }
+        if let Some(hours) = &self.business_hours {
+            for config in &hours.config {
+                if let Some(open_time) = config.open_time {
+                    check_minutes(&config.day_of_week, "open_time", open_time)?;
+                }
+                if let Some(close_time) = config.close_time {
+                    check_minutes(&config.day_of_week, "close_time", close_time)?;
+                }
+            }
         }
 
         let mut nodes = Vec::new();
@@ -843,6 +887,68 @@ mod tests {
             ..Default::default()
         };
         assert!(BusinessProfileUpdateSpec::new(&wide).is_ok());
+    }
+
+    /// Minutes past midnight are serialized verbatim, so a value outside the day
+    /// makes the server reject the whole delta — the same failure mode as an
+    /// out-of-range coordinate.
+    #[test]
+    fn business_hour_times_outside_the_day_are_rejected() {
+        for (open, close, field) in [
+            (1440, 1020, "open_time"),
+            (540, 1440, "close_time"),
+            (u32::MAX, 1020, "open_time"),
+        ] {
+            let update = BusinessProfileUpdate {
+                business_hours: Some(BusinessHoursUpdate {
+                    note: None,
+                    timezone: None,
+                    config: vec![BusinessHoursConfig::with_hours(
+                        DayOfWeek::Monday,
+                        BusinessHourMode::SpecificHours,
+                        open,
+                        close,
+                    )],
+                }),
+                ..Default::default()
+            };
+            let err = BusinessProfileUpdateSpec::new(&update)
+                .err()
+                .unwrap_or_else(|| panic!("{open}-{close} should be rejected"));
+            assert!(
+                matches!(
+                    &err,
+                    BusinessProfileUpdateError::InvalidBusinessHourTime { field: f, .. } if *f == field
+                ),
+                "{open}-{close} should name {field}, got {err:?}"
+            );
+        }
+    }
+
+    /// The bounds of a legal day, plus a range crossing midnight: WA Web's editor
+    /// coerces `open > close` in its picker, but that is a UI affordance, not a
+    /// wire constraint, so the builder must not invent one.
+    #[test]
+    fn business_hour_times_within_the_day_are_accepted() {
+        for (open, close) in [(0, 1439), (540, 1020), (1200, 120)] {
+            let update = BusinessProfileUpdate {
+                business_hours: Some(BusinessHoursUpdate {
+                    note: None,
+                    timezone: None,
+                    config: vec![BusinessHoursConfig::with_hours(
+                        DayOfWeek::Monday,
+                        BusinessHourMode::SpecificHours,
+                        open,
+                        close,
+                    )],
+                }),
+                ..Default::default()
+            };
+            assert!(
+                BusinessProfileUpdateSpec::new(&update).is_ok(),
+                "{open}-{close} should be accepted"
+            );
+        }
     }
 
     #[test]
