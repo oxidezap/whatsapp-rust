@@ -597,14 +597,16 @@ impl Client {
             match self.connect().await {
                 Err(connect_err) => {
                     wacore::telemetry::connect("fail");
-                    let is_transient = matches!(
-                        &connect_err,
-                        ConnectError::Handshake(e) if e.is_transient()
-                    );
-                    if is_transient {
-                        debug!("Transient connect failure, will retry: {connect_err:#}");
-                    } else {
-                        error!("Failed to connect: {connect_err:#}. Will retry...");
+                    match &connect_err {
+                        // The loop is about to exit on the same shutdown, so this
+                        // is the teardown reporting itself, not a failure.
+                        ConnectError::Shutdown => {
+                            debug!("Connect abandoned, the client is shutting down.");
+                        }
+                        ConnectError::Handshake(e) if e.is_transient() => {
+                            debug!("Transient connect failure, will retry: {connect_err:#}");
+                        }
+                        _ => error!("Failed to connect: {connect_err:#}. Will retry..."),
                     }
                 }
                 Ok(connection) => {
@@ -900,6 +902,16 @@ impl Client {
             .map_err(ConnectError::Transport)?;
         debug!("Version fetch and transport connection established.");
 
+        // The check in `connect` cannot stand for the whole attempt: a version
+        // fetch, a transport and a handshake are awaited after it, and a
+        // shutdown landing in that window would otherwise be published over.
+        // Re-read before each remaining step, and hand back the socket opened
+        // for a client that is no longer there.
+        if self.shutdown_signal().is_fired() {
+            transport.disconnect().await;
+            return Err(ConnectError::Shutdown);
+        }
+
         let noise_socket = match handshake::do_handshake(
             self.runtime.clone(),
             &self.persistence_manager,
@@ -916,6 +928,11 @@ impl Client {
                 return Err(e.into());
             }
         };
+
+        if self.shutdown_signal().is_fired() {
+            transport.disconnect().await;
+            return Err(ConnectError::Shutdown);
+        }
 
         // Fresh per-connection shutdown so subscribers registered during this
         // connection see a clean signal; the previous notifier was already
