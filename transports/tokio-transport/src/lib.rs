@@ -60,6 +60,11 @@ fn size_for_one_host(mut config: rustls::ClientConfig) -> rustls::ClientConfig {
 /// Useful as a starting point when users need to inspect or replicate the
 /// default TLS configuration before customizing it via [`TokioWebSocketTransportFactory::with_connector`].
 ///
+/// Its session-resumption store is sized for the one host a factory dials, not
+/// for rustls's default 32. Reused across several hosts it still works, but
+/// only the most recent one keeps its tickets; size it back up if that is the
+/// shape you need.
+///
 /// On first call, installs `ring` as the global rustls crypto provider
 /// (no-op if one is already installed).
 pub fn default_tls_connector() -> Connector {
@@ -402,22 +407,31 @@ mod tests {
         );
     }
 
+    /// Dials a port nothing answers on, bounded so a stack that drops rather
+    /// than refuses cannot hang the suite. The connector is chosen before the
+    /// dial, so whether it fails or times out is irrelevant to these tests.
+    async fn attempt_dial(factory: &TokioWebSocketTransportFactory) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            factory.create_transport(),
+        )
+        .await;
+    }
+
     /// A reconnect must not rebuild the TLS config. Nothing was retained
     /// before, which is why the resumption store inside it was always empty.
-    /// `ws://` keeps the dial cheap; the connector is chosen before the scheme
-    /// is looked at, and the connect itself is refused.
     #[tokio::test]
     async fn the_default_connector_is_retained_across_dials() {
         let factory = TokioWebSocketTransportFactory::new().with_url("ws://127.0.0.1:1/ws/chat");
         assert!(factory.default_connector.get().is_none());
 
-        let _ = factory.create_transport().await;
+        attempt_dial(&factory).await;
         assert!(
             factory.default_connector.get().is_some(),
             "the first dial built a connector and dropped it"
         );
 
-        let _ = factory.create_transport().await;
+        attempt_dial(&factory).await;
         assert!(
             factory.default_connector.get().is_some(),
             "a second dial must reuse the retained connector"
@@ -432,7 +446,7 @@ mod tests {
             .with_url("ws://127.0.0.1:1/ws/chat")
             .with_connector(default_tls_connector());
 
-        let _ = factory.create_transport().await;
+        attempt_dial(&factory).await;
 
         assert!(
             factory.default_connector.get().is_none(),
