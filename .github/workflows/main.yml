@@ -161,6 +161,10 @@ jobs:
       # compiles its module away and never runs a single one of its tests.
       - name: Test (legacy-session-interop)
         run: cargo nextest run --profile ci -p wacore-libsignal --features legacy-session-interop
+      # `tracing` is off by default, so span-scope assertions compile to nothing
+      # everywhere else. They are the only gate on which work a span owns.
+      - name: Test (tracing)
+        run: cargo nextest run --profile ci -p whatsapp-rust --features tracing --test handshake_span_scope
 
   rustdoc:
     name: Rustdoc
