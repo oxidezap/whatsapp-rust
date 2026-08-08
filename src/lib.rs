@@ -201,6 +201,8 @@ pub mod usync;
 pub mod features;
 pub use features::{
     AppStateError, AppStateSettings, BatchGroupResult, Blocking, BlockingError, BlocklistEntry,
+    BotDefault, BotList, BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType,
+    BotSectionType, BotTheme, BotThemeMode, Bots, CappingMvStatus, CappingOteStatus, CappingStatus,
     ChatActions, ChatStateError, ChatStateType, Chatstate, Comments, Community, CommunityError,
     CommunitySubgroup, ContactError, Contacts, CreateCommunityOptions, CreateCommunityResult,
     CreateGroupResult, EncType, EncryptedEdit, EventCreationParams, EventResponseType, Events,
@@ -211,17 +213,18 @@ pub use features::{
     MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
     MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
     MessageEditError, MessageRetransmission, Mex, MexError, MexErrorExtensions, MexGraphQLError,
-    MexRequest, MexResponse, NackReason, Newsletter, NewsletterAdminInfo, NewsletterAdminProfile,
-    NewsletterError, NewsletterFollower, NewsletterMessage, NewsletterMessageType,
-    NewsletterMetadata, NewsletterReactionCount, NewsletterRole, NewsletterState,
-    NewsletterVerification, ParticipantChangeResponse, ParticipantType, PictureType, PollError,
-    PollOptionResult, PollVoteCiphertext, Polls, Presence, PresenceError, PresenceStatus,
-    PreviousDescription, Profile, ProfileError, ProfilePicture, QuickReplies, ReachoutTimelock,
-    RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome, SecretEncKind,
-    SecretEncrypted, SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo,
-    SignalSessionMigration, StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting,
-    StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult,
-    UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
+    MexRequest, MexResponse, NackReason, NewChatMessageCapping, Newsletter, NewsletterAdminInfo,
+    NewsletterAdminProfile, NewsletterError, NewsletterFollower, NewsletterMessage,
+    NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
+    NewsletterState, NewsletterVerification, ParticipantChangeResponse, ParticipantType,
+    PictureType, PollError, PollOptionResult, PollVoteCiphertext, Polls, Presence, PresenceError,
+    PresenceStatus, PreviousDescription, Profile, ProfileError, ProfilePicture, QuickReplies,
+    ReachoutTimelock, RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome,
+    SecretEncKind, SecretEncrypted, SetProfilePictureResponse, Signal, SignalError,
+    SignalSessionInfo, SignalSessionMigration, StanzaRejection, StanzaResponseError, Status,
+    StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError,
+    UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key,
+    message_range,
 };
 
 pub mod bot;

@@ -1282,9 +1282,8 @@ mod tests {
                 .build()])
             .build();
 
-        // marshal writes a leading format byte that unmarshal_ref does not expect.
         let bytes = wacore_binary::marshal::marshal(&node).unwrap();
-        let decoded = wacore_binary::marshal::unmarshal_ref(&bytes[1..]).unwrap();
+        let decoded = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
         let call = parse_call_stanza(&decoded).unwrap().unwrap();
         let media = call.media.expect("offer captures media");
 

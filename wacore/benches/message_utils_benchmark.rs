@@ -256,9 +256,9 @@ fn bench_parse_message_info(bencher: divan::Bencher, shape: &str) {
 
     bencher
         .with_inputs(|| {
-            let bytes = wacore_binary::marshal::marshal(&msg_info_node(shape)).unwrap();
-            // marshal prefixes a flag byte; the receive path strips it in unpack.
-            OwnedNodeRef::new(bytes[1..].to_vec()).unwrap()
+            let packed = wacore_binary::marshal::marshal(&msg_info_node(shape)).unwrap();
+            let node_bytes = wacore_binary::util::unpack(&packed).unwrap().into_owned();
+            OwnedNodeRef::new(node_bytes).unwrap()
         })
         .bench_refs(|owned| {
             black_box(

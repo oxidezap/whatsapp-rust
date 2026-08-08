@@ -5846,7 +5846,7 @@ async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
 
     let ack_bytes = decode_frame(0, &frames[0]).expect("ack frame should decrypt");
     let ack =
-        wacore_binary::marshal::unmarshal_ref(&ack_bytes[1..]).expect("ack frame should decode");
+        wacore_binary::marshal::unmarshal_packed_ref(&ack_bytes).expect("ack frame should decode");
     assert_eq!(ack.tag.as_ref(), "ack");
     assert!(
         ack.get_attr("id")
@@ -5878,8 +5878,8 @@ async fn explicit_stanza_responses_use_the_canonical_wire_paths() {
     );
 
     let nack_bytes = decode_frame(1, &frames[1]).expect("nack frame should decrypt");
-    let nack =
-        wacore_binary::marshal::unmarshal_ref(&nack_bytes[1..]).expect("nack frame should decode");
+    let nack = wacore_binary::marshal::unmarshal_packed_ref(&nack_bytes)
+        .expect("nack frame should decode");
     assert_eq!(nack.tag.as_ref(), "ack");
     assert!(
         nack.get_attr("id")
@@ -5941,7 +5941,7 @@ async fn explicit_and_automatic_receipt_acks_use_distinct_participant_policies()
     assert_eq!(frames.len(), 2);
 
     let explicit_bytes = decode_frame(0, &frames[0]).expect("explicit ack frame should decrypt");
-    let explicit_ack = wacore_binary::marshal::unmarshal_ref(&explicit_bytes[1..])
+    let explicit_ack = wacore_binary::marshal::unmarshal_packed_ref(&explicit_bytes)
         .expect("explicit ack frame should decode");
     assert!(
         explicit_ack
@@ -5951,7 +5951,7 @@ async fn explicit_and_automatic_receipt_acks_use_distinct_participant_policies()
     );
 
     let automatic_bytes = decode_frame(1, &frames[1]).expect("automatic ack frame should decrypt");
-    let automatic_ack = wacore_binary::marshal::unmarshal_ref(&automatic_bytes[1..])
+    let automatic_ack = wacore_binary::marshal::unmarshal_packed_ref(&automatic_bytes)
         .expect("automatic ack frame should decode");
     assert!(
         automatic_ack.get_attr("participant").is_none(),
@@ -6075,7 +6075,7 @@ async fn explicit_retry_sends_only_the_retry_receipt() {
         let Some(bytes) = decode_frame(index, frame) else {
             continue;
         };
-        let Ok(receipt) = wacore_binary::marshal::unmarshal_ref(&bytes[1..]) else {
+        let Ok(receipt) = wacore_binary::marshal::unmarshal_packed_ref(&bytes) else {
             continue;
         };
         if receipt.tag.as_ref() != "receipt"
@@ -6142,7 +6142,7 @@ async fn explicit_retry_force_includes_keys_on_first_attempt() {
         let Some(bytes) = decode_frame(index, frame) else {
             continue;
         };
-        let Ok(receipt) = wacore_binary::marshal::unmarshal_ref(&bytes[1..]) else {
+        let Ok(receipt) = wacore_binary::marshal::unmarshal_packed_ref(&bytes) else {
             continue;
         };
         if receipt.tag.as_ref() == "receipt"
@@ -6964,7 +6964,7 @@ fn message_count_to_after(frames: &[bytes::Bytes], start: usize, to: &str) -> us
             let Some(buf) = decode_frame(*index, frame) else {
                 return false;
             };
-            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+            let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
                 return false;
             };
             node.tag.as_ref() == "message"
@@ -6989,7 +6989,7 @@ async fn decrypt_peer_message_after(
             .skip(start)
             .find_map(|(index, frame)| {
                 let buf = decode_frame(index, frame)?;
-                let node = wacore_binary::marshal::unmarshal_ref(&buf[1..]).ok()?;
+                let node = wacore_binary::marshal::unmarshal_packed_ref(&buf).ok()?;
                 if node.tag.as_ref() != "message"
                     || !node
                         .get_attr("to")
@@ -7021,7 +7021,7 @@ fn find_message_ack(frames: &[bytes::Bytes]) -> Option<(String, Option<String>)>
         let Some(buf) = decode_frame(i, frame) else {
             continue;
         };
-        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
             continue;
         };
         if node.tag.as_ref() == "ack"
@@ -7047,7 +7047,7 @@ fn find_receipt(
         let Some(buf) = decode_frame(i, frame) else {
             continue;
         };
-        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
             continue;
         };
         if node.tag.as_ref() == "receipt"
@@ -7082,7 +7082,7 @@ fn retry_receipt_key_bundles_for(frames: &[bytes::Bytes], id: &str) -> Vec<bool>
         let Some(buf) = decode_frame(i, frame) else {
             continue;
         };
-        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
             continue;
         };
         if node.tag.as_ref() == "receipt"
@@ -7100,7 +7100,7 @@ fn find_receipt_details(frames: &[bytes::Bytes], id: &str) -> Option<SentReceipt
         let Some(buf) = decode_frame(i, frame) else {
             continue;
         };
-        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
             continue;
         };
         if node.tag.as_ref() == "receipt"
@@ -7133,7 +7133,7 @@ fn find_message_ack_for(frames: &[bytes::Bytes], id: &str) -> Option<SentMessage
         let Some(buf) = decode_frame(i, frame) else {
             continue;
         };
-        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
             continue;
         };
         if node.tag.as_ref() == "ack"
@@ -7161,7 +7161,7 @@ fn delivery_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
         let Some(buf) = decode_frame(i, frame) else {
             continue;
         };
-        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
             continue;
         };
         if node.tag.as_ref() == "receipt"
@@ -7185,7 +7185,7 @@ fn message_acks_for(frames: &[bytes::Bytes], id: &str) -> usize {
         let Some(buf) = decode_frame(i, frame) else {
             continue;
         };
-        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
             continue;
         };
         if node.tag.as_ref() == "ack"
@@ -7207,7 +7207,7 @@ fn sender_receipts_for(frames: &[bytes::Bytes], id: &str) -> usize {
         let Some(buf) = decode_frame(i, frame) else {
             continue;
         };
-        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
             continue;
         };
         if node.tag.as_ref() == "receipt"
@@ -7355,7 +7355,7 @@ async fn self_fanout_decrypt_failure_acked_via_sender_receipt() {
     let mut saw_retry = false;
     for (i, frame) in sent.iter().enumerate() {
         if let Some(buf) = decode_frame(i, frame)
-            && let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..])
+            && let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf)
             && node.tag.as_ref() == "receipt"
             && node.get_attr("type").is_some_and(|v| {
                 v.as_str() == crate::types::presence::ReceiptType::Retry.as_wire_str()
@@ -7483,7 +7483,7 @@ async fn decrypt_failure_sends_retry_before_ack() {
             let Some(buf) = decode_frame(i, frame) else {
                 continue;
             };
-            let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+            let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
                 continue;
             };
             let is_retry = node.get_attr("type").is_some_and(|v| v.as_str() == "retry");
@@ -9748,7 +9748,7 @@ fn find_message_nack_error(frames: &[bytes::Bytes], id: &str) -> Option<u32> {
         let Some(buf) = decode_frame(i, frame) else {
             continue;
         };
-        let Ok(node) = wacore_binary::marshal::unmarshal_ref(&buf[1..]) else {
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
             continue;
         };
         if node.tag.as_ref() == "ack"
@@ -12890,7 +12890,8 @@ async fn status_stanza_gets_transport_ack() {
     .expect("a <status> stanza must be acknowledged on the wire");
 
     let bytes = decode_frame(0, &frame).expect("ack frame should decrypt");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..]).expect("ack frame should decode");
+    let ack =
+        wacore_binary::marshal::unmarshal_packed_ref(&bytes).expect("ack frame should decode");
     assert_eq!(ack.tag.as_ref(), "ack");
     assert!(
         ack.get_attr("class")
@@ -13008,7 +13009,7 @@ async fn unrecognized_stanza_is_nacked() {
 
     let bytes = decode_frame(0, &frame).expect("nack frame should decrypt");
     let nack =
-        wacore_binary::marshal::unmarshal_ref(&bytes[1..]).expect("nack frame should decode");
+        wacore_binary::marshal::unmarshal_packed_ref(&bytes).expect("nack frame should decode");
     assert_eq!(nack.tag.as_ref(), "ack");
     assert!(
         nack.get_attr("class")
@@ -13103,7 +13104,7 @@ async fn newsletter_status_stanza_is_nacked_once() {
 
     let bytes = decode_frame(0, &frame).expect("nack frame should decrypt");
     let nack =
-        wacore_binary::marshal::unmarshal_ref(&bytes[1..]).expect("nack frame should decode");
+        wacore_binary::marshal::unmarshal_packed_ref(&bytes).expect("nack frame should decode");
     assert_eq!(nack.tag.as_ref(), "ack");
     assert!(nack.get_attr("error").is_some_and(|v| v.as_str() == "488"));
 

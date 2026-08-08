@@ -1782,7 +1782,10 @@ impl Client {
             let ack = wacore::types::events::ServerAck::builder()
                 .id(id.as_str().to_string())
                 .maybe_class(node.get_attr("class").map(|v| v.as_str().to_string()))
-                .maybe_from(node.get_attr("from").and_then(|v| v.as_str().parse().ok()))
+                // `to_jid`, not `as_str().parse()`: `from` arrives as a JID token,
+                // so the string form is a fresh render that the parse immediately
+                // undoes, and that render also drops the interop `integrator`.
+                .maybe_from(node.get_attr("from").and_then(|v| v.to_jid()))
                 .maybe_timestamp(
                     node.get_attr("t")
                         .and_then(|v| v.as_str().parse::<i64>().ok())

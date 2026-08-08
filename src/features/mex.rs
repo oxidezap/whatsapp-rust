@@ -6,8 +6,9 @@ use crate::client::Client;
 use crate::request::IqError;
 use serde::Serialize;
 use thiserror::Error;
+use wacore::WireEnum;
 use wacore::iq::mex::MexQuerySpec;
-use wacore::iq::mex_operations::fetch_reachout_timelock;
+use wacore::iq::mex_operations::{fetch_new_chat_message_capping_info, fetch_reachout_timelock};
 use wacore_binary::jid::JidError;
 
 // Re-export types from wacore
@@ -87,6 +88,86 @@ macro_rules! mex_request {
 }
 pub(crate) use mex_request;
 
+/// Capping surface the quota is asked about. WhatsApp Web only ever asks about
+/// the one-on-one new-chat thread cap, so this is a constant rather than a knob.
+const NEW_CHAT_THREAD_CAPPING_TYPE: &str = "INDIVIDUAL_NEW_CHAT_THREAD";
+
+/// Where the account stands against the cap.
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+pub enum CappingStatus {
+    #[wire = "NONE"]
+    None,
+    #[wire = "FIRST_WARNING"]
+    FirstWarning,
+    #[wire = "SECOND_WARNING"]
+    SecondWarning,
+    #[wire = "CAPPED"]
+    Capped,
+    #[wire_fallback]
+    Other(String),
+}
+
+/// Eligibility for the one-time extension that lifts the cap for a cycle.
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+pub enum CappingOteStatus {
+    #[wire = "NOT_ELIGIBLE"]
+    NotEligible,
+    #[wire = "ELIGIBLE"]
+    Eligible,
+    #[wire = "ACTIVE_IN_CURRENT_CYCLE"]
+    ActiveInCurrentCycle,
+    #[wire = "EXHAUSTED"]
+    Exhausted,
+    #[wire_fallback]
+    Other(String),
+}
+
+/// Meta Verified subscription state, which is what lifts the cap permanently.
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+pub enum CappingMvStatus {
+    #[wire = "NOT_ELIGIBLE"]
+    NotEligible,
+    #[wire = "NOT_ACTIVE"]
+    NotActive,
+    #[wire = "ACTIVE"]
+    Active,
+    #[wire = "ACTIVE_UPGRADE_AVAILABLE"]
+    ActiveUpgradeAvailable,
+    #[wire_fallback]
+    Other(String),
+}
+
+/// How many new one-on-one conversations the account may still start in the
+/// current cycle, and why.
+///
+/// Every field is optional because the server omits the ones that do not apply
+/// to an account's tier.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct NewChatMessageCapping {
+    pub capping_status: Option<CappingStatus>,
+    pub ote_status: Option<CappingOteStatus>,
+    pub mv_status: Option<CappingMvStatus>,
+    /// New chats allowed per cycle.
+    pub total_quota: Option<u64>,
+    /// New chats already started this cycle.
+    pub used_quota: Option<u64>,
+    /// Unix seconds.
+    pub cycle_start_timestamp: Option<i64>,
+    /// Unix seconds. WhatsApp Web treats the cap as lifted once this passes.
+    pub cycle_end_timestamp: Option<i64>,
+    /// Unix seconds; the server's clock when it answered.
+    pub server_sent_timestamp: Option<i64>,
+}
+
+impl NewChatMessageCapping {
+    /// New chats still available this cycle, when both quota fields are present.
+    pub fn remaining_quota(&self) -> Option<u64> {
+        let total = self.total_quota?;
+        Some(total.saturating_sub(self.used_quota?))
+    }
+}
+
 /// Feature handle for MEX GraphQL operations.
 pub struct Mex<'a> {
     client: &'a Client,
@@ -119,6 +200,26 @@ impl<'a> Mex<'a> {
     pub async fn fetch_reachout_timelock(&self) -> Result<ReachoutTimelock, MexError> {
         let response = self.query(mex_request!(fetch_reachout_timelock {})).await?;
         decode_reachout_timelock(response.data)
+    }
+
+    /// Fetch the cap on how many new one-on-one conversations this account may
+    /// start in the current cycle.
+    ///
+    /// WhatsApp Web issues this at app launch and refreshes it on a TTL
+    /// (`wa_individual_new_chat_msg_capping_fetch_ttl_seconds`, 1h), gated on
+    /// `wa_individual_new_chat_msg_capping_enabled`. Accounts that the cap does
+    /// not apply to still get an answer; it just reports `NONE`.
+    pub async fn fetch_new_chat_message_capping_info(
+        &self,
+    ) -> Result<NewChatMessageCapping, MexError> {
+        let response = self
+            .query(mex_request!(fetch_new_chat_message_capping_info {
+                input: Some(fetch_new_chat_message_capping_info::Input {
+                    r#type: Some(NEW_CHAT_THREAD_CAPPING_TYPE.to_string()),
+                }),
+            }))
+            .await?;
+        decode_new_chat_message_capping(response.data)
     }
 
     #[inline]
@@ -160,6 +261,54 @@ fn decode_reachout_timelock(data: Option<serde_json::Value>) -> Result<ReachoutT
         .ok_or_else(|| {
             MexError::PayloadParsing("reachout timelock response missing account state".into())
         })
+}
+
+/// Read a GraphQL scalar that the schema types as a string but the server has
+/// been observed to send either way. WhatsApp Web coerces every one of these
+/// with `Number(...)`, so neither form is exceptional.
+fn numeric_scalar(value: Option<&serde_json::Value>) -> Option<i64> {
+    match value? {
+        serde_json::Value::Number(n) => n.as_i64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn string_scalar(value: Option<&serde_json::Value>) -> Option<&str> {
+    value?.as_str()
+}
+
+fn decode_new_chat_message_capping(
+    data: Option<serde_json::Value>,
+) -> Result<NewChatMessageCapping, MexError> {
+    let data = data.ok_or_else(|| {
+        MexError::PayloadParsing("new chat message capping response missing data".into())
+    })?;
+    // The generated `Response` mirror types the quota and timestamp scalars from
+    // a static read of the bundle and gets them wrong in both directions, so the
+    // payload is read field by field here rather than deserialized into it.
+    let info = data.get("xwa2_message_capping_info").ok_or_else(|| {
+        MexError::PayloadParsing("new chat message capping response missing capping info".into())
+    })?;
+    // Anything that is not an object — null included — would read as an all-absent
+    // cap, which a caller cannot tell apart from a genuinely sparse one. WhatsApp
+    // Web raises a 500 on the null case; treat every other non-object the same way.
+    if !info.is_object() {
+        return Err(MexError::PayloadParsing(
+            "new chat message capping response has a non-object capping info".into(),
+        ));
+    }
+
+    Ok(NewChatMessageCapping {
+        capping_status: string_scalar(info.get("capping_status")).map(CappingStatus::from),
+        ote_status: string_scalar(info.get("ote_status")).map(CappingOteStatus::from),
+        mv_status: string_scalar(info.get("mv_status")).map(CappingMvStatus::from),
+        total_quota: numeric_scalar(info.get("total_quota")).and_then(|v| u64::try_from(v).ok()),
+        used_quota: numeric_scalar(info.get("used_quota")).and_then(|v| u64::try_from(v).ok()),
+        cycle_start_timestamp: numeric_scalar(info.get("cycle_start_timestamp")),
+        cycle_end_timestamp: numeric_scalar(info.get("cycle_end_timestamp")),
+        server_sent_timestamp: numeric_scalar(info.get("server_sent_timestamp")),
+    })
 }
 
 impl Client {
@@ -320,6 +469,121 @@ mod tests {
             }))),
             Err(MexError::PayloadParsing(_))
         ));
+    }
+
+    #[test]
+    fn new_chat_capping_request_carries_the_thread_type() {
+        let request = mex_request!(fetch_new_chat_message_capping_info {
+            input: Some(fetch_new_chat_message_capping_info::Input {
+                r#type: Some(NEW_CHAT_THREAD_CAPPING_TYPE.to_string()),
+            }),
+        });
+
+        assert_eq!(
+            request.doc.name,
+            "WAWebMexFetchNewChatMessageCappingInfoJobQuery"
+        );
+        assert_eq!(request.doc.id, "24503548349331633");
+        assert_eq!(
+            serde_json::to_value(&request.variables).expect("variables serialize"),
+            json!({ "input": { "type": "INDIVIDUAL_NEW_CHAT_THREAD" } })
+        );
+    }
+
+    #[test]
+    fn new_chat_capping_response_decodes_string_scalars() {
+        // The live payload sends the quota and timestamp scalars as strings.
+        let capping = decode_new_chat_message_capping(Some(json!({
+            "xwa2_message_capping_info": {
+                "capping_status": "FIRST_WARNING",
+                "ote_status": "ELIGIBLE",
+                "mv_status": "NOT_ACTIVE",
+                "total_quota": "50",
+                "used_quota": "27",
+                "cycle_start_timestamp": "1770000000",
+                "cycle_end_timestamp": "1772592000",
+                "server_sent_timestamp": "1770500000"
+            }
+        })))
+        .expect("capping payload");
+
+        assert_eq!(capping.capping_status, Some(CappingStatus::FirstWarning));
+        assert_eq!(capping.ote_status, Some(CappingOteStatus::Eligible));
+        assert_eq!(capping.mv_status, Some(CappingMvStatus::NotActive));
+        assert_eq!(capping.total_quota, Some(50));
+        assert_eq!(capping.used_quota, Some(27));
+        assert_eq!(capping.cycle_start_timestamp, Some(1770000000));
+        assert_eq!(capping.cycle_end_timestamp, Some(1772592000));
+        assert_eq!(capping.server_sent_timestamp, Some(1770500000));
+        assert_eq!(capping.remaining_quota(), Some(23));
+    }
+
+    #[test]
+    fn new_chat_capping_response_decodes_numeric_scalars() {
+        let capping = decode_new_chat_message_capping(Some(json!({
+            "xwa2_message_capping_info": {
+                "capping_status": "CAPPED",
+                "total_quota": 50,
+                "used_quota": 50,
+                "cycle_end_timestamp": 1772592000i64
+            }
+        })))
+        .expect("capping payload");
+
+        assert_eq!(capping.capping_status, Some(CappingStatus::Capped));
+        assert_eq!(capping.total_quota, Some(50));
+        assert_eq!(capping.used_quota, Some(50));
+        assert_eq!(capping.cycle_end_timestamp, Some(1772592000));
+        // Absent fields stay absent rather than collapsing to zero.
+        assert_eq!(capping.ote_status, None);
+        assert_eq!(capping.mv_status, None);
+        assert_eq!(capping.cycle_start_timestamp, None);
+        assert_eq!(capping.server_sent_timestamp, None);
+        assert_eq!(capping.remaining_quota(), Some(0));
+    }
+
+    #[test]
+    fn new_chat_capping_keeps_unknown_status_values() {
+        let capping = decode_new_chat_message_capping(Some(json!({
+            "xwa2_message_capping_info": { "capping_status": "THIRD_WARNING" }
+        })))
+        .expect("capping payload");
+
+        assert_eq!(
+            capping.capping_status,
+            Some(CappingStatus::Other("THIRD_WARNING".to_string()))
+        );
+    }
+
+    #[test]
+    fn new_chat_capping_missing_payload_is_an_error() {
+        // No data at all — what a fatal-free but empty MEX response looks like.
+        assert!(matches!(
+            decode_new_chat_message_capping(None),
+            Err(MexError::PayloadParsing(_))
+        ));
+        // Data present, capping info absent.
+        assert!(matches!(
+            decode_new_chat_message_capping(Some(json!({}))),
+            Err(MexError::PayloadParsing(_))
+        ));
+        // WhatsApp Web raises a 500 on exactly this shape.
+        assert!(matches!(
+            decode_new_chat_message_capping(Some(json!({ "xwa2_message_capping_info": null }))),
+            Err(MexError::PayloadParsing(_))
+        ));
+        // Any other non-object would otherwise read as a cap with every field absent.
+        for malformed in [json!("CAPPED"), json!(0), json!([]), json!(true)] {
+            assert!(
+                matches!(
+                    decode_new_chat_message_capping(Some(
+                        json!({ "xwa2_message_capping_info": malformed })
+                    )),
+                    Err(MexError::PayloadParsing(_))
+                ),
+                "expected a parse error for {malformed}"
+            );
+        }
     }
 
     #[test]

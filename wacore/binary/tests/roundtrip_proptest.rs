@@ -21,7 +21,7 @@
 
 use proptest::collection::{btree_map, vec};
 use proptest::prelude::*;
-use wacore_binary::marshal::{marshal, unmarshal_ref};
+use wacore_binary::marshal::{marshal, unmarshal_packed_ref};
 use wacore_binary::node::{Attrs, Node, NodeContent, NodeValue};
 
 /// Bound recursion and collection sizes so the test is fast and the encoder's
@@ -85,8 +85,7 @@ proptest! {
     #[test]
     fn marshal_unmarshal_roundtrip(node in node_strategy()) {
         let bytes = marshal(&node).expect("marshal must succeed for a valid node");
-        // `marshal` writes a leading format byte that `unmarshal_ref` does not expect.
-        let decoded = unmarshal_ref(&bytes[1..])
+        let decoded = unmarshal_packed_ref(&bytes)
             .expect("decoding our own encoder output must succeed")
             .to_owned();
         prop_assert_eq!(decoded, node);
