@@ -19,15 +19,17 @@ pub const FORMAT_PLAIN: u8 = 0;
 /// Only inbound payloads ever set it.
 pub const FORMAT_COMPRESSED: u8 = 2;
 
-/// Check that `data` is shaped like a packed payload: a format byte that sets no
-/// undefined bit, followed by at least one node byte.
+/// Check that `data` is a packed payload in the form we produce: a
+/// [`FORMAT_PLAIN`] byte followed by at least one node byte.
 ///
-/// A shape check, not a decode. It exists because passing node bytes where a
-/// packed payload is expected fails nowhere locally: the peer reads the first
-/// node byte as flags and drops the connection.
-pub fn check_packed_payload(data: &[u8]) -> Result<()> {
+/// The compressed form is a legitimate inbound frame but nothing any `marshal*`
+/// writes, so anything that only ever handles our own output holds a buffer it
+/// did not build if it sees one. A shape check, not a decode: it exists because
+/// passing node bytes where a packed payload is expected fails nowhere locally,
+/// and the peer answers by dropping the connection.
+pub fn check_plain_payload(data: &[u8]) -> Result<()> {
     match data.split_first() {
-        Some((&format, _)) if format & !FORMAT_COMPRESSED != 0 => {
+        Some((&format, _)) if format != FORMAT_PLAIN => {
             Err(BinaryError::UnexpectedFormatByte(format))
         }
         Some((_, node_bytes)) if !node_bytes.is_empty() => Ok(()),
@@ -203,20 +205,28 @@ mod tests {
         let packed = marshal(&node).expect("marshal");
         let node_bytes = unpack(&packed).expect("unpack").into_owned();
 
-        assert!(check_packed_payload(&packed).is_ok());
+        assert!(check_plain_payload(&packed).is_ok());
         assert!(matches!(
-            check_packed_payload(&node_bytes),
+            check_plain_payload(&node_bytes),
             Err(BinaryError::UnexpectedFormatByte(byte)) if byte == node_bytes[0]
         ));
         // No format byte, and a format byte with no stanza behind it: both are
         // shaped like a packed payload only if the length is not checked.
         assert!(matches!(
-            check_packed_payload(&[]),
+            check_plain_payload(&[]),
             Err(BinaryError::EmptyData)
         ));
         assert!(matches!(
-            check_packed_payload(&[FORMAT_PLAIN]),
+            check_plain_payload(&[FORMAT_PLAIN]),
             Err(BinaryError::EmptyData)
+        ));
+        // Compressed is a legitimate inbound frame, so it is refused by byte
+        // rather than by shape: nothing we produce is compressed.
+        let mut compressed = packed.clone();
+        compressed[0] = FORMAT_COMPRESSED;
+        assert!(matches!(
+            check_plain_payload(&compressed),
+            Err(BinaryError::UnexpectedFormatByte(FORMAT_COMPRESSED))
         ));
 
         assert!(unmarshal_packed_ref(&packed).is_ok());

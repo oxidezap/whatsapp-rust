@@ -16,7 +16,7 @@ impl Client {
     /// This bypasses node logging and `sent_node_waiter` resolution — use
     /// [`send_node`](Client::send_node) for normal stanza sending.
     pub async fn send_raw_bytes(&self, plaintext: Vec<u8>) -> Result<(), ClientError> {
-        wacore_binary::util::check_packed_payload(&plaintext).map_err(SocketError::Marshal)?;
+        wacore_binary::util::check_plain_payload(&plaintext).map_err(SocketError::Marshal)?;
         let noise_socket = self.get_noise_socket()?;
         // Wire bytes and the last-sent timestamp are recorded by the noise
         // sender task at the actual transport write.

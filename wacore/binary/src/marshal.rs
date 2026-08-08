@@ -35,17 +35,12 @@ pub fn unmarshal_ref(data: &[u8]) -> Result<NodeRef<'_>> {
 /// Decode a packed payload: the format byte plus node bytes, exactly what
 /// [`marshal`] produces and what a frame carries before `unpack`.
 ///
-/// Only the uncompressed form is accepted. The returned node borrows from
+/// Only the uncompressed form is accepted: the returned node borrows from
 /// `data`, and decompressed bytes would have nowhere to live; reach for
 /// [`unpack`](crate::util::unpack) plus [`unmarshal_ref`] there.
 pub fn unmarshal_packed_ref(data: &[u8]) -> Result<NodeRef<'_>> {
-    match data.split_first() {
-        None => Err(BinaryError::EmptyData),
-        Some((&format, node_bytes)) if format == crate::util::FORMAT_PLAIN => {
-            unmarshal_ref(node_bytes)
-        }
-        Some((&format, _)) => Err(BinaryError::UnexpectedFormatByte(format)),
-    }
+    crate::util::check_plain_payload(data)?;
+    unmarshal_ref(&data[1..])
 }
 
 pub fn marshal_to(node: &Node, writer: &mut impl Write) -> Result<()> {
