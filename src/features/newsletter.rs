@@ -424,15 +424,16 @@ impl<'a> Newsletter<'a> {
 
     /// Transfer a newsletter's ownership to `user`. Owner-only.
     ///
-    /// WA Web resolves the target to its LID before sending, so pass the user's
-    /// `@lid` JID; a phone-number JID is what the server sees otherwise.
+    /// `user` may be a LID or a phone-number JID; the latter is resolved to its
+    /// LID first, since that is the only form the server addresses admins by.
     pub async fn change_owner(&self, jid: &Jid, user: &Jid) -> Result<(), NewsletterError> {
+        let user = self.resolve_admin_target(user).await?;
         let response = self
             .client
             .mex()
             .mutate(mex_request!(
                 change_newsletter_owner,
-                change_owner_variables(jid, user)
+                change_owner_variables(jid, &user)
             ))
             .await?;
 
@@ -442,19 +443,31 @@ impl<'a> Newsletter<'a> {
 
     /// Demote an admin of a newsletter back to subscriber. Owner-only.
     ///
-    /// Same LID expectation as [`Newsletter::change_owner`].
+    /// Same LID resolution as [`Newsletter::change_owner`].
     pub async fn demote_admin(&self, jid: &Jid, user: &Jid) -> Result<(), NewsletterError> {
+        let user = self.resolve_admin_target(user).await?;
         let response = self
             .client
             .mex()
             .mutate(mex_request!(
                 demote_newsletter_admin,
-                demote_admin_variables(jid, user)
+                demote_admin_variables(jid, &user)
             ))
             .await?;
 
         take_data_field(response.data, "xwa2_newsletter_admin_demote")?;
         Ok(())
+    }
+
+    /// Mirror of WA Web's `toUserLidOrThrow`: the admin mutations refuse a target
+    /// that has no known LID rather than sending a PN the server cannot address.
+    async fn resolve_admin_target(&self, user: &Jid) -> Result<Jid, NewsletterError> {
+        self.client
+            .resolve_recipient_to_lid(user)
+            .await
+            .ok_or_else(|| {
+                NewsletterError::InvalidRequest(format!("no known LID for newsletter admin {user}"))
+            })
     }
 
     /// Fetch a newsletter's admin-side information, including its admin count.
@@ -1168,6 +1181,28 @@ mod tests {
             ),
             Err(NewsletterError::InvalidRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn admin_mutations_refuse_a_target_with_no_known_lid() {
+        let client = crate::test_utils::create_test_client().await;
+        let unmapped = Jid::pn("12025550111");
+
+        // A disconnected client fails with `Iq(NotConnected)` once it reaches the
+        // wire, so `InvalidRequest` here proves the target was rejected before it.
+        let err = client
+            .newsletter()
+            .change_owner(&newsletter_jid(), &unmapped)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NewsletterError::InvalidRequest(_)));
+
+        let err = client
+            .newsletter()
+            .demote_admin(&newsletter_jid(), &unmapped)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NewsletterError::InvalidRequest(_)));
     }
 
     #[test]
