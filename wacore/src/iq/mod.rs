@@ -1,5 +1,6 @@
 pub mod abprops;
 pub mod blocklist;
+pub mod bot;
 pub mod business;
 pub mod chatstate;
 pub mod contacts;
