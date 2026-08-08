@@ -1307,13 +1307,8 @@ mod tests {
     /// reading as the named arm.
     #[test]
     fn a_contradicting_text_yields_no_classification() {
-        let pe: PairError = IqError::ServerError {
-            code: 429,
-            text: "something-else".into(),
-            error_type: None,
-            backoff: None,
-        }
-        .into();
+        let pe: PairError =
+            crate::test_utils::server_error_iq(429, "something-else", None, None).into();
 
         assert_eq!(
             pe.rejection(),
@@ -1330,13 +1325,7 @@ mod tests {
     /// failure back for the one refusal that most needs acting on.
     #[test]
     fn an_absent_text_still_classifies_by_code() {
-        let pe: PairError = IqError::ServerError {
-            code: 429,
-            text: String::new(),
-            error_type: None,
-            backoff: None,
-        }
-        .into();
+        let pe: PairError = crate::test_utils::server_error_iq(429, "", None, None).into();
 
         assert_eq!(pe.rejection(), Some(PairCodeRejection::RateOverlimit));
         assert!(pe.rejection().is_some_and(PairCodeRejection::is_throttled));
@@ -1346,13 +1335,8 @@ mod tests {
     /// `RateOverlimit` without matching the message.
     #[test]
     fn rate_overlimit_is_recoverable_as_a_typed_status() {
-        let pe: PairError = IqError::ServerError {
-            code: 429,
-            text: "rate-overlimit".into(),
-            error_type: None,
-            backoff: Some(30),
-        }
-        .into();
+        let pe: PairError =
+            crate::test_utils::server_error_iq(429, "rate-overlimit", None, Some(30)).into();
 
         assert_eq!(pe.rejection(), Some(PairCodeRejection::RateOverlimit));
         assert_eq!(pe.backoff(), Some(std::time::Duration::from_secs(30)));
@@ -1373,13 +1357,8 @@ mod tests {
     /// of falling back to the QR code the way WA Web does.
     #[test]
     fn feature_not_available_is_not_throttled() {
-        let pe: PairError = IqError::ServerError {
-            code: 452,
-            text: "feature-not-available".into(),
-            error_type: None,
-            backoff: None,
-        }
-        .into();
+        let pe: PairError =
+            crate::test_utils::server_error_iq(452, "feature-not-available", None, None).into();
 
         assert_eq!(pe.rejection(), Some(PairCodeRejection::FeatureNotAvailable));
         assert!(!PairCodeRejection::FeatureNotAvailable.is_throttled());
@@ -1450,12 +1429,7 @@ mod tests {
 
     #[test]
     fn pair_error_request_failed_preserves_iq_source() {
-        let iq = IqError::ServerError {
-            code: 400,
-            text: "bad-request".into(),
-            error_type: None,
-            backoff: None,
-        };
+        let iq = crate::test_utils::server_error_iq(400, "bad-request", None, None);
         let pe: PairError = iq.into();
         let src = std::error::Error::source(&pe).expect("source preserved");
         let downcast = src.downcast_ref::<IqError>().expect("downcasts to IqError");
@@ -1980,12 +1954,7 @@ mod tests {
             &client,
             &[1, 2, 3, 4],
             1,
-            IqError::ServerError {
-                code: 500,
-                text: "internal-server-error".to_string(),
-                error_type: None,
-                backoff: None,
-            },
+            crate::test_utils::server_error_iq(500, "internal-server-error", None, None),
         )
         .await;
 
@@ -2012,12 +1981,7 @@ mod tests {
             &client,
             &[1, 2, 3, 4],
             1,
-            IqError::ServerError {
-                code: 400,
-                text: "bad-request".to_string(),
-                error_type: None,
-                backoff: None,
-            },
+            crate::test_utils::server_error_iq(400, "bad-request", None, None),
         )
         .await;
 

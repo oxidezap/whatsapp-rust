@@ -627,12 +627,7 @@ mod tests {
 
     #[test]
     fn request_preserves_iq_error_source() {
-        let iq = IqError::ServerError {
-            code: 404,
-            text: "not-found".into(),
-            error_type: None,
-            backoff: None,
-        };
+        let iq = crate::test_utils::server_error_iq(404, "not-found", None, None);
         let me: MexError = iq.into();
         let src = std::error::Error::source(&me).expect("source preserved");
         let inner = src.downcast_ref::<IqError>().expect("downcasts to IqError");

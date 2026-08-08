@@ -11,6 +11,38 @@ pub fn node_to_owned_ref(node: &Node) -> Arc<OwnedNodeRef> {
     Arc::new(OwnedNodeRef::new(node_bytes.into_owned()).expect("OwnedNodeRef::new should succeed"))
 }
 
+/// The [`crate::request::IqError::ServerError`] an `<iq type="error">` carrying these
+/// attributes produces, built by the same parse the receive path runs so a test never
+/// states the variant's shape by hand.
+pub fn server_error_iq(
+    code: u16,
+    text: &str,
+    error_type: Option<&str>,
+    backoff: Option<u32>,
+) -> crate::request::IqError {
+    use wacore_binary::builder::NodeBuilder;
+
+    let mut error = NodeBuilder::new("error")
+        .attr("code", code.to_string())
+        .attr("text", text);
+    if let Some(error_type) = error_type {
+        error = error.attr("type", error_type);
+    }
+    if let Some(backoff) = backoff {
+        error = error.attr("backoff", backoff.to_string());
+    }
+    let response = node_to_owned_ref(
+        &NodeBuilder::new("iq")
+            .attr("type", "error")
+            .children([error.build()])
+            .build(),
+    );
+    let err = wacore::request::RequestUtils::new("test".to_string())
+        .parse_iq_response(response.get())
+        .expect_err("an error stanza must not classify as a result");
+    crate::request::IqError::from_response(err, &response)
+}
+
 pub async fn wait_for_lock_waiter(lock: &Arc<async_lock::Mutex<()>>, baseline: usize) {
     poll_until("a task to reach the contested lock", || {
         Arc::strong_count(lock) > baseline
@@ -373,9 +405,14 @@ pub(crate) async fn decode_sent_iq(
     Arc::new(OwnedNodeRef::new(node_bytes.into_owned()).expect("captured frame should decode"))
 }
 
-/// Deliver `response` to the pending IQ waiter registered under `request_id`.
+/// Deliver `response` to the pending IQ waiter registered under `request_id`, handing back
+/// the very allocation the waiter received so a caller can prove what it got is that one.
 #[cfg(test)]
-pub(crate) async fn answer_iq(client: &Arc<Client>, request_id: &str, response: &Node) {
+pub(crate) async fn answer_iq(
+    client: &Arc<Client>,
+    request_id: &str,
+    response: &Node,
+) -> Arc<OwnedNodeRef> {
     let sender = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let Some(sender) = client.response_waiters_guard().remove(request_id) {
@@ -389,8 +426,10 @@ pub(crate) async fn answer_iq(client: &Arc<Client>, request_id: &str, response: 
 
     #[cfg(feature = "voip-runtime")]
     client.bind_pending_call_link_join_ack(&response.as_node_ref());
+    let delivered = node_to_owned_ref(response);
     // Test helper: the map only ever holds Iq waiters in these fixtures.
     if let crate::client::ResponseWaiter::Iq(sender) = sender {
-        let _ = sender.send(node_to_owned_ref(response));
+        let _ = sender.send(delivered.clone());
     }
+    delivered
 }

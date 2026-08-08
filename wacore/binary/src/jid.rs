@@ -522,6 +522,10 @@ fn identity_agent(server: Server, agent: u8) -> u8 {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, Default)]
 pub struct Jid {
+    /// Inline while it fits in `size_of::<String>()`: 24 bytes on a 64-bit host,
+    /// 12 on the wasm32/32-bit builds. Phone, LID and modern group users clear
+    /// the wide budget, not the narrow one; a legacy `<creator>-<timestamp>`
+    /// group id clears neither. See `tests/jid_identity_alloc`.
     pub user: CompactString,
     pub server: Server,
     pub agent: u8,
@@ -1980,6 +1984,32 @@ mod tests {
         // Jid::from_str("2") should not be possible due to type constraints,
         // but if it were, it should fail. The string must contain '@'.
         assert!(Jid::from_str("2").is_err());
+    }
+
+    /// A device past the field's `u16` is dropped, not rejected: the fast
+    /// scanner reads it with `parse_u16_decimal` and falls back to 0, so a bad
+    /// attribute costs one device rather than the whole stanza. Pinned because
+    /// `65535` and `65536` are one apart and land on opposite sides.
+    ///
+    /// This is the parser's boundary, not the wire's: the AD form spends one
+    /// byte on the device, so PN/LID stop at 255 (see
+    /// `ad_jid_device_is_one_byte_wide_unlike_interop` in `encoder`).
+    #[test]
+    fn out_of_range_device_parses_as_no_device() {
+        let max = Jid::from_str("5511987650001:65535@s.whatsapp.net").unwrap();
+        assert_eq!(max.device, 65535);
+        assert_eq!(max.to_string(), "5511987650001:65535@s.whatsapp.net");
+
+        for raw in [
+            "5511987650001:65536@s.whatsapp.net",
+            "5511987650001:70000@s.whatsapp.net",
+            "5511987650001:-1@s.whatsapp.net",
+        ] {
+            let jid = Jid::from_str(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(jid.device, 0, "{raw}");
+            assert_eq!(jid.user, "5511987650001", "{raw}");
+            assert_eq!(jid.to_string(), "5511987650001@s.whatsapp.net", "{raw}");
+        }
     }
 
     /// Tests for HOSTED device detection (`is_hosted()` method).
