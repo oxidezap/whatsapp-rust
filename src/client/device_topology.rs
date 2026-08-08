@@ -19,9 +19,13 @@ use std::sync::atomic::Ordering;
 use portable_atomic::AtomicU64;
 use wacore_binary::CompactString;
 
-/// Bounded log capacity. Sized so a burst (e.g. a usync response for a large
+/// Bounded log length. Sized so a burst (e.g. a usync response for a large
 /// group) still fits; overflow just disables the scoped-revalidation fast
 /// path until affected memos recompute once.
+///
+/// A length bound, not a preallocation: the deque grows into it, because a
+/// session that never touches a group never writes an entry and would
+/// otherwise carry the full 8 KiB for nothing.
 const TOPOLOGY_LOG_CAPACITY: usize = 256;
 
 struct TopologyLog {
@@ -51,7 +55,7 @@ impl DeviceTopology {
         Arc::new(Self {
             generation: AtomicU64::new(0),
             log: std::sync::Mutex::new(TopologyLog {
-                entries: VecDeque::with_capacity(TOPOLOGY_LOG_CAPACITY),
+                entries: VecDeque::new(),
                 floor: 0,
             }),
             registry_mutation: async_lock::Mutex::new(()),
@@ -213,5 +217,68 @@ impl DeviceRegistryCache {
     #[cfg(test)]
     pub(crate) async fn raw_invalidate_for_tests(&self, key: &str) {
         self.cache.invalidate(key).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeviceTopology, TOPOLOGY_LOG_CAPACITY};
+
+    /// The whole point of the log: a memo whose generation went stale proves
+    /// none of the changed users are in its group and re-stamps itself.
+    #[test]
+    fn an_unrelated_change_leaves_a_memo_provably_clean() {
+        let topology = DeviceTopology::new();
+        let stamped = topology.current();
+        topology.record(["someone-else"]);
+
+        assert!(topology.current() > stamped, "the generation must advance");
+        assert!(topology.unchanged_for(stamped, |user| user == "member"));
+        assert!(
+            !topology.unchanged_for(stamped, |user| user == "someone-else"),
+            "a change touching a member cannot be proven clean"
+        );
+    }
+
+    /// Growing into the bound must not raise it: past the cap the log evicts,
+    /// and an evicted generation lifts the floor so anything older recomputes.
+    #[test]
+    fn overflowing_the_bound_evicts_and_poisons_older_generations() {
+        let topology = DeviceTopology::new();
+        let stamped = topology.current();
+        for i in 0..TOPOLOGY_LOG_CAPACITY + 10 {
+            topology.record([format!("user-{i}").as_str()]);
+        }
+
+        assert_eq!(
+            topology.log.lock().unwrap().entries.len(),
+            TOPOLOGY_LOG_CAPACITY,
+            "the log grew past its bound"
+        );
+        assert!(
+            !topology.unchanged_for(stamped, |_| false),
+            "a generation behind the floor cannot be proven clean"
+        );
+        // Everything still in the log stays answerable, which is what the
+        // eviction is trading the old entries for.
+        let floor = topology.log.lock().unwrap().floor;
+        assert!(topology.unchanged_for(floor, |user| user == "absent"));
+    }
+
+    /// A global change clears the log, so the generations it published must
+    /// still be readable as "recompute" rather than as an empty (clean) log.
+    #[test]
+    fn a_global_change_poisons_every_earlier_generation() {
+        let topology = DeviceTopology::new();
+        topology.record(["a"]);
+        let stamped = topology.current();
+        topology.record_global();
+
+        assert!(topology.log.lock().unwrap().entries.is_empty());
+        assert!(
+            !topology.unchanged_for(stamped, |_| false),
+            "an emptied log must not read as nothing having changed"
+        );
+        assert!(topology.unchanged_for(topology.current(), |_| true));
     }
 }
