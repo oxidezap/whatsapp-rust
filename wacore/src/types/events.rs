@@ -1724,7 +1724,8 @@ pub struct DecryptedPayload {
 pub struct SentFrame {
     /// The marshaled stanza, keeping the leading format byte the binary
     /// protocol writes, so decoding it is
-    /// `wacore_binary::marshal::unmarshal_ref(&plaintext[1..])`.
+    /// `wacore_binary::marshal::unmarshal_packed_ref(&plaintext)`, which checks
+    /// that byte rather than assuming it.
     ///
     /// Plaintext, as the name says, not a transport frame: the length prefix and
     /// the AEAD tag are added after this, and only

@@ -3770,7 +3770,7 @@ async fn every_send_path_is_observed_exactly_as_it_reached_the_wire() {
 
     // The bytes are the stanza, not a rendering of it: the first frame decodes
     // back to the node that was sent.
-    let decoded = wacore_binary::marshal::unmarshal_ref(&observed[0][1..])
+    let decoded = wacore_binary::marshal::unmarshal_packed_ref(&observed[0])
         .expect("an observed frame must decode as the stanza it carried");
     assert_eq!(decoded.tag.as_ref(), "presence");
     assert_eq!(
