@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::jid::Jid;
 use wacore_binary::marshal::marshal;
-use wacore_binary::node::{OwnedNodeRef, ValueRef};
+use wacore_binary::node::{NodeStr, OwnedNodeRef, ValueRef};
 
 struct CountingAlloc;
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -95,16 +95,29 @@ const TRAFFIC: &[&str] = &[
     "status@broadcast",
 ];
 
-/// The four values in a `<message>` the decoder cannot borrow out of the frame,
+/// The attributes `stanza` carries, in the order `value_shapes` reports them.
+const ATTRS: &[&str] = &["from", "participant", "recipient", "id", "t"];
+
+/// The values in a `<message>` the decoder cannot borrow out of the frame,
 /// because the wire packs two characters per byte: a group id, a phone user, a
-/// stanza id and a timestamp. Paired with a short spelling of the same value,
-/// which travels the identical decoder branch and fits inline everywhere, so
+/// legacy group id, a stanza id and a timestamp. Each is paired with a short
+/// spelling of itself, which packs the same way and fits inline everywhere, so
 /// the two stanzas below differ in length and in nothing else.
+///
+/// The legacy group id is 25 bytes, one past the 64-bit budget. Without a value
+/// on that side of it the subtraction below would expect zero on the only host
+/// CI has, and would pass whether or not the allocating branch still works.
+///
+/// The short spellings are four and five characters rather than one or two
+/// because the encoder checks the token dictionary before it packs, and a
+/// single digit is a token: it would come back borrowed and put the control on
+/// a different decoder route. `value_shapes` is what holds them to that.
 const MATERIALIZED: &[(&str, &str)] = &[
-    ("120363000000000001", "1"),
-    ("5511987650002", "2"),
+    ("120363000000000001", "9876"),
+    ("5511987650002", "5511"),
+    ("55119876500011-1700000000", "1-2"),
     ("3EB0A1B2C3D4E5F60718", "3EB0"),
-    ("1770000000", "17"),
+    ("1770000000", "97531"),
 ];
 
 /// The user part of a rendered JID, which is the only piece a `Jid` owns.
@@ -119,9 +132,8 @@ fn expected_per_user(rendered: &str) -> u64 {
 }
 
 /// A `<message>` built from either the long or the short spelling of each
-/// value. Both go through the same four decoder branches (two JID tokens, a
-/// hex-packed id, a nibble-packed timestamp), so subtracting one from the other
-/// leaves exactly the materialised strings that did not fit inline.
+/// value. Both go through the same decoder branches, so subtracting one from
+/// the other leaves exactly the materialised strings that did not fit inline.
 fn stanza(long: bool) -> bytes::Bytes {
     let pick = |i: usize| {
         if long {
@@ -133,8 +145,9 @@ fn stanza(long: bool) -> bytes::Bytes {
     let node = NodeBuilder::new("message")
         .attr("from", Jid::group(pick(0)))
         .attr("participant", Jid::pn_device(pick(1), 12))
-        .attr("id", pick(2))
-        .attr("t", pick(3))
+        .attr("recipient", Jid::group(pick(2)))
+        .attr("id", pick(3))
+        .attr("t", pick(4))
         .build();
     let mut raw = marshal(&node).expect("marshal");
     // `unmarshal_ref` does not expect the leading format byte `marshal` writes.
@@ -142,21 +155,30 @@ fn stanza(long: bool) -> bytes::Bytes {
     bytes::Bytes::from(raw)
 }
 
-/// Which decoder branch each attribute value came back on. The subtraction in
-/// `decoding_a_stanza_allocates_only_what_it_cannot_borrow` is only meaningful
-/// while the two stanzas agree on this, so it is asserted rather than assumed.
-fn value_kinds(bytes: &bytes::Bytes) -> Vec<&'static str> {
+/// How each attribute value came back: which `ValueRef` branch, and whether the
+/// decoder had to materialise it or could borrow it out of the frame. Both are
+/// wire-encoding facts the subtraction in
+/// `decoding_a_stanza_allocates_only_what_it_cannot_borrow` rests on, so they
+/// are read back and asserted rather than assumed.
+fn value_shapes(bytes: &bytes::Bytes) -> Vec<(&'static str, &'static str)> {
     let decoded = OwnedNodeRef::new(bytes.clone()).expect("decode");
-    ["from", "participant", "id", "t"]
+    ATTRS
         .iter()
-        .map(|key| match decoded.get_attr(key).expect("attr") {
-            ValueRef::Jid(_) => "jid",
-            ValueRef::String(_) => "string",
+        .map(|key| {
+            let (branch, text) = match decoded.get_attr(key).expect("attr") {
+                ValueRef::Jid(jid) => ("jid", &jid.user),
+                ValueRef::String(value) => ("string", value),
+            };
+            let storage = match text {
+                NodeStr::Borrowed(_) => "borrowed",
+                NodeStr::Owned(_) => "materialised",
+            };
+            (branch, storage)
         })
         .collect()
 }
 
-/// One test fn covering four properties, because the counting allocator is
+/// One test fn covering all of them, because the counting allocator is
 /// process-global and sibling tests would run against it concurrently.
 #[test]
 fn per_message_identities_stay_off_the_heap() {
@@ -195,8 +217,15 @@ fn the_fixtures_straddle_both_budgets() {
         .filter(|(value, _)| value.len() > SMALL_TARGET_BUDGET)
         .count();
     assert_eq!(
-        materialized_crossing, 3,
-        "the stanza must keep three values a 32-bit decode would allocate"
+        materialized_crossing, 4,
+        "the stanza must keep four values a 32-bit decode would allocate"
+    );
+    assert!(
+        MATERIALIZED
+            .iter()
+            .any(|(value, _)| value.len() > inline_capacity()),
+        "one stanza value must be past this host's budget too, or the decode \
+         subtraction would expect zero and never exercise the allocating branch"
     );
     assert!(
         MATERIALIZED
@@ -268,13 +297,20 @@ fn decoding_a_stanza_allocates_only_what_it_cannot_borrow() {
 
     let decoded = OwnedNodeRef::new(long.clone()).expect("decode");
     assert!(decoded.get_attr("from").unwrap() == "120363000000000001@g.us");
-    assert!(decoded.get_attr("id").unwrap() == MATERIALIZED[2].0);
+    assert!(decoded.get_attr("id").unwrap() == MATERIALIZED[3].0);
     // Attribute values go through `read_value`, so a JID token stays a
-    // `ValueRef::Jid` and only its packed user is materialised. Both stanzas
-    // have to land on the same branches or the subtraction below means nothing.
-    let expected_kinds = ["jid", "jid", "string", "string"];
-    assert_eq!(value_kinds(&long), expected_kinds);
-    assert_eq!(value_kinds(&short), expected_kinds);
+    // `ValueRef::Jid` and only its packed user is materialised. Every value has
+    // to be materialised on both stanzas, or the subtraction is measuring the
+    // difference between two decoder routes instead of two lengths.
+    let expected = [
+        ("jid", "materialised"),
+        ("jid", "materialised"),
+        ("jid", "materialised"),
+        ("string", "materialised"),
+        ("string", "materialised"),
+    ];
+    assert_eq!(value_shapes(&long), expected);
+    assert_eq!(value_shapes(&short), expected);
 
     let with = min_allocs(200, || OwnedNodeRef::new(long.clone()).unwrap());
     let without = min_allocs(200, || OwnedNodeRef::new(short.clone()).unwrap());
