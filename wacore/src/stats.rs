@@ -408,6 +408,12 @@ pub trait TaskInstrument: MaybeSendSync {
 }
 
 /// Future wrapper invoking a [`TaskInstrument`] around each poll.
+///
+/// Generic over the wrapped future, and polls it through [`Pin::new`], so the
+/// wrapper allocates nothing of its own. `F: Unpin` is what keeps that safe
+/// without a projection: pass an already-boxed future (what [`Runtime::spawn`]
+/// hands over) or stack-pin a local one with [`core::pin::pin!`]. Both are
+/// `Unpin`, so neither needs a heap allocation for the meter's sake.
 pub struct MeteredFuture<F> {
     inner: F,
     instrument: Arc<dyn TaskInstrument>,
@@ -677,11 +683,24 @@ unsafe impl Sync for InstrumentedRuntime {}
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl Runtime for InstrumentedRuntime {
+    // The re-box is structural: `spawn` takes and returns an erased future, so
+    // wrapping it changes the type and needs a new allocation. It is the meter's
+    // only per-spawn allocation.
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
         self.inner.spawn(Box::pin(MeteredFuture::new(
             future,
             self.instrument.clone(),
         )))
+    }
+
+    /// Forwarded so the decorator stays transparent: the default body routes
+    /// through [`Runtime::spawn`], which makes the inner runtime build an
+    /// `AbortHandle` (a boxed `dyn FnOnce`) the caller drops on the next line.
+    fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+        self.inner.spawn_detached(Box::pin(MeteredFuture::new(
+            future,
+            self.instrument.clone(),
+        )));
     }
 
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -717,6 +736,14 @@ impl Runtime for InstrumentedRuntime {
             future,
             self.instrument.clone(),
         )))
+    }
+
+    /// See the native variant: skips the `AbortHandle` the default body builds.
+    fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + 'static>>) {
+        self.inner.spawn_detached(Box::pin(MeteredFuture::new(
+            future,
+            self.instrument.clone(),
+        )));
     }
 
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()>>> {
@@ -873,6 +900,228 @@ mod tests {
 
         let snap = meter.snapshot();
         assert_eq!(snap.polls, 1);
+    }
+
+    /// Resolves `Pending` once, then `Ready(v)`. Enough polls to observe both a
+    /// mid-flight cancellation and a completed run.
+    struct PendingOnce<T> {
+        value: Option<T>,
+        polled: bool,
+    }
+
+    impl<T> PendingOnce<T> {
+        fn new(value: T) -> Self {
+            Self {
+                value: Some(value),
+                polled: false,
+            }
+        }
+    }
+
+    impl<T: Unpin> Future for PendingOnce<T> {
+        type Output = T;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            if !this.polled {
+                this.polled = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Poll::Ready(this.value.take().expect("polled after completion"))
+        }
+    }
+
+    fn poll_once<F: Future + Unpin>(fut: &mut F) -> Poll<F::Output> {
+        let waker = std::task::Waker::noop();
+        Pin::new(fut).poll(&mut Context::from_waker(waker))
+    }
+
+    /// Inner runtime that records which spawn entry point the decorator used and
+    /// drives the future inline, so a test can tell forwarding apart from the
+    /// trait's `spawn`-based default body.
+    #[derive(Default)]
+    struct RecordingRuntime {
+        spawns: AtomicU64,
+        detached_spawns: AtomicU64,
+    }
+
+    impl RecordingRuntime {
+        fn drive(mut future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+            for _ in 0..8 {
+                if poll_once(&mut future).is_ready() {
+                    return;
+                }
+            }
+            panic!("spawned test future never settled");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for RecordingRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            self.spawns.fetch_add(1, Ordering::Relaxed);
+            Self::drive(future);
+            AbortHandle::noop()
+        }
+
+        fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+            self.detached_spawns.fetch_add(1, Ordering::Relaxed);
+            Self::drive(future);
+        }
+
+        fn sleep(&self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            f();
+            Box::pin(async {})
+        }
+
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    /// The decorator forwards `spawn_detached` to the inner runtime's own
+    /// detached path. Falling back to the trait default would reach `spawn`,
+    /// making the inner runtime build an `AbortHandle` nobody keeps.
+    #[test]
+    fn the_decorator_forwards_detached_spawns() {
+        let inner = Arc::new(RecordingRuntime::default());
+        let meter = Arc::new(CpuMeter::new());
+        let runtime = InstrumentedRuntime::new(
+            inner.clone() as Arc<dyn Runtime>,
+            meter.clone() as Arc<dyn TaskInstrument>,
+        );
+
+        runtime.spawn_detached(Box::pin(PendingOnce::new(())));
+
+        assert_eq!(inner.detached_spawns.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            inner.spawns.load(Ordering::Relaxed),
+            0,
+            "a detached spawn must not reach the handle-building path"
+        );
+        assert_eq!(
+            meter.snapshot().polls,
+            2,
+            "the forwarded future is still metered on every poll"
+        );
+    }
+
+    /// The undetached path keeps its handle: forwarding must not have leaked
+    /// into `spawn`.
+    #[test]
+    fn the_decorator_keeps_undetached_spawns_on_the_handle_path() {
+        let inner = Arc::new(RecordingRuntime::default());
+        let meter = Arc::new(CpuMeter::new());
+        let runtime = InstrumentedRuntime::new(
+            inner.clone() as Arc<dyn Runtime>,
+            meter.clone() as Arc<dyn TaskInstrument>,
+        );
+
+        runtime.spawn(Box::pin(PendingOnce::new(()))).detach();
+
+        assert_eq!(inner.spawns.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.detached_spawns.load(Ordering::Relaxed), 0);
+        assert_eq!(meter.snapshot().polls, 2);
+    }
+
+    /// A stack-pinned future is `Unpin` through `Pin<&mut F>`, so the meter
+    /// wraps a non-`Unpin` async block with no box. Same accounting as boxing it.
+    #[test]
+    fn stack_pinned_future_is_metered_like_a_boxed_one() {
+        let boxed = Arc::new(CpuMeter::new());
+        let mut fut =
+            MeteredFuture::new(Box::pin(async {}), boxed.clone() as Arc<dyn TaskInstrument>);
+        assert!(poll_once(&mut fut).is_ready());
+
+        let stacked = Arc::new(CpuMeter::new());
+        let inner = core::pin::pin!(async {});
+        let mut fut = MeteredFuture::new(inner, stacked.clone() as Arc<dyn TaskInstrument>);
+        assert!(poll_once(&mut fut).is_ready());
+
+        assert_eq!(stacked.snapshot().polls, boxed.snapshot().polls);
+    }
+
+    /// A metered future whose output is an `Err` is accounted exactly like a
+    /// successful one: the meter counts polls, not outcomes.
+    #[test]
+    fn a_failing_future_is_metered_like_a_succeeding_one() {
+        let failing = Arc::new(CpuMeter::new());
+        let err = core::pin::pin!(PendingOnce::new(Err::<(), &str>("boom")));
+        let mut fut = MeteredFuture::new(err, failing.clone() as Arc<dyn TaskInstrument>);
+        assert!(poll_once(&mut fut).is_pending());
+        assert_eq!(poll_once(&mut fut), Poll::Ready(Err("boom")));
+
+        let succeeding = Arc::new(CpuMeter::new());
+        let ok = core::pin::pin!(PendingOnce::new(Ok::<(), &str>(())));
+        let mut fut = MeteredFuture::new(ok, succeeding.clone() as Arc<dyn TaskInstrument>);
+        assert!(poll_once(&mut fut).is_pending());
+        assert_eq!(poll_once(&mut fut), Poll::Ready(Ok(())));
+
+        assert_eq!(failing.snapshot().polls, 2);
+        assert_eq!(succeeding.snapshot().polls, failing.snapshot().polls);
+    }
+
+    /// Cancellation: a metered future dropped between polls keeps the polls it
+    /// did and leaves no scope open. An unbalanced `on_poll_start` would pin the
+    /// meter active forever, charging every later allocation on this thread to it.
+    #[test]
+    fn cancelling_a_metered_future_leaves_no_open_scope() {
+        let meter = AllocMeter::new();
+        let instrument: Arc<dyn TaskInstrument> = Arc::new(meter.clone());
+
+        {
+            let pending = core::pin::pin!(PendingOnce::new(()));
+            let mut fut = MeteredFuture::new(pending, Arc::clone(&instrument));
+            assert!(poll_once(&mut fut).is_pending());
+            // Charged to nobody unless the `Pending` poll left its scope open.
+            AllocMeter::on_alloc(64);
+        }
+        // Same probe after the mid-flight drop.
+        AllocMeter::on_alloc(64);
+
+        assert_eq!(meter.snapshot().allocated_bytes, 0);
+        assert_eq!(meter.snapshot().allocations, 0);
+
+        // The stack is empty, so a fresh scope still charges correctly.
+        meter.on_poll_start();
+        AllocMeter::on_alloc(16);
+        meter.on_poll_end();
+        assert_eq!(meter.snapshot().allocated_bytes, 16);
+    }
+
+    /// Nesting: a metered future polled from inside another metered poll charges
+    /// each scope once, innermost first, and both meters see their own polls.
+    #[test]
+    fn nested_metered_futures_charge_each_scope_once() {
+        let outer_meter = AllocMeter::new();
+        let inner_meter = AllocMeter::new();
+        let inner_instrument: Arc<dyn TaskInstrument> = Arc::new(inner_meter.clone());
+
+        let body = core::pin::pin!(async {
+            AllocMeter::on_alloc(100); // -> outer
+            let nested = core::pin::pin!(async { AllocMeter::on_alloc(30) });
+            let mut inner = MeteredFuture::new(nested, Arc::clone(&inner_instrument));
+            assert!(poll_once(&mut inner).is_ready()); // -> inner (innermost)
+            AllocMeter::on_alloc(7); // -> outer again
+        });
+        let mut outer = MeteredFuture::new(
+            body,
+            Arc::new(outer_meter.clone()) as Arc<dyn TaskInstrument>,
+        );
+        assert!(poll_once(&mut outer).is_ready());
+
+        assert_eq!(outer_meter.snapshot().allocated_bytes, 107);
+        assert_eq!(outer_meter.snapshot().allocations, 2);
+        assert_eq!(inner_meter.snapshot().allocated_bytes, 30);
+        assert_eq!(inner_meter.snapshot().allocations, 1);
     }
 
     #[test]

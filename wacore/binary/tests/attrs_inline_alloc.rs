@@ -33,8 +33,9 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 
 #[test]
 fn attrs_inline_and_spill_behavior() {
-    // The per-recipient fanout shape: short static keys, inline-able values.
-    // Tag and keys are borrowed statics; CompactString keeps short values inline.
+    // The per-recipient fanout shape, at the full inline width: short static
+    // keys, inline-able values. Tag and keys are borrowed statics; CompactString
+    // keeps short values inline.
     // Take the minimum delta over many iterations. The counter is process-global,
     // so harness threads can bleed allocations into any single window, but they
     // are sporadic: if inline attrs truly never allocate, at least one of the 100
@@ -46,15 +47,16 @@ fn attrs_inline_and_spill_behavior() {
         let node = NodeBuilder::new("enc")
             .attr("v", "2")
             .attr("type", "msg")
+            .attr("mediatype", "image")
             .build();
         let after = ALLOCS.load(Ordering::Relaxed);
         min_delta = min_delta.min(after - before);
-        assert_eq!(node.attrs.len(), 2);
-        assert!(!node.attrs.0.spilled(), "2 attrs must stay inline");
+        assert_eq!(node.attrs.len(), 3);
+        assert!(!node.attrs.0.spilled(), "3 attrs must stay inline");
     }
     assert_eq!(
         min_delta, 0,
-        "a node with <= 2 attrs must keep them inline (no heap allocation)"
+        "a node with <= 3 attrs must keep them inline (no heap allocation)"
     );
 
     // Larger attribute lists keep working by spilling to the heap.
