@@ -3,11 +3,12 @@
 //!
 //! `CompactString` keeps a string inline while it fits in `size_of::<String>()`
 //! bytes. That is 24 on a 64-bit host but 12 on the wasm32 and 32-bit builds
-//! this crate also targets, and every identity the wire carries lands between
-//! the two: a 13-digit phone user, a 15-digit LID, an 18-character group id, a
-//! 20-character stanza id. The same code therefore allocates nothing per
-//! message on a desktop and once per identity on wasm, so an allocation profile
-//! taken on one says nothing about the other.
+//! this crate also targets, and most of what the wire carries lands between the
+//! two: a 13-digit phone user, a 15-digit LID, an 18-character group id, a
+//! 20-character stanza id. The same code therefore allocates for those on wasm
+//! and not on a desktop, so an allocation profile taken on one says nothing
+//! about the other. A legacy `<creator>-<timestamp>` group id clears neither
+//! budget, and is here so both sides of the wide one are covered.
 //!
 //! Both halves are pinned here. The identities stay structured (a `Jid` is
 //! never rendered to text just to be compared or used as a key, and
@@ -80,9 +81,13 @@ const SMALL_TARGET_BUDGET: usize = 12;
 
 /// The mix a live stream carries, since it is the *length* of each identity
 /// that decides inline against heap: user JIDs with and without a device, both
-/// namespaces, a modern group id, the legacy `<creator>-<timestamp>` form that
-/// lands exactly on the 64-bit budget, a newsletter and the status address.
+/// namespaces, a modern group id, both legacy `<creator>-<timestamp>` forms
+/// that bracket the 64-bit budget, a newsletter and the status address.
 /// Numbers are fictitious.
+///
+/// The 25-byte legacy id is what keeps the derived-address assertions honest:
+/// without an identity past the wide budget they would all expect zero on the
+/// only host CI runs, and the one-allocation branch would go unexercised.
 const TRAFFIC: &[&str] = &[
     "5511987650001@s.whatsapp.net",
     "5511987650002:12@s.whatsapp.net",
@@ -91,6 +96,7 @@ const TRAFFIC: &[&str] = &[
     "100000000000002:7@lid",
     "120363000000000001@g.us",
     "5511987650001-1700000000@g.us",
+    "55119876500011-1700000000@g.us",
     "120000000000000001@newsletter",
     "status@broadcast",
 ];
@@ -193,10 +199,12 @@ fn per_message_identities_stay_off_the_heap() {
 /// the counts this file derives would be trivially zero on the target that
 /// motivated it and nobody would notice.
 fn the_fixtures_straddle_both_budgets() {
-    assert!(
-        SMALL_TARGET_BUDGET < inline_capacity(),
-        "this host is not the wide target these fixtures are calibrated against"
-    );
+    if inline_capacity() <= SMALL_TARGET_BUDGET {
+        // Running on the narrow target itself. Everything below describes what
+        // a wide host should see of it; the measurements do the rest, and they
+        // derive their own counts, so there is nothing here to check.
+        return;
+    }
 
     let crossing = TRAFFIC
         .iter()
@@ -210,6 +218,14 @@ fn the_fixtures_straddle_both_budgets() {
         "the traffic mix must keep identities that are inline at \
          {} bytes and heap at {SMALL_TARGET_BUDGET}, found {crossing}",
         inline_capacity()
+    );
+
+    assert!(
+        TRAFFIC
+            .iter()
+            .any(|raw| user_of(raw).len() > inline_capacity()),
+        "one identity must be past this host's budget too, or every derived \
+         address would expect zero and never allocate"
     );
 
     let materialized_crossing = MATERIALIZED

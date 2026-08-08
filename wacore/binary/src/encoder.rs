@@ -1703,6 +1703,38 @@ mod tests {
         Ok(())
     }
 
+    /// The AD form spends a single byte on the device, so a PN/LID device past
+    /// 255 has nowhere to go and the encoder says so instead of truncating it
+    /// into a different device. Interop carries its own `u16` device field and
+    /// is unaffected, which is why the limit cannot live on `Jid` itself.
+    #[test]
+    fn ad_jid_device_is_one_byte_wide_unlike_interop() -> TestResult {
+        let encode = |jid: Jid| -> Result<()> {
+            let node = NodeBuilder::new("msg").attr("from", jid).build();
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_node(&node)
+        };
+
+        encode(Jid::pn_device("5511987650001", 255)).expect("255 is the widest AD device");
+        let err = encode(Jid::pn_device("5511987650001", 256))
+            .expect_err("256 does not fit the AD device byte");
+        assert!(
+            err.to_string().contains("out of range"),
+            "the error must name the device, got {err}"
+        );
+
+        let interop = Jid {
+            user: "5511987650001".into(),
+            server: jid::Server::Interop,
+            agent: 0,
+            device: 65535,
+            integrator: 7,
+        };
+        encode(interop).expect("interop spends a full u16 on the device");
+        Ok(())
+    }
+
     /// Same invariant as above but exercised through the typed
     /// `NodeValue::Jid` path (write_jid_owned + size estimators), which
     /// previously ignored the server check and emitted AD_JID for any
