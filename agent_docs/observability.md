@@ -97,6 +97,10 @@ work. Wiring: `build()` wraps the runtime in `InstrumentedRuntime`, so all
 spawns through the `Runtime` trait are covered without touching call sites.
 The `Option` is resolved once at `build()` — `None` (default) leaves the
 runtime untouched, so there is no per-spawn or per-poll cost when unset.
+Installed, the decorator costs one allocation per spawn: `Runtime::spawn`
+takes and returns an erased future, so wrapping it changes the type and needs
+a fresh box. Nothing else on the path allocates: `MeteredFuture` is generic
+over the future it wraps, and `Bot::run` stack-pins its own.
 
 - `CpuMeter` (built-in): busy time (direct CPU proxy) + poll count via
   `wacore::time::Instant`. Works on wasm/embedded once a monotonic provider
