@@ -291,10 +291,6 @@ pub enum BusinessProfileUpdateError {
         "business profile accepts at most {BUSINESS_PROFILE_MAX_WEBSITES} websites, got {count}"
     )]
     TooManyWebsites { count: usize },
-    /// `f64::to_string` would render a non-finite or out-of-range coordinate as
-    /// `NaN`/`inf`, or as a latitude no point on earth has. The server rejects
-    /// the whole delta in that case, so the other fields in the same update
-    /// would be silently lost too.
     /// `open_time`/`close_time` are minutes past local midnight. A value at or
     /// past the end of the day is serialized verbatim, and the server rejects
     /// the whole delta for it — losing the other fields in the same update.
@@ -304,6 +300,10 @@ pub enum BusinessProfileUpdateError {
         field: &'static str,
         value: u32,
     },
+    /// `f64::to_string` would render a non-finite or out-of-range coordinate as
+    /// `NaN`/`inf`, or as a latitude no point on earth has. The server rejects
+    /// the whole delta in that case, so the other fields in the same update
+    /// would be silently lost too.
     #[error("{axis} {value} is not a finite coordinate within ±{limit}")]
     InvalidCoordinate {
         axis: &'static str,
