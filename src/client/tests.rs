@@ -400,6 +400,113 @@ async fn test_ack_dispatches_server_ack_event() {
     );
 }
 
+/// `from` arrives as a JID token, so reading it must take the JID the decoder
+/// already built rather than rendering and re-parsing it. Two things ride on
+/// that: the render is pure churn on every acked message, and it silently drops
+/// the interop `integrator`, which the wire does carry.
+#[tokio::test]
+async fn server_ack_from_preserves_the_wire_jid() {
+    use wacore::types::events::{Event, EventHandler};
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    // An addressed device JID: same value the render-and-reparse produced.
+    let device: Jid = "551199990001:3@s.whatsapp.net".parse().expect("device jid");
+    let ack = NodeBuilder::new("ack")
+        .attr("id", "ack-from-ad")
+        .attr("class", "message")
+        .attr("from", device.clone())
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(a) if a.id == "ack-from-ad" && a.from.as_ref() == Some(&device)
+        )),
+        "an addressed `from` must reach the event unchanged"
+    );
+
+    // A `from` that reached the node as a plain string still parses, so the
+    // switch does not narrow what is accepted.
+    let string_ack = NodeBuilder::new("ack")
+        .attr("id", "ack-from-str")
+        .attr("from", "not-a-phone-user@g.us")
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&string_ack)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(a)
+                if a.id == "ack-from-str"
+                    && a.from.as_ref().is_some_and(|j| j.to_string() == "not-a-phone-user@g.us")
+        )),
+        "a string-form `from` must still parse into the event"
+    );
+}
+
+/// The other half of the reason `from` stopped going through the display form:
+/// an interop JID's `integrator` is carried on the wire but is not part of the
+/// rendered JID, so rendering and re-parsing silently dropped it.
+#[test]
+fn jid_attr_display_round_trip_drops_the_interop_integrator() {
+    use wacore_binary::node::{NodeStr, ValueRef};
+    use wacore_binary::{JidRef, Server};
+
+    let value = ValueRef::Jid(JidRef {
+        user: NodeStr::Borrowed("551199990002"),
+        server: Server::Interop,
+        agent: 0,
+        device: 1,
+        integrator: 7,
+    });
+
+    let via_display: Option<Jid> = value.as_str().parse().ok();
+    assert_eq!(
+        via_display.map(|j| j.integrator),
+        Some(0),
+        "the display form carries no integrator, which is what the old path lost"
+    );
+    assert_eq!(
+        value.to_jid().map(|j| j.integrator),
+        Some(7),
+        "to_jid takes the decoded JID as-is"
+    );
+}
+
+/// Failure shape: a `from` that is not a JID still yields `None` rather than a
+/// partially-parsed value, and the ack is otherwise handled as before.
+#[tokio::test]
+async fn server_ack_from_stays_none_for_a_malformed_jid() {
+    use wacore::types::events::{Event, EventHandler};
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    let ack = NodeBuilder::new("ack")
+        .attr("id", "ack-from-bad")
+        .attr("class", "message")
+        .attr("from", "not a jid at all")
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(a)
+                if a.id == "ack-from-bad"
+                    && a.from.is_none()
+                    && a.class.as_deref() == Some("message")
+        )),
+        "an unparseable `from` must land as None without disturbing the rest"
+    );
+}
+
 /// Test that the lid_pn_cache correctly stores and retrieves LID mappings.
 ///
 /// This is critical for the LID-PN session mismatch fix. When we receive a message
