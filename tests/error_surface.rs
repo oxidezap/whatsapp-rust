@@ -24,7 +24,9 @@ use whatsapp_rust::features::{
     TcTokenError,
 };
 use whatsapp_rust::http::HttpStatusError;
-use whatsapp_rust::{ClientError, ErrorChainExt, IqError, SendError, ServerRejection};
+use whatsapp_rust::{
+    ClientError, ErrorChainExt, IqError, RejectionStanza, SendError, ServerRejection,
+};
 
 // ── Source scan ─────────────────────────────────────────────────────────────
 
@@ -225,7 +227,7 @@ fn rejected(code: u16) -> IqError {
 }
 
 /// The `<iq type="error">` a rejection carries, decoded the way the receive path decodes it.
-fn rejection_stanza(code: u16, text: &str) -> Arc<OwnedNodeRef> {
+fn rejection_stanza(code: u16, text: &str) -> RejectionStanza {
     let node = NodeBuilder::new("iq")
         .attr("type", "error")
         .children([NodeBuilder::new("error")
@@ -236,7 +238,7 @@ fn rejection_stanza(code: u16, text: &str) -> Arc<OwnedNodeRef> {
     let mut bytes = wacore_binary::marshal::marshal(&node).expect("the stanza should marshal");
     // marshal() prepends a format byte OwnedNodeRef::new does not expect.
     bytes.remove(0);
-    Arc::new(OwnedNodeRef::new(bytes).expect("the stanza should decode"))
+    Arc::new(OwnedNodeRef::new(bytes).expect("the stanza should decode")).into()
 }
 
 #[track_caller]

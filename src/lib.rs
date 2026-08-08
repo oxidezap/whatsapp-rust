@@ -169,7 +169,7 @@ pub use plugins::{
 };
 pub mod request;
 pub(crate) mod signal_flush;
-pub use request::IqError;
+pub use request::{IqError, RejectionStanza};
 #[cfg(feature = "tokio-runtime")]
 pub mod runtime_impl;
 #[cfg(feature = "tokio-runtime")]
@@ -254,7 +254,7 @@ pub mod prelude {
         PluginInterceptorRegistration, PluginManifest, PluginStanzaInterception,
         UntypedClientPlugin,
     };
-    pub use crate::request::IqError;
+    pub use crate::request::{IqError, RejectionStanza};
     #[cfg(feature = "tokio-runtime")]
     pub use crate::runtime_impl::TokioRuntime;
     pub use crate::send::{EditOptions, SendError, SendOptions, SendResult};

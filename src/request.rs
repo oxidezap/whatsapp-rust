@@ -93,6 +93,48 @@ enum PreparedIq {
     Query(Box<InfoQuery<'static>>),
 }
 
+/// A rejection stanza kept for the caller, wrapping the node the receive path decoded.
+///
+/// Exists for its `Debug`, which names the stanza instead of printing it: background IQ
+/// failures are logged with `{e:?}` on the connect path, and an error stanza can carry a
+/// JID. Reading the contents is [`Deref`] away, but that is now the caller's choice.
+///
+/// [`Deref`]: std::ops::Deref
+#[derive(Clone)]
+pub struct RejectionStanza(Arc<wacore_binary::OwnedNodeRef>);
+
+impl RejectionStanza {
+    /// The preserved node behind its refcount, for a caller that wants to keep or share it.
+    pub fn as_arc(&self) -> &Arc<wacore_binary::OwnedNodeRef> {
+        &self.0
+    }
+
+    /// Takes the preserved node out, consuming the wrapper.
+    pub fn into_arc(self) -> Arc<wacore_binary::OwnedNodeRef> {
+        self.0
+    }
+}
+
+impl From<Arc<wacore_binary::OwnedNodeRef>> for RejectionStanza {
+    fn from(response: Arc<wacore_binary::OwnedNodeRef>) -> Self {
+        Self(response)
+    }
+}
+
+impl std::ops::Deref for RejectionStanza {
+    type Target = wacore_binary::OwnedNodeRef;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RejectionStanza {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{}>", self.0.tag())
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum IqError {
@@ -121,7 +163,7 @@ pub enum IqError {
         /// The `type="error"` stanza verbatim, handed over whole the way a `type="result"`
         /// one is. What matters in a protocol error is the caller's judgement, so the summary
         /// above does not replace it: unread attributes, children and bytes stay readable.
-        response: Arc<wacore_binary::OwnedNodeRef>,
+        response: RejectionStanza,
     },
     #[error("received unexpected IQ response type: {got:?}")]
     UnexpectedResponseType { got: Option<String> },
@@ -189,7 +231,7 @@ impl IqError {
                 text,
                 error_type,
                 backoff,
-                response: response.clone(),
+                response: response.clone().into(),
             },
             wacore::request::IqError::UnexpectedResponseType { got } => {
                 Self::UnexpectedResponseType { got }
@@ -667,8 +709,14 @@ mod tests {
         assert_eq!(error_type.as_deref(), Some("cancel"));
         assert_eq!(backoff, Some(30));
         assert!(
-            Arc::ptr_eq(&response, &delivered),
+            Arc::ptr_eq(response.as_arc(), &delivered),
             "the rejection must carry the decoded node itself, not a copy of it"
+        );
+        assert_eq!(
+            format!("{response:?}"),
+            "<iq>",
+            "Debug must name the stanza, not print it: background IQ failures are logged \
+             with {{e:?}} and an error stanza can carry a JID"
         );
 
         let response = response.get();
