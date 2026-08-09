@@ -14371,3 +14371,49 @@ fn a_backend_error_is_storage_not_a_signal_failure() {
         "and anything this build does not classify stays in the named catch-all",
     );
 }
+
+/// A row we stored that no longer converts back into a record must not be
+/// reported as a malformed ciphertext. The conversion raises
+/// `InvalidProtobufEncoding` — the same variant a peer's malformed envelope
+/// raises — so the store boundary is the only place that still knows the bytes
+/// were ours.
+#[tokio::test]
+async fn a_corrupt_stored_prekey_is_not_blamed_on_the_peer() {
+    use wacore::libsignal::protocol::{PreKeyStore, SignalProtocolError};
+    use wacore::libsignal::store::PreKeyStore as WacorePreKeyStore;
+
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_corrupt_row").await;
+    let device = client.persistence_manager.get_device_arc().await;
+
+    // A stored structure with no key material: what a truncated or partially
+    // written row deserializes into.
+    let corrupt = waproto::whatsapp::PreKeyRecordStructure {
+        id: Some(7),
+        public_key: None,
+        private_key: None,
+    };
+    {
+        let guard = device.read().await;
+        WacorePreKeyStore::store_prekey(&*guard, 7, corrupt, false)
+            .await
+            .expect("stored");
+    }
+    drop(device);
+
+    let adapter = client.signal_adapter();
+    let err = adapter
+        .pre_key_store
+        .get_pre_key(7u32.into())
+        .await
+        .expect_err("a keyless row cannot become a record");
+
+    assert!(
+        matches!(err, SignalProtocolError::BackendError(context, _) if context == "stored record"),
+        "the boundary must mark it as ours, got {err:?}",
+    );
+    assert_eq!(
+        signal_error_reason(&err),
+        EncDecryptFailureReason::StorageFailure,
+        "and so the receive path reports storage, not a malformed ciphertext",
+    );
+}
