@@ -897,22 +897,6 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
         Ok(())
     }
 
-    /// Two table loads and a shift. This replaced a pair of `match` ladders
-    /// reached through a `fn` pointer, which is what the vectorised loop that
-    /// used to sit in `write_packed_bytes` was really competing against.
-    #[inline(always)]
-    fn pack_pair_table(table: &[u8; 256], part1: u8, part2: u8) -> u8 {
-        let hi = table[part1 as usize];
-        let lo = table[part2 as usize];
-        // `validate_hex`/`validate_nibble` gate every caller, so this is the
-        // same unreachable case the `match` arms panicked on.
-        assert!(
-            hi != PACK_INVALID && lo != PACK_INVALID,
-            "invalid char for packing"
-        );
-        (hi << 4) | lo
-    }
-
     fn write_packed_bytes(&mut self, value: &str, data_type: u8) -> Result<()> {
         if value.len() > token::PACKED_MAX as usize {
             panic!("String too long to be packed: {}", value.len());
@@ -938,14 +922,37 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
         // so the buffer covers any string that reaches here.
         let mut packed = [0u8; 64];
         let (pairs, tail) = input_bytes.as_chunks::<2>();
+
+        // The validity test is an OR accumulator checked once below, not a
+        // branch per pair. Legal table entries are 0..=15 and `PACK_INVALID`
+        // is 0xFF, so a set high nibble in `seen` means some character was
+        // rejected. Keeping the branch out is what lets LLVM unroll this.
+        let mut seen = 0u8;
         for (slot, pair) in packed.iter_mut().zip(pairs) {
-            *slot = Self::pack_pair_table(table, pair[0], pair[1]);
+            let hi = table[pair[0] as usize];
+            let lo = table[pair[1] as usize];
+            seen |= hi | lo;
+            *slot = (hi << 4) | lo;
         }
-        self.write_raw_bytes(&packed[..pairs.len()])?;
 
         // Odd length: the low nibble is the 0 pad, which both tables map to 15.
-        if let [last] = tail {
-            self.write_u8(Self::pack_pair_table(table, *last, 0))?;
+        let odd = if let [last] = tail {
+            let hi = table[*last as usize];
+            let lo = table[0];
+            seen |= hi | lo;
+            Some((hi << 4) | lo)
+        } else {
+            None
+        };
+
+        // Checked before anything reaches the writer. `validate_hex` and
+        // `validate_nibble` gate every caller, so this is the same unreachable
+        // case the `match` ladders this replaced used to panic on.
+        assert!(seen & 0xF0 == 0, "invalid char for packing");
+
+        self.write_raw_bytes(&packed[..pairs.len()])?;
+        if let Some(byte) = odd {
+            self.write_u8(byte)?;
         }
         Ok(())
     }
