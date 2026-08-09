@@ -14383,6 +14383,21 @@ fn a_backend_error_is_storage_not_a_signal_failure() {
          peer's ciphertext — libsignal only raises this while reading it",
     );
     assert_eq!(
+        signal_error_reason(&SignalProtocolError::InvalidSessionStructure(
+            "cannot decrypt without remote identity key"
+        )),
+        EncDecryptFailureReason::StorageFailure,
+        "a session record that decoded without usable state is our row too",
+    );
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::InvalidSessionStructure(
+            "receiver chain is closed"
+        )),
+        EncDecryptFailureReason::SignalError,
+        "but a chain we closed is a fact about the message — libsignal's \
+         `is_stored_session_corruption` draws that line and this must honour it",
+    );
+    assert_eq!(
         signal_error_reason(&SignalProtocolError::SignatureValidationFailed),
         EncDecryptFailureReason::SignalError,
         "and anything this build does not classify stays in the named catch-all",

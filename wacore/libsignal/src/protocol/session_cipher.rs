@@ -1444,7 +1444,7 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
     if let Some(ReceiverChainState::Closed { next_index }) = receiver_chain {
         if counter >= next_index {
             return Err(SignalProtocolError::InvalidSessionStructure(
-                "receiver chain is closed",
+                crate::protocol::error::CLOSED_RECEIVER_CHAIN,
             ));
         }
         let Some(message_key_gen) = state.get_message_keys(their_ephemeral, counter)? else {
@@ -1593,7 +1593,7 @@ fn get_or_create_chain_key(
         Some(ReceiverChainState::Open(chain)) => return Ok((chain, None)),
         Some(ReceiverChainState::Closed { .. }) => {
             return Err(SignalProtocolError::InvalidSessionStructure(
-                "receiver chain is closed",
+                crate::protocol::error::CLOSED_RECEIVER_CHAIN,
             ));
         }
         None => {}

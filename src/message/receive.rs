@@ -587,8 +587,12 @@ impl Client {
                     // tell the server we processed it, incrementing the offline counter.
                     // The transport <ack> is sufficient for acknowledgment.
                 }
-                // If session_had_duplicates is true, we silently skip (no warning, no event)
-                // because the message was already processed in a previous session
+                // If session_had_duplicates is true, we skip the warning and the
+                // UndecryptableMessage because the message was already processed
+                // in a previous session. The per-`<enc>` reports above are not
+                // skipped with them: they answer whether an index produced
+                // plaintext, and the skipped skmsg produced none on this
+                // delivery or the first.
             }
         } else if !session_decrypted_successfully
             && !session_had_duplicates

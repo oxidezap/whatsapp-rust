@@ -307,6 +307,12 @@ fn signal_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
         // "the active crypto provider failed the key agreement" — our provider,
         // not the sender's bytes, which were never judged.
         EncDecryptFailureReason::LocalCryptoFailure
+    } else if e.is_stored_session_corruption() {
+        // A stored `SessionRecord` that decoded and then would not yield usable
+        // state. The predicate lives in libsignal because the distinction is
+        // drawn on `InvalidSessionStructure`'s message, and only the crate that
+        // writes those messages can keep the two in step.
+        EncDecryptFailureReason::StorageFailure
     } else if matches!(e, SignalProtocolError::InvalidSenderKeySession) {
         // A sender-key record that loaded but does not hold usable state: no
         // chain key, a signing key that will not parse, or a chain whose derived

@@ -117,9 +117,62 @@ impl From<CurveError> for SignalProtocolError {
     }
 }
 
+/// The one [`SignalProtocolError::InvalidSessionStructure`] that is not this
+/// device's stored state failing.
+///
+/// `session_cipher` raises it when a message arrives on a receiver chain we
+/// closed — a fact about the message, not about the row it was decrypted
+/// against. Both raise sites use this constant so the string cannot drift away
+/// from the predicate that reads it.
+pub(crate) const CLOSED_RECEIVER_CHAIN: &str = "receiver chain is closed";
+
+impl SignalProtocolError {
+    /// Whether this error is a stored session record that decoded and then would
+    /// not yield usable state, rather than a verdict on the message.
+    ///
+    /// Every producer of [`Self::InvalidSessionStructure`] is reading persisted
+    /// session state — most through `InvalidSessionError`, which exists, in its
+    /// own words, "to keep from accidentally propagating deserialization
+    /// errors" — with the single exception of a closed receiver chain.
+    ///
+    /// Callers use this to avoid reporting our own corrupt state against the
+    /// peer who sent the message. It answers only that question: it says nothing
+    /// about whether the state is recoverable, and it is not a check for every
+    /// kind of local storage trouble (a store that cannot be read at all
+    /// surfaces as [`Self::BackendError`] instead).
+    pub fn is_stored_session_corruption(&self) -> bool {
+        matches!(self, Self::InvalidSessionStructure(what) if *what != CLOSED_RECEIVER_CHAIN)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_receiver_chain_is_not_stored_corruption() {
+        assert!(
+            !SignalProtocolError::InvalidSessionStructure(CLOSED_RECEIVER_CHAIN)
+                .is_stored_session_corruption(),
+            "a chain we closed is a fact about the message, not a corrupt row",
+        );
+        assert!(
+            SignalProtocolError::InvalidSessionStructure(
+                "cannot decrypt without remote identity key"
+            )
+            .is_stored_session_corruption(),
+            "session state missing its remote identity key is ours",
+        );
+        assert!(
+            SignalProtocolError::InvalidSessionStructure("invalid receiver chain message keys")
+                .is_stored_session_corruption(),
+            "message keys the cipher rejects are ours — libsignal logs the state as corrupt",
+        );
+        assert!(
+            !SignalProtocolError::InvalidSenderKeySession.is_stored_session_corruption(),
+            "the sender-key variant is classified on its own, not through this one",
+        );
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("synthetic backend failure: {code}")]
