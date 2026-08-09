@@ -220,7 +220,8 @@ jobs:
           df -h /
           sudo rm -rf --one-file-system /usr/local/lib/android
           df -h /
-      # `simd` needs nightly, so the matrix runs on the pinned toolchain.
+      # Pinned toolchain: .cargo/config.toml carries nightly-only rustflags
+      # (-Zshare-generics) for this target, and this job does not clear them.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -251,7 +252,7 @@ jobs:
           -p wacore-libsignal -p wacore-noise -p waproto
 
   test-stable:
-    name: Test Stable (no-simd)
+    name: Test Stable (MSRV)
     runs-on: ubuntu-latest
     # .cargo/config.toml sets nightly-only rustflags (-Zshare-generics) for the
     # x86_64-linux target; a set-but-empty RUSTFLAGS takes precedence over
@@ -279,18 +280,24 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
-      - name: Build wacore-binary (stable, no SIMD)
-        run: cargo build -p wacore-binary --no-default-features --verbose
-      - name: Test wacore-binary (stable, no SIMD)
-        run: cargo nextest run --profile ci -p wacore-binary --no-default-features --lib
-      - name: Build wacore-appstate (stable, no SIMD)
-        run: cargo build -p wacore-appstate --no-default-features --verbose
-      - name: Test wacore-appstate (stable, no SIMD)
-        run: cargo nextest run --profile ci -p wacore-appstate --no-default-features --lib
-      - name: Build wacore (stable, no SIMD)
-        run: cargo build -p wacore --no-default-features --verbose
-      - name: Test wacore (stable, no SIMD)
-        run: cargo nextest run --profile ci -p wacore --no-default-features --lib
+      # Default features, which include `simd`. That combination used to be
+      # nightly-only, so this job could only ever run the scalar half; both
+      # halves are stable now and the SIMD one is what ships, so it is the one
+      # worth testing here.
+      - name: Test wacore-binary (stable)
+        run: cargo nextest run --profile ci -p wacore-binary --lib
+      - name: Test wacore-appstate (stable)
+        run: cargo nextest run --profile ci -p wacore-appstate --lib
+      - name: Test wacore (stable)
+        run: cargo nextest run --profile ci -p wacore --lib
+      # `--no-default-features` turns the LTHash lane math back to scalar. It
+      # is the configuration wasm and ESP32 build, so it stays covered; a
+      # compile is enough, since the scalar path is what every test above
+      # already compares against.
+      - name: Build the scalar configuration (stable)
+        run: >
+          cargo build --verbose --no-default-features
+          -p wacore-binary -p wacore-appstate -p wacore
       # `rust-version` is published metadata for every member, but only the
       # three crates above are exercised at that toolchain. This compiles the
       # rest of the publishable set so the declared floor is a checked promise

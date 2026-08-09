@@ -48,7 +48,7 @@ default-members = [
 ]
 
 # Minimum supported Rust version. Floor is the stable release CI's
-# "Test Stable (no-simd)" job pins; raise both together (that job's
+# "Test Stable (MSRV)" job pins; raise both together (that job's
 # `toolchain:` and this value) when a dependency or language feature needs it.
 [workspace.package]
 rust-version = "1.94"

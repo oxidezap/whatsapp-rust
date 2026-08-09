@@ -1,16 +1,46 @@
 use std::io::Write;
 
-#[cfg(feature = "simd")]
-use core::simd::Select;
-#[cfg(feature = "simd")]
-use core::simd::prelude::*;
-#[cfg(feature = "simd")]
-use core::simd::{Simd, u8x16};
-
 use crate::error::{BinaryError, Result};
 use crate::jid::{self, Jid, JidRef};
 use crate::node::{Node, NodeContent, NodeContentRef, NodeRef, NodeValue, ValueRef};
 use crate::token;
+
+/// Marks a byte no packed encoding accepts. `validate_hex`/`validate_nibble`
+/// gate every caller, so a hit means the caller skipped that check.
+const PACK_INVALID: u8 = 0xFF;
+
+/// ASCII to nibble, the inverse of the decoder's `HEX_PAIRS`. Index 0 maps to
+/// 15 because that is the pad an odd-length string writes as its second half.
+static HEX_ENC: [u8; 256] = {
+    let mut table = [PACK_INVALID; 256];
+    let mut c = b'0';
+    while c <= b'9' {
+        table[c as usize] = c - b'0';
+        c += 1;
+    }
+    let mut c = b'A';
+    while c <= b'F' {
+        table[c as usize] = 10 + (c - b'A');
+        c += 1;
+    }
+    table[0] = 15;
+    table
+};
+
+/// ASCII to nibble for `NIBBLE_8`: digits plus the two punctuation characters
+/// a phone number can carry.
+static NIBBLE_ENC: [u8; 256] = {
+    let mut table = [PACK_INVALID; 256];
+    let mut c = b'0';
+    while c <= b'9' {
+        table[c as usize] = c - b'0';
+        c += 1;
+    }
+    table[b'-' as usize] = 10;
+    table[b'.' as usize] = 11;
+    table[0] = 15;
+    table
+};
 
 pub trait ByteWriter {
     fn write_u8(&mut self, value: u8) -> Result<()>;
@@ -867,30 +897,20 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
         Ok(())
     }
 
+    /// Two table loads and a shift. This replaced a pair of `match` ladders
+    /// reached through a `fn` pointer, which is what the vectorised loop that
+    /// used to sit in `write_packed_bytes` was really competing against.
     #[inline(always)]
-    fn pack_nibble(value: u8) -> u8 {
-        match value {
-            b'-' => 10,
-            b'.' => 11,
-            0 => 15,
-            c if c.is_ascii_digit() => c - b'0',
-            _ => panic!("Invalid char for nibble packing: {value}"),
-        }
-    }
-
-    #[inline(always)]
-    fn pack_hex(value: u8) -> u8 {
-        match value {
-            c if c.is_ascii_digit() => c - b'0',
-            c if (b'A'..=b'F').contains(&c) => 10 + (c - b'A'),
-            0 => 15,
-            _ => panic!("Invalid char for hex packing: {value}"),
-        }
-    }
-
-    #[inline(always)]
-    fn pack_byte_pair(packer: fn(u8) -> u8, part1: u8, part2: u8) -> u8 {
-        (packer(part1) << 4) | packer(part2)
+    fn pack_pair_table(table: &[u8; 256], part1: u8, part2: u8) -> u8 {
+        let hi = table[part1 as usize];
+        let lo = table[part2 as usize];
+        // `validate_hex`/`validate_nibble` gate every caller, so this is the
+        // same unreachable case the `match` arms panicked on.
+        assert!(
+            hi != PACK_INVALID && lo != PACK_INVALID,
+            "invalid char for packing"
+        );
+        (hi << 4) | lo
     }
 
     fn write_packed_bytes(&mut self, value: &str, data_type: u8) -> Result<()> {
@@ -906,67 +926,26 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
         }
         self.write_u8(rounded_len)?;
 
-        #[allow(unused_mut)]
-        let mut input_bytes = value.as_bytes();
-
-        if data_type == token::NIBBLE_8 {
-            #[cfg(feature = "simd")]
-            {
-                const NIBBLE_LOOKUP: [u8; 16] =
-                    [10, 11, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255, 255, 255];
-                let lookup = Simd::from_array(NIBBLE_LOOKUP);
-                let nibble_base = Simd::splat(b'-');
-
-                while input_bytes.len() >= 16 {
-                    let (chunk, rest) = input_bytes.split_at(16);
-                    let input = u8x16::from_slice(chunk);
-                    let indices = input.saturating_sub(nibble_base);
-                    let nibbles = lookup.swizzle_dyn(indices);
-
-                    let (evens, odds) = nibbles.deinterleave(nibbles.rotate_elements_left::<1>());
-                    let packed: Simd<u8, 16> = (evens << Simd::splat(4)) | odds;
-                    let packed_bytes = packed.to_array();
-                    self.write_raw_bytes(&packed_bytes[..8])?;
-
-                    input_bytes = rest;
-                }
-            }
-
-            let mut bytes_iter = input_bytes.iter().copied();
-            while let Some(part1) = bytes_iter.next() {
-                let part2 = bytes_iter.next().unwrap_or(0);
-                self.write_u8(Self::pack_byte_pair(Self::pack_nibble, part1, part2))?;
-            }
+        let input_bytes = value.as_bytes();
+        let table = if data_type == token::NIBBLE_8 {
+            &NIBBLE_ENC
         } else {
-            #[cfg(feature = "simd")]
-            {
-                let ascii_0 = Simd::splat(b'0');
-                let ascii_a = Simd::splat(b'A');
-                let ten = Simd::splat(10);
+            &HEX_ENC
+        };
 
-                while input_bytes.len() >= 16 {
-                    let (chunk, rest) = input_bytes.split_at(16);
-                    let input = u8x16::from_slice(chunk);
+        // Whole pairs first, so the common even-length case carries no
+        // per-iteration "is there a second half" branch. `PACKED_MAX` is 127,
+        // so the buffer covers any string that reaches here.
+        let mut packed = [0u8; 64];
+        let (pairs, tail) = input_bytes.as_chunks::<2>();
+        for (slot, pair) in packed.iter_mut().zip(pairs) {
+            *slot = Self::pack_pair_table(table, pair[0], pair[1]);
+        }
+        self.write_raw_bytes(&packed[..pairs.len()])?;
 
-                    let digit_vals = input - ascii_0;
-                    let letter_vals = input - ascii_a + ten;
-                    let is_letter = input.simd_ge(ascii_a);
-                    let nibbles = is_letter.select(letter_vals, digit_vals);
-
-                    let (evens, odds) = nibbles.deinterleave(nibbles.rotate_elements_left::<1>());
-                    let packed: Simd<u8, 16> = (evens << Simd::splat(4)) | odds;
-                    let packed_bytes = packed.to_array();
-                    self.write_raw_bytes(&packed_bytes[..8])?;
-
-                    input_bytes = rest;
-                }
-            }
-
-            let mut bytes_iter = input_bytes.iter().copied();
-            while let Some(part1) = bytes_iter.next() {
-                let part2 = bytes_iter.next().unwrap_or(0);
-                self.write_u8(Self::pack_byte_pair(Self::pack_hex, part1, part2))?;
-            }
+        // Odd length: the low nibble is the 0 pad, which both tables map to 15.
+        if let [last] = tail {
+            self.write_u8(Self::pack_pair_table(table, *last, 0))?;
         }
         Ok(())
     }

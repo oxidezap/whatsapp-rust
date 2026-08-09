@@ -4,8 +4,6 @@ use crate::node::{AttrsRef, NodeContentRef, NodeRef, NodeStr, ValueRef};
 use crate::token;
 use compact_str::CompactString;
 use std::borrow::Cow;
-#[cfg(feature = "simd")]
-use std::simd::{Simd, prelude::*, u8x16};
 
 /// Format a JidRef directly into CompactString using direct push operations,
 /// bypassing `fmt::Display` and `dyn Write` dispatch entirely.
@@ -374,30 +372,16 @@ impl<'a> Decoder<'a> {
         Ok(CompactString::from(s))
     }
 
+    // Deliberately scalar. A vectorised version of this loop lived here until
+    // it was measured against the table: `HEX_PAIRS[byte]` is one 2-byte load
+    // per input byte, and a shuffle/interleave/store sequence does not beat
+    // that. Under callgrind the SIMD path cost 4.5% more instructions on a
+    // 20-character id and 9.7% more on a 32-character one, and enabling real
+    // `pshufb` (`-Ctarget-cpu=x86-64-v2`) only narrowed the loss to 7.0%.
+    // Packed payloads are ids and phone numbers, so the loop also needed a
+    // 31-character string before it engaged at all.
     #[inline]
     fn decode_packed_hex(packed_data: &[u8], out: &mut [u8], pos: &mut usize) {
-        #[cfg(feature = "simd")]
-        let packed_data = {
-            const HEX_LOOKUP: [u8; 16] = *b"0123456789ABCDEF";
-            let lookup_table = Simd::from_array(HEX_LOOKUP);
-            let low_mask = Simd::splat(0x0F);
-
-            let (chunks, remainder) = packed_data.as_chunks::<16>();
-            for chunk in chunks {
-                let data = u8x16::from_array(*chunk);
-                let high_nibbles = (data >> 4) & low_mask;
-                let low_nibbles = data & low_mask;
-                let high_chars = lookup_table.swizzle_dyn(high_nibbles);
-                let low_chars = lookup_table.swizzle_dyn(low_nibbles);
-                let (lo, hi) = Simd::interleave(high_chars, low_chars);
-                out[*pos..*pos + 16].copy_from_slice(lo.as_array());
-                *pos += 16;
-                out[*pos..*pos + 16].copy_from_slice(hi.as_array());
-                *pos += 16;
-            }
-            remainder
-        };
-
         let written = packed_data.len() * 2;
         for (slot, &byte) in out[*pos..*pos + written]
             .chunks_exact_mut(2)
@@ -408,54 +392,12 @@ impl<'a> Decoder<'a> {
         *pos += written;
     }
 
+    // Scalar for the same reason as `decode_packed_hex`, and more so: the
+    // vector version had to validate every lane against the two legal
+    // out-of-range nibbles before it could shuffle, then fall back to this
+    // loop anyway whenever a lane failed.
     #[inline]
     fn decode_packed_nibble(packed_data: &[u8], out: &mut [u8], pos: &mut usize) -> Result<()> {
-        #[cfg(feature = "simd")]
-        let packed_data = {
-            const NIBBLE_LOOKUP: [u8; 16] = *b"0123456789-.\x00\x00\x00\x00";
-            let lookup_table = Simd::from_array(NIBBLE_LOOKUP);
-            let low_mask = Simd::splat(0x0F);
-            let le11 = Simd::splat(11);
-            let f15 = Simd::splat(15);
-
-            let (chunks, remainder) = packed_data.as_chunks::<16>();
-            for chunk in chunks {
-                let data = u8x16::from_array(*chunk);
-
-                let high_nibbles = (data >> 4) & low_mask;
-                let low_nibbles = data & low_mask;
-
-                let hi_valid = high_nibbles.simd_le(le11) | high_nibbles.simd_eq(f15);
-                let lo_valid = low_nibbles.simd_le(le11) | low_nibbles.simd_eq(f15);
-                if !(hi_valid & lo_valid).all() {
-                    for byte in *chunk {
-                        let high = (byte & 0xF0) >> 4;
-                        let low = byte & 0x0F;
-                        Self::unpack_nibble(high)?;
-                        Self::unpack_nibble(low)?;
-                    }
-                    for byte in *chunk {
-                        let high = (byte & 0xF0) >> 4;
-                        let low = byte & 0x0F;
-                        out[*pos] = Self::unpack_nibble(high)?;
-                        *pos += 1;
-                        out[*pos] = Self::unpack_nibble(low)?;
-                        *pos += 1;
-                    }
-                    continue;
-                }
-
-                let high_chars = lookup_table.swizzle_dyn(high_nibbles);
-                let low_chars = lookup_table.swizzle_dyn(low_nibbles);
-                let (lo, hi) = Simd::interleave(high_chars, low_chars);
-                out[*pos..*pos + 16].copy_from_slice(lo.as_array());
-                *pos += 16;
-                out[*pos..*pos + 16].copy_from_slice(hi.as_array());
-                *pos += 16;
-            }
-            remainder
-        };
-
         let written = packed_data.len() * 2;
         for (slot, &byte) in out[*pos..*pos + written]
             .chunks_exact_mut(2)

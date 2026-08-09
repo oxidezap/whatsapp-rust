@@ -12,8 +12,6 @@ description = "Binary data and constants for WhatsApp protocol"
 crate-type = ["rlib"]
 
 [features]
-default = ["simd"]
-simd = []
 serde = ["dep:serde", "compact_str/serde", "smallvec/serde"]
 # Render raw phone numbers in `Jid::observe()` instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.

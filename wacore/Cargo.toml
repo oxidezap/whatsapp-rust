@@ -18,11 +18,11 @@ ignored = ["getrandom"]
 
 [features]
 default = ["simd"]
-# Two independent SIMD backends behind one switch: appstate's LTHash runs on
-# fearless_simd (stable, runtime-dispatched), wacore-binary's packed codec
-# still on `portable_simd` (nightly). Enabling both here keeps this feature's
-# meaning — "SIMD everywhere it exists" — unchanged for consumers.
-simd = ["wacore-appstate/simd", "wacore-binary/simd"]
+# appstate's LTHash is the only SIMD left in the tree; wacore-binary's packed
+# codec is table-driven scalar, which measured faster than the vectors it
+# replaced. This runs on fearless_simd, so the feature no longer implies
+# nightly.
+simd = ["wacore-appstate/simd"]
 debug-snapshots = []
 # Typed interop with the decoded libsignal SessionRecord v1 model.
 legacy-session-interop = ["wacore-libsignal/legacy-session-interop"]
