@@ -1877,10 +1877,13 @@ impl EncDecryptFailureReason {
 /// - **A duplicate is not a failure.** An `<enc>` the server redelivered that
 ///   this device already processed emits neither this nor [`DecryptedPayload`]:
 ///   its plaintext was reported the first time round, and calling that a
-///   failure would put two meanings in one event. That extends to what a
-///   duplicate suppresses: a stanza whose session `<enc>` was a duplicate had
-///   its `skmsg` decrypted on that first delivery too, so skipping it now
-///   reports nothing either.
+///   failure would put two meanings in one event. The silence covers the
+///   duplicate `<enc>` itself and nothing more: a stanza whose session `<enc>`
+///   were duplicates and nothing else has its `skmsg` decrypted normally, and
+///   one where a duplicate arrives beside an `<enc>` that genuinely failed
+///   skips that `skmsg` on every delivery — so the skip is reported as
+///   [`NotAttempted`](EncDecryptFailureReason::NotAttempted), because no
+///   delivery ever produced its plaintext.
 /// - **Order is `enc_index`, not arrival.** The client decrypts a stanza's
 ///   `<enc>` nodes in per-kind passes (session, then group, then bot), so
 ///   neither these events nor [`DecryptedPayload`]s arrive in stanza order, and
