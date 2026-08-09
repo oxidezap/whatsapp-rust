@@ -1791,10 +1791,16 @@ pub enum EncDecryptFailureReason {
     /// Local Signal state was the problem, not the ciphertext: a store that
     /// could not be read, or state that could not be made durable — in which
     /// case the decrypt was abandoned rather than advancing a ratchet no crash
-    /// could recover. The stanza stays queued for redelivery.
+    /// could recover.
     ///
     /// Says nothing about the peer. A per-peer health signal built on this
     /// event should exclude it.
+    ///
+    /// Says nothing about recovery either. What the client does next is the
+    /// branch's decision, not the reason's: some leave the stanza queued for
+    /// redelivery, others nack it. Like every reason here, this one names where
+    /// the client stopped — see the "not a loss report" note on
+    /// [`EncDecryptFailed`].
     StorageFailure,
     /// The `<enc>` decrypted, and the bytes could not be turned into a message:
     /// padding this build could not strip, or a payload it could not decode.
