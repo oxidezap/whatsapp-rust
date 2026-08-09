@@ -14417,3 +14417,22 @@ async fn a_corrupt_stored_prekey_is_not_blamed_on_the_peer() {
         "and so the receive path reports storage, not a malformed ciphertext",
     );
 }
+
+/// The same libsignal rejection must not carry two names depending on which
+/// `<enc>` type reached it. `UnrecognizedMessageVersion` arrives at the group
+/// arm through `group_decrypt_retry_reason` as an invalid message; the session
+/// catch-all has to agree.
+#[test]
+fn a_version_mismatch_is_an_invalid_message_on_both_paths() {
+    use wacore::libsignal::protocol::SignalProtocolError;
+
+    let mismatch = SignalProtocolError::UnrecognizedMessageVersion(9);
+    assert_eq!(
+        signal_error_reason(&mismatch),
+        EncDecryptFailureReason::InvalidMessage,
+    );
+    assert!(
+        group_decrypt_retry_reason(&mismatch).is_some(),
+        "the group arm still recognizes it, so both now say the same thing",
+    );
+}

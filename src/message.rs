@@ -295,6 +295,11 @@ fn signal_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
         EncDecryptFailureReason::MalformedCiphertext
     } else if matches!(e, SignalProtocolError::BackendError(_, _)) {
         EncDecryptFailureReason::StorageFailure
+    } else if matches!(e, SignalProtocolError::UnrecognizedMessageVersion(_)) {
+        // The group arm reaches this one through `group_decrypt_retry_reason`
+        // and calls it an invalid message. Naming it here too keeps a session
+        // `<enc>` and an `skmsg` from reporting the same rejection differently.
+        EncDecryptFailureReason::InvalidMessage
     } else {
         EncDecryptFailureReason::SignalError
     }

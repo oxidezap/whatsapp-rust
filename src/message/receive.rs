@@ -1025,22 +1025,31 @@ impl Client {
                                     // Send retry receipt so the sender resends with a PreKeySignalMessage
                                     // to establish a new session with the new identity
                                     outcome.had_failure = true;
-                                    // A missing signed pre-key is the same
-                                    // terminal cause however it was reached;
-                                    // the sibling arm below classifies it that
-                                    // way, and one error must not carry two
-                                    // reasons depending on the route.
+                                    // The retry can fail for a reason that has
+                                    // nothing to do with the identity that sent
+                                    // it here — a store that would not answer,
+                                    // an envelope that would not parse, a signed
+                                    // pre-key we no longer hold. Name those the
+                                    // way every other arm does, and keep
+                                    // `UntrustedIdentity` for what is left: the
+                                    // retry failed and the identity change is
+                                    // the only thing that explains it.
                                     self.report_enc_decrypt_failure(
                                         info,
                                         enc_index,
                                         enc_type,
-                                        if matches!(
-                                            retry_err,
-                                            SignalProtocolError::InvalidSignedPreKeyId
-                                        ) {
-                                            EncDecryptFailureReason::UnknownPreKey
-                                        } else {
-                                            EncDecryptFailureReason::UntrustedIdentity
+                                        match signal_error_reason(&retry_err) {
+                                            EncDecryptFailureReason::SignalError => {
+                                                if matches!(
+                                                    retry_err,
+                                                    SignalProtocolError::InvalidSignedPreKeyId
+                                                ) {
+                                                    EncDecryptFailureReason::UnknownPreKey
+                                                } else {
+                                                    EncDecryptFailureReason::UntrustedIdentity
+                                                }
+                                            }
+                                            reason => reason,
                                         },
                                     );
                                     outcome.undecryptable |= self

@@ -56,9 +56,18 @@ impl Client {
     ///
     /// Pure observation: it neither decides nor reflects what the receive path
     /// does next (retry receipt, nack, ack, or nothing). Every branch that
-    /// abandons an `<enc>` calls this exactly once for it, so a consumer holding
-    /// the lease can pair each [`Event::DecryptedPayload`] with the failure of
-    /// every sibling that produced none.
+    /// abandons an `<enc>` **this client was going to decrypt** calls this
+    /// exactly once for it, so a consumer holding the lease can pair each
+    /// [`Event::DecryptedPayload`] with the failure of every sibling that
+    /// produced none.
+    ///
+    /// Two kinds of `<enc>` are outside that pairing on purpose. A duplicate
+    /// was decrypted on an earlier delivery, so neither event fires. And an
+    /// `<enc>` claimed by a registered `EncHandler` is not this client's to
+    /// decrypt at all: the consumer that registered the handler already sees
+    /// its own `Err` directly, the handler runs in a detached task, and
+    /// reporting from there would break the one ordering this event does
+    /// promise — that a stanza's events all come from its receive task.
     ///
     /// Deliberately *not* deduplicated: `UndecryptableMessage` is single-flight
     /// per `(chat, id)` because a UI must not show two placeholders for one

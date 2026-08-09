@@ -587,6 +587,12 @@ impl Client {
         // Store lookup: primary, then the LID/PN alternate. A backend error is
         // logged and treated as a miss (not a hard nack) so the resolver still
         // gets a chance — mirrors the secret-encrypted edit path.
+        //
+        // Treated as a miss for control flow, but not for reporting: "the store
+        // would not answer" is ours and "no secret here" is the companion's,
+        // and by the time the cause is named nothing else remembers which of
+        // the two emptied the lookup.
+        let mut lookup_failed = false;
         let buffered = self
             .msg_secret_buffer
             .lookup(&chat_for_lookup, &target_sender_str, target_id)
@@ -610,6 +616,7 @@ impl Client {
                     Ok(found) => found,
                     Err(e) => {
                         log::warn!("[msg:{}] msmsg: alternate lookup failed: {e:?}", info.id);
+                        lookup_failed = true;
                         None
                     }
                 },
@@ -618,6 +625,7 @@ impl Client {
                         "[msg:{}] backend error reading message_secret: {e:?}",
                         info.id
                     );
+                    lookup_failed = true;
                     None
                 }
             },
@@ -663,7 +671,11 @@ impl Client {
                             info,
                             enc_index,
                             enc_type,
-                            EncDecryptFailureReason::NoMessageSecret,
+                            if lookup_failed {
+                                EncDecryptFailureReason::StorageFailure
+                            } else {
+                                EncDecryptFailureReason::NoMessageSecret
+                            },
                         );
                         self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                         return;
