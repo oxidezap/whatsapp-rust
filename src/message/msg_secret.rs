@@ -2,6 +2,22 @@
 
 use super::*;
 
+/// Map a bot-payload failure onto the cause reported for its `<enc>`.
+///
+/// The stage comes from [`BotMessageError::stage`] rather than from matching
+/// variants here, so a new variant upstream cannot quietly land in the wrong
+/// bucket. An envelope rejected on shape never reached the cipher, so calling
+/// it a MAC failure would make malformed wire data count as an authentication
+/// failure against the peer.
+fn msmsg_failure_reason(error: &wacore::bot_message::BotMessageError) -> EncDecryptFailureReason {
+    use wacore::bot_message::BotMessageFailure;
+    match error.stage() {
+        BotMessageFailure::Envelope => EncDecryptFailureReason::MalformedCiphertext,
+        BotMessageFailure::Secret => EncDecryptFailureReason::NoMessageSecret,
+        BotMessageFailure::Authentication => EncDecryptFailureReason::BadMac,
+    }
+}
+
 impl Client {
     /// Capture embedded `MessageContextInfo.message_secret` for add-on
     /// decrypts. Bot DMs keep the legacy LID key as a second entry.
@@ -711,11 +727,14 @@ impl Client {
                             "[msg:{}] msmsg AES-GCM open failed both attempts (primary={primary_err:?}, fallback={fallback_err:?})",
                             info.id
                         );
+                        // Both attempts see the same iv/payload, so a shape
+                        // rejection is identical on either and the primary
+                        // error decides.
                         self.report_enc_decrypt_failure(
                             info,
                             enc_index,
                             enc_type,
-                            EncDecryptFailureReason::BadMac,
+                            msmsg_failure_reason(&primary_err),
                         );
                         self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                         return;
@@ -730,7 +749,7 @@ impl Client {
                         info,
                         enc_index,
                         enc_type,
-                        EncDecryptFailureReason::BadMac,
+                        msmsg_failure_reason(&primary_err),
                     );
                     self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                     return;

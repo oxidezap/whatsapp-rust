@@ -1021,11 +1021,23 @@ impl Client {
                                     // Send retry receipt so the sender resends with a PreKeySignalMessage
                                     // to establish a new session with the new identity
                                     outcome.had_failure = true;
+                                    // A missing signed pre-key is the same
+                                    // terminal cause however it was reached;
+                                    // the sibling arm below classifies it that
+                                    // way, and one error must not carry two
+                                    // reasons depending on the route.
                                     self.report_enc_decrypt_failure(
                                         info,
                                         enc_index,
                                         enc_type,
-                                        EncDecryptFailureReason::UntrustedIdentity,
+                                        if matches!(
+                                            retry_err,
+                                            SignalProtocolError::InvalidSignedPreKeyId
+                                        ) {
+                                            EncDecryptFailureReason::UnknownPreKey
+                                        } else {
+                                            EncDecryptFailureReason::UntrustedIdentity
+                                        },
                                     );
                                     outcome.undecryptable |= self
                                         .handle_decrypt_failure(
@@ -1270,7 +1282,11 @@ impl Client {
                             info,
                             enc_index,
                             enc_type,
-                            EncDecryptFailureReason::SignalError,
+                            if is_malformed_envelope_error(&e) {
+                                EncDecryptFailureReason::MalformedCiphertext
+                            } else {
+                                EncDecryptFailureReason::SignalError
+                            },
                         );
                         outcome.undecryptable |= self
                             .dispatch_undecryptable_event(
@@ -1475,14 +1491,18 @@ impl Client {
                         .await;
                 }
                 Err(e) => {
-                    // Classified from the same predicate the retry decision
-                    // uses, so the reported cause and the recovery the client
-                    // chose can never disagree.
+                    // `group_decrypt` parses the SenderKeyMessage before it
+                    // touches the chain, so an envelope it could not read never
+                    // reached a cipher. Past that, classify from the same
+                    // predicate the retry decision uses, so the reported cause
+                    // and the recovery the client chose cannot disagree.
                     self.report_enc_decrypt_failure(
                         info,
                         enc_index,
                         enc_type,
-                        if group_decrypt_retry_reason(&e).is_some() {
+                        if is_malformed_envelope_error(&e) {
+                            EncDecryptFailureReason::MalformedCiphertext
+                        } else if group_decrypt_retry_reason(&e).is_some() {
                             EncDecryptFailureReason::InvalidMessage
                         } else {
                             EncDecryptFailureReason::SignalError

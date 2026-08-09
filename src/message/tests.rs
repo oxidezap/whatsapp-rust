@@ -7038,6 +7038,25 @@ fn find_message_ack(frames: &[bytes::Bytes]) -> Option<(String, Option<String>)>
     None
 }
 
+/// How many `<ack class="message">` frames the client sent for `id`.
+fn count_message_acks_for(frames: &[bytes::Bytes], id: &str) -> usize {
+    frames
+        .iter()
+        .enumerate()
+        .filter_map(|(i, frame)| decode_frame(i, frame))
+        .filter(|buf| {
+            wacore_binary::marshal::unmarshal_packed_ref(buf).is_ok_and(|node| {
+                node.tag.as_ref() == "ack"
+                    && node
+                        .get_attr("class")
+                        .is_some_and(|v| v.as_str() == "message")
+                    && node.get_attr("error").is_none()
+                    && node.get_attr("id").is_some_and(|v| v.as_str() == id)
+            })
+        })
+        .count()
+}
+
 /// First `<receipt>` on the wire for `id` as `(to, type, recipient)`.
 fn find_receipt(
     frames: &[bytes::Bytes],
@@ -13450,7 +13469,7 @@ async fn classification_reports_every_enc_it_sets_aside() {
 /// downstream ever sees the stanza again.
 #[tokio::test]
 async fn an_all_unusable_stanza_still_reports_each_enc() {
-    let (client, _transport) = capturing_client("enc_fail_all_unknown").await;
+    let (client, transport) = capturing_client("enc_fail_all_unknown").await;
     let (recorder, _leases) = watch_enc_outcomes(&client);
 
     let node = NodeBuilder::new("message")
@@ -13483,6 +13502,27 @@ async fn an_all_unusable_stanza_still_reports_each_enc() {
             (0, EncDecryptFailureReason::UnsupportedEncType),
             (1, EncDecryptFailureReason::UnsupportedEncType),
         ],
+    );
+
+    // The ack is what makes this the terminal path: without it the server
+    // replays the stanza forever, and the two reports above would repeat with
+    // it. Assert the ack the doc claims, and that reporting did not also add a
+    // nack for a stanza the client chose to drop quietly.
+    crate::test_utils::poll_until("the unusable stanza to be transport-acked", || {
+        find_message_ack_for(&transport.sent(), "ENCFAIL_ALL_UNKNOWN").is_some()
+    })
+    .await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    let frames = transport.sent();
+    assert_eq!(
+        count_message_acks_for(&frames, "ENCFAIL_ALL_UNKNOWN"),
+        1,
+        "exactly one transport ack",
+    );
+    assert_eq!(
+        find_message_nack_error(&frames, "ENCFAIL_ALL_UNKNOWN"),
+        None,
+        "observing the failures must not turn the drop into a nack",
     );
 }
 
@@ -14065,4 +14105,161 @@ async fn the_two_forwarding_gates_are_independent() {
     );
     assert!(client.enc_decrypt_failed_forwarding_enabled());
     drop(failure_lease);
+}
+
+/// A group envelope libsignal could not even parse never reached a cipher.
+/// Reporting it as an unclassified Signal error would put a malformed-wire
+/// event in the same bucket as a real cryptographic failure.
+#[tokio::test]
+async fn a_group_envelope_that_does_not_parse_reports_malformed_ciphertext() {
+    let client = create_test_client_for_retry_with_id("enc_fail_skmsg_parse").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let group: Jid = "120363000000000005@g.us".parse().unwrap();
+    let participant: Jid = "5511900000009@s.whatsapp.net".parse().unwrap();
+    let info = Arc::new(MessageInfo {
+        id: "ENCFAIL_SKMSG_PARSE".to_string(),
+        source: crate::types::message::MessageSource {
+            sender: participant,
+            chat: group.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: group,
+                session_payloads: vec![],
+                // Too short to hold the trailing signature, so
+                // `SenderKeyMessage::try_from` rejects it before the chain is
+                // ever looked up.
+                group_payloads: vec![enc_payload_at("skmsg", vec![0x33, 0x01], 0)],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            0,
+            Some("skmsg".to_string()),
+            EncDecryptFailureReason::MalformedCiphertext
+        )],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A bot payload too short to hold its GCM tag is rejected on shape, before any
+/// key is derived. It must not be reported as a failed authentication — that
+/// would let malformed wire data count against the peer's session health.
+#[tokio::test]
+async fn a_bot_envelope_too_short_for_its_tag_is_not_reported_as_bad_mac() {
+    use crate::store::commands::DeviceCommand;
+    let (client, _transport) = capturing_client("enc_fail_msmsg_short").await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(
+            "999888777666554:0@lid".parse().unwrap(),
+        )))
+        .await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
+    let sender_identity = client
+        .dm_sender_identity_for(&bot_chat)
+        .await
+        .expect("LID seeded");
+    client
+        .persist_outbound_msg_secret(
+            &bot_chat,
+            &sender_identity,
+            "OUT_SHORT",
+            &[0x5Au8; 32],
+            wacore::msg_secret::RetentionClass::Bot,
+            crate::send::SendInstant::now(),
+        )
+        .await;
+
+    let node = NodeBuilder::new("message")
+        .attr("from", "867051314767696@bot")
+        .attr("id", "ENCFAIL_MSMSG_SHORT")
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("meta")
+                .attr("target_id", "OUT_SHORT")
+                .attr("target_sender_jid", "999888777666554@lid")
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .attr("v", "2")
+                // A valid 12-byte IV, and four bytes where a 16-byte tag has to
+                // be: the secret is found, and there is nothing to authenticate.
+                .bytes(encode_message_secret_message(&[3u8; 12], &[9u8; 4]))
+                .build(),
+        ])
+        .build();
+    client
+        .clone()
+        .handle_incoming_message(node_to_arc(node))
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            0,
+            Some("msmsg".to_string()),
+            EncDecryptFailureReason::MalformedCiphertext
+        )],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A signed pre-key we no longer hold, reported as such. The identity-change
+/// retry reaches the same libsignal error by a different route and now names
+/// the same cause, so a consumer keying a resync off `UnknownPreKey` sees both.
+#[tokio::test]
+async fn a_rotated_out_signed_prekey_reports_unknown_prekey() {
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_spk").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let (bundle, bob_jid) = bobs_prekey_bundle_with_spk_id(&client, 4243).await;
+    let bob_addr = bob_jid.to_protocol_address();
+    let mut alice = AlicePeer::new("15550002003@s.whatsapp.net").await;
+    alice.install_bob_session(&bob_addr, &bundle).await;
+    let pkmsg = alice.encrypt_text(&bob_addr, "rotated out").await;
+    let bytes = match &pkmsg {
+        CiphertextMessage::PreKeySignalMessage(m) => m.serialized().to_vec(),
+        _ => panic!("must be a pkmsg so decrypt looks up the signed prekey"),
+    };
+
+    let info = dm_info("ENCFAIL_SPK", &alice.jid);
+    let outcome = client
+        .clone()
+        .process_session_enc_batch(
+            vec![enc_payload_at("pkmsg", bytes, 2)],
+            &info,
+            &alice.jid,
+            DecryptFailMode::Show,
+        )
+        .await;
+    assert!(!outcome.decrypted, "the signed prekey is missing");
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            2,
+            Some("pkmsg".to_string()),
+            EncDecryptFailureReason::UnknownPreKey
+        )],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
 }

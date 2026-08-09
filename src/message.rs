@@ -263,6 +263,26 @@ fn decrypt_fail_log_level(mode: crate::types::events::DecryptFailMode) -> log::L
     }
 }
 
+/// Errors libsignal raises while turning bytes into a message of their declared
+/// type: too short to hold the signature, a version this build predates or does
+/// not know, or a body that is not the protobuf it claims. No key material is
+/// used to reach any of them.
+///
+/// Shared by the session and group arms so one libsignal error cannot be
+/// reported as a malformed envelope on one path and an unclassified failure on
+/// the other. `UnrecognizedMessageVersion` is deliberately absent: it is the
+/// *state* mismatch `group_decrypt` raises after parsing, not a parse failure —
+/// `UnrecognizedCiphertextVersion` is that one.
+fn is_malformed_envelope_error(e: &SignalProtocolError) -> bool {
+    matches!(
+        e,
+        SignalProtocolError::CiphertextMessageTooShort(_)
+            | SignalProtocolError::LegacyCiphertextVersion(_)
+            | SignalProtocolError::UnrecognizedCiphertextVersion(_)
+            | SignalProtocolError::InvalidProtobufEncoding
+    )
+}
+
 /// WA Web treats every `SignalDecryptionError` as `SignalRetryable`, so a
 /// sender-key desync must request a resend rather than NACK (which stops the
 /// server retransmitting). `None` = keep the NACK (genuinely non-Signal error).

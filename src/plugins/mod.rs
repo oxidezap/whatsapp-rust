@@ -6016,6 +6016,10 @@ mod tests {
             !client.raw_node_forwarding_enabled(),
             "the kind that is no longer wanted releases its own lease"
         );
+        assert!(
+            !client.enc_decrypt_failed_forwarding_enabled(),
+            "the success half of a decrypt must not turn on the failure half"
+        );
 
         // All at once, then each removed on its own.
         assert!(
@@ -6024,12 +6028,14 @@ mod tests {
                     EventKind::RawNode,
                     EventKind::DecryptedPayload,
                     EventKind::SentFrame,
+                    EventKind::EncDecryptFailed,
                 ]))
                 .expect("interest update")
         );
         assert!(client.raw_node_forwarding_enabled());
         assert!(client.decrypted_payload_forwarding_enabled());
         assert!(client.sent_frame_forwarding_enabled());
+        assert!(client.enc_decrypt_failed_forwarding_enabled());
 
         assert!(
             subscription
@@ -6039,6 +6045,7 @@ mod tests {
         assert!(client.raw_node_forwarding_enabled(), "kept");
         assert!(!client.decrypted_payload_forwarding_enabled(), "released");
         assert!(!client.sent_frame_forwarding_enabled(), "released");
+        assert!(!client.enc_decrypt_failed_forwarding_enabled(), "released");
 
         assert!(
             subscription
@@ -6048,10 +6055,23 @@ mod tests {
         assert!(client.sent_frame_forwarding_enabled());
         assert!(!client.raw_node_forwarding_enabled(), "released");
 
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::EncDecryptFailed]))
+                .expect("interest update")
+        );
+        assert!(client.enc_decrypt_failed_forwarding_enabled());
+        assert!(!client.sent_frame_forwarding_enabled(), "released");
+        assert!(
+            !client.decrypted_payload_forwarding_enabled(),
+            "and the failure half must not drag the success half back in"
+        );
+
         assert!(subscription.unsubscribe());
         assert!(!client.raw_node_forwarding_enabled());
         assert!(!client.decrypted_payload_forwarding_enabled());
         assert!(!client.sent_frame_forwarding_enabled());
+        assert!(!client.enc_decrypt_failed_forwarding_enabled());
     }
 
     #[tokio::test]
