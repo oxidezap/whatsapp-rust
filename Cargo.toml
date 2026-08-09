@@ -95,10 +95,6 @@ diesel_migrations = { version = "2.3.2", default-features = false, features = ["
 divan = { package = "codspeed-divan-compat", version = "5.0.1" }
 env_logger = { version = "0.11", default-features = false }
 event-listener = { version = "5", default-features = false }
-# `std` (default) rather than the `libm` path: wacore-appstate is already
-# std-only (LazyLock), and libm would add a dependency to serve float ops
-# this crate never touches.
-fearless_simd = { version = "0.6.0" }
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 getrandom = { version = "0.4", default-features = false }
@@ -165,7 +161,6 @@ tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 danger-skip-cert-chain-verify = ["wacore/danger-skip-cert-chain-verify"]
 default = [
-    "simd",
     "sqlite-storage",
     "tokio-transport",
     "tokio-runtime",
@@ -173,7 +168,6 @@ default = [
     "tokio-native",
     "signal",
 ]
-simd = ["wacore/simd"]
 ureq-client = ["dep:whatsapp-rust-ureq-http-client"]
 tokio-transport = ["dep:whatsapp-rust-tokio-transport"]
 tokio-runtime = ["dep:tokio"]

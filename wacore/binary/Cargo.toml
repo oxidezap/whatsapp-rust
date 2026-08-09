@@ -12,15 +12,6 @@ description = "Binary data and constants for WhatsApp protocol"
 crate-type = ["rlib"]
 
 [features]
-# Does nothing. The packed codec this used to gate is table-driven scalar now,
-# which measured faster than the vectors it replaced. It stays declared, and
-# stays in `default`, purely to leave the published feature surface where it
-# was: dropping the name breaks any manifest that says `features = ["simd"]`,
-# and dropping it from `default` trips `feature_not_enabled_by_default`. Both
-# errors would point at the consumer rather than at this change. Since the
-# feature gates nothing, keeping it costs nothing. Delete at the next major.
-default = ["simd"]
-simd = []
 serde = ["dep:serde", "compact_str/serde", "smallvec/serde"]
 # Render raw phone numbers in `Jid::observe()` instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.

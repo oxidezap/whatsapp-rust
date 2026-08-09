@@ -23,7 +23,6 @@ wacore-binary = { path = "../../wacore/binary" }
 whatsapp-rust = { path = "../..", default-features = false, features = [
     "danger-skip-cert-chain-verify",
     "danger-skip-tls-verify",
-    "simd",
     "tokio-runtime",
     "tokio-native",
     "signal",

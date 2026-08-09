@@ -11,16 +11,9 @@ description = "Appstate for WhatsApp protocol"
 [lib]
 crate-type = ["rlib"]
 
-[features]
-default = ["simd"]
-# LTHash lane math via fearless_simd: runtime level detection on stable, so
-# this feature does not drag the crate onto nightly.
-simd = ["dep:fearless_simd"]
-
 [dependencies]
 anyhow = { workspace = true }
 buffa = { workspace = true }
-fearless_simd = { workspace = true, optional = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }

@@ -1,5 +1,3 @@
-#[cfg(feature = "simd")]
-use fearless_simd::{Level, Simd, SimdBase, dispatch, u16x8};
 use hkdf::Hkdf;
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
@@ -11,12 +9,6 @@ use std::sync::LazyLock;
 /// clones the keyed state.
 static EXTRACT_HMAC: LazyLock<Hmac<Sha256>> =
     LazyLock::new(|| Hmac::<Sha256>::new_from_slice(&[0u8; 32]).expect("32-byte HMAC key"));
-
-/// Probing CPU features is comparatively expensive and the answer cannot
-/// change while the process runs, so the level is resolved once here:
-/// `multiple_op` dispatches once per operand, and a patch carries hundreds.
-#[cfg(feature = "simd")]
-static SIMD_LEVEL: LazyLock<Level> = LazyLock::new(Level::new);
 
 #[derive(Clone, Debug)]
 pub struct LTHash {
@@ -63,36 +55,19 @@ impl LTHash {
     }
 }
 
+/// Deliberately scalar. A hand-vectorised version of this loop lived here
+/// until it was measured: over an 812-MAC batch it moved the total by 0.28%,
+/// because HKDF above it dominates and LLVM already auto-vectorizes this loop
+/// about as well as the intrinsics did.
 fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool) {
     assert_eq!(base.len(), input.len(), "length mismatch");
-    // Use `% 2` instead of `.is_multiple_of(2)` for stable Rust compatibility.
-    #[allow(clippy::manual_is_multiple_of)]
-    {
-        assert!(base.len() % 2 == 0, "slice lengths must be even");
-    }
-
-    #[allow(unused_mut, unused_assignments)]
-    let (mut base_remaining, mut input_remaining): (&mut [u8], &[u8]) = (base, input);
+    assert!(base.len().is_multiple_of(2), "slice lengths must be even");
 
     // WA Web treats the accumulator as little-endian u16 lanes
     // (`new DataView(...).getUint16(off, true)` in WA/Crypto/LtHash.js).
     // Snapshot/patch MACs are HMACs over the accumulator bytes, so the lane
     // endianness is part of the wire spec.
-    #[cfg(feature = "simd")]
-    {
-        let (base_chunks, base_rem) = base_remaining.as_chunks_mut::<16>();
-        let (input_chunks, input_rem) = input_remaining.as_chunks::<16>();
-
-        dispatch!(*SIMD_LEVEL, simd => pointwise_chunks(simd, base_chunks, input_chunks, subtract));
-
-        base_remaining = base_rem;
-        input_remaining = input_rem;
-    }
-
-    for (base_pair, input_pair) in base_remaining
-        .chunks_exact_mut(2)
-        .zip(input_remaining.chunks_exact(2))
-    {
+    for (base_pair, input_pair) in base.chunks_exact_mut(2).zip(input.chunks_exact(2)) {
         let x = u16::from_le_bytes([base_pair[0], base_pair[1]]);
         let y = u16::from_le_bytes([input_pair[0], input_pair[1]]);
 
@@ -101,48 +76,7 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
         } else {
             x.wrapping_add(y)
         };
-        let bytes = result.to_le_bytes();
-        base_pair[0] = bytes[0];
-        base_pair[1] = bytes[1];
-    }
-}
-
-/// The lane math, generic over the SIMD level `dispatch!` picked at runtime.
-/// `#[inline(always)]` is load-bearing rather than a hint: it is what makes
-/// each instantiation inherit its level's `target_feature` set, so the AVX2
-/// copy lowers to AVX2 instead of to the baseline the caller was compiled for.
-#[cfg(feature = "simd")]
-#[inline(always)]
-fn pointwise_chunks<S: Simd>(
-    simd: S,
-    base_chunks: &mut [[u8; 16]],
-    input_chunks: &[[u8; 16]],
-    subtract: bool,
-) {
-    for (base_chunk, input_chunk) in base_chunks.iter_mut().zip(input_chunks) {
-        // `from_le_bytes` per lane states the wire endianness directly, so
-        // the same code is correct on either host; on little-endian it
-        // lowers to the plain 16-byte load a transmute would have emitted.
-        let base_arr: [u16; 8] = core::array::from_fn(|i| {
-            u16::from_le_bytes([base_chunk[2 * i], base_chunk[2 * i + 1]])
-        });
-        let input_arr: [u16; 8] = core::array::from_fn(|i| {
-            u16::from_le_bytes([input_chunk[2 * i], input_chunk[2 * i + 1]])
-        });
-        let base_simd = u16x8::from_slice(simd, &base_arr);
-        let input_simd = u16x8::from_slice(simd, &input_arr);
-
-        let result_simd = if subtract {
-            base_simd - input_simd
-        } else {
-            base_simd + input_simd
-        };
-
-        let mut out = [0u16; 8];
-        result_simd.store_slice(&mut out);
-        for (base_pair, lane) in base_chunk.as_chunks_mut::<2>().0.iter_mut().zip(out) {
-            *base_pair = lane.to_le_bytes();
-        }
+        base_pair.copy_from_slice(&result.to_le_bytes());
     }
 }
 
@@ -205,30 +139,31 @@ mod tests {
         }
     }
 
-    /// Straight-line reference: no chunking, no dispatch, no feature gate. The
-    /// point is to be obviously correct rather than fast, so that the test
-    /// below is an independent check on the SIMD path rather than a
-    /// comparison of that path against itself.
+    /// Reference for the test below. It reaches the same answer by a
+    /// different route than the implementation: lanes are assembled by hand
+    /// from byte positions and the arithmetic is done in `u32` and masked, so
+    /// it shares neither `from_le_bytes` nor `wrapping_*` with the code under
+    /// test. A reference that mirrors the implementation proves nothing.
     fn reference_pointwise(base: &mut [u8], input: &[u8], subtract: bool) {
-        for (b, i) in base.chunks_exact_mut(2).zip(input.chunks_exact(2)) {
-            let x = u16::from_le_bytes([b[0], b[1]]);
-            let y = u16::from_le_bytes([i[0], i[1]]);
+        for i in (0..base.len()).step_by(2) {
+            let x = base[i] as u32 | ((base[i + 1] as u32) << 8);
+            let y = input[i] as u32 | ((input[i + 1] as u32) << 8);
             let r = if subtract {
-                x.wrapping_sub(y)
+                x.wrapping_sub(y) & 0xFFFF
             } else {
-                x.wrapping_add(y)
+                (x + y) & 0xFFFF
             };
-            b.copy_from_slice(&r.to_le_bytes());
+            base[i] = (r & 0xFF) as u8;
+            base[i + 1] = (r >> 8) as u8;
         }
     }
 
-    /// The SIMD path splits into 16-byte chunks and leaves a scalar tail, so
-    /// the sizes below straddle that boundary: under one chunk, exactly one,
-    /// chunk-plus-tail, and several chunks. Inputs are seeded to cover the
-    /// wrap boundaries in both directions, which is where a lane-width or
-    /// endianness mistake would show up rather than in round-number data.
+    /// Sizes straddle the 16-byte boundary a vectorised implementation would
+    /// chunk on, so the coverage still holds if one ever comes back. Inputs
+    /// are seeded onto the wrap boundaries in both directions, which is where
+    /// a lane-width or endianness mistake shows up rather than in round data.
     #[test]
-    fn simd_path_matches_independent_scalar_reference() {
+    fn pointwise_matches_independent_reference() {
         let sizes = [0usize, 2, 14, 16, 18, 32, 34, 128, 130, 256];
         // Deterministic LCG: reproducible failures, no dev-dependency.
         let mut seed = 0x2545_F491u32;
