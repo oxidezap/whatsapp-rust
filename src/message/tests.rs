@@ -13276,6 +13276,7 @@ async fn forwarding_stops_when_the_last_lease_drops() {
 
 // --- per-`<enc>` decrypt-failure reporting ----------------------------------
 
+use crate::message::msg_secret::msmsg_failure_reason;
 use wacore::types::events::{EncDecryptFailed, EncDecryptFailureReason};
 
 /// Every `EncDecryptFailed` a client emitted, in dispatch order, plus the
@@ -14501,5 +14502,48 @@ async fn a_corrupt_stored_identity_is_not_blamed_on_the_peer() {
     assert_eq!(
         signal_error_reason(&err),
         EncDecryptFailureReason::StorageFailure,
+    );
+}
+
+/// A bot secret we stored that will not produce a key is our corrupt row, not a
+/// companion that never had one. `NoMessageSecret` is reserved for the lookups
+/// that came back empty; anything the store answered with and we could not use
+/// is storage.
+#[test]
+fn a_stored_bot_secret_that_will_not_derive_is_storage_not_a_missing_secret() {
+    use wacore::bot_message::BotMessageError;
+
+    assert_eq!(
+        msmsg_failure_reason(&BotMessageError::InvalidSecretLength {
+            expected: 32,
+            got: 20
+        }),
+        EncDecryptFailureReason::StorageFailure,
+    );
+    assert_eq!(
+        msmsg_failure_reason(&BotMessageError::AuthenticationFailed),
+        EncDecryptFailureReason::BadMac,
+        "and a real tag failure is still the peer's",
+    );
+    assert_eq!(
+        msmsg_failure_reason(&BotMessageError::PayloadTooShort { need: 16, got: 4 }),
+        EncDecryptFailureReason::MalformedCiphertext,
+        "and a body too short for its tag is still malformed wire",
+    );
+}
+
+/// `KeyAgreementFailed` is libsignal saying our active crypto provider failed,
+/// not a verdict on the sender's bytes — which were never judged. Counting it
+/// against the peer is the same mistake as counting a failed disk read.
+#[test]
+fn a_local_key_agreement_failure_is_not_the_peers() {
+    use wacore::libsignal::crypto::CryptoProviderError;
+    use wacore::libsignal::protocol::SignalProtocolError;
+
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::KeyAgreementFailed(
+            CryptoProviderError::BackendFailed
+        )),
+        EncDecryptFailureReason::LocalCryptoFailure,
     );
 }

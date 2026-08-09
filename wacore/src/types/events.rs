@@ -1785,6 +1785,10 @@ pub enum EncDecryptFailureReason {
     /// or whose `<meta>` does not say which secret to look up. Expected on a
     /// companion for a group bot invocation the primary device sent.
     NoMessageSecret,
+    /// The local cryptographic provider failed a key agreement. Ours, like
+    /// [`StorageFailure`](Self::StorageFailure): the peer's ciphertext was never
+    /// judged, so a per-peer health signal should exclude this too.
+    LocalCryptoFailure,
     /// The cryptographic layer failed for a reason this build does not classify
     /// further. A reason that shows up in volume here deserves a variant.
     SignalError,

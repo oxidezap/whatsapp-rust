@@ -9,11 +9,18 @@ use super::*;
 /// bucket. An envelope rejected on shape never reached the cipher, so calling
 /// it a MAC failure would make malformed wire data count as an authentication
 /// failure against the peer.
-fn msmsg_failure_reason(error: &wacore::bot_message::BotMessageError) -> EncDecryptFailureReason {
+///
+/// A `Secret` stage is `StorageFailure`, not `NoMessageSecret`: we found a row
+/// and it would not yield a key. `NoMessageSecret` is for the lookups that came
+/// back empty, which is the companion's state; a stored secret of the wrong
+/// length is ours.
+pub(super) fn msmsg_failure_reason(
+    error: &wacore::bot_message::BotMessageError,
+) -> EncDecryptFailureReason {
     use wacore::bot_message::BotMessageFailure;
     match error.stage() {
         BotMessageFailure::Envelope => EncDecryptFailureReason::MalformedCiphertext,
-        BotMessageFailure::Secret => EncDecryptFailureReason::NoMessageSecret,
+        BotMessageFailure::Secret => EncDecryptFailureReason::StorageFailure,
         BotMessageFailure::Authentication => EncDecryptFailureReason::BadMac,
     }
 }
