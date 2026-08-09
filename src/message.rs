@@ -307,6 +307,14 @@ fn signal_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
         // "the active crypto provider failed the key agreement" — our provider,
         // not the sender's bytes, which were never judged.
         EncDecryptFailureReason::LocalCryptoFailure
+    } else if matches!(e, SignalProtocolError::InvalidSenderKeySession) {
+        // A sender-key record that loaded but does not hold usable state: no
+        // chain key, a signing key that will not parse, or a chain whose derived
+        // key/IV the cipher rejects. Every site `group_decrypt` can reach it
+        // from is reading our stored record, which is why libsignal's own log
+        // there says the state is corrupt. The peer's copy is judged by
+        // `SignatureValidationFailed` and `InvalidMessage` instead.
+        EncDecryptFailureReason::StorageFailure
     } else if matches!(e, SignalProtocolError::UnrecognizedMessageVersion(_)) {
         // The group arm reaches this one through `group_decrypt_retry_reason`
         // and calls it an invalid message. Naming it here too keeps a session

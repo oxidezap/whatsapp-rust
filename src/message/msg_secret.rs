@@ -640,12 +640,26 @@ impl Client {
         let secret = match store_secret {
             Some(s) => s,
             None => {
-                let alternate = self
+                let alternate = match self
                     .alternate_msg_secret_jid(&backend, &target_sender)
                     .await
-                    .ok()
-                    .flatten()
-                    .map(|j| j.to_non_ad_string());
+                {
+                    Ok(jid) => jid.map(|j| j.to_non_ad_string()),
+                    Err(e) => {
+                        // The resolver still gets its chance without the
+                        // alternate identity, so this stays a miss for control
+                        // flow. But it is a store that would not answer, and the
+                        // reported cause has to say so: without this the resolver
+                        // returning `None` would be named `NoMessageSecret`,
+                        // blaming the companion for our own mapping table.
+                        log::warn!(
+                            "[msg:{}] msmsg: alternate jid lookup failed: {e:?}",
+                            info.id
+                        );
+                        lookup_failed = true;
+                        None
+                    }
+                };
                 match self
                     .resolve_msg_secret_via_app(
                         &chat_for_lookup,

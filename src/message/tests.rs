@@ -14246,13 +14246,16 @@ async fn a_rotated_out_signed_prekey_reports_unknown_prekey() {
     crate::test_utils::wait_for_outbound_tasks(&client).await;
 }
 
-/// The healthy redelivery path must stay quiet. A stanza whose session `<enc>`
-/// this device already processed had its `skmsg` decrypted on that first
-/// delivery, so skipping it now is the redelivery working — not a failure. The
-/// sibling `<enc>` that genuinely failed is still reported, so the silence is
-/// scoped to the duplicate and does not swallow the batch.
+/// A duplicate alongside a genuine failure does not buy the `skmsg` its silence.
+///
+/// `should_process_skmsg_after_session` already lets a batch through when its
+/// session `<enc>` were duplicates and nothing else, so the only way a duplicate
+/// reaches the skip branch is beside an `<enc>` that really failed — and that
+/// failure skipped this `skmsg` on the first delivery too. There is no earlier
+/// success for the redelivery to stand in for, so the skipped index is reported
+/// and the duplicate itself still is not.
 #[tokio::test]
-async fn a_skmsg_skipped_after_a_duplicate_reports_nothing() {
+async fn a_skmsg_skipped_beside_a_duplicate_is_still_reported() {
     let client = crate::test_utils::create_test_client_with_name("enc_fail_dup_skip").await;
 
     let mut alice = AlicePeer::new("15550002004@s.whatsapp.net").await;
@@ -14325,13 +14328,20 @@ async fn a_skmsg_skipped_after_a_duplicate_reports_nothing() {
 
     assert_eq!(
         recorder.failures(),
-        vec![(
-            1,
-            Some("msg".to_string()),
-            EncDecryptFailureReason::MalformedCiphertext
-        )],
-        "the duplicate reports nothing, the skmsg it suppressed reports nothing, \
-         and the enc that really failed still does",
+        vec![
+            (
+                1,
+                Some("msg".to_string()),
+                EncDecryptFailureReason::MalformedCiphertext
+            ),
+            (
+                2,
+                Some("skmsg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+        ],
+        "the duplicate reports nothing, the enc that really failed does, and so \
+         does the skmsg that failure skipped",
     );
     crate::test_utils::wait_for_outbound_tasks(&client).await;
 }
@@ -14368,6 +14378,12 @@ fn a_backend_error_is_storage_not_a_signal_failure() {
     );
     assert_eq!(
         signal_error_reason(&SignalProtocolError::InvalidSenderKeySession),
+        EncDecryptFailureReason::StorageFailure,
+        "a sender-key record that loaded without usable state is our row, not the \
+         peer's ciphertext — libsignal only raises this while reading it",
+    );
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::SignatureValidationFailed),
         EncDecryptFailureReason::SignalError,
         "and anything this build does not classify stays in the named catch-all",
     );

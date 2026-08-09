@@ -534,23 +534,26 @@ impl Client {
                     }
                 }
             } else {
+                // Reported outside the duplicate guard below, unlike the log.
+                // The duplicate rule that keeps redelivery out of this event does
+                // not reach here: `should_process_skmsg_after_session` already
+                // returns true for a batch whose session `<enc>` were duplicates
+                // and nothing else, so that stanza never takes this branch. What
+                // does take it with `session_had_duplicates` set is a batch that
+                // ALSO had a genuine failure — and that failure skipped this
+                // skmsg on the first delivery too, so it has produced no
+                // plaintext on any delivery and there is no earlier success for
+                // the redelivery to stand in for.
+                for payload in &group_payloads {
+                    self.report_enc_decrypt_failure(
+                        &info,
+                        payload.enc_index,
+                        payload.enc_type.as_wire_str(),
+                        EncDecryptFailureReason::NotAttempted,
+                    );
+                }
                 // Only show warning if session messages actually FAILED (not duplicates)
                 if !session_had_duplicates {
-                    // Reported inside this guard, not above it: a batch that saw
-                    // a duplicate is a stanza this device already processed, so
-                    // its skmsg produced its plaintext on the first delivery.
-                    // Skipping it now is the redelivery working, not a failure,
-                    // and naming it one would put ordinary redelivery traffic in
-                    // an event called `EncDecryptFailed`. Same reasoning as the
-                    // duplicate rule on the payload doc.
-                    for payload in &group_payloads {
-                        self.report_enc_decrypt_failure(
-                            &info,
-                            payload.enc_index,
-                            payload.enc_type.as_wire_str(),
-                            EncDecryptFailureReason::NotAttempted,
-                        );
-                    }
                     if info.is_expired_status() {
                         log::debug!(
                             "[msg:{}] Silently dropping expired status from {}",
