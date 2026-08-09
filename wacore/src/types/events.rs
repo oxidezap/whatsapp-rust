@@ -1770,8 +1770,13 @@ pub enum EncDecryptFailureReason {
     /// The sender encrypted to a one-time or signed pre-key of ours that this
     /// device no longer holds.
     UnknownPreKey,
-    /// The sender's identity key changed, and decryption still failed after the
-    /// stored identity was cleared and the message retried.
+    /// The sender's identity key is not the one this device trusts for them.
+    ///
+    /// Usually reported after the client cleared the stored identity and
+    /// retried, and the retry still did not produce plaintext — so the identity
+    /// change is what is left explaining it. Also reported where libsignal
+    /// raises the untrusted identity directly and no retry ran, such as the
+    /// decrypt that follows a PN→LID session migration.
     UntrustedIdentity,
     /// Authentication failed: the ciphertext did not verify under the key the
     /// client derived for it. Covers both the Signal MAC and the AES-GCM tag of
