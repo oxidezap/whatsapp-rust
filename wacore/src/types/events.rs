@@ -1778,8 +1778,14 @@ pub enum EncDecryptFailureReason {
     /// a bot (`msmsg`) payload.
     BadMac,
     /// The envelope parsed and the cryptographic layer rejected its contents —
-    /// an unrecognized version, a bad signature, or an invalid sender-key
-    /// session.
+    /// a version that does not match the state it was decrypted against, a
+    /// signature that did not verify, or a body the cipher would not accept
+    /// under keys that were themselves sound.
+    ///
+    /// Not the same as state that was never sound: a sender-key or session
+    /// record that will not yield usable keys is
+    /// [`StorageFailure`](Self::StorageFailure), because nothing about the
+    /// message was judged.
     InvalidMessage,
     /// A bot (`msmsg`) payload whose `messageSecret` this device does not hold,
     /// or whose `<meta>` does not say which secret to look up. Expected on a
@@ -1792,10 +1798,19 @@ pub enum EncDecryptFailureReason {
     /// The cryptographic layer failed for a reason this build does not classify
     /// further. A reason that shows up in volume here deserves a variant.
     SignalError,
-    /// Local Signal state was the problem, not the ciphertext: a store that
-    /// could not be read, or state that could not be made durable — in which
-    /// case the decrypt was abandoned rather than advancing a ratchet no crash
-    /// could recover.
+    /// Local state was the problem, not the ciphertext: a store that would not
+    /// answer, a row that came back and would not yield what it should hold, or
+    /// state that could not be made durable.
+    ///
+    /// Not confined to Signal state, though that is where most of it comes
+    /// from — a corrupt pre-key, identity, session or sender-key record, or a
+    /// durability failure, in which case the decrypt was abandoned rather than
+    /// advancing a ratchet no crash could recover. A bot (`msmsg`) payload
+    /// reaches it too: a message-secret lookup that *errored* rather than came
+    /// back empty, or a stored `messageSecret` that will not derive a key.
+    /// A secret this device genuinely does not hold is
+    /// [`NoMessageSecret`](Self::NoMessageSecret) instead — that is the
+    /// companion's state, this is ours.
     ///
     /// Says nothing about the peer. A per-peer health signal built on this
     /// event should exclude it.
