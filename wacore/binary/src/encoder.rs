@@ -994,6 +994,48 @@ mod tests {
 
     type TestResult = Result<()>;
 
+    /// The `match` ladders `HEX_ENC`/`NIBBLE_ENC` replaced, kept here as the
+    /// specification they are checked against. `None` is the case the old code
+    /// panicked on and the tables mark with `PACK_INVALID`.
+    fn reference_hex(value: u8) -> Option<u8> {
+        match value {
+            c if c.is_ascii_digit() => Some(c - b'0'),
+            c if (b'A'..=b'F').contains(&c) => Some(10 + (c - b'A')),
+            0 => Some(15),
+            _ => None,
+        }
+    }
+
+    fn reference_nibble(value: u8) -> Option<u8> {
+        match value {
+            b'-' => Some(10),
+            b'.' => Some(11),
+            0 => Some(15),
+            c if c.is_ascii_digit() => Some(c - b'0'),
+            _ => None,
+        }
+    }
+
+    /// Exhaustive over the byte domain, so the tables cannot drift from the
+    /// ladders they were derived from: same accepted set, same nibble for
+    /// every accepted byte, same rejected set.
+    #[test]
+    fn encode_tables_match_the_ladders_they_replaced() {
+        for byte in 0u8..=255 {
+            let i = byte as usize;
+            assert_eq!(
+                reference_hex(byte),
+                (HEX_ENC[i] != PACK_INVALID).then_some(HEX_ENC[i]),
+                "hex table disagrees at {byte:#04x}"
+            );
+            assert_eq!(
+                reference_nibble(byte),
+                (NIBBLE_ENC[i] != PACK_INVALID).then_some(NIBBLE_ENC[i]),
+                "nibble table disagrees at {byte:#04x}"
+            );
+        }
+    }
+
     #[test]
     fn test_encode_node() -> TestResult {
         let node = Node::new(
