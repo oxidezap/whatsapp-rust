@@ -12,6 +12,13 @@ description = "Binary data and constants for WhatsApp protocol"
 crate-type = ["rlib"]
 
 [features]
+# Does nothing. The packed codec this used to gate is table-driven scalar now,
+# which measured faster than the vectors it replaced. Kept, and out of
+# `default`, only because the crate is published: a manifest that names
+# `features = ["simd"]` fails to resolve against a crate that has no such
+# feature, and that error points at the consumer rather than at this change.
+# Delete it at the next major.
+simd = []
 serde = ["dep:serde", "compact_str/serde", "smallvec/serde"]
 # Render raw phone numbers in `Jid::observe()` instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
