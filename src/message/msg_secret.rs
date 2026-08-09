@@ -485,6 +485,12 @@ impl Client {
                     "[msg:{}] failed to decode MessageSecretMessage: {e:?}",
                     info.id
                 );
+                self.report_enc_decrypt_failure(
+                    info,
+                    enc_index,
+                    enc_type,
+                    EncDecryptFailureReason::MalformedCiphertext,
+                );
                 self.spawn_nack(info, NackReason::ParsingError, None);
                 return;
             }
@@ -495,6 +501,12 @@ impl Client {
             log::warn!(
                 "[msg:{}] MessageSecretMessage missing enc_iv/enc_payload",
                 info.id
+            );
+            self.report_enc_decrypt_failure(
+                info,
+                enc_index,
+                enc_type,
+                EncDecryptFailureReason::MalformedCiphertext,
             );
             self.spawn_nack(info, NackReason::ParsingError, None);
             return;
@@ -507,6 +519,12 @@ impl Client {
             Some(j) => j,
             None => {
                 log::warn!("[msg:{}] msmsg: no target_sender resolvable", info.id);
+                self.report_enc_decrypt_failure(
+                    info,
+                    enc_index,
+                    enc_type,
+                    EncDecryptFailureReason::NoMessageSecret,
+                );
                 self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                 return;
             }
@@ -532,6 +550,12 @@ impl Client {
                 log::warn!(
                     "[msg:{}] msmsg: <meta> missing target_id; cannot look up secret",
                     info.id
+                );
+                self.report_enc_decrypt_failure(
+                    info,
+                    enc_index,
+                    enc_type,
+                    EncDecryptFailureReason::NoMessageSecret,
                 );
                 self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                 return;
@@ -619,6 +643,12 @@ impl Client {
                             "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
                             info.id
                         );
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            EncDecryptFailureReason::NoMessageSecret,
+                        );
                         self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                         return;
                     }
@@ -681,6 +711,12 @@ impl Client {
                             "[msg:{}] msmsg AES-GCM open failed both attempts (primary={primary_err:?}, fallback={fallback_err:?})",
                             info.id
                         );
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            EncDecryptFailureReason::BadMac,
+                        );
                         self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                         return;
                     }
@@ -689,6 +725,12 @@ impl Client {
                     log::warn!(
                         "[msg:{}] msmsg AES-GCM open failed and no fallback msg_id: {primary_err:?}",
                         info.id
+                    );
+                    self.report_enc_decrypt_failure(
+                        info,
+                        enc_index,
+                        enc_type,
+                        EncDecryptFailureReason::BadMac,
                     );
                     self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                     return;
@@ -718,6 +760,12 @@ impl Client {
                 log::warn!(
                     "[msg:{}] msmsg plaintext is not a Message proto: {e:?}",
                     info.id
+                );
+                self.report_enc_decrypt_failure(
+                    info,
+                    enc_index,
+                    enc_type,
+                    EncDecryptFailureReason::PlaintextUnusable,
                 );
                 self.spawn_nack(info, NackReason::ParsingError, None);
                 return;

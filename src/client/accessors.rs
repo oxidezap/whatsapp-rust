@@ -88,6 +88,39 @@ impl Client {
         self.decrypted_payload_forwarding.load(Ordering::Relaxed) != 0
     }
 
+    /// Acquire per-`<enc>` decrypt-failure forwarding for one consumer.
+    ///
+    /// [`Event::EncDecryptFailed`] stays enabled until every acquired lease is
+    /// dropped. While none is held nothing is emitted and nothing is built: each
+    /// failure branch costs one relaxed atomic load.
+    ///
+    /// Separate from
+    /// [`acquire_decrypted_payload_forwarding`](Self::acquire_decrypted_payload_forwarding)
+    /// on purpose — a consumer that wants both halves of a stanza's decryption
+    /// holds both leases, and one that wants only failures does not make the
+    /// success path clone plaintext.
+    ///
+    /// [`Event::EncDecryptFailed`]: wacore::types::events::Event::EncDecryptFailed
+    pub fn acquire_enc_decrypt_failed_forwarding(self: &Arc<Self>) -> EncDecryptFailedLease {
+        let incremented = self
+            .enc_decrypt_failed_forwarding
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            })
+            .is_ok();
+        assert!(
+            incremented,
+            "enc-decrypt-failure forwarding lease counter overflow"
+        );
+        EncDecryptFailedLease {
+            client: Arc::downgrade(self),
+        }
+    }
+
+    pub(crate) fn enc_decrypt_failed_forwarding_enabled(&self) -> bool {
+        self.enc_decrypt_failed_forwarding.load(Ordering::Relaxed) != 0
+    }
+
     /// Acquire sent-frame forwarding for one consumer.
     ///
     /// [`Event::SentFrame`] stays enabled until every acquired lease is dropped.

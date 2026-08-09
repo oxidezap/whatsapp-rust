@@ -510,6 +510,7 @@ impl Client {
             alloc_meter: std::sync::OnceLock::new(),
             raw_node_forwarding: AtomicUsize::new(0),
             decrypted_payload_forwarding: AtomicUsize::new(0),
+            enc_decrypt_failed_forwarding: AtomicUsize::new(0),
             sent_frame_tap,
             stanza_interceptors: std::sync::RwLock::new(Arc::new(Vec::new())),
             stanza_interceptor_count: AtomicUsize::new(0),

@@ -6,6 +6,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use portable_atomic::{AtomicU64, Ordering};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, OnceLock, RwLock};
 use wacore_binary::Node;
@@ -281,6 +282,7 @@ pub enum EventKind {
     QuickReplyUpdate,
     DisableLinkPreviewsUpdate,
     ContactRemoved,
+    EncDecryptFailed,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -294,7 +296,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::ContactRemoved as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::EncDecryptFailed as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1021,6 +1023,17 @@ pub enum Event {
     /// [`ContactUpdate`]: the mutation arrives as a syncd `Remove`, carries no
     /// meaningful action payload, and means the contact left the address book.
     ContactRemoved(ContactRemoved),
+
+    /// One `<enc>` that produced no plaintext, and why.
+    ///
+    /// The per-`<enc>` counterpart of [`Event::DecryptedPayload`]. Library
+    /// extension — no WA Web equivalent. Gated by
+    /// `Client::acquire_enc_decrypt_failed_forwarding()` so nothing is built
+    /// while unused.
+    ///
+    /// Last, like every new variant: a binary `Serialize` format writes the
+    /// variant index, so inserting in the middle renumbers everything after it.
+    EncDecryptFailed(EncDecryptFailed),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1113,6 +1126,7 @@ impl Event {
             Event::QuickReplyUpdate(_) => EventKind::QuickReplyUpdate,
             Event::DisableLinkPreviewsUpdate(_) => EventKind::DisableLinkPreviewsUpdate,
             Event::ContactRemoved(_) => EventKind::ContactRemoved,
+            Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -1720,6 +1734,154 @@ pub struct DecryptedPayload {
     /// hand and can frame them however its sink expects.
     #[serde(skip)]
     pub payload: Bytes,
+}
+
+/// Why one `<enc>` produced no plaintext.
+///
+/// Every variant names a branch the receive path actually takes; there is no
+/// catch-all "other" standing in for code nobody wrote. New branches append new
+/// variants, so this is `#[non_exhaustive]` and a match on it needs a `_` arm.
+///
+/// This is the client's own classification of where *it* stopped, not something
+/// the server sends and not a statement about the sender's copy. Two builds can
+/// classify the same ciphertext differently as branches are refined; the pairing
+/// of a reason with a specific `<enc>` is the stable part, the exact variant is
+/// not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum EncDecryptFailureReason {
+    /// The node is unusable as a node: no `type` attribute, or no content to
+    /// decrypt. Nothing about it named a decryption to attempt.
+    MalformedNode,
+    /// The `type` is one this build does not implement. Recognized as an
+    /// `<enc>`, but no path here could ever decrypt it.
+    UnsupportedEncType,
+    /// A type this build handles, whose body is not a well-formed envelope for
+    /// it — so it never reached a cipher. Distinct from
+    /// [`InvalidMessage`](Self::InvalidMessage), which is the cryptographic
+    /// layer rejecting an envelope it did parse.
+    MalformedCiphertext,
+    /// No Signal session for the sender's address. Usually recoverable: the
+    /// client asks the sender to re-establish one.
+    NoSession,
+    /// No sender-key state for this `(group, sender)` chain — typically an
+    /// `skmsg` whose distribution message was never received or was lost.
+    NoSenderKey,
+    /// The sender encrypted to a one-time or signed pre-key of ours that this
+    /// device no longer holds.
+    UnknownPreKey,
+    /// The sender's identity key changed, and decryption still failed after the
+    /// stored identity was cleared and the message retried.
+    UntrustedIdentity,
+    /// Authentication failed: the ciphertext did not verify under the key the
+    /// client derived for it. Covers both the Signal MAC and the AES-GCM tag of
+    /// a bot (`msmsg`) payload.
+    BadMac,
+    /// The envelope parsed and the cryptographic layer rejected its contents —
+    /// an unrecognized version, a bad signature, or an invalid sender-key
+    /// session.
+    InvalidMessage,
+    /// A bot (`msmsg`) payload whose `messageSecret` this device does not hold,
+    /// or whose `<meta>` does not say which secret to look up. Expected on a
+    /// companion for a group bot invocation the primary device sent.
+    NoMessageSecret,
+    /// The cryptographic layer failed for a reason this build does not classify
+    /// further. A reason that shows up in volume here deserves a variant.
+    SignalError,
+    /// Local Signal state could not be made durable, so the decrypt was
+    /// abandoned rather than advancing a ratchet that no crash could recover.
+    /// The stanza stays queued for redelivery.
+    StorageFailure,
+    /// The `<enc>` decrypted, and the bytes could not be turned into a message:
+    /// padding this build could not strip, or a payload it could not decode.
+    ///
+    /// The one reason that can accompany a [`DecryptedPayload`] for the same
+    /// `<enc>` — when the bytes existed but were unusable, both are emitted.
+    PlaintextUnusable,
+    /// Never attempted. The client recognized the node and deliberately skipped
+    /// it: an `skmsg` whose stanza's session `<enc>` failed first (the sender
+    /// key it needed came in that one), or a session `<enc>` on a stanza
+    /// addressed from a group, which has no 1:1 session to use.
+    NotAttempted,
+}
+
+impl EncDecryptFailureReason {
+    /// Whether the client entered its decryption path for this `<enc>` at all.
+    ///
+    /// This is the line between *tried and failed* and *recognized and not
+    /// handled*. `false` means the node was set aside before any decryption was
+    /// attempted, so nothing here says whether its ciphertext was good. `true`
+    /// spans everything from an envelope that would not parse to a MAC that
+    /// would not verify — the attempt happened and did not produce plaintext.
+    pub fn decryption_was_attempted(self) -> bool {
+        !matches!(
+            self,
+            Self::MalformedNode | Self::UnsupportedEncType | Self::NotAttempted
+        )
+    }
+}
+
+/// Payload of [`Event::EncDecryptFailed`]: one `<enc>` of a stanza that
+/// produced no plaintext, and why.
+///
+/// The failing half of what [`DecryptedPayload`] reports for the succeeding
+/// half, at the same granularity and under the same numbering. A stanza can
+/// carry one `<enc>` per device; without a per-node signal a consumer watching
+/// decryption can say *this `<enc>` produced these bytes* but not *this `<enc>`
+/// failed for this reason*, and on a fan-out not even which one failed.
+///
+/// Reasons to want it: attributing a failure inside a fan-out, driving a retry
+/// or resync policy off the reason, and measuring session health per peer
+/// rather than per message.
+///
+/// # What it does not say
+///
+/// - **It is not a display signal.** Whether to show the user a placeholder is
+///   [`Event::UndecryptableMessage`], which is per *message*, deduplicated by
+///   `(chat, id)`, and carries the server's `decrypt-fail` hint. This event is
+///   per `<enc>`, is not deduplicated, and answers a different question.
+/// - **It is not a loss report.** Most reasons are recoverable — the client may
+///   already have asked the sender to resend — and this event says nothing
+///   about whether a retry went out or whether one succeeded later.
+/// - **It repeats.** A redelivered stanza that fails again emits it again, once
+///   per `<enc>` per delivery. Correlate on `info.id` if you want at-most-once.
+/// - **A duplicate is not a failure.** An `<enc>` the server redelivered that
+///   this device already processed emits neither this nor [`DecryptedPayload`]:
+///   its plaintext was reported the first time round, and calling that a
+///   failure would put two meanings in one event.
+/// - **Order is `enc_index`, not arrival.** The client decrypts a stanza's
+///   `<enc>` nodes in per-kind passes (session, then group, then bot), so
+///   neither these events nor [`DecryptedPayload`]s arrive in stanza order, and
+///   a failure for a later `<enc>` can precede a success for an earlier one.
+///   Within one stanza both kinds come from the same receive task, so they are
+///   totally ordered relative to each other — just not by position.
+///
+/// Gated by `Client::acquire_enc_decrypt_failed_forwarding()`: nothing is
+/// emitted, and nothing is built, while no consumer holds a lease.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct EncDecryptFailed {
+    /// Which message this `<enc>` belongs to.
+    pub info: Arc<MessageInfo>,
+    /// Which `<enc>` of the stanza this was, counting from zero in the order
+    /// the client enumerates them — the same numbering as
+    /// [`DecryptedPayload::enc_index`], produced by the same enumeration, so
+    /// the two events index one stanza and not two.
+    ///
+    /// That order is the stanza's direct `<enc>` children first, then the ones
+    /// under `<participants><to>` addressed to this device. It is *not* a child
+    /// index.
+    pub enc_index: usize,
+    /// The `type` attribute the `<enc>` carried: `msg`, `pkmsg`, `skmsg`, …
+    ///
+    /// `None` only when the node carried no `type` at all, which is also the
+    /// one thing [`MalformedNode`](EncDecryptFailureReason::MalformedNode) can
+    /// mean here that a present type does not. Borrowed for the types this
+    /// build knows, owned for a `type` it does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enc_type: Option<Cow<'static, str>>,
+    /// Where the client stopped.
+    pub reason: EncDecryptFailureReason,
 }
 
 /// Payload of [`Event::SentFrame`]: one marshaled stanza, exactly as it was

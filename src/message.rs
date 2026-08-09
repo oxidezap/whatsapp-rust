@@ -1,4 +1,5 @@
 use crate::client::Client;
+use crate::types::events::EncDecryptFailureReason;
 use crate::types::events::Event;
 use crate::types::message::MessageInfo;
 use log::{debug, warn};

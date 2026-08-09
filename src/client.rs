@@ -85,6 +85,30 @@ impl Drop for DecryptedPayloadLease {
     }
 }
 
+/// Lease that keeps per-`<enc>` decrypt-failure events enabled for one consumer.
+///
+/// Dropping the final lease disables forwarding. The lease holds only a weak
+/// client reference, so it cannot keep the client alive.
+#[must_use = "dropping the lease immediately releases enc-decrypt-failure forwarding"]
+pub struct EncDecryptFailedLease {
+    client: std::sync::Weak<Client>,
+}
+
+impl Drop for EncDecryptFailedLease {
+    fn drop(&mut self) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        let previous = client
+            .enc_decrypt_failed_forwarding
+            .fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(
+            previous > 0,
+            "enc-decrypt-failure forwarding lease underflow"
+        );
+    }
+}
+
 /// Lease that keeps raw decoded stanza events enabled for one consumer.
 ///
 /// Dropping the final lease disables forwarding. The lease holds only a weak
@@ -1565,6 +1589,12 @@ pub struct Client {
     /// Number of consumers currently requesting `Event::DecryptedPayload`
     /// forwarding.
     decrypted_payload_forwarding: AtomicUsize,
+
+    /// Number of consumers currently requesting `Event::EncDecryptFailed`
+    /// forwarding. Counted apart from `decrypted_payload_forwarding` so a
+    /// consumer that only watches failures does not turn on payload cloning,
+    /// and one that only watches successes pays nothing on the failure paths.
+    enc_decrypt_failed_forwarding: AtomicUsize,
 
     /// Gate and publisher for `Event::SentFrame`. Behind an `Arc` because the
     /// noise sender task reads it; see [`SentFrameTap`].

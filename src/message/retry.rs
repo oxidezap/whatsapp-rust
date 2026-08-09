@@ -52,6 +52,75 @@ impl Client {
         .await
     }
 
+    /// Report that one `<enc>` of a stanza produced no plaintext.
+    ///
+    /// Pure observation: it neither decides nor reflects what the receive path
+    /// does next (retry receipt, nack, ack, or nothing). Every branch that
+    /// abandons an `<enc>` calls this exactly once for it, so a consumer holding
+    /// the lease can pair each [`Event::DecryptedPayload`] with the failure of
+    /// every sibling that produced none.
+    ///
+    /// Deliberately *not* deduplicated: `UndecryptableMessage` is single-flight
+    /// per `(chat, id)` because a UI must not show two placeholders for one
+    /// message, and that is exactly what makes it silent on the second delivery
+    /// of a stanza that keeps failing. This one reports each delivery.
+    pub(crate) fn report_enc_decrypt_failure(
+        &self,
+        info: &Arc<MessageInfo>,
+        enc_index: usize,
+        enc_type: &'static str,
+        reason: EncDecryptFailureReason,
+    ) {
+        if !self.enc_decrypt_failed_forwarding_enabled() {
+            return;
+        }
+        self.dispatch_enc_decrypt_failure(
+            info,
+            enc_index,
+            Some(std::borrow::Cow::Borrowed(enc_type)),
+            reason,
+        );
+    }
+
+    /// Same, for a classification-time failure where the `type` attribute is
+    /// whatever the wire carried — a type this build does not implement, or
+    /// none at all. The copy is made past the gate, so an unheld lease still
+    /// costs one atomic load.
+    pub(crate) fn report_raw_enc_decrypt_failure(
+        &self,
+        info: &Arc<MessageInfo>,
+        enc_index: usize,
+        enc_type: Option<&str>,
+        reason: EncDecryptFailureReason,
+    ) {
+        if !self.enc_decrypt_failed_forwarding_enabled() {
+            return;
+        }
+        self.dispatch_enc_decrypt_failure(
+            info,
+            enc_index,
+            enc_type.map(|enc_type| std::borrow::Cow::Owned(enc_type.to_owned())),
+            reason,
+        );
+    }
+
+    fn dispatch_enc_decrypt_failure(
+        &self,
+        info: &Arc<MessageInfo>,
+        enc_index: usize,
+        enc_type: Option<std::borrow::Cow<'static, str>>,
+        reason: EncDecryptFailureReason,
+    ) {
+        self.core.event_bus.dispatch(Event::EncDecryptFailed(
+            crate::types::events::EncDecryptFailed::builder()
+                .info(Arc::clone(info))
+                .enc_index(enc_index)
+                .maybe_enc_type(enc_type)
+                .reason(reason)
+                .build(),
+        ));
+    }
+
     /// Dispatch an `UndecryptableMessage` event at most once per `(chat, id)`
     /// via the single-flight `get_with` semantic on `undecryptable_dispatched`.
     /// The atomic arm avoids the get-then-insert race where two concurrent
