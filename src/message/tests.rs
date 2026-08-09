@@ -14469,3 +14469,37 @@ fn a_migrated_session_reports_the_retry_failure_not_the_one_that_opened_it() {
         "and the error that opened the migration still maps to itself",
     );
 }
+
+/// A stored identity row whose key is the wrong length is our corruption, not
+/// the peer's. `from_djb_public_key_bytes` reports `BadKeyLength` either way, so
+/// like the pre-key row it has to be marked at the store boundary.
+#[tokio::test]
+async fn a_corrupt_stored_identity_is_not_blamed_on_the_peer() {
+    use wacore::libsignal::protocol::{IdentityKeyStore, SignalProtocolError};
+
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_corrupt_ident").await;
+    let peer: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+    let address = peer.to_protocol_address();
+
+    // Half a key: what a truncated write leaves behind.
+    client
+        .signal_cache
+        .put_identity(&address, &[0x11u8; 16])
+        .await;
+
+    let adapter = client.signal_adapter();
+    let err = adapter
+        .identity_store
+        .get_identity(&address)
+        .await
+        .expect_err("a 16-byte key cannot become an identity");
+
+    assert!(
+        matches!(err, SignalProtocolError::BackendError(context, _) if context == "stored record"),
+        "the boundary must mark it as ours, got {err:?}",
+    );
+    assert_eq!(
+        signal_error_reason(&err),
+        EncDecryptFailureReason::StorageFailure,
+    );
+}

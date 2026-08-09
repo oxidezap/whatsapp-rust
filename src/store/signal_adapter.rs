@@ -390,13 +390,19 @@ impl IdentityKeyStore for IdentityAdapter {
 
 /// Decode the cache's raw 32-byte DJB public key bytes; empty/absent = no
 /// identity (mirrors the previous inline match in `get_identity`).
+///
+/// Every caller feeds this bytes we stored, so a decode failure is a corrupt
+/// row of ours — `record_read_err` says so rather than letting `BadKeyLength`
+/// reach the receive path, where it is indistinguishable from a peer sending a
+/// bad key and would be reported against them.
 fn parse_cached_identity(
     data: Option<Arc<[u8]>>,
 ) -> Result<Option<IdentityKey>, SignalProtocolError> {
     match data {
         Some(data) if !data.is_empty() => {
             let public_key =
-                wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&data)?;
+                wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&data)
+                    .map_err(|e| record_read_err(e.into()))?;
             Ok(Some(IdentityKey::new(public_key)))
         }
         _ => Ok(None),
