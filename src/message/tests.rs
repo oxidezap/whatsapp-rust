@@ -7038,25 +7038,6 @@ fn find_message_ack(frames: &[bytes::Bytes]) -> Option<(String, Option<String>)>
     None
 }
 
-/// How many `<ack class="message">` frames the client sent for `id`.
-fn count_message_acks_for(frames: &[bytes::Bytes], id: &str) -> usize {
-    frames
-        .iter()
-        .enumerate()
-        .filter_map(|(i, frame)| decode_frame(i, frame))
-        .filter(|buf| {
-            wacore_binary::marshal::unmarshal_packed_ref(buf).is_ok_and(|node| {
-                node.tag.as_ref() == "ack"
-                    && node
-                        .get_attr("class")
-                        .is_some_and(|v| v.as_str() == "message")
-                    && node.get_attr("error").is_none()
-                    && node.get_attr("id").is_some_and(|v| v.as_str() == id)
-            })
-        })
-        .count()
-}
-
 /// First `<receipt>` on the wire for `id` as `(to, type, recipient)`.
 fn find_receipt(
     frames: &[bytes::Bytes],
@@ -13515,7 +13496,7 @@ async fn an_all_unusable_stanza_still_reports_each_enc() {
     crate::test_utils::wait_for_outbound_tasks(&client).await;
     let frames = transport.sent();
     assert_eq!(
-        count_message_acks_for(&frames, "ENCFAIL_ALL_UNKNOWN"),
+        message_acks_for(&frames, "ENCFAIL_ALL_UNKNOWN"),
         1,
         "exactly one transport ack",
     );
@@ -14262,4 +14243,131 @@ async fn a_rotated_out_signed_prekey_reports_unknown_prekey() {
         )],
     );
     crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// The healthy redelivery path must stay quiet. A stanza whose session `<enc>`
+/// this device already processed had its `skmsg` decrypted on that first
+/// delivery, so skipping it now is the redelivery working — not a failure. The
+/// sibling `<enc>` that genuinely failed is still reported, so the silence is
+/// scoped to the duplicate and does not swallow the batch.
+#[tokio::test]
+async fn a_skmsg_skipped_after_a_duplicate_reports_nothing() {
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_dup_skip").await;
+
+    let mut alice = AlicePeer::new("15550002004@s.whatsapp.net").await;
+    let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+    let bob_addr = bob_jid.to_protocol_address();
+    alice.install_bob_session(&bob_addr, &bundle).await;
+    let pkmsg = alice.encrypt_text(&bob_addr, "establish").await;
+    let (established, _, _, _) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
+    assert!(established, "the session must exist first");
+
+    // Force a plain SignalMessage, whose replay libsignal answers with
+    // `DuplicatedMessage` off the message-key cache.
+    if let Some(record) = alice.sessions.0.get_mut(&bob_addr)
+        && let Some(state) = record.session_state_mut()
+    {
+        state.clear_unacknowledged_pre_key_message();
+    }
+    let bytes = match alice.encrypt_text(&bob_addr, "first delivery").await {
+        CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
+        _ => panic!("expected a SignalMessage"),
+    };
+
+    let first = dm_info("ENCFAIL_DUP_FIRST", &alice.jid);
+    let outcome = client
+        .clone()
+        .process_session_enc_batch(
+            vec![enc_payload_at("msg", bytes.clone(), 0)],
+            &first,
+            &alice.jid,
+            DecryptFailMode::Show,
+        )
+        .await;
+    assert!(outcome.decrypted, "the first delivery must decrypt");
+
+    // Only now start watching, so the first delivery's events are not counted.
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    // The redelivery: the same ciphertext (a duplicate) alongside one that
+    // genuinely fails, which is what drives `should_process_skmsg_after_session`
+    // to skip the group payload.
+    let group: Jid = "120363000000000006@g.us".parse().unwrap();
+    let redelivered = Arc::new(MessageInfo {
+        id: "ENCFAIL_DUP_REDELIVERED".to_string(),
+        source: crate::types::message::MessageSource {
+            sender: alice.jid.clone(),
+            chat: group,
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info: redelivered,
+                sender_encryption_jid: alice.jid.clone(),
+                session_payloads: vec![
+                    enc_payload_at("msg", bytes, 0),
+                    enc_payload_at("msg", UNPARSEABLE_ENVELOPE.to_vec(), 1),
+                ],
+                group_payloads: vec![enc_payload_at("skmsg", vec![0u8; 71], 2)],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            1,
+            Some("msg".to_string()),
+            EncDecryptFailureReason::MalformedCiphertext
+        )],
+        "the duplicate reports nothing, the skmsg it suppressed reports nothing, \
+         and the enc that really failed still does",
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// The shared classifier for libsignal errors the decrypt arms do not name
+/// themselves. A store that could not answer is local, not cryptographic:
+/// reporting it as `SignalError` would blame the peer for our own disk, and
+/// both the session catch-all and the group arm read this one function so they
+/// cannot drift apart.
+#[test]
+fn a_backend_error_is_storage_not_a_signal_failure() {
+    use wacore::libsignal::protocol::SignalProtocolError;
+
+    #[derive(Debug)]
+    struct StoreDown;
+    impl std::fmt::Display for StoreDown {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("store down")
+        }
+    }
+    impl std::error::Error for StoreDown {}
+
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::BackendError(
+            "backend",
+            Box::new(StoreDown)
+        )),
+        EncDecryptFailureReason::StorageFailure,
+    );
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::CiphertextMessageTooShort(3)),
+        EncDecryptFailureReason::MalformedCiphertext,
+        "an envelope that would not parse stays malformed",
+    );
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::InvalidSenderKeySession),
+        EncDecryptFailureReason::SignalError,
+        "and anything this build does not classify stays in the named catch-all",
+    );
 }

@@ -1788,9 +1788,13 @@ pub enum EncDecryptFailureReason {
     /// The cryptographic layer failed for a reason this build does not classify
     /// further. A reason that shows up in volume here deserves a variant.
     SignalError,
-    /// Local Signal state could not be made durable, so the decrypt was
-    /// abandoned rather than advancing a ratchet that no crash could recover.
-    /// The stanza stays queued for redelivery.
+    /// Local Signal state was the problem, not the ciphertext: a store that
+    /// could not be read, or state that could not be made durable — in which
+    /// case the decrypt was abandoned rather than advancing a ratchet no crash
+    /// could recover. The stanza stays queued for redelivery.
+    ///
+    /// Says nothing about the peer. A per-peer health signal built on this
+    /// event should exclude it.
     StorageFailure,
     /// The `<enc>` decrypted, and the bytes could not be turned into a message:
     /// padding this build could not strip, or a payload it could not decode.
@@ -1848,7 +1852,10 @@ impl EncDecryptFailureReason {
 /// - **A duplicate is not a failure.** An `<enc>` the server redelivered that
 ///   this device already processed emits neither this nor [`DecryptedPayload`]:
 ///   its plaintext was reported the first time round, and calling that a
-///   failure would put two meanings in one event.
+///   failure would put two meanings in one event. That extends to what a
+///   duplicate suppresses: a stanza whose session `<enc>` was a duplicate had
+///   its `skmsg` decrypted on that first delivery too, so skipping it now
+///   reports nothing either.
 /// - **Order is `enc_index`, not arrival.** The client decrypts a stanza's
 ///   `<enc>` nodes in per-kind passes (session, then group, then bot), so
 ///   neither these events nor [`DecryptedPayload`]s arrive in stanza order, and

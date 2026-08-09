@@ -534,19 +534,23 @@ impl Client {
                     }
                 }
             } else {
-                // The skmsg is skipped whatever the reason (failure or
-                // duplicate), so the per-enc report belongs here rather than
-                // inside the warning branch below.
-                for payload in &group_payloads {
-                    self.report_enc_decrypt_failure(
-                        &info,
-                        payload.enc_index,
-                        payload.enc_type.as_wire_str(),
-                        EncDecryptFailureReason::NotAttempted,
-                    );
-                }
                 // Only show warning if session messages actually FAILED (not duplicates)
                 if !session_had_duplicates {
+                    // Reported inside this guard, not above it: a batch that saw
+                    // a duplicate is a stanza this device already processed, so
+                    // its skmsg produced its plaintext on the first delivery.
+                    // Skipping it now is the redelivery working, not a failure,
+                    // and naming it one would put ordinary redelivery traffic in
+                    // an event called `EncDecryptFailed`. Same reasoning as the
+                    // duplicate rule on the payload doc.
+                    for payload in &group_payloads {
+                        self.report_enc_decrypt_failure(
+                            &info,
+                            payload.enc_index,
+                            payload.enc_type.as_wire_str(),
+                            EncDecryptFailureReason::NotAttempted,
+                        );
+                    }
                     if info.is_expired_status() {
                         log::debug!(
                             "[msg:{}] Silently dropping expired status from {}",
@@ -1282,11 +1286,7 @@ impl Client {
                             info,
                             enc_index,
                             enc_type,
-                            if is_malformed_envelope_error(&e) {
-                                EncDecryptFailureReason::MalformedCiphertext
-                            } else {
-                                EncDecryptFailureReason::SignalError
-                            },
+                            signal_error_reason(&e),
                         );
                         outcome.undecryptable |= self
                             .dispatch_undecryptable_event(
@@ -1491,21 +1491,21 @@ impl Client {
                         .await;
                 }
                 Err(e) => {
-                    // `group_decrypt` parses the SenderKeyMessage before it
-                    // touches the chain, so an envelope it could not read never
-                    // reached a cipher. Past that, classify from the same
-                    // predicate the retry decision uses, so the reported cause
-                    // and the recovery the client chose cannot disagree.
+                    // Envelope and storage failures are named by the shared
+                    // classifier; only what it leaves unnamed is refined by the
+                    // same predicate the retry decision uses, so the reported
+                    // cause and the recovery the client chose cannot disagree.
                     self.report_enc_decrypt_failure(
                         info,
                         enc_index,
                         enc_type,
-                        if is_malformed_envelope_error(&e) {
-                            EncDecryptFailureReason::MalformedCiphertext
-                        } else if group_decrypt_retry_reason(&e).is_some() {
-                            EncDecryptFailureReason::InvalidMessage
-                        } else {
+                        match signal_error_reason(&e) {
                             EncDecryptFailureReason::SignalError
+                                if group_decrypt_retry_reason(&e).is_some() =>
+                            {
+                                EncDecryptFailureReason::InvalidMessage
+                            }
+                            reason => reason,
                         },
                     );
                     if info.is_expired_status() {

@@ -283,6 +283,23 @@ fn is_malformed_envelope_error(e: &SignalProtocolError) -> bool {
     )
 }
 
+/// Cause reported for a libsignal error the decrypt arms do not name themselves.
+///
+/// Shared by the session catch-all and the group arm so the same error cannot be
+/// classified two ways. `BackendError` is local storage failing to answer — the
+/// store adapter wraps every backend error in it — and not the ciphertext
+/// failing: reporting it as a cryptographic error would blame the peer for our
+/// own disk, and corrupt any per-peer health signal built on this event.
+fn signal_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
+    if is_malformed_envelope_error(e) {
+        EncDecryptFailureReason::MalformedCiphertext
+    } else if matches!(e, SignalProtocolError::BackendError(_, _)) {
+        EncDecryptFailureReason::StorageFailure
+    } else {
+        EncDecryptFailureReason::SignalError
+    }
+}
+
 /// WA Web treats every `SignalDecryptionError` as `SignalRetryable`, so a
 /// sender-key desync must request a resend rather than NACK (which stops the
 /// server retransmitting). `None` = keep the NACK (genuinely non-Signal error).
