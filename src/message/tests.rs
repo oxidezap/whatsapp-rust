@@ -13372,10 +13372,7 @@ fn dm_info(msg_id: &str, sender: &Jid) -> Arc<MessageInfo> {
 /// material is touched.
 const UNPARSEABLE_ENVELOPE: [u8; 3] = [0x33, 0x01, 0x02];
 
-async fn classified(
-    client: &Arc<Client>,
-    node: wacore_binary::Node,
-) -> Option<ClassifiedMessage> {
+async fn classified(client: &Arc<Client>, node: wacore_binary::Node) -> Option<ClassifiedMessage> {
     client.classify_incoming_message(&node_to_arc(node)).await
 }
 
