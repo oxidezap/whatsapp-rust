@@ -192,27 +192,72 @@ mod tests {
     }
 
     #[test]
-    fn test_simd_determinism_and_consistency() {
+    fn add_then_subtract_returns_to_zero_across_sizes() {
         let test_sizes = [2, 4, 8, 16, 18, 32, 64, 128, 256];
 
         for &size in &test_sizes {
-            let mut base_simd = vec![0u8; size];
-            let mut base_scalar = vec![0u8; size];
+            let mut base = vec![0u8; size];
             let input = vec![1u8; size];
 
-            perform_pointwise_with_overflow(&mut base_simd, &input, false);
-            perform_pointwise_with_overflow(&mut base_scalar, &input, false);
-            assert_eq!(base_simd, base_scalar, "Add failed for size {}", size);
+            perform_pointwise_with_overflow(&mut base, &input, false);
+            perform_pointwise_with_overflow(&mut base, &input, true);
+            assert_eq!(base, vec![0u8; size], "size {size}");
+        }
+    }
 
-            perform_pointwise_with_overflow(&mut base_simd, &input, true);
-            perform_pointwise_with_overflow(&mut base_scalar, &input, true);
-            assert_eq!(base_simd, base_scalar, "Subtract failed for size {}", size);
-            assert_eq!(
-                base_simd,
-                vec![0u8; size],
-                "Subtract result incorrect for size {}",
-                size
-            );
+    /// Straight-line reference: no chunking, no dispatch, no feature gate. The
+    /// point is to be obviously correct rather than fast, so that the test
+    /// below is an independent check on the SIMD path rather than a
+    /// comparison of that path against itself.
+    fn reference_pointwise(base: &mut [u8], input: &[u8], subtract: bool) {
+        for (b, i) in base.chunks_exact_mut(2).zip(input.chunks_exact(2)) {
+            let x = u16::from_le_bytes([b[0], b[1]]);
+            let y = u16::from_le_bytes([i[0], i[1]]);
+            let r = if subtract {
+                x.wrapping_sub(y)
+            } else {
+                x.wrapping_add(y)
+            };
+            b.copy_from_slice(&r.to_le_bytes());
+        }
+    }
+
+    /// The SIMD path splits into 16-byte chunks and leaves a scalar tail, so
+    /// the sizes below straddle that boundary: under one chunk, exactly one,
+    /// chunk-plus-tail, and several chunks. Inputs are seeded to cover the
+    /// wrap boundaries in both directions, which is where a lane-width or
+    /// endianness mistake would show up rather than in round-number data.
+    #[test]
+    fn simd_path_matches_independent_scalar_reference() {
+        let sizes = [0usize, 2, 14, 16, 18, 32, 34, 128, 130, 256];
+        // Deterministic LCG: reproducible failures, no dev-dependency.
+        let mut seed = 0x2545_F491u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+
+        for size in sizes {
+            for subtract in [false, true] {
+                for edge in [0u8, 0xFF, 0x01] {
+                    let base: Vec<u8> = (0..size)
+                        .map(|i| if i % 3 == 0 { edge } else { next() })
+                        .collect();
+                    let input: Vec<u8> = (0..size)
+                        .map(|i| if i % 5 == 0 { edge } else { next() })
+                        .collect();
+
+                    let mut actual = base.clone();
+                    let mut expected = base.clone();
+                    perform_pointwise_with_overflow(&mut actual, &input, subtract);
+                    reference_pointwise(&mut expected, &input, subtract);
+
+                    assert_eq!(
+                        actual, expected,
+                        "size {size}, subtract {subtract}, edge {edge:#04x}"
+                    );
+                }
+            }
         }
     }
 
