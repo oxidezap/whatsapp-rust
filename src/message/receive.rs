@@ -992,7 +992,7 @@ impl Client {
                                         MigrationDecryptResult::Duplicate => {
                                             outcome.duplicate = true;
                                         }
-                                        MigrationDecryptResult::NotDecrypted => {
+                                        MigrationDecryptResult::NotDecrypted(terminal) => {
                                             log::debug!(
                                                 "[msg:{}] InvalidPreKeyId after identity change for {}. \
                                                  Sending retry receipt with fresh keys.",
@@ -1004,7 +1004,9 @@ impl Client {
                                                 info,
                                                 enc_index,
                                                 enc_type,
-                                                EncDecryptFailureReason::UnknownPreKey,
+                                                terminal.unwrap_or(
+                                                    EncDecryptFailureReason::UnknownPreKey,
+                                                ),
                                             );
                                             outcome.undecryptable |= self
                                                 .handle_decrypt_failure(
@@ -1086,7 +1088,10 @@ impl Client {
                     }
                     // Try PN→LID session migration before sending retry receipt
                     if let SignalProtocolError::SessionNotFound(_) = e {
-                        match self
+                        // `Some` only when a migration ran and its retry decrypt
+                        // failed: then that failure is the terminal one, not the
+                        // error that opened the migration.
+                        let terminal = match self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1111,8 +1116,8 @@ impl Client {
                                 outcome.duplicate = true;
                                 continue;
                             }
-                            MigrationDecryptResult::NotDecrypted => {}
-                        }
+                            MigrationDecryptResult::NotDecrypted(reason) => reason,
+                        };
 
                         debug!(
                             "[msg:{}] No session found for {} message from {}. Sending retry receipt to request session establishment.",
@@ -1125,7 +1130,7 @@ impl Client {
                             info,
                             enc_index,
                             enc_type,
-                            EncDecryptFailureReason::NoSession,
+                            terminal.unwrap_or(EncDecryptFailureReason::NoSession),
                         );
                         outcome.undecryptable |= self
                             .handle_decrypt_failure(info, RetryReason::NoSession, decrypt_fail_mode)
@@ -1137,7 +1142,10 @@ impl Client {
                     ) {
                         // whatsmeow migrates PN sessions before decrypt; a fresh
                         // LID record can otherwise shadow the sender's PN ratchet.
-                        match self
+                        // `Some` only when a migration ran and its retry decrypt
+                        // failed: then that failure is the terminal one, not the
+                        // error that opened the migration.
+                        let terminal = match self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1162,8 +1170,8 @@ impl Client {
                                 outcome.duplicate = true;
                                 continue;
                             }
-                            MigrationDecryptResult::NotDecrypted => {}
-                        }
+                            MigrationDecryptResult::NotDecrypted(reason) => reason,
+                        };
 
                         // WAWebMsgProcessingDecryptionHandler classifies both as
                         // SignalRetryable -> sendRetryReceipt only, with no delete.
@@ -1191,7 +1199,12 @@ impl Client {
                         );
 
                         outcome.had_failure = true;
-                        self.report_enc_decrypt_failure(info, enc_index, enc_type, failure);
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            terminal.unwrap_or(failure),
+                        );
                         outcome.undecryptable |= self
                             .handle_decrypt_failure(info, reason, decrypt_fail_mode)
                             .await;
@@ -1201,7 +1214,10 @@ impl Client {
                         // session exists under a PN address (legacy migration).
                         // Migrating lets Signal use the existing ratchet state
                         // instead of looking up the consumed one-time prekey.
-                        match self
+                        // `Some` only when a migration ran and its retry decrypt
+                        // failed: then that failure is the terminal one, not the
+                        // error that opened the migration.
+                        let terminal = match self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1226,8 +1242,8 @@ impl Client {
                                 outcome.duplicate = true;
                                 continue;
                             }
-                            MigrationDecryptResult::NotDecrypted => {}
-                        }
+                            MigrationDecryptResult::NotDecrypted(reason) => reason,
+                        };
 
                         log::debug!(
                             "[msg:{}] Decryption failed for {} message from {} due to InvalidPreKeyId. \
@@ -1244,7 +1260,7 @@ impl Client {
                             info,
                             enc_index,
                             enc_type,
-                            EncDecryptFailureReason::UnknownPreKey,
+                            terminal.unwrap_or(EncDecryptFailureReason::UnknownPreKey),
                         );
                         outcome.undecryptable |= self
                             .handle_decrypt_failure(
@@ -1836,11 +1852,11 @@ impl Client {
         deferred: &mut Vec<DeferredPlaintext>,
     ) -> MigrationDecryptResult {
         if !parsed_message.is_available() || !sender_jid.is_lid() {
-            return MigrationDecryptResult::NotDecrypted;
+            return MigrationDecryptResult::NotDecrypted(None);
         }
 
         let Some(pn) = self.lid_pn_cache.get_phone_number(&sender_jid.user).await else {
-            return MigrationDecryptResult::NotDecrypted;
+            return MigrationDecryptResult::NotDecrypted(None);
         };
 
         // Release the address lock so the migration loop can acquire it for
@@ -1864,7 +1880,7 @@ impl Client {
                 info.id,
                 info.source.sender.observe()
             );
-            return MigrationDecryptResult::NotDecrypted;
+            return MigrationDecryptResult::NotDecrypted(None);
         }
 
         match decrypt_session_message(parsed_message, signal_address, adapter, rng).await {
@@ -1905,7 +1921,9 @@ impl Client {
                     "[msg:{}] Decryption still failed after PN→LID migration: {retry_err:?}",
                     info.id
                 );
-                MigrationDecryptResult::NotDecrypted
+                // A session was found and moved; whatever failed now is the
+                // terminal cause, not the error that opened the migration.
+                MigrationDecryptResult::NotDecrypted(Some(session_error_reason(&retry_err)))
             }
         }
     }

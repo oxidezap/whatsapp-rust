@@ -155,8 +155,16 @@ enum MigrationDecryptResult {
     Decrypted,
     /// Server redelivered an already-processed message.
     Duplicate,
-    /// Migration didn't apply or still failed; caller sends a retry receipt.
-    NotDecrypted,
+    /// Migration didn't apply, or applied and the retry still failed; the
+    /// caller sends a retry receipt either way.
+    ///
+    /// `Some` carries the terminal cause when a migration actually ran and its
+    /// retry decrypt failed. Without it the caller would report the error that
+    /// sent it here — typically `NoSession` — for a message whose session was
+    /// in fact found and whose retry then failed a MAC or a store read.
+    /// `None` means nothing was migrated, so the caller's own error still is
+    /// the terminal one.
+    NotDecrypted(Option<EncDecryptFailureReason>),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -302,6 +310,25 @@ fn signal_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
         EncDecryptFailureReason::InvalidMessage
     } else {
         EncDecryptFailureReason::SignalError
+    }
+}
+
+/// Cause for a terminal error on the 1:1 session path, matching what the arms
+/// of `process_session_enc_batch` report for the same libsignal errors.
+///
+/// Used where an error reaches a reporting site that has no arm of its own —
+/// the PN→LID migration's retry decrypt — so a migrated session that then fails
+/// a MAC is not reported under the error that opened the migration.
+fn session_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
+    match e {
+        SignalProtocolError::SessionNotFound(_) => EncDecryptFailureReason::NoSession,
+        SignalProtocolError::BadMac(_) => EncDecryptFailureReason::BadMac,
+        SignalProtocolError::InvalidMessage(_, _) => EncDecryptFailureReason::InvalidMessage,
+        SignalProtocolError::InvalidPreKeyId | SignalProtocolError::InvalidSignedPreKeyId => {
+            EncDecryptFailureReason::UnknownPreKey
+        }
+        SignalProtocolError::UntrustedIdentity(_) => EncDecryptFailureReason::UntrustedIdentity,
+        other => signal_error_reason(other),
     }
 }
 

@@ -14436,3 +14436,36 @@ fn a_version_mismatch_is_an_invalid_message_on_both_paths() {
         "the group arm still recognizes it, so both now say the same thing",
     );
 }
+
+/// A PN→LID migration that finds a session and then fails the retry must report
+/// what the retry failed on, not the error that opened the migration. Reporting
+/// `NoSession` for a session that was found and then failed its MAC is the kind
+/// of miscount this event exists to avoid.
+#[test]
+fn a_migrated_session_reports_the_retry_failure_not_the_one_that_opened_it() {
+    use wacore::libsignal::protocol::{CiphertextMessageType, SignalProtocolError};
+
+    assert_eq!(
+        session_error_reason(&SignalProtocolError::BadMac(CiphertextMessageType::Whisper)),
+        EncDecryptFailureReason::BadMac,
+    );
+    assert_eq!(
+        session_error_reason(&SignalProtocolError::InvalidMessage(
+            CiphertextMessageType::Whisper,
+            "bad"
+        )),
+        EncDecryptFailureReason::InvalidMessage,
+    );
+    assert_eq!(
+        session_error_reason(&SignalProtocolError::InvalidSignedPreKeyId),
+        EncDecryptFailureReason::UnknownPreKey,
+    );
+    let address: Jid = "12025550101@s.whatsapp.net".parse().unwrap();
+    assert_eq!(
+        session_error_reason(&SignalProtocolError::SessionNotFound(
+            address.to_protocol_address()
+        )),
+        EncDecryptFailureReason::NoSession,
+        "and the error that opened the migration still maps to itself",
+    );
+}
