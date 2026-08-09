@@ -446,6 +446,25 @@ impl Client {
                 "Connection torn down while awaiting the processing permit; leaving message {} for redelivery",
                 info.id
             );
+            // Every `<enc>` still queued here is abandoned without being tried.
+            // Reported before the bail, because classification already reported
+            // any node it set aside: staying silent would leave a stanza whose
+            // malformed `<enc>` was reported and whose decryptable siblings
+            // were not, which is the one shape this event promises not to
+            // produce. The stanza is unacked and will come back, and the event
+            // repeats with it.
+            for payload in session_payloads
+                .iter()
+                .chain(&group_payloads)
+                .chain(&bot_payloads)
+            {
+                self.report_enc_decrypt_failure(
+                    &info,
+                    payload.enc_index,
+                    payload.enc_type.as_wire_str(),
+                    EncDecryptFailureReason::NotAttempted,
+                );
+            }
             return;
         }
 

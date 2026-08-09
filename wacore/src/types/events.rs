@@ -1832,10 +1832,14 @@ pub enum EncDecryptFailureReason {
     /// The one reason that can accompany a [`DecryptedPayload`] for the same
     /// `<enc>` — when the bytes existed but were unusable, both are emitted.
     PlaintextUnusable,
-    /// Never attempted. The client recognized the node and deliberately skipped
-    /// it: an `skmsg` whose stanza's session `<enc>` failed first (the sender
-    /// key it needed came in that one), or a session `<enc>` on a stanza
-    /// addressed from a group, which has no 1:1 session to use.
+    /// Never attempted. The client recognized the node and did not try it: an
+    /// `skmsg` whose stanza's session `<enc>` failed first (the sender key it
+    /// needed came in that one), a session `<enc>` on a stanza addressed from a
+    /// group, which has no 1:1 session to use, or a stanza abandoned when the
+    /// connection was torn down before its turn to decrypt came.
+    ///
+    /// Says nothing about the ciphertext, which was never read. The last case
+    /// is not even about this stanza — it is about when it arrived.
     NotAttempted,
 }
 

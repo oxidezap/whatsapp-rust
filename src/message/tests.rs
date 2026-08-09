@@ -14246,6 +14246,64 @@ async fn a_rotated_out_signed_prekey_reports_unknown_prekey() {
     crate::test_utils::wait_for_outbound_tasks(&client).await;
 }
 
+/// A stanza abandoned by a teardown reports every `<enc>` it never tried.
+///
+/// The bail happens after classification, so its failures are already out. If
+/// the queued payloads stayed silent, a mixed stanza would report the malformed
+/// index and nothing for the decryptable siblings — the one shape the event
+/// promises not to produce. The stanza is unacked and comes back; the event
+/// repeats with it.
+#[tokio::test]
+async fn a_stanza_abandoned_by_a_teardown_reports_what_it_never_tried() {
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_teardown").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let sender: Jid = "15550002005@s.whatsapp.net".parse().unwrap();
+    let info = dm_info("ENCFAIL_TEARDOWN", &sender);
+
+    // The generation this stanza was classified under, before teardown bumps it.
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads: vec![enc_payload_at("msg", vec![1u8; 40], 1)],
+                group_payloads: vec![enc_payload_at("skmsg", vec![2u8; 40], 2)],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            stale_generation,
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![
+            (
+                1,
+                Some("msg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+            (
+                2,
+                Some("skmsg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+        ],
+        "every queued index is reported as never tried, none is decrypted",
+    );
+    assert!(
+        recorder.decrypted().is_empty(),
+        "the teardown bailed before any decrypt could run",
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
 /// A duplicate alongside a genuine failure does not buy the `skmsg` its silence.
 ///
 /// `should_process_skmsg_after_session` already lets a batch through when its
