@@ -1,5 +1,5 @@
 #[cfg(feature = "simd")]
-use core::simd::u16x8;
+use fearless_simd::{Level, Simd, SimdBase, dispatch, u16x8};
 use hkdf::Hkdf;
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
@@ -11,6 +11,12 @@ use std::sync::LazyLock;
 /// clones the keyed state.
 static EXTRACT_HMAC: LazyLock<Hmac<Sha256>> =
     LazyLock::new(|| Hmac::<Sha256>::new_from_slice(&[0u8; 32]).expect("32-byte HMAC key"));
+
+/// Probing CPU features is comparatively expensive and the answer cannot
+/// change while the process runs, so the level is resolved once here:
+/// `multiple_op` dispatches once per operand, and a patch carries hundreds.
+#[cfg(feature = "simd")]
+static SIMD_LEVEL: LazyLock<Level> = LazyLock::new(Level::new);
 
 #[derive(Clone, Debug)]
 pub struct LTHash {
@@ -77,30 +83,7 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
         let (base_chunks, base_rem) = base_remaining.as_chunks_mut::<16>();
         let (input_chunks, input_rem) = input_remaining.as_chunks::<16>();
 
-        for (base_chunk, input_chunk) in base_chunks.iter_mut().zip(input_chunks) {
-            // `from_le_bytes` per lane states the wire endianness directly, so
-            // the same code is correct on either host; on little-endian it
-            // lowers to the plain 16-byte load a transmute would have emitted.
-            let base_arr: [u16; 8] = core::array::from_fn(|i| {
-                u16::from_le_bytes([base_chunk[2 * i], base_chunk[2 * i + 1]])
-            });
-            let input_arr: [u16; 8] = core::array::from_fn(|i| {
-                u16::from_le_bytes([input_chunk[2 * i], input_chunk[2 * i + 1]])
-            });
-            let base_simd = u16x8::from_array(base_arr);
-            let input_simd = u16x8::from_array(input_arr);
-
-            let result_simd = if subtract {
-                base_simd - input_simd
-            } else {
-                base_simd + input_simd
-            };
-
-            let out = result_simd.to_array();
-            for (base_pair, lane) in base_chunk.as_chunks_mut::<2>().0.iter_mut().zip(out) {
-                *base_pair = lane.to_le_bytes();
-            }
-        }
+        dispatch!(*SIMD_LEVEL, simd => pointwise_chunks(simd, base_chunks, input_chunks, subtract));
 
         base_remaining = base_rem;
         input_remaining = input_rem;
@@ -121,6 +104,45 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
         let bytes = result.to_le_bytes();
         base_pair[0] = bytes[0];
         base_pair[1] = bytes[1];
+    }
+}
+
+/// The lane math, generic over the SIMD level `dispatch!` picked at runtime.
+/// `#[inline(always)]` is load-bearing rather than a hint: it is what makes
+/// each instantiation inherit its level's `target_feature` set, so the AVX2
+/// copy lowers to AVX2 instead of to the baseline the caller was compiled for.
+#[cfg(feature = "simd")]
+#[inline(always)]
+fn pointwise_chunks<S: Simd>(
+    simd: S,
+    base_chunks: &mut [[u8; 16]],
+    input_chunks: &[[u8; 16]],
+    subtract: bool,
+) {
+    for (base_chunk, input_chunk) in base_chunks.iter_mut().zip(input_chunks) {
+        // `from_le_bytes` per lane states the wire endianness directly, so
+        // the same code is correct on either host; on little-endian it
+        // lowers to the plain 16-byte load a transmute would have emitted.
+        let base_arr: [u16; 8] = core::array::from_fn(|i| {
+            u16::from_le_bytes([base_chunk[2 * i], base_chunk[2 * i + 1]])
+        });
+        let input_arr: [u16; 8] = core::array::from_fn(|i| {
+            u16::from_le_bytes([input_chunk[2 * i], input_chunk[2 * i + 1]])
+        });
+        let base_simd = u16x8::from_slice(simd, &base_arr);
+        let input_simd = u16x8::from_slice(simd, &input_arr);
+
+        let result_simd = if subtract {
+            base_simd - input_simd
+        } else {
+            base_simd + input_simd
+        };
+
+        let mut out = [0u16; 8];
+        result_simd.store_slice(&mut out);
+        for (base_pair, lane) in base_chunk.as_chunks_mut::<2>().0.iter_mut().zip(out) {
+            *base_pair = lane.to_le_bytes();
+        }
     }
 }
 

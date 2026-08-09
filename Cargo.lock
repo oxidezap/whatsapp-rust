@@ -1357,6 +1357,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "fearless_simd"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0f5f895dac0865bc235f1364793899569a7db538137f1024dccea56bf41c78d"
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3889,6 +3895,7 @@ dependencies = [
  "anyhow",
  "buffa",
  "codspeed-divan-compat",
+ "fearless_simd",
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",

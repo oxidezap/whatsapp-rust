@@ -13,11 +13,17 @@ crate-type = ["rlib"]
 
 [features]
 default = ["simd"]
-simd = ["wacore-binary/simd"]
+# LTHash lane math via fearless_simd: runtime level detection on stable, so
+# this feature no longer drags the crate onto nightly. It deliberately does
+# NOT chain to `wacore-binary/simd` — that one is still `portable_simd` and
+# nightly-only; `wacore/simd` enables both so the top-level surface is
+# unchanged.
+simd = ["dep:fearless_simd"]
 
 [dependencies]
 anyhow = { workspace = true }
 buffa = { workspace = true }
+fearless_simd = { workspace = true, optional = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
