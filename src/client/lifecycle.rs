@@ -1492,11 +1492,33 @@ impl Client {
         {
             self.flush_offline_receipts();
         }
-        self.outbound_flush.close();
-        self.outbound_flush
-            .flush(&*self.runtime, Duration::from_secs(2))
-            .await;
-        self.notify_connection_shutdown();
+        // Everything from here touches connection-scoped shared state, and a
+        // `resume()` across the await above can have a replacement installed
+        // that has already reopened the outbound scope and reset the
+        // per-connection notifier for itself. Fencing unconditionally would
+        // silence the connection the resume asked for — its receipts, retries
+        // and transport acks rejected for the life of the connection, its
+        // subscribers told to stand down. Asked under the publish section, so a
+        // replacement cannot appear between the question and the act it gates.
+        let fenced = {
+            let _publish = self.connection_publish.lock().await;
+            let ours = self.still_owns_connection(torn_down.as_ref()).await;
+            if ours {
+                self.outbound_flush.close();
+            }
+            ours
+        };
+        if fenced {
+            self.outbound_flush
+                .flush(&*self.runtime, Duration::from_secs(2))
+                .await;
+            // Re-asked: the drain is another await, and the notifier is the one
+            // piece of this that a replacement would feel immediately.
+            let _publish = self.connection_publish.lock().await;
+            if self.still_owns_connection(torn_down.as_ref()).await {
+                self.notify_connection_shutdown();
+            }
+        }
 
         if let Some(transport) = &torn_down {
             transport.disconnect().await;
@@ -1516,12 +1538,28 @@ impl Client {
         // paused" instead got that wrong in both directions — it skipped the
         // cleanup after an overlapping resume, leaving a direct caller flagged
         // connected for good, and it would have run it for a replacement.
-        let still_ours = match (&torn_down, &*self.transport.lock().await) {
+        if had_connection
+            && !self.is_running.load(Ordering::Relaxed)
+            && self.still_owns_connection(torn_down.as_ref()).await
+        {
+            self.cleanup_connection_state().await;
+        }
+    }
+
+    /// Whether the connection a teardown captured is still the published one.
+    ///
+    /// The question every step of [`pause`](Self::pause) after its first await
+    /// has to ask before touching anything connection-scoped. A `resume()` can
+    /// have a replacement installed by then, and that replacement has already
+    /// claimed the shared state — the outbound scope, the per-connection
+    /// notifier, the connected flag — for itself.
+    async fn still_owns_connection(
+        &self,
+        torn_down: Option<&Arc<dyn crate::transport::Transport>>,
+    ) -> bool {
+        match (torn_down, &*self.transport.lock().await) {
             (Some(mine), Some(published)) => Arc::ptr_eq(mine, published),
             _ => false,
-        };
-        if had_connection && !self.is_running.load(Ordering::Relaxed) && still_ours {
-            self.cleanup_connection_state().await;
         }
     }
 
@@ -2816,6 +2854,57 @@ mod tests {
         assert!(
             !matches!(after, Ok(Err(ConnectError::AlreadyConnected))),
             "so the resumed session can connect, got {after:?}"
+        );
+    }
+
+    /// A teardown must stop fencing the moment it stops owning the connection.
+    /// `outbound_flush` and the per-connection shutdown notifier are shared and
+    /// unversioned, and a replacement installed by a resume has already reopened
+    /// and reset them for itself — so an old pause finishing its drain and then
+    /// firing them would reject that connection's receipts, retries and
+    /// transport acks for its whole life and stand its subscribers down.
+    #[tokio::test]
+    async fn a_teardown_that_lost_the_connection_stops_fencing_it() {
+        let client = crate::test_utils::create_test_client().await;
+        let (torn_down, _entered, release, _closes) = parked_transport();
+        drop(release);
+        *client.transport.lock().await = Some(torn_down);
+
+        let in_flight = client
+            .outbound_flush
+            .try_track()
+            .expect("the flush scope must be open on a fresh client");
+        let pausing = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.pause().await }
+        });
+        crate::test_utils::poll_until("the pause to reach its outbound flush", || {
+            client.outbound_flush.flush_waiters() >= 1
+        })
+        .await;
+
+        // Exactly what a resume plus a fresh connection do on their way up.
+        client.resume();
+        let (replacement, _r_entered, r_release, _r_closes) = parked_transport();
+        drop(r_release);
+        *client.transport.lock().await = Some(replacement);
+        client.outbound_flush.reopen();
+        client.reset_connection_shutdown();
+        let replacement_shutdown = client.connection_shutdown_signal();
+
+        drop(in_flight);
+        tokio::time::timeout(Duration::from_secs(10), pausing)
+            .await
+            .expect("the pause must finish once its flush drains")
+            .expect("the pause task must not panic");
+
+        assert!(
+            !replacement_shutdown.is_fired(),
+            "the old teardown must not shut down the connection the resume asked for"
+        );
+        assert!(
+            client.outbound_flush.try_track().is_some(),
+            "and must leave its outbound scope open, or it sends nothing for its whole life"
         );
     }
 
