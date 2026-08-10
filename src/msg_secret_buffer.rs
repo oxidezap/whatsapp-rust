@@ -431,7 +431,10 @@ impl MsgSecretWriteBuffer {
         }
     }
 
-    #[cfg(test)]
+    /// Captures buffered but not yet persisted. Bounded by the pending limit
+    /// (`MAX_PENDING_MSG_SECRETS` in production): a producer that would exceed
+    /// it parks on `capacity_available` rather than the buffer growing, so this
+    /// count is a saturation gauge as much as a memory figure.
     pub(crate) fn pending_len(&self) -> usize {
         self.pending.lock().unwrap_or_else(|p| p.into_inner()).len()
     }

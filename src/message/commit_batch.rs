@@ -137,6 +137,32 @@ impl InboundCommitBatcher {
         !self.lock().entries.is_empty()
     }
 
+    /// Accumulated entries and the encoded bytes they account for, for
+    /// `memory_report()`.
+    ///
+    /// This is the largest thing one client retains: a drain batch holds
+    /// `MAX_BATCH_BYTES` of decoded protos, two orders of magnitude above every
+    /// other collection in the report. The byte figure is the same
+    /// `message_encoded_len` sum the flush threshold is compared against, so it
+    /// is a proxy for the decoded footprint, not a measurement of it — the
+    /// decoded `wa::Message` graph is larger than its wire form.
+    ///
+    /// Two exclusions, both deliberate:
+    ///
+    /// - **A batch inside its commit.** [`Self::take`] empties this state
+    ///   before `commit_inbound_batch` awaits the backend, the Signal flush and
+    ///   the durability hook, all of which still hold the messages. Counting
+    ///   them would mean re-encoding the batch to price it on the commit path —
+    ///   real work on the receive path to sharpen a report — so this reads
+    ///   "waiting to be committed", not "resident". `has_entries` draws the
+    ///   same line, for the same reason.
+    /// - **The reusable encode arena**, whose lock a drain commit holds across
+    ///   its backend write; a report must not queue behind one.
+    pub(crate) fn pending_stats(&self) -> (usize, usize) {
+        let state = self.lock();
+        (state.entries.len(), state.bytes)
+    }
+
     /// Switch to immediate (live) commits. Only the end-of-drain flush (or a
     /// later flush completing a deferred transition) calls this, while
     /// holding the processing permit.
@@ -956,6 +982,45 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    // The accumulating batch is the largest allocation one client holds (4 MiB
+    // of decoded protos at the flush threshold, two orders of magnitude above
+    // every cache in the report), so it has to be visible while it accumulates
+    // rather than only in aggregate afterwards. The flush assertion pins the
+    // other half of `pending_stats`'s contract: it counts what is waiting to be
+    // committed, so handing the batch to a commit clears it.
+    #[tokio::test]
+    async fn memory_report_names_the_uncommitted_drain_batch() {
+        let client = create_test_client_with_failing_http("batch_report").await;
+        client.inbound_commit_batch.reset();
+
+        let empty = client.memory_report().await;
+        assert_eq!(empty.inbound_commit_batch.entries, 0);
+        assert_eq!(empty.inbound_commit_batch.bytes, 0);
+
+        for id in ["R1", "R2"] {
+            client.commit_or_batch_inbound(item(id), false).await;
+        }
+
+        let held = client.memory_report().await;
+        assert_eq!(held.inbound_commit_batch.entries, 2);
+        assert!(
+            held.inbound_commit_batch.bytes > 0,
+            "accumulated entries must carry their encoded-byte estimate"
+        );
+        assert!(
+            held.total_estimated_bytes() >= held.inbound_commit_batch.bytes,
+            "the batch must reach the report's byte total, not only its own field"
+        );
+
+        client
+            .flush_inbound_commits_under_permit(false, None, None)
+            .await;
+
+        let flushed = client.memory_report().await;
+        assert_eq!(flushed.inbound_commit_batch.entries, 0);
+        assert_eq!(flushed.inbound_commit_batch.bytes, 0);
     }
 
     // Live traffic commits immediately as a batch of one.

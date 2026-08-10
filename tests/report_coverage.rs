@@ -6,7 +6,20 @@
 //! alone, since they cost `size_of` and cannot drift. Collections can, so every
 //! field whose type names one is either walked by the report or listed below
 //! with the reason it is not.
+//!
+//! A field's own type expression is not the whole answer: a collection wrapped
+//! in a newtype (`pending_device_sync: PendingDeviceSync`) names nothing
+//! growable and used to pass unseen, which is how the biggest per-client
+//! retention in the library — the inbound commit batch, which accumulates to
+//! 4 MiB of decoded protos — stayed out of the report. So the scan also resolves
+//! each field's crate-local types one level, aliases expanded, and looks at
+//! *their* fields.
+//!
+//! One level, not transitively: `self_weak: Weak<Client>` makes the graph
+//! reach every collection from every field, and a guard that flags everything
+//! flags nothing.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Type constructors that can retain an unbounded number of entries. A field
@@ -32,6 +45,36 @@ const EXEMPT: &[(&str, &str)] = &[
     (
         "message_retry_counts",
         "counter-only map bounded by the retry ceiling; entries are two integers",
+    ),
+    (
+        "self_weak",
+        "a `Weak<Client>` back to this same client, so its collections are the \
+         ones every other field already accounts for",
+    ),
+    (
+        "plugin_host",
+        "walked by the feature-gated plugin section of the report (installed \
+         plugins, tasks, subscriptions, endpoint queues), not by the common list",
+    ),
+    (
+        "lifecycle",
+        "callbacks and connection scopes registered once at build by the \
+         extension host; fixed for the client's lifetime, not workload-driven",
+    ),
+    (
+        "stanza_router",
+        "one handler per protocol tag, populated by `create_stanza_router` at \
+         construction and never written again",
+    ),
+    (
+        "device_topology",
+        "the changed-users log is a fixed-length ring (TOPOLOGY_LOG_CAPACITY); \
+         overflow degrades memos to a recompute rather than retaining more",
+    ),
+    (
+        "media_conn",
+        "the host list from the most recent `<media_conn>` IQ — one server \
+         response, replaced wholesale on refresh",
     ),
 ];
 
@@ -64,8 +107,140 @@ fn type_idents(ty: &syn::Type, out: &mut Vec<String>) {
         syn::Type::Paren(p) => type_idents(&p.elem, out),
         syn::Type::Group(g) => type_idents(&g.elem, out),
         syn::Type::Tuple(t) => t.elems.iter().for_each(|e| type_idents(e, out)),
+        syn::Type::Array(a) => type_idents(&a.elem, out),
         _ => {}
     }
+}
+
+/// Every `.rs` file under `src/`, so a type can be looked up wherever it is
+/// defined rather than only where it is used.
+fn crate_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
+    for entry in entries {
+        let path = entry.expect("a directory entry").path();
+        if path.is_dir() {
+            crate_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Type name -> the idents appearing in that type's own field types.
+///
+/// Structs and enums both, since either can hold a collection. Names are not
+/// qualified by module: two same-named types would merge their fields, which
+/// can only over-report (a candidate that then has to be reported or exempted),
+/// never hide one.
+fn crate_type_fields() -> (HashMap<String, Vec<String>>, HashMap<String, Vec<String>>) {
+    fn collect(
+        items: &[syn::Item],
+        defs: &mut HashMap<String, Vec<String>>,
+        aliases: &mut HashMap<String, Vec<String>>,
+    ) {
+        for item in items {
+            let (name, field_types) = match item {
+                syn::Item::Struct(item) => (
+                    item.ident.to_string(),
+                    item.fields.iter().map(|f| f.ty.clone()).collect::<Vec<_>>(),
+                ),
+                syn::Item::Enum(item) => (
+                    item.ident.to_string(),
+                    item.variants
+                        .iter()
+                        .flat_map(|v| v.fields.iter().map(|f| f.ty.clone()))
+                        .collect(),
+                ),
+                syn::Item::Type(item) => {
+                    // An alias is a spelling, not a type: `type Pending =
+                    // HashMap<..>` must not let a field hide a map behind one.
+                    let entry = aliases.entry(item.ident.to_string()).or_default();
+                    type_idents(&item.ty, entry);
+                    continue;
+                }
+                syn::Item::Mod(item) => {
+                    if let Some((_, inner)) = &item.content {
+                        collect(inner, defs, aliases);
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            let entry = defs.entry(name).or_default();
+            for ty in &field_types {
+                type_idents(ty, entry);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    crate_sources(&manifest_path("src"), &mut files);
+    let mut defs = HashMap::new();
+    let mut aliases = HashMap::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
+        let parsed = syn::parse_file(&text).unwrap_or_else(|e| panic!("parse {file:?}: {e}"));
+        collect(&parsed.items, &mut defs, &mut aliases);
+    }
+
+    // Substitute aliases so the lookup below stays one level deep. Aliases are
+    // resolved among themselves first (two rounds cover an alias of an alias,
+    // the deepest chain here), then applied to every type's field idents.
+    fn expand(idents: &[String], aliases: &HashMap<String, Vec<String>>) -> Vec<String> {
+        idents
+            .iter()
+            .flat_map(|ident| match aliases.get(ident) {
+                // A self-referential spelling (`type Cache = Cache<..>`) would
+                // otherwise expand forever without adding anything.
+                Some(target) if target != std::slice::from_ref(ident) => target.clone(),
+                _ => vec![ident.clone()],
+            })
+            .collect()
+    }
+
+    for _ in 0..2 {
+        let snapshot = aliases.clone();
+        for idents in aliases.values_mut() {
+            *idents = expand(idents, &snapshot);
+        }
+    }
+    for idents in defs.values_mut() {
+        *idents = expand(idents, &aliases);
+    }
+    // The alias map is returned too: a `Client` field can name one directly
+    // (`group_cache: OnceLock<Arc<GroupCache>>` over `type GroupCache =
+    // TypedCache<..>`), and expanding only inside type definitions would leave
+    // that field invisible — removing it from the report would keep this green.
+    (defs, aliases)
+}
+
+/// `idents` with every alias replaced by what it stands for.
+fn resolve_aliases(idents: &[String], aliases: &HashMap<String, Vec<String>>) -> Vec<String> {
+    idents
+        .iter()
+        .flat_map(|ident| match aliases.get(ident) {
+            Some(target) if target != std::slice::from_ref(ident) => target.clone(),
+            _ => vec![ident.clone()],
+        })
+        .collect()
+}
+
+/// How a field reaches a growable: directly in its own type, or through one
+/// crate-local type it names. Returned for the failure message, so a new
+/// candidate says which collection put it on the list.
+fn growable_path(idents: &[String], defs: &HashMap<String, Vec<String>>) -> Option<String> {
+    if let Some(direct) = idents.iter().find(|i| GROWABLE.contains(&i.as_str())) {
+        return Some(direct.clone());
+    }
+    for ident in idents {
+        let Some(fields) = defs.get(ident) else {
+            continue;
+        };
+        if let Some(inner) = fields.iter().find(|i| GROWABLE.contains(&i.as_str())) {
+            return Some(format!("{ident}::{inner}"));
+        }
+    }
+    None
 }
 
 /// Whether `name` occurs in `text` as a whole identifier. A plain substring
@@ -134,6 +309,7 @@ fn client_struct(text: &str) -> syn::ItemStruct {
 fn every_growable_client_field_reaches_the_memory_report() {
     let client = client_struct(&read("src/client.rs"));
     let report = memory_report_body(&read("src/client/accessors.rs"));
+    let (defs, aliases) = crate_type_fields();
 
     let mut missing = Vec::new();
     for field in &client.fields {
@@ -142,14 +318,15 @@ fn every_growable_client_field_reaches_the_memory_report() {
         };
         let mut idents = Vec::new();
         type_idents(&field.ty, &mut idents);
-        if !idents.iter().any(|i| GROWABLE.contains(&i.as_str())) {
+        let idents = resolve_aliases(&idents, &aliases);
+        let Some(via) = growable_path(&idents, &defs) else {
             continue;
-        }
+        };
         if EXEMPT.iter().any(|(exempt, _)| *exempt == name) {
             continue;
         }
         if !mentions(&report, &name) {
-            missing.push(format!("  {name}: {}", idents.join("<")));
+            missing.push(format!("  {name}: {} (via {via})", idents.join("<")));
         }
     }
 
@@ -178,6 +355,43 @@ fn a_mention_is_a_whole_identifier() {
         "cache"
     ));
     assert!(!mentions("self.group_devices_memo", "devices_memo"));
+}
+
+/// The capability the scan gained: a collection wrapped in a crate-local type,
+/// or spelled through an alias, still puts its field on the candidate list.
+#[test]
+fn a_newtype_or_alias_does_not_hide_its_collection() {
+    let (defs, aliases) = crate_type_fields();
+    let path = |ident: &str| growable_path(&resolve_aliases(&[ident.to_string()], &aliases), &defs);
+
+    // A field that names an alias directly — `group_cache: OnceLock<Arc<
+    // GroupCache>>` — resolves through it, so dropping that cache from the
+    // report fails the guard rather than passing silently.
+    assert_eq!(
+        path("GroupCache").as_deref(),
+        Some("TypedCache"),
+        "`type GroupCache = TypedCache<..>` must resolve on a Client field type"
+    );
+    assert_eq!(
+        path("PendingDeviceSync").as_deref(),
+        Some("PendingDeviceSync::HashSet"),
+        "the offline unknown-device queue is a HashSet behind a newtype"
+    );
+    assert_eq!(
+        path("InboundCommitBatcher").as_deref(),
+        Some("InboundCommitBatcher::Vec"),
+        "the offline-drain commit batch is a Vec behind a newtype"
+    );
+    assert_eq!(
+        path("MsgSecretWriteBuffer").as_deref(),
+        Some("MsgSecretWriteBuffer::HashMap"),
+        "`type Pending = HashMap<..>` must not read as an opaque type"
+    );
+
+    // A type that holds no collection stays off the list, so the resolution is
+    // selective rather than flagging every crate-local field type.
+    assert_eq!(path("SentFrameTap"), None);
+    assert_eq!(path("NotAClientFieldTypeAnywhere"), None);
 }
 
 /// An exemption must name a field that still exists, so the list cannot rot

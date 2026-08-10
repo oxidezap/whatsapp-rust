@@ -433,6 +433,35 @@ pub struct MemoryReport {
     pub history_sync_tasks_peak: u64,
     /// Lifetime high-water mark of logical compressed-payload bytes.
     pub history_sync_payload_bytes_peak: u64,
+    // -- Transient retention (accumulated, not yet handed on) --
+    /// Inbound messages accumulated for the next per-batch commit, and the
+    /// encoded-byte sum compared against the 4 MiB flush threshold. The decoded
+    /// protos this holds are the largest per-client allocation in this report by
+    /// two orders of magnitude.
+    ///
+    /// "Accumulated", not "resident": a batch already handed to its commit is
+    /// still in memory but no longer counted here (see
+    /// `InboundCommitBatcher::pending_stats`). Live traffic commits
+    /// immediately, so outside an offline drain this is normally zero.
+    pub inbound_commit_batch: CollectionStats,
+    /// `messageSecret` captures buffered for write-behind persistence — from
+    /// live receives and sends as well as an offline drain, so a slow backend
+    /// can saturate this with no drain in progress.
+    ///
+    /// A producer that would exceed the 4096-entry limit waits for an in-flight
+    /// write rather than the buffer growing. That limit is not a hard ceiling:
+    /// a queueing future cancelled while backpressured force-buffers what it
+    /// still holds rather than losing it, so this can read above the limit
+    /// during teardown.
+    pub msg_secret_buffer: usize,
+    /// Users awaiting a device-list refresh, and the dedup that suppresses a
+    /// second refresh for the same user while one is outstanding.
+    ///
+    /// Offline entries are drained by `doPendingDeviceSync` at the end of the
+    /// backlog. Entries added by the *online* path are removed only by that
+    /// same drain or by teardown, so on a connection with no offline drain this
+    /// grows with the distinct users seen with an unknown device.
+    pub pending_device_sync: usize,
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
     pub chat_lanes: u64,
@@ -509,7 +538,7 @@ pub struct MemoryReport {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 12] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 13] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -523,6 +552,7 @@ impl MemoryReport {
             ("signal_identities:", &self.signal_identities),
             ("signal_sender_keys:", &self.signal_sender_keys),
             ("history_sync_tasks:", &self.history_sync_tasks),
+            ("inbound_commit_batch:", &self.inbound_commit_batch),
         ]
     }
 
@@ -549,11 +579,14 @@ impl std::fmt::Display for MemoryReport {
             writeln!(f, "  {name:<22} {:>7} entries {:>10} B", c.entries, c.bytes)
         }
         // First TTL_BOUNDED entries of collections() are the TTL-bounded
-        // caches; the next SIGNAL_CACHES are Signal store caches. The final
-        // entry is transient history-sync retention. Adding a cache to
-        // collections() means moving this boundary, or the sections shift.
+        // caches; the next SIGNAL_CACHES are Signal store caches. The last two
+        // are transient retention: history sync, then the inbound commit batch.
+        // Adding a cache to collections() means moving this boundary, or the
+        // sections shift.
         const TTL_BOUNDED: usize = 8;
         const SIGNAL_CACHES: usize = 3;
+        const HISTORY_SYNC: usize = TTL_BOUNDED + SIGNAL_CACHES;
+        const COMMIT_BATCH: usize = HISTORY_SYNC + 1;
         let collections = self.collections();
         writeln!(f, "=== Memory Report ===")?;
         writeln!(f, "--- TTL-bounded caches ---")?;
@@ -627,11 +660,7 @@ impl std::fmt::Display for MemoryReport {
             )?;
         }
         writeln!(f, "--- In-flight history sync ---")?;
-        line(
-            f,
-            collections[TTL_BOUNDED + SIGNAL_CACHES].0,
-            &self.history_sync_tasks,
-        )?;
+        line(f, collections[HISTORY_SYNC].0, &self.history_sync_tasks)?;
         writeln!(
             f,
             "  peak tasks:             {}",
@@ -642,6 +671,10 @@ impl std::fmt::Display for MemoryReport {
             "  peak payload storage:   {} B",
             self.history_sync_payload_bytes_peak
         )?;
+        writeln!(f, "--- Transient retention ---")?;
+        line(f, collections[COMMIT_BATCH].0, &self.inbound_commit_batch)?;
+        writeln!(f, "  msg_secret_buffer:      {}", self.msg_secret_buffer)?;
+        writeln!(f, "  pending_device_sync:    {}", self.pending_device_sync)?;
         #[cfg(feature = "plugins")]
         {
             writeln!(f, "--- Plugins ---")?;

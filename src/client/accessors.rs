@@ -349,6 +349,11 @@ impl Client {
             .len();
         let app_state_key_requests = self.app_state_key_requests.lock().await.len();
         let app_state_syncing = self.app_state_syncing.len();
+        let (commit_batch_entries, commit_batch_bytes) = self.inbound_commit_batch.pending_stats();
+        let inbound_commit_batch =
+            CollectionStats::new(commit_batch_entries as u64, commit_batch_bytes as u64);
+        let msg_secret_buffer = self.msg_secret_buffer.pending_len();
+        let pending_device_sync = self.pending_device_sync.len();
         let chatstate_handlers = self.chatstate_handler_count.load(Ordering::Acquire);
         let history_sync_activity = self.history_sync_activity.snapshot();
         let history_sync_tasks = CollectionStats::new(
@@ -427,6 +432,9 @@ impl Client {
             history_sync_tasks,
             history_sync_tasks_peak: history_sync_activity.tasks_peak as u64,
             history_sync_payload_bytes_peak: history_sync_activity.payload_bytes_peak as u64,
+            inbound_commit_batch,
+            msg_secret_buffer,
+            pending_device_sync,
             session_locks: self.session_locks.entry_count(),
             chat_lanes: self.chat_lanes.entry_count(),
             group_distribution_locks: group_distribution_locks.entries,

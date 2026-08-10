@@ -4844,6 +4844,56 @@ async fn memory_report_display_sections_stay_aligned() {
             "{name} must render under the Signal heading, got:\n{rendered}"
         );
     }
+
+    // The last two `collections()` entries are transient retention, one section
+    // each. Their order is what the two boundary constants encode, so a cache
+    // appended to `collections()` without moving them lands here.
+    let history_start = rendered
+        .find("--- In-flight history sync ---")
+        .expect("history sync section");
+    let drain_start = rendered
+        .find("--- Transient retention ---")
+        .expect("transient-retention section");
+    assert!(
+        history_start < drain_start,
+        "sections must render in `collections()` order, got:\n{rendered}"
+    );
+    assert!(
+        rendered[history_start..drain_start].contains("history_sync_tasks:"),
+        "history_sync_tasks must render under its own heading, got:\n{rendered}"
+    );
+    for name in [
+        "inbound_commit_batch:",
+        "msg_secret_buffer:",
+        "pending_device_sync:",
+    ] {
+        assert!(
+            rendered[drain_start..].contains(name),
+            "{name} must render under the transient-retention heading, got:\n{rendered}"
+        );
+    }
+}
+
+/// The offline unknown-device queue has no capacity cap: its bound is the drain
+/// that empties it, since dropping a user would leave sends to them addressed to
+/// a stale device list. That makes the count the only warning a consumer gets,
+/// so it has to reach the report.
+#[tokio::test]
+async fn memory_report_counts_the_offline_device_sync_queue() {
+    let client =
+        crate::test_utils::create_test_client_with_name("pending_device_sync_report").await;
+    assert_eq!(client.memory_report().await.pending_device_sync, 0);
+
+    let jid: Jid = "559980000002@s.whatsapp.net".parse().expect("a test jid");
+    assert!(client.pending_device_sync.add(&jid));
+    assert!(
+        !client.pending_device_sync.add(&jid),
+        "the queue dedups per user, so a retry storm from one sender adds one entry"
+    );
+    assert_eq!(client.memory_report().await.pending_device_sync, 1);
+
+    client.pending_device_sync.take_all();
+    assert_eq!(client.memory_report().await.pending_device_sync, 0);
 }
 
 #[tokio::test]

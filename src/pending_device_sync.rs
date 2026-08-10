@@ -38,6 +38,19 @@ impl PendingDeviceSync {
         self.lock().drain().collect()
     }
 
+    /// Users queued for the next `doPendingDeviceSync`, plus the users an
+    /// online refresh already covered — [`Self::add`] is the dedup for both, and
+    /// only [`Self::take_all`] and [`Self::clear`] remove anything, so an entry
+    /// added by the online path stays until the next drain or teardown.
+    ///
+    /// The set has no capacity cap, and a cap would be the wrong fix: dropping a
+    /// user silently skips a device refresh and leaves the next send to them
+    /// addressed to a stale device list. The bound is the drain, not a number —
+    /// which is why the count belongs in `memory_report()`.
+    pub(crate) fn len(&self) -> usize {
+        self.lock().len()
+    }
+
     pub(crate) fn clear(&self) {
         self.lock().clear();
     }

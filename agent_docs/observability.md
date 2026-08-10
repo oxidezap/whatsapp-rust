@@ -403,7 +403,161 @@ Not everything is expressible. The noise sender task's batch buffer grows to
 can read it without a channel built for the purpose; it stays unreported rather
 than guessed. The safety net for the parts that *are* reachable is
 `tests/report_coverage.rs`, which parses `Client`'s fields and fails when one
-whose type names a collection never reaches `memory_report()`.
+that reaches a collection — in its own type, or through one crate-local type it
+names, aliases resolved — never reaches `memory_report()`. Resolution stops at
+one level on purpose: `self_weak: Weak<Client>` makes the type graph reach every
+collection from every field, and a guard that flags everything flags nothing.
+Fields past that boundary are listed in the file's `EXEMPT` with their reason.
+
+## Per-client retention and cache bounds
+
+Two questions a multi-session consumer asks that the sections above do not
+answer directly: what does one more `Client` retain before it does anything, and
+which of its collections can a workload or a peer grow without limit. Both were
+audited in full; this is the result, so nobody re-derives it.
+
+### What one client retains at construction
+
+Measured at the global allocator (`tests/e2e/tests/per_client_retention.rs`,
+`#[ignore]`d, 16 clients, median of the tail) rather than in `RssAnon`, because a
+2 KiB structure and a 3 KiB one both round to the same page count. Identical
+under `dev` and `release`:
+
+| what | retained |
+| --- | ---: |
+| `Client` + `UreqHttpClient` | 24 267 B |
+| + `InMemoryBackend`, empty | 26 211 B |
+
+Quote the pair, not the two halves: ureq materializes part of its agent lazily,
+so a few hundred bytes land on either side of the boundary between building the
+HTTP client and building the client that takes it, and the split moves between
+runs while the sum holds to within a handful of bytes. The client's own share is
+~22.4 KiB and the HTTP client's ~1.9 KiB, which is the right granularity to
+reason at and the wrong one to regression-test.
+
+Against that, the two preallocated bounded queues a session owns:
+
+| queue | capacity | payload | retained |
+| --- | ---: | ---: | ---: |
+| `major_sync_task_sender` (`Client::new`) | 32 | 56 B | 2 816 B |
+| transport events (`EVENT_CHANNEL_CAPACITY`, per connection) | 64 | 40 B | 3 840 B |
+
+So the sync queue is ~11% of a constructed client — but a connected session's
+marginal cost is ~530 KiB (see the table further up), against which both queues
+together are ~1.2%. **Neither is worth making lazy.** The sync queue's receiver
+is handed to `Bot::build` to spawn its worker, so deferring the allocation means
+an `Option` plus a builder handoff that no longer has a receiver to give; the
+transport queue is created by the transport at connect, and every connected
+session drains it. Paying an indirection on a per-connection path to defer 0.5%
+of a session is the wrong trade.
+
+**A capacity cap is a bound here, not a reservation.** `PortableCache` starts on
+an empty `HashMap`: capacity 1 and capacity 10 000 both retain 248 B until
+entries arrive (pinned by `cache_capacity_is_not_preallocated`). Raising a cap
+costs nothing at construction, which is why the coordination caches can afford
+to be sized generously.
+
+### Bytes vs. object graphs, and first-use allocation
+
+Both already hold, so neither is an open question:
+
+- The retry cache (`recent_messages`) is `Cache<ChatMessageId, Arc<Vec<u8>>>` —
+  encoded protobuf, never a `waproto::` graph — and its default capacity is 0,
+  so the DB is the only copy unless a consumer opts into the L1.
+- First-use allocation is already the pattern for everything whose cost is worth
+  deferring: `group_cache`, `app_state_processor`, `delivery_receipt_queue`,
+  `transport_ack_queue` and `custom_enc_handlers` are `OnceLock`s built on first
+  use, not in the constructor.
+
+The one place decoded protos are retained is `inbound_commit_batch`, and there
+the decode is the point: the entries are dispatched to the consumer and handed
+to the durability hook as `wa::Message`. Re-encoding them to save bytes would
+add a decode per delivery to a path that already holds the batch for
+milliseconds. It is bounded at 400 messages / 4 MiB instead — a *flush
+threshold*, not a hard ceiling: `maybe_flush_inbound_commits` checks it after the
+entry is inserted, so a batch overshoots by its last message, and one very large
+message can overshoot substantially on its own.
+
+### What is bounded, and by what
+
+| collection | bound | what eviction costs |
+| --- | --- | --- |
+| `group_cache` | 1h TTL, 250 | re-query on miss |
+| `device_registry_cache` | 1h TTL, 5 000 | store stays authoritative |
+| `recent_messages` | 5m TTL, 0 (disabled) | DB is authoritative |
+| `message_retry_counts` | 1h TTL, 500, FIFO | a forgiven `MAX_DECRYPT_RETRIES` — see below |
+| `undecryptable_dispatched` | 5m TTL, 1 000 | a duplicate event |
+| `pdo_pending_requests` / `pdo_requested` | 30s TTL, 200 / 24h TTL, 512 | a repeated PDO request |
+| `sender_key_devices_cache` | 1h TTI, 500 | a redundant SKDM |
+| `session_recreate_history` | 1h TTL, 256 | one un-throttled recreate |
+| `session_locks` / `chat_lanes` / `group_distribution_locks` | 10 000 / 5 000 / 512 | nothing: an `evict_guard` refuses to evict a lock a task holds, so the map briefly exceeds capacity instead of minting a second lock for one key |
+| `resend_rate_limiter` | 4 096, FIFO | fail-open by design — an evicted bucket is recreated full, so undersizing forgives rate, never over-throttles |
+| `group_devices_memo` / `skdm_warm_memo` / `dm_devices_memo` | 64 / 64 / 512 | a recompute |
+| `SignalStoreCache` sessions / identities / sender keys | 2 000 each (+1/8 slack before an eviction scan) | nothing: only *clean* entries are evicted, so an unpersisted record is never dropped |
+| `SignalStoreCache::sender_key_locks` | 2 000, idle-only | nothing: only locks held solely by the map are dropped |
+| `inbound_commit_batch` | 400 messages / 4 MiB, checked after insert | commits early, no loss; overshoots by one message |
+| `msg_secret_buffer` | 4 096, except on cancellation | nothing: a producer that would exceed it parks on `capacity_available`, and a cancelled one force-buffers past the mark rather than losing captures |
+| device-topology changed-users log | 256 | a memo recompute; overflow can never serve stale data |
+| `AbPropsCache` | the compile-time `WATCHED` interest set | server props outside it are discarded at parse |
+| `CallRegistry` pre-offer controls / ringing group calls / event queues | 64 entries or 1 MiB each | fail-closed admission |
+| `PendingCallLinkJoins` transitions | 32 | fail-closed |
+| `major_sync_task_sender` / transport events / noise send jobs | 32 / 64 / 8 | backpressure, no loss |
+
+### What is unbounded, and why it stays that way
+
+Every one of these except the last reaches `memory_report()`, which is the point:
+the bound is a drain or a lifecycle, so the count is the only warning available.
+
+- **`lid_pn_cache`** — deliberate, and pinned by a test. Evicting a still-valid
+  mapping silently downgrades Signal addresses to `@c.us`; WA Web's
+  `WAWebLidPnCache` is plain `Map`s with no expiry either.
+- **`app_state_key_requests`** — swept by deadline (`retain`) on every insert
+  path, so a busy client holds only key ids whose retry deadline has not passed.
+  The sweep is lazy, not timed: a client that requests keys and then goes idle
+  keeps those stamps until the next request or a reconnect clears the map. No
+  capacity cap, because dropping a stamp either re-asks the phone for a key
+  already requested or loses the dedup that keeps a stuck sender from re-asking
+  every few seconds. Growth is self-limiting anyway: each new key id costs a peer
+  message on the wire.
+- **`pending_device_sync`** — one entry per distinct user seen with an unknown
+  device. Offline entries are drained by `doPendingDeviceSync` at the end of the
+  backlog; entries the *online* path adds are removed only by that same drain or
+  by teardown, so a connection that never drains keeps them for its lifetime,
+  which also suppresses a second immediate refresh for those users. A cap would
+  skip a device refresh and leave the next send to that user addressed to a stale
+  device list, so the fix if this ever matters is a removal on the online path,
+  not a ceiling.
+- **`pending_retries`** — held only for the duration of one retry receipt (a
+  `scopeguard` removes it), so the bound is concurrent receipts.
+- **`presence_subscriptions`**, **`response_waiters`**, **`node_waiters`**,
+  **`sent_node_waiters`**, **`stanza_interceptors`** — one entry per thing the
+  *application* asked for. Not a peer-driven growth vector.
+- **`transport_ack_queue`** / **`delivery_receipt_queue`** — unbounded
+  `async_channel`s whose depth is a stalled-transport signal; capping them would
+  drop acks the server is waiting for.
+- **`offline_receipt_buffer`** — drained at the end of every offline batch, and
+  the one entry here the report does *not* count: it is listed in
+  `report_coverage.rs`'s `EXEMPT` because its `MessageInfo` values are already
+  attributed where the batch owns them. Its depth during a drain is therefore
+  invisible; if that ever matters, it needs a field of its own rather than a cap.
+
+Two design rules the audit confirmed, and one place where the second does not
+hold as tightly as the code comments suggest:
+
+1. **A cap must not evict state something is relying on.** The `evict_guard` on
+   the coordination caches and the clean-only eviction in `SignalStoreCache` are
+   the same idea applied twice: exceed capacity rather than break an invariant.
+2. **A rate limiter should fail closed, not evict.** `message_retry_counts` is
+   what enforces `MAX_DECRYPT_RETRIES`, and forgetting a counter forgives the cap
+   it exists to apply. Its 1h TTL is chosen for exactly that (a 5m TTL expired
+   between reconnects, so the count never reached the cap) — but its 500-entry
+   capacity is a plain FIFO eviction with no guard, so **more than 500 distinct
+   retry keys inside the hour does forgive the ceiling**: the evicted key's next
+   decrypt failure re-enters `increment_retry_count` on the `None => 1` arm.
+   Left as is deliberately — the counters are two integers, so the honest fix is
+   a larger capacity rather than a mechanism, and no workload has been measured
+   against 500 concurrent retry keys. Recorded here so the next person measures
+   instead of re-deriving.
 
 ## Relation to the `metrics`/`tracing` features
 
