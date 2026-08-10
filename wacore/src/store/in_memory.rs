@@ -325,22 +325,33 @@ impl SignalStore for InMemoryBackend {
         // the load factor eight times. The batch length is known, so the table
         // can reach its final size in one allocation instead.
         //
-        // Reserve the batch length MINUS the rows already stored, not the batch
-        // length: a batch may legally overwrite ids (the trait permits it), and
-        // a table grown for rows that were only overwritten never shrinks back.
-        // `keys.len() - len()` is the floor on how many ids must be new, since
-        // no batch can overwrite more rows than exist — so it can only
-        // under-reserve (falling back to incremental growth), never inflate the
-        // resident table. The connect path, where the map is empty and every id
-        // is freshly minted from the monotonic NEXT_PK_ID counter, reserves the
-        // whole batch and gets the full win; a replay of a stored window
-        // reserves nothing and leaves the table exactly as it found it.
+        // Two things stop that reservation from over-growing a table, because a
+        // table grown for rows that were never added does not shrink back and
+        // this is meant to cost no retained bytes:
+        //
+        // 1. Subtract the rows already stored. A batch may legally overwrite
+        //    ids, and no batch can overwrite more rows than exist, so
+        //    `keys.len() - len()` is the floor on how many ids must be new.
+        // 2. Only reserve at all when the batch is strictly ascending, which
+        //    proves its ids are distinct. Without that, 812 entries sharing one
+        //    id would reserve a 1024-bucket table to hold a single row. Testing
+        //    the order costs one pass of integer compares and no allocation;
+        //    deduplicating properly would need a set, whose own allocation and
+        //    812 hashes cost more than the eight allocations being saved.
+        //
+        // Both are one-sided: they can only under-reserve and fall back to
+        // incremental growth, never inflate the resident table. The connect path
+        // satisfies both — the map is empty and `upload_pre_keys_pass` emits
+        // `gen_start + i`, so the whole batch is reserved and gets the full win.
         //
         // This does NOT shrink the table that stays resident: the final
         // capacity is the same either way, so it buys allocator traffic and
         // in-call headroom, not retained bytes.
-        let at_least_new = keys.len().saturating_sub(state.prekeys.len());
-        state.prekeys.reserve(at_least_new);
+        let ascending = keys.windows(2).all(|pair| pair[0].0 < pair[1].0);
+        if ascending {
+            let at_least_new = keys.len().saturating_sub(state.prekeys.len());
+            state.prekeys.reserve(at_least_new);
+        }
         for (id, record) in keys {
             state.prekeys.insert(
                 *id,
@@ -1361,6 +1372,39 @@ mod tests {
             state.prekeys.capacity(),
             settled,
             "an all-overwrite batch must not enlarge the table"
+        );
+    }
+
+    /// A batch whose ids repeat stores one row per distinct id, so sizing the
+    /// table from the batch length would leave it holding a table for rows that
+    /// never existed. The reservation is skipped unless the batch is strictly
+    /// ascending, which is what makes its ids provably distinct.
+    #[tokio::test]
+    async fn a_batch_of_repeated_ids_does_not_reserve_for_them() {
+        const COUNT: usize = 812;
+        let backend = InMemoryBackend::new();
+        let batch: Vec<(u32, Bytes)> = (0..COUNT)
+            .map(|i| (7, Bytes::from(format!("record-{i}"))))
+            .collect();
+
+        backend.store_prekeys_batch(&batch, false).await.unwrap();
+
+        // One row survives — the last write for id 7 — so the table must be
+        // sized for one row, not for the 812 entries that were handed over.
+        let mut control: HashMap<u32, ()> = HashMap::new();
+        control.insert(7, ());
+
+        let state = backend.state.lock().await;
+        assert_eq!(state.prekeys.len(), 1, "last write wins per id");
+        assert_eq!(
+            state.prekeys.capacity(),
+            control.capacity(),
+            "a repeated-id batch must not size the table by its length"
+        );
+        drop(state);
+        assert_eq!(
+            backend.load_prekey(7).await.unwrap(),
+            Some(Bytes::from(format!("record-{}", COUNT - 1)))
         );
     }
 
