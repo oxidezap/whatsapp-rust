@@ -805,15 +805,20 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// `Arc<dyn HttpClient>`, so a process running several bots can give them
     /// all one client instead of one apiece.
     ///
-    /// This is the only route for a client that is not `Clone`, or one erased to
-    /// `Arc<dyn HttpClient>` because the host picks it at runtime — nothing
-    /// implements [`HttpClient`](crate::http::HttpClient) for `Arc<dyn
-    /// HttpClient>`, so such a client could not reach `with_http_client` at all.
-    /// A concrete `Clone` client needs neither: cloning
+    /// Reach for it when one client has to reach several builders and cloning
+    /// is not on the table. [`with_http_client`](Self::with_http_client) carries
+    /// no `Clone` bound, so a non-`Clone` client is perfectly welcome there —
+    /// but by value it moves into one builder and no further. A client already
+    /// erased to `Arc<dyn HttpClient>`, because the host chooses it at runtime,
+    /// needs this setter for a second reason: nothing implements
+    /// [`HttpClient`](crate::http::HttpClient) for `Arc<dyn HttpClient>`, so it
+    /// cannot reach the by-value setter at all.
+    ///
+    /// A concrete `Clone` client can already share without either: cloning
     /// [`UreqHttpClient`](crate::http::UreqHttpClient) shares its `ureq::Agent`
-    /// and therefore its pool, so `with_http_client(shared.clone())` already
-    /// shares (see `agent_docs/observability.md`). What this setter adds there
-    /// is one instance rather than N clones of one, and parity with
+    /// and therefore its pool, so `with_http_client(shared.clone())` shares
+    /// today (see `agent_docs/observability.md`). What this setter adds there is
+    /// one instance rather than N clones of one, and parity with
     /// [`ClientBuilder::with_http_client_arc`](crate::client::ClientBuilder::with_http_client_arc).
     ///
     /// Sharing by either route is worth it because the *default* is per-bot:
