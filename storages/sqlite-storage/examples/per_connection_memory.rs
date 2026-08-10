@@ -201,14 +201,21 @@ async fn main() {
     let cache_kib: u32 = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(512);
     let warm = args.iter().any(|a| a == "warm");
 
-    let mut path = std::env::temp_dir();
-    path.push(format!("wa_percon_{}.db", std::process::id()));
-    for suffix in ["", "-wal", "-shm"] {
-        let mut p = path.clone().into_os_string();
-        p.push(suffix);
-        let _ = std::fs::remove_file(p);
+    // A directory of our own, created exclusively: `create_dir` fails outright
+    // if anything already sits at the path (a symlink included), so nobody who
+    // can write to the shared temp directory can pre-place one and redirect the
+    // database, WAL and shm files this then writes.
+    let dir = std::env::temp_dir().join(format!("wa_percon_{}", std::process::id()));
+    std::fs::create_dir(&dir).expect("exclusive scratch directory");
+    // A guard, not a tail cleanup: two of the modes below return early.
+    struct ScratchDir(std::path::PathBuf);
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
-    let url = path.to_string_lossy().into_owned();
+    let scratch = ScratchDir(dir.clone());
+    let url = dir.join("bench.db").to_string_lossy().into_owned();
 
     if mode == "compile-options" {
         compile_options(&url).await;
@@ -271,9 +278,5 @@ async fn main() {
     );
 
     drop(stores);
-    for suffix in ["", "-wal", "-shm"] {
-        let mut p = path.clone().into_os_string();
-        p.push(suffix);
-        let _ = std::fs::remove_file(p);
-    }
+    drop(scratch);
 }
