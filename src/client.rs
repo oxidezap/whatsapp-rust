@@ -840,6 +840,10 @@ pub enum ConnectError {
     /// rather than reconnecting this one.
     #[error("client has been shut down")]
     Shutdown,
+    /// [`Client::pause`] is in effect. Unlike [`Self::Shutdown`] this is not
+    /// final: [`Client::resume`] lifts it and connecting works again.
+    #[error("client is paused")]
+    Paused,
     /// A step of the connect flow ran out of time.
     #[error("{stage} timed out after {timeout:?}")]
     Timeout {
@@ -904,6 +908,7 @@ impl ConnectError {
             ConnectError::AlreadyConnected
             | ConnectError::NotActivated
             | ConnectError::Shutdown
+            | ConnectError::Paused
             | ConnectError::Version(_)
             | ConnectError::Transport(_) => false,
         }
@@ -1288,6 +1293,13 @@ pub struct Client {
     /// Deliberately not part of `is_terminal`: a paused client is between
     /// connections, not finished, and the application means to come back.
     pub(crate) paused: AtomicBool,
+    /// Serialises [`Client::pause`] against [`Client::resume`]. See
+    /// `pause_lifecycle` on those methods for what the ordering buys.
+    pub(crate) pause_lifecycle: Mutex<()>,
+    /// Fired by [`Client::pause`] and [`Client::resume`], and by nothing else,
+    /// so the run loop's reconnect backoff can watch it without the spurious
+    /// wakes that would collapse the delay it exists to serve.
+    pub(crate) pause_state_notifier: Arc<event_listener::Event>,
     /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
     /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
     pub(crate) auto_reconnect_errors: Arc<AtomicU32>,

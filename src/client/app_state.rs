@@ -1071,13 +1071,15 @@ impl Client {
         if !self.is_running.load(Ordering::Relaxed) {
             return Some(false);
         }
-        // A pause is the same shape: not terminal, because the application means
-        // to come back, but the loop is parked and the next connection is due
-        // whenever it says so — which may be never. Waiting one out is waiting
-        // on an application decision, not on a network.
-        if self.is_paused() {
-            return Some(false);
-        }
+        // A pause deliberately gets no branch of its own. It is not terminal —
+        // the application means to come back — and nothing on the next
+        // connection re-issues a consumer's task, so giving up here would drop
+        // a full-sync request outright rather than defer it. Waiting is already
+        // what this does for a 900s backoff, and a pause is the same shape:
+        // offline now, connected later, bounded by the client's lifetime. The
+        // window where the pause is still tearing down is handled where it
+        // belongs, in `can_reach_server`, so a paused client never reads as
+        // reachable while it waits.
         None
     }
 
@@ -4427,37 +4429,49 @@ mod await_connection_tests {
         );
     }
 
-    /// A pause is an open-ended offline window the application controls, so the
-    /// wait has to end on it too. Not because the client is finished — it is
-    /// coming back — but because when it comes back is a decision nothing here
-    /// can wait for, and the parked task holds the `Arc<Client>` meanwhile.
+    /// A pause must not end the wait: nothing on the next connection re-issues a
+    /// consumer's task, so giving up would drop a full-sync request rather than
+    /// defer it. It must not read as a live connection either, or the retry
+    /// sends on a socket the application has just asked to have closed. Waiting,
+    /// and reporting unreachable while it waits, is the pair that holds.
     #[tokio::test]
-    async fn a_paused_client_ends_the_wait() {
+    async fn a_paused_client_keeps_the_wait_but_is_not_reachable() {
         let client = crate::test_utils::create_test_client_with_name("await-paused").await;
         client.is_running.store(true, Ordering::Relaxed);
-
-        let waiter = {
-            let client = Arc::clone(&client);
-            tokio::spawn(async move { client.await_connection().await })
-        };
-
-        crate::test_utils::poll_until("the waiter to park on the notifier", || {
-            client.socket_ready_notifier.total_listeners() >= 1
-        })
-        .await;
+        // Everything a reachable connection needs, so only the pause can be
+        // what makes the answer no.
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        assert!(client.can_reach_server(), "reachable before the pause");
 
         client.pause().await;
+
         assert!(
-            !tokio::time::timeout(Duration::from_secs(5), waiter)
-                .await
-                .expect("a paused client must end the wait rather than hold it open")
-                .expect("the waiter should not panic"),
-            "and it reports that no connection arrived"
+            !client.can_reach_server(),
+            "a paused client must not answer as reachable, teardown window included"
         );
         assert!(
             !client.is_terminal(),
             "which is not the same as the client being finished"
         );
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+        assert!(
+            !waiter.is_finished(),
+            "and the wait carries on, because the pause is meant to end"
+        );
+        waiter.abort();
     }
 
     /// The run loop's own exit is the terminal transition with no signal of its

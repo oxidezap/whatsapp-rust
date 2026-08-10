@@ -450,6 +450,8 @@ impl Client {
 
             enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
             paused: AtomicBool::new(false),
+            pause_lifecycle: Mutex::new(()),
+            pause_state_notifier: Arc::new(event_listener::Event::new()),
             auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
             connected_at_ms: Arc::new(AtomicI64::new(0)),
             backoff_reset_suppressed: Arc::new(AtomicBool::new(false)),
@@ -652,6 +654,12 @@ impl Client {
                         ConnectError::Shutdown => {
                             debug!("Connect abandoned, the client is shutting down.");
                         }
+                        // The other requested refusal, and the same shape: the
+                        // loop is about to park on the pause that caused it, so
+                        // this is the teardown reporting itself.
+                        ConnectError::Paused => {
+                            debug!("Connect abandoned, the session is paused.");
+                        }
                         ConnectError::Handshake(e) if e.is_transient() => {
                             debug!("Transient connect failure, will retry: {connect_err:#}");
                         }
@@ -754,10 +762,23 @@ impl Client {
             // fires on every disconnect the loop is here to reconnect from, so
             // watching it would collapse the backoff instead of interrupting it.
             let shutdown_fired = wacore::runtime::wait_for_shutdown(&shutdown);
+            // Third arm for the pause state, and a notifier that fires on
+            // nothing else. `pause()` landing here must not wait out a delay
+            // before parking, and `resume()` must not wait one out at all — the
+            // contract is that a pause owes no backoff, and the cap is 900s.
+            // Deliberately NOT `session_state_notifier`, which every teardown
+            // fires: watching that would collapse the backoff this loop exists
+            // to serve and hammer the server. Only the two transitions that
+            // have to be seen promptly fire this one, and the loop re-reads the
+            // state either way.
+            let pause_changed = self.pause_state_notifier.listen();
             futures::select! {
                 _ = self.runtime.sleep(delay).fuse() => {}
                 _ = shutdown_fired.fuse() => {
                     debug!("Shutdown signalled during reconnect backoff, exiting run loop.");
+                }
+                _ = pause_changed.fuse() => {
+                    debug!("Pause state changed during reconnect backoff, re-reading it.");
                 }
             }
         }
@@ -812,7 +833,32 @@ impl Client {
         if self.shutdown_signal().is_fired() {
             return Err(ConnectError::Shutdown);
         }
+        // A pause is a standing instruction that no connection exists, and it
+        // has to bind the act of connecting rather than the loop that calls it:
+        // a flag only the loop consults is one an in-flight attempt can outrun,
+        // publishing a live socket for a client the application has parked.
+        // Refused here and re-read at every step below, `pause()` means what it
+        // says. Not final, unlike a shutdown — `resume()` lifts it.
+        if self.is_paused() {
+            return Err(ConnectError::Paused);
+        }
         self.connect_boxed().await
+    }
+
+    /// Why this connection attempt must not go on, if it must not.
+    ///
+    /// Re-asked at every step of the connect graph, because both answers can
+    /// arrive while a version fetch, a transport and a handshake are being
+    /// awaited — a window as wide as the 20s connect timeout. Checked once at
+    /// the start, either one would be published straight over.
+    fn connect_refusal(&self) -> Option<ConnectError> {
+        if self.shutdown_signal().is_fired() {
+            return Some(ConnectError::Shutdown);
+        }
+        if self.is_paused() {
+            return Some(ConnectError::Paused);
+        }
+        None
     }
 
     #[inline(never)]
@@ -999,9 +1045,9 @@ impl Client {
         // shutdown landing in that window would otherwise be published over.
         // Re-read before each remaining step, and hand back the socket opened
         // for a client that is no longer there.
-        if self.shutdown_signal().is_fired() {
+        if let Some(refusal) = self.connect_refusal() {
             transport.disconnect().await;
-            return Err(ConnectError::Shutdown);
+            return Err(refusal);
         }
 
         let noise_socket = match handshake::do_handshake(
@@ -1022,9 +1068,9 @@ impl Client {
             }
         };
 
-        if self.shutdown_signal().is_fired() {
+        if let Some(refusal) = self.connect_refusal() {
             transport.disconnect().await;
-            return Err(ConnectError::Shutdown);
+            return Err(refusal);
         }
 
         // Fresh per-connection shutdown so subscribers registered during this
@@ -1050,14 +1096,14 @@ impl Client {
         // shutdown could land across, and `signal_shutdown_sync` runs no
         // cleanup of its own. Nothing has been announced yet, so undoing the
         // publish here is the whole retraction.
-        if self.shutdown_signal().is_fired() {
+        if let Some(refusal) = self.connect_refusal() {
             let orphan = self.transport.lock().await.take();
             *self.transport_events.lock().await = None;
             *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = None;
             if let Some(orphan) = orphan {
                 orphan.disconnect().await;
             }
-            return Err(ConnectError::Shutdown);
+            return Err(refusal);
         }
 
         self.is_connected.store(true, Ordering::Release);
@@ -1285,17 +1331,23 @@ impl Client {
     ///
     /// What it guarantees: once this returns, the socket is closed, pending
     /// receipts and Signal state have been flushed on the same terms as
-    /// `disconnect()`, and `run()` will open no further connection until
-    /// resumed. Idempotent — pausing a paused client just tears down again.
+    /// `disconnect()`, and **no connection will be opened by anyone** until
+    /// resumed. [`connect`](Self::connect) is refused with
+    /// [`ConnectError::Paused`] for as long as it holds — including an attempt
+    /// already in flight when this was called, which is retracted rather than
+    /// published. A guarantee the run loop alone could not give: it consults
+    /// its state between attempts, and an attempt can outrun that. Idempotent —
+    /// pausing a paused client just tears down again.
     ///
-    /// What it does **not** guarantee. It governs the supervision loop, not
-    /// [`connect`](Self::connect): a caller driving connections itself is not
-    /// refused one while paused, because for that caller "stay offline" is
-    /// already just "don't call connect". Nor does it dispatch
-    /// [`Event::Disconnected`](crate::types::events::Event) — the
-    /// application ended this connection, so the teardown is not news, the same
-    /// reasoning `reconnect()` applies. And it is not a protocol-level presence
-    /// change: the account stays registered and other devices see nothing.
+    /// What it does **not** do. It dispatches no
+    /// [`Event::Disconnected`](crate::types::events::Event) — the application
+    /// ended this connection, so the teardown is not news, the same reasoning
+    /// `reconnect()` applies. It is not a protocol-level presence change: the
+    /// account stays registered and other devices see nothing. And it does not
+    /// override `enable_auto_reconnect`: a client whose application has already
+    /// asked it not to come back still stops when its connection ends, pause or
+    /// no pause, because that is the same preference the stream errors that end
+    /// a session for good are read through.
     ///
     /// Resuming reconnects like any other reconnect — new connection
     /// generation, fresh `<success>`, app state re-synced. Nothing is carried
@@ -1305,6 +1357,14 @@ impl Client {
         tracing::instrument(name = "wa.conn.pause", level = "info", skip_all)
     )]
     pub async fn pause(self: &Arc<Self>) {
+        // Held for the whole teardown, and taken by `resume` too: without it a
+        // `resume()` landing between the flag and the socket close clears the
+        // pause while the connection this call is still tearing down is what
+        // the run loop is reading. The loop then reaches its post-connection
+        // branches with the pause already gone and takes the ordinary backoff —
+        // the one delay `resume` is documented never to owe. Serialised, the
+        // pair is what it claims to be: a teardown, then a release.
+        let _lifecycle = self.pause_lifecycle.lock().await;
         info!("Pausing the session: dropping the connection until resumed.");
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
@@ -1316,12 +1376,19 @@ impl Client {
         self.paused.store(true, Ordering::SeqCst);
         // The application ended this connection, so the teardown is not news:
         // the same flag `reconnect()` uses to keep a requested drop out of
-        // `Event::Disconnected`.
-        self.intentional_reconnect.store(true, Ordering::Relaxed);
-        // Work parked in `await_connection` would otherwise wait out the whole
-        // pause: not terminal, so nothing else tells it that no connection is
-        // coming until the application asks for one.
+        // `Event::Disconnected`. Only when there is a connection to end,
+        // though — `drive_connection` is what consumes it, so setting it with
+        // no reader running leaves it standing for the connection *after* the
+        // resume, whose first genuine drop would then go unreported.
+        if self.is_connected() {
+            self.intentional_reconnect.store(true, Ordering::Relaxed);
+        }
+        // Two audiences: `session_state_notifier` for work parked in
+        // `await_connection`, which must re-read a reachability that this call
+        // has just changed, and the pause notifier for a run loop sitting in a
+        // reconnect backoff it should no longer be serving.
         self.notify_session_state();
+        self.pause_state_notifier.notify(usize::MAX);
 
         // Same durable-before-receipts gate as disconnect().
         if self
@@ -1349,12 +1416,17 @@ impl Client {
     /// that with [`wait_for_connected`](Self::wait_for_connected). A no-op on a
     /// client that is not paused, and on one that has since been disconnected:
     /// this clears the pause, it does not undo a shutdown.
-    pub fn resume(&self) {
+    ///
+    /// Awaits a [`pause`](Self::pause) still in flight rather than cutting
+    /// across it, so "no backoff is owed" holds however the two are called.
+    pub async fn resume(&self) {
+        let _lifecycle = self.pause_lifecycle.lock().await;
         if !self.paused.swap(false, Ordering::SeqCst) {
             return;
         }
         info!("Resuming the session.");
         self.notify_session_state();
+        self.pause_state_notifier.notify(usize::MAX);
     }
 
     /// Whether [`pause`](Self::pause) is in effect and no connection will be
@@ -1739,6 +1811,13 @@ impl Client {
             // so the window is wide enough to admit a whole sync that the
             // replacement generation then retires — attempt charged, work lost.
             && !self.expected_disconnect.load(Ordering::Relaxed)
+            // Same reasoning as the line above, for the other requested
+            // teardown: `pause()` publishes the flag and only then flushes and
+            // closes, so the socket answers for the whole of that window and
+            // the answer is thrown away with the connection. Asked here rather
+            // than at each waiter, so a send, an IQ and a retry all get the
+            // same verdict.
+            && !self.is_paused()
     }
 }
 
@@ -2371,7 +2450,7 @@ mod tests {
             "and `run()` is still the call driving it"
         );
 
-        client.resume();
+        client.resume().await;
         assert!(!client.is_paused());
         next_connect_attempt(&entered).await;
 
@@ -2424,7 +2503,7 @@ mod tests {
             "the loop must say why it stopped connecting: {said:?}",
         );
 
-        client.resume();
+        client.resume().await;
         client.disconnect().await;
         drop(release);
         tokio::time::timeout(Duration::from_secs(10), run)
@@ -2457,6 +2536,120 @@ mod tests {
         assert!(client.is_terminal(), "and the client is finished for good");
     }
 
+    /// The guarantee a loop-only flag could not give. `pause()` returning means
+    /// no connection exists and none will be opened — by the run loop or by a
+    /// caller reaching for `connect()` directly — until `resume()` lifts it.
+    /// Refused, not queued, and not final: the error says so.
+    #[tokio::test]
+    async fn connecting_is_refused_while_the_session_is_paused() {
+        let client = crate::test_utils::create_test_client().await;
+        client.pause().await;
+
+        let error = tokio::time::timeout(Duration::from_millis(500), client.connect())
+            .await
+            .expect("the refusal must be immediate, with no I/O attempted")
+            .expect_err("a paused client must refuse to connect");
+        assert!(matches!(error, ConnectError::Paused));
+        assert!(
+            !client.is_terminal(),
+            "and refusing is not the same as being finished"
+        );
+
+        client.resume().await;
+        // Not `Paused` any more: this one gets as far as the transport the
+        // fixture has no server behind, which is the refusal being lifted.
+        let after = tokio::time::timeout(Duration::from_secs(5), client.connect()).await;
+        assert!(
+            !matches!(after, Ok(Err(ConnectError::Paused))),
+            "resuming must lift the refusal, got {after:?}"
+        );
+    }
+
+    /// The half the run loop cannot cover on its own: a `pause()` landing while
+    /// an attempt is already opening a transport. Nothing is published for the
+    /// teardown to close, so without the re-check inside the connect graph the
+    /// attempt goes on to publish a live socket for a client the application
+    /// has parked, and `is_paused()` stays true over a session that is online.
+    #[tokio::test]
+    async fn a_pause_mid_attempt_retracts_the_connection_it_would_have_published() {
+        let (client, entered, release) = client_parked_in_connect().await;
+
+        let connecting = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.connect().await.map(|_| ()) }
+        });
+        next_connect_attempt(&entered).await;
+
+        // Parked inside the attempt, exactly the window where no transport has
+        // been published yet.
+        client.pause().await;
+        drop(release);
+
+        let refused = tokio::time::timeout(Duration::from_secs(10), connecting)
+            .await
+            .expect("the attempt must finish once the transport call returns")
+            .expect("the connect task must not panic");
+        assert!(
+            refused.is_err(),
+            "an attempt overtaken by a pause must not hand back a connection"
+        );
+        assert!(
+            !client.is_connected(),
+            "and must leave nothing published behind it"
+        );
+        assert!(client.transport.lock().await.is_none());
+    }
+
+    /// A `resume()` that cuts across a `pause()` still tearing down would clear
+    /// the pause while the run loop is still reading the old connection, so the
+    /// loop would reach its post-connection branches with the pause already gone
+    /// and take the ordinary backoff — the one delay `resume` promises never to
+    /// owe. It waits for the teardown instead.
+    #[tokio::test]
+    async fn resuming_waits_for_a_pause_still_tearing_down() {
+        let client = crate::test_utils::create_test_client().await;
+        let (transport, entered_rx, release_tx, _closes) = parked_transport();
+        *client.transport.lock().await = Some(transport);
+
+        let pausing = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.pause().await }
+        });
+        // Parked in the socket close: the pause has published the flag and has
+        // not finished, which is the whole window under test.
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the pause must reach the socket close")
+            .expect("the observer channel must stay open");
+
+        let resuming = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.resume().await }
+        });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !resuming.is_finished(),
+            "resuming must wait for the teardown it would otherwise cut across"
+        );
+        assert!(
+            client.is_paused(),
+            "and the pause stands until it has been torn down"
+        );
+
+        drop(release_tx);
+        tokio::time::timeout(Duration::from_secs(5), pausing)
+            .await
+            .expect("the pause must finish once the close returns")
+            .expect("the pause task must not panic");
+        tokio::time::timeout(Duration::from_secs(5), resuming)
+            .await
+            .expect("and the resume must follow it")
+            .expect("the resume task must not panic");
+        assert!(!client.is_paused(), "which leaves the session released");
+    }
+
     /// `resume()` clears a pause and nothing else. On a client that has been
     /// disconnected in the meantime there is nothing to go back to, and saying
     /// otherwise would make the pair look like a way out of a shutdown.
@@ -2466,7 +2659,7 @@ mod tests {
 
         client.pause().await;
         client.disconnect().await;
-        client.resume();
+        client.resume().await;
 
         assert!(!client.is_paused(), "the pause itself is cleared");
         assert!(
