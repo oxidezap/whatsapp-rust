@@ -320,16 +320,27 @@ impl SignalStore for InMemoryBackend {
 
     async fn store_prekeys_batch(&self, keys: &[(u32, Bytes)], _uploaded: bool) -> Result<()> {
         let mut state = self.state.lock().await;
-        // The batch length is known and every id in it is new: prekey ids are
-        // minted from the monotonic NEXT_PK_ID counter, so a batch never
-        // overwrites a stored row (unlike `put_msg_secrets`, where reserving a
-        // mostly-overwrite batch would grow the table for rows it never adds).
-        // Growing incrementally instead allocates and copies a whole table per
-        // rehash — a connect-sized batch crosses the load factor eight times.
+        // Growing one insert at a time allocates and copies a whole table per
+        // rehash, and a connect-sized batch arriving at an empty map crosses
+        // the load factor eight times. The batch length is known, so the table
+        // can reach its final size in one allocation instead.
+        //
+        // Reserve the batch length MINUS the rows already stored, not the batch
+        // length: a batch may legally overwrite ids (the trait permits it), and
+        // a table grown for rows that were only overwritten never shrinks back.
+        // `keys.len() - len()` is the floor on how many ids must be new, since
+        // no batch can overwrite more rows than exist — so it can only
+        // under-reserve (falling back to incremental growth), never inflate the
+        // resident table. The connect path, where the map is empty and every id
+        // is freshly minted from the monotonic NEXT_PK_ID counter, reserves the
+        // whole batch and gets the full win; a replay of a stored window
+        // reserves nothing and leaves the table exactly as it found it.
+        //
         // This does NOT shrink the table that stays resident: the final
         // capacity is the same either way, so it buys allocator traffic and
         // in-call headroom, not retained bytes.
-        state.prekeys.reserve(keys.len());
+        let at_least_new = keys.len().saturating_sub(state.prekeys.len());
+        state.prekeys.reserve(at_least_new);
         for (id, record) in keys {
             state.prekeys.insert(
                 *id,
@@ -1322,6 +1333,35 @@ mod tests {
                 "pass {pass}: the reserved table must match an incrementally grown one"
             );
         }
+    }
+
+    /// Replaying a stored window must not grow the table by one bucket. The
+    /// trait permits a batch to overwrite ids, and a table grown for rows that
+    /// were only overwritten never shrinks back — so a reservation taken on the
+    /// bare batch length would retain an extra table forever, which is exactly
+    /// the residency this change claims not to touch.
+    #[tokio::test]
+    async fn replaying_a_stored_batch_does_not_grow_the_table() {
+        const COUNT: u32 = 812;
+        let backend = InMemoryBackend::new();
+        let batch: Vec<(u32, Bytes)> = (1..=COUNT)
+            .map(|id| (id, Bytes::from_static(b"record")))
+            .collect();
+
+        backend.store_prekeys_batch(&batch, false).await.unwrap();
+        let settled = backend.state.lock().await.prekeys.capacity();
+
+        // Same ids twice more: every row is an overwrite, so nothing is added.
+        backend.store_prekeys_batch(&batch, true).await.unwrap();
+        backend.store_prekeys_batch(&batch, true).await.unwrap();
+
+        let state = backend.state.lock().await;
+        assert_eq!(state.prekeys.len(), COUNT as usize, "no rows were added");
+        assert_eq!(
+            state.prekeys.capacity(),
+            settled,
+            "an all-overwrite batch must not enlarge the table"
+        );
     }
 
     #[tokio::test]
