@@ -198,7 +198,7 @@ so a per-session diff reads "41.0 KiB in reserve_rehash" and looks like rehash
 churn. It is not: 1024 buckets × (`size_of::<(u32, PreKeyEntry)>()` + 1 control
 byte) = 41,984 B is the table that *stays*, and the intermediate tables are all
 freed before the process peak. `store_prekeys_batch` does reserve for the batch
-length (#1266), which cuts the call from 11 allocations / 84.1 KB to 3 / 42.1 KB
+length (#1270), which cuts the call from 11 allocations / 84.1 KB to 3 / 42.1 KB
 and its in-call transient high-water from 63.1 KB to 42.1 KB — but retained is
 bit-identical at 42,072 B either way, because the final table is the same size.
 Reserving is worth it for the allocator traffic; it will never move the 41 KiB.
