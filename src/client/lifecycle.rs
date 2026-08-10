@@ -71,6 +71,23 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Release);
     }
 
+    /// Forget what the connection that just ended owed the reconnect backoff.
+    ///
+    /// A planned end is not a failure, whether the application asked for it or a
+    /// protocol step like the post-pairing 515 did, so the consecutive-failure
+    /// count driving the Fibonacci delay goes back to zero. Both planned exits
+    /// call this because `stats().reconnect_errors` reports that count, and a
+    /// number that depended on which exit was taken would make a change of
+    /// branch a change of public behaviour.
+    ///
+    /// The auth timestamp is consumed for a separate reason: left standing, a
+    /// later failed connect reads this cycle's value as a "stable" connection
+    /// and resets the backoff on the strength of it.
+    fn clear_connection_backoff_state(&self) {
+        self.auto_reconnect_errors.store(0, Ordering::Relaxed);
+        self.connected_at_ms.store(0, Ordering::Relaxed);
+    }
+
     pub(crate) fn connection_shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
         self.connection_shutdown
             .lock()
@@ -632,41 +649,44 @@ impl Client {
                 }
             }
 
+            // The application having asked this client to stop, which
+            // `expected_disconnect` cannot answer on its own — twice over. The
+            // post-pairing 515 sets that flag too, and every attempt *clears* it
+            // at the top of this loop, so a `disconnect()` landing during the
+            // attempt (a window as wide as the 20s connect timeout) leaves no
+            // trace in it at all. Left to it, the loop announced a reconnect
+            // that the shutdown had already ruled out, then fell straight out of
+            // the `while` — the log claiming the opposite of what had happened.
+            //
+            // Asked instead from the two signals a per-attempt reset cannot
+            // reach: the shutdown latch, set once and never cleared by
+            // `disconnect`, `logout` and `signal_shutdown_sync`, and
+            // `is_running`, this loop's own stop condition. The trailing pair is
+            // the same question at the ordering the flags are published in — the
+            // Acquire pairs with the Release in `publish_terminal_verdict`,
+            // which clears the reader flag *before* publishing the verdict, so a
+            // verdict read here guarantees the cleared flag is visible to the
+            // load beside it. That covers the window where the stores have
+            // landed but the latch's notify has not.
+            if shutdown.is_fired()
+                || !self.is_running.load(Ordering::Relaxed)
+                || (self.expected_disconnect.load(Ordering::Acquire)
+                    && !self.is_running.load(Ordering::Relaxed))
+            {
+                self.clear_connection_backoff_state();
+                info!("Disconnect requested, shutting down without reconnecting.");
+                break;
+            }
+
             if !self.enable_auto_reconnect.load(Ordering::Relaxed) {
                 info!("Auto-reconnect disabled, shutting down.");
                 self.stop_supervision_loop();
                 break;
             }
 
-            // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately.
-            //
-            // Acquire, paired with the Release in `disconnect`/`signal_shutdown_sync`:
-            // those clear `is_running` before publishing this flag, so seeing it
-            // set here means their cleared reader flag is visible to the Relaxed
-            // load below. Without the pairing the two stores can be read torn —
-            // planned end, reader still live — which is the misreport again, on
-            // a connection that happened to end of its own accord at the same
-            // moment the application asked for the client to stop.
-            if self.expected_disconnect.load(Ordering::Acquire) {
-                // A planned end owes no backoff whichever way it goes, so the
-                // per-connection reset happens before that is decided: a terminal
-                // exit must leave the same `reconnect_errors` a reconnecting one
-                // does, or this branch changes what `stats()` reports.
-                self.auto_reconnect_errors.store(0, Ordering::Relaxed);
-                // Consume the auth timestamp so a later failed connect can't
-                // read this cycle's stale value as a "stable" connection.
-                self.connected_at_ms.store(0, Ordering::Relaxed);
-                // The flag only says the end was planned, not that another
-                // connection follows: `disconnect()`, `logout()` and
-                // `signal_shutdown_sync()` set it too, and they also clear
-                // `is_running` — this loop's own stop condition. Reading it as
-                // "reconnect" announced one and then fell straight out of the
-                // `while`, leaving the log claiming the opposite of what the
-                // requested shutdown had just done.
-                if !self.is_running.load(Ordering::Relaxed) {
-                    info!("Disconnect requested, shutting down without reconnecting.");
-                    break;
-                }
+            // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
+            if self.expected_disconnect.load(Ordering::Relaxed) {
+                self.clear_connection_backoff_state();
                 info!("Expected disconnect (e.g., 515), reconnecting immediately...");
                 continue;
             }
@@ -2091,6 +2111,52 @@ mod tests {
             .await
             .expect("run() must return once the client has been disconnected")
             .expect("the run task must not panic");
+    }
+
+    /// The wider half of the same window. `run` clears `expected_disconnect` at
+    /// the top of every attempt, so a `disconnect()` that lands just before that
+    /// reset — anywhere in a window as wide as the 20s connect timeout — leaves
+    /// the flag false by the time the branch reads it. Judged on that flag alone
+    /// the loop announces a backoff for a reconnect `connect()` is already
+    /// refusing, which is the same untrue line one branch further down.
+    ///
+    /// The clear here stands in for the reset, because the reset runs before the
+    /// factory parks and the state it leaves is the whole of what the loop sees.
+    #[tokio::test]
+    async fn a_disconnect_the_attempt_reset_erased_still_stops_the_loop() {
+        if crate::test_utils::log_capture::delegated_to_child(
+            "client::lifecycle::tests::a_disconnect_the_attempt_reset_erased_still_stops_the_loop",
+        ) {
+            return;
+        }
+        let logs = crate::test_utils::log_capture::session();
+        let (client, entered, release) = client_parked_in_connect().await;
+
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run().await });
+        next_connect_attempt(&entered).await;
+
+        client.disconnect().await;
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+        drop(release);
+
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must return even with its verdict flag erased")
+            .expect("the run task must not panic");
+
+        let said = logs.records_for(RUN_LOOP_LOG);
+        assert!(
+            !said
+                .iter()
+                .any(|(_, message)| message.contains("Will attempt to reconnect in")),
+            "a shut-down client owes no backoff, so none may be announced: {said:?}",
+        );
+        assert!(
+            said.iter()
+                .any(|(_, message)| message.contains("Disconnect requested")),
+            "the loop must still say why it stopped: {said:?}",
+        );
     }
 
     /// The branch's per-connection reset runs whichever exit it takes. Doing it
