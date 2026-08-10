@@ -207,7 +207,13 @@ impl Client {
     /// transport connected, server authenticated, and critical app state synced.
     /// This is the condition `wait_for_connected` uses to resolve.
     fn is_fully_ready(&self) -> bool {
-        self.is_connected() && self.is_logged_in() && self.is_ready.load(Ordering::Relaxed)
+        self.is_connected()
+            && self.is_logged_in()
+            && self.is_ready.load(Ordering::Relaxed)
+            // A pause publishes its flag before the read loop has cleared any
+            // of the three above, so without this the waiters hand a caller the
+            // very connection the application just asked to have closed.
+            && !self.is_paused()
     }
 
     /// Dispatch the Connected event and notify waiters for the originating connection.
@@ -450,9 +456,9 @@ impl Client {
 
             enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
             paused: AtomicBool::new(false),
-            pause_lifecycle: Mutex::new(()),
             pause_state_notifier: Arc::new(event_listener::Event::new()),
             pause_teardown_pending: AtomicBool::new(false),
+            pause_generation: AtomicU64::new(0),
             auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
             connected_at_ms: Arc::new(AtomicI64::new(0)),
             backoff_reset_suppressed: Arc::new(AtomicBool::new(false)),
@@ -867,11 +873,20 @@ impl Client {
     /// arrive while a version fetch, a transport and a handshake are being
     /// awaited — a window as wide as the 20s connect timeout. Checked once at
     /// the start, either one would be published straight over.
-    fn connect_refusal(&self) -> Option<ConnectError> {
+    fn connect_refusal(&self, attempt_pause_generation: u64) -> Option<ConnectError> {
         if self.shutdown_signal().is_fired() {
             return Some(ConnectError::Shutdown);
         }
-        if self.is_paused() {
+        // The generation, not just the flag: a `pause()` and `resume()` that
+        // both complete while this attempt is awaiting its handshake leave every
+        // level-triggered read of the flag saying `false`, and the attempt sails
+        // on — carrying an `outbound_flush` scope it reopened before the pause
+        // closed, so its receipts, retries and transport acks would be dropped
+        // for the life of the connection. An attempt that spanned a pause is not
+        // the connection the resume asked for; the next one is.
+        if self.is_paused()
+            || self.pause_generation.load(Ordering::SeqCst) != attempt_pause_generation
+        {
             return Some(ConnectError::Paused);
         }
         None
@@ -987,6 +1002,9 @@ impl Client {
             return Err(ConnectError::AlreadyConnected);
         }
         let _t = wacore::telemetry::timer(wacore::telemetry::CONNECT_DURATION);
+        // Read once, compared at every checkpoint below: this is the attempt's
+        // claim to belong to the current pause era.
+        let attempt_pause_generation = self.pause_generation.load(Ordering::SeqCst);
 
         // Reset login state for new connection attempt. This ensures that
         // handle_success will properly process the <success> stanza even if
@@ -1061,7 +1079,7 @@ impl Client {
         // shutdown landing in that window would otherwise be published over.
         // Re-read before each remaining step, and hand back the socket opened
         // for a client that is no longer there.
-        if let Some(refusal) = self.connect_refusal() {
+        if let Some(refusal) = self.connect_refusal(attempt_pause_generation) {
             transport.disconnect().await;
             return Err(refusal);
         }
@@ -1084,7 +1102,7 @@ impl Client {
             }
         };
 
-        if let Some(refusal) = self.connect_refusal() {
+        if let Some(refusal) = self.connect_refusal(attempt_pause_generation) {
             transport.disconnect().await;
             return Err(refusal);
         }
@@ -1112,7 +1130,7 @@ impl Client {
         // shutdown could land across, and `signal_shutdown_sync` runs no
         // cleanup of its own. Nothing has been announced yet, so undoing the
         // publish here is the whole retraction.
-        if let Some(refusal) = self.connect_refusal() {
+        if let Some(refusal) = self.connect_refusal(attempt_pause_generation) {
             let orphan = self.transport.lock().await.take();
             *self.transport_events.lock().await = None;
             *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -1380,14 +1398,14 @@ impl Client {
         tracing::instrument(name = "wa.conn.pause", level = "info", skip_all)
     )]
     pub async fn pause(self: &Arc<Self>) {
-        // Held for the whole teardown, and taken by `resume` too: without it a
-        // `resume()` landing between the flag and the socket close clears the
-        // pause while the connection this call is still tearing down is what
-        // the run loop is reading. The loop then reaches its post-connection
-        // branches with the pause already gone and takes the ordinary backoff —
-        // the one delay `resume` is documented never to owe. Serialised, the
-        // pair is what it claims to be: a teardown, then a release.
-        let _lifecycle = self.pause_lifecycle.lock().await;
+        // Deliberately NOT serialised against `resume` with a lock. The obvious
+        // way to keep a resume from cutting across this teardown is to hold one
+        // for the whole of it — and that parks `resume` behind an untimed
+        // socket close, so a transport that never answers turns "come back on
+        // my word" into a session that never comes back at all. The ordering
+        // that actually mattered is the reconnect backoff, and
+        // `pause_teardown_pending` below settles that as a fact about the
+        // connection rather than a race between two callers.
         info!("Pausing the session: dropping the connection until resumed.");
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
@@ -1404,6 +1422,10 @@ impl Client {
         // the resume, whose first genuine drop would then go unreported.
         // `pause_teardown_pending` is what tells the run loop this teardown owes
         // no backoff even if a `resume()` beats it to the branch.
+        // Bumped before anything else, so an attempt already in flight is
+        // refused at its next checkpoint whether or not a resume has landed by
+        // then.
+        self.pause_generation.fetch_add(1, Ordering::SeqCst);
         let had_connection = self.is_connected();
         if had_connection {
             self.intentional_reconnect.store(true, Ordering::Relaxed);
@@ -1454,10 +1476,13 @@ impl Client {
     /// client that is not paused, and on one that has since been disconnected:
     /// this clears the pause, it does not undo a shutdown.
     ///
-    /// Awaits a [`pause`](Self::pause) still in flight rather than cutting
-    /// across it, so "no backoff is owed" holds however the two are called.
-    pub async fn resume(&self) {
-        let _lifecycle = self.pause_lifecycle.lock().await;
+    /// Safe to call while a [`pause`](Self::pause) is still tearing down, and
+    /// deliberately does not wait for one: the teardown ends in an untimed
+    /// socket close, and a resume that queued behind it could be held off for
+    /// as long as an unresponsive transport cared to take. "No backoff is owed"
+    /// does not depend on the two being ordered — the run loop reads that from
+    /// the connection that ended, not from whichever call landed first.
+    pub fn resume(&self) {
         if !self.paused.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -1760,15 +1785,17 @@ impl Client {
     ///
     /// If the socket is already connected, returns immediately.
     pub async fn wait_for_socket(&self, timeout: Duration) -> Result<(), ConnectError> {
-        // Fast path: already connected
-        if self.is_connected() {
+        // Fast path: already connected. Not while paused, though — the flag is
+        // published before the teardown clears `is_connected`, and the socket
+        // this would report is the one being closed.
+        if self.is_connected() && !self.is_paused() {
             return Ok(());
         }
 
         // Register waiter and re-check to avoid race condition:
         // If socket becomes ready between checks, the notified future captures it.
         let notified = self.socket_ready_notifier.listen();
-        if self.is_connected() {
+        if self.is_connected() && !self.is_paused() {
             return Ok(());
         }
 
@@ -2487,7 +2514,7 @@ mod tests {
             "and `run()` is still the call driving it"
         );
 
-        client.resume().await;
+        client.resume();
         assert!(!client.is_paused());
         next_connect_attempt(&entered).await;
 
@@ -2540,7 +2567,7 @@ mod tests {
             "the loop must say why it stopped connecting: {said:?}",
         );
 
-        client.resume().await;
+        client.resume();
         client.disconnect().await;
         drop(release);
         tokio::time::timeout(Duration::from_secs(10), run)
@@ -2592,7 +2619,7 @@ mod tests {
             "and refusing is not the same as being finished"
         );
 
-        client.resume().await;
+        client.resume();
         // Not `Paused` any more: this one gets as far as the transport the
         // fixture has no server behind, which is the refusal being lifted.
         let after = tokio::time::timeout(Duration::from_secs(5), client.connect()).await;
@@ -2667,7 +2694,7 @@ mod tests {
         );
         assert!(client.transport.lock().await.is_none());
 
-        client.resume().await;
+        client.resume();
         let after = tokio::time::timeout(Duration::from_secs(5), client.connect()).await;
         assert!(
             !matches!(after, Ok(Err(ConnectError::AlreadyConnected))),
@@ -2675,42 +2702,38 @@ mod tests {
         );
     }
 
-    /// A `resume()` that cuts across a `pause()` still tearing down would clear
-    /// the pause while the run loop is still reading the old connection, so the
-    /// loop would reach its post-connection branches with the pause already gone
-    /// and take the ordinary backoff — the one delay `resume` promises never to
-    /// owe. It waits for the teardown instead.
+    /// The teardown ends in an untimed socket close, so a `resume()` that had to
+    /// queue behind it would be held off for as long as an unresponsive
+    /// transport cared to take — turning "come back on my word" into a session
+    /// that never comes back. It must not wait, and the guarantee it exists for
+    /// must not depend on its waiting: the loop reads the no-backoff fact off
+    /// the connection that ended, not off which caller won.
     #[tokio::test]
-    async fn resuming_waits_for_a_pause_still_tearing_down() {
+    async fn resuming_does_not_queue_behind_a_stalled_teardown() {
         let client = crate::test_utils::create_test_client().await;
         let (transport, entered_rx, release_tx, _closes) = parked_transport();
         *client.transport.lock().await = Some(transport);
+        client.set_connected_for_test(true);
 
         let pausing = tokio::spawn({
             let client = Arc::clone(&client);
             async move { client.pause().await }
         });
-        // Parked in the socket close: the pause has published the flag and has
-        // not finished, which is the whole window under test.
+        // Parked in the close, which is where a dead transport leaves it.
         tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
             .await
             .expect("the pause must reach the socket close")
             .expect("the observer channel must stay open");
 
-        let resuming = tokio::spawn({
-            let client = Arc::clone(&client);
-            async move { client.resume().await }
-        });
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
+        client.resume();
         assert!(
-            !resuming.is_finished(),
-            "resuming must wait for the teardown it would otherwise cut across"
+            !client.is_paused(),
+            "resuming must take effect while the socket close is still hanging"
         );
         assert!(
-            client.is_paused(),
-            "and the pause stands until it has been torn down"
+            client.pause_teardown_pending.load(Ordering::Relaxed),
+            "and the teardown still owes the run loop its no-backoff answer, \
+             which is what makes waiting unnecessary"
         );
 
         drop(release_tx);
@@ -2718,11 +2741,6 @@ mod tests {
             .await
             .expect("the pause must finish once the close returns")
             .expect("the pause task must not panic");
-        tokio::time::timeout(Duration::from_secs(5), resuming)
-            .await
-            .expect("and the resume must follow it")
-            .expect("the resume task must not panic");
-        assert!(!client.is_paused(), "which leaves the session released");
     }
 
     /// `resume()` clears a pause and nothing else. On a client that has been
@@ -2734,7 +2752,7 @@ mod tests {
 
         client.pause().await;
         client.disconnect().await;
-        client.resume().await;
+        client.resume();
 
         assert!(!client.is_paused(), "the pause itself is cleared");
         assert!(

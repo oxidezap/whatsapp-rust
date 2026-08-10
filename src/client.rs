@@ -1293,9 +1293,6 @@ pub struct Client {
     /// Deliberately not part of `is_terminal`: a paused client is between
     /// connections, not finished, and the application means to come back.
     pub(crate) paused: AtomicBool,
-    /// Serialises [`Client::pause`] against [`Client::resume`]. See
-    /// `pause_lifecycle` on those methods for what the ordering buys.
-    pub(crate) pause_lifecycle: Mutex<()>,
     /// Fired by [`Client::pause`] and [`Client::resume`], and by nothing else,
     /// so the run loop's reconnect backoff can watch it without the spurious
     /// wakes that would collapse the delay it exists to serve.
@@ -1305,6 +1302,11 @@ pub struct Client {
     /// re-read of `paused`, because a [`Client::resume`] can land between the
     /// two and the backoff a pause does not owe must not turn on that timing.
     pub(crate) pause_teardown_pending: AtomicBool,
+    /// Bumped by every [`Client::pause`]. A connection attempt reads it once at
+    /// the start and is refused if it has moved, so an attempt that spanned a
+    /// pause is never published — even when a [`Client::resume`] landed while it
+    /// was still handshaking and left the flag reading `false` throughout.
+    pub(crate) pause_generation: AtomicU64,
     /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
     /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
     pub(crate) auto_reconnect_errors: Arc<AtomicU32>,
