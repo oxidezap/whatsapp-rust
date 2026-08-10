@@ -47,16 +47,18 @@ const SEED_ROWS: usize = 4_000;
 const ROW_BYTES: usize = 1_024;
 
 fn rss_bytes() -> u64 {
-    // Field 2 of /proc/self/statm is resident pages. 4 KiB is the page size on
-    // every platform this harness is meant to run on; a wrong constant would
-    // scale every number here equally, so comparisons stay valid regardless.
-    let statm = std::fs::read_to_string("/proc/self/statm").expect("/proc/self/statm");
-    let pages: u64 = statm
-        .split_whitespace()
-        .nth(1)
-        .and_then(|f| f.parse().ok())
-        .expect("resident pages");
-    pages * 4096
+    // smaps_rollup rather than statm: it reports `Rss:` already in kB, so the
+    // reading does not depend on knowing the kernel's page size (which is not
+    // always 4 KiB, and which std cannot report without libc).
+    let rollup =
+        std::fs::read_to_string("/proc/self/smaps_rollup").expect("/proc/self/smaps_rollup");
+    let kib: u64 = rollup
+        .lines()
+        .find_map(|line| line.strip_prefix("Rss:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .expect("Rss: line");
+    kib * 1024
 }
 
 fn db_err(e: diesel::result::Error) -> wacore::store::error::StoreError {
@@ -138,13 +140,18 @@ async fn write_burst(stores: Vec<SqliteStore>) -> (Duration, Duration, Duration)
     )
 }
 
-async fn writes(url: &str, sessions: usize, read_pool_size: u32) {
+/// `dir` rather than one database URL: each arm gets a database of its own, so
+/// the second is not measured against the pages, WAL and rows the first left
+/// behind — which would confound the comparison with run order.
+async fn writes(dir: &std::path::Path, sessions: usize, read_pool_size: u32) {
     let config = || SqliteStoreConfig {
         read_pool_size,
         ..Default::default()
     };
+    let url = |name: &str| dir.join(name).to_string_lossy().into_owned();
 
-    let base = SqliteStore::with_config_for_device(url, 1, config())
+    let shared_url = url("writes_handles.db");
+    let base = SqliteStore::with_config_for_device(&shared_url, 1, config())
         .await
         .expect("open");
     let mut fleet = vec![base.clone()];
@@ -157,10 +164,11 @@ async fn writes(url: &str, sessions: usize, read_pool_size: u32) {
          total={total:?} fastest={fastest:?} slowest={slowest:?}"
     );
 
+    let separate_url = url("writes_pools.db");
     let mut separate = Vec::new();
     for device_id in 1..=sessions {
         separate.push(
-            SqliteStore::with_config_for_device(url, device_id as i32, config())
+            SqliteStore::with_config_for_device(&separate_url, device_id as i32, config())
                 .await
                 .expect("open"),
         );
@@ -200,13 +208,21 @@ async fn main() {
     let sessions: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(50);
     let cache_kib: u32 = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(512);
     let warm = args.iter().any(|a| a == "warm");
+    // Zero would divide the per-session figure by nothing, and `handles` would
+    // still open its base store — a count nobody asked for.
+    assert!(sessions >= 1, "sessions must be at least 1");
 
-    // A directory of our own, created exclusively: `create_dir` fails outright
-    // if anything already sits at the path (a symlink included), so nobody who
-    // can write to the shared temp directory can pre-place one and redirect the
-    // database, WAL and shm files this then writes.
+    // A directory of our own, created exclusively and owner-only: the create
+    // fails outright if anything already sits at the path (a symlink included),
+    // and mode 0o700 keeps it that way regardless of umask. Between them,
+    // nobody else on the machine can pre-place or swap the database, WAL and
+    // shm files this then writes.
+    use std::os::unix::fs::DirBuilderExt as _;
     let dir = std::env::temp_dir().join(format!("wa_percon_{}", std::process::id()));
-    std::fs::create_dir(&dir).expect("exclusive scratch directory");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .expect("exclusive scratch directory");
     // A guard, not a tail cleanup: two of the modes below return early.
     struct ScratchDir(std::path::PathBuf);
     impl Drop for ScratchDir {
@@ -223,7 +239,7 @@ async fn main() {
     }
     if mode == "writes" {
         // args[2] is the reader-pool size here, not a cache size.
-        writes(&url, sessions, cache_kib).await;
+        writes(&dir, sessions, cache_kib).await;
         return;
     }
 
@@ -238,43 +254,53 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let before = rss_bytes();
 
-    let mut stores = Vec::with_capacity(sessions);
-    match mode {
-        "pools" => {
-            for device_id in 0..sessions {
-                let store =
-                    SqliteStore::with_config_for_device(&url, device_id as i32 + 1, config())
-                        .await
-                        .expect("open");
-                touch(&store).await;
-                stores.push(store);
-            }
-        }
-        "handles" => {
-            let base = SqliteStore::with_config_for_device(&url, 1, config())
+    let mut stores: Vec<SqliteStore> = Vec::with_capacity(sessions);
+    let mut after_first = before;
+    for n in 0..sessions {
+        let device_id = n as i32 + 1;
+        let store = match (mode, stores.first()) {
+            ("pools", _) => SqliteStore::with_config_for_device(&url, device_id, config())
                 .await
-                .expect("open");
-            touch(&base).await;
-            for device_id in 1..sessions {
-                stores.push(base.share_for_device(device_id as i32 + 1));
-            }
-            stores.push(base);
+                .expect("open"),
+            // The first handle is a real store; the rest hang off it.
+            ("handles", None) => SqliteStore::with_config_for_device(&url, device_id, config())
+                .await
+                .expect("open"),
+            ("handles", Some(base)) => base.share_for_device(device_id),
+            (other, _) => panic!("unknown mode {other}"),
+        };
+        touch(&store).await;
+        if warm {
+            scan(&store).await;
         }
-        other => panic!("unknown mode {other}"),
-    }
-    if warm {
-        for store in &stores {
-            scan(store).await;
+        stores.push(store);
+        if n == 0 {
+            // The *marginal* cost is the number that describes the batch, and
+            // it is the one that survives a warmed allocator: whatever the
+            // seeding connection left behind for the first session to reuse is
+            // in this reading, so subtracting it takes the discount out of the
+            // per-session figure instead of hiding in it.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            after_first = rss_bytes();
         }
     }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let after = rss_bytes();
     let delta = after.saturating_sub(before);
+    let marginal = after.saturating_sub(after_first);
+    let others = sessions.saturating_sub(1);
     println!(
         "mode={mode} sessions={sessions} cache_kib={cache_kib} warm={warm} \
-         rss_delta={delta}B per_session={:.1}KiB",
-        delta as f64 / sessions as f64 / 1024.0
+         rss_delta={delta}B per_session={:.1}KiB marginal_per_session={}",
+        delta as f64 / sessions as f64 / 1024.0,
+        if others == 0 {
+            // One session is all baseline and no margin; saying "0.0KiB" would
+            // read as a measurement rather than the absence of one.
+            "n/a".to_string()
+        } else {
+            format!("{:.1}KiB", marginal as f64 / others as f64 / 1024.0)
+        }
     );
 
     drop(stores);

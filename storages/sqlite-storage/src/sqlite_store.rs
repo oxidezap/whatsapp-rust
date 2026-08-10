@@ -647,9 +647,12 @@ impl SqliteStore {
     ///   The row still comes from the usual provisioning path — the same
     ///   [`create_new_device`](Self::create_new_device) or restore that a store
     ///   from [`new_for_device`](Self::new_for_device) would need.
-    /// - **Isolate writes.** Siblings share the one write permit, so their
-    ///   writes serialize against each other. That is the trade, and it is not
-    ///   free: on a burst where every session writes continuously, sharing
+    /// - **Isolate writes.** Siblings share the write permits, of which
+    ///   [`SqliteStoreConfig::pool_size`] decides the number — so at its
+    ///   default of 1 their writes serialize against each other, and a base
+    ///   store built with a wider pool passes that width on instead. That is
+    ///   the trade, and at the default it is not free: on a burst where every
+    ///   session writes continuously, sharing
     ///   costs ~2.5x the aggregate write throughput of a pool per session,
     ///   because a private connection lets one session's queueing overlap
     ///   another's SQLite work. In exchange the queue is FIFO-fair, where
@@ -659,6 +662,14 @@ impl SqliteStore {
     ///   sessions actually have — and not for continuously writing ones.
     ///   [`SqliteStoreConfig::read_pool_size`] widens the *read* side only,
     ///   and its connections are shared here too.
+    /// - **Split the resource report.** `resource_report()` describes the
+    ///   *pool*, and siblings share one, so every handle reports the same
+    ///   whole-pool estimate. That is the honest answer for a shared
+    ///   connection — the bytes belong to the pool, not to any one session —
+    ///   but it means summing the report across a fleet of siblings counts
+    ///   those bytes once per sibling. Count them once per pool instead. The
+    ///   saving this method exists for is exactly why there is only one pool
+    ///   left to count.
     ///
     /// ```no_run
     /// # use whatsapp_rust_sqlite_storage::SqliteStore;
@@ -6807,18 +6818,29 @@ mod share_for_device_tests {
         (started.elapsed(), per_session)
     }
 
-    /// Sharing a pool means sharing the single write permit, so sibling
-    /// sessions serialize on writes. This is the cost of the memory saving and
-    /// the reason `share_for_device` is not the default shape — it is measured
-    /// here rather than argued about.
+    /// Sharing a pool means sharing its write permits, and at the default
+    /// `pool_size` there is exactly one — so sibling sessions serialize on
+    /// writes. That is the cost of the memory saving and the reason
+    /// `share_for_device` is not the default shape; it is measured here rather
+    /// than argued about. `pool_size` is set explicitly, because the claim
+    /// holds for that value and not for a wider pool.
     ///
     /// The assertions are the two properties that must hold on any machine:
     /// no write fails, and no session starves. The timings are printed for the
     /// record; asserting on wall-clock would only buy a flaky test.
     #[tokio::test]
-    async fn concurrent_writes_serialize_across_siblings() {
+    async fn concurrent_writes_serialize_across_siblings_at_the_default_pool_size() {
         let db = TempDb::new("share_write_contention");
-        let base = base_store(&db).await;
+        let base = SqliteStore::with_config_for_device(
+            &db.url(),
+            1,
+            SqliteStoreConfig {
+                pool_size: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("store opens");
         let mut fleet = vec![base.clone()];
         for device_id in 2..=SESSIONS as i32 {
             fleet.push(base.share_for_device(device_id));
