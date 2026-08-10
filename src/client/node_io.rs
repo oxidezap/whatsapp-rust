@@ -1908,9 +1908,9 @@ impl Client {
                     // Not fidelity: WA Web (Handle/StreamError.js) special-cases
                     // only 500..600, so 429 is indistinguishable from any other
                     // reconnect there — survivable because a human watches the UI.
-                    // An embedder has none, and `StreamError` is the channel every
-                    // other coded branch already reports through. Dispatched after
-                    // the stores so a handler sees the rate-limited session.
+                    // An embedder has none, so report the rate limit through
+                    // `StreamError`. Dispatched after the stores so a handler
+                    // sees the rate-limited session.
                     self.core.event_bus.dispatch(Event::StreamError(
                         crate::types::events::StreamError::builder()
                             .code(code.to_string())

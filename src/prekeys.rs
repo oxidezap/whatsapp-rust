@@ -783,7 +783,10 @@ impl Client {
                         ));
                     }
 
-                    let next = delay_a + delay_b;
+                    // Clamped like `fibonacci_backoff`: the sleep is already
+                    // capped, so past MAX the state only exists to overflow
+                    // (u64 at ~90 retries, a debug panic).
+                    let next = delay_a.saturating_add(delay_b).min(MAX_DELAY_SECS);
                     delay_a = delay_b;
                     delay_b = next;
                 }
