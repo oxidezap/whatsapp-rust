@@ -478,8 +478,8 @@ pub mod log_capture {
     use std::sync::{LazyLock, Mutex, OnceLock};
 
     /// The targets tests assert on. A target absent from here is not buffered,
-    /// so [`records_for`] would report it as silent — add it before asserting
-    /// on it.
+    /// so [`Session::records_for`] would report it as silent — add it before
+    /// asserting on it.
     const CAPTURED_TARGETS: &[&str] = &[
         "whatsapp_rust::client::lifecycle",
         "whatsapp_rust::message::receive",
