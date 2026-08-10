@@ -1,7 +1,9 @@
 mod accessors;
 mod adapters;
 mod app_state;
-pub(crate) use app_state::SyncSettles;
+pub(crate) use app_state::{BatchedSyncOutcome, BatchedSyncRequest, SyncSettles};
+#[cfg(test)]
+pub(crate) use app_state::{SyncHolder, batched_sync_outcome_tests::batch_result};
 mod builder;
 mod context_impl;
 mod device_registry;

@@ -304,6 +304,29 @@ pub(crate) enum ReservationWait {
     Always,
 }
 
+/// The two choices a batched sync makes for itself unless a caller overrides
+/// them.
+///
+/// Both defaults are right for a trigger the server raised — a `server_sync`
+/// notification, a dirty bit, the bootstrap — and wrong for a consumer that
+/// asked for a named collection by hand. Such a caller wants the collection
+/// re-read *now*: an equivalent sync in flight does not discharge its request
+/// (see [`ReservationWait`]), and "the persisted version is not zero" is not a
+/// reason to withhold the snapshot it asked for. Overriding is deliberately not
+/// the default — a background trigger that waited on every holder would queue
+/// behind patch sends it has no reason to outrank, and one that forced a
+/// snapshot would re-download whole collections on every dirty bit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchedSyncRequest {
+    /// Ask for `return_snapshot` on the first round even when a version is
+    /// persisted, instead of only when it is zero.
+    pub(crate) snapshot: bool,
+    /// Wait for whoever holds the collection rather than skipping behind an
+    /// equivalent sync. The bootstrap already does this on account of its
+    /// deadline; this is how a non-bootstrap caller asks for the same.
+    pub(crate) wait_for_holder: bool,
+}
+
 /// What a batched sync achieved, collection by collection.
 ///
 /// A single `Ok`/`Err` for the whole batch cannot carry this. The initial
@@ -377,7 +400,7 @@ pub(crate) struct SyncInFlight {
     next_token: AtomicU64,
     /// Notified whenever a reservation is released, so [`SyncInFlight::begin`]
     /// can wait for one instead of spinning.
-    released: event_listener::Event,
+    pub(crate) released: event_listener::Event,
 }
 
 impl SyncInFlight {
@@ -1468,63 +1491,27 @@ impl Client {
     /// deadline also bounds the missing-key wait, letting the explicit
     /// `AppStateSyncKeyRequest` fallback recover a late key on this connection
     /// without running past the watchdog.
-
-    /// Re-fetches the requested app-state collections on the current connection.
     ///
-    /// This is the provider-facing equivalent of WhatsApp Web's `resyncAppState`.
-    /// The caller supplies the collection names and whether a full snapshot is required;
-    /// reservation, connection fencing, pagination, and retry bookkeeping remain owned by the
-    /// provider instead of being reproduced by an application adapter.
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            name = "wa.appstate.resync",
-            level = "debug",
-            skip_all,
-            fields(full_sync),
-            err(Debug)
-        )
-    )]
-    pub async fn resync_app_state(
-        &self,
-        collections: impl IntoIterator<Item = WAPatchName>,
-        full_sync: bool,
-    ) -> Result<()> {
-        let collections = collections.into_iter().collect::<Vec<_>>();
-        if collections.is_empty() {
-            return Ok(());
-        }
-
-        self.await_connection().await;
-        if full_sync {
-            for collection in collections {
-                match self.process_app_state_sync_task(collection, true).await? {
-                    SyncOutcome::Completed => {}
-                    SyncOutcome::Deferred => {
-                        anyhow::bail!("app-state full resync deferred for {:?}", collection)
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        let scope = self.sync_scope(None);
-        let outcome = self.sync_collections_batched(collections, scope).await?;
-        if outcome.all_synced() {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "app-state resync incomplete: {:?}",
-                outcome.unsynced().collect::<Vec<_>>()
-            )
-        }
-    }
-
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len()), err(Debug)))]
+    /// Not instrumented itself: it forwards to
+    /// [`Self::sync_collections_batched_with`], whose span would otherwise nest
+    /// inside an identical one.
     pub(crate) async fn sync_collections_batched(
         &self,
         collections: Vec<WAPatchName>,
         scope: SyncScope,
+    ) -> Result<BatchedSyncOutcome> {
+        self.sync_collections_batched_with(collections, scope, BatchedSyncRequest::default())
+            .await
+    }
+
+    /// [`Self::sync_collections_batched`] with the two decisions a background
+    /// trigger takes for granted spelled out — see [`BatchedSyncRequest`].
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len(), snapshot = request.snapshot), err(Debug)))]
+    pub(crate) async fn sync_collections_batched_with(
+        &self,
+        collections: Vec<WAPatchName>,
+        scope: SyncScope,
+        request: BatchedSyncRequest,
     ) -> Result<BatchedSyncOutcome> {
         let mut outcome = BatchedSyncOutcome::default();
         if collections.is_empty() {
@@ -1553,7 +1540,7 @@ impl Client {
         // finding the collection already synced afterwards is the fast case.
         // Background callers still skip, because for them the in-flight sync
         // genuinely does the work.
-        let wait = if scope.is_bootstrap() {
+        let wait = if scope.is_bootstrap() || request.wait_for_holder {
             ReservationWait::Always
         } else {
             ReservationWait::SkipBehindSync
@@ -1594,7 +1581,7 @@ impl Client {
             return Ok(outcome);
         }
 
-        self.sync_collections_batched_inner(pending, scope, &mut outcome)
+        self.sync_collections_batched_inner(pending, scope, request, &mut outcome)
             .await?;
 
         // A run that crossed its deadline is not a clean one, even if every
@@ -1623,6 +1610,7 @@ impl Client {
         &self,
         mut pending: Vec<WAPatchName>,
         scope: SyncScope,
+        request: BatchedSyncRequest,
         outcome: &mut BatchedSyncOutcome,
     ) -> Result<()> {
         use wacore::appstate::patch_decode::CollectionSyncError;
@@ -1634,6 +1622,12 @@ impl Client {
         // that is still making progress.
         const MAX_ITERATIONS: usize = 500;
         let mut iteration = 0;
+        // Spent on the first round only. From the second on, the persisted
+        // version is the one the first round just wrote, and standing *that*
+        // down would discard the snapshot it applied and re-page the collection
+        // from scratch for as long as the server keeps setting
+        // `has_more_patches`.
+        let mut stand_version_down = request.snapshot;
 
         while !pending.is_empty() && iteration < MAX_ITERATIONS {
             // With the cap at WA Web's 500, a collection paging healthily can
@@ -1662,7 +1656,30 @@ impl Client {
             let mut collection_nodes = Vec::with_capacity(pending.len());
             let mut was_snapshot = HashSet::new();
             for &name in &pending {
-                let state = backend.get_version(name.as_str()).await?;
+                let mut state = backend.get_version(name.as_str()).await?;
+                // Asking for a snapshot is not enough to get one applied: the
+                // processor takes a snapshot only when it is strictly newer than
+                // what is stored, and a collection whose local copy is *wrong*
+                // rather than behind — the reason a caller asks — is exactly the
+                // case where the two versions agree. So the request is expressed
+                // by standing the version down, which is also what makes the rest
+                // of the run treat the collection as one that never synced.
+                //
+                // Not a gamble on the server answering with a snapshot either:
+                // the processor refuses a patch list that arrives with no
+                // snapshot to anchor it against an empty ltHash, so the worst
+                // case leaves the collection retryable at version 0 — asking for
+                // the snapshot again — rather than applying patches to a baseline
+                // they were never built on.
+                if stand_version_down && state.version != 0 {
+                    debug!(
+                        target: "Client/AppState",
+                        "Batched sync: standing {name:?} down from v{} for a requested snapshot",
+                        state.version
+                    );
+                    state = wacore::appstate::hash::HashState::default();
+                    backend.set_version(name.as_str(), state.clone()).await?;
+                }
                 let want_snapshot = state.version == 0;
                 if want_snapshot {
                     was_snapshot.insert(name);
@@ -1678,6 +1695,7 @@ impl Client {
                 }
                 collection_nodes.push(builder.build());
             }
+            stand_version_down = false;
 
             let sync_node = NodeBuilder::new("sync").children(collection_nodes).build();
             let iq = crate::request::InfoQuery {
@@ -2736,16 +2754,6 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn resync_app_state_with_empty_collections_is_a_noop() {
-        let client = crate::test_utils::create_test_client_with_name("appstate-empty-resync").await;
-
-        client
-            .resync_app_state(std::iter::empty(), false)
-            .await
-            .expect("empty app-state resync should be a no-op");
-    }
 
     #[tokio::test]
     async fn key_arrival_finishes_before_a_slow_fanout() {
