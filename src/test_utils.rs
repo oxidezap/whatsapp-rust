@@ -303,6 +303,33 @@ async fn create_test_client_from_backend(
     client
 }
 
+/// Build an isolated in-memory test client over a caller-supplied transport
+/// factory, for tests that need to decide when — or whether — a connection
+/// attempt gets as far as a socket.
+#[cfg(test)]
+pub(crate) async fn create_test_client_with_transport_factory(
+    transport_factory: Arc<dyn crate::transport::TransportFactory>,
+) -> Arc<Client> {
+    let pm = Arc::new(
+        PersistenceManager::new(create_test_backend().await)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+
+    let (client, _rx) = Client::new(
+        Arc::new(TokioRuntime),
+        pm,
+        transport_factory,
+        Arc::new(MockHttpClient),
+        None,
+    )
+    .await;
+
+    client.enter_live_mode_for_tests();
+
+    client
+}
+
 pub async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
     use wacore::libsignal::protocol::{
         IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
@@ -437,6 +464,149 @@ pub(crate) async fn create_iq_test_client() -> (
     client.enter_live_mode_for_tests();
 
     (client, transport)
+}
+
+/// Buffers what the client announced, so a test can assert that a branch's log
+/// describes what the branch actually did.
+///
+/// One capture for the whole process, because `log`'s global logger is
+/// install-once and every asserting test would otherwise race for the slot.
+/// Which targets it buffers is one decision, made in `CAPTURED_TARGETS`:
+/// filtering at `enabled()` keeps an installed capture from holding the entire
+/// suite's logging for the lifetime of the process.
+pub mod log_capture {
+    use std::sync::{LazyLock, Mutex, OnceLock};
+
+    /// The targets tests assert on. A target absent from here is not buffered,
+    /// so [`records_for`] would report it as silent — add it before asserting
+    /// on it.
+    const CAPTURED_TARGETS: &[&str] = &[
+        "whatsapp_rust::client::lifecycle",
+        "whatsapp_rust::message::receive",
+    ];
+
+    #[derive(Default)]
+    struct Capture {
+        records: Mutex<Vec<(&'static str, log::Level, String)>>,
+    }
+
+    impl log::Log for Capture {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            CAPTURED_TARGETS.contains(&metadata.target())
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            // Keyed by the `&'static str` from the list rather than the
+            // record's borrow, so a buffered entry owns nothing but its message.
+            let Some(target) = CAPTURED_TARGETS
+                .iter()
+                .find(|target| **target == record.target())
+            else {
+                return;
+            };
+            self.records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((target, record.level(), record.args().to_string()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    static CAPTURE: LazyLock<Capture> = LazyLock::new(Capture::default);
+
+    /// `true` once this process's logger is the capture above. Idempotent: the
+    /// install is attempted once per process and the verdict cached.
+    fn installed() -> bool {
+        static INSTALLED: OnceLock<bool> = OnceLock::new();
+        *INSTALLED.get_or_init(|| {
+            let installed = log::set_logger(&*CAPTURE).is_ok();
+            if installed {
+                log::set_max_level(log::LevelFilter::Trace);
+            }
+            installed
+        })
+    }
+
+    /// Hands a test's log assertions to a fresh process when this one's `log`
+    /// slot is already owned by a sibling test's `env_logger`. `log`'s global
+    /// logger is install-once, so a threaded `cargo test --lib` run cannot be
+    /// relied on to leave it free, and skipping the assertions there would let a
+    /// regression in the very behaviour under test go unseen. `cargo nextest`
+    /// gives every test its own process, so this never fires under CI.
+    ///
+    /// `true` means the caller should return immediately: the child already ran
+    /// the real assertions and its failure, if any, has been propagated.
+    pub fn delegated_to_child(test_name: &str) -> bool {
+        const CHILD_MARKER: &str = "WA_RUST_OWNS_LOG_CAPTURE";
+
+        if installed() {
+            return false;
+        }
+        assert!(
+            std::env::var_os(CHILD_MARKER).is_none(),
+            "{test_name}: a single-test child must own the log capture, and did not",
+        );
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("running test binary path"))
+                .args([test_name, "--exact", "--test-threads=1"])
+                .env(CHILD_MARKER, "1")
+                .output()
+                .expect("re-running the test in its own process");
+        // libtest exits 0 for a filter that matched nothing, so accepting the
+        // exit code alone would let a stale `test_name` (after a rename, say)
+        // restore the very skip this helper exists to remove. Demand the child's
+        // own result line for the test we asked it to run.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(&format!("test {test_name} ... ok")),
+            "{test_name} did not run and pass in its own process:\n{stdout}{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
+
+    /// Exclusive use of the capture, and an empty buffer to start from.
+    ///
+    /// The buffer is process-wide, so two asserting tests running at once would
+    /// read each other's records — and "nothing announced a reconnect" is only a
+    /// statement about the test's own client if no other client is logging into
+    /// the same buffer. Holding this is what makes it one. Records are readable
+    /// only through it, so there is no way to assert without the exclusion.
+    pub struct Session(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Session {
+        /// Every record captured on `target` since this session began, oldest
+        /// first.
+        pub fn records_for(&self, target: &str) -> Vec<(log::Level, String)> {
+            CAPTURE
+                .records
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|(captured, _, _)| *captured == target)
+                .map(|(_, level, message)| (*level, message.clone()))
+                .collect()
+        }
+    }
+
+    /// Claim the capture for one test. Call [`delegated_to_child`] first: this
+    /// panics rather than silently reporting an uninstalled capture as silence.
+    pub fn session() -> Session {
+        static LOCK: Mutex<()> = Mutex::new(());
+
+        assert!(
+            installed(),
+            "the log capture must own this process's logger before a test asserts on it",
+        );
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        CAPTURE
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        Session(guard)
+    }
 }
 
 /// Wait for the client to write the `index`-th frame and decode it.

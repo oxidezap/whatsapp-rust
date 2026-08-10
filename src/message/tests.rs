@@ -5090,93 +5090,17 @@ async fn test_undecryptable_deduped_across_resends() {
     }
 }
 
-/// Buffers what `message::receive` announced, so a test can assert that a
-/// branch's log describes what the branch actually did.
-#[derive(Default)]
-struct ReceiveLogCapture {
-    records: std::sync::Mutex<Vec<(log::Level, String)>>,
-}
-
-impl log::Log for ReceiveLogCapture {
-    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.target() == "whatsapp_rust::message::receive"
-    }
-
-    fn log(&self, record: &log::Record<'_>) {
-        if self.enabled(record.metadata()) {
-            self.records
-                .lock()
-                .unwrap()
-                .push((record.level(), record.args().to_string()));
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-static RECEIVE_LOG_CAPTURE: std::sync::LazyLock<ReceiveLogCapture> =
-    std::sync::LazyLock::new(ReceiveLogCapture::default);
-
-/// `true` once this process's logger is the capture above. Idempotent: the
-/// install is attempted once per process and the verdict cached.
-fn receive_log_capture_installed() -> bool {
-    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *INSTALLED.get_or_init(|| {
-        let installed = log::set_logger(&*RECEIVE_LOG_CAPTURE).is_ok();
-        if installed {
-            log::set_max_level(log::LevelFilter::Trace);
-        }
-        installed
-    })
-}
-
-/// Hands a test's log assertions to a fresh process when this one's `log` slot
-/// is already owned by a sibling test's `env_logger`. `log`'s global logger is
-/// install-once, so a threaded `cargo test --lib` run cannot be relied on to
-/// leave it free, and skipping the assertions there would let a regression in
-/// the very behaviour under test go unseen. `cargo nextest` gives every test
-/// its own process, so this never fires under CI.
-///
-/// `true` means the caller should return immediately: the child already ran the
-/// real assertions and its failure, if any, has been propagated.
-fn log_assertions_delegated_to_child(test_name: &str) -> bool {
-    const CHILD_MARKER: &str = "WA_RUST_OWNS_LOG_CAPTURE";
-
-    if receive_log_capture_installed() {
-        return false;
-    }
-    assert!(
-        std::env::var_os(CHILD_MARKER).is_none(),
-        "{test_name}: a single-test child must own the log capture, and did not",
-    );
-    let output =
-        std::process::Command::new(std::env::current_exe().expect("running test binary path"))
-            .args([test_name, "--exact", "--test-threads=1"])
-            .env(CHILD_MARKER, "1")
-            .output()
-            .expect("re-running the test in its own process");
-    // libtest exits 0 for a filter that matched nothing, so accepting the exit
-    // code alone would let a stale `test_name` (after a rename, say) restore the
-    // very skip this helper exists to remove. Demand the child's own result line
-    // for the test we asked it to run.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains(&format!("test {test_name} ... ok")),
-        "{test_name} did not run and pass in its own process:\n{stdout}{}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    true
-}
+use crate::test_utils::log_capture::delegated_to_child as log_assertions_delegated_to_child;
 
 /// The captured `message::receive` records that name `msg_id`.
-fn receive_logs_for(msg_id: &str) -> Vec<(log::Level, String)> {
-    RECEIVE_LOG_CAPTURE
-        .records
-        .lock()
-        .unwrap()
-        .iter()
+fn receive_logs_for(
+    session: &crate::test_utils::log_capture::Session,
+    msg_id: &str,
+) -> Vec<(log::Level, String)> {
+    session
+        .records_for("whatsapp_rust::message::receive")
+        .into_iter()
         .filter(|(_, message)| message.contains(msg_id))
-        .cloned()
         .collect()
 }
 
@@ -5198,6 +5122,7 @@ async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
     ) {
         return;
     }
+    let log_session = crate::test_utils::log_capture::session();
     let client = create_test_client_for_retry_with_id("undec_log_batch").await;
     let recorder = Arc::new(EventRecorder::default());
     client.subscribe_handler(recorder.clone()).detach();
@@ -5260,7 +5185,7 @@ async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
         "the batch's dispatch must still be the one UndecryptableMessage for this id",
     );
 
-    let logs = receive_logs_for(msg_id);
+    let logs = receive_logs_for(&log_session, msg_id);
     assert!(
         !logs.is_empty(),
         "the decrypt failure must leave a receive-side record for this id",
@@ -5284,6 +5209,7 @@ async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
     ) {
         return;
     }
+    let log_session = crate::test_utils::log_capture::session();
     let client = create_test_client_for_retry_with_id("undec_log_branch").await;
     let recorder = Arc::new(EventRecorder::default());
     client.subscribe_handler(recorder.clone()).detach();
@@ -5334,7 +5260,7 @@ async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
         "the branch must dispatch exactly one UndecryptableMessage",
     );
 
-    let announcements: Vec<_> = receive_logs_for(msg_id)
+    let announcements: Vec<_> = receive_logs_for(&log_session, msg_id)
         .into_iter()
         .filter(|(_, m)| m.contains(DISPATCH_ANNOUNCEMENT))
         .collect();

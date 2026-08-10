@@ -626,6 +626,17 @@ impl Client {
 
             // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
             if self.expected_disconnect.load(Ordering::Relaxed) {
+                // The flag only says the end was planned, not that another
+                // connection follows: `disconnect()`, `logout()` and
+                // `signal_shutdown_sync()` set it too, and they also clear
+                // `is_running` — this loop's own stop condition. Reading it as
+                // "reconnect" announced one and then fell straight out of the
+                // `while`, leaving the log claiming the opposite of what the
+                // requested shutdown had just done.
+                if !self.is_running.load(Ordering::Relaxed) {
+                    info!("Disconnect requested, shutting down without reconnecting.");
+                    break;
+                }
                 self.auto_reconnect_errors.store(0, Ordering::Relaxed);
                 // Consume the auth timestamp so a later failed connect can't
                 // read this cycle's stale value as a "stable" connection.
@@ -1011,6 +1022,22 @@ impl Client {
         self.disconnect().await;
     }
 
+    /// End this client's session for good: close the socket, stop the run
+    /// loop, and flush what is still pending.
+    ///
+    /// Terminal, not a pause. The shutdown it fires is published once and for
+    /// all, so afterwards [`run`](Self::run) returns immediately and
+    /// [`connect`](Self::connect) refuses with [`ConnectError::Shutdown`] — a
+    /// new [`Client`] over the same store is the way back. That is the semantics
+    /// [`logout`](Self::logout) relies on by ending with this call, and the one
+    /// [`signal_shutdown_sync`](Self::signal_shutdown_sync) reproduces for
+    /// `Drop`.
+    ///
+    /// What it does **not** offer is a session you can pick up again. To drop
+    /// the current connection and have the client come back on its own, use
+    /// [`reconnect`](Self::reconnect) or
+    /// [`reconnect_immediately`](Self::reconnect_immediately): those leave the
+    /// run loop in place, which is what makes them reversible.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.conn.disconnect", level = "info", skip_all)
@@ -1897,6 +1924,170 @@ mod tests {
             .await
             .expect_err("connecting twice must be refused");
         assert!(matches!(error, ConnectError::AlreadyConnected));
+    }
+
+    /// Where the run loop's own account of itself lands.
+    const RUN_LOOP_LOG: &str = "whatsapp_rust::client::lifecycle";
+
+    /// A transport factory that parks in `create_transport()` until released,
+    /// holding the run loop inside a connect attempt. That is the window a
+    /// caller's `disconnect()` lands in, and parking it makes the interleaving
+    /// a fixture instead of a race.
+    struct ParkedConnect {
+        entered: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::transport::TransportFactory for ParkedConnect {
+        async fn create_transport(
+            &self,
+        ) -> Result<(
+            Arc<dyn crate::transport::Transport>,
+            async_channel::Receiver<crate::transport::TransportEvent>,
+        )> {
+            let _ = self.entered.send(()).await;
+            let _ = self.release.recv().await;
+            // No socket is ever opened: what these tests are about is the
+            // branch the loop takes once an attempt has ended, and a failed
+            // attempt reaches it by the same route a dropped connection does.
+            Err(anyhow::anyhow!("this factory never opens a transport"))
+        }
+    }
+
+    /// A client whose every connect attempt parks. `entered` yields one item
+    /// per attempt reached; each `release` item lets one attempt fail, and
+    /// dropping the sender releases all the rest.
+    async fn client_parked_in_connect() -> (
+        Arc<Client>,
+        async_channel::Receiver<()>,
+        async_channel::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = async_channel::bounded(4);
+        let (release_tx, release_rx) = async_channel::bounded(4);
+        let client =
+            crate::test_utils::create_test_client_with_transport_factory(Arc::new(ParkedConnect {
+                entered: entered_tx,
+                release: release_rx,
+            }))
+            .await;
+        (client, entered_rx, release_tx)
+    }
+
+    /// Blocks until the run loop has reached its next connect attempt.
+    async fn next_connect_attempt(entered: &async_channel::Receiver<()>) {
+        tokio::time::timeout(Duration::from_secs(5), entered.recv())
+            .await
+            .expect("the run loop must reach a connect attempt")
+            .expect("the observer channel must stay open");
+    }
+
+    /// The misreport this branch's guard exists for. `disconnect()` is
+    /// terminal: it clears `is_running`, which is the loop's own stop
+    /// condition. Landing it while a connect attempt is in flight used to make
+    /// the loop announce an immediate reconnect on its way out — and that line
+    /// is the only account a reader has of a session that never came back.
+    #[tokio::test]
+    async fn a_requested_disconnect_is_not_announced_as_a_reconnect() {
+        if crate::test_utils::log_capture::delegated_to_child(
+            "client::lifecycle::tests::a_requested_disconnect_is_not_announced_as_a_reconnect",
+        ) {
+            return;
+        }
+        let logs = crate::test_utils::log_capture::session();
+        let (client, entered, release) = client_parked_in_connect().await;
+
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run().await });
+        next_connect_attempt(&entered).await;
+
+        // Parked, so this is guaranteed to land before the loop reaches the
+        // branch that reports what happens next.
+        client.disconnect().await;
+        drop(release);
+
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must return once the client has been disconnected")
+            .expect("the run task must not panic");
+
+        let said = logs.records_for(RUN_LOOP_LOG);
+        assert!(
+            !said
+                .iter()
+                .any(|(_, message)| message.contains("reconnecting immediately")),
+            "a requested disconnect must not announce a reconnect the shutdown forbids: {said:?}",
+        );
+        assert!(
+            said.iter()
+                .any(|(_, message)| message.contains("Disconnect requested")),
+            "the loop must still say why it stopped: {said:?}",
+        );
+    }
+
+    /// The case the branch is really for, kept intact: a connection that ended
+    /// with `expected_disconnect` set while the loop is still running — the
+    /// post-pairing 515 — is announced as an immediate reconnect, and the
+    /// attempt that follows is what makes the announcement true.
+    #[tokio::test]
+    async fn a_protocol_reconnect_is_still_announced_and_still_made() {
+        if crate::test_utils::log_capture::delegated_to_child(
+            "client::lifecycle::tests::a_protocol_reconnect_is_still_announced_and_still_made",
+        ) {
+            return;
+        }
+        let logs = crate::test_utils::log_capture::session();
+        let (client, entered, release) = client_parked_in_connect().await;
+
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run().await });
+        next_connect_attempt(&entered).await;
+
+        // What a 515 leaves behind: the end was planned, and nobody asked the
+        // client to stop. Set from inside the attempt, so it survives the reset
+        // `connect` performs on entry.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        release
+            .send(())
+            .await
+            .expect("the release channel must stay open");
+
+        next_connect_attempt(&entered).await;
+        let said = logs.records_for(RUN_LOOP_LOG);
+        assert!(
+            said.iter()
+                .any(|(_, message)| message.contains("reconnecting immediately")),
+            "an expected disconnect that leaves the loop running still reconnects: {said:?}",
+        );
+
+        client.disconnect().await;
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must return once the client has been disconnected")
+            .expect("the run task must not panic");
+    }
+
+    /// The promise the branch above now keeps: `disconnect()` ends the session,
+    /// not just the socket. There is no way back for this client — `run()`
+    /// refuses to start another supervision loop — which is exactly why the
+    /// loop must not advertise one on its way out.
+    #[tokio::test]
+    async fn a_disconnected_client_cannot_be_run_again() {
+        let client = crate::test_utils::create_test_client().await;
+        client.disconnect().await;
+
+        assert!(
+            client.is_terminal(),
+            "a disconnected client is finished, not between connections"
+        );
+        tokio::time::timeout(Duration::from_secs(5), client.run())
+            .await
+            .expect("run() must refuse at once after a disconnect, not start a session");
+        assert!(
+            !client.is_running.load(Ordering::SeqCst),
+            "a refused run() must not leave the client advertising a reader"
+        );
     }
 
     /// Far enough up the Fibonacci sequence that the next backoff is the 900s
