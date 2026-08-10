@@ -1300,6 +1300,11 @@ pub struct Client {
     /// so the run loop's reconnect backoff can watch it without the spurious
     /// wakes that would collapse the delay it exists to serve.
     pub(crate) pause_state_notifier: Arc<event_listener::Event>,
+    /// Set by [`Client::pause`] for the connection it tears down, consumed by
+    /// the run loop's post-connection branch. A one-shot fact rather than a
+    /// re-read of `paused`, because a [`Client::resume`] can land between the
+    /// two and the backoff a pause does not owe must not turn on that timing.
+    pub(crate) pause_teardown_pending: AtomicBool,
     /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
     /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
     pub(crate) auto_reconnect_errors: Arc<AtomicU32>,

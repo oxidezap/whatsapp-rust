@@ -452,6 +452,7 @@ impl Client {
             paused: AtomicBool::new(false),
             pause_lifecycle: Mutex::new(()),
             pause_state_notifier: Arc::new(event_listener::Event::new()),
+            pause_teardown_pending: AtomicBool::new(false),
             auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
             connected_at_ms: Arc::new(AtomicI64::new(0)),
             backoff_reset_suppressed: Arc::new(AtomicBool::new(false)),
@@ -722,11 +723,27 @@ impl Client {
                 continue;
             }
 
+            // Registered before the pause state is read, not at the `select!`
+            // below: `event_listener` is edge-triggered, so a pause and resume
+            // that both land in the gap between the read and a later
+            // registration are lost, and the loop then serves a delay of up to
+            // the 900s cap that `resume` promised it would not.
+            let pause_changed = self.pause_state_notifier.listen();
+
             // A `pause()` is what ended this connection, so no backoff is owed
             // and none is announced: the wait belongs to the park at the top of
             // the loop, and computing a delay here would only log a reconnect
             // time that a resume is free to beat.
-            if self.paused.load(Ordering::Relaxed) {
+            //
+            // Read as a one-shot fact about the connection that just ended, not
+            // as current state: `pause()` returns once the socket is closed,
+            // which is before this loop has finished unwinding, so a `resume()`
+            // in that window would otherwise leave this reading `paused` as
+            // false and charging the ordinary backoff for a teardown the
+            // application requested.
+            if self.pause_teardown_pending.swap(false, Ordering::Relaxed)
+                || self.paused.load(Ordering::Relaxed)
+            {
                 self.clear_connection_backoff_state();
                 continue;
             }
@@ -762,16 +779,15 @@ impl Client {
             // fires on every disconnect the loop is here to reconnect from, so
             // watching it would collapse the backoff instead of interrupting it.
             let shutdown_fired = wacore::runtime::wait_for_shutdown(&shutdown);
-            // Third arm for the pause state, and a notifier that fires on
-            // nothing else. `pause()` landing here must not wait out a delay
-            // before parking, and `resume()` must not wait one out at all — the
+            // Third arm for the pause state, on the listener registered
+            // above. `pause()` landing here must not wait out a delay before
+            // parking, and `resume()` must not wait one out at all — the
             // contract is that a pause owes no backoff, and the cap is 900s.
             // Deliberately NOT `session_state_notifier`, which every teardown
             // fires: watching that would collapse the backoff this loop exists
             // to serve and hammer the server. Only the two transitions that
             // have to be seen promptly fire this one, and the loop re-reads the
             // state either way.
-            let pause_changed = self.pause_state_notifier.listen();
             futures::select! {
                 _ = self.runtime.sleep(delay).fuse() => {}
                 _ = shutdown_fired.fuse() => {
@@ -1339,6 +1355,13 @@ impl Client {
     /// its state between attempts, and an attempt can outrun that. Idempotent —
     /// pausing a paused client just tears down again.
     ///
+    /// One qualification on "the socket is closed": an attempt still inside its
+    /// handshake holds its transport in that future, where this call cannot
+    /// reach it. That socket is closed by the attempt itself at its next
+    /// refusal check, which can land just after this returns. What holds
+    /// unconditionally is the part a caller can act on — no such attempt ever
+    /// becomes a published, readable connection.
+    ///
     /// What it does **not** do. It dispatches no
     /// [`Event::Disconnected`](crate::types::events::Event) — the application
     /// ended this connection, so the teardown is not news, the same reasoning
@@ -1374,14 +1397,17 @@ impl Client {
         // branches and start a backoff for a connection that is not coming back
         // on its own.
         self.paused.store(true, Ordering::SeqCst);
-        // The application ended this connection, so the teardown is not news:
-        // the same flag `reconnect()` uses to keep a requested drop out of
-        // `Event::Disconnected`. Only when there is a connection to end,
-        // though — `drive_connection` is what consumes it, so setting it with
-        // no reader running leaves it standing for the connection *after* the
-        // resume, whose first genuine drop would then go unreported.
-        if self.is_connected() {
+        // Both flags describe the connection this call is ending, so both are
+        // set only when there is one. `intentional_reconnect` keeps a requested
+        // drop out of `Event::Disconnected` — set with no reader running,
+        // nothing consumes it and it would stand into the connection *after*
+        // the resume, whose first genuine drop would then go unreported.
+        // `pause_teardown_pending` is what tells the run loop this teardown owes
+        // no backoff even if a `resume()` beats it to the branch.
+        let had_connection = self.is_connected();
+        if had_connection {
             self.intentional_reconnect.store(true, Ordering::Relaxed);
+            self.pause_teardown_pending.store(true, Ordering::Relaxed);
         }
         // Two audiences: `session_state_notifier` for work parked in
         // `await_connection`, which must re-read a reachability that this call
@@ -1406,6 +1432,17 @@ impl Client {
         let transport = self.transport.lock().await.clone();
         if let Some(transport) = transport {
             transport.disconnect().await;
+        }
+
+        // A connection nobody is reading has no `drive_connection` to run the
+        // teardown behind it, and `connect()` publishes `is_connected` before
+        // handing the `Connection` back — so a caller that connected directly
+        // and never drove it would be left flagged connected for good, and
+        // every later `connect()` refused as `AlreadyConnected`. `is_running`
+        // is how the client asks whether anything is reading; when nothing is,
+        // this call owns the cleanup.
+        if had_connection && !self.is_running.load(Ordering::Relaxed) {
+            self.cleanup_connection_state().await;
         }
     }
 
@@ -2598,6 +2635,44 @@ mod tests {
             "and must leave nothing published behind it"
         );
         assert!(client.transport.lock().await.is_none());
+    }
+
+    /// `connect()` publishes `is_connected` before it hands the `Connection`
+    /// back, so a caller that connected directly and has not started reading is
+    /// flagged connected with no `drive_connection` behind it to run a teardown.
+    /// Pausing there has to do the cleanup itself, or the flag stands for good
+    /// and every later `connect()` is refused as `AlreadyConnected` — a pause
+    /// that cannot be resumed from.
+    #[tokio::test]
+    async fn pausing_an_undriven_connection_still_clears_the_connected_flag() {
+        let client = crate::test_utils::create_test_client().await;
+        let (transport, _entered_rx, release_tx, closes) = parked_transport();
+        drop(release_tx); // an ordinary prompt close
+        *client.transport.lock().await = Some(transport);
+        // What `connect()` leaves behind for a `Connection` nobody drives.
+        client.set_connected_for_test(true);
+        assert!(!client.is_running.load(Ordering::Relaxed), "and no reader");
+
+        tokio::time::timeout(Duration::from_secs(10), client.pause())
+            .await
+            .expect("pause must not block");
+
+        // At least once: the cleanup closes the socket too, and transports make
+        // `disconnect()` idempotent for exactly this overlap — the same one
+        // `Client::disconnect()` has.
+        assert!(closes.load(Ordering::SeqCst) >= 1, "the socket is closed");
+        assert!(
+            !client.is_connected(),
+            "and the client no longer claims a connection nothing was reading"
+        );
+        assert!(client.transport.lock().await.is_none());
+
+        client.resume().await;
+        let after = tokio::time::timeout(Duration::from_secs(5), client.connect()).await;
+        assert!(
+            !matches!(after, Ok(Err(ConnectError::AlreadyConnected))),
+            "so resuming can connect again, got {after:?}"
+        );
     }
 
     /// A `resume()` that cuts across a `pause()` still tearing down would clear
