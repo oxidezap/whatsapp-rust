@@ -449,6 +449,7 @@ impl Client {
             offline_batch: Arc::new(offline_resume::OfflineBatchCoordinator::new()),
 
             enable_auto_reconnect: Arc::new(AtomicBool::new(true)),
+            paused: AtomicBool::new(false),
             auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
             connected_at_ms: Arc::new(AtomicI64::new(0)),
             backoff_reset_suppressed: Arc::new(AtomicBool::new(false)),
@@ -591,6 +592,8 @@ impl Client {
     ///
     /// Returns when the session is over for good: [`disconnect`](Self::disconnect),
     /// [`logout`](Self::logout), or a connection ending with auto-reconnect off.
+    /// [`pause`](Self::pause) does not end it — the loop parks and this call
+    /// keeps running until [`resume`](Self::resume) or one of the above.
     // Deliberately NOT instrumented: this span would live for the entire client
     // lifetime, distorting duration/throughput metrics just like the removed
     // keepalive-loop span. Identity (lid/pn) attribution comes from the
@@ -622,6 +625,18 @@ impl Client {
         // disconnect() flips is_running while the branch runs).
         let mut first_connect = true;
         while self.is_running.load(Ordering::Relaxed) {
+            // The one place a pause is honoured, and it is before the attempt
+            // rather than after one fails: a `pause()` can land during a
+            // reconnect backoff as easily as during a live connection, and
+            // either way the next thing this loop must not do is connect.
+            // Parking here rather than where the connection ended is what makes
+            // that true for both. `continue` re-tests `is_running`, so a
+            // `disconnect()` during the pause ends the session from here.
+            if self.paused.load(Ordering::Relaxed) {
+                info!("Session paused; not connecting until resumed.");
+                self.wait_while_paused().await;
+                continue;
+            }
             if !first_connect {
                 self.stats.record_reconnect();
             }
@@ -696,6 +711,15 @@ impl Client {
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 self.clear_connection_backoff_state();
                 info!("Expected disconnect (e.g., 515), reconnecting immediately...");
+                continue;
+            }
+
+            // A `pause()` is what ended this connection, so no backoff is owed
+            // and none is announced: the wait belongs to the park at the top of
+            // the loop, and computing a delay here would only log a reconnect
+            // time that a resume is free to beat.
+            if self.paused.load(Ordering::Relaxed) {
+                self.clear_connection_backoff_state();
                 continue;
             }
 
@@ -1247,6 +1271,117 @@ impl Client {
         let transport = self.transport.lock().await.clone();
         if let Some(transport) = transport {
             transport.disconnect().await;
+        }
+    }
+
+    /// Drop the current connection and stay offline until [`resume`](Self::resume).
+    ///
+    /// The middle of the range between [`reconnect`](Self::reconnect), which
+    /// comes back on the library's schedule, and [`disconnect`](Self::disconnect),
+    /// which does not come back at all. The supervision loop started by
+    /// [`run`](Self::run) stays alive and parked, so the future a caller is
+    /// awaiting keeps running and the client is **not** terminal — it is between
+    /// connections, on purpose, for as long as the application wants.
+    ///
+    /// What it guarantees: once this returns, the socket is closed, pending
+    /// receipts and Signal state have been flushed on the same terms as
+    /// `disconnect()`, and `run()` will open no further connection until
+    /// resumed. Idempotent — pausing a paused client just tears down again.
+    ///
+    /// What it does **not** guarantee. It governs the supervision loop, not
+    /// [`connect`](Self::connect): a caller driving connections itself is not
+    /// refused one while paused, because for that caller "stay offline" is
+    /// already just "don't call connect". Nor does it dispatch
+    /// [`Event::Disconnected`](crate::types::events::Event) — the
+    /// application ended this connection, so the teardown is not news, the same
+    /// reasoning `reconnect()` applies. And it is not a protocol-level presence
+    /// change: the account stays registered and other devices see nothing.
+    ///
+    /// Resuming reconnects like any other reconnect — new connection
+    /// generation, fresh `<success>`, app state re-synced. Nothing is carried
+    /// across the pause that a network drop would not also have taken.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "wa.conn.pause", level = "info", skip_all)
+    )]
+    pub async fn pause(self: &Arc<Self>) {
+        info!("Pausing the session: dropping the connection until resumed.");
+        #[cfg(feature = "client-lifecycle")]
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.cancel_active_scope();
+        }
+        // Before the teardown, so the run loop cannot reach its post-connection
+        // branches and start a backoff for a connection that is not coming back
+        // on its own.
+        self.paused.store(true, Ordering::SeqCst);
+        // The application ended this connection, so the teardown is not news:
+        // the same flag `reconnect()` uses to keep a requested drop out of
+        // `Event::Disconnected`.
+        self.intentional_reconnect.store(true, Ordering::Relaxed);
+        // Work parked in `await_connection` would otherwise wait out the whole
+        // pause: not terminal, so nothing else tells it that no connection is
+        // coming until the application asks for one.
+        self.notify_session_state();
+
+        // Same durable-before-receipts gate as disconnect().
+        if self
+            .flush_inbound_commits_bounded(Duration::from_secs(2))
+            .await
+        {
+            self.flush_offline_receipts();
+        }
+        self.outbound_flush.close();
+        self.outbound_flush
+            .flush(&*self.runtime, Duration::from_secs(2))
+            .await;
+        self.notify_connection_shutdown();
+
+        let transport = self.transport.lock().await.clone();
+        if let Some(transport) = transport {
+            transport.disconnect().await;
+        }
+    }
+
+    /// Release a [`pause`](Self::pause): the run loop reconnects at once, with
+    /// no backoff owed for an offline window the application chose.
+    ///
+    /// Returns once the loop has been told, not once it is connected — wait for
+    /// that with [`wait_for_connected`](Self::wait_for_connected). A no-op on a
+    /// client that is not paused, and on one that has since been disconnected:
+    /// this clears the pause, it does not undo a shutdown.
+    pub fn resume(&self) {
+        if !self.paused.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        info!("Resuming the session.");
+        self.notify_session_state();
+    }
+
+    /// Whether [`pause`](Self::pause) is in effect and no connection will be
+    /// opened by [`run`](Self::run) until [`resume`](Self::resume).
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Park the supervision loop for the length of a pause.
+    ///
+    /// Returns when the pause is released or when nothing is driving the client
+    /// any more — `disconnect()` and `logout()` clear `is_running`, and the
+    /// caller re-tests it, so a session ended mid-pause ends here rather than
+    /// waiting for a resume that is never coming.
+    ///
+    /// `session_state_notifier` is the wake for both, which is why no notifier
+    /// of its own is needed: every transition that changes either answer already
+    /// fires it, and a wake that settles nothing simply re-parks.
+    async fn wait_while_paused(&self) {
+        loop {
+            // Registered before the re-check, so a resume landing in the gap
+            // between the two is not missed and parked-for-good.
+            let changed = self.session_state_notifier.listen();
+            if !self.paused.load(Ordering::Relaxed) || !self.is_running.load(Ordering::Relaxed) {
+                return;
+            }
+            changed.await;
         }
     }
 
@@ -2199,6 +2334,150 @@ mod tests {
             0,
             "and the auth timestamp is consumed, so no later connect reads it as stable"
         );
+    }
+
+    /// The capability the disconnect/reconnect pair left out: go offline, stay
+    /// offline for as long as the application wants, come back on its word. The
+    /// run loop must open no connection in between, and `run()` must still be
+    /// running when it does.
+    #[tokio::test]
+    async fn a_paused_session_stops_connecting_and_resumes_on_request() {
+        let (client, entered, release) = client_parked_in_connect().await;
+
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run().await });
+        next_connect_attempt(&entered).await;
+
+        client.pause().await;
+        assert!(client.is_paused(), "the pause is in effect once it returns");
+        release
+            .send(())
+            .await
+            .expect("the release channel must stay open");
+
+        // Parked on the session notifier is the loop's own observable for
+        // "waiting out a pause" — no sleep can stand in for it.
+        crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+        assert!(
+            entered.is_empty(),
+            "a paused loop must not open a connection while it waits"
+        );
+        assert!(
+            !client.is_terminal(),
+            "a paused client is between connections, not finished"
+        );
+        assert!(
+            !run.is_finished(),
+            "and `run()` is still the call driving it"
+        );
+
+        client.resume();
+        assert!(!client.is_paused());
+        next_connect_attempt(&entered).await;
+
+        client.disconnect().await;
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must return once the client has been disconnected")
+            .expect("the run task must not panic");
+    }
+
+    /// A pause is not a failure, so it is not announced as one. The loop owes no
+    /// backoff for an offline window the application chose, and a delay logged
+    /// here would be a reconnect time any `resume()` is free to beat — the same
+    /// class of untrue line the terminal-disconnect branch was fixed for.
+    #[tokio::test]
+    async fn pausing_announces_no_backoff_it_will_not_wait() {
+        if crate::test_utils::log_capture::delegated_to_child(
+            "client::lifecycle::tests::pausing_announces_no_backoff_it_will_not_wait",
+        ) {
+            return;
+        }
+        let logs = crate::test_utils::log_capture::session();
+        let (client, entered, release) = client_parked_in_connect().await;
+        // A session that already struggled: without the skip, this is the
+        // counter the post-connection branch would build a delay from.
+        client.auto_reconnect_errors.store(6, Ordering::Relaxed);
+
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run().await });
+        next_connect_attempt(&entered).await;
+
+        client.pause().await;
+        release
+            .send(())
+            .await
+            .expect("the release channel must stay open");
+        crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+        let said = logs.records_for(RUN_LOOP_LOG);
+        assert!(
+            !said
+                .iter()
+                .any(|(_, message)| message.contains("Will attempt to reconnect in")),
+            "a pause owes no backoff, so none may be announced: {said:?}",
+        );
+        assert!(
+            said.iter()
+                .any(|(_, message)| message.contains("Session paused")),
+            "the loop must say why it stopped connecting: {said:?}",
+        );
+
+        client.resume();
+        client.disconnect().await;
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must return once the client has been disconnected")
+            .expect("the run task must not panic");
+    }
+
+    /// A pause parks the loop, so `disconnect()` has to reach it there — the
+    /// wait is on the session notifier, which every path that clears
+    /// `is_running` fires. Missed, the run future outlives the shutdown for as
+    /// long as the pause does, which is forever.
+    #[tokio::test]
+    async fn disconnecting_a_paused_session_still_ends_the_run_loop() {
+        let (client, entered, release) = client_parked_in_connect().await;
+
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run().await });
+        next_connect_attempt(&entered).await;
+
+        client.pause().await;
+        drop(release);
+        crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+        client.disconnect().await;
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("a paused run loop must still return when the client is disconnected")
+            .expect("the run task must not panic");
+        assert!(client.is_terminal(), "and the client is finished for good");
+    }
+
+    /// `resume()` clears a pause and nothing else. On a client that has been
+    /// disconnected in the meantime there is nothing to go back to, and saying
+    /// otherwise would make the pair look like a way out of a shutdown.
+    #[tokio::test]
+    async fn resuming_does_not_undo_a_shutdown() {
+        let client = crate::test_utils::create_test_client().await;
+
+        client.pause().await;
+        client.disconnect().await;
+        client.resume();
+
+        assert!(!client.is_paused(), "the pause itself is cleared");
+        assert!(
+            client.is_terminal(),
+            "but a resumed client is still a shut-down one"
+        );
+        let error = client
+            .connect()
+            .await
+            .expect_err("and it still refuses to connect");
+        assert!(matches!(error, ConnectError::Shutdown));
     }
 
     /// The promise the branch above now keeps: `disconnect()` ends the session,

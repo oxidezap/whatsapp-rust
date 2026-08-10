@@ -1282,6 +1282,12 @@ pub struct Client {
     pub(crate) undecryptable_dispatched: Cache<ChatMessageId, ()>,
 
     pub enable_auto_reconnect: Arc<AtomicBool>,
+    /// Set by [`Client::pause`] and cleared by [`Client::resume`]: the run loop
+    /// parks instead of connecting for as long as it holds.
+    ///
+    /// Deliberately not part of `is_terminal`: a paused client is between
+    /// connections, not finished, and the application means to come back.
+    pub(crate) paused: AtomicBool,
     /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
     /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
     pub(crate) auto_reconnect_errors: Arc<AtomicU32>,

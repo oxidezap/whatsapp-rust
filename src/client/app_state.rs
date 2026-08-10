@@ -1071,6 +1071,13 @@ impl Client {
         if !self.is_running.load(Ordering::Relaxed) {
             return Some(false);
         }
+        // A pause is the same shape: not terminal, because the application means
+        // to come back, but the loop is parked and the next connection is due
+        // whenever it says so — which may be never. Waiting one out is waiting
+        // on an application decision, not on a network.
+        if self.is_paused() {
+            return Some(false);
+        }
         None
     }
 
@@ -4417,6 +4424,39 @@ mod await_connection_tests {
                 .expect("a finished client must end the wait, with nothing else nudging it")
                 .expect("the waiter should not panic"),
             "and it reports that none arrived"
+        );
+    }
+
+    /// A pause is an open-ended offline window the application controls, so the
+    /// wait has to end on it too. Not because the client is finished — it is
+    /// coming back — but because when it comes back is a decision nothing here
+    /// can wait for, and the parked task holds the `Arc<Client>` meanwhile.
+    #[tokio::test]
+    async fn a_paused_client_ends_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-paused").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        client.pause().await;
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a paused client must end the wait rather than hold it open")
+                .expect("the waiter should not panic"),
+            "and it reports that no connection arrived"
+        );
+        assert!(
+            !client.is_terminal(),
+            "which is not the same as the client being finished"
         );
     }
 
