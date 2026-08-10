@@ -64,6 +64,10 @@ const MAX_BATCH_WIRE_BYTES: usize = 64 * 1024;
 /// session tens of KiB for the rest of the connection. Measured at 60 KiB
 /// resident per socket after one 60 KiB frame, against 8 KiB for a socket that
 /// only ever sends small ones.
+///
+/// Login alone gets there: an 812-key pre-key upload marshals to 40 799 wire
+/// bytes, ten times this capacity, before the session has sent a single
+/// message.
 const OUT_BUF_IDLE_CAPACITY: usize = 4096;
 
 /// Consecutive small batches that mark a burst as finished. Only then is the
@@ -78,6 +82,14 @@ const SMALL_BATCHES_BEFORE_SHRINK: usize = 32;
 /// test can reach it: the decision is only checkable if it is separable from
 /// the loop that acts on it.
 ///
+/// Two conditions end a burst, and they cover opposite shapes of traffic.
+/// `queue_drained` is the sender with nothing left to write, about to block in
+/// `recv`; it is the only signal a session that grows the buffer at login and
+/// then falls silent ever emits, since it produces no further batch for a
+/// countdown over batches to advance on. The countdown covers the other shape:
+/// traffic continuous enough that the queue is never observed empty, but whose
+/// batches have shrunk back to stanza-sized.
+///
 /// `buffer_capacity` is read as well as the wire length because a frame that
 /// fails mid-encrypt is truncated back out of the buffer, leaving the
 /// allocation it grew with no wire bytes to notice it by. Only large traffic
@@ -86,11 +98,20 @@ const SMALL_BATCHES_BEFORE_SHRINK: usize = 32;
 fn should_release_batch_buffer(
     batch_wire_len: usize,
     buffer_capacity: usize,
+    queue_drained: bool,
     grown: &mut bool,
     small_batches: &mut usize,
 ) -> bool {
     if batch_wire_len > OUT_BUF_IDLE_CAPACITY || buffer_capacity > OUT_BUF_IDLE_CAPACITY {
         *grown = true;
+    }
+    // Checked ahead of the size of the batch just written: one large frame
+    // followed by silence is precisely the case to release on, and testing the
+    // size first would send it down the "burst still running" path forever.
+    if *grown && queue_drained {
+        *grown = false;
+        *small_batches = 0;
+        return true;
     }
     if batch_wire_len > OUT_BUF_IDLE_CAPACITY {
         *small_batches = 0;
@@ -459,9 +480,20 @@ impl NoiseSocket {
             // Release the grown allocation once the burst is over. Nothing above
             // reads `out_buf` across iterations — `split()` left it empty — so
             // replacing it here cannot affect a batching decision.
+            //
+            // An empty channel with nothing carried over is the end of the
+            // burst: the loop is one statement from blocking in `recv`, so no
+            // frame is in flight and no batch is pending, and releasing here
+            // interrupts nothing. `is_empty` is an instantaneous read and a
+            // producer may enqueue immediately after it — that costs one 4 KiB
+            // allocation the next batch would regrow, which is the side this
+            // trade favours: a burst that was about to continue pays once,
+            // while every session that goes quiet stops paying at all.
+            let queue_drained = carry_over.is_none() && send_job_rx.is_empty();
             if should_release_batch_buffer(
                 batch_wire_len,
                 out_buf.capacity(),
+                queue_drained,
                 &mut out_buf_grown,
                 &mut small_batches,
             ) {
@@ -1310,18 +1342,25 @@ mod tests {
         /// A capacity a burst plausibly grew the buffer to, tied to the
         /// threshold so it cannot drift under it.
         const GROWN_CAPACITY: usize = OUT_BUF_IDLE_CAPACITY * 16;
+        /// The countdown cases all run with jobs still queued behind the
+        /// batch: a drained queue releases outright, so it would answer every
+        /// one of them before the countdown was ever reached.
+        const BUSY: bool = false;
+        const DRAINED: bool = true;
 
         /// Drives `count` small batches and returns how many asked for a release.
         fn quiet(count: usize, capacity: usize, grown: &mut bool, small: &mut usize) -> usize {
             (0..count)
-                .filter(|_| should_release_batch_buffer(SMALL, capacity, grown, small))
+                .filter(|_| should_release_batch_buffer(SMALL, capacity, BUSY, grown, small))
                 .count()
         }
 
         #[test]
         fn a_grown_buffer_is_released_once_the_burst_has_been_quiet() {
             let (mut grown, mut small) = (false, 0);
-            assert!(!should_release_batch_buffer(BIG, 0, &mut grown, &mut small));
+            assert!(!should_release_batch_buffer(
+                BIG, 0, BUSY, &mut grown, &mut small
+            ));
             assert!(grown, "a large batch must mark the buffer grown");
 
             assert_eq!(
@@ -1330,7 +1369,7 @@ mod tests {
                 "released before the burst was over"
             );
             assert!(should_release_batch_buffer(
-                SMALL, 0, &mut grown, &mut small
+                SMALL, 0, BUSY, &mut grown, &mut small
             ));
             assert!(!grown, "the release must clear the grown flag");
         }
@@ -1339,16 +1378,67 @@ mod tests {
         #[test]
         fn a_large_batch_restarts_the_countdown() {
             let (mut grown, mut small) = (false, 0);
-            should_release_batch_buffer(BIG, 0, &mut grown, &mut small);
+            should_release_batch_buffer(BIG, 0, BUSY, &mut grown, &mut small);
             quiet(SMALL_BATCHES_BEFORE_SHRINK - 1, 0, &mut grown, &mut small);
 
-            should_release_batch_buffer(BIG, 0, &mut grown, &mut small);
+            should_release_batch_buffer(BIG, 0, BUSY, &mut grown, &mut small);
 
             assert_eq!(
                 quiet(SMALL_BATCHES_BEFORE_SHRINK - 1, 0, &mut grown, &mut small),
                 0,
                 "the countdown carried over across a large batch"
             );
+        }
+
+        /// The case the countdown cannot reach: one large batch, then nothing.
+        /// A session that grows the buffer at login and falls silent sends no
+        /// second batch, so a rule that only counts batches holds the
+        /// allocation until the connection drops.
+        #[test]
+        fn a_drained_queue_releases_a_buffer_no_further_batch_would() {
+            let (mut grown, mut small) = (false, 0);
+            assert!(
+                should_release_batch_buffer(BIG, 0, DRAINED, &mut grown, &mut small),
+                "a large batch with nothing queued behind it ends the burst"
+            );
+            assert!(!grown, "the release must clear the grown flag");
+
+            // And the countdown starts clean, rather than carrying a partial
+            // count into whatever the next burst turns out to be.
+            assert_eq!(small, 0);
+        }
+
+        /// The same silence after a frame that failed mid-encrypt: it was
+        /// truncated back out, so the batch has no wire bytes and only the
+        /// capacity names the allocation it grew.
+        #[test]
+        fn a_drained_queue_releases_a_buffer_grown_by_a_truncated_frame() {
+            let (mut grown, mut small) = (false, 0);
+            assert!(should_release_batch_buffer(
+                0,
+                GROWN_CAPACITY,
+                DRAINED,
+                &mut grown,
+                &mut small
+            ));
+        }
+
+        /// A drained queue must not cost a socket that never sent anything
+        /// large: with no allocation to give back, replacing the buffer would
+        /// be a fresh allocation for nothing, on every batch it ever writes.
+        #[test]
+        fn a_drained_queue_does_not_release_a_buffer_that_never_grew() {
+            let (mut grown, mut small) = (false, 0);
+            for _ in 0..SMALL_BATCHES_BEFORE_SHRINK * 4 {
+                assert!(!should_release_batch_buffer(
+                    SMALL,
+                    OUT_BUF_IDLE_CAPACITY,
+                    DRAINED,
+                    &mut grown,
+                    &mut small
+                ));
+            }
+            assert!(!grown);
         }
 
         /// A frame that fails mid-encrypt is truncated out of the buffer, so the
@@ -1361,6 +1451,7 @@ mod tests {
             assert!(!should_release_batch_buffer(
                 0,
                 GROWN_CAPACITY,
+                BUSY,
                 &mut grown,
                 &mut small
             ));
@@ -1378,6 +1469,7 @@ mod tests {
             assert!(should_release_batch_buffer(
                 SMALL,
                 GROWN_CAPACITY,
+                BUSY,
                 &mut grown,
                 &mut small
             ));
@@ -1398,6 +1490,94 @@ mod tests {
             );
             assert!(!grown);
         }
+    }
+
+    /// The bytes an idle socket keeps, asserted on a real `BytesMut`.
+    ///
+    /// A login-sized stanza — an 812-key pre-key upload marshals to 40 799 wire
+    /// bytes — grows the batch buffer past ten times its idle size, and
+    /// `split()` hands the wire bytes to the transport while leaving the
+    /// allocation behind: the next frame reclaims it whole rather than
+    /// allocating. A session that then goes quiet writes no second batch, so
+    /// the batch countdown alone can never give those bytes back.
+    ///
+    /// Driven through the primitives the sender loop uses, in the order it uses
+    /// them, because the loop's own buffer is a local no test can reach.
+    #[tokio::test]
+    async fn an_idle_socket_does_not_keep_the_buffer_its_login_grew() {
+        /// Wire size of the pre-key upload the client sends at login.
+        const LOGIN_STANZA: usize = 40_799;
+
+        /// One turn of the sender loop's buffer lifecycle: encrypt a frame,
+        /// write the batch out, decide on the allocation, then probe what the
+        /// next frame finds waiting. The probe is what makes retention visible
+        /// — `capacity()` reads 0 straight after a `split()`, and the retained
+        /// allocation only reappears when the next write reclaims it.
+        async fn retained_after(queue_drained: bool, stanza_len: usize) -> usize {
+            let key = [0x6bu8; 32];
+            let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+            let write_key = Arc::new(NoiseCipher::new(&key).expect("32-byte key"));
+            let mut write_counter = 0u32;
+            let mut out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
+            let (mut grown, mut small_batches) = (false, 0usize);
+
+            NoiseSocket::encrypt_frame_into(
+                &runtime,
+                &write_key,
+                &mut write_counter,
+                bytes::Bytes::from(vec![0x11u8; stanza_len]),
+                &mut out_buf,
+            )
+            .await
+            .expect("the login stanza must encrypt");
+
+            // The write: the wire bytes leave, and the allocation would not.
+            let batch_wire_len = out_buf.split().freeze().len();
+            if should_release_batch_buffer(
+                batch_wire_len,
+                out_buf.capacity(),
+                queue_drained,
+                &mut grown,
+                &mut small_batches,
+            ) {
+                out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
+            }
+
+            NoiseSocket::encrypt_frame_into(
+                &runtime,
+                &write_key,
+                &mut write_counter,
+                bytes::Bytes::from(vec![0x22u8; 64]),
+                &mut out_buf,
+            )
+            .await
+            .expect("the next frame must encrypt");
+            out_buf.capacity()
+        }
+
+        assert_eq!(
+            retained_after(true, LOGIN_STANZA).await,
+            OUT_BUF_IDLE_CAPACITY,
+            "a socket that goes quiet after login must keep an idle-sized buffer"
+        );
+
+        // The other half of the trade, so a release that fired unconditionally
+        // would not pass either: while work is still queued the burst is not
+        // over, and the allocation it needs stays.
+        assert!(
+            retained_after(false, LOGIN_STANZA).await > LOGIN_STANZA,
+            "a burst still in progress must keep the buffer it grew"
+        );
+
+        // And a socket whose traffic never exceeded the idle capacity pays for
+        // none of this: nothing to release, so nothing to reallocate. It reads
+        // as slightly under the idle capacity rather than at it, because the
+        // probe frame lands in what the batch before it left of the same
+        // allocation instead of reclaiming it.
+        assert!(
+            retained_after(true, 64).await <= OUT_BUF_IDLE_CAPACITY,
+            "a small-frame socket must never have grown in the first place"
+        );
     }
 
     /// Releasing the grown buffer must be invisible on the wire: a burst after
