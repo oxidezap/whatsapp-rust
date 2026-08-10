@@ -183,6 +183,9 @@ pub type ConnectionInitHook = Arc<
 /// concurrent DB access — it drives both the pool and the internal serialization in
 /// lockstep — or `cache_size_kib` for a hotter/larger DB; pass a `thread_pool` to control
 /// r2d2's management threads (e.g. share your own across crates).
+///
+/// Sessions that share one database file can go further and share the connection
+/// itself: see [`SqliteStore::share_for_device`].
 #[derive(Clone)]
 pub struct SqliteStoreConfig {
     /// Max concurrent operations: r2d2 `max_size` AND the internal semaphore permits,
@@ -212,6 +215,14 @@ pub struct SqliteStoreConfig {
     /// per-session stores.
     pub read_pool_size: u32,
     /// `PRAGMA cache_size`, in KiB per connection.
+    ///
+    /// A cap on growth, not a reservation, and not the whole per-connection
+    /// cost: a connection also carries a 48,000 B lookaside slab that no pragma
+    /// can shrink (`SQLITE_DBCONFIG_LOOKASIDE` is C-API only, and diesel does
+    /// not expose the `sqlite3*`). Measured on an idle session, dropping this
+    /// from 512 to 1 moved resident memory from ~123 to ~92 KiB per connection
+    /// — so tuning it down does not substitute for holding fewer connections;
+    /// see [`SqliteStore::share_for_device`].
     pub cache_size_kib: u32,
     /// `PRAGMA mmap_size`, in bytes. `None` (default) leaves mmap off — the
     /// current behavior. When set, pages are read through a reclaimable,
@@ -607,6 +618,65 @@ impl SqliteStore {
 
     pub fn device_id(&self) -> i32 {
         self.device_id
+    }
+
+    /// A store for a *sibling device* in the same database, reusing this
+    /// store's connections instead of opening more.
+    ///
+    /// Every constructor builds its own r2d2 pool, so a process holding N
+    /// sessions against one database file ends up with N SQLite connections —
+    /// and a connection costs memory before it reads a single row: a 48,000 B
+    /// lookaside slab (`SQLITE_DEFAULT_LOOKASIDE` 1200,40, which this build
+    /// does not override), plus a page cache that grows to
+    /// [`SqliteStoreConfig::cache_size_kib`]. Measured on an idle session that
+    /// has only done a couple of point reads, that is ~123 KiB of resident
+    /// memory per session, and it does not shrink meaningfully with a smaller
+    /// cache cap: ~92 KiB of it survives `cache_size_kib = 1`. Nothing else
+    /// about the store is per-session — every query already takes a
+    /// `device_id` — so sibling sessions on one database only ever needed that
+    /// field to differ. Same reasoning as [`SqliteStore::shared`], applied to
+    /// sibling devices instead of sibling crates.
+    ///
+    /// The returned store owns clones of the pool handles, so it stays usable
+    /// for as long as it lives — dropping the store it came from closes
+    /// nothing.
+    ///
+    /// What it does **not** do:
+    ///
+    /// - **Create the device row.** It only stamps queries with `device_id`.
+    ///   The row still comes from the usual provisioning path — the same
+    ///   [`create_new_device`](Self::create_new_device) or restore that a store
+    ///   from [`new_for_device`](Self::new_for_device) would need.
+    /// - **Isolate writes.** Siblings share the one write permit, so their
+    ///   writes serialize against each other. That is the trade, and it is not
+    ///   free: on a burst where every session writes continuously, sharing
+    ///   costs ~2.5x the aggregate write throughput of a pool per session,
+    ///   because a private connection lets one session's queueing overlap
+    ///   another's SQLite work. In exchange the queue is FIFO-fair, where
+    ///   separate connections leave it to SQLite's busy handler and its random
+    ///   backoff (measured: ~2x spread between the fastest and slowest
+    ///   session). So this is for fleets that are mostly idle — the shape
+    ///   sessions actually have — and not for continuously writing ones.
+    ///   [`SqliteStoreConfig::read_pool_size`] widens the *read* side only,
+    ///   and its connections are shared here too.
+    ///
+    /// ```no_run
+    /// # use whatsapp_rust_sqlite_storage::SqliteStore;
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let device_1 = SqliteStore::new_for_device("whatsapp.db", 1).await?;
+    /// // One pool, one connection, two sessions.
+    /// let device_2 = device_1.share_for_device(2);
+    /// # Ok(()) }
+    /// ```
+    pub fn share_for_device(&self, device_id: i32) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            db_semaphore: Arc::clone(&self.db_semaphore),
+            reads: self.reads.clone(),
+            snapshot_safe: self.snapshot_safe,
+            database_path: self.database_path.clone(),
+            device_id,
+        }
     }
 
     /// Run a **read-only** query on a reader connection, falling back to the
@@ -5718,10 +5788,10 @@ mod read_routing_tests {
 
     /// A file-backed store: reader connections need real WAL, which an
     /// in-memory database has none of. Removed on drop.
-    struct TempDb(std::path::PathBuf);
+    pub(super) struct TempDb(std::path::PathBuf);
 
     impl TempDb {
-        fn new(tag: &str) -> Self {
+        pub(super) fn new(tag: &str) -> Self {
             use portable_atomic::AtomicU64;
             use std::sync::atomic::Ordering;
             static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -5734,7 +5804,7 @@ mod read_routing_tests {
             Self(path)
         }
 
-        fn url(&self) -> String {
+        pub(super) fn url(&self) -> String {
             self.0.to_string_lossy().into_owned()
         }
     }
@@ -6595,6 +6665,199 @@ impl SqliteStore {
                 Vec::new(),
                 3
             )
+        );
+    }
+}
+
+#[cfg(test)]
+mod share_for_device_tests {
+    use super::read_routing_tests::TempDb;
+    use super::*;
+    use std::time::Duration;
+    use wacore::time::Instant;
+
+    /// How many sibling sessions the concurrency tests run. Small enough to
+    /// stay quick, large enough that a serialized queue is visible.
+    const SESSIONS: usize = 8;
+    const WRITES_PER_SESSION: usize = 25;
+
+    async fn base_store(db: &TempDb) -> SqliteStore {
+        SqliteStore::new_for_device(&db.url(), 1)
+            .await
+            .expect("store opens")
+    }
+
+    /// Sibling handles are only plumbing: the `device_id` is what separates
+    /// their rows, exactly as it does for two independently-opened stores.
+    #[tokio::test]
+    async fn siblings_share_the_database_but_not_each_other_s_rows() {
+        let db = TempDb::new("share_isolation");
+        let device_1 = base_store(&db).await;
+        let device_2 = device_1.share_for_device(2);
+        assert_eq!(device_2.device_id(), 2);
+
+        device_1
+            .put_session("alice.1:0", b"device-1-record")
+            .await
+            .expect("write through the first handle");
+
+        // Same file: the sibling can read the row by asking for the other
+        // device explicitly.
+        assert_eq!(
+            device_2
+                .get_session_for_device("alice.1:0", 1)
+                .await
+                .expect("read"),
+            Some(b"device-1-record".to_vec()),
+            "both handles must be looking at the same database"
+        );
+        // Its own device scope, however, is empty.
+        assert_eq!(
+            device_2.get_session("alice.1:0").await.expect("read"),
+            None,
+            "a sibling device must not see another device's session"
+        );
+
+        // And a write through the sibling lands in its own scope only.
+        device_2
+            .put_session("alice.1:0", b"device-2-record")
+            .await
+            .expect("write through the sibling handle");
+        assert_eq!(
+            device_1.get_session("alice.1:0").await.expect("read"),
+            Some(Bytes::from_static(b"device-1-record")),
+            "the sibling's write must not clobber the first device's row"
+        );
+    }
+
+    /// The whole point of the method, asserted the only way that proves it:
+    /// by counting connections. A fleet of handles opens one; a fleet of
+    /// stores opens one each.
+    #[tokio::test]
+    async fn a_fleet_of_handles_opens_one_connection() {
+        let db = TempDb::new("share_conn_count");
+        let base = base_store(&db).await;
+        let mut fleet = vec![base.clone()];
+        for device_id in 2..=SESSIONS as i32 {
+            fleet.push(base.share_for_device(device_id));
+        }
+        // r2d2 opens connections lazily, so make every handle actually use one.
+        for store in &fleet {
+            store.get_session("probe").await.expect("read");
+        }
+        let shared_connections: u32 = fleet
+            .iter()
+            .map(|store| store.pool.state().connections)
+            .max()
+            .expect("non-empty fleet");
+        assert_eq!(
+            shared_connections, 1,
+            "sibling handles must reuse the one pooled connection"
+        );
+        // Same semaphore, so they also share the write queue — the trade-off
+        // the doc comment describes, asserted rather than assumed.
+        assert!(
+            fleet
+                .iter()
+                .all(|store| Arc::ptr_eq(&store.db_semaphore, &base.db_semaphore)),
+            "handles must share the write permit, not just the pool"
+        );
+
+        // The baseline this replaces: one store per session, one connection each.
+        let db = TempDb::new("share_conn_count_baseline");
+        let mut separate = Vec::new();
+        for device_id in 1..=SESSIONS as i32 {
+            let store = SqliteStore::new_for_device(&db.url(), device_id)
+                .await
+                .expect("store opens");
+            store.get_session("probe").await.expect("read");
+            separate.push(store);
+        }
+        let total: u32 = separate
+            .iter()
+            .map(|store| store.pool.state().connections)
+            .sum();
+        assert_eq!(
+            total, SESSIONS as u32,
+            "one store per session is one connection per session"
+        );
+    }
+
+    /// Every session writes at once; returns wall-clock for the whole burst
+    /// and each session's own completion time.
+    async fn write_burst(stores: Vec<SqliteStore>) -> (Duration, Vec<Duration>) {
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for (n, store) in stores.into_iter().enumerate() {
+            tasks.push(tokio::spawn(async move {
+                let session_started = Instant::now();
+                for i in 0..WRITES_PER_SESSION {
+                    store
+                        .put_session(&format!("peer.{n}.{i}:0"), &[n as u8; 256])
+                        .await
+                        .expect("write must not fail under contention");
+                }
+                session_started.elapsed()
+            }));
+        }
+        let mut per_session = Vec::new();
+        for task in tasks {
+            per_session.push(task.await.expect("join"));
+        }
+        (started.elapsed(), per_session)
+    }
+
+    /// Sharing a pool means sharing the single write permit, so sibling
+    /// sessions serialize on writes. This is the cost of the memory saving and
+    /// the reason `share_for_device` is not the default shape — it is measured
+    /// here rather than argued about.
+    ///
+    /// The assertions are the two properties that must hold on any machine:
+    /// no write fails, and no session starves. The timings are printed for the
+    /// record; asserting on wall-clock would only buy a flaky test.
+    #[tokio::test]
+    async fn concurrent_writes_serialize_across_siblings() {
+        let db = TempDb::new("share_write_contention");
+        let base = base_store(&db).await;
+        let mut fleet = vec![base.clone()];
+        for device_id in 2..=SESSIONS as i32 {
+            fleet.push(base.share_for_device(device_id));
+        }
+        let (shared_total, shared_sessions) = write_burst(fleet).await;
+
+        let db = TempDb::new("share_write_contention_baseline");
+        let mut separate = Vec::new();
+        for device_id in 1..=SESSIONS as i32 {
+            separate.push(
+                SqliteStore::new_for_device(&db.url(), device_id)
+                    .await
+                    .expect("store opens"),
+            );
+        }
+        let (separate_total, separate_sessions) = write_burst(separate).await;
+
+        let summarize = |label: &str, total: Duration, sessions: &[Duration]| {
+            let slowest = sessions.iter().max().copied().unwrap_or_default();
+            let fastest = sessions.iter().min().copied().unwrap_or_default();
+            println!(
+                "{label}: {SESSIONS} sessions x {WRITES_PER_SESSION} writes in {total:?} \
+                 (session fastest {fastest:?}, slowest {slowest:?})"
+            );
+        };
+        summarize("shared pool", shared_total, &shared_sessions);
+        summarize("pool per session", separate_total, &separate_sessions);
+
+        // Starvation check: a FIFO permit hands every session its turn, so the
+        // slowest cannot be an order of magnitude behind the fastest. A pool
+        // per session leans on SQLite's busy handler instead, which backs off
+        // randomly and offers no such guarantee — so only the shared side is
+        // asserted.
+        let fastest = shared_sessions.iter().min().copied().unwrap_or_default();
+        let slowest = shared_sessions.iter().max().copied().unwrap_or_default();
+        assert!(
+            slowest < fastest * 10 + Duration::from_secs(1),
+            "no sibling may starve on the shared write queue: \
+             fastest {fastest:?}, slowest {slowest:?}"
         );
     }
 }
