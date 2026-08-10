@@ -3260,6 +3260,95 @@ async fn test_stream_error_429_keeps_reconnect_with_backoff() {
     );
 }
 
+/// A rate-limited session parks the client for minutes; without an event the
+/// only trace is the missing connection. WA Web has no 429 arm to copy here
+/// (only 500..600 is special-cased), so this is our own `StreamError` contract
+/// applied consistently, and the neighbours must keep their own events.
+#[tokio::test]
+async fn test_stream_error_429_dispatches_stream_error_event() {
+    use wacore::types::events::{Event, EventHandler};
+
+    let client = create_offline_sync_test_client().await;
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    let node = NodeBuilder::new("stream:error")
+        .attr("code", "429")
+        .children([NodeBuilder::new("text")
+            .attr("text", "rate-overlimit")
+            .build()])
+        .build();
+    client.handle_stream_error(&node.as_node_ref()).await;
+
+    let events = collector.events();
+    let stream_errors: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &**event {
+            Event::StreamError(stream_error) => Some(stream_error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stream_errors.len(),
+        1,
+        "429 must dispatch exactly one StreamError, got {events:?}"
+    );
+    assert_eq!(stream_errors[0].code, "429");
+    let raw = stream_errors[0]
+        .raw
+        .as_ref()
+        .expect("the stanza must ride along so the reason survives");
+    assert_eq!(raw.tag, "stream:error");
+    assert!(
+        raw.get_optional_child("text").is_some(),
+        "the raw stanza must keep the server's children, not just the code"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(**event, Event::LoggedOut(_) | Event::StreamReplaced(_))),
+        "429 is not a logout or a replacement"
+    );
+}
+
+/// The branches either side of 429 keep dispatching what they always did — a
+/// regression here would look like the 429 event working while 516/409 lost
+/// theirs.
+#[tokio::test]
+async fn test_stream_error_neighbours_keep_their_events() {
+    use wacore::types::events::{Event, EventHandler};
+
+    for (code, expect_logged_out) in [("516", true), ("401", true), ("409", false)] {
+        let client = create_offline_sync_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+
+        let node = NodeBuilder::new("stream:error").attr("code", code).build();
+        client.handle_stream_error(&node.as_node_ref()).await;
+
+        let events = collector.events();
+        let matched = events.iter().any(|event| {
+            if expect_logged_out {
+                matches!(**event, Event::LoggedOut(_))
+            } else {
+                matches!(**event, Event::StreamReplaced(_))
+            }
+        });
+        assert!(matched, "{code} lost its event, got {events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(**event, Event::StreamError(_))),
+            "{code} must not also report as a generic StreamError"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_stream_error_503_keeps_reconnect() {
     let client = create_offline_sync_test_client().await;

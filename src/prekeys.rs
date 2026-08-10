@@ -724,6 +724,13 @@ impl Client {
     /// Retry schedule: 1s, 2s, 3s, 5s, 8s, 13s, ... capped at 610s.
     /// Verified against WA Web JS: `{ algo: { type: "fibonacci", first: 1e3, second: 2e3 }, max: 61e4 }`
     ///
+    /// `max` caps the delay, not the attempt count: `WAWebUploadPreKeysJob` ends its
+    /// loop only by calling `endWithValue` on `success`, and its error arms (>=500,
+    /// 406, anything else — 429 lands in the last) all fall through to the same
+    /// retry. So the absence of an attempt limit here is the mirror, not a gap; the
+    /// disconnect bail below is an exit WA Web does not even have (it awaits
+    /// `waitForConnection()` instead).
+    ///
     /// When `force` is true, bypasses the count guard (used by digest repair path).
     pub(crate) async fn upload_pre_keys_with_retry(
         &self,

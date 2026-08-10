@@ -1905,6 +1905,18 @@ impl Client {
                     // Deliberate rate-limit backoff: the stability reset must
                     // not erase it even if the connection had been up >= 30s.
                     self.backoff_reset_suppressed.store(true, Ordering::Relaxed);
+                    // Not fidelity: WA Web (Handle/StreamError.js) special-cases
+                    // only 500..600, so 429 is indistinguishable from any other
+                    // reconnect there — survivable because a human watches the UI.
+                    // An embedder has none, and `StreamError` is the channel every
+                    // other coded branch already reports through. Dispatched after
+                    // the stores so a handler sees the rate-limited session.
+                    self.core.event_bus.dispatch(Event::StreamError(
+                        crate::types::events::StreamError::builder()
+                            .code(code.to_string())
+                            .raw(node.to_owned())
+                            .build(),
+                    ));
                 }
                 "503" => {
                     // Server is going down/restarting: mark logged-out so sends fail
