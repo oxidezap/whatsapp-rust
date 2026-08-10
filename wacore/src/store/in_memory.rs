@@ -320,6 +320,16 @@ impl SignalStore for InMemoryBackend {
 
     async fn store_prekeys_batch(&self, keys: &[(u32, Bytes)], _uploaded: bool) -> Result<()> {
         let mut state = self.state.lock().await;
+        // The batch length is known and every id in it is new: prekey ids are
+        // minted from the monotonic NEXT_PK_ID counter, so a batch never
+        // overwrites a stored row (unlike `put_msg_secrets`, where reserving a
+        // mostly-overwrite batch would grow the table for rows it never adds).
+        // Growing incrementally instead allocates and copies a whole table per
+        // rehash — a connect-sized batch crosses the load factor eight times.
+        // This does NOT shrink the table that stays resident: the final
+        // capacity is the same either way, so it buys allocator traffic and
+        // in-call headroom, not retained bytes.
+        state.prekeys.reserve(keys.len());
         for (id, record) in keys {
             state.prekeys.insert(
                 *id,
@@ -1241,6 +1251,77 @@ mod tests {
             backend.get_session(&second).await.unwrap().unwrap(),
             Bytes::from_static(b"second")
         );
+    }
+
+    /// A connect-sized batch: every id must be readable back, and a later batch
+    /// repeating an id must overwrite it rather than duplicate or drop it. This
+    /// is what pins `store_prekeys_batch` idempotent per id across the reserve.
+    #[tokio::test]
+    async fn store_prekeys_batch_stores_every_key() {
+        const COUNT: u32 = 812;
+        let backend = InMemoryBackend::new();
+
+        let batch: Vec<(u32, Bytes)> = (1..=COUNT)
+            .map(|id| (id, Bytes::from(format!("record-{id}"))))
+            .collect();
+        backend.store_prekeys_batch(&batch, false).await.unwrap();
+
+        for id in 1..=COUNT {
+            assert_eq!(
+                backend.load_prekey(id).await.unwrap(),
+                Some(Bytes::from(format!("record-{id}"))),
+                "prekey {id} must survive the batch write"
+            );
+        }
+        assert_eq!(backend.get_max_prekey_id().await.unwrap(), COUNT);
+
+        backend
+            .store_prekeys_batch(&[(7, Bytes::from_static(b"rewritten"))], true)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.load_prekey(7).await.unwrap(),
+            Some(Bytes::from_static(b"rewritten"))
+        );
+        assert_eq!(
+            backend.state.lock().await.prekeys.len(),
+            COUNT as usize,
+            "re-storing an existing id must not add a row"
+        );
+    }
+
+    /// Reserving for the batch length must leave the table exactly the size the
+    /// row count alone demands — the point of the reserve is to reach that size
+    /// in one allocation, not to reach a bigger one. The control map is grown
+    /// one insert at a time, which is the un-reserved shape; hashbrown sizes a
+    /// table from the element count alone, so the two must agree. The second
+    /// pass covers the reserve landing on an already-populated map, where
+    /// reserving the full batch length on top of the existing rows would be
+    /// visible as a doubled table.
+    #[tokio::test]
+    async fn store_prekeys_batch_reserve_does_not_over_grow_the_table() {
+        const COUNT: u32 = 812;
+        let backend = InMemoryBackend::new();
+        let mut control: HashMap<u32, ()> = HashMap::new();
+
+        for pass in 0..2u32 {
+            let first = pass * COUNT + 1;
+            let batch: Vec<(u32, Bytes)> = (first..first + COUNT)
+                .map(|id| (id, Bytes::from_static(b"record")))
+                .collect();
+            backend.store_prekeys_batch(&batch, false).await.unwrap();
+            for id in first..first + COUNT {
+                control.insert(id, ());
+            }
+
+            let state = backend.state.lock().await;
+            assert_eq!(state.prekeys.len(), control.len());
+            assert_eq!(
+                state.prekeys.capacity(),
+                control.capacity(),
+                "pass {pass}: the reserved table must match an incrementally grown one"
+            );
+        }
     }
 
     #[tokio::test]

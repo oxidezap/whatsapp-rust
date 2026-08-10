@@ -191,6 +191,18 @@ staying alive because the `Bytes` slices handed to `store_prekeys_batch` *are*
 what the backend stores (one allocation instead of 812), and 41 KiB is that
 map's `RawTable` at 1024 buckets. Nothing to optimise; do not re-derive it.
 
+That 41 KiB deserves one clarification, because a heap profiler hands it to you
+under a name that invites the wrong fix. dhat attributes the final table to
+`hashbrown::RawTable::reserve_rehash`, the frame that happened to allocate it,
+so a per-session diff reads "41.0 KiB in reserve_rehash" and looks like rehash
+churn. It is not: 1024 buckets × (`size_of::<(u32, PreKeyEntry)>()` + 1 control
+byte) = 41,984 B is the table that *stays*, and the intermediate tables are all
+freed before the process peak. `store_prekeys_batch` does reserve for the batch
+length (#1266), which cuts the call from 11 allocations / 84.1 KB to 3 / 42.1 KB
+and its in-call transient high-water from 63.1 KB to 42.1 KB — but retained is
+bit-identical at 42,072 B either way, because the final table is the same size.
+Reserving is worth it for the allocator traffic; it will never move the 41 KiB.
+
 **The rustls session cache is 5 KiB, not 44.** A whole retained
 `default_tls_connector()` measures 14.0 KiB; disabling resumption entirely takes
 it to 9.0 KiB, and sizing the store for the one host a factory dials takes it to
