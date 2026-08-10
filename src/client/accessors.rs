@@ -349,6 +349,12 @@ impl Client {
             .len();
         let app_state_key_requests = self.app_state_key_requests.lock().await.len();
         let app_state_syncing = self.app_state_syncing.len();
+        // `get()`, not the builder: a report must not be what constructs the
+        // processor, so an un-synced client still reports zero.
+        let app_state_key_cache = match self.app_state_processor.get() {
+            Some(processor) => processor.cached_key_count().await,
+            None => 0,
+        };
         let (commit_batch_entries, commit_batch_bytes) = self.inbound_commit_batch.pending_stats();
         let inbound_commit_batch =
             CollectionStats::new(commit_batch_entries as u64, commit_batch_bytes as u64);
@@ -451,6 +457,7 @@ impl Client {
             pending_retries: pending_retries_count,
             presence_subscriptions,
             app_state_key_requests,
+            app_state_key_cache,
             app_state_syncing,
             signal_sessions,
             signal_identities,

@@ -491,6 +491,11 @@ pub struct MemoryReport {
     pub pending_retries: usize,
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
+    /// Expanded app-state keys the processor holds in memory. No capacity cap
+    /// and no TTL — one entry per distinct key id the server's patches
+    /// reference, emptied only on reconnect. Zero until the first app-state
+    /// sync builds the processor.
+    pub app_state_key_cache: usize,
     pub app_state_syncing: usize,
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
@@ -643,6 +648,7 @@ impl std::fmt::Display for MemoryReport {
             "  app_state_key_requests: {}",
             self.app_state_key_requests
         )?;
+        writeln!(f, "  app_state_key_cache:    {}", self.app_state_key_cache)?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
         writeln!(f, "--- Signal store caches ---")?;
         for (name, c) in &collections[TTL_BOUNDED..TTL_BOUNDED + SIGNAL_CACHES] {

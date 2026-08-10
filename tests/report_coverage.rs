@@ -76,6 +76,17 @@ const EXEMPT: &[(&str, &str)] = &[
         "the host list from the most recent `<media_conn>` IQ — one server \
          response, replaced wholesale on refresh",
     ),
+    (
+        "ab_props",
+        "server props are filtered against the compile-time `WATCHED` interest \
+         set at parse time, so the map is bounded by that list and not by what \
+         the server sends",
+    ),
+    (
+        "pair_code_state",
+        "one in-flight pairing attempt; its `Vec` is the server's pairing ref, \
+         a handful of bytes, not a collection of entries",
+    ),
 ];
 
 fn manifest_path(relative: &str) -> PathBuf {
@@ -175,6 +186,10 @@ fn crate_type_fields() -> (HashMap<String, Vec<String>>, HashMap<String, Vec<Str
 
     let mut files = Vec::new();
     crate_sources(&manifest_path("src"), &mut files);
+    // `wacore` too: `Client` holds several of its types, and a collection behind
+    // one of those is no less a per-session cost for living in another crate.
+    // `AppStateProcessor`'s unbounded key cache is the one that proved it.
+    crate_sources(&manifest_path("wacore/src"), &mut files);
     let mut defs = HashMap::new();
     let mut aliases = HashMap::new();
     for file in &files {
@@ -183,29 +198,12 @@ fn crate_type_fields() -> (HashMap<String, Vec<String>>, HashMap<String, Vec<Str
         collect(&parsed.items, &mut defs, &mut aliases);
     }
 
-    // Substitute aliases so the lookup below stays one level deep. Aliases are
-    // resolved among themselves first (two rounds cover an alias of an alias,
-    // the deepest chain here), then applied to every type's field idents.
-    fn expand(idents: &[String], aliases: &HashMap<String, Vec<String>>) -> Vec<String> {
-        idents
-            .iter()
-            .flat_map(|ident| match aliases.get(ident) {
-                // A self-referential spelling (`type Cache = Cache<..>`) would
-                // otherwise expand forever without adding anything.
-                Some(target) if target != std::slice::from_ref(ident) => target.clone(),
-                _ => vec![ident.clone()],
-            })
-            .collect()
-    }
-
-    for _ in 0..2 {
-        let snapshot = aliases.clone();
-        for idents in aliases.values_mut() {
-            *idents = expand(idents, &snapshot);
-        }
-    }
+    // Substitute aliases so the lookup below stays one level deep: aliases are
+    // resolved among themselves to a fixed point, then applied to every type's
+    // field idents.
+    flatten_alias_chains(&mut aliases);
     for idents in defs.values_mut() {
-        *idents = expand(idents, &aliases);
+        *idents = resolve_aliases(idents, &aliases);
     }
     // The alias map is returned too: a `Client` field can name one directly
     // (`group_cache: OnceLock<Arc<GroupCache>>` over `type GroupCache =
@@ -214,15 +212,59 @@ fn crate_type_fields() -> (HashMap<String, Vec<String>>, HashMap<String, Vec<Str
     (defs, aliases)
 }
 
-/// `idents` with every alias replaced by what it stands for.
+/// `idents` with every alias replaced, one substitution deep, by what it stands
+/// for. Chains are handled by [`flatten_alias_chains`] having already collapsed
+/// the map, so one pass here is enough.
 fn resolve_aliases(idents: &[String], aliases: &HashMap<String, Vec<String>>) -> Vec<String> {
     idents
         .iter()
         .flat_map(|ident| match aliases.get(ident) {
+            // A self-referential spelling (`type Cache = Cache<..>`) would
+            // otherwise expand forever without adding anything.
             Some(target) if target != std::slice::from_ref(ident) => target.clone(),
             _ => vec![ident.clone()],
         })
         .collect()
+}
+
+/// Collapse `A -> B -> … -> Vec` so every alias maps directly to what it
+/// bottoms out in.
+///
+/// Iterates to a fixed point rather than a fixed number of rounds: a chain
+/// longer than the loop would otherwise leave its tail unresolved, and the
+/// resulting miss looks exactly like "this field holds no collection".
+///
+/// Each round dedups, which is what makes the iteration terminate rather than
+/// blow up. Without it an alias naming another one twice (`type Pair = (Foo,
+/// Foo)`) doubles its ident list every round — with the whole of `wacore` in the
+/// map that is an OOM, not a slow test. Since the question asked of the result
+/// is only *which* idents are reachable, multiplicity carries no information,
+/// so dropping it costs nothing and bounds each list by the number of distinct
+/// idents in the tree.
+fn flatten_alias_chains(aliases: &mut HashMap<String, Vec<String>>) {
+    fn dedup(mut idents: Vec<String>) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        idents.retain(|ident| seen.insert(ident.clone()));
+        idents
+    }
+
+    for idents in aliases.values_mut() {
+        *idents = dedup(std::mem::take(idents));
+    }
+    loop {
+        let snapshot = aliases.clone();
+        let mut changed = false;
+        for idents in aliases.values_mut() {
+            let expanded = dedup(resolve_aliases(idents, &snapshot));
+            if *idents != expanded {
+                *idents = expanded;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
 }
 
 /// How a field reaches a growable: directly in its own type, or through one
@@ -392,6 +434,43 @@ fn a_newtype_or_alias_does_not_hide_its_collection() {
     // selective rather than flagging every crate-local field type.
     assert_eq!(path("SentFrameTap"), None);
     assert_eq!(path("NotAClientFieldTypeAnywhere"), None);
+}
+
+/// An alias chain longer than any fixed number of rounds still bottoms out.
+///
+/// Synthetic rather than drawn from the tree: the real chains are one link, and
+/// the failure this guards against — a longer chain silently reading as "no
+/// collection here" — would arrive with the code that introduced it.
+#[test]
+fn alias_chains_resolve_to_a_fixed_point() {
+    let mut aliases: HashMap<String, Vec<String>> = [
+        ("A", vec!["B"]),
+        ("B", vec!["C"]),
+        ("C", vec!["D"]),
+        ("D", vec!["E"]),
+        ("E", vec!["Arc", "Vec", "u8"]),
+        // Self-shadowing: `type Cache = Cache<..>` re-exports a foreign name and
+        // must not expand forever.
+        ("Cache", vec!["Cache"]),
+    ]
+    .into_iter()
+    .map(|(name, target)| {
+        (
+            name.to_string(),
+            target.into_iter().map(str::to_string).collect(),
+        )
+    })
+    .collect();
+
+    flatten_alias_chains(&mut aliases);
+
+    assert_eq!(aliases["A"], ["Arc", "Vec", "u8"]);
+    assert_eq!(aliases["Cache"], ["Cache"]);
+    assert_eq!(
+        resolve_aliases(&["A".to_string()], &aliases),
+        ["Arc", "Vec", "u8"],
+        "a field naming the head of the chain must reach the Vec at its end"
+    );
 }
 
 /// An exemption must name a field that still exists, so the list cannot rot

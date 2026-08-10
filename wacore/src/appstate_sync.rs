@@ -176,6 +176,18 @@ impl AppStateProcessor {
         *self.key_cache.lock().await = HashMap::new();
     }
 
+    /// Expanded app-state keys held in memory, for `Client::memory_report()`.
+    ///
+    /// The cache has neither a capacity cap nor a TTL: it gains an entry per
+    /// distinct key id the server's patches reference and is emptied only by
+    /// [`Self::clear_key_cache`] on reconnect, so a long-lived connection is its
+    /// only bound. That is why the count is worth reporting — the backend stays
+    /// authoritative, so a cap would be safe here, but nothing has measured how
+    /// many distinct keys a real account accumulates.
+    pub async fn cached_key_count(&self) -> usize {
+        self.key_cache.lock().await.len()
+    }
+
     /// Pre-fetch and cache all keys needed for a patch list.
     async fn prefetch_keys(&self, pl: &PatchList) -> Result<()> {
         let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);

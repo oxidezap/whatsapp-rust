@@ -157,7 +157,10 @@ impl InboundCommitBatcher {
     ///   "waiting to be committed", not "resident". `has_entries` draws the
     ///   same line, for the same reason.
     /// - **The reusable encode arena**, whose lock a drain commit holds across
-    ///   its backend write; a report must not queue behind one.
+    ///   its backend write; a report must not queue behind one. Worth knowing
+    ///   that this hides real memory rather than a transient: the arena is
+    ///   cleared but not shrunk, so one oversized message leaves its capacity
+    ///   resident for the session.
     pub(crate) fn pending_stats(&self) -> (usize, usize) {
         let state = self.lock();
         (state.entries.len(), state.bytes)

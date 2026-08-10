@@ -493,7 +493,7 @@ message can overshoot substantially on its own.
 | `session_locks` / `chat_lanes` / `group_distribution_locks` | 10 000 / 5 000 / 512 | nothing: an `evict_guard` refuses to evict a lock a task holds, so the map briefly exceeds capacity instead of minting a second lock for one key |
 | `resend_rate_limiter` | 4 096, FIFO | fail-open by design — an evicted bucket is recreated full, so undersizing forgives rate, never over-throttles |
 | `group_devices_memo` / `skdm_warm_memo` / `dm_devices_memo` | 64 / 64 / 512 | a recompute |
-| `SignalStoreCache` sessions / identities / sender keys | 2 000 each (+1/8 slack before an eviction scan) | nothing: only *clean* entries are evicted, so an unpersisted record is never dropped |
+| `SignalStoreCache` sessions / identities / sender keys | 2 000 each (+1/8 slack before an eviction scan), *while flushes succeed* | nothing: only *clean* entries are evicted, so an unpersisted record is never dropped — which also means a backend that stops accepting writes leaves everything dirty and the maps grow past the cap. Correct, and the reason to watch the counts rather than trust the number |
 | `SignalStoreCache::sender_key_locks` | 2 000, idle-only | nothing: only locks held solely by the map are dropped |
 | `inbound_commit_batch` | 400 messages / 4 MiB, checked after insert | commits early, no loss; overshoots by one message |
 | `msg_secret_buffer` | 4 096, except on cancellation | nothing: a producer that would exceed it parks on `capacity_available`, and a cancelled one force-buffers past the mark rather than losing captures |
@@ -527,6 +527,13 @@ the bound is a drain or a lifecycle, so the count is the only warning available.
   skip a device refresh and leave the next send to that user addressed to a stale
   device list, so the fix if this ever matters is a removal on the online path,
   not a ceiling.
+- **`AppStateProcessor::key_cache`** — expanded app-state keys, one entry per
+  distinct key id the server's patches reference, with no cap and no TTL;
+  emptied only by `clear_key_cache` on reconnect. The backend stays
+  authoritative, so unlike the three above a cap here would be *safe* — nothing
+  has measured how many distinct keys a real account accumulates, which is why
+  it reports a count instead. It lives in `wacore`, which is why the coverage
+  guard now parses that crate too.
 - **`pending_retries`** — held only for the duration of one retry receipt (a
   `scopeguard` removes it), so the bound is concurrent receipts.
 - **`presence_subscriptions`**, **`response_waiters`**, **`node_waiters`**,
@@ -536,10 +543,16 @@ the bound is a drain or a lifecycle, so the count is the only warning available.
   `async_channel`s whose depth is a stalled-transport signal; capping them would
   drop acks the server is waiting for.
 - **`offline_receipt_buffer`** — drained at the end of every offline batch, and
-  the one entry here the report does *not* count: it is listed in
+  one of two things here the report does *not* count: it is listed in
   `report_coverage.rs`'s `EXEMPT` because its `MessageInfo` values are already
   attributed where the batch owns them. Its depth during a drain is therefore
   invisible; if that ever matters, it needs a field of its own rather than a cap.
+- **The drain commit's encode arena** — the other unreported one, and the only
+  entry on this list that is not a collection: a `Vec<u8>` reused across drain
+  commits. `commit_inbound_batch` clears it but keeps its capacity, so one
+  oversized message leaves that capacity resident for the rest of the session.
+  Unreported because sampling it means taking a lock a commit holds across its
+  backend write. Sizing it is a shrink-after-use question, not a cap question.
 
 Two design rules the audit confirmed, and one place where the second does not
 hold as tightly as the code comments suggest:

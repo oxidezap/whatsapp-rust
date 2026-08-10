@@ -4862,13 +4862,19 @@ async fn memory_report_display_sections_stay_aligned() {
         rendered[history_start..drain_start].contains("history_sync_tasks:"),
         "history_sync_tasks must render under its own heading, got:\n{rendered}"
     );
+    // Bounded to the section, not "somewhere after its heading": an unbounded
+    // slice would keep passing if one of these moved into `Plugins` or `Misc`,
+    // which is exactly the drift this test exists to catch.
+    let drain_end = rendered[drain_start + 1..]
+        .find("\n--- ")
+        .map_or(rendered.len(), |at| drain_start + 1 + at);
     for name in [
         "inbound_commit_batch:",
         "msg_secret_buffer:",
         "pending_device_sync:",
     ] {
         assert!(
-            rendered[drain_start..].contains(name),
+            rendered[drain_start..drain_end].contains(name),
             "{name} must render under the transient-retention heading, got:\n{rendered}"
         );
     }

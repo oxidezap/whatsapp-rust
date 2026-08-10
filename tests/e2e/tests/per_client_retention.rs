@@ -86,6 +86,47 @@ fn median(mut v: Vec<isize>) -> isize {
     v[v.len() / 2]
 }
 
+/// The counter itself, since every figure below is only as good as it is.
+///
+/// Not `#[ignore]`d, unlike the measurements: this one is fast, deterministic
+/// and is the thing a reader has to trust. Bounds rather than equalities,
+/// because `LIVE` is process-wide and the harness threads allocate too — one
+/// large allocation makes that noise irrelevant to the assertions.
+#[test]
+fn the_allocator_counts_what_it_hands_out() {
+    const SIZE: usize = 4 * 1024 * 1024;
+
+    let (buffer, alloc_bytes) = retained(|| vec![0u8; SIZE]);
+    assert!(
+        alloc_bytes >= SIZE as isize,
+        "an allocation must raise the live count by at least its size, got {alloc_bytes}"
+    );
+
+    // realloc: growing in place or by copy must be counted as the delta, not as
+    // a second whole allocation.
+    let (grown, realloc_bytes) = retained(|| {
+        let mut buffer = buffer;
+        buffer.resize(SIZE * 2, 0);
+        buffer
+    });
+    assert!(
+        realloc_bytes >= SIZE as isize,
+        "growing by SIZE must raise the count by about SIZE, got {realloc_bytes}"
+    );
+    assert!(
+        realloc_bytes < (2 * SIZE) as isize,
+        "growing by SIZE must not be counted as a fresh 2*SIZE allocation, got {realloc_bytes}"
+    );
+
+    let before_drop = live();
+    drop(grown);
+    let freed = before_drop - live();
+    assert!(
+        freed >= (2 * SIZE) as isize,
+        "dropping must return the whole allocation to the count, got {freed}"
+    );
+}
+
 /// What the two per-client bounded queues cost, and what fraction of a client
 /// that is.
 ///
