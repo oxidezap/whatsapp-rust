@@ -805,12 +805,23 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// `Arc<dyn HttpClient>`, so a process running several bots can give them
     /// all one client instead of one apiece.
     ///
-    /// Without this, every bot gets its own — the `ureq-client` default builds
-    /// a fresh [`UreqHttpClient`](crate::http::UreqHttpClient) per builder — and
-    /// each one retains a connection pool once it has transferred media. That
-    /// is ~36 KiB of live heap per bot over plain HTTP and more over TLS, paid
-    /// again for every session in the process. (An idle session pays nothing:
-    /// the version fetch sends `Connection: close`, so it pools nothing.)
+    /// This is the only route for a client that is not `Clone`, or one erased to
+    /// `Arc<dyn HttpClient>` because the host picks it at runtime — nothing
+    /// implements [`HttpClient`](crate::http::HttpClient) for `Arc<dyn
+    /// HttpClient>`, so such a client could not reach `with_http_client` at all.
+    /// A concrete `Clone` client needs neither: cloning
+    /// [`UreqHttpClient`](crate::http::UreqHttpClient) shares its `ureq::Agent`
+    /// and therefore its pool, so `with_http_client(shared.clone())` already
+    /// shares (see `agent_docs/observability.md`). What this setter adds there
+    /// is one instance rather than N clones of one, and parity with
+    /// [`ClientBuilder::with_http_client_arc`](crate::client::ClientBuilder::with_http_client_arc).
+    ///
+    /// Sharing by either route is worth it because the *default* is per-bot:
+    /// every builder calls its own `UreqHttpClient::new()`, and each retains a
+    /// connection pool once it has transferred media — ~36 KiB of live heap per
+    /// bot over plain HTTP and more over TLS, paid again for every session in
+    /// the process. (An idle session pays nothing: the version fetch sends
+    /// `Connection: close`, so it pools nothing.)
     ///
     /// # What sharing implies
     ///
@@ -818,18 +829,30 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// that is a trade, not a free win:
     ///
     /// - **It does not serialize.** `ureq::Agent` holds its pool lock only
-    ///   across checkout, so concurrent requests through one client overlap;
-    ///   `whatsapp-rust-ureq-http-client` pins this at 64 requests in flight at
-    ///   once. Each request still occupies one `spawn_blocking` thread, exactly
-    ///   as it does with a client per bot.
+    ///   across checkout, so concurrent requests through one client overlap.
+    ///   `whatsapp-rust-ureq-http-client`'s
+    ///   `a_shared_client_runs_concurrent_requests_concurrently` holds 64 of
+    ///   them in flight at once against a server that answers none until all 64
+    ///   have arrived. Each request still occupies one `spawn_blocking` thread,
+    ///   exactly as it does with a client per bot.
     /// - **The idle pool is capped per agent, not per bot.** `UreqHttpClient`'s
-    ///   default agent retains 3 idle connections (2 per host), which one bot
+    ///   default agent retains 3 idle connections and 2 per host, which one bot
     ///   fills and a fleet contends over: 8 concurrent workers sharing the
     ///   default agent reused 79% of their connections where a client each
     ///   reused 95%. Size the pool for the fleet — build a `ureq::Agent` with
-    ///   `max_idle_connections` at the intended concurrency and pass
-    ///   `UreqHttpClient::with_agent(agent)` — and the reuse rate comes back to
-    ///   95% while the per-bot retention stays collapsed into one pool.
+    ///   **both** `max_idle_connections` and `max_idle_connections_per_host` at
+    ///   the intended concurrency, and pass `UreqHttpClient::with_agent(agent)`.
+    ///   Both, because a fleet's media requests converge on the same CDN
+    ///   authority, so the per-host cap binds first and raising only the global
+    ///   one changes nothing. Sized that way the reuse rate comes back to 95%
+    ///   while the per-bot retention stays collapsed into one pool.
+    /// - **Sessions stop being isolated at the TLS layer.** Media URLs carry
+    ///   their auth per request and the client sends no cookies, so a shared
+    ///   connection carries nothing between sessions that the shared source IP
+    ///   does not already carry — except TLS session resumption, which lets a
+    ///   server link two sessions even across a source-IP change. That is why
+    ///   sharing is opt-in rather than the default, and it is the reason to
+    ///   weigh before opting in for the memory alone.
     ///
     /// # Example
     /// ```rust,ignore

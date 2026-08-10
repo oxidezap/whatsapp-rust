@@ -355,6 +355,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+    use std::time::Duration;
 
     fn spawn_fixed_size_server(body_size: usize) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -527,7 +528,7 @@ mod tests {
         assert_eq!(resp.status_code, 200);
 
         let (headers, body) = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(5))
             .expect("server should capture the request");
         assert_eq!(
             parsed_content_length(&headers),
@@ -564,7 +565,7 @@ mod tests {
         assert_eq!(resp.status_code, 200);
 
         let (headers, body) = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(10))
             .expect("server should capture the request");
         assert_eq!(parsed_content_length(&headers), Some(payload.len()));
         assert_eq!(body, payload);
@@ -1100,15 +1101,110 @@ mod tests {
         assert_eq!(resp.status_code, 403);
     }
 
+    /// How long the gate below waits for its peers before giving up. Long
+    /// enough that a loaded runner never trips it, short enough that the whole
+    /// failure still lands inside nextest's 60s slow warning.
+    const GATE_DEADLINE: Duration = Duration::from_secs(20);
+
+    /// A [`std::sync::Barrier`] that gives up instead of waiting forever.
+    ///
+    /// `Barrier::wait` is the natural fit — release only once `n` callers have
+    /// arrived — but a barrier that is one caller short blocks every thread on
+    /// it for good. That turns the regression this fixture exists to catch into
+    /// a hung CI job rather than a verdict: nextest's default profile
+    /// deliberately warns on a slow test without killing it
+    /// (`.config/nextest.toml`), so nothing upstream would cut the wait short.
+    ///
+    /// So the release is sticky and has a deadline. Sticky because a serialized
+    /// client arrives one request at a time: without it, each of the `n`
+    /// stragglers would serve its own full deadline and the failure would take
+    /// `n` times longer than the diagnosis needs. Whoever trips the deadline
+    /// records it, and the test asserts on that — a named failure instead of a
+    /// wait with no end.
+    #[derive(Default)]
+    struct Gate {
+        state: std::sync::Mutex<GateState>,
+        released: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct GateState {
+        arrived: usize,
+        open: bool,
+        starved: bool,
+    }
+
+    impl Gate {
+        fn wait(&self, n: usize, deadline: Duration) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.arrived += 1;
+            if state.arrived >= n || state.open {
+                state.open = true;
+                self.released.notify_all();
+                return;
+            }
+            let (mut state, timeout) = self
+                .released
+                .wait_timeout_while(state, deadline, |state| !state.open)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if timeout.timed_out() {
+                state.starved = true;
+                state.open = true;
+                self.released.notify_all();
+            }
+        }
+
+        fn starved(&self) -> bool {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .starved
+        }
+    }
+
+    /// The escape hatch itself: a peer that never arrives ends the wait at the
+    /// deadline and records it, which is what turns the regression below into a
+    /// failure instead of a hang. Worth its own test because nothing else
+    /// exercises it — the concurrency test only ever takes the happy path.
+    #[test]
+    fn the_gate_gives_up_instead_of_waiting_forever() {
+        let gate = Gate::default();
+        gate.wait(2, Duration::from_millis(50));
+        assert!(
+            gate.starved(),
+            "a peer that never arrives must end the wait"
+        );
+    }
+
+    /// And the other side of it: real peers release the gate without tripping
+    /// the deadline, so the assertion above cannot pass vacuously.
+    #[test]
+    fn the_gate_releases_once_its_peers_arrive() {
+        let gate = Arc::new(Gate::default());
+        let peer = Arc::clone(&gate);
+        let joined = thread::spawn(move || peer.wait(2, GATE_DEADLINE));
+        gate.wait(2, GATE_DEADLINE);
+        joined.join().expect("peer thread");
+
+        assert!(
+            !gate.starved(),
+            "both arrived, so nothing should have starved"
+        );
+    }
+
     /// Answers nothing until `n` requests have arrived, so the test can only
-    /// finish if all `n` were in flight at the same time.
-    fn spawn_barrier_server(n: usize) -> String {
+    /// pass if all `n` were in flight at the same time.
+    fn spawn_barrier_server(n: usize) -> (String, Arc<Gate>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().unwrap();
-        let barrier = Arc::new(std::sync::Barrier::new(n));
+        let gate = Arc::new(Gate::default());
+        let server_gate = Arc::clone(&gate);
         thread::spawn(move || {
             while let Ok((mut stream, _)) = listener.accept() {
-                let barrier = Arc::clone(&barrier);
+                let gate = Arc::clone(&server_gate);
                 thread::spawn(move || {
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 1024];
@@ -1121,12 +1217,14 @@ mod tests {
                             break;
                         }
                     }
-                    barrier.wait();
+                    gate.wait(n, GATE_DEADLINE);
+                    // Answered even when the gate timed out, so the client side
+                    // finishes and the assertion — not the wait — is what fails.
                     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
                 });
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), gate)
     }
 
     /// One client shared by a fleet must not become a fleet-wide lock.
@@ -1139,13 +1237,15 @@ mod tests {
     /// agent ever serialized, request 1 would block forever waiting for a
     /// response the server only sends once request N has arrived.
     ///
-    /// Deliberately more concurrent than the agent's 3-connection idle pool:
-    /// the cap bounds what is *retained* between requests, and reading it as a
-    /// concurrency limit is the mistake this pins down.
+    /// `N` is deliberately far above the agent's 3-connection idle pool: that
+    /// cap bounds what is *retained* between requests, and reading it as a
+    /// concurrency limit is the mistake this pins down. It is also the figure
+    /// `BotBuilder::with_http_client_arc` quotes, so the doc there is only ever
+    /// claiming what this test actually holds — raise one and raise the other.
     #[tokio::test(flavor = "current_thread")]
     async fn a_shared_client_runs_concurrent_requests_concurrently() {
-        const N: usize = 8;
-        let url = spawn_barrier_server(N);
+        const N: usize = 64;
+        let (url, gate) = spawn_barrier_server(N);
         let client = Arc::new(UreqHttpClient::new());
 
         let mut handles = Vec::with_capacity(N);
@@ -1158,9 +1258,15 @@ mod tests {
             let response = handle
                 .await
                 .expect("request task")
-                .expect("the barrier only releases once every request is in flight");
+                .expect("every request should reach the fixture");
             assert_eq!(response.status_code, 200);
         }
+
+        assert!(
+            !gate.starved(),
+            "the gate timed out: fewer than {N} requests were ever in flight at once, \
+             so the shared agent serialized them"
+        );
     }
 
     #[test]
