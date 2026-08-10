@@ -1307,6 +1307,13 @@ pub struct Client {
     /// pause is never published — even when a [`Client::resume`] landed while it
     /// was still handshaking and left the flag reading `false` throughout.
     pub(crate) pause_generation: AtomicU64,
+    /// Held across the connect graph's final refusal-check-and-publish and
+    /// across [`Client::pause`]'s capture of what it is tearing down, so a pause
+    /// cannot read "no connection" from an attempt one statement short of
+    /// publishing one. Deliberately covers flag and slot writes only — never
+    /// network I/O — so it cannot become the kind of wait that parks a caller
+    /// behind an unresponsive socket.
+    pub(crate) connection_publish: Mutex<()>,
     /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
     /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
     pub(crate) auto_reconnect_errors: Arc<AtomicU32>,

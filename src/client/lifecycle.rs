@@ -236,6 +236,7 @@ impl Client {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if self.connection_generation.load(Ordering::SeqCst) != expected_generation
                     || self.expected_disconnect.load(Ordering::Acquire)
+                    || self.is_paused()
                 {
                     debug!(
                         "Skipping Connected dispatch after generation {expected_generation} retired"
@@ -254,8 +255,13 @@ impl Client {
             .login_transition
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // `paused` alongside the retirement checks: a pause spends up to four
+        // seconds flushing before it closes the socket, and a post-login task
+        // finishing in that window passes its generation check and would
+        // announce a session that is being taken offline.
         if self.connection_generation.load(Ordering::SeqCst) != expected_generation
             || self.expected_disconnect.load(Ordering::Acquire)
+            || self.is_paused()
         {
             debug!("Skipping Connected dispatch after its connection retired");
             return;
@@ -459,6 +465,7 @@ impl Client {
             pause_state_notifier: Arc::new(event_listener::Event::new()),
             pause_teardown_pending: AtomicBool::new(false),
             pause_generation: AtomicU64::new(0),
+            connection_publish: Mutex::new(()),
             auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
             connected_at_ms: Arc::new(AtomicI64::new(0)),
             backoff_reset_suppressed: Arc::new(AtomicBool::new(false)),
@@ -666,6 +673,10 @@ impl Client {
                         // this is the teardown reporting itself.
                         ConnectError::Paused => {
                             debug!("Connect abandoned, the session is paused.");
+                            // Retracted by a pause, so no backoff is owed even
+                            // if a resume has already cleared the flag this
+                            // branch cannot see any more.
+                            self.pause_teardown_pending.store(true, Ordering::Relaxed);
                         }
                         ConnectError::Handshake(e) if e.is_transient() => {
                             debug!("Transient connect failure, will retry: {connect_err:#}");
@@ -1122,25 +1133,42 @@ impl Client {
         self.authenticated_generation
             .store(NO_AUTHENTICATED_GENERATION, Ordering::SeqCst);
 
-        *self.transport.lock().await = Some(transport);
-        *self.transport_events.lock().await = Some(transport_events);
-        *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = Some(noise_socket);
+        // The final refusal, the publish and the connected flag are one section,
+        // taken against `pause()`'s own capture. Checked and then published
+        // without it, a pause landing between the two reads `is_connected` as
+        // false and captures no transport, while this goes on to publish and
+        // flag a connection nothing will ever tear down. Nothing here awaits
+        // network I/O — the slot writes are the whole of it — so this is not the
+        // hazard the pause/resume ordering lock was.
+        let orphan = {
+            let _publish = self.connection_publish.lock().await;
 
-        // The last word, because the slot locks above are the final awaits a
-        // shutdown could land across, and `signal_shutdown_sync` runs no
-        // cleanup of its own. Nothing has been announced yet, so undoing the
-        // publish here is the whole retraction.
-        if let Some(refusal) = self.connect_refusal(attempt_pause_generation) {
-            let orphan = self.transport.lock().await.take();
-            *self.transport_events.lock().await = None;
-            *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            *self.transport.lock().await = Some(transport);
+            *self.transport_events.lock().await = Some(transport_events);
+            *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = Some(noise_socket);
+
+            // Nothing has been announced yet, so undoing the publish is the
+            // whole retraction.
+            match self.connect_refusal(attempt_pause_generation) {
+                Some(refusal) => {
+                    let orphan = self.transport.lock().await.take();
+                    *self.transport_events.lock().await = None;
+                    *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                    Some((orphan, refusal))
+                }
+                None => {
+                    self.is_connected.store(true, Ordering::Release);
+                    None
+                }
+            }
+        };
+        // Closed outside the section: this one does write to the network.
+        if let Some((orphan, refusal)) = orphan {
             if let Some(orphan) = orphan {
                 orphan.disconnect().await;
             }
             return Err(refusal);
         }
-
-        self.is_connected.store(true, Ordering::Release);
 
         // Notify waiters that socket is ready (before login)
         self.socket_ready_notifier.notify(usize::MAX);
@@ -1411,40 +1439,51 @@ impl Client {
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.cancel_active_scope();
         }
-        // Before the teardown, so the run loop cannot reach its post-connection
-        // branches and start a backoff for a connection that is not coming back
-        // on its own.
-        self.paused.store(true, Ordering::SeqCst);
-        // Both flags describe the connection this call is ending, so both are
-        // set only when there is one. `intentional_reconnect` keeps a requested
-        // drop out of `Event::Disconnected` — set with no reader running,
-        // nothing consumes it and it would stand into the connection *after*
-        // the resume, whose first genuine drop would then go unreported.
-        // `pause_teardown_pending` is what tells the run loop this teardown owes
-        // no backoff even if a `resume()` beats it to the branch.
-        // Bumped before anything else, so an attempt already in flight is
-        // refused at its next checkpoint whether or not a resume has landed by
-        // then.
-        let this_pause = self.pause_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let had_connection = self.is_connected();
-        if had_connection {
-            self.intentional_reconnect.store(true, Ordering::Relaxed);
+        // One section with `connect_graph`'s publish, so this call cannot read
+        // "no connection" from an attempt that is a statement away from
+        // publishing one. Everything in here is a flag or a slot read; the
+        // flushes and the socket close are outside it.
+        let (had_connection, torn_down) = {
+            let _publish = self.connection_publish.lock().await;
+
+            // Before the teardown, so the run loop cannot reach its
+            // post-connection branches and start a backoff for a connection that
+            // is not coming back on its own. Bumped with it, so an attempt
+            // already in flight is refused at its next checkpoint whether or not
+            // a resume has landed by then.
+            self.paused.store(true, Ordering::SeqCst);
+            self.pause_generation.fetch_add(1, Ordering::SeqCst);
+
+            let had_connection = self.is_connected();
+            // `intentional_reconnect` keeps a requested drop out of
+            // `Event::Disconnected`, and is set only when there is a connection
+            // to consume it: with no reader running it would stand into the
+            // connection *after* the resume, whose first genuine drop would then
+            // go unreported.
+            if had_connection {
+                self.intentional_reconnect.store(true, Ordering::Relaxed);
+            }
+            // Not conditional on that, though. It says "the end of this attempt
+            // owes no backoff", and an attempt refused before it ever published
+            // a connection owes one just as little — otherwise a pause and
+            // resume that both land mid-connect leave the loop serving a delay
+            // of up to the 900s cap for a retraction the application asked for.
             self.pause_teardown_pending.store(true, Ordering::Relaxed);
-        }
+
+            // Bound to the connection this call is ending, before the first
+            // await. The flushes below are bounded but not instant, and a
+            // `resume()` landing across them can have the run loop publish a
+            // replacement into this slot — a lookup made afterwards would close
+            // the connection the resume just asked for.
+            let torn_down = self.transport.lock().await.clone();
+            (had_connection, torn_down)
+        };
         // Two audiences: `session_state_notifier` for work parked in
         // `await_connection`, which must re-read a reachability that this call
         // has just changed, and the pause notifier for a run loop sitting in a
         // reconnect backoff it should no longer be serving.
         self.notify_session_state();
         self.pause_state_notifier.notify(usize::MAX);
-
-        // Bound to the connection this call is ending, before the first await.
-        // The flushes below are bounded but not instant, and a `resume()` landing
-        // across them can have the run loop publish a replacement into this slot
-        // — so a lookup made afterwards would close the connection the resume
-        // just asked for instead of the one being torn down. Which socket this
-        // call owns is decided here, where the answer is still unambiguous.
-        let torn_down = self.transport.lock().await.clone();
 
         // Same durable-before-receipts gate as disconnect().
         if self
@@ -1459,7 +1498,7 @@ impl Client {
             .await;
         self.notify_connection_shutdown();
 
-        if let Some(transport) = torn_down {
+        if let Some(transport) = &torn_down {
             transport.disconnect().await;
         }
 
@@ -1471,15 +1510,17 @@ impl Client {
         // is how the client asks whether anything is reading; when nothing is,
         // this call owns the cleanup.
         //
-        // Only while this pause is still the standing one, though: cleanup
-        // clears the connection state wholesale, and a `resume()` across the
-        // awaits above means the state it would clear belongs to the connection
-        // that resume asked for, not to the one this call tore down.
-        if had_connection
-            && !self.is_running.load(Ordering::Relaxed)
-            && self.is_paused()
-            && self.pause_generation.load(Ordering::SeqCst) == this_pause
-        {
+        // Gated on identity, not on the pause still standing: cleanup clears
+        // connection state wholesale, so the question is whether the state still
+        // belongs to the connection this call tore down. Asking "am I still
+        // paused" instead got that wrong in both directions — it skipped the
+        // cleanup after an overlapping resume, leaving a direct caller flagged
+        // connected for good, and it would have run it for a replacement.
+        let still_ours = match (&torn_down, &*self.transport.lock().await) {
+            (Some(mine), Some(published)) => Arc::ptr_eq(mine, published),
+            _ => false,
+        };
+        if had_connection && !self.is_running.load(Ordering::Relaxed) && still_ours {
             self.cleanup_connection_state().await;
         }
     }
@@ -1948,6 +1989,14 @@ impl Connection<'_> {
         let owns_reader = !this.client.is_running.swap(true, Ordering::SeqCst);
         let _release_reader = owns_reader.then(|| {
             scopeguard::guard((), |_| {
+                // Only the run loop consumes the pause marker, and this path is
+                // not it. Left standing, a later `resume(); run()` would carry
+                // it into the new session and let its first genuine failure pass
+                // as a planned pause — clearing the counter and retrying at once
+                // instead of honouring the backoff, rate-limit penalty included.
+                this.client
+                    .pause_teardown_pending
+                    .store(false, Ordering::Relaxed);
                 this.client.stop_supervision_loop();
             })
         });
@@ -2715,6 +2764,58 @@ mod tests {
         assert!(
             !matches!(after, Ok(Err(ConnectError::AlreadyConnected))),
             "so resuming can connect again, got {after:?}"
+        );
+    }
+
+    /// The cleanup for an unread connection has to survive a `resume()` landing
+    /// across the teardown. Gated on the pause still standing, it did not: the
+    /// resume cleared the flag, the only cleanup path was skipped, and a caller
+    /// who had connected directly was left flagged connected for good with every
+    /// later `connect()` refused as `AlreadyConnected` — a resume that cannot
+    /// reconnect. Identity is the right question, and the answer is the same
+    /// either way: the state is this call's to clear because the socket it tore
+    /// down is still the published one.
+    #[tokio::test]
+    async fn a_resume_across_the_teardown_does_not_strand_an_unread_connection() {
+        let client = crate::test_utils::create_test_client().await;
+        let (transport, _entered, release, _closes) = parked_transport();
+        drop(release);
+        *client.transport.lock().await = Some(transport);
+        // What `connect()` leaves for a `Connection` nobody drives.
+        client.set_connected_for_test(true);
+        assert!(!client.is_running.load(Ordering::Relaxed), "and no reader");
+
+        let in_flight = client
+            .outbound_flush
+            .try_track()
+            .expect("the flush scope must be open on a fresh client");
+        let pausing = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.pause().await }
+        });
+        crate::test_utils::poll_until("the pause to reach its outbound flush", || {
+            client.outbound_flush.flush_waiters() >= 1
+        })
+        .await;
+
+        // The overlap: the application changes its mind mid-teardown.
+        client.resume();
+
+        drop(in_flight);
+        tokio::time::timeout(Duration::from_secs(10), pausing)
+            .await
+            .expect("the pause must finish once its flush drains")
+            .expect("the pause task must not panic");
+
+        assert!(
+            !client.is_connected(),
+            "the torn-down connection must not be left published"
+        );
+        assert!(client.transport.lock().await.is_none());
+        let after = tokio::time::timeout(Duration::from_secs(5), client.connect()).await;
+        assert!(
+            !matches!(after, Ok(Err(ConnectError::AlreadyConnected))),
+            "so the resumed session can connect, got {after:?}"
         );
     }
 
