@@ -1425,7 +1425,7 @@ impl Client {
         // Bumped before anything else, so an attempt already in flight is
         // refused at its next checkpoint whether or not a resume has landed by
         // then.
-        self.pause_generation.fetch_add(1, Ordering::SeqCst);
+        let this_pause = self.pause_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let had_connection = self.is_connected();
         if had_connection {
             self.intentional_reconnect.store(true, Ordering::Relaxed);
@@ -1437,6 +1437,14 @@ impl Client {
         // reconnect backoff it should no longer be serving.
         self.notify_session_state();
         self.pause_state_notifier.notify(usize::MAX);
+
+        // Bound to the connection this call is ending, before the first await.
+        // The flushes below are bounded but not instant, and a `resume()` landing
+        // across them can have the run loop publish a replacement into this slot
+        // — so a lookup made afterwards would close the connection the resume
+        // just asked for instead of the one being torn down. Which socket this
+        // call owns is decided here, where the answer is still unambiguous.
+        let torn_down = self.transport.lock().await.clone();
 
         // Same durable-before-receipts gate as disconnect().
         if self
@@ -1451,8 +1459,7 @@ impl Client {
             .await;
         self.notify_connection_shutdown();
 
-        let transport = self.transport.lock().await.clone();
-        if let Some(transport) = transport {
+        if let Some(transport) = torn_down {
             transport.disconnect().await;
         }
 
@@ -1463,7 +1470,16 @@ impl Client {
         // every later `connect()` refused as `AlreadyConnected`. `is_running`
         // is how the client asks whether anything is reading; when nothing is,
         // this call owns the cleanup.
-        if had_connection && !self.is_running.load(Ordering::Relaxed) {
+        //
+        // Only while this pause is still the standing one, though: cleanup
+        // clears the connection state wholesale, and a `resume()` across the
+        // awaits above means the state it would clear belongs to the connection
+        // that resume asked for, not to the one this call tore down.
+        if had_connection
+            && !self.is_running.load(Ordering::Relaxed)
+            && self.is_paused()
+            && self.pause_generation.load(Ordering::SeqCst) == this_pause
+        {
             self.cleanup_connection_state().await;
         }
     }
@@ -2699,6 +2715,63 @@ mod tests {
         assert!(
             !matches!(after, Ok(Err(ConnectError::AlreadyConnected))),
             "so resuming can connect again, got {after:?}"
+        );
+    }
+
+    /// Which socket a pause owns is decided when it starts, not when it gets
+    /// round to closing one. Its flushes are bounded but not instant, and a
+    /// `resume()` landing across them lets the run loop publish a replacement
+    /// into the same slot — so a teardown that looked the slot up afterwards
+    /// would close the connection the resume had just asked for, and the
+    /// resumed session would die on arrival.
+    #[tokio::test]
+    async fn a_pause_closes_the_socket_it_started_with_not_whatever_replaced_it() {
+        let client = crate::test_utils::create_test_client().await;
+        let (torn_down, _torn_entered, torn_release, torn_closes) = parked_transport();
+        drop(torn_release); // the ordinary prompt close
+        let (replacement, _repl_entered, repl_release, repl_closes) = parked_transport();
+        drop(repl_release);
+        *client.transport.lock().await = Some(torn_down);
+
+        // Holds the outbound flush open, which is where `pause()` waits — the
+        // window a resume and a fresh connection fit into.
+        let in_flight = client
+            .outbound_flush
+            .try_track()
+            .expect("the flush scope must be open on a fresh client");
+
+        let pausing = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.pause().await }
+        });
+        crate::test_utils::poll_until("the pause to reach its outbound flush", || {
+            client.outbound_flush.flush_waiters() >= 1
+        })
+        .await;
+
+        // Exactly what a resume plus a fresh connection leave behind.
+        client.resume();
+        *client.transport.lock().await = Some(replacement);
+
+        drop(in_flight);
+        tokio::time::timeout(Duration::from_secs(10), pausing)
+            .await
+            .expect("the pause must finish once its flush drains")
+            .expect("the pause task must not panic");
+
+        assert_eq!(
+            torn_closes.load(Ordering::SeqCst),
+            1,
+            "the pause closes the socket it set out to close"
+        );
+        assert_eq!(
+            repl_closes.load(Ordering::SeqCst),
+            0,
+            "and never the one the resume asked for"
+        );
+        assert!(
+            client.transport.lock().await.is_some(),
+            "which is left published for the resumed session to use"
         );
     }
 
