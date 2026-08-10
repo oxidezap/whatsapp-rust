@@ -668,6 +668,14 @@ impl Client {
             // verdict read here guarantees the cleared flag is visible to the
             // load beside it. That covers the window where the stores have
             // landed but the latch's notify has not.
+            //
+            // What is left is a `disconnect()` that *begins* after this question
+            // has been answered, and no check placed earlier can observe one:
+            // the lines below report the state at the moment they are written,
+            // which is all a log can do. The loop is still correct there — the
+            // `while` condition, and the shutdown the backoff races, both see
+            // it — so the cost is one already-stale line, not a session that
+            // fails to end.
             if shutdown.is_fired()
                 || !self.is_running.load(Ordering::Relaxed)
                 || (self.expected_disconnect.load(Ordering::Acquire)
