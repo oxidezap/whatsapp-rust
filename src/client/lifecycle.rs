@@ -46,8 +46,7 @@ impl Client {
     /// for `Drop` impls on FFI wrappers (e.g. `WasmWhatsAppClient`) that
     /// can't run async cleanup synchronously.
     pub fn signal_shutdown_sync(&self) {
-        self.expected_disconnect.store(true, Ordering::Relaxed);
-        self.is_running.store(false, Ordering::Relaxed);
+        self.publish_terminal_verdict();
         self.shutdown_notifier.notify();
         self.notify_session_state();
         #[cfg(feature = "client-lifecycle")]
@@ -55,6 +54,21 @@ impl Client {
             lifecycle.signal_shutdown_sync();
         }
         self.notify_connection_shutdown();
+    }
+
+    /// Publish "the session is over, and no reconnect follows" as one
+    /// transition.
+    ///
+    /// The order and the `Release` are the whole point, and pair with the
+    /// `Acquire` load in [`run`](Self::run)'s expected-disconnect branch: that
+    /// branch reads `expected_disconnect` first and `is_running` second, so the
+    /// reader flag has to be cleared *before* the verdict is published. Stored
+    /// the other way round — or both `Relaxed`, as they were — the branch can
+    /// read a torn pair, see a planned end with a reader still live, and
+    /// announce a reconnect that this call has already ruled out.
+    fn publish_terminal_verdict(&self) {
+        self.is_running.store(false, Ordering::Relaxed);
+        self.expected_disconnect.store(true, Ordering::Release);
     }
 
     pub(crate) fn connection_shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
@@ -624,8 +638,24 @@ impl Client {
                 break;
             }
 
-            // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately
-            if self.expected_disconnect.load(Ordering::Relaxed) {
+            // If this was an expected disconnect (e.g., 515 after pairing), reconnect immediately.
+            //
+            // Acquire, paired with the Release in `disconnect`/`signal_shutdown_sync`:
+            // those clear `is_running` before publishing this flag, so seeing it
+            // set here means their cleared reader flag is visible to the Relaxed
+            // load below. Without the pairing the two stores can be read torn —
+            // planned end, reader still live — which is the misreport again, on
+            // a connection that happened to end of its own accord at the same
+            // moment the application asked for the client to stop.
+            if self.expected_disconnect.load(Ordering::Acquire) {
+                // A planned end owes no backoff whichever way it goes, so the
+                // per-connection reset happens before that is decided: a terminal
+                // exit must leave the same `reconnect_errors` a reconnecting one
+                // does, or this branch changes what `stats()` reports.
+                self.auto_reconnect_errors.store(0, Ordering::Relaxed);
+                // Consume the auth timestamp so a later failed connect can't
+                // read this cycle's stale value as a "stable" connection.
+                self.connected_at_ms.store(0, Ordering::Relaxed);
                 // The flag only says the end was planned, not that another
                 // connection follows: `disconnect()`, `logout()` and
                 // `signal_shutdown_sync()` set it too, and they also clear
@@ -637,10 +667,6 @@ impl Client {
                     info!("Disconnect requested, shutting down without reconnecting.");
                     break;
                 }
-                self.auto_reconnect_errors.store(0, Ordering::Relaxed);
-                // Consume the auth timestamp so a later failed connect can't
-                // read this cycle's stale value as a "stable" connection.
-                self.connected_at_ms.store(0, Ordering::Relaxed);
                 info!("Expected disconnect (e.g., 515), reconnecting immediately...");
                 continue;
             }
@@ -1045,8 +1071,7 @@ impl Client {
     pub async fn disconnect(self: &Arc<Self>) {
         info!("Disconnecting client intentionally.");
         wacore::telemetry::set_connected(false);
-        self.expected_disconnect.store(true, Ordering::Relaxed);
-        self.is_running.store(false, Ordering::Relaxed);
+        self.publish_terminal_verdict();
         self.shutdown_notifier.notify();
         self.notify_session_state();
         #[cfg(feature = "client-lifecycle")]
@@ -2066,6 +2091,40 @@ mod tests {
             .await
             .expect("run() must return once the client has been disconnected")
             .expect("the run task must not panic");
+    }
+
+    /// The branch's per-connection reset runs whichever exit it takes. Doing it
+    /// only on the reconnecting side would leave `stats().reconnect_errors`
+    /// reporting failures from before the connection that succeeded — a public
+    /// number a change about a log line has no business moving.
+    #[tokio::test]
+    async fn a_requested_disconnect_still_clears_the_connection_counters() {
+        let (client, entered, release) = client_parked_in_connect().await;
+        // What a session that struggled and then settled leaves behind.
+        client.auto_reconnect_errors.store(7, Ordering::Relaxed);
+        client.connected_at_ms.store(1, Ordering::Relaxed);
+
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run().await });
+        next_connect_attempt(&entered).await;
+
+        client.disconnect().await;
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("run() must return once the client has been disconnected")
+            .expect("the run task must not panic");
+
+        assert_eq!(
+            client.stats().reconnect_errors,
+            0,
+            "a planned end owes no backoff, so its counter is cleared on both exits"
+        );
+        assert_eq!(
+            client.connected_at_ms.load(Ordering::Relaxed),
+            0,
+            "and the auth timestamp is consumed, so no later connect reads it as stable"
+        );
     }
 
     /// The promise the branch above now keeps: `disconnect()` ends the session,

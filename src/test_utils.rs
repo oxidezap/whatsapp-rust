@@ -528,19 +528,43 @@ pub mod log_capture {
         })
     }
 
-    /// Hands a test's log assertions to a fresh process when this one's `log`
-    /// slot is already owned by a sibling test's `env_logger`. `log`'s global
-    /// logger is install-once, so a threaded `cargo test --lib` run cannot be
-    /// relied on to leave it free, and skipping the assertions there would let a
-    /// regression in the very behaviour under test go unseen. `cargo nextest`
-    /// gives every test its own process, so this never fires under CI.
+    const CHILD_MARKER: &str = "WA_RUST_OWNS_LOG_CAPTURE";
+
+    /// Whether this process is running exactly one test, which is what makes an
+    /// assertion about the buffer an assertion about the test that filled it.
+    ///
+    /// The sink is process-wide and its targets are generic — half the suite
+    /// builds a client and disconnects it — so a sibling test running
+    /// concurrently contributes records indistinguishable from the caller's.
+    /// Serialising the *asserting* tests is not enough, because the siblings
+    /// that pollute never ask for the lock. Isolation is the only guarantee
+    /// that holds, so it is required rather than hoped for.
+    ///
+    /// `cargo nextest`, which is what CI runs, gives every test its own process
+    /// and says so in the environment. Everything else — a threaded
+    /// `cargo test --lib` above all — earns isolation by re-running in a child.
+    fn runs_this_test_alone() -> bool {
+        std::env::var_os(CHILD_MARKER).is_some() || std::env::var_os("NEXTEST").is_some()
+    }
+
+    /// Hands a test's log assertions to a fresh process unless this one is
+    /// already running that test alone and owns the `log` slot.
+    ///
+    /// Two things can be missing: isolation (see
+    /// [`runs_this_test_alone`]) and the logger itself, which is install-once
+    /// and may have been claimed by a sibling test's `env_logger`. A child
+    /// process supplies both. Skipping the assertions instead would let a
+    /// regression in the very behaviour under test go unseen.
     ///
     /// `true` means the caller should return immediately: the child already ran
     /// the real assertions and its failure, if any, has been propagated.
     pub fn delegated_to_child(test_name: &str) -> bool {
-        const CHILD_MARKER: &str = "WA_RUST_OWNS_LOG_CAPTURE";
-
-        if installed() {
+        // The order of this `&&` is load-bearing, not incidental: `installed()`
+        // is what replaces the process's logger, and this capture forwards
+        // nothing it does not buffer. Installed in a process running the whole
+        // suite, it would swallow every other test's logging for the rest of
+        // the run. Only a process running this one test may reach it.
+        if runs_this_test_alone() && installed() {
             return false;
         }
         assert!(
@@ -568,11 +592,13 @@ pub mod log_capture {
 
     /// Exclusive use of the capture, and an empty buffer to start from.
     ///
-    /// The buffer is process-wide, so two asserting tests running at once would
-    /// read each other's records — and "nothing announced a reconnect" is only a
-    /// statement about the test's own client if no other client is logging into
-    /// the same buffer. Holding this is what makes it one. Records are readable
-    /// only through it, so there is no way to assert without the exclusion.
+    /// What makes "nothing announced a reconnect" a statement about the test's
+    /// own client is [`delegated_to_child`]: the assertions only ever run in a
+    /// process running this one test, so nothing else can be logging. The lock
+    /// here covers the remaining case within such a process — a test that
+    /// itself asserts twice — and the empty buffer keeps a record from before
+    /// the client existed out of the answer. Records are readable only through
+    /// this, so there is no way to assert without both.
     pub struct Session(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
     impl Session {
@@ -590,14 +616,17 @@ pub mod log_capture {
         }
     }
 
-    /// Claim the capture for one test. Call [`delegated_to_child`] first: this
-    /// panics rather than silently reporting an uninstalled capture as silence.
+    /// Claim the capture for one test. Call [`delegated_to_child`] first and
+    /// return when it says so: this panics rather than let a test assert on a
+    /// buffer it does not own, where an uninstalled capture reads as silence
+    /// and a sibling test's records read as the caller's.
     pub fn session() -> Session {
         static LOCK: Mutex<()> = Mutex::new(());
 
         assert!(
-            installed(),
-            "the log capture must own this process's logger before a test asserts on it",
+            runs_this_test_alone() && installed(),
+            "a test may only assert on the log capture in a process running it alone, \
+             with the capture installed; call `delegated_to_child` first",
         );
         let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         CAPTURE
