@@ -1100,6 +1100,69 @@ mod tests {
         assert_eq!(resp.status_code, 403);
     }
 
+    /// Answers nothing until `n` requests have arrived, so the test can only
+    /// finish if all `n` were in flight at the same time.
+    fn spawn_barrier_server(n: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(n));
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut tmp) {
+                            Ok(0) | Err(_) => return,
+                            Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                        }
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    barrier.wait();
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// One client shared by a fleet must not become a fleet-wide lock.
+    ///
+    /// `BotBuilder::with_http_client_arc` invites exactly that sharing, so what
+    /// `ureq::Agent` does with concurrent callers is part of this crate's
+    /// contract rather than an implementation detail: it holds the pool lock
+    /// across checkout only, never across the request. The barrier server is
+    /// what makes a regression fail rather than merely run slower — if the
+    /// agent ever serialized, request 1 would block forever waiting for a
+    /// response the server only sends once request N has arrived.
+    ///
+    /// Deliberately more concurrent than the agent's 3-connection idle pool:
+    /// the cap bounds what is *retained* between requests, and reading it as a
+    /// concurrency limit is the mistake this pins down.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shared_client_runs_concurrent_requests_concurrently() {
+        const N: usize = 8;
+        let url = spawn_barrier_server(N);
+        let client = Arc::new(UreqHttpClient::new());
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let client = Arc::clone(&client);
+            let url = url.clone();
+            handles.push(tokio::spawn(async move { client.execute(get(url)).await }));
+        }
+        for handle in handles {
+            let response = handle
+                .await
+                .expect("request task")
+                .expect("the barrier only releases once every request is in flight");
+            assert_eq!(response.status_code, 200);
+        }
+    }
+
     #[test]
     fn upload_streaming_rejects_non_post() {
         let client = UreqHttpClient::new();

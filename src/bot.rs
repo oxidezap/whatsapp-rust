@@ -791,11 +791,64 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
 
     /// Set the HTTP client used for media operations and version fetching,
     /// replacing the `ureq-client` default when that feature is enabled.
-    pub fn with_http_client<C>(mut self, client: C) -> BotBuilder<B, T, Provided, R>
+    ///
+    /// The client is wrapped in an `Arc` internally; use
+    /// [`BotBuilder::with_http_client_arc`] to give several bots one client.
+    pub fn with_http_client<C>(self, client: C) -> BotBuilder<B, T, Provided, R>
     where
         C: crate::http::HttpClient + 'static,
     {
-        self.http_client = Some(Arc::new(client));
+        self.with_http_client_arc(Arc::new(client))
+    }
+
+    /// [`BotBuilder::with_http_client`] for an already-shared
+    /// `Arc<dyn HttpClient>`, so a process running several bots can give them
+    /// all one client instead of one apiece.
+    ///
+    /// Without this, every bot gets its own — the `ureq-client` default builds
+    /// a fresh [`UreqHttpClient`](crate::http::UreqHttpClient) per builder — and
+    /// each one retains a connection pool once it has transferred media. That
+    /// is ~36 KiB of live heap per bot over plain HTTP and more over TLS, paid
+    /// again for every session in the process. (An idle session pays nothing:
+    /// the version fetch sends `Connection: close`, so it pools nothing.)
+    ///
+    /// # What sharing implies
+    ///
+    /// A shared client means a shared connection pool, and for `UreqHttpClient`
+    /// that is a trade, not a free win:
+    ///
+    /// - **It does not serialize.** `ureq::Agent` holds its pool lock only
+    ///   across checkout, so concurrent requests through one client overlap;
+    ///   `whatsapp-rust-ureq-http-client` pins this at 64 requests in flight at
+    ///   once. Each request still occupies one `spawn_blocking` thread, exactly
+    ///   as it does with a client per bot.
+    /// - **The idle pool is capped per agent, not per bot.** `UreqHttpClient`'s
+    ///   default agent retains 3 idle connections (2 per host), which one bot
+    ///   fills and a fleet contends over: 8 concurrent workers sharing the
+    ///   default agent reused 79% of their connections where a client each
+    ///   reused 95%. Size the pool for the fleet — build a `ureq::Agent` with
+    ///   `max_idle_connections` at the intended concurrency and pass
+    ///   `UreqHttpClient::with_agent(agent)` — and the reuse rate comes back to
+    ///   95% while the per-bot retention stays collapsed into one pool.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let http = Arc::new(UreqHttpClient::new());
+    /// for db in session_databases {
+    ///     bots.push(
+    ///         Bot::builder()
+    ///             .with_backend(SqliteStore::new(db).await?)
+    ///             .with_http_client_arc(http.clone())
+    ///             .build()
+    ///             .await?,
+    ///     );
+    /// }
+    /// ```
+    pub fn with_http_client_arc(
+        mut self,
+        client: Arc<dyn crate::http::HttpClient>,
+    ) -> BotBuilder<B, T, Provided, R> {
+        self.http_client = Some(client);
         self.cast()
     }
 
@@ -1719,6 +1772,63 @@ mod tests {
         assert!(
             bot.client().resource_report().await.alloc.is_some(),
             "with_alloc_meter installs the handle when it is the last setter"
+        );
+    }
+
+    /// The whole point of `with_http_client_arc`: two bots end up pointing at
+    /// one client, not at two clones of one. `with_http_client` would wrap the
+    /// `Arc` in a second `Arc` per bot, giving each its own connection pool
+    /// again — which is the per-session cost this setter exists to collapse.
+    #[tokio::test]
+    async fn shared_http_client_is_one_client_across_bots() {
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttpClient);
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            clients.push(
+                Bot::builder()
+                    .with_backend_arc(create_test_sqlite_backend().await)
+                    .with_transport_factory(TokioWebSocketTransportFactory::new())
+                    .with_http_client_arc(Arc::clone(&http))
+                    .with_runtime(TokioRuntime)
+                    .build()
+                    .await
+                    .expect("build")
+                    .client(),
+            );
+        }
+
+        assert!(
+            Arc::ptr_eq(&clients[0].http_client, &clients[1].http_client),
+            "both bots must hold the same HTTP client, not a copy each"
+        );
+        assert!(
+            Arc::ptr_eq(&clients[0].http_client, &http),
+            "the client the bots hold must be the one the caller passed in"
+        );
+    }
+
+    /// The other half of the contract: passing by value still gives each bot
+    /// its own client, so nothing changes for callers who do not opt in.
+    #[tokio::test]
+    async fn by_value_http_clients_stay_independent() {
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            clients.push(
+                Bot::builder()
+                    .with_backend_arc(create_test_sqlite_backend().await)
+                    .with_transport_factory(TokioWebSocketTransportFactory::new())
+                    .with_http_client(MockHttpClient)
+                    .with_runtime(TokioRuntime)
+                    .build()
+                    .await
+                    .expect("build")
+                    .client(),
+            );
+        }
+
+        assert!(
+            !Arc::ptr_eq(&clients[0].http_client, &clients[1].http_client),
+            "with_http_client must keep giving each bot its own client"
         );
     }
 
