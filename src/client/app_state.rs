@@ -1468,6 +1468,58 @@ impl Client {
     /// deadline also bounds the missing-key wait, letting the explicit
     /// `AppStateSyncKeyRequest` fallback recover a late key on this connection
     /// without running past the watchdog.
+
+    /// Re-fetches the requested app-state collections on the current connection.
+    ///
+    /// This is the provider-facing equivalent of WhatsApp Web's `resyncAppState`.
+    /// The caller supplies the collection names and whether a full snapshot is required;
+    /// reservation, connection fencing, pagination, and retry bookkeeping remain owned by the
+    /// provider instead of being reproduced by an application adapter.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.appstate.resync",
+            level = "debug",
+            skip_all,
+            fields(full_sync),
+            err(Debug)
+        )
+    )]
+    pub async fn resync_app_state(
+        &self,
+        collections: impl IntoIterator<Item = WAPatchName>,
+        full_sync: bool,
+    ) -> Result<()> {
+        let collections = collections.into_iter().collect::<Vec<_>>();
+        if collections.is_empty() {
+            return Ok(());
+        }
+
+        self.await_connection().await;
+        if full_sync {
+            for collection in collections {
+                match self.process_app_state_sync_task(collection, true).await? {
+                    SyncOutcome::Completed => {}
+                    SyncOutcome::Deferred => {
+                        anyhow::bail!("app-state full resync deferred for {:?}", collection)
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let scope = self.sync_scope(None);
+        let outcome = self.sync_collections_batched(collections, scope).await?;
+        if outcome.all_synced() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "app-state resync incomplete: {:?}",
+                outcome.unsynced().collect::<Vec<_>>()
+            )
+        }
+    }
+
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len()), err(Debug)))]
     pub(crate) async fn sync_collections_batched(
         &self,
@@ -2684,6 +2736,16 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resync_app_state_with_empty_collections_is_a_noop() {
+        let client = crate::test_utils::create_test_client_with_name("appstate-empty-resync").await;
+
+        client
+            .resync_app_state(std::iter::empty(), false)
+            .await
+            .expect("empty app-state resync should be a no-op");
+    }
 
     #[tokio::test]
     async fn key_arrival_finishes_before_a_slow_fanout() {
