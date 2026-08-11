@@ -3033,14 +3033,14 @@ mod tests {
         }
     }
 
-    /// Devices the stanza carries a pairwise sender-key copy for.
-    fn skdm_target_count(stanza: &wacore_binary::OwnedNodeRef) -> usize {
+    /// Devices the stanza carries a pairwise sender-key copy for. `None` is the
+    /// stronger claim than `Some(0)`: a send with nothing to distribute omits
+    /// the `<participants>` node entirely rather than emitting an empty one.
+    fn skdm_targets(stanza: &wacore_binary::OwnedNodeRef) -> Option<usize> {
         stanza
             .get()
             .get_optional_child_by_tag(&["participants"])
-            .map_or(0, |participants| {
-                participants.get_children_by_tag("to").count()
-            })
+            .map(|participants| participants.get_children_by_tag("to").count())
     }
 
     fn attr_value(stanza: &wacore_binary::OwnedNodeRef, key: &str) -> Option<String> {
@@ -3060,8 +3060,8 @@ mod tests {
         fixture.send_text("first message warms the group").await;
         let first = fixture.stanza(0).await;
         assert_eq!(
-            skdm_target_count(&first),
-            fixture.recipient_devices,
+            skdm_targets(&first),
+            Some(fixture.recipient_devices),
             "the first send is cold and must distribute to every device"
         );
 
@@ -3070,8 +3070,8 @@ mod tests {
             .await;
         let revoke = fixture.stanza(1).await;
         assert_eq!(
-            skdm_target_count(&revoke),
-            0,
+            skdm_targets(&revoke),
+            None,
             "every device is warm, so the revoke has nothing to distribute"
         );
         assert!(
@@ -3092,8 +3092,8 @@ mod tests {
             .await;
         let revoke = fixture.stanza(0).await;
         assert_eq!(
-            skdm_target_count(&revoke),
-            fixture.recipient_devices,
+            skdm_targets(&revoke),
+            Some(fixture.recipient_devices),
             "a cold revoke must still hand the sender key to every device"
         );
     }
@@ -3144,8 +3144,8 @@ mod tests {
         let admin_revoke = fixture.stanza(2).await;
         assert_eq!(attr_value(&sender_revoke, "edit").as_deref(), Some("7"));
         assert_eq!(attr_value(&admin_revoke, "edit").as_deref(), Some("8"));
-        assert_eq!(skdm_target_count(&sender_revoke), 0);
-        assert_eq!(skdm_target_count(&admin_revoke), 0);
+        assert_eq!(skdm_targets(&sender_revoke), None);
+        assert_eq!(skdm_targets(&admin_revoke), None);
     }
 
     #[test]
