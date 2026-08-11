@@ -283,6 +283,7 @@ pub enum EventKind {
     DisableLinkPreviewsUpdate,
     ContactRemoved,
     EncDecryptFailed,
+    CallLogSync,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -296,7 +297,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::EncDecryptFailed as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::CallLogSync as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1034,6 +1035,9 @@ pub enum Event {
     /// Last, like every new variant: a binary `Serialize` format writes the
     /// variant index, so inserting in the middle renumbers everything after it.
     EncDecryptFailed(EncDecryptFailed),
+
+    /// A call-history record synced from the primary device.
+    CallLogSync(CallLogSync),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1127,6 +1131,7 @@ impl Event {
             Event::DisableLinkPreviewsUpdate(_) => EventKind::DisableLinkPreviewsUpdate,
             Event::ContactRemoved(_) => EventKind::ContactRemoved,
             Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
+            Event::CallLogSync(_) => EventKind::CallLogSync,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -2371,6 +2376,14 @@ pub struct ContactRemoved {
     pub from_full_sync: bool,
 }
 
+/// A call-history record delivered through app-state synchronization.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct CallLogSync {
+    pub record: Box<wa::CallLogRecord>,
+    pub from_full_sync: bool,
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
@@ -2403,6 +2416,8 @@ mod tests {
         assert_eq!(EventKind::PairingQrCodesExhausted as u8, 58);
         assert_eq!(EventKind::PairingCodeError as u8, 59);
         assert_eq!(EventKind::AppStateSyncFailed as u8, 60);
+        assert_eq!(EventKind::EncDecryptFailed as u8, 67);
+        assert_eq!(EventKind::CallLogSync as u8, 68);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted

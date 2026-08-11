@@ -2,6 +2,7 @@ pub(crate) mod app_state_settings;
 mod blocking;
 mod bots;
 mod business;
+pub(crate) mod call_log;
 pub(crate) mod chat_actions;
 mod chatstate;
 mod comments;
