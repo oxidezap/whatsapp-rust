@@ -384,11 +384,11 @@ inherits = "release"
 debug = 1
 strip = false
 
-# Curve25519 is the asymmetric work on both hot paths: the Signal ratchet DH
-# and XEdDSA signature run per message, the Noise handshake per connection.
-# Profiling put ~56% of a client's field-arithmetic time in the Montgomery
-# ladder alone. This fork optimizes the three code paths we actually reach,
-# none of them upstream yet:
+# Curve25519 is the asymmetric work a client pays for: the Signal ratchet DH
+# and the XEdDSA signature run per message, the Noise handshake per
+# connection. Profiling put ~56% of a client's field-arithmetic time in the
+# Montgomery ladder alone. Those operations reach three routines inside the
+# crate, and the fork optimizes each, none of it upstream yet:
 #
 #   variable-base ladder  a squaring that doubles its 64-bit inputs rather
 #                         than routing through `pow2k(1)`, a `mul121666`
