@@ -363,14 +363,15 @@ impl BatchedSyncOutcome {
         self.unsynced().next().is_none()
     }
 
-    /// What a batch that failed before producing any bucket achieved: nothing,
-    /// for everything it asked for.
+    /// Everything the batch asked for, reported as retryable.
     ///
-    /// A top-level error carries no per-collection verdict, but the client still
-    /// knows what it requested and that none of it landed, and `retryable` is
-    /// exactly what those collections are. Synthesizing it here is what keeps a
-    /// failed batch from finishing in silence; the retry scheduler already does
-    /// the same for a sequence of rounds that ends without buckets.
+    /// Deliberately imprecise: a batch can fail after a collection was already
+    /// applied, and the `?` on the inner call takes the partial outcome with it,
+    /// so nothing downstream can tell which of them landed. Over-reporting costs
+    /// an incremental re-sync that resumes from the persisted version, which is
+    /// what the retry scheduler already spends on a global failure. Silence
+    /// costs more, because next to a `Connected` it reads as a clean startup on
+    /// a session that may have no push name.
     pub(crate) fn all_retryable(requested: &[WAPatchName]) -> Self {
         Self {
             retryable: requested.to_vec(),
