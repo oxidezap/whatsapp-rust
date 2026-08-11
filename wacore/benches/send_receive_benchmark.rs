@@ -655,7 +655,16 @@ fn setup_dm_recv() -> DmRecvData {
 struct GrpSendData {
     alice: User,
     group_jid: Jid,
-    participants: Vec<Jid>,
+    /// Built in setup, not per iteration: production resolves the group once
+    /// and holds the result behind an `Arc` across sends (`ensure_self_in_group`
+    /// hands the same `Arc` straight back whenever we are already a member, the
+    /// steady state), so a send never constructs or drops a participant list.
+    /// Building it in the measured body charged every group send an
+    /// N-participant construct + teardown that no send performs — 26.8K
+    /// instructions at 512 members, and the entire reason this benchmark
+    /// appeared to scale with group size while `prepare_group_stanza` itself is
+    /// flat (334.0K at 8 members, 334.1K at 512).
+    group_info: GroupInfo,
     /// Warm-send fixture: the resolved set with its phash memo pre-warmed in
     /// setup, like the per-group device memo serves production repeat sends.
     resolved_for_phash: Option<std::sync::Arc<wacore::send::ResolvedGroupDevices>>,
@@ -705,10 +714,18 @@ fn setup_group_send(n: usize) -> GrpSendData {
         .phash(&alice.jid)
         .expect("phash must warm in setup");
 
+    // Self-append happens once here for the same reason production does it once
+    // per resolution: `prepare_group_stanza` expects the sender in the list.
+    let own_base = alice.jid.to_non_ad();
+    if !participants.iter().any(|p| p.is_same_user_as(&own_base)) {
+        participants.push(own_base);
+    }
+    let group_info = GroupInfo::new(participants, AddressingMode::Pn);
+
     GrpSendData {
         alice,
         group_jid,
-        participants,
+        group_info,
         resolved_for_phash: Some(resolved),
         force_skdm: false,
         resolver: MockResolver(devices),
@@ -1045,15 +1062,7 @@ fn run_group_send(d: &mut GrpSendData) {
     // only emits a phash if it gets the full device set. Mirror the real
     // warm-send caller by passing it; the cold/force_skdm path resolves the set
     // itself and keeps None.
-    let mut group_info = GroupInfo::new(std::mem::take(&mut d.participants), AddressingMode::Pn);
-    let own_base = own_jid.to_non_ad();
-    if !group_info
-        .participants
-        .iter()
-        .any(|p| p.is_same_user_as(&own_base))
-    {
-        group_info.participants.push(own_base);
-    }
+    let group_info = &d.group_info;
     let mut stores = SignalStores {
         sender_key_store: &mut d.alice.sender_keys,
         session_store: &mut d.alice.sessions,
@@ -1067,7 +1076,7 @@ fn run_group_send(d: &mut GrpSendData) {
         &mut stores,
         &d.resolver,
         GroupStanzaRequest {
-            group: &group_info,
+            group: group_info,
             own_jid: &own_jid,
             own_lid: &own_jid,
             account: Some(&d.account),

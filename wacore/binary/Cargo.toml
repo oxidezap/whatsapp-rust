@@ -48,3 +48,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "group_fanout_benchmark"
+harness = false

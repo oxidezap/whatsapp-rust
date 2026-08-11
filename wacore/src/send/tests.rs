@@ -3921,6 +3921,253 @@ mod mark_full_distribution_list {
              not aborting the whole cohort"
         );
     }
+
+    /// A steady-state group stanza's size tracks our OWN device count, never
+    /// the group's.
+    ///
+    /// `<participants>` carries sender-key distributions only. A warm send
+    /// distributes none to members — but it does re-distribute to our own
+    /// companions on every send, because own devices are never memoized warm
+    /// (WA Web `!isMeDevice`, see `update_sender_key_devices`). So the steady
+    /// state is one `<to>` per own companion and nothing per member, and the
+    /// `phash` covering the whole device set is a fixed-width digest ("2:" plus
+    /// 8 base64 chars) memoized on the resolved set. Both the single-device and
+    /// the multi-device steady state are pinned below at 8 and at 512 members:
+    /// the encoded stanza is the same size either way, so a repeat group send
+    /// has no per-member encoding to cache between sends.
+    ///
+    /// Pinned as a test rather than left to the group benchmarks because the
+    /// claim is about the *shape* of the stanza: a future change that folded
+    /// member state into it would still benchmark fine on a small group.
+    #[tokio::test]
+    async fn warm_group_stanza_size_tracks_own_devices_not_group_size() {
+        // Our own other devices, which receive a fresh SKDM on every send.
+        // Shared with the assertions so they can name the exact JIDs the stanza
+        // must address, not merely how many.
+        fn companion_jids(companions: usize) -> Vec<Jid> {
+            (1..=companions)
+                .map(|d| format!("12025550111:{d}@s.whatsapp.net").parse().unwrap())
+                .collect()
+        }
+
+        // `members` is the group; `companions` are our own other devices.
+        async fn warm_stanza(members: usize, companions: usize) -> Node {
+            let own_jid: Jid = "12025550111:0@s.whatsapp.net".parse().unwrap();
+            let own_lid: Jid = "100000000000001:0@lid".parse().unwrap();
+            let group: Jid = "120363000000000001@g.us".parse().unwrap();
+
+            let participants: Vec<Jid> = (0..members)
+                .map(|i| {
+                    format!("{}@s.whatsapp.net", 12025550200u64 + i as u64)
+                        .parse()
+                        .unwrap()
+                })
+                .collect();
+            let own_companions: Vec<Jid> = companion_jids(companions);
+
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut sks = MemSenderKeyStore::default();
+            // A warm send never creates the chain, so seed it exactly as the
+            // first (cold) send to this group would have.
+            let sk_name = make_sender_key_name(&group, &own_jid.to_protocol_address());
+            crate::libsignal::protocol::create_sender_key_distribution_message(
+                &sk_name, &mut sks, &mut rng,
+            )
+            .await
+            .expect("seed the sender key chain");
+
+            // Sessions already exist for the companions, as they do in the
+            // steady state, so the SKDM encrypts to `msg` (not `pkmsg`) and no
+            // prekey fetch or device-identity node enters the stanza.
+            let mut ss = MemSessionStore::default();
+            let mut is = MemIdentityStore {
+                pair: IdentityKeyPair::generate(&mut rng),
+                reg_id: 7,
+                known: Default::default(),
+            };
+            for companion in &own_companions {
+                let addr = companion.to_protocol_address();
+                process_prekey_bundle(
+                    &addr,
+                    &mut ss,
+                    &mut is,
+                    &signed_prekey_bundle(),
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("establish the companion session");
+                // `process_prekey_bundle` alone leaves the session holding a
+                // pending pre-key, so its next encryption is still a `pkmsg`
+                // first contact. The steady state this fixture models is the
+                // one after the companion has answered, which is what clears
+                // the pending key — so clear it, and let the `enc type`
+                // assertion below hold the fixture to it.
+                let mut record = ss
+                    .load_session(&addr)
+                    .await
+                    .expect("load")
+                    .expect("session present");
+                record
+                    .session_state_mut()
+                    .expect("session state")
+                    .clear_unacknowledged_pre_key_message();
+                ss.store_session(&addr, record).await.expect("store");
+            }
+            let mut pks = UnusedPreKeyStore;
+            let spks = UnusedSignedPreKeyStore;
+            let mut stores = SignalStores {
+                sender_key_store: &mut sks,
+                session_store: &mut ss,
+                identity_store: &mut is,
+                prekey_store: &mut pks,
+                signed_prekey_store: &spks,
+            };
+
+            let mut group_participants = participants.clone();
+            group_participants.push(own_jid.to_non_ad());
+            let group_info = GroupInfo::new(group_participants, AddressingMode::Pn);
+            // The full resolved device set the warm send hashes into `phash`.
+            // The companions belong inside it, not beside it: production filters
+            // the SKDM targets out of this very set (`filter_skdm_targets` over
+            // `all_devices_for_phash`), and the server validates the phash against
+            // every recipient device — so a stanza whose `<participants>` named a
+            // device the phash did not cover is a shape no send produces.
+            let mut resolved_devices = participants;
+            resolved_devices.extend(own_companions.iter().cloned());
+            let resolved = ResolvedGroupDevices::new(resolved_devices);
+            let msg = wa::Message {
+                conversation: Some("steady state".into()),
+                ..Default::default()
+            };
+
+            prepare_group_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &MockSendContextResolver::new(),
+                GroupStanzaRequest {
+                    group: &group_info,
+                    own_jid: &own_jid,
+                    own_lid: &own_lid,
+                    account: None,
+                    to: &group,
+                    message: &msg,
+                    message_id: "WARMGROUPSCALE1",
+                    force_distribution: false,
+                    distribution_targets: (!own_companions.is_empty())
+                        .then(|| own_companions.clone()),
+                    distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                    phash_devices: Some(&resolved),
+                    edit: None,
+                    extra_nodes: &[],
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .expect("warm group send")
+            .node
+        }
+
+        // Every ciphertext in the stanza varies in length run to run (WA pads
+        // each plaintext by a random 1..=16 bytes), so sizes are only
+        // comparable with the payloads normalised. What is under test is the
+        // stanza's structure and attributes, not the ciphertext.
+        fn with_fixed_payloads(node: &Node) -> Node {
+            use wacore_binary::node::NodeContent;
+            let mut out = node.clone();
+            out.content = match out.content {
+                Some(NodeContent::Bytes(_)) => Some(NodeContent::Bytes(vec![0u8; 96])),
+                Some(NodeContent::Nodes(children)) => Some(NodeContent::Nodes(
+                    children.iter().map(with_fixed_payloads).collect(),
+                )),
+                other => other,
+            };
+            out
+        }
+
+        // The whole hierarchy, not just the root's children: a `<to>` or `<enc>`
+        // subtree that grew with the group would otherwise slip past, and a
+        // rename that happens to preserve the encoded length would slip past the
+        // size comparison too. Attribute *keys* only — the values legitimately
+        // differ (the phash digests two different device sets), and the phash is
+        // asserted on its own below.
+        fn shape(node: &Node) -> String {
+            let mut attrs: Vec<&str> = node.attrs.0.iter().map(|(k, _)| k.as_ref()).collect();
+            attrs.sort_unstable();
+            let children: Vec<String> = node.children().unwrap_or(&[]).iter().map(shape).collect();
+            format!("{}[{}]({})", node.tag, attrs.join(","), children.join(" "))
+        }
+
+        // Single-device account (no companions) and a two-companion one: the
+        // two steady states this client actually produces.
+        for companions in [0usize, 2] {
+            let small = warm_stanza(8, companions).await;
+            let large = warm_stanza(512, companions).await;
+
+            for (label, node) in [("8-member", &small), ("512-member", &large)] {
+                // The JIDs, not just how many: a list of the right length that
+                // addressed group members instead of our companions would be
+                // exactly the regression this test exists to catch.
+                let distributed: Vec<Jid> = node
+                    .get_optional_child("participants")
+                    .and_then(Node::children)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|to| to.attrs().jid("jid"))
+                    .collect();
+                assert_eq!(
+                    distributed,
+                    companion_jids(companions),
+                    "{label} warm send distributes to our own companions only, \
+                     never to the group's members"
+                );
+                // The enc type is the whole premise of the fixture, so it is
+                // checked rather than asserted in a comment.
+                for to in node
+                    .get_optional_child("participants")
+                    .and_then(Node::children)
+                    .unwrap_or(&[])
+                {
+                    let enc = to
+                        .get_optional_child("enc")
+                        .unwrap_or_else(|| panic!("{label} participant carries an enc"));
+                    assert_eq!(
+                        enc.attrs().optional_string("type").as_deref(),
+                        Some("msg"),
+                        "{label} companion SKDM ciphertext type"
+                    );
+                }
+                // Version tag plus 8 base64 chars — the width is what makes the
+                // stanza size independent of the set hashed, and the `2:` is
+                // what makes it the phash the server expects rather than some
+                // other ten-character attribute.
+                let phash = node
+                    .attrs()
+                    .optional_string("phash")
+                    .unwrap_or_else(|| panic!("{label} warm send must carry a phash"));
+                assert!(
+                    phash.starts_with("2:") && phash.len() == 10,
+                    "{label} phash is a fixed-width v2 digest, got {phash:?}"
+                );
+            }
+
+            assert_eq!(
+                shape(&small),
+                shape(&large),
+                "same stanza shape with {companions} companions"
+            );
+            assert_eq!(
+                wacore_binary::marshal::marshal(&with_fixed_payloads(&small))
+                    .unwrap()
+                    .len(),
+                wacore_binary::marshal::marshal(&with_fixed_payloads(&large))
+                    .unwrap()
+                    .len(),
+                "the encoded warm group stanza is the same size at 8 and 512 members \
+                 with {companions} companions"
+            );
+        }
+    }
 }
 
 /// Item 3 — phash device-set construction. The set hashed is the full
@@ -5105,5 +5352,313 @@ mod local_identity_change_on_send {
             assert!(raw.devices.is_empty());
             assert!(!raw.includes_prekey_message);
         }
+    }
+}
+
+/// A warm group send — one with no sender-key distribution, which is what a
+/// group in ordinary conversation does for every message between topology
+/// changes — carries nothing per recipient. Profiling a client reported the
+/// encoder growing with group size and named the recipient list as the thing
+/// being serialized per message; on the warm path it is not, and these tests
+/// pin that so it cannot quietly become true.
+///
+/// The distinction that makes it work: `<participants>` (one pairwise-encrypted
+/// `<enc>` per device) is built only inside the `distribution_list` branch. A
+/// warm send leaves that `None`, the phash comes from a memo as a fixed-length
+/// hash, and `stale_users_for` returns empty without walking anything. What is
+/// left is `<enc type="skmsg">` — one ciphertext for the whole group — plus a
+/// reporting token, and neither knows how many members there are.
+///
+/// The distributing send *is* linear, and inherently so: each device needs its
+/// own copy of the sender key under its own ratcheting session, so there is no
+/// cache to add. That side is covered by `mark_full_distribution_list`.
+mod warm_group_send_encoding_scale {
+    use super::*;
+    use crate::libsignal::protocol::{
+        Direction, IdentityChange, IdentityKey, IdentityKeyStore, PreKeyId, PreKeyRecord,
+        PreKeyStore, ProtocolAddress, SenderKeyRecord, SessionRecord, SessionStore, SignedPreKeyId,
+        SignedPreKeyRecord, SignedPreKeyStore,
+    };
+    use crate::runtime::{AbortHandle, Runtime};
+    use crate::types::jid::{JidExt, make_sender_key_name};
+    use crate::types::message::AddressingMode;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+    use wacore_binary::marshal::marshal;
+    use wacore_binary::node::NodeContent;
+
+    type SigResult<T> = crate::libsignal::protocol::error::Result<T>;
+
+    /// A warm send touches no pairwise session, so every store below except the
+    /// sender-key one exists only to satisfy `SignalStores`. `unreachable!()`
+    /// rather than a stub answer: if the warm path ever starts reaching for a
+    /// session, that is the regression these tests are here to catch, and it
+    /// should fail loudly instead of being absorbed.
+    #[derive(Clone, Default)]
+    struct UnusedSessionStore;
+    #[async_trait::async_trait]
+    impl SessionStore for UnusedSessionStore {
+        async fn load_session(&self, _: &ProtocolAddress) -> SigResult<Option<SessionRecord>> {
+            unreachable!("warm group send must not load a pairwise session")
+        }
+        async fn has_session(&self, _: &ProtocolAddress) -> SigResult<bool> {
+            unreachable!("warm group send must not probe for a pairwise session")
+        }
+        async fn store_session(&mut self, _: &ProtocolAddress, _: SessionRecord) -> SigResult<()> {
+            unreachable!("warm group send must not write a pairwise session")
+        }
+    }
+
+    #[derive(Clone)]
+    struct UnusedIdentityStore;
+    #[async_trait::async_trait]
+    impl IdentityKeyStore for UnusedIdentityStore {
+        async fn get_identity_key_pair(&self) -> SigResult<IdentityKeyPair> {
+            unreachable!()
+        }
+        async fn get_local_registration_id(&self) -> SigResult<u32> {
+            unreachable!()
+        }
+        async fn save_identity(
+            &mut self,
+            _: &ProtocolAddress,
+            _: &IdentityKey,
+        ) -> SigResult<IdentityChange> {
+            unreachable!()
+        }
+        async fn is_trusted_identity(
+            &self,
+            _: &ProtocolAddress,
+            _: &IdentityKey,
+            _: Direction,
+        ) -> SigResult<bool> {
+            unreachable!()
+        }
+        async fn get_identity(&self, _: &ProtocolAddress) -> SigResult<Option<IdentityKey>> {
+            unreachable!()
+        }
+    }
+
+    struct UnusedPreKeys;
+    #[async_trait::async_trait]
+    impl PreKeyStore for UnusedPreKeys {
+        async fn get_pre_key(&self, _: PreKeyId) -> SigResult<PreKeyRecord> {
+            unreachable!()
+        }
+        async fn save_pre_key(&mut self, _: PreKeyId, _: &PreKeyRecord) -> SigResult<()> {
+            unreachable!()
+        }
+        async fn remove_pre_key(&mut self, _: PreKeyId) -> SigResult<()> {
+            unreachable!()
+        }
+    }
+    struct UnusedSignedPreKeys;
+    #[async_trait::async_trait]
+    impl SignedPreKeyStore for UnusedSignedPreKeys {
+        async fn get_signed_pre_key(&self, _: SignedPreKeyId) -> SigResult<SignedPreKeyRecord> {
+            unreachable!()
+        }
+        async fn save_signed_pre_key(
+            &mut self,
+            _: SignedPreKeyId,
+            _: &SignedPreKeyRecord,
+        ) -> SigResult<()> {
+            unreachable!()
+        }
+    }
+    #[derive(Default)]
+    struct MemSenderKeyStore(HashMap<SenderKeyName, SenderKeyRecord>);
+    #[async_trait::async_trait]
+    impl SenderKeyStore for MemSenderKeyStore {
+        async fn store_sender_key(
+            &mut self,
+            n: &SenderKeyName,
+            r: SenderKeyRecord,
+        ) -> SigResult<()> {
+            self.0.insert(n.clone(), r);
+            Ok(())
+        }
+        async fn load_sender_key(&self, n: &SenderKeyName) -> SigResult<Option<SenderKeyRecord>> {
+            Ok(self.0.get(n).cloned())
+        }
+    }
+
+    struct TestRuntime;
+    #[async_trait::async_trait]
+    impl Runtime for TestRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            let handle = tokio::spawn(future);
+            AbortHandle::new(move || handle.abort())
+        }
+        fn sleep(&self, _d: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async move {
+                let _ = tokio::task::spawn_blocking(f).await;
+            })
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    fn member(i: usize) -> Jid {
+        // Fictitious, fixed-width user parts: a varying digit count would change
+        // the encoded length of the *participant list*, which is exactly the
+        // quantity under test, and only in the distributing case does it reach
+        // the wire at all.
+        format!("10000000000{:04}@s.whatsapp.net", i)
+            .parse()
+            .unwrap()
+    }
+
+    /// Byte length of the marshalled stanza with the skmsg ciphertext removed.
+    ///
+    /// The ciphertext cannot be compared directly: `pad_with_context_from_encoded`
+    /// appends a random 1..16-byte pad, so two encodes of the same message differ
+    /// in length by design. Everything else in the stanza is deterministic, and
+    /// everything else is what "does the recipient list reach the wire" asks about.
+    fn stanza_size_without_ciphertext(node: &Node) -> usize {
+        let enc = node
+            .get_optional_child("enc")
+            .expect("a group send always carries <enc>");
+        let payload = match &enc.content {
+            Some(NodeContent::Bytes(b)) => b.len(),
+            other => panic!("<enc> must carry bytes, got {other:?}"),
+        };
+        marshal(node).expect("stanza must marshal").len() - payload
+    }
+
+    async fn warm_group_stanza(member_count: usize) -> Node {
+        let own: Jid = "12025550100:3@s.whatsapp.net".parse().unwrap();
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let members: Vec<Jid> = (0..member_count).map(member).collect();
+
+        // Seed the chain the warm path expects to already exist: distribution is
+        // what would otherwise create it, and a warm send by definition skips it.
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let kp = KeyPair::generate(&mut rng);
+        let mut record = SenderKeyRecord::new_empty();
+        record
+            .add_sender_key_state(3, 1, 0, &[7u8; 32], kp.public_key, Some(kp.private_key))
+            .expect("valid sender key state");
+        let name = make_sender_key_name(&group, &own.to_protocol_address());
+        let mut sender_keys = MemSenderKeyStore::default();
+        sender_keys.0.insert(name, record);
+
+        let mut sessions = UnusedSessionStore;
+        let mut identities = UnusedIdentityStore;
+        let mut prekeys = UnusedPreKeys;
+        let signed_prekeys = UnusedSignedPreKeys;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_keys,
+            session_store: &mut sessions,
+            identity_store: &mut identities,
+            prekey_store: &mut prekeys,
+            signed_prekey_store: &signed_prekeys,
+        };
+
+        let group_info = GroupInfo::new(members.clone(), AddressingMode::Pn);
+        let resolved = std::sync::Arc::new(ResolvedGroupDevices::new(members));
+        // Warm the phash memo in setup, exactly as `setup_group_send` does in
+        // the benchmark and as production does on the first send after a
+        // topology change. Left cold, the `OnceLock` would make the *first*
+        // send recompute an O(member_count) hash inside the very path these
+        // tests claim is warm — measuring the cold path under a warm name, and
+        // leaving a regression that recomputed it per send undetectable.
+        resolved.phash(&own).expect("phash must warm in setup");
+        let message = wa::Message {
+            conversation: Some("same text regardless of group size".into()),
+            ..Default::default()
+        };
+        let account = wa::ADVSignedDeviceIdentity::default();
+
+        prepare_group_stanza(
+            &TestRuntime,
+            &mut stores,
+            &MockSendContextResolver::new(),
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own,
+                own_lid: &own,
+                account: Some(&account),
+                to: &group,
+                message: &message,
+                message_id: "WARM-SCALE-1",
+                force_distribution: false,
+                distribution_targets: None,
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: Some(&resolved),
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await
+        .expect("warm group send must succeed")
+        .node
+    }
+
+    /// The headline: 8 members and 512 members produce a byte-identical stanza
+    /// once the randomly padded ciphertext is discounted. If a future change
+    /// puts anything per-recipient back on a warm send, this is what fails.
+    #[tokio::test]
+    async fn warm_send_stanza_size_is_independent_of_group_size() {
+        let mut sizes = Vec::new();
+        for n in [8usize, 32, 128, 512] {
+            let node = warm_group_stanza(n).await;
+
+            assert!(
+                node.get_optional_child("participants").is_none(),
+                "a warm send distributes no sender key, so it must emit no \
+                 <participants> fan-out (group size {n})"
+            );
+            assert!(
+                node.get_optional_child("device-identity").is_none(),
+                "<device-identity> rides along with a pkmsg in the fan-out, and \
+                 there is no fan-out here (group size {n})"
+            );
+            sizes.push((n, stanza_size_without_ciphertext(&node)));
+        }
+
+        let (_, first) = sizes[0];
+        assert!(
+            sizes.iter().all(|&(_, s)| s == first),
+            "warm group stanza must not grow with the participant count; \
+             got {sizes:?} (size excludes the randomly padded skmsg ciphertext)"
+        );
+    }
+
+    /// The phash is the one input that *is* derived from every participant, so
+    /// it is the obvious candidate for smuggling O(N) bytes onto the wire. It
+    /// does not: it is a fixed-width hash, present and identical in width at
+    /// every group size, and different between sizes because the set differs.
+    #[tokio::test]
+    async fn phash_is_present_and_fixed_width_at_every_group_size() {
+        let mut seen: Vec<(usize, String)> = Vec::new();
+        for n in [8usize, 512] {
+            let node = warm_group_stanza(n).await;
+            let phash = node
+                .attrs()
+                .optional_string("phash")
+                .unwrap_or_else(|| panic!("group send carries a phash on every send (size {n})"))
+                .to_string();
+            seen.push((n, phash));
+        }
+        assert_eq!(
+            seen[0].1.len(),
+            seen[1].1.len(),
+            "phash width must not depend on the member count: {seen:?}"
+        );
+        assert_ne!(
+            seen[0].1, seen[1].1,
+            "different participant sets must hash differently, or the \
+             fixed width above would be proving nothing"
+        );
     }
 }
