@@ -859,6 +859,75 @@ mod tests {
         );
     }
 
+    /// Asking does not make a rewind safe. A snapshot strictly older than what
+    /// is stored is a replay or a server that is behind, and taking it would
+    /// roll the collection backward — the thing the guard exists to prevent.
+    #[tokio::test]
+    async fn a_requested_snapshot_older_than_the_persisted_version_is_refused() {
+        let (backend, processor, mut patch_list, stale_index_mac) =
+            snapshot_resync_scenario().await;
+        // The snapshot is v2, so persisting v5 puts the collection ahead of it.
+        backend
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                HashState {
+                    version: 5,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept version");
+        patch_list.requested_snapshot = true;
+
+        let (mutations, state, pl) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("a refused snapshot is a verdict, not a failure");
+
+        assert!(
+            backend
+                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
+                .await
+                .unwrap()
+                .is_some(),
+            "the older snapshot must not have replaced the baseline"
+        );
+        assert_eq!(
+            state.version, 5,
+            "and must not have rolled the version back"
+        );
+        assert!(mutations.is_empty());
+        assert!(
+            matches!(pl.error, Some(CollectionSyncError::Retry { .. })),
+            "an unfulfilled snapshot request must not read as a completed replay"
+        );
+    }
+
+    /// A response carrying no snapshot is not evidence that the request went
+    /// unanswered — it is exactly what an empty collection replies. Since every
+    /// first sync asks with `return_snapshot`, calling it unfulfilled would leave
+    /// every empty collection retryable on the bootstrap that gates `Connected`.
+    #[tokio::test]
+    async fn a_snapshot_request_answered_with_an_empty_collection_is_not_an_error() {
+        let (_backend, processor, mut patch_list, _) = snapshot_resync_scenario().await;
+        patch_list.requested_snapshot = true;
+        patch_list.snapshot = None;
+        patch_list.snapshot_ref = None;
+        patch_list.patches = Vec::new();
+
+        let (mutations, _, pl) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("an empty collection is an answer");
+
+        assert!(
+            pl.error.is_none(),
+            "an empty collection must not read as a failed request: {:?}",
+            pl.error
+        );
+        assert!(mutations.is_empty(), "there was nothing to replay");
+    }
+
     #[tokio::test]
     async fn snapshot_resync_drops_stale_mutation_macs() {
         let (backend, processor, patch_list, stale_index_mac) = snapshot_resync_scenario().await;

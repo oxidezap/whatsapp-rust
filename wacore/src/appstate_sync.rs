@@ -276,15 +276,18 @@ impl AppStateProcessor {
         // roll the collection backward. No-op on the benign first-sync path, where snapshots
         // are requested only at version 0.
         //
-        // A snapshot the caller asked for is exempt: the guard exists to stop an
-        // unsolicited one from rewinding the collection, and a caller that asked
-        // is telling us the persisted version is not the thing to measure it
-        // against — see [`PatchList::requested_snapshot`]. Nothing is rewound
-        // either way, because the snapshot is applied whole and its own version
-        // becomes the persisted one.
+        // A snapshot the caller asked for is exempt from the *equal* case only —
+        // see [`PatchList::requested_snapshot`]. A caller asking is telling us the
+        // persisted version is not the thing to measure the snapshot against, and
+        // its copy being wrong rather than behind is exactly when the two versions
+        // agree; applying there replaces the baseline without moving it. A
+        // snapshot strictly older than what is stored is a different thing — a
+        // replay, or a server that is behind — and taking it would roll the
+        // collection backward, which no request makes safe.
         let snapshot_fresh = pl.snapshot.as_ref().is_some_and(|snapshot| {
             let snapshot_version = snapshot.version.as_option().and_then(|v| v.version).unwrap_or(0);
-            if !pl.requested_snapshot && snapshot_is_stale(state.version, snapshot_version) {
+            let rewinds = snapshot_version < state.version;
+            if snapshot_is_stale(state.version, snapshot_version) && (!pl.requested_snapshot || rewinds) {
                 log::warn!(
                     target: "AppState",
                     "Skipping stale snapshot for {collection_name}: incoming v{snapshot_version} <= persisted v{}",
@@ -294,6 +297,30 @@ impl AppStateProcessor {
             }
             true
         });
+        // A snapshot that arrived and was refused leaves the request unfulfilled,
+        // and the caller has to hear it: reading the run as a completed replay
+        // would leave a consumer that cleared its own copy first — the documented
+        // way to reconcile deletions — holding nothing. Reported rather than
+        // raised, because it is a verdict about one collection and a later
+        // attempt can still get a newer snapshot.
+        //
+        // Only when one *arrived*. A response carrying no snapshot at all is not
+        // evidence of anything: it is exactly what an empty collection answers,
+        // and every first sync asks with `return_snapshot` — so treating it as
+        // unfulfilled would leave every empty collection retryable on the
+        // bootstrap that gates `Connected`.
+        if pl.requested_snapshot && !snapshot_fresh && pl.snapshot.is_some() {
+            log::warn!(
+                target: "AppState",
+                "Snapshot request for {collection_name} unfulfilled: the returned snapshot is older than persisted v{}",
+                state.version
+            );
+            pl.error = Some(CollectionSyncError::Retry {
+                code: 0,
+                text: "requested snapshot is older than the persisted version".to_string(),
+            });
+            return Ok((new_mutations, state, pl));
+        }
         if snapshot_fresh && let Some(snapshot) = pl.snapshot.take() {
             let keys_map = self.key_cache.lock().await.clone();
             let collection_name_owned = collection_name.to_string();

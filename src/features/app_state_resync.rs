@@ -15,8 +15,18 @@ use wacore::appstate::patch_decode::WAPatchName;
 pub enum AppStateResyncMode {
     /// Ask for the patches recorded after the persisted version.
     ///
-    /// The cheap repair, and the right one when local state is merely behind:
-    /// the server sends only what changed since the last successful sync.
+    /// The cheap repair, and the right one when the *client's own* app-state
+    /// store is behind the server: it sends only what changed since the last
+    /// successful sync.
+    ///
+    /// It cannot repair a consumer's mirror on its own. The version it asks
+    /// from is the client's, not the mirror's, so a mirror that missed
+    /// mutations the client did apply — a handler that failed, an event dropped
+    /// on a full mailbox, a database restored behind the client's — asks the
+    /// server for changes it already has, and the server rightly sends nothing.
+    /// The collection comes back [`synced`](AppStateResyncReport::synced) and
+    /// the mirror is exactly as stale as before. Use [`Self::Snapshot`] for
+    /// that.
     Incremental,
     /// Ask for the collection's current snapshot, whatever the persisted
     /// version says.
@@ -46,6 +56,14 @@ pub enum AppStateResyncMode {
     /// [`EventDelivery::Ordered`](crate::bot::EventDelivery::Ordered) queues and
     /// drops on a full mailbox. A report is evidence about the sync, not about a
     /// consumer's mirror.
+    ///
+    /// A collection can also come back `synced` having replayed nothing, because
+    /// a response with no snapshot is what an empty collection answers and the
+    /// protocol gives no way to tell that apart from a request the server chose
+    /// not to serve. A snapshot that does arrive but is older than the persisted
+    /// version is refused and reported
+    /// [`retryable`](AppStateResyncReport::retryable) rather than applied — a
+    /// request does not make rolling a collection backward safe.
     Snapshot,
 }
 
@@ -64,12 +82,21 @@ pub struct AppStateResyncReport {
     /// The server refused the collection outright (400/404). Asking again gets
     /// the same answer, so a retry never clears this on its own.
     pub fatal: Vec<WAPatchName>,
-    /// Not synced, but a later attempt can: a retryable server error, a decode
-    /// key that never landed, the connection going away mid-run, or the
-    /// pagination cap.
+    /// Not synced, but a later attempt can: a retryable server error, a snapshot
+    /// the request asked for and the response did not carry, a decode key that
+    /// never landed, another writer that held the collection past the wait, the
+    /// connection going away mid-run, or the pagination cap.
     pub retryable: Vec<WAPatchName>,
-    /// Another writer — a sync or a patch send — still held the collection when
-    /// the wait for it ran out, so this call did nothing for it.
+    /// Another sync was already fetching the collection, so this call stood
+    /// down and left the work to it.
+    ///
+    /// Empty in practice for this call, which waits for a holder rather than
+    /// standing down — an explicit request is not discharged by whatever
+    /// another caller happened to ask for. A wait that runs out lands in
+    /// `retryable` instead, since nobody covered the collection. The bucket is
+    /// here because the report mirrors the sync engine's, and a future caller
+    /// that does stand down should not have its result quietly folded into
+    /// another category.
     pub skipped: Vec<WAPatchName>,
 }
 

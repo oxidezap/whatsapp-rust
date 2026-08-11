@@ -1829,6 +1829,13 @@ impl Client {
             // available without teaching `wacore` about connections, and it caps
             // what a retired scope can commit at one collection instead of five.
             let mut results = Vec::with_capacity(patch_lists.len());
+            // Held rather than raised with `?`, for the same reason the dispatch
+            // loop below refuses to drop a collection: each list this loop
+            // finished is already persisted, so failing out from here would strand
+            // its mutations behind an advanced cursor that no later sync re-reads.
+            // The error still ends the run — after what was applied has been
+            // dispatched.
+            let mut apply_error = None;
             for pl in patch_lists {
                 if let Err(lost) = self.admits(scope) {
                     warn!(
@@ -1837,7 +1844,13 @@ impl Client {
                     );
                     break;
                 }
-                results.push(proc.process_one_patch_list(pl, &download, true).await?);
+                match proc.process_one_patch_list(pl, &download, true).await {
+                    Ok(applied) => results.push(applied),
+                    Err(e) => {
+                        apply_error = Some(e);
+                        break;
+                    }
+                }
             }
 
             let mut needs_refetch = Vec::new();
@@ -1949,6 +1962,13 @@ impl Client {
                     );
                     outcome.retryable.push(name);
                 }
+            }
+
+            // Raised only now: the collections this round did apply have been
+            // dispatched, and `outcome` carries them, so the caller's error is
+            // about the round rather than about work it never heard of.
+            if let Some(e) = apply_error {
+                return Err(e);
             }
 
             pending = needs_refetch;
