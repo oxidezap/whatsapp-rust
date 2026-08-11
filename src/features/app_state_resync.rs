@@ -151,7 +151,15 @@ impl Client {
     /// This waits for a usable connection before asking anything, bounded only
     /// by the client's own lifetime — a reconnect backoff runs to 900s, and a
     /// client that is offline on purpose is waited for rather than failed, so
-    /// the wait can be long. Wrap the call in a timeout if the caller needs one.
+    /// the wait can be long.
+    ///
+    /// Bound it with a timeout if a caller must, but bound the *wait*, not the
+    /// whole call: dropping the future once a response is being applied cancels
+    /// it between the writes that replace a collection's baseline — the mutation
+    /// MACs and the version are separate commits — and leaves the collection
+    /// needing another sync to agree with itself again. Nothing is lost that a
+    /// later sync cannot rebuild, and no other writer can interleave while this
+    /// one holds the reservation, but a cancelled apply is not a clean stop.
     ///
     /// It also does not retry: what a run left unsynced comes back in the
     /// report, and *when* to ask again is the caller's decision. Re-asking in a
@@ -163,10 +171,11 @@ impl Client {
     ///
     /// [`AppStateError::InvalidRequest`] when the request names
     /// [`WAPatchName::Unknown`], which is a parse fallback rather than a
-    /// collection the server has. [`AppStateError::NotConnected`] when the
-    /// client stopped or was never running, so nothing was asked of the server.
-    /// [`AppStateError::Internal`] when the request itself failed — the IQ never
-    /// came back, or a response could not be read. A collection the server
+    /// collection the server has. [`AppStateError::NotConnected`] when nothing
+    /// was asked of the server at all: the client stopped, was never running, or
+    /// lost the connection this request was admitted on before a single IQ went
+    /// out. [`AppStateError::Internal`] when the request itself failed — the IQ
+    /// never came back, or a response could not be read. A collection the server
     /// answered *about* is reported in the returned [`AppStateResyncReport`],
     /// never as an error.
     ///
@@ -229,6 +238,18 @@ impl Client {
             )
             .await?;
 
+        // The wait can be won and the connection lost before the batch reserves
+        // anything: the socket it was admitted on retires, every collection comes
+        // back retryable, and no IQ was ever built. Reporting that would answer a
+        // question about the server with an outcome the server never saw, so it
+        // joins the other way this call never reached one. Asked as "the scope is
+        // gone" rather than "nothing synced", because a batch that waited out a
+        // holder also reaches nobody — and there the connection is fine and the
+        // per-collection verdict is the honest answer.
+        if !outcome.reached_server() && self.admits(scope).is_err() {
+            return Err(AppStateError::NotConnected);
+        }
+
         Ok(outcome.into())
     }
 }
@@ -239,6 +260,7 @@ mod tests {
     use crate::client::{SyncHolder, batch_result};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use wacore::appstate::hash::HashState;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::node::Node;
@@ -354,6 +376,54 @@ mod tests {
         );
     }
 
+    /// Winning the wait does not mean the connection survives to the first IQ.
+    /// Reporting every collection retryable for a socket that retired underneath
+    /// answers a question about the server with an outcome the server never saw,
+    /// and reads to the caller as an attempted repair rather than a reconnect
+    /// race.
+    #[tokio::test]
+    async fn a_connection_retired_before_the_first_iq_is_an_error() {
+        let (client, transport) = create_reachable_client().await;
+        // Held so the resync parks on the reservation, giving the test a moment
+        // where the request is admitted but nothing has reached the wire.
+        let held = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::Regular, SyncHolder::PatchSend)
+            .expect("reserve the collection first");
+
+        let resync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Incremental)
+                    .await
+            })
+        };
+        crate::test_utils::poll_until("the resync to park behind the holder", || {
+            client.app_state_syncing.released.total_listeners() >= 1
+        })
+        .await;
+
+        // The socket this request was admitted on is replaced.
+        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        drop(held);
+
+        let error = tokio::time::timeout(Duration::from_secs(5), resync)
+            .await
+            .expect("the resync must not wait on a connection that is gone")
+            .expect("the resync task should not panic")
+            .expect_err("a request that never reached the server is not a report");
+
+        assert!(
+            matches!(error, AppStateError::NotConnected),
+            "expected NotConnected, got {error:?}"
+        );
+        assert!(
+            transport.sent().is_empty(),
+            "and nothing may have reached the wire"
+        );
+    }
+
     /// `Unknown` is what parsing an unrecognised name yields, so the server has
     /// nothing under it. Rejected whole rather than filtered out: a request that
     /// quietly syncs the rest reports success for a batch it did not carry out.
@@ -429,9 +499,9 @@ mod tests {
     /// persisted version — which is exactly the case this mode exists for — so
     /// the request has to travel with the response as
     /// `PatchList::requested_snapshot`. Nothing persisted may change before the
-    /// answer arrives: a caller following the docs and wrapping this in a
-    /// timeout would otherwise strand the collection on a version its stored
-    /// mutation MACs no longer match.
+    /// answer arrives: a caller that bounds the wait with a timeout would
+    /// otherwise be left, on every cancellation, with a collection stranded on a
+    /// version its stored mutation MACs no longer match.
     #[tokio::test]
     async fn snapshot_mode_writes_nothing_before_the_response() {
         let (client, transport) = create_reachable_client().await;
