@@ -35,10 +35,17 @@ pub enum AppStateResyncMode {
     /// still reported [`synced`](AppStateResyncReport::synced).
     ///
     /// A consumer repairing that kind of drift should clear its copy of the
-    /// collection first and rebuild it from the replay. The call is the
-    /// boundary: every mutation is dispatched before it returns, so a collection
-    /// listed in `synced` has already delivered everything the server had for
-    /// it — including nothing at all, for a collection that is now empty.
+    /// collection first and rebuild it from the replay.
+    ///
+    /// What the return does and does not tell you: every mutation has been
+    /// *dispatched to the event bus* by then, and the collection's own state is
+    /// persisted. It does not mean handlers have run. Delivery from there is the
+    /// bus's, and under
+    /// [`EventDelivery::Concurrent`](crate::bot::EventDelivery::Concurrent) each
+    /// callback runs in a task of its own, while
+    /// [`EventDelivery::Ordered`](crate::bot::EventDelivery::Ordered) queues and
+    /// drops on a full mailbox. A report is evidence about the sync, not about a
+    /// consumer's mirror.
     Snapshot,
 }
 
@@ -115,8 +122,8 @@ impl Client {
     /// # Blocking and retries
     ///
     /// This waits for a usable connection before asking anything, bounded only
-    /// by the client's own lifetime — a reconnect backoff runs to 900s and a
-    /// [`Client::pause`](Client::pause)d client resumes rather than fails, so
+    /// by the client's own lifetime — a reconnect backoff runs to 900s, and a
+    /// client that is offline on purpose is waited for rather than failed, so
     /// the wait can be long. Wrap the call in a timeout if the caller needs one.
     ///
     /// It also does not retry: what a run left unsynced comes back in the
