@@ -61,10 +61,16 @@ pub enum AppStateResyncMode {
     /// A collection can also come back `synced` having replayed nothing, because
     /// a response with no snapshot is what an empty collection answers and the
     /// protocol gives no way to tell that apart from a request the server chose
-    /// not to serve. A snapshot that does arrive but is older than the persisted
-    /// version is refused and reported
-    /// [`retryable`](AppStateResyncReport::retryable) rather than applied — a
-    /// request does not make rolling a collection backward safe.
+    /// not to serve.
+    ///
+    /// A snapshot older than the persisted version is normal — the server
+    /// snapshots periodically and sends the patches recorded since — and is
+    /// rebuilt from as long as those patches can carry the collection back to
+    /// where it was. One that cannot is refused and reported
+    /// [`retryable`](AppStateResyncReport::retryable) rather than applied. That
+    /// judgement is made on versions alone, so a patch that fails its MACs after
+    /// the snapshot has replaced the baseline leaves the collection whole but at
+    /// the snapshot's version: a cursor to re-earn on the next sync, not damage.
     Snapshot,
 }
 

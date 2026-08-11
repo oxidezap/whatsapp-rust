@@ -1003,6 +1003,44 @@ mod tests {
         );
     }
 
+    /// A snapshot big enough to paginate arrives well behind the cursor on its
+    /// first page, with the window that closes the gap spread over the pages
+    /// after it. Judging that page alone refuses it every time — and the refusal
+    /// is what stops the batch from following `has_more_patches` to the pages
+    /// that would have finished the rebuild, so repeated requests never get past
+    /// page one.
+    #[tokio::test]
+    async fn a_first_page_that_says_there_is_more_is_not_a_rewind() {
+        // Snapshot v2 with its first patch, against a collection at v9: this page
+        // ends at v3, and the pages after it are where v4..=v9 would come from.
+        let (backend, processor, mut patch_list, stale_index_mac) =
+            stale_window_scenario(9, &[3]).await;
+        patch_list.has_more_patches = true;
+
+        let (mutations, _, pl) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("a first page is not a failure");
+
+        assert!(
+            pl.error.is_none(),
+            "a page that says there is more must not be judged as falling short: {:?}",
+            pl.error
+        );
+        assert!(
+            !mutations.is_empty(),
+            "the rebuild must start rather than wait for a page it refused to ask for"
+        );
+        assert_eq!(
+            backend
+                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
+                .await
+                .unwrap(),
+            None,
+            "and the snapshot must have replaced the baseline it rebuilds from"
+        );
+    }
+
     /// A gapped window advertises a version it cannot reach: the patch after the
     /// gap fails `validatePatchVersion`. Counting the highest version it names
     /// would accept the snapshot, persist it, and only then fail — leaving the

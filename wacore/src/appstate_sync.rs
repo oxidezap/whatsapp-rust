@@ -307,7 +307,23 @@ impl AppStateProcessor {
                 }
                 response_ends_at = patch_version;
             }
-            let rewinds = response_ends_at < state.version;
+            // A page that says there is more is not the whole answer, so it
+            // cannot be the evidence that the answer falls short. A snapshot big
+            // enough to paginate arrives well behind the cursor on its first
+            // page — the window that closes the gap is spread over the pages
+            // after it — and judging that page alone refuses it every time, which
+            // is also what stops the batch from following `has_more_patches` to
+            // the pages that would have finished it.
+            //
+            // Version reachability is all this can establish. A patch in the
+            // window can still fail its MACs once applied, and by then the
+            // snapshot has replaced the baseline — leaving the collection whole
+            // but at the snapshot's version rather than the one it started from.
+            // That is a cursor to re-earn, not damage: the state and its MACs
+            // still agree, and the next sync asks from there. Proving the window
+            // first would mean applying it twice, and holding it back until it
+            // proves out wants a transaction the store does not offer.
+            let rewinds = !pl.has_more_patches && response_ends_at < state.version;
             if snapshot_is_stale(state.version, snapshot_version) && (!pl.requested_snapshot || rewinds) {
                 log::warn!(
                     target: "AppState",
