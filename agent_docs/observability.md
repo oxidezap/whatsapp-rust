@@ -357,6 +357,66 @@ reliable signal and `freed`/`net` drift for buffers that outlive their poll.
 file-backed pages — useful for a process holding many small per-session DBs. WAL
 caveat: mmap covers reads of the main DB file; writes still go through the WAL.
 
+## Per-message allocation on the send paths
+
+Measured with `divan::AllocProfiler` installed as the global allocator in
+`wacore/benches/send_receive_benchmark.rs` (temporarily — see below), 50 samples
+per bench, pinned to one core. Divan tallies only the benchmarked closure, so
+the fixture's session setup is excluded; the identical counts across group sizes
+confirm that.
+
+| send | allocations / msg | bytes / msg |
+| --- | ---: | ---: |
+| `bench_dm_send` | 157 | 27.9 KB |
+| `bench_group_send_10` (warm) | **22** | **3.58 KB** |
+| `bench_group_send_50` (warm) | **22** | **3.58 KB** |
+| `bench_group_send_256` (warm) | **22** | **3.58 KB** |
+| `bench_group_send_skdm_256` (distributing) | 6,816 | 675.1 KB |
+
+**A warm group send is the cheapest thing this client does, and it is flat in
+group size.** 22 allocations for any group from 10 to 256 members, against 157
+for a DM. That ordering is not a surprise once the shapes are next to each
+other: a DM fans out one pairwise Signal encrypt per recipient device, while a
+warm group send does a single sender-key encrypt for the whole group and
+attaches one `<enc type="skmsg">`. The group path is cheaper per message
+precisely because sender keys exist.
+
+**Where a large per-message figure comes from is redistribution, amortized.** A
+distributing send costs 6,816 allocations at 256 targets — about 26.6 per
+device, which is one X3DH plus one pairwise encrypt each, and is inherent: every
+device needs its own copy of the sender key under its own ratcheting session. An
+external profile of a client reported 387 allocations per group message at 128
+members. That figure is not reproducible as a per-message cost here (warm is 22)
+and it is not meant to be: it sits between the warm and distributing numbers,
+which is what an average over a stream that periodically redistributes looks
+like. At 128 members a distribution is ~3.4K allocations, so a redistribution
+roughly every ten messages lands squarely on 387.
+
+The consequence for anyone reading such a number as a target: the lever is not
+allocation in the send path. It is how often the sender key is redistributed,
+which `resolve_skdm_targets_memoized` already minimizes — and that memo exists
+for correctness (not re-sending keys to devices that have them), so it is not a
+knob to turn further for performance.
+
+`send::encrypt::ensure_sessions_for_devices` is worth naming because a profile
+will point at it: it is called from inside the `distribution_list` branch only,
+so a warm send never enters it at all. Its per-message cost in an averaged
+profile is entirely amortized cold-path cost.
+
+To re-measure, add the allocator to the bench temporarily rather than
+committing it:
+
+```rust
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+```
+
+It is deliberately *not* checked in for `send_receive_benchmark`. Swapping the
+global allocator changes the timing of every bench in that file, which would
+put a one-time step through each of their CodSpeed series for a number that is
+only wanted occasionally. `voip_benchmark.rs` and `prekey_store_benchmark.rs`
+do carry it, because there the allocation churn is the thing under test.
+
 ## Fixed process cost vs per-session cost
 
 A process that runs one session pays far more than a process that runs ten
