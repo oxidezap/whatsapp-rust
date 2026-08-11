@@ -138,6 +138,28 @@ fn ensure_self_in_group(
     }
 }
 
+/// Whether a loaded `skdm_warm_memo` entry still describes this send.
+///
+/// Its own function so the check has exactly one definition. The tests that
+/// pin the memo's behaviour need the same predicate, and a second copy of it
+/// would keep answering "valid" if a fifth term were ever added here — the
+/// tests would pass while every send missed the memo, with nothing reporting
+/// it. Pure comparison over an already-loaded tuple, so it adds nothing to the
+/// send path.
+pub(crate) fn skdm_memo_entry_is_valid(
+    memo: &crate::client::SkdmWarmMemoEntry,
+    devices: &std::sync::Arc<wacore::send::ResolvedGroupDevices>,
+    cached_map: &std::sync::Arc<crate::sender_key_device_cache::SenderKeyDeviceMap>,
+    cached_map_generation: u64,
+    own_sending_jid: &Jid,
+) -> bool {
+    let (memo_devices, memo_map, memo_generation, memo_sender, _) = memo;
+    std::ptr::eq(memo_devices.as_ptr(), std::sync::Arc::as_ptr(devices))
+        && std::ptr::eq(memo_map.as_ptr(), std::sync::Arc::as_ptr(cached_map))
+        && *memo_generation == cached_map_generation
+        && memo_sender == own_sending_jid
+}
+
 /// SKDM update data — only populated for group sends, deferred until after
 /// send_node(). This matches WhatsApp Web which only calls markHasSenderKey()
 /// after server ACK.
@@ -1495,14 +1517,16 @@ impl Client {
                 // same Arc; the memoized needs are a pure function of that
                 // identity.
                 if self.device_memos_enabled
-                    && let Some((dw, cw, memo_gen, memo_sender, memo_needs)) =
-                        self.skdm_warm_memo.get(group).await
-                    && std::ptr::eq(dw.as_ptr(), std::sync::Arc::as_ptr(&all_devices))
-                    && std::ptr::eq(cw.as_ptr(), std::sync::Arc::as_ptr(&cached_map))
-                    && memo_gen == cached_map_gen
-                    && &memo_sender == own_sending_jid
+                    && let Some(memo) = self.skdm_warm_memo.get(group).await
+                    && skdm_memo_entry_is_valid(
+                        &memo,
+                        &all_devices,
+                        &cached_map,
+                        cached_map_gen,
+                        own_sending_jid,
+                    )
                 {
-                    return Some((all_devices, memo_needs));
+                    return Some((all_devices, memo.4));
                 }
                 let needs_skdm = self.filter_skdm_targets(
                     group_jid,
@@ -3136,25 +3160,24 @@ mod tests {
             .pn
             .clone()
             .expect("own pn");
-        let Ok(devices) = client
+        // Panics rather than reading as a miss:
+        // `skdm_warm_memo_misses_after_a_device_is_forgotten` asserts on
+        // `None`, so a resolve failure would satisfy it without ever
+        // exercising the generation term it exists to pin.
+        let devices = client
             .resolve_group_devices_memoized(group, &group_info, &own)
             .await
-        else {
-            return None;
-        };
+            .expect("device resolution must succeed against the seeded fixture");
         let generation = cached_map.generation();
-        let (dw, cw, memo_gen, memo_sender, memo_needs) = client.skdm_warm_memo.get(group).await?;
-        (std::ptr::eq(dw.as_ptr(), Arc::as_ptr(&devices))
-            && std::ptr::eq(cw.as_ptr(), Arc::as_ptr(&cached_map))
-            && memo_gen == generation
-            && memo_sender == own)
-            .then_some(memo_needs)
+        let memo = client.skdm_warm_memo.get(group).await?;
+        // The same predicate the send path applies, not a second copy of it.
+        skdm_memo_entry_is_valid(&memo, &devices, &cached_map, generation, &own).then_some(memo.4)
     }
 
     /// The premise of every "the warm group send is flat in group size" claim:
     /// once the group is warm, `resolve_skdm_targets_memoized` really does take
     /// the memo and skip `filter_skdm_targets`. If it did not, each send would
-    /// pay one hash lookup per device — measured at 649 instructions per member
+    /// pay one hash lookup per device — measured at 655 instructions per member
     /// by `skdm_target_resolution_memo_cold`, which is the exact shape an
     /// external profile attributed to this path.
     ///

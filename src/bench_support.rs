@@ -83,13 +83,27 @@ impl HttpClient for NoopHttpClient {
     }
 }
 
-/// Fictitious PN users, well outside any allocated range. Deterministic in the
+/// Reserved fictional NANP numbers: `1` + a real NPA + the `555` exchange + a
+/// line number in the unassignable `0100`-`0199` block, the format the rest of
+/// this repository's fixtures use.
+///
+/// One NPA only yields 100 such numbers, so the block is spread over several
+/// NPAs — enough for the 512-member sweep with room left. Deterministic in the
 /// index, so the fixture at 512 is a superset of the same fixture at 8.
 fn member_user(index: usize) -> String {
-    format!("1555{:09}", index + 1)
+    /// Real area codes, used only to shape the number; the `555` exchange plus
+    /// the `0100`-`0199` line block is what makes it unassignable.
+    const NPAS: [u16; 8] = [202, 212, 213, 312, 415, 503, 617, 702];
+    assert!(
+        index < NPAS.len() * 100,
+        "the reserved 555-01xx block is exhausted; add another NPA"
+    );
+    format!("1{}555{:04}", NPAS[index / 100], 100 + index % 100)
 }
 
-const OWN_USER: &str = "1555000000000";
+/// Our own account, from the same reserved block and outside the range
+/// [`member_user`] draws from.
+const OWN_USER: &str = "19045550100";
 const GROUP_JID: &str = "120363000000000042@g.us";
 
 /// A logged-in client holding a resolved N-member group, warmed to the steady
@@ -256,8 +270,8 @@ async fn build_fixture(group_size: usize) -> Fixture {
     // harmless simplification: `ensure_self_in_group` runs per send and CLONES
     // the whole `GroupInfo` when self is absent, so a self-less fixture charges
     // every send an N-participant copy no real send performs. Measured both
-    // ways at 512 members, that artifact alone is 23,353 instructions per send
-    // (527,167 self-absent vs 503,814 self-present) — 46 instructions per
+    // ways at 512 members, that artifact alone is 22,836 instructions per send
+    // (525,989 self-absent vs 503,153 self-present) — 45 instructions per
     // member, which would have roughly doubled the per-member slope this sweep
     // reports. Same class of error as the one PR #1279 removed from the
     // `wacore` sweep.

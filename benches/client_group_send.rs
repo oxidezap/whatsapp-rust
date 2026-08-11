@@ -43,8 +43,9 @@ fn main() {
 /// member — tens of millions of instructions at 512 members. Amortised over a
 /// long run that shows up as growth in group size that has nothing to do with
 /// a steady-state send: measured, a 1000-iteration sweep at 512 members read
-/// 623.6K instructions per send against what a sub-threshold sweep reports, purely from the one rotation it crossed. `sample_count ×
-/// sample_size` is kept well under the threshold so no run can reach it.
+/// the per-send cost ~10% high against a sub-threshold sweep, purely from the
+/// one rotation it crossed. `sample_count × sample_size` is kept well under the
+/// threshold so no run can reach it.
 const SAMPLE_COUNT: u32 = 20;
 const SAMPLE_SIZE: u32 = 20;
 
@@ -85,7 +86,7 @@ fn shared(label: &'static str, group_size: usize) -> &'static GroupSendHarness {
 /// the entirety of the apparent per-member growth. The same trap has a second
 /// mouth here: a fixture whose participant list omits self makes
 /// `ensure_self_in_group` deep-clone the metadata on every send, worth another
-/// 46 instructions per member; a third is an unacknowledged companion session,
+/// 45 instructions per member; a third is an unacknowledged companion session,
 /// worth 11% of the absolute cost. Both are measured in `bench_support`.
 ///
 /// Each iteration advances the sender-key chain by one, as a real repeat send
