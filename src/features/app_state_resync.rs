@@ -7,7 +7,6 @@
 
 use crate::client::{BatchedSyncOutcome, BatchedSyncRequest, Client};
 use crate::features::chat_actions::AppStateError;
-use crate::request::IqError;
 use wacore::appstate::patch_decode::WAPatchName;
 
 /// How much of a collection a re-sync asks the server for.
@@ -179,14 +178,18 @@ impl Client {
     ///
     /// [`AppStateError::InvalidRequest`] when the request names
     /// [`WAPatchName::Unknown`], which is a parse fallback rather than a
-    /// collection the server has. [`AppStateError::NotConnected`] when the
-    /// transport was what stopped it: the client stopped or was never running,
-    /// the connection this request was admitted on retired before a single IQ
-    /// went out, or the IQ was refused for want of a socket.
+    /// collection the server has. [`AppStateError::NotConnected`] when nothing
+    /// was ever asked: the client stopped, was never running, or lost the
+    /// connection this request was admitted on before it could reserve anything.
     /// [`AppStateError::Internal`] when the request itself failed — it timed
-    /// out, or a response could not be read. A collection the server answered
-    /// *about* is reported in the returned [`AppStateResyncReport`], never as an
-    /// error.
+    /// out, or a response could not be read.
+    ///
+    /// Losing the transport once the run is under way is not an error but a
+    /// verdict: the collections it was carrying come back
+    /// [`retryable`](AppStateResyncReport::retryable), and the ones it had
+    /// already applied stay in [`synced`](AppStateResyncReport::synced), so a
+    /// caller keeps what the run achieved instead of being told only that it
+    /// failed.
     ///
     /// # Example
     ///
@@ -236,7 +239,7 @@ impl Client {
         }
 
         let scope = self.sync_scope(None);
-        let outcome = match self
+        let outcome = self
             .sync_collections_batched_with(
                 collections,
                 scope,
@@ -245,28 +248,7 @@ impl Client {
                     wait_for_holder: true,
                 },
             )
-            .await
-        {
-            Ok(outcome) => outcome,
-            // The connection can go between being admitted and the IQ reaching
-            // the socket, and `send_iq` then refuses it outright. That is the
-            // same answer the wait gives when no connection is coming, so it
-            // gets the same error rather than an opaque `Internal` a caller
-            // would have to unwrap to tell apart from a real failure.
-            Err(e) => {
-                return Err(
-                    if e.chain().any(|source| {
-                        source
-                            .downcast_ref::<IqError>()
-                            .is_some_and(IqError::is_transport_unavailable)
-                    }) {
-                        AppStateError::NotConnected
-                    } else {
-                        AppStateError::Internal(e)
-                    },
-                );
-            }
-        };
+            .await?;
 
         // The wait can be won and the connection lost before the batch reserves
         // anything: the socket it was admitted on retires, every collection comes
@@ -456,10 +438,11 @@ mod tests {
 
     /// The scope can still be live when `send_iq` refuses the request for want of
     /// a socket — the wait was won, the generation never changed, and the socket
-    /// went between. Surfacing that as `Internal` would leave the caller
-    /// unwrapping an error chain to tell a reconnect from a real failure.
+    /// went between. The collection is not covered by anyone after that, which is
+    /// what `retryable` says; raising instead would tell the caller the run
+    /// failed without telling it what it still owes.
     #[tokio::test]
-    async fn an_iq_refused_for_want_of_a_socket_is_not_connected() {
+    async fn an_iq_refused_for_want_of_a_socket_leaves_the_collection_retryable() {
         let (client, transport) = create_reachable_client().await;
         // Parks the resync past `await_connection` with its scope still valid,
         // which is the only place the socket can go without the checks noticing.
@@ -486,20 +469,78 @@ mod tests {
         client.is_running.store(false, Ordering::Release);
         drop(held);
 
-        let error = tokio::time::timeout(Duration::from_secs(5), resync)
+        let report = tokio::time::timeout(Duration::from_secs(5), resync)
             .await
             .expect("the resync must not wait on a socket that is gone")
             .expect("the resync task should not panic")
-            .expect_err("an IQ that was never sent is not a report");
+            .expect("a lost socket is a verdict about the collection, not a failed request");
+
+        assert_eq!(
+            report.retryable,
+            vec![WAPatchName::Regular],
+            "the collection is not covered by anyone"
+        );
+        assert!(report.synced.is_empty());
+        assert!(
+            transport.sent().is_empty(),
+            "and nothing may have reached the wire"
+        );
+    }
+
+    /// A rebuild is the one path here that destroys persisted state before
+    /// asking for anything, so what it does for a connection that is already
+    /// gone is worth pinning: nothing. The scope check before the reservation is
+    /// what stops it this early — `stand_collection_down` re-asks before each of
+    /// its own writes for the narrower window after that, which this cannot
+    /// reach without a hook between reserving and standing down.
+    #[tokio::test]
+    async fn a_rebuild_for_a_retired_connection_leaves_the_collection_alone() {
+        let (client, transport) = create_reachable_client().await;
+        persist_version(&client, WAPatchName::Regular, 42).await;
+        let held = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::Regular, SyncHolder::PatchSend)
+            .expect("reserve the collection first");
+
+        let resync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Snapshot)
+                    .await
+            })
+        };
+        crate::test_utils::poll_until("the resync to park behind the holder", || {
+            client.app_state_syncing.released.total_listeners() >= 1
+        })
+        .await;
+
+        // The socket this rebuild was admitted on is replaced while it waits.
+        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        drop(held);
+
+        let error = tokio::time::timeout(Duration::from_secs(5), resync)
+            .await
+            .expect("the resync must not wait on a connection that is gone")
+            .expect("the resync task should not panic")
+            .expect_err("a request that never reached the server is not a report");
 
         assert!(
             matches!(error, AppStateError::NotConnected),
             "expected NotConnected, got {error:?}"
         );
-        assert!(
-            transport.sent().is_empty(),
-            "and nothing may have reached the wire"
+        assert_eq!(
+            client
+                .persistence_manager
+                .backend()
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .expect("the version should be readable")
+                .version,
+            42,
+            "a rebuild that could not run must leave the collection alone"
         );
+        assert!(transport.sent().is_empty());
     }
 
     /// `Unknown` is what parsing an unrecognised name yields, so the server has

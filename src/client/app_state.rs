@@ -328,6 +328,18 @@ pub(crate) struct BatchedSyncRequest {
     pub(crate) wait_for_holder: bool,
 }
 
+/// Whether a collection was stood down for a rebuild, or left alone because the
+/// connection it was being stood down for is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandDown {
+    /// The collection is unsynced now — either it was already, or both halves of
+    /// the reset landed.
+    Done,
+    /// Nothing was written. The collection is exactly as it was, and the caller
+    /// should treat it as one this run did not cover.
+    Declined(ScopeLost),
+}
+
 /// What a batched sync achieved, collection by collection.
 ///
 /// A single `Ok`/`Err` for the whole batch cannot carry this. The initial
@@ -1499,15 +1511,26 @@ impl Client {
     /// nothing downstream is looking for.
     ///
     /// Callers hold the collection's reservation across this, so no other writer
-    /// can observe the half-stood-down state while the rebuild runs.
+    /// can observe the half-stood-down state while the rebuild runs — while the
+    /// scope holds. A reconnect clears the reservation registry out from under
+    /// live tasks, so the scope is re-asked before each write: these are the two
+    /// destructive ones on this path, and landing either after the replacement
+    /// connection has applied its own work would take that work's baseline with
+    /// it. Declining leaves the collection exactly as it was, which the caller
+    /// hears as a collection that did not sync rather than as a rebuild that
+    /// half ran.
     async fn stand_collection_down(
         &self,
         backend: &dyn wacore::store::traits::Backend,
         name: WAPatchName,
-    ) -> Result<()> {
+        scope: SyncScope,
+    ) -> Result<StandDown> {
         let state = backend.get_version(name.as_str()).await?;
         if state.version == 0 {
-            return Ok(());
+            return Ok(StandDown::Done);
+        }
+        if let Err(lost) = self.admits(scope) {
+            return Ok(StandDown::Declined(lost));
         }
         debug!(
             target: "Client/AppState",
@@ -1517,8 +1540,15 @@ impl Client {
         backend
             .set_version(name.as_str(), wacore::appstate::hash::HashState::default())
             .await?;
+        if let Err(lost) = self.admits(scope) {
+            // The version is already down, and that half is the recoverable one:
+            // the next sync sees an unsynced collection and rebuilds it, clearing
+            // the MACs on the way. Stopping here is still better than writing on,
+            // because by now another generation may own the collection.
+            return Ok(StandDown::Declined(lost));
+        }
         backend.clear_mutation_macs(name.as_str()).await?;
-        Ok(())
+        Ok(StandDown::Done)
     }
 
     /// Sync multiple collections in a single IQ request, re-fetching those with `has_more_patches`.
@@ -1713,8 +1743,15 @@ impl Client {
             // Build multi-collection IQ, tracking which collections need a snapshot
             let mut collection_nodes = Vec::with_capacity(pending.len());
             for &name in &pending {
-                if rebuild {
-                    self.stand_collection_down(&*backend, name).await?;
+                if rebuild
+                    && let StandDown::Declined(lost) =
+                        self.stand_collection_down(&*backend, name, scope).await?
+                {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: not rebuilding {name:?} ({lost:?})"
+                    );
+                    continue;
                 }
                 let state = backend.get_version(name.as_str()).await?;
                 let want_snapshot = state.version == 0;
@@ -1734,6 +1771,19 @@ impl Client {
             }
             rebuild = false;
 
+            // Every collection declined its rebuild, so there is nothing to ask
+            // about. A collection left out of the request is reconciled as
+            // retryable below, but only once a response comes back — and sending
+            // an empty `<sync>` to get one is a round trip for no work.
+            if collection_nodes.is_empty() {
+                warn!(
+                    target: "Client/AppState",
+                    "Batched sync: nothing left to ask about for {pending:?}"
+                );
+                outcome.retryable.extend(pending);
+                return Ok(());
+            }
+
             let sync_node = NodeBuilder::new("sync").children(collection_nodes).build();
             let iq = crate::request::InfoQuery {
                 namespace: "w:sync:app:state",
@@ -1749,7 +1799,26 @@ impl Client {
             // and an IQ that errors or times out spent one just as much as one
             // that answered.
             outcome.note_reached_server();
-            let resp = self.send_iq(iq).await?;
+            let resp = match self.send_iq(iq).await {
+                Ok(resp) => resp,
+                // Losing the transport is what the buckets are for, not what an
+                // error is for: the collections this round was carrying are not
+                // covered by anyone, and the rounds before it are already applied
+                // and dispatched into `outcome`. Raising instead would throw that
+                // away and tell the caller nothing about which collections it
+                // still owes. Anything else — a timeout, a server error, a
+                // response that would not parse — is a genuine failure and keeps
+                // travelling as one.
+                Err(e) if e.is_transport_unavailable() => {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: transport went while asking about {pending:?} ({e})"
+                    );
+                    outcome.retryable.extend(pending);
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             // The IQ can outrun the scope, so the round is re-admitted before
             // any of it is trusted.
