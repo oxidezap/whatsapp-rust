@@ -1513,12 +1513,20 @@ impl Client {
     /// Callers hold the collection's reservation across this, so no other writer
     /// can observe the half-stood-down state while the rebuild runs — while the
     /// scope holds. A reconnect clears the reservation registry out from under
-    /// live tasks, so the scope is re-asked before each write: these are the two
-    /// destructive ones on this path, and landing either after the replacement
-    /// connection has applied its own work would take that work's baseline with
-    /// it. Declining leaves the collection exactly as it was, which the caller
-    /// hears as a collection that did not sync rather than as a rebuild that
-    /// half ran.
+    /// live tasks, so the scope is re-asked before each write, and a rebuild
+    /// that has lost it leaves the collection exactly as it was rather than half
+    /// reset.
+    ///
+    /// Those checks narrow the window; they do not close it. A connection that
+    /// retires while one of these writes is in flight is not seen, so the write
+    /// still lands — the same shape as the apply itself, whose three writes sit
+    /// behind one admission check in
+    /// [`sync_collections_batched_inner`](Self::sync_collections_batched_inner).
+    /// What remains is bounded by how long a local store write takes, against a
+    /// replacement connection that would have to handshake, reserve and apply
+    /// inside it. Closing it properly means a store that refuses writes from a
+    /// retired generation, which is the same change the apply wants and does not
+    /// belong to one caller.
     async fn stand_collection_down(
         &self,
         backend: &dyn wacore::store::traits::Backend,
