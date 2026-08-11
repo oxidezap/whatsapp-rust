@@ -170,7 +170,6 @@ struct GroupBranchRequest<'a> {
     to: Jid,
     message: &'a wa::Message,
     request_id: &'a str,
-    force_key_distribution: bool,
     edit: Option<EditAttribute>,
     extra_stanza_nodes: &'a [Node],
     group_metadata_freshness: crate::cache::Freshness,
@@ -405,7 +404,6 @@ pub(crate) struct SendPipelineOptions<'a> {
     /// instead of handing over a copy.
     pub(crate) request_id: Option<&'a str>,
     pub(crate) peer: bool,
-    pub(crate) force_key_distribution: bool,
     pub(crate) edit: Option<EditAttribute>,
     pub(crate) extra_stanza_nodes: Vec<Node>,
     pub(crate) stanza_type: Option<StanzaType>,
@@ -1678,7 +1676,6 @@ impl Client {
             sent_at,
             request_id: request_id_override,
             peer,
-            force_key_distribution,
             edit,
             extra_stanza_nodes,
             stanza_type: stanza_type_override,
@@ -1763,7 +1760,6 @@ impl Client {
                 to,
                 message,
                 request_id,
-                force_key_distribution,
                 edit,
                 extra_stanza_nodes: &extra_stanza_nodes,
                 group_metadata_freshness,
@@ -1936,7 +1932,6 @@ impl Client {
             to,
             message,
             request_id,
-            force_key_distribution,
             edit,
             extra_stanza_nodes,
             group_metadata_freshness,
@@ -2040,7 +2035,7 @@ impl Client {
             };
 
             let (key_exists, needs_rotation) = read_sender_key_state().await?;
-            let mut force_skdm = force_key_distribution || !key_exists || needs_rotation;
+            let mut force_skdm = !key_exists || needs_rotation;
             if force_skdm {
                 // Serialize the whole rotation/redistribution under the
                 // per-group guard and RE-CHECK once inside it: a send that
@@ -2049,20 +2044,19 @@ impl Client {
                 // redistributing to every member again.
                 distribution_guard = Some(self.group_distribution_lock(&to).await);
                 let (key_exists, needs_rotation) = read_sender_key_state().await?;
-                force_skdm = force_key_distribution || !key_exists || needs_rotation;
-                if !key_exists || needs_rotation {
+                force_skdm = !key_exists || needs_rotation;
+                if force_skdm {
                     self.reset_sender_key_device_tracking(&to_str).await?;
-                }
-                if needs_rotation {
-                    log::info!(
-                        "Periodic sender-key rotation for {} (chain iteration >= {SENDER_KEY_ROTATION_THRESHOLD})",
-                        to.observe()
-                    );
-                    self.signal_cache
-                        .delete_sender_key(sender_key_name.cache_key())
-                        .await;
-                }
-                if !force_skdm {
+                    if needs_rotation {
+                        log::info!(
+                            "Periodic sender-key rotation for {} (chain iteration >= {SENDER_KEY_ROTATION_THRESHOLD})",
+                            to.observe()
+                        );
+                        self.signal_cache
+                            .delete_sender_key(sender_key_name.cache_key())
+                            .await;
+                    }
+                } else {
                     distribution_guard = None;
                 }
             }
@@ -2619,6 +2613,7 @@ mod tests {
     use super::*;
     use crate::test_utils::wait_for_lock_waiter;
     use std::str::FromStr;
+    use wacore::proto_helpers::MessageBuilderExt;
 
     #[test]
     fn status_revoke_requires_a_distinct_outer_stanza_id() {
@@ -2935,24 +2930,222 @@ mod tests {
         assert_eq!(revoke_type, RevokeType::Sender);
     }
 
-    #[test]
-    fn test_force_skdm_only_for_admin_revoke() {
-        // Admin revokes require force_skdm=true to get proper message structure
-        // with phash, <participants>, and <device-identity> that WhatsApp Web uses.
-        // Without this, the server returns error 479.
-        let sender_jid = Jid::from_str("123456@s.whatsapp.net").unwrap();
+    /// A group whose metadata, device lists and pairwise sessions are all
+    /// primed, so a send reaches the wire without a single IQ and the captured
+    /// frames are exactly the message stanzas the test asked for.
+    struct GroupSendFixture {
+        client: Arc<Client>,
+        transport: Arc<crate::transport::mock::CapturingMockTransport>,
+        group: Jid,
+        member: Jid,
+        /// Every recipient device the group resolves to (own device excluded).
+        recipient_devices: usize,
+    }
 
-        let sender_revoke = RevokeType::Sender;
-        let admin_revoke = RevokeType::Admin {
-            original_sender: sender_jid,
-        };
+    impl GroupSendFixture {
+        async fn new() -> Self {
+            use wacore::client::context::GroupInfo;
+            use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+            use wacore::types::message::AddressingMode;
 
-        // This matches the logic in revoke_message()
-        let force_skdm_sender = matches!(sender_revoke, RevokeType::Admin { .. });
-        let force_skdm_admin = matches!(admin_revoke, RevokeType::Admin { .. });
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let own = Jid::from_str("5511000000001@s.whatsapp.net").unwrap();
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetId(Some(own.clone())))
+                .await;
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetLid(Some(
+                    Jid::from_str("100000000000001@lid").unwrap(),
+                )))
+                .await;
 
-        assert!(!force_skdm_sender, "Sender revoke should NOT force SKDM");
-        assert!(force_skdm_admin, "Admin revoke MUST force SKDM");
+            let member_users = ["5511000000002", "5511000000003"];
+            for user in [own.user.as_str()].into_iter().chain(member_users) {
+                let record = DeviceListRecord {
+                    user: user.into(),
+                    devices: vec![DeviceInfo::new(0, None)],
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                };
+                client
+                    .device_registry_cache
+                    .raw_insert_for_tests(user.to_string(), Arc::new(record))
+                    .await;
+            }
+
+            let participants: Vec<Jid> = member_users
+                .iter()
+                .map(|user| Jid::from_str(&format!("{user}@s.whatsapp.net")).unwrap())
+                .collect();
+            for participant in &participants {
+                crate::test_utils::seed_peer_session(&client, participant).await;
+            }
+
+            let group = Jid::from_str("120363000000000042@g.us").unwrap();
+            client
+                .get_group_cache()
+                .insert(
+                    group.clone(),
+                    Arc::new(GroupInfo::new(participants.clone(), AddressingMode::Pn)),
+                )
+                .await;
+
+            Self {
+                client,
+                transport,
+                group,
+                member: participants[0].clone(),
+                recipient_devices: participants.len(),
+            }
+        }
+
+        async fn send_text(&self, text: &str) {
+            self.client
+                .send_message(self.group.clone(), wa::Message::text(text))
+                .await
+                .expect("group text send should reach the wire");
+        }
+
+        async fn revoke(&self, message_id: &str, revoke_type: RevokeType) {
+            self.client
+                .revoke_message(self.group.clone(), message_id, revoke_type)
+                .await
+                .expect("revoke should reach the wire");
+        }
+
+        fn admin_revoke(&self) -> RevokeType {
+            RevokeType::Admin {
+                original_sender: self.member.clone(),
+            }
+        }
+
+        async fn stanza(&self, index: usize) -> Arc<wacore_binary::OwnedNodeRef> {
+            crate::test_utils::decode_sent_iq(&self.transport, index).await
+        }
+
+        /// Wire bytes of the `index`-th frame, the number the amplification is
+        /// measured in.
+        fn frame_len(&self, index: usize) -> usize {
+            self.transport.sent()[index].len()
+        }
+    }
+
+    /// Devices the stanza carries a pairwise sender-key copy for.
+    fn skdm_target_count(stanza: &wacore_binary::OwnedNodeRef) -> usize {
+        stanza
+            .get()
+            .get_optional_child_by_tag(&["participants"])
+            .map_or(0, |participants| {
+                participants.get_children_by_tag("to").count()
+            })
+    }
+
+    fn attr_value(stanza: &wacore_binary::OwnedNodeRef, key: &str) -> Option<String> {
+        stanza
+            .get()
+            .get_attr(key)
+            .map(|value| value.as_str().into_owned())
+    }
+
+    /// The regression: an admin revoke in a group whose members already hold the
+    /// sender key re-sent it to every device, turning a 1-recipient stanza into
+    /// one `<enc>` per device.
+    #[tokio::test]
+    async fn admin_revoke_does_not_redistribute_a_warm_sender_key() {
+        let fixture = GroupSendFixture::new().await;
+
+        fixture.send_text("first message warms the group").await;
+        let first = fixture.stanza(0).await;
+        assert_eq!(
+            skdm_target_count(&first),
+            fixture.recipient_devices,
+            "the first send is cold and must distribute to every device"
+        );
+
+        fixture
+            .revoke("3EB0FAKEREVOKED01", fixture.admin_revoke())
+            .await;
+        let revoke = fixture.stanza(1).await;
+        assert_eq!(
+            skdm_target_count(&revoke),
+            0,
+            "every device is warm, so the revoke has nothing to distribute"
+        );
+        assert!(
+            fixture.frame_len(1) < fixture.frame_len(0),
+            "a revoke that distributes nothing must be smaller than the cold send"
+        );
+    }
+
+    /// The contrast: removing the force must not remove the distribution. A
+    /// revoke sent before anything warmed the group is still cold and still
+    /// reaches every device.
+    #[tokio::test]
+    async fn admin_revoke_on_a_cold_group_still_distributes_to_every_device() {
+        let fixture = GroupSendFixture::new().await;
+
+        fixture
+            .revoke("3EB0FAKEREVOKED02", fixture.admin_revoke())
+            .await;
+        let revoke = fixture.stanza(0).await;
+        assert_eq!(
+            skdm_target_count(&revoke),
+            fixture.recipient_devices,
+            "a cold revoke must still hand the sender key to every device"
+        );
+    }
+
+    /// `edit`, `phash` and the `skmsg` payload are built by the group path
+    /// itself, with or without a distribution list, so a revoke that hands out
+    /// no sender key still carries the whole structure.
+    #[tokio::test]
+    async fn warm_admin_revoke_keeps_the_full_group_stanza_structure() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("warm the group").await;
+        fixture
+            .revoke("3EB0FAKEREVOKED03", fixture.admin_revoke())
+            .await;
+
+        let revoke = fixture.stanza(1).await;
+        assert_eq!(attr_value(&revoke, "edit").as_deref(), Some("8"));
+        assert!(
+            attr_value(&revoke, "phash").is_some_and(|phash| !phash.is_empty()),
+            "groups carry a phash on every send, distribution or not"
+        );
+        let enc = revoke
+            .get()
+            .get_optional_child_by_tag(&["enc"])
+            .expect("the revoke payload itself is always one skmsg");
+        assert_eq!(
+            enc.get_attr("type")
+                .map(|value| value.as_str().into_owned()),
+            Some("skmsg".to_string())
+        );
+    }
+
+    /// Neither revoke type forces distribution: both go out on the ordinary
+    /// group path, like every other message.
+    #[tokio::test]
+    async fn no_revoke_type_forces_sender_key_redistribution() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("warm the group").await;
+
+        fixture
+            .revoke("3EB0FAKEREVOKED04", RevokeType::Sender)
+            .await;
+        fixture
+            .revoke("3EB0FAKEREVOKED05", fixture.admin_revoke())
+            .await;
+
+        let sender_revoke = fixture.stanza(1).await;
+        let admin_revoke = fixture.stanza(2).await;
+        assert_eq!(attr_value(&sender_revoke, "edit").as_deref(), Some("7"));
+        assert_eq!(attr_value(&admin_revoke, "edit").as_deref(), Some("8"));
+        assert_eq!(skdm_target_count(&sender_revoke), 0);
+        assert_eq!(skdm_target_count(&admin_revoke), 0);
     }
 
     #[test]

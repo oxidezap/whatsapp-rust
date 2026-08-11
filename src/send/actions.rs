@@ -60,14 +60,12 @@ impl Client {
         // The message_id being revoked is already in protocolMessage.key.id
         // Passing None generates a fresh stanza ID
         //
-        // For admin revokes, force SKDM distribution to get the proper message structure
-        // with phash, <participants>, and <device-identity> that WhatsApp Web uses
-        let force_skdm = matches!(revoke_type, RevokeType::Admin { .. });
+        // A revoke is an ordinary group message: the sender key goes only to devices
+        // that do not have it yet, like every other send.
         self.send_message_impl(
             to,
             &revoke_message,
             SendPipelineOptions {
-                force_key_distribution: force_skdm,
                 edit: Some(edit_attr),
                 ..Default::default()
             },

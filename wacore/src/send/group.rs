@@ -572,7 +572,7 @@ pub async fn prepare_group_stanza(
         message_children.push(build_reporting_node(result));
     }
 
-    // Add phash if we distributed keys in this message
+    // Groups carry a phash on every send, distribution or not (see above).
     if let Some(phash) = phash_for_stanza {
         stanza_builder = stanza_builder.attr("phash", phash);
     }
