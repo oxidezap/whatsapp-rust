@@ -5318,6 +5318,13 @@ mod warm_group_send_encoding_scale {
 
         let group_info = GroupInfo::new(members.clone(), AddressingMode::Pn);
         let resolved = std::sync::Arc::new(ResolvedGroupDevices::new(members));
+        // Warm the phash memo in setup, exactly as `setup_group_send` does in
+        // the benchmark and as production does on the first send after a
+        // topology change. Left cold, the `OnceLock` would make the *first*
+        // send recompute an O(member_count) hash inside the very path these
+        // tests claim is warm — measuring the cold path under a warm name, and
+        // leaving a regression that recomputed it per send undetectable.
+        resolved.phash(&own).expect("phash must warm in setup");
         let message = wa::Message {
             conversation: Some("same text regardless of group size".into()),
             ..Default::default()
