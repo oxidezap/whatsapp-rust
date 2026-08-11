@@ -33,6 +33,17 @@ fn main() {
 /// device id must stay within `u8` to take the `AD_JID` path — a single user
 /// numbered up to 511 would silently encode half the sweep as `JID_PAIR` and
 /// measure two wire shapes at once.
+///
+/// The ciphertexts are `type="msg"`, the shape a redistribution to devices that
+/// already hold a pairwise session emits. A device being contacted for the
+/// first time gets `type="pkmsg"` instead, whose `PreKeySignalMessage` carries
+/// an identity key, a base key and the registration id on top of the same inner
+/// message — roughly twice the payload. Marshalling is linear in payload bytes,
+/// so that case rides the same slope from a higher intercept; what this sweep
+/// exists to pin is the per-recipient term, which the payload does not move.
+/// Building the real ciphertexts is out of reach here regardless: `wacore-binary`
+/// does not depend on libsignal, and giving it a dev-dependency on the Signal
+/// stack to size a byte array would be a poor trade.
 fn create_skdm_fanout_node(width: usize) -> Node {
     const DEVICES_PER_USER: usize = 4;
     let recipients: Vec<Node> = (0..width)

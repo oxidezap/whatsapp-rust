@@ -4005,7 +4005,14 @@ mod mark_full_distribution_list {
             group_participants.push(own_jid.to_non_ad());
             let group_info = GroupInfo::new(group_participants, AddressingMode::Pn);
             // The full resolved device set the warm send hashes into `phash`.
-            let resolved = ResolvedGroupDevices::new(participants);
+            // The companions belong inside it, not beside it: production filters
+            // the SKDM targets out of this very set (`filter_skdm_targets` over
+            // `all_devices_for_phash`), and the server validates the phash against
+            // every recipient device — so a stanza whose `<participants>` named a
+            // device the phash did not cover is a shape no send produces.
+            let mut resolved_devices = participants;
+            resolved_devices.extend(own_companions.iter().cloned());
+            let resolved = ResolvedGroupDevices::new(resolved_devices);
             let msg = wa::Message {
                 conversation: Some("steady state".into()),
                 ..Default::default()
@@ -4024,7 +4031,8 @@ mod mark_full_distribution_list {
                     message: &msg,
                     message_id: "WARMGROUPSCALE1",
                     force_distribution: false,
-                    distribution_targets: (!own_companions.is_empty()).then_some(own_companions),
+                    distribution_targets: (!own_companions.is_empty())
+                        .then(|| own_companions.clone()),
                     distribution_policy: SenderKeyDistributionPolicy::BestEffort,
                     phash_devices: Some(&resolved),
                     edit: None,
