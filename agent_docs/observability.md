@@ -379,7 +379,7 @@ identical counts across group sizes confirm that.
 | `bench_group_send_10` (no distribution) | **22** | **3.58 KB** |
 | `bench_group_send_50` (no distribution) | **22** | **3.58 KB** |
 | `bench_group_send_256` (no distribution) | **22** | **3.58 KB** |
-| `bench_group_send_skdm_256` (distributing) | 6,816 | 675.1 KB |
+| `bench_group_send_skdm_256` (distributing, first message) | 6,816 | 675.1 KB |
 
 **The result that holds regardless of scope: a group send that distributes no
 sender key is flat in group size.** 22 allocations and 3.58 KB whether the group
@@ -389,14 +389,25 @@ everyone and nothing per recipient (pinned by
 is higher because a DM pairwise-encrypts once per recipient device; the group
 path is cheaper per message precisely because sender keys exist.
 
-**Two things the distributing row is not.** It is not X3DH: `setup_group_send`
-calls `establish_session` for every member before forcing distribution, so
-`ensure_sessions_for_devices` finds each session present and never reaches the
-prekey-fetch branch. What 6,816 measures is the SKDM encrypt fan-out — one
-pairwise encrypt and one `<to><enc>` node per target, ~26.6 allocations each —
-plus the stanza build. A cold fixture with genuinely missing sessions would cost
-more; nothing here measures that. And it is not "the" cold cost: forced
-rotation and reset paths redistribute on their own schedule.
+**What the distributing row is, precisely.** It is *not* X3DH:
+`setup_group_send` calls `establish_session` for every member before forcing
+distribution, so `ensure_sessions_for_devices` finds each session present and
+never reaches the prekey-fetch branch. A cold fixture with genuinely missing
+sessions would cost more, and nothing here measures that.
+
+It is also not the shape a *later* redistribution takes. `establish_session`
+runs `process_prekey_bundle` alone — unlike `establish_bidirectional`, it never
+completes the round trip — so every session still carries its `pending_pre_key`
+and each SKDM encryption emits a `pkmsg`, with first-message prekey wrapping and
+device-identity serialization attached. So 6,816 is the **first-message fan-out
+at 256 targets**, ~26.6 allocations each. A forced rotation or reset over
+acknowledged sessions emits plain `SignalMessage`s and is cheaper; that number
+is unmeasured here.
+
+Note "targets", not members: `setup_group_send(n)` creates exactly one device
+per member, while SKDM fan-out scales with *resolved devices*. A real group
+resolves to more devices than members, so member counts cannot be substituted
+into these figures without that topology.
 
 ### What this does not settle
 
@@ -414,10 +425,12 @@ revision of this section was wrong to present them as doing so:
   `ensure_sessions_for_devices`. So the 22 figure is specifically the
   zero-own-target case, and "a warm send never touches session setup" is false
   for the ordinary multi-device account.
-- **The amortization arithmetic does not land on 387 either.** One ~3.4K
-  distribution at 128 members plus nine 22-allocation sends averages ~360, not
-  387. Close enough to suggest the shape is right — a stream that periodically
-  redistributes — but not close enough to claim the decomposition.
+- **The amortization arithmetic does not land on 387 either.** Scaling the
+  measured row down to 128 *targets* gives ~3.4K; one of those plus nine
+  22-allocation sends averages ~360, not 387. And the external figure is quoted
+  in group *members*, whose device count is not stated — a 128-member group
+  resolves to more than 128 targets. The shape is suggestive; the decomposition
+  is not claimable from here.
 
 `send::encrypt::ensure_sessions_for_devices` is worth naming because a profile
 points at it: it is reached only through the `distribution_list` branch, so a
