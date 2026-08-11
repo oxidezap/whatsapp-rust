@@ -76,11 +76,12 @@ fn create_skdm_fanout_node(width: usize) -> Node {
 
 // Group sender-key distribution, swept across the recipient count reported for
 // real groups. Marshalling is linear in the fan-out width, so this is what a
-// cold group send (or a redistribution after a membership change) pays in the
-// encoder; the steady-state send that follows carries no `<participants>` at
-// all. Keeping both facts measurable is what tells a group-size regression
-// ("the warm stanza grew a per-participant node") apart from a group that is
-// merely redistributing.
+// redistribution — a membership change, or a rotation — pays in the encoder,
+// and a first-contact fan-out pays the same per-recipient term over the larger
+// `pkmsg` payload (see the fixture). The steady-state send that follows carries
+// no `<participants>` at all. Keeping both facts measurable is what tells a
+// group-size regression ("the warm stanza grew a per-participant node") apart
+// from a group that is merely redistributing.
 //
 // `marshal_exact`, not `marshal_auto`: every outbound stanza goes through
 // `Client::marshal_node_for_send`, which picks the two-pass exact strategy.
