@@ -275,56 +275,9 @@ impl AppStateProcessor {
         // (persisted >= incoming) is discarded ("skip applying syncd old version") so it can't
         // roll the collection backward. No-op on the benign first-sync path, where snapshots
         // are requested only at version 0.
-        //
-        // A snapshot the caller asked for is measured differently — see
-        // [`PatchList::requested_snapshot`]. A caller asking is telling us the
-        // persisted version is not the thing to measure the snapshot against, and
-        // its copy being wrong rather than behind is exactly when the two agree.
-        //
-        // What decides it is where the *response* ends, not where the snapshot
-        // starts. A snapshot arrives with the patch window that follows it, so
-        // one behind the cursor can still carry the collection level with or past
-        // it once its patches are applied — and rebuilding from that sequence is
-        // the repair that was asked for. Rebuilding is also what makes those
-        // patches applicable at all: they are contiguous from the snapshot, not
-        // from the persisted version, so keeping the old baseline would fail
-        // `validatePatchVersion` on the first of them. Only a sequence that still
-        // ends behind the cursor would roll the collection backward, and no
-        // request makes that safe.
         let snapshot_fresh = pl.snapshot.as_ref().is_some_and(|snapshot| {
             let snapshot_version = snapshot.version.as_option().and_then(|v| v.version).unwrap_or(0);
-            // How far the response can actually take the collection: the
-            // snapshot, plus the patches that follow it without a gap.
-            // `validatePatchVersion` applies each patch at exactly `version + 1`,
-            // so the first gap ends the window — and the versions past it,
-            // however high they read, are not reachable from this response. What
-            // matters is where it can land, not what it advertises.
-            let mut response_ends_at = snapshot_version;
-            for patch in &pl.patches {
-                let patch_version = patch.version.as_option().and_then(|v| v.version).unwrap_or(0);
-                if patch_version != response_ends_at.saturating_add(1) {
-                    break;
-                }
-                response_ends_at = patch_version;
-            }
-            // A page that says there is more is not the whole answer, so it
-            // cannot be the evidence that the answer falls short. A snapshot big
-            // enough to paginate arrives well behind the cursor on its first
-            // page — the window that closes the gap is spread over the pages
-            // after it — and judging that page alone refuses it every time, which
-            // is also what stops the batch from following `has_more_patches` to
-            // the pages that would have finished it.
-            //
-            // Version reachability is all this can establish. A patch in the
-            // window can still fail its MACs once applied, and by then the
-            // snapshot has replaced the baseline — leaving the collection whole
-            // but at the snapshot's version rather than the one it started from.
-            // That is a cursor to re-earn, not damage: the state and its MACs
-            // still agree, and the next sync asks from there. Proving the window
-            // first would mean applying it twice, and holding it back until it
-            // proves out wants a transaction the store does not offer.
-            let rewinds = !pl.has_more_patches && response_ends_at < state.version;
-            if snapshot_is_stale(state.version, snapshot_version) && (!pl.requested_snapshot || rewinds) {
+            if snapshot_is_stale(state.version, snapshot_version) {
                 log::warn!(
                     target: "AppState",
                     "Skipping stale snapshot for {collection_name}: incoming v{snapshot_version} <= persisted v{}",
@@ -334,36 +287,6 @@ impl AppStateProcessor {
             }
             true
         });
-        // A snapshot that arrived and was refused leaves the request unfulfilled,
-        // and the caller has to hear it: reading the run as a completed replay
-        // would leave a consumer that cleared its own copy first — the documented
-        // way to reconcile deletions — holding nothing. Reported rather than
-        // raised, because it is a verdict about one collection and a later
-        // attempt can still get a newer snapshot.
-        //
-        // Only when a snapshot *arrived*. A response carrying none is not
-        // evidence of anything: it is exactly what an empty collection answers,
-        // and every first sync asks with `return_snapshot`, so treating that as
-        // unfulfilled would leave every empty collection retryable on the
-        // bootstrap that gates `Connected`.
-        //
-        // Any patches it came with go with it. Refusing the snapshot means the
-        // response could not reach the persisted version, and its patches are
-        // contiguous from the snapshot rather than from that version — so
-        // attempting them only fails `validatePatchVersion` on the first one,
-        // turning a per-collection verdict into an error about the whole run.
-        if pl.requested_snapshot && !snapshot_fresh && pl.snapshot.is_some() {
-            log::warn!(
-                target: "AppState",
-                "Snapshot request for {collection_name} unfulfilled: the returned snapshot is older than persisted v{}",
-                state.version
-            );
-            pl.error = Some(CollectionSyncError::Retry {
-                code: 0,
-                text: "requested snapshot is older than the persisted version".to_string(),
-            });
-            return Ok((new_mutations, state, pl));
-        }
         if snapshot_fresh && let Some(snapshot) = pl.snapshot.take() {
             let keys_map = self.key_cache.lock().await.clone();
             let collection_name_owned = collection_name.to_string();
@@ -688,7 +611,6 @@ mod external_blob_tests {
             snapshot: None,
             snapshot_ref,
             error: None,
-            requested_snapshot: false,
         }
     }
 
@@ -735,7 +657,6 @@ mod external_blob_tests {
             snapshot: None,
             snapshot_ref: None,
             error: None,
-            requested_snapshot: false,
         };
         let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
             Err(anyhow!("simulated failure"))

@@ -311,16 +311,17 @@ pub(crate) enum ReservationWait {
 /// notification, a dirty bit, the bootstrap — and wrong for a consumer that
 /// asked for a named collection by hand. Such a caller wants the collection
 /// re-read *now*: an equivalent sync in flight does not discharge its request
-/// (see [`ReservationWait`]), and "the persisted version is not zero" is not a
-/// reason to withhold the snapshot it asked for. Overriding is deliberately not
+/// (see [`ReservationWait`]), and a collection it has declared untrustworthy is
+/// not repaired by resuming from where it was. Overriding is deliberately not
 /// the default — a background trigger that waited on every holder would queue
-/// behind patch sends it has no reason to outrank, and one that forced a
-/// snapshot would re-download whole collections on every dirty bit.
+/// behind patch sends it has no reason to outrank, and one that rebuilt would
+/// re-download whole collections on every dirty bit.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BatchedSyncRequest {
-    /// Ask for `return_snapshot` on the first round even when a version is
-    /// persisted, instead of only when it is zero.
-    pub(crate) snapshot: bool,
+    /// Stand each collection down to unsynced before asking, so the round that
+    /// follows rebuilds it from a snapshot instead of resuming from where it
+    /// was.
+    pub(crate) rebuild: bool,
     /// Wait for whoever holds the collection rather than skipping behind an
     /// equivalent sync. The bootstrap already does this on account of its
     /// deadline; this is how a non-bootstrap caller asks for the same.
@@ -1481,6 +1482,45 @@ impl Client {
         .map_err(|_| ReservationSkip::WaitTimedOut)
     }
 
+    /// Stand `name` down to the state of a collection that has never synced.
+    ///
+    /// The only way to ask the server to replay a collection: it sends a
+    /// snapshot when the request carries no version, and the processor applies
+    /// one only over a version older than its own — so a rebuild is expressed by
+    /// having nothing rather than by asking for something. That also keeps this
+    /// on the path the first sync already takes, instead of teaching the
+    /// snapshot rules a second shape to recognise.
+    ///
+    /// The version goes first. Either write can be the last one a cancelled or
+    /// failed rebuild completes, and of the two halves it can stop at, `v0` with
+    /// stale MACs is the recoverable one: `process_patch_list` clears them
+    /// itself before applying anything to an empty baseline. The other order
+    /// leaves the collection claiming a version whose MACs are gone, which
+    /// nothing downstream is looking for.
+    ///
+    /// Callers hold the collection's reservation across this, so no other writer
+    /// can observe the half-stood-down state while the rebuild runs.
+    async fn stand_collection_down(
+        &self,
+        backend: &dyn wacore::store::traits::Backend,
+        name: WAPatchName,
+    ) -> Result<()> {
+        let state = backend.get_version(name.as_str()).await?;
+        if state.version == 0 {
+            return Ok(());
+        }
+        debug!(
+            target: "Client/AppState",
+            "Batched sync: standing {name:?} down from v{} to rebuild it",
+            state.version
+        );
+        backend
+            .set_version(name.as_str(), wacore::appstate::hash::HashState::default())
+            .await?;
+        backend.clear_mutation_macs(name.as_str()).await?;
+        Ok(())
+    }
+
     /// Sync multiple collections in a single IQ request, re-fetching those with `has_more_patches`.
     /// Mirrors WA Web's `serverSync()` outer loop (`WAWebSyncdServerSync`).
     ///
@@ -1506,7 +1546,7 @@ impl Client {
 
     /// [`Self::sync_collections_batched`] with the two decisions a background
     /// trigger takes for granted spelled out — see [`BatchedSyncRequest`].
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len(), snapshot = request.snapshot), err(Debug)))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len(), rebuild = request.rebuild), err(Debug)))]
     pub(crate) async fn sync_collections_batched_with(
         &self,
         collections: Vec<WAPatchName>,
@@ -1632,12 +1672,12 @@ impl Client {
         // that is still making progress.
         const MAX_ITERATIONS: usize = 500;
         let mut iteration = 0;
-        // Spent on the first round only. A snapshot answers with the whole
-        // collection and moves the version to the server's head, so asking for
-        // one again on the refetch round would discard the page just applied and
-        // re-page the collection from scratch for as long as the server keeps
-        // setting `has_more_patches`.
-        let mut force_snapshot = request.snapshot;
+        // Spent on the first round: the rebuild is what stands the collection
+        // down, and every round after it is the pagination that follows from
+        // there — re-standing it down would throw away the page just applied and
+        // re-page the collection for as long as the server keeps setting
+        // `has_more_patches`.
+        let mut rebuild = request.rebuild;
         // Which collections are mid-replay, kept across rounds rather than
         // rebuilt per round. A snapshot that answers `has_more_patches` is still
         // being replayed on the pages that follow it, and those pages carry the
@@ -1672,15 +1712,13 @@ impl Client {
 
             // Build multi-collection IQ, tracking which collections need a snapshot
             let mut collection_nodes = Vec::with_capacity(pending.len());
-            // What *this round* asked for, which is not the same as what is being
-            // replayed: a refetch round asks incrementally for a collection whose
-            // replay started with the snapshot in the round before it.
-            let mut asked_for_snapshot = HashSet::new();
             for &name in &pending {
+                if rebuild {
+                    self.stand_collection_down(&*backend, name).await?;
+                }
                 let state = backend.get_version(name.as_str()).await?;
-                let want_snapshot = force_snapshot || state.version == 0;
+                let want_snapshot = state.version == 0;
                 if want_snapshot {
-                    asked_for_snapshot.insert(name);
                     replaying_snapshot.insert(name);
                 }
                 let mut builder = NodeBuilder::new("collection")
@@ -1694,7 +1732,7 @@ impl Client {
                 }
                 collection_nodes.push(builder.build());
             }
-            force_snapshot = false;
+            rebuild = false;
 
             let sync_node = NodeBuilder::new("sync").children(collection_nodes).build();
             let iq = crate::request::InfoQuery {
@@ -1761,14 +1799,6 @@ impl Client {
                     );
                     false
                 });
-            }
-
-            // Carried from the request, because the response cannot say it and
-            // the snapshot guard needs it. Set after the `retain` above, so a
-            // collection nobody asked about can never arrive carrying the
-            // exemption.
-            for pl in &mut patch_lists {
-                pl.requested_snapshot = asked_for_snapshot.contains(&pl.name);
             }
 
             let proc = self.get_app_state_processor();
@@ -2104,10 +2134,6 @@ impl Client {
             // Parse the response once here; the same parsed list is handed to the
             // processor below (no second parse).
             let mut pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
-            // Carried from the request; the response cannot say it. Without it a
-            // `full_sync` over a persisted version gets its snapshot discarded on
-            // arrival and reports the collection synced without having read it.
-            pl.requested_snapshot = want_snapshot;
             debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
                 name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
 
@@ -2550,8 +2576,6 @@ impl Client {
                         snapshot: None,
                         snapshot_ref: None,
                         error: None,
-                        // A patch send never asks for one.
-                        requested_snapshot: false,
                     }
                 }
                 Err(e) => {

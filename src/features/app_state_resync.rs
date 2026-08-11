@@ -29,12 +29,22 @@ pub enum AppStateResyncMode {
     /// the mirror is exactly as stale as before. Use [`Self::Snapshot`] for
     /// that.
     Incremental,
-    /// Ask for the collection's current snapshot, whatever the persisted
-    /// version says.
+    /// Discard what is stored and rebuild the collection from the server's
+    /// snapshot.
     ///
     /// The expensive repair, for when local state is not behind but *wrong* —
     /// a mirror rebuilt from scratch, a database restored from a backup, an
     /// ltHash that stopped agreeing with its peers.
+    ///
+    /// The rebuild is expressed by standing the collection down to unsynced and
+    /// letting the sync ask as a first sync does, because that is the only
+    /// request the server answers with a snapshot. It is the same path every
+    /// collection takes when the client first pairs, so the pagination, the
+    /// missing-key recovery and the blob fetching are the ones already worn in.
+    ///
+    /// A run that fails partway therefore leaves the collection asking to be
+    /// rebuilt rather than resuming from where it was — the cost of having
+    /// declared the stored copy untrustworthy.
     ///
     /// # A snapshot replays; it does not reconcile
     ///
@@ -62,15 +72,6 @@ pub enum AppStateResyncMode {
     /// a response with no snapshot is what an empty collection answers and the
     /// protocol gives no way to tell that apart from a request the server chose
     /// not to serve.
-    ///
-    /// A snapshot older than the persisted version is normal — the server
-    /// snapshots periodically and sends the patches recorded since — and is
-    /// rebuilt from as long as those patches can carry the collection back to
-    /// where it was. One that cannot is refused and reported
-    /// [`retryable`](AppStateResyncReport::retryable) rather than applied. That
-    /// judgement is made on versions alone, so a patch that fails its MACs after
-    /// the snapshot has replaced the baseline leaves the collection whole but at
-    /// the snapshot's version: a cursor to re-earn on the next sync, not damage.
     Snapshot,
 }
 
@@ -240,7 +241,7 @@ impl Client {
                 collections,
                 scope,
                 BatchedSyncRequest {
-                    snapshot: mode == AppStateResyncMode::Snapshot,
+                    rebuild: mode == AppStateResyncMode::Snapshot,
                     wait_for_holder: true,
                 },
             )
@@ -572,17 +573,27 @@ mod tests {
         );
     }
 
-    /// The processor discards a snapshot that is not strictly newer than the
-    /// persisted version — which is exactly the case this mode exists for — so
-    /// the request has to travel with the response as
-    /// `PatchList::requested_snapshot`. Nothing persisted may change before the
-    /// answer arrives: a caller that bounds the wait with a timeout would
-    /// otherwise be left, on every cancellation, with a collection stranded on a
-    /// version its stored mutation MACs no longer match.
+    /// A rebuild is expressed by standing the collection down, because a
+    /// snapshot is only ever sent for a request that carries no version. Both
+    /// halves matter: a version left behind stale MACs, or MACs left behind a
+    /// version, is a baseline nothing downstream is looking for.
     #[tokio::test]
-    async fn snapshot_mode_writes_nothing_before_the_response() {
+    async fn snapshot_mode_stands_the_collection_down_before_asking() {
         let (client, transport) = create_reachable_client().await;
         persist_version(&client, WAPatchName::Regular, 42).await;
+        let backend = client.persistence_manager.backend();
+        let stale_index_mac = vec![0xAB; 32];
+        backend
+            .put_mutation_macs(
+                WAPatchName::Regular.as_str(),
+                42,
+                &[wacore::appstate::processor::AppStateMutationMAC {
+                    index_mac: stale_index_mac.clone(),
+                    value_mac: vec![0xCD; 32],
+                }],
+            )
+            .await
+            .expect("the test backend should accept mutation MACs");
 
         let resync = {
             let client = Arc::clone(&client);
@@ -593,22 +604,43 @@ mod tests {
             })
         };
 
-        // The IQ is on the wire and unanswered: everything the request could
-        // have written, it has written by now.
+        // The IQ is on the wire: whatever the rebuild stood down, it stood down
+        // before asking, and it did so holding the collection's reservation.
         let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
-        let persisted = client
-            .persistence_manager
-            .backend()
-            .get_version(WAPatchName::Regular.as_str())
-            .await
-            .expect("the version should be readable");
         assert_eq!(
-            persisted.version, 42,
-            "a request in flight must not have moved the persisted version"
+            backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .expect("the version should be readable")
+                .version,
+            0,
+            "the collection must be asking as one that never synced"
+        );
+        assert_eq!(
+            backend
+                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
+                .await
+                .expect("the MAC store should be readable"),
+            None,
+            "and its old baseline must have gone with the version"
         );
 
-        let id = sent
-            .get()
+        let node = sent.get().to_owned();
+        let collection = node
+            .get_optional_child_by_tag(&["sync", "collection"])
+            .expect("the request asks about a collection")
+            .clone();
+        assert_eq!(
+            attr(&collection, "return_snapshot").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            attr(&collection, "version"),
+            None,
+            "a request that carries a version is not answered with a snapshot"
+        );
+
+        let id = node
             .attrs()
             .optional_string("id")
             .expect("every IQ carries an id")
@@ -653,27 +685,53 @@ mod tests {
         );
     }
 
-    /// A snapshot answers with the whole collection and moves the version to the
-    /// server's head, so asking for one again on the refetch round would discard
-    /// the page just applied and re-page the collection from scratch for as long
-    /// as the server keeps setting `has_more_patches`.
+    /// The rebuild is spent standing the collection down, so repeating it on the
+    /// refetch round would discard the page the first round just applied and
+    /// re-page the collection from scratch for as long as the server keeps
+    /// setting `has_more_patches`. The applied page is simulated by writing the
+    /// version the processor would have written, between the two rounds.
     #[tokio::test]
-    async fn the_snapshot_request_is_spent_on_the_first_round() {
+    async fn the_rebuild_is_spent_on_the_first_round() {
+        use futures::FutureExt;
+
         let (client, transport) = create_reachable_client().await;
         persist_version(&client, WAPatchName::Regular, 42).await;
 
-        let (result, asked) = resync_against(
-            &client,
-            &transport,
-            vec![WAPatchName::Regular],
-            AppStateResyncMode::Snapshot,
-            |frame, id| {
-                // Only the first round has more to send, so the second is the
-                // refetch and a third would mean the request never cleared.
+        let mut resync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Snapshot)
+                    .await
+            })
+        };
+
+        let asked: std::sync::Mutex<Vec<Node>> = std::sync::Mutex::new(Vec::new());
+        let server = async {
+            let mut frame = 0usize;
+            loop {
+                let node = crate::test_utils::decode_sent_iq(&transport, frame).await;
+                let node = node.get().to_owned();
+                let id = node
+                    .attrs()
+                    .optional_string("id")
+                    .expect("every IQ carries an id")
+                    .into_owned();
+                asked.lock().expect("not poisoned").push(
+                    node.get_optional_child_by_tag(&["sync", "collection"])
+                        .expect("every round asks about a collection")
+                        .clone(),
+                );
+
+                // The first round is the one with more to send; before answering
+                // it, stand in for the page the processor would have applied.
                 let has_more = frame == 0;
-                NodeBuilder::new("iq")
+                if has_more {
+                    persist_version(&client, WAPatchName::Regular, 7).await;
+                }
+                let response = NodeBuilder::new("iq")
                     .attr("type", "result")
-                    .attr("id", id)
+                    .attr("id", &id)
                     .attr("from", "s.whatsapp.net")
                     .children([NodeBuilder::new("sync")
                         .children([NodeBuilder::new("collection")
@@ -681,23 +739,30 @@ mod tests {
                             .attr("has_more_patches", if has_more { "true" } else { "false" })
                             .build()])
                         .build()])
-                    .build()
-            },
-        )
-        .await;
+                    .build();
+                crate::test_utils::answer_iq(&client, &id, &response).await;
+                frame += 1;
+            }
+        };
+        futures::pin_mut!(server);
+        let result = futures::select! {
+            result = (&mut resync).fuse() => result.expect("the resync task should not panic"),
+            () = server.as_mut().fuse() => unreachable!("the responder never completes"),
+        };
 
         result.expect("the server answered");
-        assert_eq!(asked.len(), 2, "one refetch round after the snapshot");
+        let asked = asked.lock().expect("not poisoned").clone();
+        assert_eq!(asked.len(), 2, "one refetch round after the first page");
         assert_eq!(attr(&asked[0], "return_snapshot").as_deref(), Some("true"));
         assert_eq!(
             attr(&asked[1], "return_snapshot").as_deref(),
             Some("false"),
-            "the refetch must resume from the version the response left persisted"
+            "the refetch must resume from the page the response left persisted"
         );
         assert_eq!(
             attr(&asked[1], "version").as_deref(),
-            Some("42"),
-            "and that version is the one nothing in this run had reason to move"
+            Some("7"),
+            "a second stand-down would have thrown that page away"
         );
     }
 

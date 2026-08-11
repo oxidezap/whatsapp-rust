@@ -51,16 +51,6 @@ pub struct PatchList {
     pub snapshot_ref: Option<wa::ExternalBlobReference>, // external reference to fetch
     /// Per-collection error from server (None = success).
     pub error: Option<CollectionSyncError>,
-    /// Whether this collection's `return_snapshot` was asked for, rather than
-    /// the snapshot merely arriving.
-    ///
-    /// Not parsed from the response — the response cannot say it. The caller
-    /// that built the request sets it, because it is the only party that knows,
-    /// and the snapshot guard needs it: a snapshot is normally discarded unless
-    /// it is strictly newer than the persisted version, which is exactly wrong
-    /// for a caller who asked for one *because* the persisted copy is not to be
-    /// trusted.
-    pub requested_snapshot: bool,
 }
 
 /// Per-collection error returned by the server inside a `<collection type="error">` node.
@@ -177,8 +167,6 @@ fn parse_single_collection(collection: &Node) -> Result<PatchList> {
         snapshot,
         snapshot_ref,
         error,
-        // Only the caller that built the request knows this; see the field.
-        requested_snapshot: false,
     })
 }
 

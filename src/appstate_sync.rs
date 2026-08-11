@@ -445,7 +445,6 @@ mod tests {
             snapshot: None,
             snapshot_ref: None,
             error: None,
-            requested_snapshot: false,
         };
 
         let result = processor.process_patch_list(patch_list, false).await;
@@ -565,7 +564,6 @@ mod tests {
             }),
             snapshot_ref: None,
             error: None,
-            requested_snapshot: false,
         };
 
         (backend, processor, patch_list, stale_index_mac)
@@ -804,11 +802,12 @@ mod tests {
         );
     }
 
-    /// The stale-snapshot guard exists to stop an unsolicited snapshot from
-    /// rewinding a collection, and that is unchanged: only the caller's own
-    /// request lifts it.
+    /// The stale-snapshot guard stops a snapshot from rewinding a collection,
+    /// and nothing lifts it — a rebuild stands the collection down to unsynced
+    /// first, so the snapshot it then receives is never measured against a
+    /// version at all.
     #[tokio::test]
-    async fn an_unrequested_snapshot_at_the_persisted_version_is_still_discarded() {
+    async fn a_snapshot_at_the_persisted_version_is_discarded() {
         let (backend, processor, patch_list, stale_index_mac) = snapshot_resync_scenario().await;
         // The snapshot is v2; persisting v2 makes it exactly as new, which the
         // guard treats as stale.
@@ -836,342 +835,6 @@ mod tests {
                 .is_some(),
             "the snapshot must not have been applied"
         );
-    }
-
-    /// A caller asking for a snapshot is saying the persisted version is not the
-    /// thing to measure it against — its local copy is wrong, not behind, so the
-    /// two versions agreeing is the normal case rather than a replay attempt.
-    /// Without the exemption the repair is a silent no-op.
-    #[tokio::test]
-    async fn a_requested_snapshot_applies_at_the_persisted_version() {
-        let (backend, processor, mut patch_list, stale_index_mac) =
-            snapshot_resync_scenario().await;
-        backend
-            .set_version(
-                WAPatchName::Regular.as_str(),
-                HashState {
-                    version: 2,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("test backend should accept version");
-        patch_list.requested_snapshot = true;
-
-        processor
-            .process_patch_list(patch_list, false)
-            .await
-            .expect("a requested snapshot should apply");
-
-        assert_eq!(
-            backend
-                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
-                .await
-                .unwrap(),
-            None,
-            "the requested snapshot must replace the baseline it was asked to repair"
-        );
-    }
-
-    /// Asking does not make a rewind safe. A snapshot strictly older than what
-    /// is stored is a replay or a server that is behind, and taking it would
-    /// roll the collection backward — the thing the guard exists to prevent.
-    #[tokio::test]
-    async fn a_requested_snapshot_older_than_the_persisted_version_is_refused() {
-        let (backend, processor, mut patch_list, stale_index_mac) =
-            snapshot_resync_scenario().await;
-        // The snapshot is v2, so persisting v5 puts the collection ahead of it.
-        backend
-            .set_version(
-                WAPatchName::Regular.as_str(),
-                HashState {
-                    version: 5,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("test backend should accept version");
-        patch_list.requested_snapshot = true;
-
-        let (mutations, state, pl) = processor
-            .process_patch_list(patch_list, false)
-            .await
-            .expect("a refused snapshot is a verdict, not a failure");
-
-        assert!(
-            backend
-                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
-                .await
-                .unwrap()
-                .is_some(),
-            "the older snapshot must not have replaced the baseline"
-        );
-        assert_eq!(
-            state.version, 5,
-            "and must not have rolled the version back"
-        );
-        assert!(mutations.is_empty());
-        assert!(
-            matches!(pl.error, Some(CollectionSyncError::Retry { .. })),
-            "an unfulfilled snapshot request must not read as a completed replay"
-        );
-    }
-
-    /// Helper for the stale-window cases: the shared scenario's snapshot is v2,
-    /// so a window of `versions` and a cursor past all of them is a response
-    /// that cannot reach the collection wherever it already is.
-    async fn stale_window_scenario(
-        cursor: u64,
-        versions: &[u64],
-    ) -> (Arc<MockBackend>, AppStateProcessor, PatchList, Vec<u8>) {
-        let (backend, processor, mut patch_list, stale_index_mac) =
-            snapshot_resync_scenario().await;
-        backend
-            .set_version(
-                WAPatchName::Regular.as_str(),
-                HashState {
-                    version: cursor,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("test backend should accept version");
-        patch_list.requested_snapshot = true;
-
-        let key_id_bytes = b"snap_key_id".to_vec();
-        let keys = expand_app_state_keys(&[9u8; 32]);
-        let plaintext = wa::SyncActionData {
-            value: buffa::MessageField::some(wa::SyncActionValue {
-                timestamp: Some(3000),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-        .encode_to_vec();
-        for (i, version) in versions.iter().enumerate() {
-            patch_list.patches.push(wa::SyncdPatch {
-                mutations: vec![create_encrypted_mutation(
-                    wa::syncd_mutation::SyncdOperation::Set,
-                    &[0x20 + i as u8; 32],
-                    &plaintext,
-                    &keys,
-                    &key_id_bytes,
-                )],
-                version: buffa::MessageField::some(wa::SyncdVersion {
-                    version: Some(*version),
-                }),
-                key_id: buffa::MessageField::some(wa::KeyId {
-                    id: Some(key_id_bytes.clone()),
-                }),
-                ..Default::default()
-            });
-        }
-
-        (backend, processor, patch_list, stale_index_mac)
-    }
-
-    /// A whole window behind the cursor is refused as one. Letting its patches
-    /// through because the response was not empty only fails the strict version
-    /// check on the first of them — they are contiguous from the snapshot, not
-    /// from the cursor — turning a per-collection verdict into an error about
-    /// the whole run.
-    #[tokio::test]
-    async fn a_window_entirely_behind_the_cursor_is_refused_with_its_patches() {
-        // Snapshot v2 and its window v3/v4, against a collection at v9.
-        let (backend, processor, patch_list, stale_index_mac) =
-            stale_window_scenario(9, &[3, 4]).await;
-
-        let (mutations, state, pl) = processor
-            .process_patch_list(patch_list, false)
-            .await
-            .expect("a refused window is a verdict, not a failure");
-
-        assert!(
-            matches!(pl.error, Some(CollectionSyncError::Retry { .. })),
-            "expected a retryable verdict, got {:?}",
-            pl.error
-        );
-        assert_eq!(state.version, 9, "nothing may have moved the cursor");
-        assert!(mutations.is_empty());
-        assert!(
-            backend
-                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
-                .await
-                .unwrap()
-                .is_some(),
-            "and the baseline must be untouched"
-        );
-    }
-
-    /// A snapshot big enough to paginate arrives well behind the cursor on its
-    /// first page, with the window that closes the gap spread over the pages
-    /// after it. Judging that page alone refuses it every time — and the refusal
-    /// is what stops the batch from following `has_more_patches` to the pages
-    /// that would have finished the rebuild, so repeated requests never get past
-    /// page one.
-    #[tokio::test]
-    async fn a_first_page_that_says_there_is_more_is_not_a_rewind() {
-        // Snapshot v2 with its first patch, against a collection at v9: this page
-        // ends at v3, and the pages after it are where v4..=v9 would come from.
-        let (backend, processor, mut patch_list, stale_index_mac) =
-            stale_window_scenario(9, &[3]).await;
-        patch_list.has_more_patches = true;
-
-        let (mutations, _, pl) = processor
-            .process_patch_list(patch_list, false)
-            .await
-            .expect("a first page is not a failure");
-
-        assert!(
-            pl.error.is_none(),
-            "a page that says there is more must not be judged as falling short: {:?}",
-            pl.error
-        );
-        assert!(
-            !mutations.is_empty(),
-            "the rebuild must start rather than wait for a page it refused to ask for"
-        );
-        assert_eq!(
-            backend
-                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
-                .await
-                .unwrap(),
-            None,
-            "and the snapshot must have replaced the baseline it rebuilds from"
-        );
-    }
-
-    /// A gapped window advertises a version it cannot reach: the patch after the
-    /// gap fails `validatePatchVersion`. Counting the highest version it names
-    /// would accept the snapshot, persist it, and only then fail — leaving the
-    /// collection rewound by a run that returned an error.
-    #[tokio::test]
-    async fn a_gapped_window_does_not_count_as_reaching_its_highest_version() {
-        // Snapshot v2, then v3 — and then v9, with v4..=v8 missing. The cursor
-        // sits at v5, which only the unreachable tail claims to pass.
-        let (backend, processor, patch_list, stale_index_mac) =
-            stale_window_scenario(5, &[3, 9]).await;
-
-        let (mutations, state, pl) = processor
-            .process_patch_list(patch_list, false)
-            .await
-            .expect("a refused window is a verdict, not a failure");
-
-        assert!(
-            matches!(pl.error, Some(CollectionSyncError::Retry { .. })),
-            "expected a retryable verdict, got {:?}",
-            pl.error
-        );
-        assert_eq!(
-            state.version, 5,
-            "the snapshot must not have been persisted over the cursor"
-        );
-        assert!(mutations.is_empty());
-        assert!(
-            backend
-                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
-                .await
-                .unwrap()
-                .is_some(),
-            "and the baseline must be untouched"
-        );
-    }
-
-    /// A snapshot behind the cursor arrives with the patch window that follows
-    /// it, and that sequence can still land the collection past where it was.
-    /// Rebuilding from the snapshot is what the request asked for and what makes
-    /// the patches applicable at all: they are contiguous from the snapshot, not
-    /// from the persisted version.
-    #[tokio::test]
-    async fn a_snapshot_behind_the_cursor_is_rebuilt_when_its_patches_carry_it_past() {
-        let (backend, processor, mut patch_list, _) = snapshot_resync_scenario().await;
-        // The snapshot is v2 and its window is v3/v4, so persisting v3 puts the
-        // collection past the snapshot while the response still ends ahead of it.
-        backend
-            .set_version(
-                WAPatchName::Regular.as_str(),
-                HashState {
-                    version: 3,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("test backend should accept version");
-        patch_list.requested_snapshot = true;
-
-        let key_id_bytes = b"snap_key_id".to_vec();
-        let keys = expand_app_state_keys(&[9u8; 32]);
-        let plaintext = wa::SyncActionData {
-            value: buffa::MessageField::some(wa::SyncActionValue {
-                timestamp: Some(3000),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-        .encode_to_vec();
-        for (version, index_mac) in [(3u64, [0x22u8; 32]), (4, [0x33; 32])] {
-            patch_list.patches.push(wa::SyncdPatch {
-                mutations: vec![create_encrypted_mutation(
-                    wa::syncd_mutation::SyncdOperation::Set,
-                    &index_mac,
-                    &plaintext,
-                    &keys,
-                    &key_id_bytes,
-                )],
-                version: buffa::MessageField::some(wa::SyncdVersion {
-                    version: Some(version),
-                }),
-                key_id: buffa::MessageField::some(wa::KeyId {
-                    id: Some(key_id_bytes.clone()),
-                }),
-                ..Default::default()
-            });
-        }
-
-        let (mutations, state, pl) = processor
-            .process_patch_list(patch_list, false)
-            .await
-            .expect("the patches are a valid answer");
-
-        assert!(
-            pl.error.is_none(),
-            "a response that carried the collection forward is not unfulfilled: {:?}",
-            pl.error
-        );
-        assert_eq!(
-            state.version, 4,
-            "the snapshot and its window must both have been applied"
-        );
-        assert_eq!(
-            mutations.len(),
-            3,
-            "the snapshot record plus one mutation per patch"
-        );
-    }
-
-    /// A response carrying no snapshot is not evidence that the request went
-    /// unanswered — it is exactly what an empty collection replies. Since every
-    /// first sync asks with `return_snapshot`, calling it unfulfilled would leave
-    /// every empty collection retryable on the bootstrap that gates `Connected`.
-    #[tokio::test]
-    async fn a_snapshot_request_answered_with_an_empty_collection_is_not_an_error() {
-        let (_backend, processor, mut patch_list, _) = snapshot_resync_scenario().await;
-        patch_list.requested_snapshot = true;
-        patch_list.snapshot = None;
-        patch_list.snapshot_ref = None;
-        patch_list.patches = Vec::new();
-
-        let (mutations, _, pl) = processor
-            .process_patch_list(patch_list, false)
-            .await
-            .expect("an empty collection is an answer");
-
-        assert!(
-            pl.error.is_none(),
-            "an empty collection must not read as a failed request: {:?}",
-            pl.error
-        );
-        assert!(mutations.is_empty(), "there was nothing to replay");
     }
 
     #[tokio::test]
@@ -1240,7 +903,6 @@ mod tests {
             snapshot: None,
             snapshot_ref: None,
             error: None,
-            requested_snapshot: false,
         };
 
         let (mutations, state, pl) = processor
@@ -1301,7 +963,6 @@ mod tests {
             snapshot: None,
             snapshot_ref: None,
             error: None,
-            requested_snapshot: false,
         };
 
         processor
@@ -1350,7 +1011,6 @@ mod tests {
                 ..Default::default()
             }),
             error: None,
-            requested_snapshot: false,
         };
 
         let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<Vec<u8>> {
@@ -1517,7 +1177,6 @@ mod tests {
                 snapshot: None,
                 snapshot_ref: None,
                 error: None,
-                requested_snapshot: false,
             };
 
             let (mutations, state, _) = processor
@@ -1613,7 +1272,6 @@ mod tests {
             snapshot: Some(snapshot),
             snapshot_ref: None,
             error: None,
-            requested_snapshot: false,
         };
 
         let (mutations, state, _) = processor
