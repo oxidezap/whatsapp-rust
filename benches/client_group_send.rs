@@ -43,35 +43,35 @@ fn main() {
 /// member — tens of millions of instructions at 512 members. Amortised over a
 /// long run that shows up as growth in group size that has nothing to do with
 /// a steady-state send: measured, a 1000-iteration sweep at 512 members read
-/// 623.6K instructions per send against the 565.0K a sub-threshold sweep
-/// reports, purely from the one rotation it crossed. `sample_count ×
+/// 623.6K instructions per send against what a sub-threshold sweep reports, purely from the one rotation it crossed. `sample_count ×
 /// sample_size` is kept well under the threshold so no run can reach it.
 const SAMPLE_COUNT: u32 = 20;
 const SAMPLE_SIZE: u32 = 20;
 
-/// One fixture per group size, leaked for the process lifetime and shared by
-/// every benchmark below.
+/// One fixture per (benchmark, group size), leaked for the process lifetime.
 ///
 /// Building one is not cheap — at 512 members it establishes 513 Signal
 /// sessions and runs a cold fan-out to all of them, ~2.7 billion instructions.
 /// Divan generates `with_inputs` values per iteration, so a fresh harness per
 /// iteration would spend essentially all of its wall clock in setup; under
 /// CodSpeed's Valgrind instrumentation that is the difference between a viable
-/// CI job and an unviable one. Sharing across benchmarks as well as iterations
-/// keeps it to four setups for the whole target instead of sixteen.
+/// CI job and an unviable one.
 ///
-/// Sharing is safe against the rotation threshold because only
-/// `warm_group_send` advances the sender-key chain, so a fixture sees at most
-/// `SAMPLE_COUNT * SAMPLE_SIZE + 2` sends however the benchmarks are ordered.
-/// A second chain-advancing benchmark would need its own fixture or a smaller
-/// budget.
-fn shared(group_size: usize) -> &'static GroupSendHarness {
-    static FIXTURES: OnceLock<Mutex<HashMap<usize, &'static GroupSendHarness>>> = OnceLock::new();
+/// Keyed by benchmark and not by size alone, so no benchmark inherits state
+/// another one left behind. Two things leak across a shared fixture and both
+/// are silent: `warm_group_send` advances the sender-key chain toward the
+/// rotation threshold, and its sends re-arm the coalesced signal-flush worker,
+/// which on this single-threaded runtime can then only fire inside some later
+/// measured closure. Sixteen setups instead of four is the price of results
+/// that do not depend on the order benchmarks run in.
+fn shared(label: &'static str, group_size: usize) -> &'static GroupSendHarness {
+    static FIXTURES: OnceLock<Mutex<HashMap<(&'static str, usize), &'static GroupSendHarness>>> =
+        OnceLock::new();
     let mut map = FIXTURES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("fixture registry");
-    map.entry(group_size)
+    map.entry((label, group_size))
         .or_insert_with(|| Box::leak(Box::new(GroupSendHarness::new(group_size))))
 }
 
@@ -85,7 +85,8 @@ fn shared(group_size: usize) -> &'static GroupSendHarness {
 /// the entirety of the apparent per-member growth. The same trap has a second
 /// mouth here: a fixture whose participant list omits self makes
 /// `ensure_self_in_group` deep-clone the metadata on every send, worth another
-/// 45 instructions per member — see `bench_support`.
+/// 46 instructions per member; a third is an unacknowledged companion session,
+/// worth 11% of the absolute cost. Both are measured in `bench_support`.
 ///
 /// Each iteration advances the sender-key chain by one, as a real repeat send
 /// does; no iteration re-distributes to a member (they are all warm), and each
@@ -93,7 +94,7 @@ fn shared(group_size: usize) -> &'static GroupSendHarness {
 /// `!isMeDevice` guard produces.
 #[divan::bench(args = GROUP_SIZES, sample_count = SAMPLE_COUNT, sample_size = SAMPLE_SIZE)]
 fn warm_group_send(bencher: divan::Bencher, group_size: usize) {
-    let harness = shared(group_size);
+    let harness = shared("warm_group_send", group_size);
     bencher.bench(|| harness.warm_send());
 }
 
@@ -106,7 +107,7 @@ fn warm_group_send(bencher: divan::Bencher, group_size: usize) {
 /// crypto on top.
 #[divan::bench(args = GROUP_SIZES, sample_count = SAMPLE_COUNT, sample_size = SAMPLE_SIZE)]
 fn skdm_target_resolution_warm(bencher: divan::Bencher, group_size: usize) {
-    let harness = shared(group_size);
+    let harness = shared("skdm_target_resolution_warm", group_size);
     bencher.bench(|| black_box(harness.resolve_skdm_targets()));
 }
 
@@ -123,7 +124,7 @@ fn skdm_target_resolution_warm(bencher: divan::Bencher, group_size: usize) {
 /// benchmark measures how much it costs, not how often it happens.
 #[divan::bench(args = GROUP_SIZES, sample_count = SAMPLE_COUNT, sample_size = SAMPLE_SIZE)]
 fn skdm_target_resolution_memo_cold(bencher: divan::Bencher, group_size: usize) {
-    let harness = shared(group_size);
+    let harness = shared("skdm_target_resolution_memo_cold", group_size);
     bencher.bench(|| black_box(harness.resolve_skdm_targets_memo_cold()));
 }
 
@@ -137,6 +138,6 @@ fn skdm_target_resolution_memo_cold(bencher: divan::Bencher, group_size: usize) 
 /// size, while what a warm send dirties is not.
 #[divan::bench(args = GROUP_SIZES, sample_count = SAMPLE_COUNT, sample_size = SAMPLE_SIZE)]
 fn flush_signal_cache_steady(bencher: divan::Bencher, group_size: usize) {
-    let harness = shared(group_size);
+    let harness = shared("flush_signal_cache_steady", group_size);
     bencher.bench(|| harness.flush_signal_cache());
 }

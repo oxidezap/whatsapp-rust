@@ -64,6 +64,22 @@ fn pack_flush_state(generation: u64, flags: u64) -> u64 {
     (generation << 2) | flags
 }
 
+// Feature-gated, not `any(test, ...)`: the crate's own tests observe the
+// scheduler through its state word directly, so a test build would see this as
+// dead code.
+#[cfg(feature = "bench-harness")]
+impl Client {
+    /// Whether a coalesced flush worker is currently armed.
+    ///
+    /// Fixture observation only. A benchmark's warm-up sends arm this worker,
+    /// and on a single-threaded runtime it can only run inside a later
+    /// `block_on` — i.e. inside a measured sample. The harness settles it
+    /// before sampling and asserts on this.
+    pub(crate) fn signal_flush_worker_armed(&self) -> bool {
+        self.signal_flush_state.load(Ordering::Acquire) & FLUSH_RUNNING != 0
+    }
+}
+
 impl Client {
     /// Request a coalesced flush of the receive-path Signal cache for the
     /// caller's already-validated `lane_generation`. The first request for the

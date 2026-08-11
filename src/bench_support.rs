@@ -231,11 +231,24 @@ async fn build_fixture(group_size: usize) -> Fixture {
     // Our own list carries the primary plus one companion.
     seed_registry(&client, OWN_USER, &[0, 1]).await;
 
-    // Signal sessions for every device the cold send distributes to.
+    // Signal sessions for every device the cold send distributes to. Members
+    // are only encrypted to by that one cold send — afterwards they are marked
+    // warm and never re-targeted — so a one-way X3DH is enough for them.
     for participant in &participants {
         seed_peer_session(&client, participant).await;
     }
-    seed_peer_session(&client, &own_pn.with_device(1)).await;
+    // Our own companion is the exception: it is re-targeted on EVERY send
+    // (WA Web `!isMeDevice`), so it is the one session whose state every
+    // measured iteration depends on. A one-way `process_prekey_bundle` leaves
+    // the initiator holding an unacknowledged pre-key, and `message_encrypt`
+    // then emits a `pkmsg` — wrapping the identity key, base key and
+    // registration id — forever, because the sink transport can never deliver
+    // the reply that clears it. That would measure first contact on every
+    // iteration instead of the warm pairwise send. Established both ways, and
+    // asserted below, for the same reason `wacore`'s DM fan-out benchmark
+    // asserts it.
+    let companion = own_pn.with_device(1);
+    establish_acknowledged_session(&client, &companion).await;
 
     let group: Jid = GROUP_JID.parse().expect("group jid");
     // Self is in the participant list, as the server's group metadata has it —
@@ -243,10 +256,10 @@ async fn build_fixture(group_size: usize) -> Fixture {
     // harmless simplification: `ensure_self_in_group` runs per send and CLONES
     // the whole `GroupInfo` when self is absent, so a self-less fixture charges
     // every send an N-participant copy no real send performs. Measured both
-    // ways at 512 members, that artifact alone was 22,888 instructions per send
-    // (588,789 self-absent vs 565,901 self-present) — 45 instructions per
-    // member, about half of the growth this sweep would otherwise have
-    // reported. Same class of error as the one PR #1279 removed from the
+    // ways at 512 members, that artifact alone is 23,353 instructions per send
+    // (527,167 self-absent vs 503,814 self-present) — 46 instructions per
+    // member, which would have roughly doubled the per-member slope this sweep
+    // reports. Same class of error as the one PR #1279 removed from the
     // `wacore` sweep.
     participants.push(own_pn.to_non_ad());
     let group_info = Arc::new(GroupInfo::new(participants, AddressingMode::Pn));
@@ -262,6 +275,8 @@ async fn build_fixture(group_size: usize) -> Fixture {
     // establishes the warm memos. A benchmark measures send three onwards.
     send_once(&client, &group).await;
     send_once(&client, &group).await;
+
+    settle_signal_flush_worker(&client).await;
 
     Fixture {
         client,
@@ -295,8 +310,42 @@ async fn seed_registry(client: &Arc<Client>, user: &str, devices: &[u32]) {
         .await;
 }
 
+/// Let the coalesced flush worker the warm-up sends armed fire and stand down.
+///
+/// `persist_signal_state_pre_wire` arms a 25 ms worker on a lease-covered send
+/// instead of writing through. This fixture drives everything from `block_on`
+/// on a single-threaded runtime, so that worker can only ever run *inside* a
+/// later `block_on` — which, once sampling starts, means inside a measured
+/// closure. Left armed it would fold an unrelated ~1.9K-instruction cache flush
+/// into whichever sample happened to cross the deadline, which on the ~3.9K
+/// resolver benchmark is a 50% perturbation and makes results depend on the
+/// order benchmarks run in.
+///
+/// Sends inside `warm_group_send` re-arm it, and that is deliberate: a real
+/// client pays exactly that coalesced flush on the send path, so suppressing it
+/// there would measure less than a send costs. What must not happen is a worker
+/// armed by *setup* landing in a benchmark that never sends.
+async fn settle_signal_flush_worker(client: &Arc<Client>) {
+    // The worker sleeps one 25 ms window, flushes, then exits when nothing is
+    // dirty. Poll rather than sleep a fixed span so a slow instrumented run
+    // cannot start sampling with the worker still armed.
+    for _ in 0..40 {
+        if !client.signal_flush_worker_armed() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("signal flush worker stayed armed; a measured sample could absorb its flush");
+}
+
 /// Establish a pairwise Signal session with `peer`, as a real client does off a
 /// prekey bundle fetch. Every key here is generated locally; none is real.
+///
+/// One-way: the initiator's session keeps its unacknowledged pre-key, so the
+/// first message to `peer` is a `pkmsg`. That is correct for a device this
+/// fixture only ever encrypts to once, during the cold warm-up send. For the
+/// own companion — encrypted to on every measured send — use
+/// [`establish_acknowledged_session`] instead.
 async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
     use wacore::libsignal::protocol::{
         IdentityKeyPair, KeyPair, PreKeyBundle, UsePQRatchet, process_prekey_bundle,
@@ -333,6 +382,133 @@ async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
     )
     .await
     .expect("peer session");
+}
+
+/// Establish a session with `peer` that is *acknowledged*, so `message_encrypt`
+/// emits a plain `msg` rather than a `pkmsg`.
+///
+/// Backed by a real second client rather than a throwaway key set, because the
+/// acknowledgement only comes from the peer actually decrypting our first
+/// message and replying: the reply's ratchet step is what clears the initiator's
+/// pending pre-key. The second client is dropped afterwards — it exists to
+/// produce that one reply, not to be measured.
+async fn establish_acknowledged_session(client: &Arc<Client>, peer: &Jid) {
+    use wacore::libsignal::protocol::{
+        CiphertextMessage, IdentityKey, PreKeyBundle, PreKeySignalMessage, SignalMessage,
+        UsePQRatchet, message_decrypt, message_encrypt, process_prekey_bundle,
+    };
+    use wacore::types::jid::JidExt;
+
+    let peer_backend = Arc::new(InMemoryBackend::new());
+    let peer_pm = Arc::new(
+        PersistenceManager::new(peer_backend)
+            .await
+            .expect("companion persistence manager"),
+    );
+    let (peer_client, _sync_rx) = Client::new(
+        Arc::new(TokioRuntime),
+        peer_pm,
+        Arc::new(SinkTransportFactory),
+        Arc::new(NoopHttpClient),
+        None,
+    )
+    .await;
+
+    let own_snapshot = client.persistence_manager.get_device_snapshot();
+    let own_address = own_snapshot
+        .pn
+        .as_ref()
+        .expect("own pn must be set before establishing the companion session")
+        .to_protocol_address();
+    let peer_address = peer.to_protocol_address();
+
+    // The bundle is the companion device's real published material — identity
+    // key and signed pre-key from its own store — so its side can decrypt what
+    // we encrypt to it. No one-time pre-key: `PreKeyBundle` allows `None`, and
+    // omitting it keeps this fixture from depending on pre-key generation.
+    let peer_snapshot = peer_client.persistence_manager.get_device_snapshot();
+    let bundle = PreKeyBundle::new(
+        peer_snapshot.registration_id,
+        u32::from(peer.device).into(),
+        None,
+        peer_snapshot.signed_pre_key_id.into(),
+        peer_snapshot.signed_pre_key.public_key,
+        peer_snapshot.signed_pre_key_signature.to_vec(),
+        IdentityKey::new(peer_snapshot.identity_key.public_key),
+    )
+    .expect("companion prekey bundle");
+
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let mut adapter = client.signal_adapter();
+    process_prekey_bundle(
+        &peer_address,
+        &mut adapter.session_store,
+        &mut adapter.identity_store,
+        &bundle,
+        &mut rng,
+        UsePQRatchet::No,
+    )
+    .await
+    .expect("companion session");
+
+    // us → companion: a pkmsg, since our pre-key is still unacknowledged.
+    let initial = message_encrypt(
+        b"init",
+        &peer_address,
+        &mut adapter.session_store,
+        &mut adapter.identity_store,
+    )
+    .await
+    .expect("initial encrypt");
+    let mut peer_adapter = peer_client.signal_adapter();
+    message_decrypt(
+        &CiphertextMessage::PreKeySignalMessage(
+            PreKeySignalMessage::try_from(initial.serialize()).expect("pkmsg parses"),
+        ),
+        &own_address,
+        &mut peer_adapter.session_store,
+        &mut peer_adapter.identity_store,
+        &mut peer_adapter.pre_key_store,
+        &peer_adapter.signed_pre_key_store,
+        &mut rng,
+        UsePQRatchet::No,
+    )
+    .await
+    .expect("companion decrypts our first message");
+
+    // companion → us: decrypting this reply is what clears our pending pre-key.
+    let reply = message_encrypt(
+        b"ack",
+        &own_address,
+        &mut peer_adapter.session_store,
+        &mut peer_adapter.identity_store,
+    )
+    .await
+    .expect("companion reply encrypt");
+    message_decrypt(
+        &CiphertextMessage::SignalMessage(
+            SignalMessage::try_from(reply.serialize()).expect("msg parses"),
+        ),
+        &peer_address,
+        &mut adapter.session_store,
+        &mut adapter.identity_store,
+        &mut adapter.pre_key_store,
+        &adapter.signed_pre_key_store,
+        &mut rng,
+        UsePQRatchet::No,
+    )
+    .await
+    .expect("we decrypt the companion's reply");
+
+    // The point of all of the above. A fixture regression that reverted to a
+    // one-way X3DH would otherwise quietly turn every measured send into a
+    // first-contact send.
+    assert!(
+        !wacore::send::pkmsg_would_be_emitted(&mut adapter.session_store, &peer_address)
+            .await
+            .expect("session must be loadable in setup"),
+        "the own companion's session must be acknowledged; a pkmsg here measures first contact"
+    );
 }
 
 /// Put the client in the state a connected, post-offline-sync client is in: a
