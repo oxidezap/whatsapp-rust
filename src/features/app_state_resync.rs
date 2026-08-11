@@ -127,11 +127,14 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`AppStateError::NotConnected`] when the client stopped or was never
-    /// running, so nothing was asked of the server. [`AppStateError::Internal`]
-    /// when the request itself failed — the IQ never came back, or a response
-    /// could not be read. A collection the server answered *about* is reported
-    /// in the returned [`AppStateResyncReport`], never as an error.
+    /// [`AppStateError::InvalidRequest`] when the request names
+    /// [`WAPatchName::Unknown`], which is a parse fallback rather than a
+    /// collection the server has. [`AppStateError::NotConnected`] when the
+    /// client stopped or was never running, so nothing was asked of the server.
+    /// [`AppStateError::Internal`] when the request itself failed — the IQ never
+    /// came back, or a response could not be read. A collection the server
+    /// answered *about* is reported in the returned [`AppStateResyncReport`],
+    /// never as an error.
     ///
     /// # Example
     ///
@@ -158,6 +161,18 @@ impl Client {
         // must not park until a connection it does not need shows up.
         if collections.is_empty() {
             return Ok(AppStateResyncReport::default());
+        }
+
+        // `WAPatchName::Unknown` is what parsing an unrecognised collection name
+        // yields, not a collection the server has; asking for it would put
+        // `name="unknown"` on the wire for the server to refuse. Rejected rather
+        // than filtered out, and rejected whole: a request that silently syncs
+        // the rest reports success for a batch it did not carry out.
+        if collections.contains(&WAPatchName::Unknown) {
+            return Err(AppStateError::InvalidRequest(
+                "WAPatchName::Unknown is a parse fallback, not a collection that can be synced"
+                    .to_owned(),
+            ));
         }
 
         // The verdict is the point of the wait. `false` means the client is
@@ -302,6 +317,31 @@ mod tests {
         assert!(
             transport.sent().is_empty(),
             "an empty request must not send an IQ"
+        );
+    }
+
+    /// `Unknown` is what parsing an unrecognised name yields, so the server has
+    /// nothing under it. Rejected whole rather than filtered out: a request that
+    /// quietly syncs the rest reports success for a batch it did not carry out.
+    #[tokio::test]
+    async fn a_request_naming_the_unknown_collection_is_refused() {
+        let (client, transport) = create_reachable_client().await;
+
+        let error = client
+            .resync_app_state(
+                [WAPatchName::Regular, WAPatchName::Unknown],
+                AppStateResyncMode::Incremental,
+            )
+            .await
+            .expect_err("`unknown` is not a collection the server can answer for");
+
+        assert!(
+            matches!(error, AppStateError::InvalidRequest(_)),
+            "expected InvalidRequest, got {error:?}"
+        );
+        assert!(
+            transport.sent().is_empty(),
+            "nothing may reach the wire, including the collections named alongside it"
         );
     }
 

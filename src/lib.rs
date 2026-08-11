@@ -67,6 +67,10 @@ pub(crate) mod test_alloc {
 
 /// The app-state collections, named as they appear on the wire. Part of the
 /// public surface because [`Client::resync_app_state`] takes them.
+///
+/// [`WAPatchName::Unknown`] is not one of them: it is what parsing an
+/// unrecognised collection name yields, so the server has nothing under that
+/// name. `resync_app_state` rejects a request naming it.
 pub use wacore::appstate::patch_decode::WAPatchName;
 pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
