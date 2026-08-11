@@ -38,7 +38,17 @@ fn create_ack_node() -> Node {
 /// A device fanout. Device-qualified JIDs encode as `AD_JID`, so what repeats
 /// per child is the packed decode and the AD path, not `read_jid_pair`.
 fn create_fanout_node() -> Node {
-    let devices: Vec<Node> = (0..8)
+    create_fanout_node_of_width(8)
+}
+
+/// The `<participants>` shape a sender-key distribution puts on the wire: one
+/// `<to jid=…>` per recipient device, each wrapping its own `<enc>`. This is
+/// the only group stanza whose encode cost is proportional to the participant
+/// count — a steady-state group send distributes no keys and so carries none
+/// of this (pinned by `warm_group_stanza_carries_no_per_participant_data` in
+/// `wacore`), which is why the width is swept here rather than assumed.
+fn create_fanout_node_of_width(width: usize) -> Node {
+    let devices: Vec<Node> = (0..width)
         .map(|i| {
             NodeBuilder::new("to")
                 .attr("jid", format!("5511999990000:{i}@s.whatsapp.net"))
@@ -225,6 +235,20 @@ fn bench_marshal_auto_huge_bytes(bencher: divan::Bencher) {
 fn bench_marshal_auto_many_children(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_many_children_node)
+        .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
+}
+
+// Group sender-key distribution, swept across the recipient count reported for
+// real groups. Marshalling is linear in the fan-out width, so this is what a
+// cold group send (or a redistribution after a membership change) pays in the
+// encoder; the steady-state send that follows carries no `<participants>` at
+// all. Keeping both facts measurable is what tells a group-size regression
+// ("the warm stanza grew a per-participant node") apart from a group that is
+// merely redistributing.
+#[divan::bench(args = [8, 32, 128, 512])]
+fn bench_marshal_auto_group_fanout(bencher: divan::Bencher, width: usize) {
+    bencher
+        .with_inputs(|| create_fanout_node_of_width(width))
         .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 

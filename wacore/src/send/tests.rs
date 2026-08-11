@@ -3921,6 +3921,133 @@ mod mark_full_distribution_list {
              not aborting the whole cohort"
         );
     }
+
+    /// Nothing in a steady-state group stanza is per-participant.
+    ///
+    /// `<participants>` exists only to carry sender-key distributions, and a
+    /// warm send distributes none; the `phash` that covers the whole device set
+    /// is a fixed-width digest ("2:" + 8 base64 chars) memoized on the resolved
+    /// set. So the encoded stanza is byte-for-byte the same size for a group of
+    /// 8 and a group of 512, and the encoder cost of a repeat group send does
+    /// not scale with the group — there is no per-participant encoding to
+    /// cache between sends.
+    ///
+    /// Pinned as a test rather than left to the group benchmarks because the
+    /// claim is about the *shape* of the stanza: a future change that folded
+    /// participant state into it would still benchmark fine on a small group.
+    #[tokio::test]
+    async fn warm_group_stanza_carries_no_per_participant_data() {
+        async fn warm_stanza(members: usize) -> Node {
+            let own_jid: Jid = "12025550111:0@s.whatsapp.net".parse().unwrap();
+            let own_lid: Jid = "100000000000001:0@lid".parse().unwrap();
+            let group: Jid = "120363000000000001@g.us".parse().unwrap();
+
+            let participants: Vec<Jid> = (0..members)
+                .map(|i| {
+                    format!("{}@s.whatsapp.net", 12025550200u64 + i as u64)
+                        .parse()
+                        .unwrap()
+                })
+                .collect();
+
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut sks = MemSenderKeyStore::default();
+            // A warm send never creates the chain, so seed it exactly as the
+            // first (cold) send to this group would have.
+            let sk_name = make_sender_key_name(&group, &own_jid.to_protocol_address());
+            crate::libsignal::protocol::create_sender_key_distribution_message(
+                &sk_name, &mut sks, &mut rng,
+            )
+            .await
+            .expect("seed the sender key chain");
+
+            let mut ss = MemSessionStore::default();
+            let mut is = MemIdentityStore {
+                pair: IdentityKeyPair::generate(&mut rng),
+                reg_id: 7,
+                known: Default::default(),
+            };
+            let mut pks = UnusedPreKeyStore;
+            let spks = UnusedSignedPreKeyStore;
+            let mut stores = SignalStores {
+                sender_key_store: &mut sks,
+                session_store: &mut ss,
+                identity_store: &mut is,
+                prekey_store: &mut pks,
+                signed_prekey_store: &spks,
+            };
+
+            let mut group_participants = participants.clone();
+            group_participants.push(own_jid.to_non_ad());
+            let group_info = GroupInfo::new(group_participants, AddressingMode::Pn);
+            // The full resolved device set the warm send hashes into `phash`.
+            let resolved = ResolvedGroupDevices::new(participants);
+            let msg = wa::Message {
+                conversation: Some("steady state".into()),
+                ..Default::default()
+            };
+
+            prepare_group_stanza(
+                &TokioTestRuntime,
+                &mut stores,
+                &MockSendContextResolver::new(),
+                GroupStanzaRequest {
+                    group: &group_info,
+                    own_jid: &own_jid,
+                    own_lid: &own_lid,
+                    account: None,
+                    to: &group,
+                    message: &msg,
+                    message_id: "WARMGROUPSCALE1",
+                    force_distribution: false,
+                    distribution_targets: None,
+                    distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                    phash_devices: Some(&resolved),
+                    edit: None,
+                    extra_nodes: &[],
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .expect("warm group send")
+            .node
+        }
+
+        let small = warm_stanza(8).await;
+        let large = warm_stanza(512).await;
+
+        for (label, node) in [("8-member", &small), ("512-member", &large)] {
+            assert!(
+                node.get_optional_child("participants").is_none(),
+                "{label} warm send must distribute no sender keys"
+            );
+            assert_eq!(
+                node.attrs().optional_string("phash").map(|p| p.len()),
+                Some(10),
+                "{label} phash is a fixed-width digest"
+            );
+        }
+
+        let small_children: Vec<&str> = small
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .map(|c| c.tag.as_ref())
+            .collect();
+        let large_children: Vec<&str> = large
+            .children()
+            .unwrap_or(&[])
+            .iter()
+            .map(|c| c.tag.as_ref())
+            .collect();
+        assert_eq!(small_children, large_children, "same stanza shape");
+
+        assert_eq!(
+            wacore_binary::marshal::marshal(&small).unwrap().len(),
+            wacore_binary::marshal::marshal(&large).unwrap().len(),
+            "the encoded warm group stanza is the same size at 8 and 512 members"
+        );
+    }
 }
 
 /// Item 3 — phash device-set construction. The set hashed is the full
