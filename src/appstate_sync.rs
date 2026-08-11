@@ -903,6 +903,74 @@ mod tests {
         );
     }
 
+    /// A refused snapshot can arrive alongside patches that carry the collection
+    /// past it. Those are a valid answer, and stopping at the snapshot would
+    /// throw away work already on the wire and leave the collection no further
+    /// along than before.
+    #[tokio::test]
+    async fn patches_alongside_a_refused_snapshot_are_still_applied() {
+        let (backend, processor, mut patch_list, _) = snapshot_resync_scenario().await;
+        // The snapshot is v2, so persisting v3 puts the collection past it while
+        // the patches (v4, v5) still carry it forward.
+        backend
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                HashState {
+                    version: 3,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept version");
+        patch_list.requested_snapshot = true;
+
+        let key_id_bytes = b"snap_key_id".to_vec();
+        let keys = expand_app_state_keys(&[9u8; 32]);
+        let plaintext = wa::SyncActionData {
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(3000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for (version, index_mac) in [(4u64, [0x22u8; 32]), (5, [0x33; 32])] {
+            patch_list.patches.push(wa::SyncdPatch {
+                mutations: vec![create_encrypted_mutation(
+                    wa::syncd_mutation::SyncdOperation::Set,
+                    &index_mac,
+                    &plaintext,
+                    &keys,
+                    &key_id_bytes,
+                )],
+                version: buffa::MessageField::some(wa::SyncdVersion {
+                    version: Some(version),
+                }),
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(key_id_bytes.clone()),
+                }),
+                ..Default::default()
+            });
+        }
+
+        let (mutations, state, pl) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("the patches are a valid answer");
+
+        assert!(
+            pl.error.is_none(),
+            "a response that carried the collection forward is not unfulfilled: {:?}",
+            pl.error
+        );
+        assert_eq!(state.version, 5, "the patches must have been applied");
+        assert_eq!(
+            mutations.len(),
+            2,
+            "one mutation per patch, and no snapshot"
+        );
+    }
+
     /// A response carrying no snapshot is not evidence that the request went
     /// unanswered — it is exactly what an empty collection replies. Since every
     /// first sync asks with `return_snapshot`, calling it unfulfilled would leave

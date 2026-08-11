@@ -1638,6 +1638,14 @@ impl Client {
         // re-page the collection from scratch for as long as the server keeps
         // setting `has_more_patches`.
         let mut force_snapshot = request.snapshot;
+        // Which collections are mid-replay, kept across rounds rather than
+        // rebuilt per round. A snapshot that answers `has_more_patches` is still
+        // being replayed on the pages that follow it, and those pages carry the
+        // same rebuild — `process_app_state_sync_task` holds its own `full_sync`
+        // across pagination for exactly this reason. Rebuilding it per round
+        // dispatched page two onward as live changes, which is what a consumer
+        // reads `from_full_sync` to tell apart.
+        let mut replaying_snapshot: HashSet<WAPatchName> = HashSet::new();
 
         while !pending.is_empty() && iteration < MAX_ITERATIONS {
             // With the cap at WA Web's 500, a collection paging healthily can
@@ -1664,12 +1672,16 @@ impl Client {
 
             // Build multi-collection IQ, tracking which collections need a snapshot
             let mut collection_nodes = Vec::with_capacity(pending.len());
-            let mut was_snapshot = HashSet::new();
+            // What *this round* asked for, which is not the same as what is being
+            // replayed: a refetch round asks incrementally for a collection whose
+            // replay started with the snapshot in the round before it.
+            let mut asked_for_snapshot = HashSet::new();
             for &name in &pending {
                 let state = backend.get_version(name.as_str()).await?;
                 let want_snapshot = force_snapshot || state.version == 0;
                 if want_snapshot {
-                    was_snapshot.insert(name);
+                    asked_for_snapshot.insert(name);
+                    replaying_snapshot.insert(name);
                 }
                 let mut builder = NodeBuilder::new("collection")
                     .attr("name", name.as_str())
@@ -1756,7 +1768,7 @@ impl Client {
             // collection nobody asked about can never arrive carrying the
             // exemption.
             for pl in &mut patch_lists {
-                pl.requested_snapshot = was_snapshot.contains(&pl.name);
+                pl.requested_snapshot = asked_for_snapshot.contains(&pl.name);
             }
 
             let proc = self.get_app_state_processor();
@@ -1923,10 +1935,12 @@ impl Client {
                 self.request_missing_keys_with_dedup(&missing, APP_STATE_KEY_REQUEST_DEDUP)
                     .await;
 
-                // full_sync is true only when this collection had a snapshot
-                // (version was 0 before sync). This prevents server_sync-triggered
-                // incremental syncs from being incorrectly marked as full syncs.
-                let full_sync = was_snapshot.contains(&name);
+                // full_sync marks a rebuild rather than a live change, so it is
+                // true for every page of a replay a snapshot started — not only
+                // the page the snapshot itself arrived on. A `server_sync`
+                // fetching patches for an already-synced collection never enters
+                // the set, which is what keeps it from reading as a full sync.
+                let full_sync = replaying_snapshot.contains(&name);
                 wacore::telemetry::appstate_mutations(mutations.len() as u64);
                 for m in mutations {
                     self.dispatch_app_state_mutation(&m, full_sync).await;

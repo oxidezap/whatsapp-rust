@@ -304,12 +304,22 @@ impl AppStateProcessor {
         // raised, because it is a verdict about one collection and a later
         // attempt can still get a newer snapshot.
         //
-        // Only when one *arrived*. A response carrying no snapshot at all is not
-        // evidence of anything: it is exactly what an empty collection answers,
-        // and every first sync asks with `return_snapshot` — so treating it as
-        // unfulfilled would leave every empty collection retryable on the
-        // bootstrap that gates `Connected`.
-        if pl.requested_snapshot && !snapshot_fresh && pl.snapshot.is_some() {
+        // Three conditions, each carrying its own case:
+        //
+        // - Only when a snapshot *arrived*. A response carrying none is not
+        //   evidence of anything: it is exactly what an empty collection answers,
+        //   and every first sync asks with `return_snapshot`, so treating that as
+        //   unfulfilled would leave every empty collection retryable on the
+        //   bootstrap that gates `Connected`.
+        // - Only when the response brought nothing else. A refused snapshot can
+        //   arrive alongside patches that carry the collection past it, and those
+        //   are a valid answer — stopping here would throw away work already on
+        //   the wire and leave the collection no further along than before.
+        if pl.requested_snapshot
+            && !snapshot_fresh
+            && pl.snapshot.is_some()
+            && pl.patches.is_empty()
+        {
             log::warn!(
                 target: "AppState",
                 "Snapshot request for {collection_name} unfulfilled: the returned snapshot is older than persisted v{}",
