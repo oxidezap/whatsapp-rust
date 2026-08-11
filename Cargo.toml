@@ -384,11 +384,15 @@ inherits = "release"
 debug = 1
 strip = false
 
-# Curve25519 is the asymmetric work a client pays for: the Signal ratchet DH
-# and the XEdDSA signature run per message, the Noise handshake per
-# connection. Profiling put ~56% of a client's field-arithmetic time in the
-# Montgomery ladder alone. Those operations reach three routines inside the
-# crate, and the fork optimizes each, none of it upstream yet:
+# Curve25519 is the asymmetric work a client pays for, and it is worth being
+# exact about when: a steady-state 1:1 message costs none of it — encrypt
+# advances the symmetric chain and stops. The DH lands on a ratchet step
+# (`RootKey::create_chain`, i.e. session setup and every direction change),
+# the XEdDSA signature on every sender-key group message, and the Noise
+# handshake once per connection. Profiling put ~56% of a client's
+# field-arithmetic time in the Montgomery ladder alone. Those operations
+# reach three routines inside the crate, and the fork optimizes each, none of
+# it upstream yet:
 #
 #   variable-base ladder  a squaring that doubles its 64-bit inputs rather
 #                         than routing through `pow2k(1)`, a `mul121666`
@@ -411,6 +415,12 @@ strip = false
 # resolving to crates.io. And `[patch]` is a workspace-root property: a
 # consumer depending on published `wacore-libsignal` gets upstream unless it
 # repeats this block, so the win is ours and our binaries', not the crate's.
+# Pinned by `rev`, not by the branch it came from: with a branch, a `cargo
+# update` run for an unrelated dependency silently pulls whatever the branch
+# head has become, which for a crypto implementation means unreviewed field
+# arithmetic entering the graph without anyone deciding to take it. Moving to
+# a newer fork commit is a deliberate edit here. The branch is
+# `claude/x25519-field-arithmetic-5293gk`.
 # Revert to the crates.io release once the changes land upstream.
 [patch.crates-io]
-curve25519-dalek = { git = "https://github.com/jlucaso1/curve25519-dalek", branch = "claude/x25519-field-arithmetic-5293gk" }
+curve25519-dalek = { git = "https://github.com/jlucaso1/curve25519-dalek", rev = "fc70cc9bed57c7b48c85d9635037c1b322b2d8c3" }
