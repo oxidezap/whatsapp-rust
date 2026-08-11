@@ -21,6 +21,23 @@ fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
     DateTime::<Utc>::from_timestamp_millis(ms)
 }
 
+/// A wall-clock instant as the first whole millisecond at or after it.
+///
+/// `timestamp_millis` truncates, and stored timestamps are whole milliseconds,
+/// so a bound landing inside a millisecond has to move to the next one for both
+/// ends of a half-open window: a row at `.500` is neither `>= .500_5` nor
+/// excluded by `< .500_5`, and truncation gets both backwards. `Utc::now()`
+/// carries nanoseconds, so this is the common case for a caller passing "an
+/// hour ago", not an exotic one.
+fn ceil_to_ms(t: DateTime<Utc>) -> i64 {
+    let ms = t.timestamp_millis();
+    if t.timestamp_subsec_nanos().is_multiple_of(1_000_000) {
+        ms
+    } else {
+        ms.saturating_add(1)
+    }
+}
+
 type ContactRow = (
     String,
     Option<String>,
@@ -381,9 +398,10 @@ impl ChatStore {
     ///
     /// This is the read a reconciliation consumer wants — "everything that
     /// landed since I last looked, across all chats" — which the chat list plus
-    /// [`messages`](Self::messages) can only answer by paging every thread. It
-    /// answers that question by re-entering at the head and walking down to
-    /// what the consumer already has, NOT by resuming from a saved watermark:
+    /// [`messages`](Self::messages) can only answer by paging every thread.
+    /// Each pass re-enters at the head and walks down until it recognizes what
+    /// it already has; the cursor pages *within* a pass and is not carried
+    /// across passes:
     ///
     /// ```ignore
     /// let mut after = None;
@@ -391,16 +409,27 @@ impl ChatStore {
     ///     let page = store.messages_by_arrival(after, 100).await?;
     ///     let Some(oldest) = page.last() else { break };
     ///     after = Some(oldest.into());
-    ///     let caught_up = page.iter().any(|m| m.seq <= watermark);
-    ///     // ... handle the rows above the watermark ...
-    ///     if caught_up { break }
+    ///     // Stop on content, never on a remembered `seq` — see below.
+    ///     if page.iter().all(|m| already_stored(&m.chat_jid, &m.id)) { break }
+    ///     // ... take the ones that are new ...
     /// }
-    /// // watermark = the highest seq this pass saw
     /// ```
     ///
-    /// Passing a saved watermark as `after` does the opposite of what it reads
-    /// like: it asks for rows *older* than the watermark, so a consumer doing
-    /// that walks back into its own history and never sees a new message.
+    /// Two ways to get this wrong, both silent:
+    ///
+    /// Passing a remembered cursor as `after` does the opposite of what it
+    /// reads like — it asks for rows *older* than that point, so the consumer
+    /// walks back into its own history and never sees a new message.
+    ///
+    /// Stopping at a remembered `seq` skips messages. `seq` is the implicit
+    /// rowid, which SQLite assigns as `max(rowid) + 1`: deleting the newest
+    /// message hands its number to the next arrival, clearing a chat entirely
+    /// restarts at 1, and a `VACUUM` renumbers independently of all that. Each
+    /// of those puts a genuinely new message at or below a remembered value,
+    /// where a watermark comparison reads it as already seen. Deleting and
+    /// clearing are ordinary app-state events this store applies, so it is
+    /// routine rather than a corner case. Compare content across passes —
+    /// `(chat_jid, id)` is the stable identity.
     ///
     /// Equivalent to [`messages_by_arrival_in_range`](Self::messages_by_arrival_in_range)
     /// with no bounds.
@@ -415,6 +444,8 @@ impl ChatStore {
 
     /// The arrival feed restricted to a half-open wall-clock window,
     /// `since <= timestamp < until`. Either end may be `None` for unbounded.
+    /// Sub-millisecond bounds are honored exactly; stored timestamps are whole
+    /// milliseconds, so each end resolves to the first one at or after it.
     ///
     /// The window is a filter over the scan, not a seek: cost tracks the rows
     /// walked, not the rows returned, so a narrow window over an old part of a
@@ -427,11 +458,9 @@ impl ChatStore {
     /// Arrival, not timestamp — [`StoredMessage::seq`] descending. History-sync
     /// backfill inserts old conversations at new `seq`, so a poller keyed on
     /// `timestamp` would skip those rows forever while an arrival-keyed one
-    /// sees them on its next pull. That is also why paging runs newest-first
-    /// against a volatile cursor: `seq` is comparable but a `VACUUM` may
-    /// renumber it, and a consumer that always re-enters at the newest row and
-    /// walks down can only ever re-read rows after one, never skip them.
-    /// Callers dedupe on `(chat_jid, id)`.
+    /// sees them on its next pull. Paging runs newest-first because that is the
+    /// direction a volatile cursor survives: every pass re-enters at the head,
+    /// so nothing depends on a `seq` still meaning what it did last time.
     ///
     /// # Arrival, not change
     ///
@@ -461,8 +490,8 @@ impl ChatStore {
         // A negative LIMIT means "unbounded" to SQLite; never let that happen.
         let limit = limit.max(0);
         let device_id = self.device_id();
-        let since_ms = since.map(|t| t.timestamp_millis());
-        let until_ms = until.map(|t| t.timestamp_millis());
+        let since_ms = since.map(ceil_to_ms);
+        let until_ms = until.map(ceil_to_ms);
         let rows: Vec<MessageRow> = self
             .db()
             .read(move |conn| {

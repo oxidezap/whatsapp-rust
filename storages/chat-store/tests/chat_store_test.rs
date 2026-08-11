@@ -6219,3 +6219,120 @@ async fn arrival_feed_rejects_an_unbounded_limit() {
             .is_empty()
     );
 }
+
+/// Sub-millisecond bounds are honored exactly. `Utc::now()` carries
+/// nanoseconds, so a caller asking for "the last hour" hits this on every call;
+/// truncating the bound gets both ends of the half-open window backwards.
+#[tokio::test]
+async fn arrival_feed_window_honors_sub_millisecond_bounds() {
+    let (_store, chat_store) = test_store().await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("m"),
+            incoming_info(PEER, PEER, "SUB-1", 1_700_000_000),
+        )],
+    )
+    .await;
+    // The stored row sits exactly on a whole second, so on a whole millisecond.
+    let on_the_ms = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let just_after = on_the_ms + chrono::Duration::microseconds(500);
+
+    // `since` half a microsecond past the row excludes it: the row precedes
+    // the bound. Truncation would have kept it.
+    assert!(
+        chat_store
+            .messages_by_arrival_in_range(None, Some(just_after), None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // ...and `until` at the same instant includes it, for the same reason.
+    assert_eq!(
+        chat_store
+            .messages_by_arrival_in_range(None, None, Some(just_after), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // A bound exactly on the row keeps the half-open contract: `since`
+    // includes, `until` excludes.
+    assert_eq!(
+        chat_store
+            .messages_by_arrival_in_range(None, Some(on_the_ms), None, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        chat_store
+            .messages_by_arrival_in_range(None, None, Some(on_the_ms), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The fact that rules out a remembered `seq`: SQLite assigns the implicit
+/// rowid as `max(rowid) + 1`, so deleting the newest message hands its number
+/// to the next arrival. A consumer that stopped at a saved watermark would read
+/// that brand-new message as already seen and drop it — silently, and after an
+/// ordinary delete-for-me, not an exotic one.
+#[tokio::test]
+async fn a_new_message_can_land_at_a_previously_used_seq() {
+    let (_store, chat_store) = test_store().await;
+    let chat = jid(PEER);
+
+    feed(
+        &chat_store,
+        [
+            message_event(
+                wa::Message::text("first"),
+                incoming_info(PEER, PEER, "REUSE-1", 1_700_000_000),
+            ),
+            message_event(
+                wa::Message::text("newest"),
+                incoming_info(PEER, PEER, "REUSE-2", 1_700_000_001),
+            ),
+        ],
+    )
+    .await;
+    let watermark = chat_store.messages_by_arrival(None, 10).await.unwrap()[0].seq;
+
+    feed(
+        &chat_store,
+        [Event::DeleteMessageForMeUpdate(
+            wacore::types::events::DeleteMessageForMeUpdate::builder()
+                .chat_jid(chat.clone())
+                .message_id("REUSE-2".to_string())
+                .from_me(false)
+                .timestamp(Utc.timestamp_opt(1_700_000_002, 0).unwrap())
+                .action(Box::new(
+                    wa::sync_action_value::DeleteMessageForMeAction::default(),
+                ))
+                .from_full_sync(false)
+                .build(),
+        )],
+    )
+    .await;
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("genuinely new"),
+            incoming_info(PEER, PEER, "REUSE-3", 1_700_000_002),
+        )],
+    )
+    .await;
+
+    let page = chat_store.messages_by_arrival(None, 10).await.unwrap();
+    assert_eq!(page[0].id, "REUSE-3");
+    assert!(
+        page[0].seq <= watermark,
+        "a new arrival reused the deleted row's seq ({} vs watermark {}), which \
+         is why the documented loop stops on content and not on a saved seq",
+        page[0].seq,
+        watermark
+    );
+}
