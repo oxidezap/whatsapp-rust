@@ -1528,10 +1528,20 @@ impl Client {
         // collection under both `synced` and `skipped`, making `all_synced()`
         // false and publishing a failure that blames a writer who never existed.
         let mut seen = HashSet::with_capacity(collections.len());
-        let collections: Vec<WAPatchName> = collections
+        let mut collections: Vec<WAPatchName> = collections
             .into_iter()
             .filter(|name| seen.insert(*name))
             .collect();
+
+        // Reserved in a fixed order, because the loop below holds every guard it
+        // has taken while waiting for the next one. Two batches that wait —
+        // `ReservationWait::Always` — and name overlapping collections in
+        // opposite orders would otherwise each hold the other's next collection
+        // and make no progress until both waits time out, minutes later, for
+        // work neither was slow at. A single order over a shared set is what
+        // makes that cycle unconstructible. The name is the only ordering both
+        // callers can agree on without coordinating.
+        collections.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
 
         // The bootstrap cannot skip: it has to know the collection is synced
         // before it dispatches Connected, and an equivalent sync in flight only
@@ -1622,12 +1632,12 @@ impl Client {
         // that is still making progress.
         const MAX_ITERATIONS: usize = 500;
         let mut iteration = 0;
-        // Spent on the first round only. From the second on, the persisted
-        // version is the one the first round just wrote, and standing *that*
-        // down would discard the snapshot it applied and re-page the collection
-        // from scratch for as long as the server keeps setting
-        // `has_more_patches`.
-        let mut stand_version_down = request.snapshot;
+        // Spent on the first round only. A snapshot answers with the whole
+        // collection and moves the version to the server's head, so asking for
+        // one again on the refetch round would discard the page just applied and
+        // re-page the collection from scratch for as long as the server keeps
+        // setting `has_more_patches`.
+        let mut force_snapshot = request.snapshot;
 
         while !pending.is_empty() && iteration < MAX_ITERATIONS {
             // With the cap at WA Web's 500, a collection paging healthily can
@@ -1656,31 +1666,8 @@ impl Client {
             let mut collection_nodes = Vec::with_capacity(pending.len());
             let mut was_snapshot = HashSet::new();
             for &name in &pending {
-                let mut state = backend.get_version(name.as_str()).await?;
-                // Asking for a snapshot is not enough to get one applied: the
-                // processor takes a snapshot only when it is strictly newer than
-                // what is stored, and a collection whose local copy is *wrong*
-                // rather than behind — the reason a caller asks — is exactly the
-                // case where the two versions agree. So the request is expressed
-                // by standing the version down, which is also what makes the rest
-                // of the run treat the collection as one that never synced.
-                //
-                // Not a gamble on the server answering with a snapshot either:
-                // the processor refuses a patch list that arrives with no
-                // snapshot to anchor it against an empty ltHash, so the worst
-                // case leaves the collection retryable at version 0 — asking for
-                // the snapshot again — rather than applying patches to a baseline
-                // they were never built on.
-                if stand_version_down && state.version != 0 {
-                    debug!(
-                        target: "Client/AppState",
-                        "Batched sync: standing {name:?} down from v{} for a requested snapshot",
-                        state.version
-                    );
-                    state = wacore::appstate::hash::HashState::default();
-                    backend.set_version(name.as_str(), state.clone()).await?;
-                }
-                let want_snapshot = state.version == 0;
+                let state = backend.get_version(name.as_str()).await?;
+                let want_snapshot = force_snapshot || state.version == 0;
                 if want_snapshot {
                     was_snapshot.insert(name);
                 }
@@ -1695,7 +1682,7 @@ impl Client {
                 }
                 collection_nodes.push(builder.build());
             }
-            stand_version_down = false;
+            force_snapshot = false;
 
             let sync_node = NodeBuilder::new("sync").children(collection_nodes).build();
             let iq = crate::request::InfoQuery {
@@ -1762,6 +1749,14 @@ impl Client {
                     );
                     false
                 });
+            }
+
+            // Carried from the request, because the response cannot say it and
+            // the snapshot guard needs it. Set after the `retain` above, so a
+            // collection nobody asked about can never arrive carrying the
+            // exemption.
+            for pl in &mut patch_lists {
+                pl.requested_snapshot = was_snapshot.contains(&pl.name);
             }
 
             let proc = self.get_app_state_processor();
@@ -2071,6 +2066,10 @@ impl Client {
             // Parse the response once here; the same parsed list is handed to the
             // processor below (no second parse).
             let mut pl = wacore::appstate::patch_decode::parse_patch_list_ref(resp.get())?;
+            // Carried from the request; the response cannot say it. Without it a
+            // `full_sync` over a persisted version gets its snapshot discarded on
+            // arrival and reports the collection synced without having read it.
+            pl.requested_snapshot = want_snapshot;
             debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
                 name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
 
@@ -2513,6 +2512,8 @@ impl Client {
                         snapshot: None,
                         snapshot_ref: None,
                         error: None,
+                        // A patch send never asks for one.
+                        requested_snapshot: false,
                     }
                 }
                 Err(e) => {

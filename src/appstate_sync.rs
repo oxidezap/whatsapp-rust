@@ -445,6 +445,7 @@ mod tests {
             snapshot: None,
             snapshot_ref: None,
             error: None,
+            requested_snapshot: false,
         };
 
         let result = processor.process_patch_list(patch_list, false).await;
@@ -564,6 +565,7 @@ mod tests {
             }),
             snapshot_ref: None,
             error: None,
+            requested_snapshot: false,
         };
 
         (backend, processor, patch_list, stale_index_mac)
@@ -788,6 +790,75 @@ mod tests {
         );
     }
 
+    /// The stale-snapshot guard exists to stop an unsolicited snapshot from
+    /// rewinding a collection, and that is unchanged: only the caller's own
+    /// request lifts it.
+    #[tokio::test]
+    async fn an_unrequested_snapshot_at_the_persisted_version_is_still_discarded() {
+        let (backend, processor, patch_list, stale_index_mac) = snapshot_resync_scenario().await;
+        // The snapshot is v2; persisting v2 makes it exactly as new, which the
+        // guard treats as stale.
+        backend
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                HashState {
+                    version: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept version");
+
+        processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("a discarded snapshot is not an error");
+
+        assert!(
+            backend
+                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
+                .await
+                .unwrap()
+                .is_some(),
+            "the snapshot must not have been applied"
+        );
+    }
+
+    /// A caller asking for a snapshot is saying the persisted version is not the
+    /// thing to measure it against — its local copy is wrong, not behind, so the
+    /// two versions agreeing is the normal case rather than a replay attempt.
+    /// Without the exemption the repair is a silent no-op.
+    #[tokio::test]
+    async fn a_requested_snapshot_applies_at_the_persisted_version() {
+        let (backend, processor, mut patch_list, stale_index_mac) =
+            snapshot_resync_scenario().await;
+        backend
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                HashState {
+                    version: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept version");
+        patch_list.requested_snapshot = true;
+
+        processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("a requested snapshot should apply");
+
+        assert_eq!(
+            backend
+                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
+                .await
+                .unwrap(),
+            None,
+            "the requested snapshot must replace the baseline it was asked to repair"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_resync_drops_stale_mutation_macs() {
         let (backend, processor, patch_list, stale_index_mac) = snapshot_resync_scenario().await;
@@ -854,6 +925,7 @@ mod tests {
             snapshot: None,
             snapshot_ref: None,
             error: None,
+            requested_snapshot: false,
         };
 
         let (mutations, state, pl) = processor
@@ -914,6 +986,7 @@ mod tests {
             snapshot: None,
             snapshot_ref: None,
             error: None,
+            requested_snapshot: false,
         };
 
         processor
@@ -962,6 +1035,7 @@ mod tests {
                 ..Default::default()
             }),
             error: None,
+            requested_snapshot: false,
         };
 
         let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<Vec<u8>> {
@@ -1128,6 +1202,7 @@ mod tests {
                 snapshot: None,
                 snapshot_ref: None,
                 error: None,
+                requested_snapshot: false,
             };
 
             let (mutations, state, _) = processor
@@ -1223,6 +1298,7 @@ mod tests {
             snapshot: Some(snapshot),
             snapshot_ref: None,
             error: None,
+            requested_snapshot: false,
         };
 
         let (mutations, state, _) = processor

@@ -275,9 +275,16 @@ impl AppStateProcessor {
         // (persisted >= incoming) is discarded ("skip applying syncd old version") so it can't
         // roll the collection backward. No-op on the benign first-sync path, where snapshots
         // are requested only at version 0.
+        //
+        // A snapshot the caller asked for is exempt: the guard exists to stop an
+        // unsolicited one from rewinding the collection, and a caller that asked
+        // is telling us the persisted version is not the thing to measure it
+        // against — see [`PatchList::requested_snapshot`]. Nothing is rewound
+        // either way, because the snapshot is applied whole and its own version
+        // becomes the persisted one.
         let snapshot_fresh = pl.snapshot.as_ref().is_some_and(|snapshot| {
             let snapshot_version = snapshot.version.as_option().and_then(|v| v.version).unwrap_or(0);
-            if snapshot_is_stale(state.version, snapshot_version) {
+            if !pl.requested_snapshot && snapshot_is_stale(state.version, snapshot_version) {
                 log::warn!(
                     target: "AppState",
                     "Skipping stale snapshot for {collection_name}: incoming v{snapshot_version} <= persisted v{}",
@@ -611,6 +618,7 @@ mod external_blob_tests {
             snapshot: None,
             snapshot_ref,
             error: None,
+            requested_snapshot: false,
         }
     }
 
@@ -657,6 +665,7 @@ mod external_blob_tests {
             snapshot: None,
             snapshot_ref: None,
             error: None,
+            requested_snapshot: false,
         };
         let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
             Err(anyhow!("simulated failure"))

@@ -23,15 +23,22 @@ pub enum AppStateResyncMode {
     ///
     /// The expensive repair, for when local state is not behind but *wrong* —
     /// a mirror rebuilt from scratch, a database restored from a backup, an
-    /// ltHash that stopped agreeing with its peers. The response carries the
-    /// whole collection, so every mutation in it is dispatched again with
-    /// `from_full_sync` set.
+    /// ltHash that stopped agreeing with its peers.
     ///
-    /// This stands the collection's persisted version down to zero before
-    /// asking, because a snapshot is only ever applied over a version older
-    /// than its own. A run that then fails leaves the collection asking for a
-    /// snapshot again rather than resuming from where it was — the cost of
-    /// declaring the stored copy untrustworthy.
+    /// # A snapshot replays; it does not reconcile
+    ///
+    /// The response carries what the collection holds *now*, and every record in
+    /// it is dispatched as a fresh mutation with `from_full_sync` set. Nothing is
+    /// dispatched for a record the server no longer has, because the snapshot
+    /// does not mention it — so a mirror carrying a contact, label or mute that
+    /// has since been deleted still carries it afterwards, and the collection is
+    /// still reported [`synced`](AppStateResyncReport::synced).
+    ///
+    /// A consumer repairing that kind of drift should clear its copy of the
+    /// collection first and rebuild it from the replay. The call is the
+    /// boundary: every mutation is dispatched before it returns, so a collection
+    /// listed in `synced` has already delivered everything the server had for
+    /// it — including nothing at all, for a collection that is now empty.
     Snapshot,
 }
 
@@ -344,26 +351,30 @@ mod tests {
         );
     }
 
-    /// A snapshot is applied only when it is strictly newer than the persisted
-    /// version, so a collection whose local copy is wrong rather than behind —
-    /// the case this mode exists for — would have its snapshot discarded on
-    /// arrival. Standing the version down first is what makes the request mean
-    /// what the caller asked for.
+    /// The processor discards a snapshot that is not strictly newer than the
+    /// persisted version — which is exactly the case this mode exists for — so
+    /// the request has to travel with the response as
+    /// `PatchList::requested_snapshot`. Nothing persisted may change before the
+    /// answer arrives: a caller following the docs and wrapping this in a
+    /// timeout would otherwise strand the collection on a version its stored
+    /// mutation MACs no longer match.
     #[tokio::test]
-    async fn snapshot_mode_stands_the_persisted_version_down_before_asking() {
+    async fn snapshot_mode_writes_nothing_before_the_response() {
         let (client, transport) = create_reachable_client().await;
         persist_version(&client, WAPatchName::Regular, 42).await;
 
-        let (result, _) = resync_against(
-            &client,
-            &transport,
-            vec![WAPatchName::Regular],
-            AppStateResyncMode::Snapshot,
-            |_, id| batch_result(id, &[("regular", None)]),
-        )
-        .await;
+        let resync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Snapshot)
+                    .await
+            })
+        };
 
-        result.expect("the server answered");
+        // The IQ is on the wire and unanswered: everything the request could
+        // have written, it has written by now.
+        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
         let persisted = client
             .persistence_manager
             .backend()
@@ -371,10 +382,21 @@ mod tests {
             .await
             .expect("the version should be readable");
         assert_eq!(
-            persisted.version, 0,
-            "a snapshot request that the response never anchored must leave the \
-             collection asking for one again, not sitting on the version it distrusts"
+            persisted.version, 42,
+            "a request in flight must not have moved the persisted version"
         );
+
+        let id = sent
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("every IQ carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(&client, &id, &batch_result(&id, &[("regular", None)])).await;
+        resync
+            .await
+            .expect("the resync task should not panic")
+            .expect("the server answered");
     }
 
     /// The incremental mode must not touch persisted state: it asks for what
@@ -410,54 +432,27 @@ mod tests {
         );
     }
 
-    /// The stand-down is the request, so repeating it on the refetch round would
-    /// discard the version the snapshot just wrote and re-page the collection
-    /// from scratch for as long as the server keeps setting `has_more_patches`.
-    /// The applied snapshot is simulated by writing the version the processor
-    /// would have written, between the two rounds.
+    /// A snapshot answers with the whole collection and moves the version to the
+    /// server's head, so asking for one again on the refetch round would discard
+    /// the page just applied and re-page the collection from scratch for as long
+    /// as the server keeps setting `has_more_patches`.
     #[tokio::test]
-    async fn the_stand_down_is_spent_on_the_first_round() {
-        use futures::FutureExt;
-
+    async fn the_snapshot_request_is_spent_on_the_first_round() {
         let (client, transport) = create_reachable_client().await;
         persist_version(&client, WAPatchName::Regular, 42).await;
 
-        let mut resync = {
-            let client = Arc::clone(&client);
-            tokio::spawn(async move {
-                client
-                    .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Snapshot)
-                    .await
-            })
-        };
-
-        let asked: std::sync::Mutex<Vec<Node>> = std::sync::Mutex::new(Vec::new());
-        let server = async {
-            let mut frame = 0usize;
-            loop {
-                let node = crate::test_utils::decode_sent_iq(&transport, frame).await;
-                let node = node.get().to_owned();
-                let id = node
-                    .attrs()
-                    .optional_string("id")
-                    .expect("every IQ carries an id")
-                    .into_owned();
-                let collection = node
-                    .get_optional_child("sync")
-                    .and_then(|sync| sync.get_optional_child("collection"))
-                    .expect("every round asks about a collection")
-                    .clone();
-                asked.lock().expect("not poisoned").push(collection);
-
-                // The first round is the one with more to send; before answering
-                // it, stand in for the snapshot the processor would have applied.
+        let (result, asked) = resync_against(
+            &client,
+            &transport,
+            vec![WAPatchName::Regular],
+            AppStateResyncMode::Snapshot,
+            |frame, id| {
+                // Only the first round has more to send, so the second is the
+                // refetch and a third would mean the request never cleared.
                 let has_more = frame == 0;
-                if has_more {
-                    persist_version(&client, WAPatchName::Regular, 7).await;
-                }
-                let response = NodeBuilder::new("iq")
+                NodeBuilder::new("iq")
                     .attr("type", "result")
-                    .attr("id", &id)
+                    .attr("id", id)
                     .attr("from", "s.whatsapp.net")
                     .children([NodeBuilder::new("sync")
                         .children([NodeBuilder::new("collection")
@@ -465,30 +460,23 @@ mod tests {
                             .attr("has_more_patches", if has_more { "true" } else { "false" })
                             .build()])
                         .build()])
-                    .build();
-                crate::test_utils::answer_iq(&client, &id, &response).await;
-                frame += 1;
-            }
-        };
-        futures::pin_mut!(server);
-        let result = futures::select! {
-            result = (&mut resync).fuse() => result.expect("the resync task should not panic"),
-            () = server.as_mut().fuse() => unreachable!("the responder never completes"),
-        };
+                    .build()
+            },
+        )
+        .await;
 
         result.expect("the server answered");
-        let asked = asked.lock().expect("not poisoned").clone();
         assert_eq!(asked.len(), 2, "one refetch round after the snapshot");
         assert_eq!(attr(&asked[0], "return_snapshot").as_deref(), Some("true"));
         assert_eq!(
             attr(&asked[1], "return_snapshot").as_deref(),
             Some("false"),
-            "the refetch must resume from the version the snapshot persisted"
+            "the refetch must resume from the version the response left persisted"
         );
         assert_eq!(
             attr(&asked[1], "version").as_deref(),
-            Some("7"),
-            "a second stand-down would have thrown that version away"
+            Some("42"),
+            "and that version is the one nothing in this run had reason to move"
         );
     }
 
@@ -510,6 +498,36 @@ mod tests {
         let report = result.expect("the server answered");
         assert_eq!(report.synced, vec![WAPatchName::Regular]);
         assert_eq!(asked.len(), 1, "the duplicate must not reach the wire");
+    }
+
+    /// Both batches wait for whoever holds a collection, and each holds every
+    /// guard it has taken while waiting for the next one — so overlapping
+    /// requests named in opposite orders could each hold the other's next
+    /// collection and make no progress until both waits timed out, minutes
+    /// later, for work neither was slow at. Reserving in one order over a shared
+    /// set is what makes that cycle unconstructible, and the request the batch
+    /// puts on the wire is that order.
+    #[tokio::test]
+    async fn collections_are_reserved_in_a_fixed_order_whatever_the_caller_asked() {
+        let (client, transport) = create_reachable_client().await;
+
+        let (result, asked) = resync_against(
+            &client,
+            &transport,
+            // Deliberately not the canonical order.
+            vec![WAPatchName::RegularHigh, WAPatchName::Regular],
+            AppStateResyncMode::Incremental,
+            |_, id| batch_result(id, &[("regular", None), ("regular_high", None)]),
+        )
+        .await;
+
+        result.expect("the server answered");
+        let order: Vec<Option<String>> = asked.iter().map(|c| attr(c, "name")).collect();
+        assert_eq!(
+            order,
+            vec![Some("regular".to_owned()), Some("regular_high".to_owned())],
+            "the batch must reserve, and ask, in name order rather than the caller's"
+        );
     }
 
     /// 400/404 is the server's answer, not a transport failure. Raising it as
