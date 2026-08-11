@@ -19,23 +19,40 @@ For an application whose deployment hardware is known to report both `bmi2` and
 ```toml
 # <consumer app>/.cargo/config.toml
 [target.x86_64-unknown-linux-gnu]
+# APPEND to whatever this key already holds — the assignment replaces the
+# array, it does not merge with another `[target.*]` block or with
+# `build.rustflags`.
 rustflags = ["-Ctarget-feature=+bmi2,+avx2"]
 ```
 
-**Check the features, not the year.** "2013 or newer" is the wrong test and
-will eventually ship a crashing binary: Intel's Silvermont/Goldmont line (most
-Atom, Celeron and Pentium parts, including current ones) and AMD's Jaguar/Puma
-cores are all newer than Haswell and have neither feature. The dates in the
-floor column below mark when the *mainstream* core gained it, not when every
-part did. What holds is a per-CPU check on each deployment target, or the
-equivalent guarantee from a fleet inventory:
+Cargo picks exactly one rustflags source, highest first:
+`CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS`, `target.<triple>.rustflags`,
+`build.rustflags`. They do not combine. So an invocation that sets `RUSTFLAGS`
+for any reason silently discards the config entry above, and the feature flags
+have to be merged into that variable instead.
+
+**Check the features, not the CPU's age or its brand.** Neither "2013 or newer"
+nor a product family is a sound test. By microarchitecture, Intel Silvermont and
+Goldmont and AMD Jaguar and Puma are all later than Haswell and carry neither
+feature — but those cores ship under Atom, Celeron and Pentium names alongside
+parts built on entirely different cores that do have both (Pentium Gold 8505 is
+Alder Lake, and has AVX2), so the marketing name settles nothing either way. The
+dates in the floor column below mark when the mainstream core gained the
+feature, not when every part did. CPUID on each deployment target is the only
+rule that holds:
 
 ```bash
-# fails loudly if any single logical CPU is missing either feature —
-# a union over /proc/cpuinfo would pass on a heterogeneous host and still
-# SIGILL the moment the process is scheduled onto the odd core
-awk '/^flags/ { if (!/ avx2 /  || !/ bmi2 /) { bad++ } } END { exit bad > 0 }' \
-  /proc/cpuinfo && echo ok || echo "some CPU lacks avx2/bmi2"
+# nonzero exit if ANY logical CPU is missing either feature: a union over
+# /proc/cpuinfo would pass on a heterogeneous host and still SIGILL the moment
+# the process is scheduled onto the odd core. Token-boundary matched, so a
+# flags line that ends in the feature name still counts.
+check_isa() {
+  awk '/^flags/ { if (!/(^| )avx2( |$)/ || !/(^| )bmi2( |$)/) bad++ }
+       END { exit bad > 0 }' /proc/cpuinfo && return 0
+  echo "some CPU lacks avx2/bmi2" >&2
+  return 1
+}
+check_isa   # usable as a gate: the status survives the diagnostic
 ```
 
 **The build host needs the features too, not just the deployment host.** A
@@ -47,7 +64,10 @@ require both features on the builder, or pass
 `--target x86_64-unknown-linux-gnu` explicitly, which splits host from target
 and leaves the host tools unflagged.
 
-For `wasm32-unknown-unknown`, add `-Ctarget-feature=+simd128`.
+For `wasm32-unknown-unknown`, add `-Ctarget-feature=+simd128` — provided the
+runtimes you deploy to accept it. A module using `v128` fails *validation*
+outright on an engine without the proposal, so this is a per-runtime decision,
+not a per-CPU one; see [wasm32](#wasm32) for what was and was not checked here.
 
 Do not use `-Ctarget-cpu=native` — see [Rejected](#measured-and-rejected).
 
@@ -57,7 +77,7 @@ Instruction counts on this repository's own benches, `wacore` and
 `wacore-libsignal`, measured as described in [Method](#method). Percentages are
 Ir deltas against a build with no `target-feature` at all.
 
-| flag | key gen | sig create | sig verify | group encrypt | DM encrypt | `bench_dm_send` | `bench_group_send_10` | CPU floor (Intel / AMD) |
+| flag | key gen | sig create | sig verify ᵃ | group encrypt | DM encrypt | `bench_dm_send` | `bench_group_send_10` | CPU floor (Intel / AMD) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | *(none — today's default)* | — | — | — | — | — | — | — | x86-64 baseline |
 | `+bmi2` | **−11.2%** | **−11.1%** | −6.6% | **−11.6%** | **−12.3%** | **−12.5%** | **−11.9%** | Haswell 2013 / Excavator 2015 |
@@ -65,6 +85,14 @@ Ir deltas against a build with no `target-feature` at all.
 | `+avx2` | −13.5% | −12.4% | −1.7% | −11.9% | −8.0% | −7.5% | −8.2% | Haswell 2013 / Excavator 2015 |
 | **`+bmi2,+avx2`** | **−24.1%** | **−22.9%** | **−8.2%** | **−23.0%** | **−19.7%** | **−19.4%** | **−19.5%** | Haswell 2013 / Excavator 2015 |
 | `-Ctarget-cpu=native` | — | — | — | — | — | — | — | whatever built it — *see [Rejected](#measured-and-rejected)* |
+
+ᵃ `bench_signature_verification` is a **mixed workload**, not verification in
+isolation: each measured iteration creates one signature and then verifies ten
+times. Signing moves 11–12% under these flags, so roughly a tenth of that
+column's operations are on the faster-moving side and its numbers overstate the
+verify-only effect by a little. Left as-is rather than corrected — the bench
+already exists under that name on CodSpeed, and reshaping it to hoist the
+signing into `with_inputs` would break its series for a footnote.
 
 Two results decide the recommendation:
 
@@ -104,11 +132,12 @@ runtime-dispatches `vartime_double_base_mul` through a CPUID check and, on any
 AVX2-capable host, runs a hand-written vector backend that no `target-feature`
 of ours touches (see [Runtime dispatch](#runtime-dispatch-is-not-the-same-thing)).
 That is why `+avx2` is worth only −1.7% here against −13.5% on key generation.
-It still keeps −6.6% from `+bmi2`, because verification does not end at the
-scalar multiplication: `verify_signature_prepared`
+It still keeps −6.6% from `+bmi2`, from two sources. Verification does not end
+at the scalar multiplication: `verify_signature_prepared`
 (`wacore/libsignal/src/core/curve/curve25519.rs`) compresses the resulting
 `EdwardsPoint`, and `compress` is a serial field inversion — `FieldElement51`
-work, on the flag's side of the line.
+work, on the flag's side of the line. The rest is the one signature the bench
+creates per iteration (footnote ᵃ), which moves with the sig-create column.
 
 ## Why these cannot be defaults
 
@@ -118,11 +147,14 @@ the instruction wherever it likes, and a CPU without the feature raises
 because there is no check.
 
 The failure mode is worse than a refusal to boot, and worth being precise
-about: nothing on the ELF/x86-64 Linux path validates target features at load
-time, so the process starts normally, passes its readiness probe, and traps
-whenever control first reaches an emitted instruction — potentially the first
-Signal operation, potentially much later, under traffic. A successful startup
-is not evidence of compatibility.
+about. A load-time check does exist in principle — glibc 2.33+ reads
+`GNU_PROPERTY_X86_ISA_1_NEEDED` from `.note.gnu.property` and refuses a binary
+whose ISA level the CPU cannot meet — but `-C target-feature` does not emit that
+property, so this recipe does not get you one. What you get instead: the process
+starts normally, passes its readiness probe, and traps whenever control first
+reaches an emitted instruction, potentially the first Signal operation and
+potentially much later under traffic. **A successful startup is not evidence of
+compatibility**, and there is no runtime fallback to take.
 
 That is fine for an application whose deployment target is known. It is not
 fine for a library on crates.io, which is compiled by people whose hardware it
@@ -247,17 +279,28 @@ RUSTFLAGS="$BASE -Ctarget-feature=+bmi2,+avx2" CARGO_TARGET_DIR=/tmp/t-bmi2avx2 
 BIN=$(find /tmp/t-bmi2avx2/release/deps -name 'libsignal_benchmark-*' -type f -perm -u+x ! -name '*.d')
 
 for size in 20 40; do
-  valgrind --tool=callgrind --callgrind-out-file=/dev/null --cache-sim=no --branch-sim=no \
+  valgrind --tool=callgrind --callgrind-out-file="cg.bmi2avx2.$size" \
+    --cache-sim=no --branch-sim=no \
     "$BIN" --bench bench_key_generation \
     --sample-count 5 --sample-size $size --threads 1
 done   # (Ir@40 - Ir@20) / ((40-20) * 5) = Ir per iteration
+
+# the per-function table below reads the profiles this kept; a
+# --callgrind-out-file=/dev/null run gives you the totals and nothing else
+callgrind_annotate cg.bmi2avx2.20 | grep curve25519
 ```
 
 `--bench` is required: without it divan lists the benchmarks and exits without
 running them, and the run looks like a 0.016 s success.
 
 Per-function attribution in the mechanism table comes from
-`callgrind_annotate` on the same runs.
+`callgrind_annotate` on the retained `--sample-size 20` profile of each config.
+
+Tool and toolchain versions, since both bound the result: valgrind/callgrind
+3.22.0, and `nightly-2026-06-16` as pinned by `rust-toolchain.toml` — the
+`BASE` flags above are nightly-only (`-Zshare-generics`, `-Zunstable-options`),
+so a build that bypasses or overrides the pinned toolchain fails on stable
+rather than producing a comparable number.
 
 ### Caveats
 
