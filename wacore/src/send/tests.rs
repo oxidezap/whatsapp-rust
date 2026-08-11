@@ -3941,8 +3941,16 @@ mod mark_full_distribution_list {
     /// member state into it would still benchmark fine on a small group.
     #[tokio::test]
     async fn warm_group_stanza_size_tracks_own_devices_not_group_size() {
-        // `members` is the group; `companions` are our own other devices, which
-        // receive a fresh SKDM on every send.
+        // Our own other devices, which receive a fresh SKDM on every send.
+        // Shared with the assertions so they can name the exact JIDs the stanza
+        // must address, not merely how many.
+        fn companion_jids(companions: usize) -> Vec<Jid> {
+            (1..=companions)
+                .map(|d| format!("12025550111:{d}@s.whatsapp.net").parse().unwrap())
+                .collect()
+        }
+
+        // `members` is the group; `companions` are our own other devices.
         async fn warm_stanza(members: usize, companions: usize) -> Node {
             let own_jid: Jid = "12025550111:0@s.whatsapp.net".parse().unwrap();
             let own_lid: Jid = "100000000000001:0@lid".parse().unwrap();
@@ -3955,9 +3963,7 @@ mod mark_full_distribution_list {
                         .unwrap()
                 })
                 .collect();
-            let own_companions: Vec<Jid> = (1..=companions)
-                .map(|d| format!("12025550111:{d}@s.whatsapp.net").parse().unwrap())
-                .collect();
+            let own_companions: Vec<Jid> = companion_jids(companions);
 
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
             let mut sks = MemSenderKeyStore::default();
@@ -3980,8 +3986,9 @@ mod mark_full_distribution_list {
                 known: Default::default(),
             };
             for companion in &own_companions {
+                let addr = companion.to_protocol_address();
                 process_prekey_bundle(
-                    &companion.to_protocol_address(),
+                    &addr,
                     &mut ss,
                     &mut is,
                     &signed_prekey_bundle(),
@@ -3990,6 +3997,22 @@ mod mark_full_distribution_list {
                 )
                 .await
                 .expect("establish the companion session");
+                // `process_prekey_bundle` alone leaves the session holding a
+                // pending pre-key, so its next encryption is still a `pkmsg`
+                // first contact. The steady state this fixture models is the
+                // one after the companion has answered, which is what clears
+                // the pending key — so clear it, and let the `enc type`
+                // assertion below hold the fixture to it.
+                let mut record = ss
+                    .load_session(&addr)
+                    .await
+                    .expect("load")
+                    .expect("session present");
+                record
+                    .session_state_mut()
+                    .expect("session state")
+                    .clear_unacknowledged_pre_key_message();
+                ss.store_session(&addr, record).await.expect("store");
             }
             let mut pks = UnusedPreKeyStore;
             let spks = UnusedSignedPreKeyStore;
@@ -4082,15 +4105,38 @@ mod mark_full_distribution_list {
             let large = warm_stanza(512, companions).await;
 
             for (label, node) in [("8-member", &small), ("512-member", &large)] {
-                let distributed = node
+                // The JIDs, not just how many: a list of the right length that
+                // addressed group members instead of our companions would be
+                // exactly the regression this test exists to catch.
+                let distributed: Vec<Jid> = node
                     .get_optional_child("participants")
                     .and_then(Node::children)
-                    .map_or(0, <[Node]>::len);
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|to| to.attrs().jid("jid"))
+                    .collect();
                 assert_eq!(
-                    distributed, companions,
+                    distributed,
+                    companion_jids(companions),
                     "{label} warm send distributes to our own companions only, \
-                     never to the {companions}-companion account's group members"
+                     never to the group's members"
                 );
+                // The enc type is the whole premise of the fixture, so it is
+                // checked rather than asserted in a comment.
+                for to in node
+                    .get_optional_child("participants")
+                    .and_then(Node::children)
+                    .unwrap_or(&[])
+                {
+                    let enc = to
+                        .get_optional_child("enc")
+                        .unwrap_or_else(|| panic!("{label} participant carries an enc"));
+                    assert_eq!(
+                        enc.attrs().optional_string("type").as_deref(),
+                        Some("msg"),
+                        "{label} companion SKDM ciphertext type"
+                    );
+                }
                 // Version tag plus 8 base64 chars — the width is what makes the
                 // stanza size independent of the set hashed, and the `2:` is
                 // what makes it the phash the server expects rather than some

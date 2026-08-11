@@ -35,15 +35,14 @@ fn main() {
 /// measure two wire shapes at once.
 ///
 /// The ciphertexts are `type="msg"`, the shape a redistribution to devices that
-/// already hold a pairwise session emits. A device being contacted for the
-/// first time gets `type="pkmsg"` instead, whose `PreKeySignalMessage` carries
-/// an identity key, a base key and the registration id on top of the same inner
-/// message — roughly twice the payload. Marshalling is linear in payload bytes,
-/// so that case rides the same slope from a higher intercept; what this sweep
-/// exists to pin is the per-recipient term, which the payload does not move.
-/// Building the real ciphertexts is out of reach here regardless: `wacore-binary`
-/// does not depend on libsignal, and giving it a dev-dependency on the Signal
-/// stack to size a byte array would be a poor trade.
+/// already hold a pairwise session emits — a membership change or a rotation.
+/// **This sweep does not characterize a first-contact fan-out.** Those get
+/// `type="pkmsg"`, whose `PreKeySignalMessage` carries an identity key, a base
+/// key and the registration id on top of the same inner message, and that
+/// larger payload is paid once *per recipient* — `marshal_exact` copies every
+/// payload through the writer — so it raises the slope, not the intercept. Read
+/// this sweep as a lower bound there, or measure a `pkmsg` payload separately;
+/// do not extrapolate the cold cost from these numbers.
 fn create_skdm_fanout_node(width: usize) -> Node {
     const DEVICES_PER_USER: usize = 4;
     let recipients: Vec<Node> = (0..width)
@@ -76,12 +75,13 @@ fn create_skdm_fanout_node(width: usize) -> Node {
 
 // Group sender-key distribution, swept across the recipient count reported for
 // real groups. Marshalling is linear in the fan-out width, so this is what a
-// redistribution — a membership change, or a rotation — pays in the encoder,
-// and a first-contact fan-out pays the same per-recipient term over the larger
-// `pkmsg` payload (see the fixture). The steady-state send that follows carries
-// no `<participants>` at all. Keeping both facts measurable is what tells a
-// group-size regression ("the warm stanza grew a per-participant node") apart
-// from a group that is merely redistributing.
+// redistribution — a membership change, or a rotation — pays in the encoder.
+// A first-contact fan-out pays a steeper per-recipient term over the larger
+// `pkmsg` payload (see the fixture), so it is not what these numbers measure.
+// The steady-state send that follows carries no `<participants>` at all.
+// Keeping both facts measurable is what tells a group-size regression ("the
+// warm stanza grew a per-participant node") apart from a group that is merely
+// redistributing.
 //
 // `marshal_exact`, not `marshal_auto`: every outbound stanza goes through
 // `Client::marshal_node_for_send`, which picks the two-pass exact strategy.
