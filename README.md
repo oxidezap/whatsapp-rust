@@ -70,16 +70,24 @@ for the host contract and type-safe API example.
 ### Codegen flags
 
 The crate sets no `target-feature`, because a published library cannot know
-which CPU it will run on and such a flag has no runtime fallback — a binary
-built with it simply will not start on hardware that lacks the feature. An
-application that *does* control its deployment target can take about a fifth of
-the per-message instruction count on the Signal paths by setting it itself:
+which CPU it will run on and such a flag has no runtime fallback. A binary
+built with one dies with `SIGILL` on hardware that lacks the feature — and not
+necessarily at startup, since nothing validates target features at load time:
+it traps whenever execution first reaches an emitted instruction, which can be
+well into serving traffic, so a clean startup is not a compatibility check.
+
+An application that *does* control its deployment target can take about a fifth
+of the per-message instruction count on the Signal paths by setting it itself:
 
 ```toml
 # <your app>/.cargo/config.toml
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-Ctarget-feature=+bmi2,+avx2"]   # CPU floor: Haswell / Excavator
+rustflags = ["-Ctarget-feature=+bmi2,+avx2"]
 ```
+
+Confirm every deployment target reports both features first — check CPUID, not
+the CPU's year. Current Atom/Celeron/Pentium (Silvermont, Goldmont) and AMD
+Jaguar/Puma parts are newer than Haswell and have neither.
 
 Measurements per flag, the CPU floor each one raises, why `+adx` and
 `-Ctarget-cpu=native` are not worth taking, and the `wasm32` equivalent are in

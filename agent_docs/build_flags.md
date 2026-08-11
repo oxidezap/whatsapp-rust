@@ -3,8 +3,8 @@
 Codegen flags this library does **not** set for you, what each is worth on its
 hot paths, and the CPU floor each one raises. Nothing here changes a default:
 `whatsapp-rust` is published to crates.io and cannot know what it will run on,
-and every flag below that pays is one that makes the binary refuse to start on
-a CPU that lacks the feature.
+and every flag below that pays is one that makes the binary die on a CPU that
+lacks the feature.
 
 The decision this doc exists to serve: an application that controls its own
 deployment target can buy roughly **a fifth of the per-message instruction
@@ -13,13 +13,23 @@ cannot buy it on the application's behalf.
 
 ## Recommendation
 
-For an application that knows it ships to x86-64 hardware from 2013 or newer:
+For an application whose deployment hardware is known to report both `bmi2` and
+`avx2` in CPUID:
 
 ```toml
 # <consumer app>/.cargo/config.toml
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-Ctarget-feature=+bmi2,+avx2"]
 ```
+
+**Check the features, not the year.** "2013 or newer" is the wrong test and
+will eventually ship a crashing binary: Intel's Silvermont/Goldmont line (most
+Atom, Celeron and Pentium parts, including current ones) and AMD's Jaguar/Puma
+cores are all newer than Haswell and have neither feature. The dates in the
+floor column below mark when the *mainstream* core gained it, not when every
+part did. `grep -o 'avx2\|bmi2' /proc/cpuinfo | sort -u` on each deployment
+target, or the equivalent from your fleet inventory, is the check that
+actually holds.
 
 For `wasm32-unknown-unknown`, add `-Ctarget-feature=+simd128`.
 
@@ -72,19 +82,31 @@ the access pattern reveals nothing. That is a wide, branch-free, data-parallel
 loop, and AVX2 halves it. Neither flag can take the other's function, which is
 why the combined figure is close to the sum.
 
-`sig verify` moves least (−8.2%) because it is the one operation that does not
-go through either function: `curve25519-dalek` runtime-dispatches
-`vartime_double_base_mul` through a CPUID check and, on any AVX2-capable host,
-runs a hand-written vector backend that no `target-feature` of ours touches.
-See [Runtime dispatch](#runtime-dispatch-is-not-the-same-thing).
+`sig verify` moves least, and its two columns say why. Its scalar
+multiplication is the one that escapes both flags: `curve25519-dalek`
+runtime-dispatches `vartime_double_base_mul` through a CPUID check and, on any
+AVX2-capable host, runs a hand-written vector backend that no `target-feature`
+of ours touches (see [Runtime dispatch](#runtime-dispatch-is-not-the-same-thing)).
+That is why `+avx2` is worth only −1.7% here against −13.5% on key generation.
+It still keeps −6.6% from `+bmi2`, because verification does not end at the
+scalar multiplication: `verify_signature_prepared`
+(`wacore/libsignal/src/core/curve/curve25519.rs`) compresses the resulting
+`EdwardsPoint`, and `compress` is a serial field inversion — `FieldElement51`
+work, on the flag's side of the line.
 
 ## Why these cannot be defaults
 
 `+avx2` and `+bmi2` are compile-time promises, not requests. The compiler emits
-the instruction wherever it likes, including in code that runs before `main`,
-and a CPU without the feature raises `SIGILL` on the first one. There is no
-fallback path to take, because there is no check: the binary simply does not
-run.
+the instruction wherever it likes, and a CPU without the feature raises
+`SIGILL` on the first one it reaches. There is no fallback path to take,
+because there is no check.
+
+The failure mode is worse than a refusal to boot, and worth being precise
+about: nothing on the ELF/x86-64 Linux path validates target features at load
+time, so the process starts normally, passes its readiness probe, and traps
+whenever control first reaches an emitted instruction — potentially the first
+Signal operation, potentially much later, under traffic. A successful startup
+is not evidence of compatibility.
 
 That is fine for an application whose deployment target is known. It is not
 fine for a library on crates.io, which is compiled by people whose hardware it
@@ -111,9 +133,12 @@ fallback to offer when the CPU turns out to be older.
 
 Already done, and worth knowing about before someone re-derives it:
 `[profile.release]` in the root `Cargo.toml` has carried `lto = "fat"` (with
-`codegen-units = 1`) for some time. There is no LTO change available on the
-release path, and none should be made — the per-package `opt-level` overrides
-documented in `binary_size_ci.md` depend on fat LTO to take effect.
+`codegen-units = 1`) for some time. There is no LTO change to make on the
+release path. Note that the per-package `opt-level` overrides documented in
+`binary_size_ci.md` are *not* conditional on it — cargo applies a profile
+override when it compiles that dependency, whatever the LTO mode — but the
+~530 KiB those overrides are credited with was measured under fat LTO, so
+changing the LTO mode would invalidate that figure rather than the mechanism.
 
 `[profile.bench]` deliberately overrides it back to `lto = "thin"`. That is not
 an oversight: a fat-LTO bench build of `send_receive_benchmark` +
@@ -163,7 +188,7 @@ convenient shorthand for the above. Two independent reasons:
    `libsignal_benchmark` dies under callgrind with `Unrecognised instruction
    … Process terminating with default action of signal 4 (SIGILL)`. It runs
    fine on the bare CPU. Anything that profiles under Valgrind — which includes
-   CodSpeed, this repo's benchmark CI — sees a binary that will not start.
+   CodSpeed, this repo's benchmark CI — cannot run the binary.
 2. **It is slower than the explicit list on at least one real host.** Prior
    wall-clock A/B on the same host family recorded `bench_dm_session_establishment`
    at 493 µs stock, 445 µs with `+adx,+bmi2,+avx2`, and **544 µs** with
