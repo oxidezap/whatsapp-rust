@@ -383,3 +383,14 @@ strip = false
 inherits = "release"
 debug = 1
 strip = false
+
+# X25519 is the one asymmetric primitive on the per-message path (Signal
+# ratchet DH) and the connection path (Noise handshake), and profiling put
+# ~56% of a client's field-arithmetic time in the Montgomery ladder. This
+# fork carries ladder-level optimizations — squaring that doubles 64-bit
+# inputs instead of routing through `pow2k(1)`, a `mul121666` specialized on
+# the constant's sparse limbs — that are not upstream yet. x25519-dalek 3.0
+# resolves through the same 5.x requirement, so both wrappers pick it up.
+# Revert to the crates.io release once the changes land upstream.
+[patch.crates-io]
+curve25519-dalek = { git = "https://github.com/jlucaso1/curve25519-dalek", branch = "claude/x25519-field-arithmetic-5293gk" }

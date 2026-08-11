@@ -124,6 +124,10 @@ skip = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# crates.io only. Nothing in this workspace is vendored from a git remote, and
-# a new git source should be an explicit decision rather than a silent one.
+# crates.io, plus the one git remote the workspace patches in on purpose. A new
+# git source should be an explicit decision rather than a silent one.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# curve25519-dalek 5.x is patched to a fork carrying X25519 ladder
+# optimizations that are not upstream yet; see `[patch.crates-io]` in the root
+# Cargo.toml. Drop this entry when the patch does.
+allow-git = ["https://github.com/jlucaso1/curve25519-dalek"]
