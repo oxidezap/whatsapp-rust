@@ -1275,10 +1275,19 @@ impl Client {
         if !self.scope_is_current(scope) {
             return false;
         }
+        // Reachability, not just a live generation: 429 and 503 clear
+        // `is_logged_in` inline and fall through without retiring the connection
+        // (`handle_stream_error`), so the scope check alone still admits a
+        // session the client has already stopped treating as authenticated, and
+        // `dispatch_connected` does not ask either. The replacement connection
+        // announces itself; this one has nothing left to announce.
+        //
         // Presence is NOT sent here. WhatsApp Web sends presence from the
         // setting_pushName mutation handler (WAWebPushNameSync), not from
         // criticalSyncDone. Our setting_pushName handler already does this.
-        self.dispatch_connected(scope.generation).await;
+        if self.can_reach_server() {
+            self.dispatch_connected(scope.generation).await;
+        }
         // After the readiness transition, not before: the report claims the
         // session is usable, and until `Connected` is actually published that
         // claim can still be falsified by a disconnect during the resubscribe
@@ -5074,6 +5083,10 @@ mod critical_bootstrap_tests {
     }
 
     /// A client with a recorder attached, holding the subscription alive.
+    ///
+    /// Reachable, because the bootstrap only announces a connection that still
+    /// is: a fixture that skipped the flags would have passed no matter what the
+    /// announce guard asked.
     async fn recording_client(
         name: &str,
     ) -> (
@@ -5082,6 +5095,17 @@ mod critical_bootstrap_tests {
         crate::types::events::Subscription,
     ) {
         let client = crate::test_utils::create_test_client_with_name(name).await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        assert!(
+            client.can_reach_server(),
+            "the fixture itself is announceable"
+        );
         let recorder = Arc::new(BootstrapRecorder::default());
         let subscription = client.subscribe(recorder.interest(), Arc::clone(&recorder) as _);
         (client, recorder, subscription)
@@ -5268,6 +5292,11 @@ mod critical_bootstrap_tests {
     #[tokio::test]
     async fn a_retryable_critical_sync_still_announces_the_connection() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
         let recorder = Arc::new(BootstrapRecorder::default());
         let _subscription = client.subscribe(recorder.interest(), Arc::clone(&recorder) as _);
 
@@ -5403,5 +5432,44 @@ mod critical_bootstrap_tests {
             client.needs_initial_full_sync.is_armed(),
             "the critical half closing is not the bootstrap closing"
         );
+    }
+
+    /// A 429 or 503 clears `is_logged_in` inline and falls through without
+    /// retiring the connection, so the generation check alone still admits it.
+    /// Announcing there would set `is_ready` on a session the client has already
+    /// stopped treating as authenticated, and the reconnect that follows is what
+    /// gets to announce. The gap is still reported and still retried, because
+    /// the collections are no less owed for the socket having gone bad.
+    #[tokio::test]
+    async fn a_de_authenticated_connection_announces_nothing() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-429").await;
+        let scope = client.sync_scope(None);
+        let stalled = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stalled);
+
+        // Exactly what `handle_stream_error` does for 429 and 503.
+        client.is_logged_in.store(false, Ordering::Relaxed);
+
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &stalled)
+                .await,
+            "the generation is intact, so the leftovers still go to the background sync"
+        );
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            0,
+            "an unauthenticated session must not be announced"
+        );
+        assert_eq!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .as_slice(),
+            [false].as_slice(),
+            "and the report has to say the connection never happened"
+        );
+        assert!(client.needs_initial_full_sync.is_armed());
     }
 }

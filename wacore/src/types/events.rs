@@ -652,10 +652,12 @@ pub struct SelfPushNameUpdated {
 /// carry — for `critical_block` that includes the push name, so presence stays
 /// unavailable until it syncs.
 ///
-/// The initial sync that follows pairing always connects, so its report always
-/// carries `connected: true`. A `false` comes from a sync that ran before the
-/// connection was ready, such as one a `syncd_app_state` dirty bit started while
-/// the offline backlog was still being processed.
+/// The initial sync that follows pairing normally connects, so its report
+/// normally carries `connected: true`. A `false` means no [`Event::Connected`]
+/// accompanied this report: a sync that ran before the connection was ready,
+/// such as one a `syncd_app_state` dirty bit started while the offline backlog
+/// was still being processed, or an initial sync whose connection was paused,
+/// superseded or rejected by the server as it finished.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct AppStateSyncFailed {
@@ -1434,7 +1436,12 @@ pub struct ClientOutdated {
     pub raw: Option<Node>,
 }
 
-/// The session is authenticated and out of passive mode, so stanzas are flowing.
+/// The session is authenticated and has asked the server to leave passive mode.
+///
+/// That request is best effort: a failure to go active is logged and the
+/// connection is announced anyway, on the same reasoning as below, so treat this
+/// as "the client believes stanzas should be flowing" rather than a guarantee
+/// that the server agrees.
 ///
 /// After a fresh pairing the client waits for the critical app-state
 /// collections before publishing this, so the push name and blocklist are
