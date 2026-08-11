@@ -27,9 +27,25 @@ will eventually ship a crashing binary: Intel's Silvermont/Goldmont line (most
 Atom, Celeron and Pentium parts, including current ones) and AMD's Jaguar/Puma
 cores are all newer than Haswell and have neither feature. The dates in the
 floor column below mark when the *mainstream* core gained it, not when every
-part did. `grep -o 'avx2\|bmi2' /proc/cpuinfo | sort -u` on each deployment
-target, or the equivalent from your fleet inventory, is the check that
-actually holds.
+part did. What holds is a per-CPU check on each deployment target, or the
+equivalent guarantee from a fleet inventory:
+
+```bash
+# fails loudly if any single logical CPU is missing either feature —
+# a union over /proc/cpuinfo would pass on a heterogeneous host and still
+# SIGILL the moment the process is scheduled onto the odd core
+awk '/^flags/ { if (!/ avx2 /  || !/ bmi2 /) { bad++ } } END { exit bad > 0 }' \
+  /proc/cpuinfo && echo ok || echo "some CPU lacks avx2/bmi2"
+```
+
+**The build host needs the features too, not just the deployment host.** A
+`[target.x86_64-unknown-linux-gnu]` rustflags entry reaches build scripts and
+proc macros whenever cargo is invoked *without* an explicit `--target`, because
+that is the case where cargo unifies host and target compilation. Building on a
+baseline machine for a newer fleet then traps during the build itself. Either
+require both features on the builder, or pass
+`--target x86_64-unknown-linux-gnu` explicitly, which splits host from target
+and leaves the host tools unflagged.
 
 For `wasm32-unknown-unknown`, add `-Ctarget-feature=+simd128`.
 
@@ -225,9 +241,14 @@ BASE='-Zshare-generics=y -Zunstable-options -Clinker-features=+lld -Clink-arg=-W
 RUSTFLAGS="$BASE -Ctarget-feature=+bmi2,+avx2" CARGO_TARGET_DIR=/tmp/t-bmi2avx2 \
   cargo build --profile bench --bench libsignal_benchmark -p wacore-libsignal
 
+# `deps/` holds the executable *and* its `libsignal_benchmark-<hash>.d`
+# dep-info file, so a bare glob passes the .d path to divan as a positional
+# filter and silently benchmarks nothing. Select the executable.
+BIN=$(find /tmp/t-bmi2avx2/release/deps -name 'libsignal_benchmark-*' -type f -perm -u+x ! -name '*.d')
+
 for size in 20 40; do
   valgrind --tool=callgrind --callgrind-out-file=/dev/null --cache-sim=no --branch-sim=no \
-    /tmp/t-bmi2avx2/release/deps/libsignal_benchmark-* --bench bench_key_generation \
+    "$BIN" --bench bench_key_generation \
     --sample-count 5 --sample-size $size --threads 1
 done   # (Ir@40 - Ir@20) / ((40-20) * 5) = Ir per iteration
 ```

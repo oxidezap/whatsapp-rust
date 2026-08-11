@@ -87,7 +87,9 @@ rustflags = ["-Ctarget-feature=+bmi2,+avx2"]
 
 Confirm every deployment target reports both features first — check CPUID, not
 the CPU's year. Current Atom/Celeron/Pentium (Silvermont, Goldmont) and AMD
-Jaguar/Puma parts are newer than Haswell and have neither.
+Jaguar/Puma parts are newer than Haswell and have neither. The build machine
+needs them too unless you pass an explicit `--target`, since without one cargo
+applies these flags to build scripts and proc macros as well.
 
 Measurements per flag, the CPU floor each one raises, why `+adx` and
 `-Ctarget-cpu=native` are not worth taking, and the `wasm32` equivalent are in
