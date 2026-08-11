@@ -4062,12 +4062,17 @@ mod mark_full_distribution_list {
             out
         }
 
-        fn child_tags(node: &Node) -> Vec<&str> {
-            node.children()
-                .unwrap_or(&[])
-                .iter()
-                .map(|c| c.tag.as_ref())
-                .collect()
+        // The whole hierarchy, not just the root's children: a `<to>` or `<enc>`
+        // subtree that grew with the group would otherwise slip past, and a
+        // rename that happens to preserve the encoded length would slip past the
+        // size comparison too. Attribute *keys* only — the values legitimately
+        // differ (the phash digests two different device sets), and the phash is
+        // asserted on its own below.
+        fn shape(node: &Node) -> String {
+            let mut attrs: Vec<&str> = node.attrs.0.iter().map(|(k, _)| k.as_ref()).collect();
+            attrs.sort_unstable();
+            let children: Vec<String> = node.children().unwrap_or(&[]).iter().map(shape).collect();
+            format!("{}[{}]({})", node.tag, attrs.join(","), children.join(" "))
         }
 
         // Single-device account (no companions) and a two-companion one: the
@@ -4086,16 +4091,23 @@ mod mark_full_distribution_list {
                     "{label} warm send distributes to our own companions only, \
                      never to the {companions}-companion account's group members"
                 );
-                assert_eq!(
-                    node.attrs().optional_string("phash").map(|p| p.len()),
-                    Some(10),
-                    "{label} phash is a fixed-width digest"
+                // Version tag plus 8 base64 chars — the width is what makes the
+                // stanza size independent of the set hashed, and the `2:` is
+                // what makes it the phash the server expects rather than some
+                // other ten-character attribute.
+                let phash = node
+                    .attrs()
+                    .optional_string("phash")
+                    .unwrap_or_else(|| panic!("{label} warm send must carry a phash"));
+                assert!(
+                    phash.starts_with("2:") && phash.len() == 10,
+                    "{label} phash is a fixed-width v2 digest, got {phash:?}"
                 );
             }
 
             assert_eq!(
-                child_tags(&small),
-                child_tags(&large),
+                shape(&small),
+                shape(&large),
                 "same stanza shape with {companions} companions"
             );
             assert_eq!(
