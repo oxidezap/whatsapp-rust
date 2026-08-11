@@ -60,4 +60,5 @@ Read the one that covers what you are touching:
 | `agent_docs/plugin_architecture.md` | Touching the `plugins` / `client-lifecycle` feature surface |
 | `agent_docs/voip_audio_codecs.md` | VoIP media: codec profiles, negotiation, encoded audio API |
 | `agent_docs/binary_size_ci.md` | A size gate failed, or a change adds dependencies or generic instantiations |
+| `agent_docs/build_flags.md` | Recommending codegen flags, or asked why a `target-feature` is not a default |
 | `agent_docs/debugging.md` | Decoding raw binary-protocol bytes by hand |

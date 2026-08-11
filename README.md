@@ -67,6 +67,24 @@ their own `whatsapp-rust` dependency, and Cargo feature unification activates it
 for the consumer. See [`agent_docs/plugin_architecture.md`](agent_docs/plugin_architecture.md)
 for the host contract and type-safe API example.
 
+### Codegen flags
+
+The crate sets no `target-feature`, because a published library cannot know
+which CPU it will run on and such a flag has no runtime fallback — a binary
+built with it simply will not start on hardware that lacks the feature. An
+application that *does* control its deployment target can take about a fifth of
+the per-message instruction count on the Signal paths by setting it itself:
+
+```toml
+# <your app>/.cargo/config.toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Ctarget-feature=+bmi2,+avx2"]   # CPU floor: Haswell / Excavator
+```
+
+Measurements per flag, the CPU floor each one raises, why `+adx` and
+`-Ctarget-cpu=native` are not worth taking, and the `wasm32` equivalent are in
+[`agent_docs/build_flags.md`](agent_docs/build_flags.md).
+
 ### One dependency is enough
 
 `whatsapp-rust` re-exports the whole stack, so you never need to declare the sibling crates (`wacore`, `wacore-binary`, `waproto`, `whatsapp-rust-tokio-transport`, `whatsapp-rust-ureq-http-client`, `whatsapp-rust-sqlite-storage`) yourself, including when pinning a git revision:
