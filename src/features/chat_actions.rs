@@ -30,8 +30,9 @@ pub enum AppStateError {
     /// label id).
     #[error("invalid app-state request: {0}")]
     InvalidRequest(String),
-    /// The client has no connection to ask on and none is coming: it is
-    /// shutting down, or it was never started. Nothing reached the server.
+    /// The transport, not the request, is what stopped it: the client is
+    /// shutting down, was never started, or lost the socket before the request
+    /// could be sent or answered.
     #[error("no usable connection for the app-state request")]
     NotConnected,
     /// Encoding, key lookup, or sending the app-state patch failed.

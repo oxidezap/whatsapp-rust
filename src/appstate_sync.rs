@@ -917,6 +917,128 @@ mod tests {
         );
     }
 
+    /// Helper for the stale-window cases: the shared scenario's snapshot is v2,
+    /// so a window of `versions` and a cursor past all of them is a response
+    /// that cannot reach the collection wherever it already is.
+    async fn stale_window_scenario(
+        cursor: u64,
+        versions: &[u64],
+    ) -> (Arc<MockBackend>, AppStateProcessor, PatchList, Vec<u8>) {
+        let (backend, processor, mut patch_list, stale_index_mac) =
+            snapshot_resync_scenario().await;
+        backend
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                HashState {
+                    version: cursor,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept version");
+        patch_list.requested_snapshot = true;
+
+        let key_id_bytes = b"snap_key_id".to_vec();
+        let keys = expand_app_state_keys(&[9u8; 32]);
+        let plaintext = wa::SyncActionData {
+            value: buffa::MessageField::some(wa::SyncActionValue {
+                timestamp: Some(3000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        for (i, version) in versions.iter().enumerate() {
+            patch_list.patches.push(wa::SyncdPatch {
+                mutations: vec![create_encrypted_mutation(
+                    wa::syncd_mutation::SyncdOperation::Set,
+                    &[0x20 + i as u8; 32],
+                    &plaintext,
+                    &keys,
+                    &key_id_bytes,
+                )],
+                version: buffa::MessageField::some(wa::SyncdVersion {
+                    version: Some(*version),
+                }),
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(key_id_bytes.clone()),
+                }),
+                ..Default::default()
+            });
+        }
+
+        (backend, processor, patch_list, stale_index_mac)
+    }
+
+    /// A whole window behind the cursor is refused as one. Letting its patches
+    /// through because the response was not empty only fails the strict version
+    /// check on the first of them — they are contiguous from the snapshot, not
+    /// from the cursor — turning a per-collection verdict into an error about
+    /// the whole run.
+    #[tokio::test]
+    async fn a_window_entirely_behind_the_cursor_is_refused_with_its_patches() {
+        // Snapshot v2 and its window v3/v4, against a collection at v9.
+        let (backend, processor, patch_list, stale_index_mac) =
+            stale_window_scenario(9, &[3, 4]).await;
+
+        let (mutations, state, pl) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("a refused window is a verdict, not a failure");
+
+        assert!(
+            matches!(pl.error, Some(CollectionSyncError::Retry { .. })),
+            "expected a retryable verdict, got {:?}",
+            pl.error
+        );
+        assert_eq!(state.version, 9, "nothing may have moved the cursor");
+        assert!(mutations.is_empty());
+        assert!(
+            backend
+                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
+                .await
+                .unwrap()
+                .is_some(),
+            "and the baseline must be untouched"
+        );
+    }
+
+    /// A gapped window advertises a version it cannot reach: the patch after the
+    /// gap fails `validatePatchVersion`. Counting the highest version it names
+    /// would accept the snapshot, persist it, and only then fail — leaving the
+    /// collection rewound by a run that returned an error.
+    #[tokio::test]
+    async fn a_gapped_window_does_not_count_as_reaching_its_highest_version() {
+        // Snapshot v2, then v3 — and then v9, with v4..=v8 missing. The cursor
+        // sits at v5, which only the unreachable tail claims to pass.
+        let (backend, processor, patch_list, stale_index_mac) =
+            stale_window_scenario(5, &[3, 9]).await;
+
+        let (mutations, state, pl) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("a refused window is a verdict, not a failure");
+
+        assert!(
+            matches!(pl.error, Some(CollectionSyncError::Retry { .. })),
+            "expected a retryable verdict, got {:?}",
+            pl.error
+        );
+        assert_eq!(
+            state.version, 5,
+            "the snapshot must not have been persisted over the cursor"
+        );
+        assert!(mutations.is_empty());
+        assert!(
+            backend
+                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
+                .await
+                .unwrap()
+                .is_some(),
+            "and the baseline must be untouched"
+        );
+    }
+
     /// A snapshot behind the cursor arrives with the patch window that follows
     /// it, and that sequence can still land the collection past where it was.
     /// Rebuilding from the snapshot is what the request asked for and what makes

@@ -293,13 +293,20 @@ impl AppStateProcessor {
         // request makes that safe.
         let snapshot_fresh = pl.snapshot.as_ref().is_some_and(|snapshot| {
             let snapshot_version = snapshot.version.as_option().and_then(|v| v.version).unwrap_or(0);
-            let response_ends_at = pl
-                .patches
-                .iter()
-                .filter_map(|p| p.version.as_option().and_then(|v| v.version))
-                .max()
-                .unwrap_or(snapshot_version)
-                .max(snapshot_version);
+            // How far the response can actually take the collection: the
+            // snapshot, plus the patches that follow it without a gap.
+            // `validatePatchVersion` applies each patch at exactly `version + 1`,
+            // so the first gap ends the window — and the versions past it,
+            // however high they read, are not reachable from this response. What
+            // matters is where it can land, not what it advertises.
+            let mut response_ends_at = snapshot_version;
+            for patch in &pl.patches {
+                let patch_version = patch.version.as_option().and_then(|v| v.version).unwrap_or(0);
+                if patch_version != response_ends_at.saturating_add(1) {
+                    break;
+                }
+                response_ends_at = patch_version;
+            }
             let rewinds = response_ends_at < state.version;
             if snapshot_is_stale(state.version, snapshot_version) && (!pl.requested_snapshot || rewinds) {
                 log::warn!(
@@ -318,22 +325,18 @@ impl AppStateProcessor {
         // raised, because it is a verdict about one collection and a later
         // attempt can still get a newer snapshot.
         //
-        // Three conditions, each carrying its own case:
+        // Only when a snapshot *arrived*. A response carrying none is not
+        // evidence of anything: it is exactly what an empty collection answers,
+        // and every first sync asks with `return_snapshot`, so treating that as
+        // unfulfilled would leave every empty collection retryable on the
+        // bootstrap that gates `Connected`.
         //
-        // - Only when a snapshot *arrived*. A response carrying none is not
-        //   evidence of anything: it is exactly what an empty collection answers,
-        //   and every first sync asks with `return_snapshot`, so treating that as
-        //   unfulfilled would leave every empty collection retryable on the
-        //   bootstrap that gates `Connected`.
-        // - Only when the response brought nothing else. A refused snapshot can
-        //   arrive alongside patches that carry the collection past it, and those
-        //   are a valid answer — stopping here would throw away work already on
-        //   the wire and leave the collection no further along than before.
-        if pl.requested_snapshot
-            && !snapshot_fresh
-            && pl.snapshot.is_some()
-            && pl.patches.is_empty()
-        {
+        // Any patches it came with go with it. Refusing the snapshot means the
+        // response could not reach the persisted version, and its patches are
+        // contiguous from the snapshot rather than from that version — so
+        // attempting them only fails `validatePatchVersion` on the first one,
+        // turning a per-collection verdict into an error about the whole run.
+        if pl.requested_snapshot && !snapshot_fresh && pl.snapshot.is_some() {
             log::warn!(
                 target: "AppState",
                 "Snapshot request for {collection_name} unfulfilled: the returned snapshot is older than persisted v{}",
