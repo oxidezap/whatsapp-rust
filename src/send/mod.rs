@@ -1323,7 +1323,7 @@ impl Client {
     /// Atomic get-or-init: if another task invalidated the cache during our
     /// DB read, get_or_init's single-flight guarantee means the stale data
     /// won't be inserted — the invalidation wins and the next caller re-inits.
-    async fn skdm_device_map(
+    pub(crate) async fn skdm_device_map(
         &self,
         group_jid: &str,
     ) -> std::sync::Arc<crate::sender_key_device_cache::SenderKeyDeviceMap> {
@@ -1464,7 +1464,7 @@ impl Client {
     /// comes from the per-group memo (`resolve_group_devices_memoized`), so a
     /// warm repeat send skips the per-member registry fan-out entirely.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets_memoized", level = "debug", skip_all, fields(group = %group_jid)))]
-    async fn resolve_skdm_targets_memoized(
+    pub(crate) async fn resolve_skdm_targets_memoized(
         &self,
         group: &Jid,
         group_jid: &str,
@@ -3077,6 +3077,95 @@ mod tests {
         assert!(
             fixture.frame_len(1) < fixture.frame_len(0),
             "a revoke that distributes nothing must be smaller than the cold send"
+        );
+    }
+
+    /// Whether the next send would take the memoized path: the entry exists and
+    /// all four of `resolve_skdm_targets_memoized`'s validity conditions still
+    /// hold. Re-derived here rather than counted inside the production path,
+    /// which would mean adding a hit counter to a hot function just to observe
+    /// it.
+    async fn skdm_memo_would_hit(client: &Arc<Client>, group: &Jid) -> bool {
+        let cached_map = client.skdm_device_map(&group.to_string()).await;
+        let group_info = client
+            .get_group_cache()
+            .get(group)
+            .await
+            .expect("group metadata must be cached");
+        let own = client
+            .persistence_manager
+            .get_device_snapshot()
+            .pn
+            .clone()
+            .expect("own pn");
+        let Ok(devices) = client
+            .resolve_group_devices_memoized(group, &group_info, &own)
+            .await
+        else {
+            return false;
+        };
+        let generation = cached_map.generation();
+        match client.skdm_warm_memo.get(group).await {
+            Some((dw, cw, memo_gen, memo_sender, _)) => {
+                std::ptr::eq(dw.as_ptr(), Arc::as_ptr(&devices))
+                    && std::ptr::eq(cw.as_ptr(), Arc::as_ptr(&cached_map))
+                    && memo_gen == generation
+                    && memo_sender == own
+            }
+            None => false,
+        }
+    }
+
+    /// The premise of every "the warm group send is flat in group size" claim:
+    /// once the group is warm, `resolve_skdm_targets_memoized` really does take
+    /// the memo and skip `filter_skdm_targets`. If it did not, each send would
+    /// pay one hash lookup per device — measured at 649 instructions per member
+    /// by `skdm_target_resolution_memo_cold`, which is the exact shape an
+    /// external profile attributed to this path.
+    ///
+    /// Repeat sends are what has to hold, not just the second one: our own
+    /// companions are re-targeted every send (WA Web `!isMeDevice`), so the
+    /// memo has to survive being re-inserted with a non-empty `needs` set.
+    #[tokio::test]
+    async fn skdm_warm_memo_hits_on_every_repeat_send() {
+        let fixture = GroupSendFixture::new().await;
+
+        // The first send is cold: it distributes to every device, so there is
+        // nothing warm to memoize against yet.
+        fixture.send_text("cold send").await;
+        for round in 0..4 {
+            fixture.send_text("warm send").await;
+            assert!(
+                skdm_memo_would_hit(&fixture.client, &fixture.group).await,
+                "the warm memo must be live after warm send {round}; a miss here \
+                 puts filter_skdm_targets back on every send"
+            );
+        }
+    }
+
+    /// The counterpart: a forgotten device (a retry receipt's
+    /// `markForgetSenderKey`) flips the map in place, which keeps the `Arc` but
+    /// advances the generation — the one signal pointer identity cannot carry.
+    /// The memo must miss, or the send would skip a distribution the peer is
+    /// asking for. This is why the generation is part of the key, and why an
+    /// optimization must not drop it.
+    #[tokio::test]
+    async fn skdm_warm_memo_misses_after_a_device_is_forgotten() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("cold send").await;
+        fixture.send_text("warm send").await;
+        assert!(skdm_memo_would_hit(&fixture.client, &fixture.group).await);
+
+        let forgotten = fixture.member.with_device(0);
+        fixture
+            .client
+            .sender_key_device_cache
+            .mark_forgotten(&fixture.group.to_string(), std::iter::once(&forgotten))
+            .await;
+
+        assert!(
+            !skdm_memo_would_hit(&fixture.client, &fixture.group).await,
+            "an in-place cold flip must invalidate the memo through the generation"
         );
     }
 

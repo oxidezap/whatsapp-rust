@@ -47,6 +47,16 @@ jobs:
             packages: -p wacore -p wacore-noise
           - name: proto-signal
             packages: -p wacore-binary -p wacore-libsignal -p wacore-appstate
+          # The client crate's own benchmarks. Its fixture needs crate-private
+          # internals a bench target cannot otherwise reach, so it builds with
+          # the non-default `bench-harness` feature. Its own shard rather than a
+          # third package on an existing one: it is the only shard that compiles
+          # the full client dependency tree (Diesel/SQLite, rustls, tokio), so
+          # folding it in would serialize that build behind benchmarks that do
+          # not need it. Unlike `integration-benchmarks` below it needs no mock
+          # server — the fixture drives the send path over a sink transport.
+          - name: client
+            packages: -p whatsapp-rust --features bench-harness
     steps:
       - uses: actions/checkout@v6
         with:

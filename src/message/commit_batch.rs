@@ -220,13 +220,14 @@ impl InboundCommitBatcher {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "bench-harness"))]
 impl Client {
-    /// Test-only mirror of a completed offline sync: the flag, live permit
-    /// count and batcher mode move together so tests can never run in a
+    /// Test/bench mirror of a completed offline sync: the flag, live permit
+    /// count and batcher mode move together so a fixture can never run in a
     /// hybrid drain/live state production cannot reach. Kept next to the
     /// production transition (`finish_offline_sync`) so a new step gets added
-    /// to both.
+    /// to both. The `bench-harness` fixture needs it for the same reason a
+    /// test does — a send measured in drain mode is not the steady state.
     pub(crate) fn enter_live_mode_for_tests(&self) {
         self.offline_sync_completed.store(true, Ordering::Release);
         self.offline_sync_finish_started

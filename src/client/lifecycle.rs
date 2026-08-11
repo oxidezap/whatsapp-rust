@@ -1934,8 +1934,10 @@ impl Client {
         self.is_connected.load(Ordering::Acquire)
     }
 
-    /// Force the connected flag for tests that exercise connected-only operations.
-    #[cfg(test)]
+    /// Force the connected flag for tests that exercise connected-only
+    /// operations. Also reached by the `bench-harness` fixture, which drives
+    /// the same connected-only send path with no socket behind it.
+    #[cfg(any(test, feature = "bench-harness"))]
     pub(crate) fn set_connected_for_test(&self, connected: bool) {
         self.is_connected.store(connected, Ordering::Release);
     }

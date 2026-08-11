@@ -288,6 +288,13 @@ pub mod prelude {
 
 pub use spam_report::{SpamFlow, SpamReportRequest, SpamReportResult};
 
+/// Offline fixture the client-level benchmarks build on. Not a public API:
+/// gated behind the non-default `bench-harness` feature and hidden from docs,
+/// so an ordinary build carries neither the module nor its sink transport.
+#[cfg(feature = "bench-harness")]
+#[doc(hidden)]
+pub mod bench_support;
+
 #[cfg(test)]
 pub mod test_utils;
 

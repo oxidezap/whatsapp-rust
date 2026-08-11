@@ -9,6 +9,10 @@ license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 readme = "README.md"
 description = "Rust client for WhatsApp Web"
+# Only the explicit [[bench]] targets below are built; never auto-discover
+# benches/*.rs, so a stray untracked file on a reused CI runner can't get
+# compiled as a phantom bench. Same rationale as wacore.
+autobenches = false
 
 [package.metadata.docs.rs]
 features = ["plugins"]
@@ -158,6 +162,11 @@ metrics = ["wacore/metrics"]
 # Render raw phone numbers in tracing fields instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
 tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
+# Offline fixture for the client-level benchmarks (`benches/`). Not a public
+# API: the module it enables is `#[doc(hidden)]` and exists only so a bench
+# target, which links the crate from outside, can reach the crate-private send
+# internals it measures. Never enable it in a shipping build.
+bench-harness = ["tokio-runtime", "tokio/rt-multi-thread"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 danger-skip-cert-chain-verify = ["wacore/danger-skip-cert-chain-verify"]
 default = [
@@ -252,6 +261,7 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 [dev-dependencies]
 aes = { workspace = true }
 cbc = { workspace = true, features = ["block-padding"] }
+divan = { workspace = true }
 env_logger = { workspace = true }
 # `total_listeners()` (how tests observe that a waiter parked) is std-gated.
 event-listener = { workspace = true, features = ["std"] }
@@ -293,6 +303,14 @@ required-features = ["tracing"]
 [[example]]
 name = "metrics"
 required-features = ["metrics"]
+
+# Client-level group-send sweep. `required-features` keeps the fixture out of
+# an ordinary `cargo bench`/`cargo build --all-targets`, which would otherwise
+# fail to find `whatsapp_rust::bench_support`.
+[[bench]]
+name = "client_group_send"
+harness = false
+required-features = ["bench-harness"]
 
 [profile.release]
 opt-level = 3
