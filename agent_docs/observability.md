@@ -357,51 +357,80 @@ reliable signal and `freed`/`net` drift for buffers that outlive their poll.
 file-backed pages — useful for a process holding many small per-session DBs. WAL
 caveat: mmap covers reads of the main DB file; writes still go through the WAL.
 
-## Per-message allocation on the send paths
+## Per-message allocation on the group stanza build
 
-Measured with `divan::AllocProfiler` installed as the global allocator in
-`wacore/benches/send_receive_benchmark.rs` (temporarily — see below), 50 samples
-per bench, pinned to one core. Divan tallies only the benchmarked closure, so
-the fixture's session setup is excluded; the identical counts across group sizes
-confirm that.
+**Read the scope before the numbers.** These come from
+`wacore/benches/send_receive_benchmark.rs`, whose `run_group_send` calls
+`prepare_group_stanza` and marshals the resulting node — and nothing else. The
+client send path around it (group lookup, retry caching, sender-key cache
+access, `resolve_skdm_targets_memoized`, persistence-adapter construction, the
+send itself; `src/send/mod.rs`) is not in the measured region. A whole-client
+per-message profile is a strictly larger quantity and these figures cannot be
+subtracted from one or compared against one.
 
-| send | allocations / msg | bytes / msg |
+Measured with `divan::AllocProfiler` installed as the global allocator
+(temporarily — see below), 50 samples per bench, pinned to one core. Divan
+tallies only the benchmarked closure, so the fixtures' setup is excluded; the
+identical counts across group sizes confirm that.
+
+| stanza build | allocations | bytes |
 | --- | ---: | ---: |
 | `bench_dm_send` | 157 | 27.9 KB |
-| `bench_group_send_10` (warm) | **22** | **3.58 KB** |
-| `bench_group_send_50` (warm) | **22** | **3.58 KB** |
-| `bench_group_send_256` (warm) | **22** | **3.58 KB** |
+| `bench_group_send_10` (no distribution) | **22** | **3.58 KB** |
+| `bench_group_send_50` (no distribution) | **22** | **3.58 KB** |
+| `bench_group_send_256` (no distribution) | **22** | **3.58 KB** |
 | `bench_group_send_skdm_256` (distributing) | 6,816 | 675.1 KB |
 
-**A warm group send is the cheapest thing this client does, and it is flat in
-group size.** 22 allocations for any group from 10 to 256 members, against 157
-for a DM. That ordering is not a surprise once the shapes are next to each
-other: a DM fans out one pairwise Signal encrypt per recipient device, while a
-warm group send does a single sender-key encrypt for the whole group and
-attaches one `<enc type="skmsg">`. The group path is cheaper per message
-precisely because sender keys exist.
+**The result that holds regardless of scope: a group send that distributes no
+sender key is flat in group size.** 22 allocations and 3.58 KB whether the group
+has 10 members or 256, because the stanza carries one `<enc type="skmsg">` for
+everyone and nothing per recipient (pinned by
+`warm_group_send_encoding_scale` in `wacore/src/send/tests.rs`). The DM figure
+is higher because a DM pairwise-encrypts once per recipient device; the group
+path is cheaper per message precisely because sender keys exist.
 
-**Where a large per-message figure comes from is redistribution, amortized.** A
-distributing send costs 6,816 allocations at 256 targets — about 26.6 per
-device, which is one X3DH plus one pairwise encrypt each, and is inherent: every
-device needs its own copy of the sender key under its own ratcheting session. An
-external profile of a client reported 387 allocations per group message at 128
-members. That figure is not reproducible as a per-message cost here (warm is 22)
-and it is not meant to be: it sits between the warm and distributing numbers,
-which is what an average over a stream that periodically redistributes looks
-like. At 128 members a distribution is ~3.4K allocations, so a redistribution
-roughly every ten messages lands squarely on 387.
+**Two things the distributing row is not.** It is not X3DH: `setup_group_send`
+calls `establish_session` for every member before forcing distribution, so
+`ensure_sessions_for_devices` finds each session present and never reaches the
+prekey-fetch branch. What 6,816 measures is the SKDM encrypt fan-out — one
+pairwise encrypt and one `<to><enc>` node per target, ~26.6 allocations each —
+plus the stanza build. A cold fixture with genuinely missing sessions would cost
+more; nothing here measures that. And it is not "the" cold cost: forced
+rotation and reset paths redistribute on their own schedule.
 
-The consequence for anyone reading such a number as a target: the lever is not
-allocation in the send path. It is how often the sender key is redistributed,
-which `resolve_skdm_targets_memoized` already minimizes — and that memo exists
-for correctness (not re-sending keys to devices that have them), so it is not a
-knob to turn further for performance.
+### What this does not settle
+
+An external profile of a client reported 387 allocations per group message at
+128 members. These numbers neither reproduce nor refute it, and the earlier
+revision of this section was wrong to present them as doing so:
+
+- **Different scope.** 387 came from a full client send; 22 is stanza build plus
+  marshal. The missing work is real and unmeasured.
+- **Different configuration.** The no-distribution fixture has no own companion
+  device. On a linked account, own devices are *never* memoized warm — see the
+  comment at `src/send/mod.rs` in the `initial_targets` match, which spells out
+  that own-only SKDM needs **is** the warm steady state. Such a send carries a
+  nonempty `distribution_list` on every message and *does* call
+  `ensure_sessions_for_devices`. So the 22 figure is specifically the
+  zero-own-target case, and "a warm send never touches session setup" is false
+  for the ordinary multi-device account.
+- **The amortization arithmetic does not land on 387 either.** One ~3.4K
+  distribution at 128 members plus nine 22-allocation sends averages ~360, not
+  387. Close enough to suggest the shape is right — a stream that periodically
+  redistributes — but not close enough to claim the decomposition.
 
 `send::encrypt::ensure_sessions_for_devices` is worth naming because a profile
-will point at it: it is called from inside the `distribution_list` branch only,
-so a warm send never enters it at all. Its per-message cost in an averaged
-profile is entirely amortized cold-path cost.
+points at it: it is reached only through the `distribution_list` branch, so a
+send with no SKDM targets skips it entirely — but as above, an account with a
+companion device has targets on every send.
+
+One correction to make in passing, because the earlier revision got it backwards:
+`resolve_skdm_targets_memoized` does **not** govern how often sender keys are
+redistributed. It memoizes device-set *resolution*, skipping the per-member
+registry fan-out on a repeat send. Which devices still need the key is decided by
+`filter_skdm_targets` against the `SenderKeyDeviceMap`
+(`device_and_primary_warm`). That map is the state to look at for redistribution
+frequency; the memo is a lookup cache in front of a different question.
 
 To re-measure, add the allocator to the bench temporarily rather than
 committing it:
