@@ -6095,10 +6095,15 @@ async fn arrival_feed_window_is_half_open() {
     assert_eq!(ids(resumed), ["W-2", "W-1"]);
 }
 
-/// Tombstones are rows too: a reconciler that never sees the revoke keeps
-/// serving content the sender withdrew.
+/// Tombstones are rows too, and a revoke does NOT reorder them. Both halves
+/// matter and they pull in opposite directions: the feed carries the tombstone,
+/// so a full pass sees the withdrawal, but the revoke rewrites the row in place
+/// and leaves `seq` where the insert put it — so a consumer tailing only the
+/// head walks straight past a message that was revoked after it read it. That
+/// is the boundary between this feed and `subscribe()`, and it is documented on
+/// `messages_by_arrival_in_range` because it is not guessable from the name.
 #[tokio::test]
-async fn arrival_feed_carries_tombstones() {
+async fn arrival_feed_carries_tombstones_without_reordering_them() {
     let (_store, chat_store) = test_store().await;
     let chat = jid(PEER);
 
@@ -6110,6 +6115,19 @@ async fn arrival_feed_carries_tombstones() {
             Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
         )
         .unwrap();
+    chat_store.flush().await.unwrap();
+    let before = chat_store.messages_by_arrival(None, 10).await.unwrap();
+    let seq_before = before[0].seq;
+
+    // A later message, so "did the revoke move it to the head?" has an answer.
+    feed(
+        &chat_store,
+        [message_event(
+            wa::Message::text("after"),
+            incoming_info(PEER, PEER, "LATER-1", 1_700_000_005),
+        )],
+    )
+    .await;
     chat_store
         .record_revoke(
             &chat,
@@ -6120,9 +6138,15 @@ async fn arrival_feed_carries_tombstones() {
     chat_store.flush().await.unwrap();
 
     let page = chat_store.messages_by_arrival(None, 10).await.unwrap();
-    assert_eq!(page.len(), 1);
-    assert!(page[0].revoked);
-    assert!(page[0].message.is_none());
+    assert_eq!(
+        page.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        ["LATER-1", "REVOKED-1"],
+        "the revoke must not move the row it tombstoned"
+    );
+    let tombstone = &page[1];
+    assert!(tombstone.revoked);
+    assert!(tombstone.message.is_none());
+    assert_eq!(tombstone.seq, seq_before, "arrival position is immutable");
 }
 
 /// Another device's history in the same file is not this session's feed. The

@@ -375,12 +375,32 @@ impl ChatStore {
     }
 
     /// One page of the whole session's messages, every chat interleaved, newest
-    /// arrival first. Pass the cursor of the last message you already have to
-    /// get the page after it.
+    /// arrival first. `after` is the cursor of the last row of the page you
+    /// have; it yields the page after that one, which is the next batch of
+    /// *older* arrivals.
     ///
     /// This is the read a reconciliation consumer wants — "everything that
     /// landed since I last looked, across all chats" — which the chat list plus
-    /// [`messages`](Self::messages) can only answer by paging every thread.
+    /// [`messages`](Self::messages) can only answer by paging every thread. It
+    /// answers that question by re-entering at the head and walking down to
+    /// what the consumer already has, NOT by resuming from a saved watermark:
+    ///
+    /// ```ignore
+    /// let mut after = None;
+    /// loop {
+    ///     let page = store.messages_by_arrival(after, 100).await?;
+    ///     let Some(oldest) = page.last() else { break };
+    ///     after = Some(oldest.into());
+    ///     let caught_up = page.iter().any(|m| m.seq <= watermark);
+    ///     // ... handle the rows above the watermark ...
+    ///     if caught_up { break }
+    /// }
+    /// // watermark = the highest seq this pass saw
+    /// ```
+    ///
+    /// Passing a saved watermark as `after` does the opposite of what it reads
+    /// like: it asks for rows *older* than the watermark, so a consumer doing
+    /// that walks back into its own history and never sees a new message.
     ///
     /// Equivalent to [`messages_by_arrival_in_range`](Self::messages_by_arrival_in_range)
     /// with no bounds.
@@ -413,8 +433,17 @@ impl ChatStore {
     /// walks down can only ever re-read rows after one, never skip them.
     /// Callers dedupe on `(chat_jid, id)`.
     ///
-    /// Tombstones (revoked messages) and undecryptable placeholders are rows
-    /// like any other and appear here; a consumer reconciling state wants both.
+    /// # Arrival, not change
+    ///
+    /// A tombstone or an undecryptable placeholder is a row like any other and
+    /// appears here. A *mutation* of a row does not: an edit, a revoke, a star
+    /// or a status change rewrites the row in place, and `seq` is assigned by
+    /// the INSERT and survives every UPDATE, so a message the consumer has
+    /// already walked past never resurfaces at the head no matter what happens
+    /// to it afterwards. A consumer that has to track those subscribes to
+    /// [`StoreChange::Messages`](crate::types::StoreChange::Messages) via
+    /// [`ChatStore::subscribe`] and re-reads the chat it names; this feed
+    /// answers "what has arrived", not "what has changed".
     ///
     /// # Cost
     ///
@@ -722,7 +751,11 @@ mod tests {
         ] {
             let plan = plan(&sql);
             assert!(
-                plan.contains("messages") && !plan.contains("USING INDEX"),
+                // Any `INDEX`, not just `USING INDEX`: SQLite also spells the
+                // regressed plans `USING COVERING INDEX` and `USING AUTOMATIC
+                // COVERING INDEX`, and the plans this test wants name neither
+                // (`INTEGER PRIMARY KEY` is the table).
+                plan.contains("messages") && !plan.contains("INDEX"),
                 "{label}: expected the table itself, got:\n{plan}"
             );
             assert!(
