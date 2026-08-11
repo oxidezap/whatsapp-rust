@@ -3922,22 +3922,28 @@ mod mark_full_distribution_list {
         );
     }
 
-    /// Nothing in a steady-state group stanza is per-participant.
+    /// A steady-state group stanza's size tracks our OWN device count, never
+    /// the group's.
     ///
-    /// `<participants>` exists only to carry sender-key distributions, and a
-    /// warm send distributes none; the `phash` that covers the whole device set
-    /// is a fixed-width digest ("2:" + 8 base64 chars) memoized on the resolved
-    /// set. So the encoded stanza is byte-for-byte the same size for a group of
-    /// 8 and a group of 512, and the encoder cost of a repeat group send does
-    /// not scale with the group — there is no per-participant encoding to
-    /// cache between sends.
+    /// `<participants>` carries sender-key distributions only. A warm send
+    /// distributes none to members — but it does re-distribute to our own
+    /// companions on every send, because own devices are never memoized warm
+    /// (WA Web `!isMeDevice`, see `update_sender_key_devices`). So the steady
+    /// state is one `<to>` per own companion and nothing per member, and the
+    /// `phash` covering the whole device set is a fixed-width digest ("2:" plus
+    /// 8 base64 chars) memoized on the resolved set. Both the single-device and
+    /// the multi-device steady state are pinned below at 8 and at 512 members:
+    /// the encoded stanza is the same size either way, so a repeat group send
+    /// has no per-member encoding to cache between sends.
     ///
     /// Pinned as a test rather than left to the group benchmarks because the
     /// claim is about the *shape* of the stanza: a future change that folded
-    /// participant state into it would still benchmark fine on a small group.
+    /// member state into it would still benchmark fine on a small group.
     #[tokio::test]
-    async fn warm_group_stanza_carries_no_per_participant_data() {
-        async fn warm_stanza(members: usize) -> Node {
+    async fn warm_group_stanza_size_tracks_own_devices_not_group_size() {
+        // `members` is the group; `companions` are our own other devices, which
+        // receive a fresh SKDM on every send.
+        async fn warm_stanza(members: usize, companions: usize) -> Node {
             let own_jid: Jid = "12025550111:0@s.whatsapp.net".parse().unwrap();
             let own_lid: Jid = "100000000000001:0@lid".parse().unwrap();
             let group: Jid = "120363000000000001@g.us".parse().unwrap();
@@ -3948,6 +3954,9 @@ mod mark_full_distribution_list {
                         .parse()
                         .unwrap()
                 })
+                .collect();
+            let own_companions: Vec<Jid> = (1..=companions)
+                .map(|d| format!("12025550111:{d}@s.whatsapp.net").parse().unwrap())
                 .collect();
 
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -3961,12 +3970,27 @@ mod mark_full_distribution_list {
             .await
             .expect("seed the sender key chain");
 
+            // Sessions already exist for the companions, as they do in the
+            // steady state, so the SKDM encrypts to `msg` (not `pkmsg`) and no
+            // prekey fetch or device-identity node enters the stanza.
             let mut ss = MemSessionStore::default();
             let mut is = MemIdentityStore {
                 pair: IdentityKeyPair::generate(&mut rng),
                 reg_id: 7,
                 known: Default::default(),
             };
+            for companion in &own_companions {
+                process_prekey_bundle(
+                    &companion.to_protocol_address(),
+                    &mut ss,
+                    &mut is,
+                    &signed_prekey_bundle(),
+                    &mut rng,
+                    UsePQRatchet::No,
+                )
+                .await
+                .expect("establish the companion session");
+            }
             let mut pks = UnusedPreKeyStore;
             let spks = UnusedSignedPreKeyStore;
             let mut stores = SignalStores {
@@ -4000,7 +4024,7 @@ mod mark_full_distribution_list {
                     message: &msg,
                     message_id: "WARMGROUPSCALE1",
                     force_distribution: false,
-                    distribution_targets: None,
+                    distribution_targets: (!own_companions.is_empty()).then_some(own_companions),
                     distribution_policy: SenderKeyDistributionPolicy::BestEffort,
                     phash_devices: Some(&resolved),
                     edit: None,
@@ -4013,40 +4037,70 @@ mod mark_full_distribution_list {
             .node
         }
 
-        let small = warm_stanza(8).await;
-        let large = warm_stanza(512).await;
-
-        for (label, node) in [("8-member", &small), ("512-member", &large)] {
-            assert!(
-                node.get_optional_child("participants").is_none(),
-                "{label} warm send must distribute no sender keys"
-            );
-            assert_eq!(
-                node.attrs().optional_string("phash").map(|p| p.len()),
-                Some(10),
-                "{label} phash is a fixed-width digest"
-            );
+        // Every ciphertext in the stanza varies in length run to run (WA pads
+        // each plaintext by a random 1..=16 bytes), so sizes are only
+        // comparable with the payloads normalised. What is under test is the
+        // stanza's structure and attributes, not the ciphertext.
+        fn with_fixed_payloads(node: &Node) -> Node {
+            use wacore_binary::node::NodeContent;
+            let mut out = node.clone();
+            out.content = match out.content {
+                Some(NodeContent::Bytes(_)) => Some(NodeContent::Bytes(vec![0u8; 96])),
+                Some(NodeContent::Nodes(children)) => Some(NodeContent::Nodes(
+                    children.iter().map(with_fixed_payloads).collect(),
+                )),
+                other => other,
+            };
+            out
         }
 
-        let small_children: Vec<&str> = small
-            .children()
-            .unwrap_or(&[])
-            .iter()
-            .map(|c| c.tag.as_ref())
-            .collect();
-        let large_children: Vec<&str> = large
-            .children()
-            .unwrap_or(&[])
-            .iter()
-            .map(|c| c.tag.as_ref())
-            .collect();
-        assert_eq!(small_children, large_children, "same stanza shape");
+        fn child_tags(node: &Node) -> Vec<&str> {
+            node.children()
+                .unwrap_or(&[])
+                .iter()
+                .map(|c| c.tag.as_ref())
+                .collect()
+        }
 
-        assert_eq!(
-            wacore_binary::marshal::marshal(&small).unwrap().len(),
-            wacore_binary::marshal::marshal(&large).unwrap().len(),
-            "the encoded warm group stanza is the same size at 8 and 512 members"
-        );
+        // Single-device account (no companions) and a two-companion one: the
+        // two steady states this client actually produces.
+        for companions in [0usize, 2] {
+            let small = warm_stanza(8, companions).await;
+            let large = warm_stanza(512, companions).await;
+
+            for (label, node) in [("8-member", &small), ("512-member", &large)] {
+                let distributed = node
+                    .get_optional_child("participants")
+                    .and_then(Node::children)
+                    .map_or(0, <[Node]>::len);
+                assert_eq!(
+                    distributed, companions,
+                    "{label} warm send distributes to our own companions only, \
+                     never to the {companions}-companion account's group members"
+                );
+                assert_eq!(
+                    node.attrs().optional_string("phash").map(|p| p.len()),
+                    Some(10),
+                    "{label} phash is a fixed-width digest"
+                );
+            }
+
+            assert_eq!(
+                child_tags(&small),
+                child_tags(&large),
+                "same stanza shape with {companions} companions"
+            );
+            assert_eq!(
+                wacore_binary::marshal::marshal(&with_fixed_payloads(&small))
+                    .unwrap()
+                    .len(),
+                wacore_binary::marshal::marshal(&with_fixed_payloads(&large))
+                    .unwrap()
+                    .len(),
+                "the encoded warm group stanza is the same size at 8 and 512 members \
+                 with {companions} companions"
+            );
+        }
     }
 }
 
