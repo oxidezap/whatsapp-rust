@@ -8,16 +8,17 @@
 //! - transport: a sink that drops the bytes the noise socket hands it. The
 //!   stanza is still marshalled, framed and encrypted, so everything up to and
 //!   including the wire write is measured; only the socket write is elided.
-//! - store: [`InMemoryBackend`], so a measurement is not dominated by SQLite.
-//!   The SQLite backend's own cost is therefore **not** covered here.
+//! - store: [`wacore::store::InMemoryBackend`], so a measurement is not
+//!   dominated by SQLite. The SQLite backend's own cost is therefore **not**
+//!   covered here.
 //! - registry / group metadata: pre-seeded into the in-process caches, as a
 //!   client that has already resolved the group holds them. No usync or
 //!   group-info IQ is issued, which is also why no IQ response has to be faked.
 //!
 //! Everything a real client resolves once and holds across sends — the
 //! `Arc<GroupInfo>`, the resolved device set, the sender key, the warm marks —
-//! is established in [`GroupSendHarness::new`], outside anything a benchmark
-//! measures. That is deliberate: PR #1279 found that building an N-participant
+//! is established in [`GroupSendHarness::new`](crate::bench_support::GroupSendHarness::new),
+//! outside anything a benchmark measures. That is deliberate: PR #1279 found that building an N-participant
 //! `GroupInfo` *inside* the measured body was the entirety of the apparent
 //! per-member growth in the `wacore` benchmark. A fixture that scales with the
 //! sweep parameter measures the fixture.
