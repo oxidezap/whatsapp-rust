@@ -384,20 +384,27 @@ inherits = "release"
 debug = 1
 strip = false
 
-# X25519 is the one asymmetric primitive on the per-message path (Signal
-# ratchet DH) and the connection path (Noise handshake), and profiling put
-# ~56% of a client's field-arithmetic time in the Montgomery ladder. This
-# fork carries ladder-level optimizations — squaring that doubles 64-bit
-# inputs instead of routing through `pow2k(1)`, a `mul121666` specialized on
-# the constant's sparse limbs, and a `sub_unreduced` that drops the trailing
-# reduction where the ladder's own bounds allow it — that are not upstream
-# yet. A second group of changes sharpens the AVX2 vector backend — a
-# column-major field multiply that stops spilling, a fused blend in point
-# doubling — which is the XEdDSA side of the same bill: sender-key messages
-# carry a signature per message, and Edwards double-base multiplication runs
-# on that backend. A third reorders `LookupTable::select` so `subtle`'s
-# `#[inline(never)]` barrier is crossed while nothing expensive is live,
-# which is the fixed-base path: every ephemeral ratchet key and prekey.
+# Curve25519 is the asymmetric work on both hot paths: the Signal ratchet DH
+# and XEdDSA signature run per message, the Noise handshake per connection.
+# Profiling put ~56% of a client's field-arithmetic time in the Montgomery
+# ladder alone. This fork optimizes the three code paths we actually reach,
+# none of them upstream yet:
+#
+#   variable-base ladder  a squaring that doubles its 64-bit inputs rather
+#                         than routing through `pow2k(1)`, a `mul121666`
+#                         specialized on the constant's sparse limbs, a
+#                         `sub_unreduced` that drops the trailing reduction
+#                         where the operands' own bounds allow it, and a
+#                         field multiply re-emitted to stop spilling
+#   fixed-base ladder     given a vector implementation at all — it ran in
+#                         `serial::u64` even with AVX2 live — which is every
+#                         ephemeral ratchet key and every prekey
+#   Edwards / XEdDSA      a column-major vector multiply and a fused blend in
+#                         point doubling, both on the AVX2 backend that
+#                         signature verification runs on
+#
+# The serial backends carry their share, so the wasm32 and 32-bit ESP32
+# builds benefit too, not only x86_64.
 # Scope: `wacore-libsignal`'s direct dependency and x25519-dalek 3.0, which
 # requires the same 5.x. The webrtc tree's x25519-dalek 2.0.1 asks for
 # curve25519-dalek 4.1.3, which the patch does not match, so VoIP keeps
