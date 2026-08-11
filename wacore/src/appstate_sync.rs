@@ -276,17 +276,31 @@ impl AppStateProcessor {
         // roll the collection backward. No-op on the benign first-sync path, where snapshots
         // are requested only at version 0.
         //
-        // A snapshot the caller asked for is exempt from the *equal* case only —
-        // see [`PatchList::requested_snapshot`]. A caller asking is telling us the
+        // A snapshot the caller asked for is measured differently — see
+        // [`PatchList::requested_snapshot`]. A caller asking is telling us the
         // persisted version is not the thing to measure the snapshot against, and
-        // its copy being wrong rather than behind is exactly when the two versions
-        // agree; applying there replaces the baseline without moving it. A
-        // snapshot strictly older than what is stored is a different thing — a
-        // replay, or a server that is behind — and taking it would roll the
-        // collection backward, which no request makes safe.
+        // its copy being wrong rather than behind is exactly when the two agree.
+        //
+        // What decides it is where the *response* ends, not where the snapshot
+        // starts. A snapshot arrives with the patch window that follows it, so
+        // one behind the cursor can still carry the collection level with or past
+        // it once its patches are applied — and rebuilding from that sequence is
+        // the repair that was asked for. Rebuilding is also what makes those
+        // patches applicable at all: they are contiguous from the snapshot, not
+        // from the persisted version, so keeping the old baseline would fail
+        // `validatePatchVersion` on the first of them. Only a sequence that still
+        // ends behind the cursor would roll the collection backward, and no
+        // request makes that safe.
         let snapshot_fresh = pl.snapshot.as_ref().is_some_and(|snapshot| {
             let snapshot_version = snapshot.version.as_option().and_then(|v| v.version).unwrap_or(0);
-            let rewinds = snapshot_version < state.version;
+            let response_ends_at = pl
+                .patches
+                .iter()
+                .filter_map(|p| p.version.as_option().and_then(|v| v.version))
+                .max()
+                .unwrap_or(snapshot_version)
+                .max(snapshot_version);
+            let rewinds = response_ends_at < state.version;
             if snapshot_is_stale(state.version, snapshot_version) && (!pl.requested_snapshot || rewinds) {
                 log::warn!(
                     target: "AppState",

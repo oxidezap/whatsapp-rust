@@ -917,15 +917,16 @@ mod tests {
         );
     }
 
-    /// A refused snapshot can arrive alongside patches that carry the collection
-    /// past it. Those are a valid answer, and stopping at the snapshot would
-    /// throw away work already on the wire and leave the collection no further
-    /// along than before.
+    /// A snapshot behind the cursor arrives with the patch window that follows
+    /// it, and that sequence can still land the collection past where it was.
+    /// Rebuilding from the snapshot is what the request asked for and what makes
+    /// the patches applicable at all: they are contiguous from the snapshot, not
+    /// from the persisted version.
     #[tokio::test]
-    async fn patches_alongside_a_refused_snapshot_are_still_applied() {
+    async fn a_snapshot_behind_the_cursor_is_rebuilt_when_its_patches_carry_it_past() {
         let (backend, processor, mut patch_list, _) = snapshot_resync_scenario().await;
-        // The snapshot is v2, so persisting v3 puts the collection past it while
-        // the patches (v4, v5) still carry it forward.
+        // The snapshot is v2 and its window is v3/v4, so persisting v3 puts the
+        // collection past the snapshot while the response still ends ahead of it.
         backend
             .set_version(
                 WAPatchName::Regular.as_str(),
@@ -948,7 +949,7 @@ mod tests {
             ..Default::default()
         }
         .encode_to_vec();
-        for (version, index_mac) in [(4u64, [0x22u8; 32]), (5, [0x33; 32])] {
+        for (version, index_mac) in [(3u64, [0x22u8; 32]), (4, [0x33; 32])] {
             patch_list.patches.push(wa::SyncdPatch {
                 mutations: vec![create_encrypted_mutation(
                     wa::syncd_mutation::SyncdOperation::Set,
@@ -977,11 +978,14 @@ mod tests {
             "a response that carried the collection forward is not unfulfilled: {:?}",
             pl.error
         );
-        assert_eq!(state.version, 5, "the patches must have been applied");
+        assert_eq!(
+            state.version, 4,
+            "the snapshot and its window must both have been applied"
+        );
         assert_eq!(
             mutations.len(),
-            2,
-            "one mutation per patch, and no snapshot"
+            3,
+            "the snapshot record plus one mutation per patch"
         );
     }
 
