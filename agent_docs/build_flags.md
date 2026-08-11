@@ -14,7 +14,8 @@ cannot buy it on the application's behalf.
 ## Recommendation
 
 For an application whose deployment hardware is known to report both `bmi2` and
-`avx2` in CPUID:
+`avx2` as *usable* — which means an OS-filtered feature report, not raw CPUID
+(see below):
 
 ```toml
 # <consumer app>/.cargo/config.toml
@@ -32,14 +33,22 @@ for any reason silently discards the config entry above, and the feature flags
 have to be merged into that variable instead.
 
 **Check the features, not the CPU's age or its brand.** Neither "2013 or newer"
-nor a product family is a sound test. By microarchitecture, Intel Silvermont and
-Goldmont and AMD Jaguar and Puma are all later than Haswell and carry neither
-feature — but those cores ship under Atom, Celeron and Pentium names alongside
-parts built on entirely different cores that do have both (Pentium Gold 8505 is
-Alder Lake, and has AVX2), so the marketing name settles nothing either way. The
-dates in the floor column below mark when the mainstream core gained the
-feature, not when every part did. CPUID on each deployment target is the only
-rule that holds:
+nor a product family is a sound test. By microarchitecture, Intel Silvermont
+(2013) and Goldmont (2016) and AMD Jaguar (2013) and Puma (2014) all lack both
+features — Goldmont and Puma while being outright later than Haswell, Silvermont
+and Jaguar while being its contemporaries — and those cores ship under Atom,
+Celeron and Pentium names alongside parts built on entirely different cores that
+do have both (Pentium Gold 8505 is Alder Lake, and has AVX2), so the marketing
+name settles nothing either way. The dates in the floor column below mark when
+the mainstream core gained the feature, not when every part did.
+
+**And the CPU bit alone is not enough for `+avx2`.** AVX2 needs the OS to have
+enabled YMM state; where it has not — some hypervisor configurations — the CPUID
+feature bit still reads set and the instruction still faults. A raw CPUID probe
+or a fleet inventory built from one has to check `OSXSAVE` and the relevant
+`XCR0` bits too. The Linux check below sidesteps this by construction: the
+kernel clears `avx2` from `/proc/cpuinfo` when XSAVE state is not enabled, so
+what it reports is already OS-filtered.
 
 ```bash
 # nonzero exit if ANY logical CPU is missing either feature: a union over
