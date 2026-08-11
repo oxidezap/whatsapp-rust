@@ -1946,10 +1946,14 @@ impl Client {
                     self.dispatch_app_state_mutation(&m, full_sync).await;
                 }
 
-                // Save version
-                backend
-                    .set_version(name.as_str(), new_state.clone())
-                    .await?;
+                // No version write here. `process_one_patch_list` already
+                // persisted this exact state — alongside the mutation MACs it
+                // belongs with, which is what makes the pair agree — so rewriting
+                // it only widened the window in which it could be wrong. A
+                // reconnect between the apply and here clears the reservation
+                // registry, so the replacement connection can reserve the same
+                // collection and move it on; this write would then land after it
+                // and put the older version back, next to the newer MACs.
 
                 // Check if this collection needs more patches
                 if list.has_more_patches {
