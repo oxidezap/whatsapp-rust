@@ -362,6 +362,21 @@ impl BatchedSyncOutcome {
     pub(crate) fn all_synced(&self) -> bool {
         self.unsynced().next().is_none()
     }
+
+    /// What a batch that failed before producing any bucket achieved: nothing,
+    /// for everything it asked for.
+    ///
+    /// A top-level error carries no per-collection verdict, but the client still
+    /// knows what it requested and that none of it landed, and `retryable` is
+    /// exactly what those collections are. Synthesizing it here is what keeps a
+    /// failed batch from finishing in silence; the retry scheduler already does
+    /// the same for a sequence of rounds that ends without buckets.
+    pub(crate) fn all_retryable(requested: &[WAPatchName]) -> Self {
+        Self {
+            retryable: requested.to_vec(),
+            ..Default::default()
+        }
+    }
 }
 
 /// What the critical bootstrap does with the answer its batched sync produced.
@@ -383,10 +398,6 @@ pub(crate) struct CriticalSyncPlan {
     /// Something the bootstrap owes is not in `retry` and never will be, so a
     /// later clean round must not stand the gate down on its behalf.
     pub(crate) stranded: bool,
-    /// Whether the bootstrap still owes work at the moment of the decision.
-    pub(crate) outstanding: bool,
-    /// Whether consumers get an `AppStateSyncFailed` alongside `Connected`.
-    pub(crate) report: bool,
 }
 
 impl CriticalSyncPlan {
@@ -411,29 +422,19 @@ impl CriticalSyncPlan {
         // answer, but the batch's other misses are no less recoverable for it
         // having happened, and the watchdog is no longer there to ask again.
         let retry: Vec<WAPatchName> = retryable.iter().chain(skipped).copied().collect();
-        let stranded = !fatal.is_empty();
-        let outstanding = stranded || !retry.is_empty();
         Self {
             retry,
-            stranded,
-            outstanding,
-            report: outstanding,
+            stranded: !fatal.is_empty(),
         }
     }
 
-    /// The plan for a batch that failed before producing any bucket.
+    /// Whether the bootstrap still owes work, which is also what makes the
+    /// outcome worth publishing: a consumer needs to hear about a sync that left
+    /// a gap, and about nothing else.
     ///
-    /// Nothing is reported: an error yields no per-collection verdict, and
-    /// inventing buckets for one would tell consumers something the client does
-    /// not know. Everything asked for goes back on the retry list, which is what
-    /// the same failure gets everywhere else the client syncs.
-    pub(crate) fn from_error(requested: &[WAPatchName]) -> Self {
-        Self {
-            retry: requested.to_vec(),
-            stranded: false,
-            outstanding: !requested.is_empty(),
-            report: false,
-        }
+    /// Derived rather than stored so the two can never disagree.
+    pub(crate) fn outstanding(&self) -> bool {
+        self.stranded || !self.retry.is_empty()
     }
 }
 
@@ -1240,14 +1241,20 @@ impl Client {
     /// Announce a connection whose critical bootstrap has an answer, and report
     /// what the answer left unsynced.
     ///
-    /// Returns whether the generation survived; a caller with follow-up work has
-    /// to stop when it did not, because a `Connected` from a dead connection is
-    /// worse than none.
+    /// Returns whether the generation survived, which is not the same question as
+    /// whether `Connected` went out: [`dispatch_connected`](Self::dispatch_connected)
+    /// also declines for a paused or lifecycle-cancelled connection, and this
+    /// still returns true for those. Deliberately, because the caller uses the
+    /// answer to decide whether to hand the leftovers to the background sync, and
+    /// a pause is precisely when that work must survive: the sync parks until the
+    /// client resumes rather than being dropped. The report stays honest either
+    /// way, since its `connected` flag is read from `is_ready`, which only the
+    /// publication sets.
     pub(crate) async fn finish_critical_bootstrap(
         self: &Arc<Self>,
         scope: SyncScope,
         plan: &CriticalSyncPlan,
-        outcome: Option<&BatchedSyncOutcome>,
+        outcome: &BatchedSyncOutcome,
     ) -> bool {
         // Armed first, before anything a consumer handler can interrupt.
         // Everything below (resubscribe, `Connected`, the failure report) can
@@ -1256,7 +1263,7 @@ impl Client {
         // skips what it still owes. Clearing is never done here: on the happy path
         // the bootstrap still owes the non-critical collections, and the background
         // sync that fetches them is what stands the gate down.
-        if plan.outstanding {
+        if plan.outstanding() {
             self.settle_bootstrap(scope, true);
         }
         if !self.scope_is_current(scope) {
@@ -1281,7 +1288,7 @@ impl Client {
         if !self.scope_is_current(scope) {
             return false;
         }
-        if let Some(outcome) = outcome.filter(|_| plan.report) {
+        if plan.outstanding() {
             self.dispatch_app_state_sync_failed(outcome, self.is_ready.load(Ordering::Relaxed));
         }
         true
@@ -5101,17 +5108,10 @@ mod critical_bootstrap_tests {
         expected: CriticalSyncPlan,
     }
 
-    fn plan(
-        retry: &[WAPatchName],
-        stranded: bool,
-        outstanding: bool,
-        report: bool,
-    ) -> CriticalSyncPlan {
+    fn plan(retry: &[WAPatchName], stranded: bool) -> CriticalSyncPlan {
         CriticalSyncPlan {
             retry: retry.to_vec(),
             stranded,
-            outstanding,
-            report,
         }
     }
 
@@ -5127,47 +5127,47 @@ mod critical_bootstrap_tests {
             Case {
                 what: "everything synced",
                 outcome: outcome(&[CB, CUL], &[], &[], &[], true),
-                expected: plan(&[], false, false, false),
+                expected: plan(&[], false),
             },
             Case {
                 what: "one collection refused",
                 outcome: outcome(&[CUL], &[CB], &[], &[], true),
-                expected: plan(&[], true, true, true),
+                expected: plan(&[], true),
             },
             Case {
                 what: "one collection retryable",
                 outcome: outcome(&[CUL], &[], &[CB], &[], true),
-                expected: plan(&[CB], false, true, true),
+                expected: plan(&[CB], false),
             },
             Case {
                 what: "one collection held by another writer",
                 outcome: outcome(&[CUL], &[], &[], &[CB], true),
-                expected: plan(&[CB], false, true, true),
+                expected: plan(&[CB], false),
             },
             Case {
                 what: "refused alongside a retryable",
                 outcome: outcome(&[], &[CB], &[CUL], &[], true),
-                expected: plan(&[CUL], true, true, true),
+                expected: plan(&[CUL], true),
             },
             Case {
                 what: "refused alongside a held one",
                 outcome: outcome(&[], &[CB], &[], &[CUL], true),
-                expected: plan(&[CUL], true, true, true),
+                expected: plan(&[CUL], true),
             },
             Case {
                 what: "retryable alongside a held one",
                 outcome: outcome(&[], &[], &[CB], &[CUL], true),
-                expected: plan(&[CB, CUL], false, true, true),
+                expected: plan(&[CB, CUL], false),
             },
             Case {
                 what: "every bucket at once",
                 outcome: outcome(&[], &[CB], &[CUL], &[Regular], true),
-                expected: plan(&[CUL, Regular], true, true, true),
+                expected: plan(&[CUL, Regular], true),
             },
             Case {
                 what: "nothing reached the server",
                 outcome: outcome(&[], &[], &[], &[CB, CUL], false),
-                expected: plan(&[CB, CUL], false, true, true),
+                expected: plan(&[CB, CUL], false),
             },
         ]
     }
@@ -5188,7 +5188,7 @@ mod critical_bootstrap_tests {
 
             assert!(
                 client
-                    .finish_critical_bootstrap(scope, &plan, Some(&case.outcome))
+                    .finish_critical_bootstrap(scope, &plan, &case.outcome)
                     .await,
                 "the generation is live for {}",
                 case.what
@@ -5206,39 +5206,56 @@ mod critical_bootstrap_tests {
                     .lock()
                     .expect("recorded failures mutex")
                     .as_slice(),
-                if plan.report { [true].as_slice() } else { &[] },
+                if plan.outstanding() {
+                    [true].as_slice()
+                } else {
+                    &[]
+                },
                 "failure report for {}",
                 case.what
             );
             assert_eq!(
                 client.needs_initial_full_sync.is_armed(),
-                plan.outstanding,
+                plan.outstanding(),
                 "bootstrap gate for {}",
                 case.what
             );
         }
     }
 
-    /// A batch that blew up before producing buckets has no per-collection
-    /// verdict to publish, so it announces and retries what it asked for without
-    /// inventing a report.
+    /// A batch that blew up before producing buckets still has to say so.
+    /// Announcing without the report would read as a clean startup to a consumer
+    /// whose session may be missing the push name and the blocklist.
     #[tokio::test]
-    async fn a_failed_batch_announces_without_reporting_buckets() {
+    async fn a_failed_batch_reports_everything_it_asked_for() {
         let requested = [WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow];
-        let plan = CriticalSyncPlan::from_error(&requested);
-        assert_eq!(plan, self::plan(&requested, false, true, false));
+        let synthesized = BatchedSyncOutcome::all_retryable(&requested);
+        assert_eq!(synthesized.retryable, requested);
+        assert!(
+            !synthesized.reached_server(),
+            "a batch that failed outright must not charge an attempt"
+        );
+
+        let plan = CriticalSyncPlan::from_outcome(&synthesized);
+        assert_eq!(plan, self::plan(&requested, false));
 
         let (client, recorder, _subscription) = recording_client("critical-plan-error").await;
         let scope = client.sync_scope(None);
-        assert!(client.finish_critical_bootstrap(scope, &plan, None).await);
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &synthesized)
+                .await
+        );
 
         assert_eq!(recorder.connected.load(Ordering::Relaxed), 1);
-        assert!(
+        assert_eq!(
             recorder
                 .failures
                 .lock()
                 .expect("recorded failures mutex")
-                .is_empty()
+                .as_slice(),
+            [true].as_slice(),
+            "the gap has to reach the consumer, not just the log"
         );
         assert!(client.needs_initial_full_sync.is_armed());
     }
@@ -5306,7 +5323,7 @@ mod critical_bootstrap_tests {
         let plan = CriticalSyncPlan::from_outcome(&outcome);
         assert!(
             client
-                .finish_critical_bootstrap(scope, &plan, Some(&outcome))
+                .finish_critical_bootstrap(scope, &plan, &outcome)
                 .await
         );
 
@@ -5341,7 +5358,7 @@ mod critical_bootstrap_tests {
 
         assert!(
             !client
-                .finish_critical_bootstrap(scope, &plan, Some(&stranded))
+                .finish_critical_bootstrap(scope, &plan, &stranded)
                 .await,
             "the caller must be told to stop"
         );
@@ -5379,11 +5396,7 @@ mod critical_bootstrap_tests {
             true,
         );
         let plan = CriticalSyncPlan::from_outcome(&clean);
-        assert!(
-            client
-                .finish_critical_bootstrap(scope, &plan, Some(&clean))
-                .await
-        );
+        assert!(client.finish_critical_bootstrap(scope, &plan, &clean).await);
 
         assert!(
             client.needs_initial_full_sync.is_armed(),

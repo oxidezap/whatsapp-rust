@@ -1360,13 +1360,17 @@ impl Client {
                 const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
                 let critical_deadline = wacore::time::Instant::now()
                     + Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS);
-                // Explicit "the critical path reached an answer" signal for the watchdog.
-                // A push_name check is not a reliable proxy: a business account gets
-                // push_name set from business_name at pairing (src/pair.rs) while still
-                // needing the full sync, so the watchdog would wrongly stand down on a
-                // failed sync. Note "an answer", not "a clean one": the watchdog is there
-                // for a critical path that never produces a verdict at all, since every
-                // verdict below announces the connection and retries in band.
+                // Claimed by whichever of the sync and the watchdog gets there
+                // first, and never by both. A plain "the sync finished" flag is not
+                // enough: `reconnect_immediately` sets `expected_disconnect` and
+                // then awaits seconds of bounded flushes before it closes the
+                // socket, so a sync landing in that window would abort the
+                // watchdog mid-teardown and leave the connection up, flagged for a
+                // disconnect that never comes, with `dispatch_connected` declining
+                // to announce it. The claim is also not a push_name check, which
+                // was never a reliable proxy: a business account gets push_name
+                // set from business_name at pairing (src/pair.rs) while still
+                // needing the full sync.
                 let critical_sync_settled =
                     Arc::new(AtomicBool::new(false));
                 let timeout_client = client_clone.clone();
@@ -1381,10 +1385,10 @@ impl Client {
                     {
                         return;
                     }
-                    if timeout_settled.load(Ordering::SeqCst) {
+                    if timeout_settled.swap(true, Ordering::SeqCst) {
                         debug!(
                             target: "Client/AppState",
-                            "Critical sync timeout fired but critical sync already settled"
+                            "Critical sync timeout fired but the sync already settled"
                         );
                     } else {
                         warn!(
@@ -1447,7 +1451,19 @@ impl Client {
                 // persisted push name and survives even a restart. What did not
                 // sync rides along with the background sync instead, on this
                 // connection, which is also where a late app state key lands.
-                critical_sync_settled.store(true, Ordering::SeqCst);
+                if critical_sync_settled.swap(true, Ordering::SeqCst) {
+                    // The watchdog claimed it first and is already retiring this
+                    // connection. Aborting it now would strand the teardown, and
+                    // announcing a connection it is closing would be a lie; the
+                    // replacement it brings up announces itself. detach() because
+                    // dropping the handle would abort the task.
+                    debug!(
+                        target: "Client/AppState",
+                        "Critical app state sync answered after the watchdog fired; leaving the reconnect to it"
+                    );
+                    critical_sync_timeout_handle.detach();
+                    return;
+                }
                 critical_sync_timeout_handle.abort();
 
                 // WA Web's answer to a critical collection it cannot get is to
@@ -1458,7 +1474,7 @@ impl Client {
                 // this point `set_passive(false)` has already been sent and
                 // offline stanzas are being delivered to a consumer that still
                 // believes nothing ever connected.
-                let (plan, outcome) = match result {
+                let outcome = match result {
                     Ok(outcome) => {
                         if !outcome.all_synced() {
                             warn!(
@@ -1467,16 +1483,17 @@ impl Client {
                                 outcome.fatal, outcome.retryable, outcome.skipped
                             );
                         }
-                        (CriticalSyncPlan::from_outcome(&outcome), Some(outcome))
+                        outcome
                     }
                     Err(e) => {
                         client_clone.log_sync_error("critical app state sync", &e);
-                        (CriticalSyncPlan::from_error(&CRITICAL_COLLECTIONS), None)
+                        BatchedSyncOutcome::all_retryable(&CRITICAL_COLLECTIONS)
                     }
                 };
+                let plan = CriticalSyncPlan::from_outcome(&outcome);
 
                 if !client_clone
-                    .finish_critical_bootstrap(critical_scope, &plan, outcome.as_ref())
+                    .finish_critical_bootstrap(critical_scope, &plan, &outcome)
                     .await
                 {
                     return;
