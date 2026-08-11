@@ -425,6 +425,19 @@ impl SyncInFlight {
         })
     }
 
+    /// Whether anything holds `name` right now.
+    ///
+    /// A question, not a claim: reserving in order to find out would make this
+    /// briefly the holder, and a concurrent [`ReservationWait::SkipBehindSync`]
+    /// sync that looked in that window would stand down and report a collection
+    /// skipped that nothing was actually doing.
+    pub(crate) fn is_held(&self, name: WAPatchName) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&name)
+    }
+
     /// Reserve `name` for `holder`, or report what already holds it.
     pub(crate) fn try_begin_as(
         self: &Arc<Self>,
@@ -1559,6 +1572,32 @@ impl Client {
         Ok(StandDown::Done)
     }
 
+    /// Wait out whoever holds any of `collections`, taking nothing.
+    ///
+    /// Only useful before a batch that waits: it moves the waiting to a point
+    /// where this call holds no reservation, so a slow holder of one collection
+    /// cannot block writers to the others through us. Each collection is waited
+    /// for and released immediately — the reservation is not the point, the
+    /// holder being gone is.
+    ///
+    /// Best effort by construction. A holder that outlasts the bound, or a
+    /// collection taken again before the caller reserves it, is left to the
+    /// caller's own pass to report.
+    async fn wait_for_contended(&self, collections: &[WAPatchName], scope: SyncScope) {
+        for &name in collections {
+            if !self.app_state_syncing.is_held(name) {
+                continue;
+            }
+            if self.admits(scope).is_err() {
+                return;
+            }
+            debug!(target: "Client/AppState", "Waiting out the holder of {name:?} before reserving the batch");
+            let _ = self
+                .reserve_for_sync(name, ReservationWait::Always, scope)
+                .await;
+        }
+    }
+
     /// Sync multiple collections in a single IQ request, re-fetching those with `has_more_patches`.
     /// Mirrors WA Web's `serverSync()` outer loop (`WAWebSyncdServerSync`).
     ///
@@ -1633,6 +1672,21 @@ impl Client {
         } else {
             ReservationWait::SkipBehindSync
         };
+
+        // A caller that waits does not wait *holding*. The loop below keeps every
+        // guard it has taken while it waits for the next collection, which for a
+        // wait of [`APP_STATE_RESERVATION_WAIT`] blocks writers to a collection
+        // this call is not even asking about yet — and `send_app_state_patch`
+        // takes the global send lock before it waits for its own reservation, so
+        // one held collection stalls patch sends to all of them. Clearing the way
+        // first costs a pass over an at-most-five-element set and leaves the wait
+        // holding nothing. It is not atomic — a collection can be taken again
+        // between the two passes — and it does not need to be: the pass below
+        // reports whatever it still cannot get, which is the same answer it would
+        // have given anyway.
+        if request.wait_for_holder {
+            self.wait_for_contended(&collections, scope).await;
+        }
 
         let mut guards = Vec::with_capacity(collections.len());
         let mut pending = Vec::with_capacity(collections.len());

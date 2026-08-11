@@ -543,6 +543,53 @@ mod tests {
         assert!(transport.sent().is_empty());
     }
 
+    /// Waiting for one collection must not hold another. The batch keeps every
+    /// guard it has taken while it waits for the next, so a slow holder of one
+    /// collection would otherwise block writers to the others through us — and
+    /// `send_app_state_patch` takes the global send lock *before* waiting for its
+    /// own reservation, so that stalls patch sends to every collection, not just
+    /// the held one.
+    #[tokio::test]
+    async fn waiting_for_one_collection_does_not_hold_another() {
+        let (client, _transport) = create_reachable_client().await;
+        // Held for the whole test: the resync can never get past it, so whatever
+        // it does hold, it holds for as long as this test looks.
+        let _held = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::RegularHigh, SyncHolder::PatchSend)
+            .expect("reserve the contended collection first");
+
+        let resync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .resync_app_state(
+                        [WAPatchName::Regular, WAPatchName::RegularHigh],
+                        AppStateResyncMode::Incremental,
+                    )
+                    .await
+            })
+        };
+        crate::test_utils::poll_until("the resync to park on the contended collection", || {
+            client.app_state_syncing.released.total_listeners() >= 1
+        })
+        .await;
+
+        // The one it is not waiting for must be free for anyone else to take.
+        // Reserving it as a patch send is what a concurrent chat action does.
+        let taken = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::Regular, SyncHolder::PatchSend);
+        assert!(
+            taken.is_ok(),
+            "a collection this call is only going to ask about must not be held \
+             hostage to another collection's holder"
+        );
+
+        drop(taken);
+        resync.abort();
+    }
+
     /// `Unknown` is what parsing an unrecognised name yields, so the server has
     /// nothing under it. Rejected whole rather than filtered out: a request that
     /// quietly syncs the rest reports success for a batch it did not carry out.
