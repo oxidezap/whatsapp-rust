@@ -272,7 +272,8 @@ pub(crate) enum SyncHolder {
 pub(crate) enum ReservationSkip {
     /// An equivalent sync already holds it, so it is already doing this work.
     EquivalentSyncInFlight,
-    /// The holder did not release within the bound.
+    /// Nobody else is covering the collection and this call did not get it: the
+    /// holder outlasted the bound, or the caller was not willing to wait.
     WaitTimedOut,
 }
 
@@ -302,6 +303,11 @@ pub(crate) enum ReservationWait {
     /// the snapshot while an incremental one asks for patches after the
     /// persisted version, so skipping would turn the request into a no-op.
     Always,
+    /// Take it if it is free, and report it otherwise. For a caller that has
+    /// already waited out the holders separately — waiting again here would be
+    /// waiting while holding the collections reserved before this one, which is
+    /// what that earlier wait exists to avoid.
+    TryOnce,
 }
 
 /// The two choices a batched sync makes for itself unless a caller overrides
@@ -1490,6 +1496,10 @@ impl Client {
             Err(SyncHolder::Sync) if wait == ReservationWait::SkipBehindSync => {
                 return Err(ReservationSkip::EquivalentSyncInFlight);
             }
+            Err(holder) if wait == ReservationWait::TryOnce => {
+                debug!(target: "Client/AppState", "Not waiting for the {holder:?} holding {name:?}");
+                return Err(ReservationSkip::WaitTimedOut);
+            }
             Err(holder) => {
                 debug!(target: "Client/AppState", "Waiting for the {holder:?} holding {name:?}");
             }
@@ -1667,7 +1677,14 @@ impl Client {
         // finding the collection already synced afterwards is the fast case.
         // Background callers still skip, because for them the in-flight sync
         // genuinely does the work.
-        let wait = if scope.is_bootstrap() || request.wait_for_holder {
+        let wait = if request.wait_for_holder {
+            // The waiting already happened, above, holding nothing. Waiting again
+            // here would do it holding every collection reserved before this one
+            // — and a collection taken back in the gap between the two passes is
+            // the one case that gap can produce, so it is reported rather than
+            // waited on.
+            ReservationWait::TryOnce
+        } else if scope.is_bootstrap() {
             ReservationWait::Always
         } else {
             ReservationWait::SkipBehindSync
@@ -1680,10 +1697,10 @@ impl Client {
         // takes the global send lock before it waits for its own reservation, so
         // one held collection stalls patch sends to all of them. Clearing the way
         // first costs a pass over an at-most-five-element set and leaves the wait
-        // holding nothing. It is not atomic — a collection can be taken again
-        // between the two passes — and it does not need to be: the pass below
-        // reports whatever it still cannot get, which is the same answer it would
-        // have given anyway.
+        // holding nothing. It is not atomic — a collection can be taken again in
+        // the gap between the two passes — which is why the pass below does not
+        // wait: it reports what it cannot get, so the gap costs a retry rather
+        // than reopening the blocking this exists to prevent.
         if request.wait_for_holder {
             self.wait_for_contended(&collections, scope).await;
         }
@@ -3760,6 +3777,37 @@ pub(crate) mod batched_sync_outcome_tests {
         assert!(
             transport.sent().is_empty(),
             "a skipped batch must not reach the wire"
+        );
+    }
+
+    /// A caller that waited out the holders separately must not wait again while
+    /// reserving: by then it holds the collections it got first, and waiting on
+    /// top of them is the head-of-line blocking the earlier wait exists to
+    /// avoid. A collection taken back in the gap between the two passes is
+    /// reported instead, costing a retry.
+    #[tokio::test]
+    async fn a_second_pass_reservation_reports_rather_than_waits() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let _held = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::Regular, SyncHolder::PatchSend)
+            .expect("reserve the collection first");
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.reserve_for_sync(
+                WAPatchName::Regular,
+                ReservationWait::TryOnce,
+                client.sync_scope(None),
+            ),
+        )
+        .await
+        .expect("the second pass must not wait on the holder");
+
+        assert_eq!(
+            refused.map(drop),
+            Err(ReservationSkip::WaitTimedOut),
+            "a collection nobody is covering, that this call could not take"
         );
     }
 
