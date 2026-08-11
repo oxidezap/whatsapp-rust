@@ -651,6 +651,11 @@ pub struct SelfPushNameUpdated {
 /// [`Event::Connected`] anyway and is usable, minus whatever those collections
 /// carry — for `critical_block` that includes the push name, so presence stays
 /// unavailable until it syncs.
+///
+/// The initial sync that follows pairing always connects, so its report always
+/// carries `connected: true`. A `false` comes from a sync that ran before the
+/// connection was ready, such as one a `syncd_app_state` dirty bit started while
+/// the offline backlog was still being processed.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct AppStateSyncFailed {
@@ -1429,6 +1434,15 @@ pub struct ClientOutdated {
     pub raw: Option<Node>,
 }
 
+/// The session is authenticated and out of passive mode, so stanzas are flowing.
+///
+/// After a fresh pairing the client waits for the critical app-state
+/// collections before publishing this, so the push name and blocklist are
+/// normally in place by now. It waits, but it does not withhold: a critical
+/// collection the server refused or could not deliver is reported as
+/// [`AppStateSyncFailed`] and the connection is announced regardless, because a
+/// session already delivering messages is not one a consumer should be left
+/// believing never opened.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct Connected {}

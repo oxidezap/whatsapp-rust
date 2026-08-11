@@ -203,9 +203,10 @@ impl Client {
         self.notify_session_state();
     }
 
-    /// Returns `true` when the client has completed its full startup:
-    /// transport connected, server authenticated, and critical app state synced.
-    /// This is the condition `wait_for_connected` uses to resolve.
+    /// Returns `true` when the client has completed its full startup: transport
+    /// connected, server authenticated, and the critical app state sync settled
+    /// one way or the other. This is the condition `wait_for_connected` uses to
+    /// resolve.
     fn is_fully_ready(&self) -> bool {
         self.is_connected()
             && self.is_logged_in()
