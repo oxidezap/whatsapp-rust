@@ -229,6 +229,25 @@ impl From<&StoredMessage> for MessageCursor {
     }
 }
 
+/// Keyset-pagination cursor for the session-wide arrival feed: pass the
+/// [`seq`](StoredMessage::seq) of the last message on the page you have to
+/// fetch the page after it, which is the next batch of older arrivals.
+///
+/// Separate from [`MessageCursor`] because the two order by different keys — a
+/// per-chat page sorts by `(timestamp_ms, seq)` and the arrival feed sorts by
+/// `seq` alone, so a cursor from one cannot page the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArrivalCursor {
+    /// [`StoredMessage::seq`] of the last message on the previous page.
+    pub seq: i64,
+}
+
+impl From<&StoredMessage> for ArrivalCursor {
+    fn from(m: &StoredMessage) -> Self {
+        Self { seq: m.seq }
+    }
+}
+
 /// Keyset-pagination cursor for the chat list: pass the values of the last
 /// chat you have to fetch the page after it.
 ///

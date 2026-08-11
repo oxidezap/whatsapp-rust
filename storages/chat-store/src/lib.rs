@@ -41,6 +41,6 @@ pub mod types;
 pub use error::{ChatStoreError, Result};
 pub use store::ChatStore;
 pub use types::{
-    ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind, MessageStatus,
-    ReactionEntry, ReceiptEntry, StoreChange, StoredMessage,
+    ArrivalCursor, ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind,
+    MessageStatus, ReactionEntry, ReceiptEntry, StoreChange, StoredMessage,
 };

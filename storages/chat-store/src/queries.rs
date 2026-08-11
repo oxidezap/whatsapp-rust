@@ -13,8 +13,8 @@ use crate::error::{Result, db_err};
 use crate::schema;
 use crate::store::ChatStore;
 use crate::types::{
-    ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind, MessageStatus,
-    ReactionEntry, ReceiptEntry, StoredMessage,
+    ArrivalCursor, ChatCursor, ChatEntry, ContactEntry, MediaRef, MessageCursor, MessageKind,
+    MessageStatus, ReactionEntry, ReceiptEntry, StoredMessage,
 };
 
 fn ms_to_utc(ms: i64) -> Option<DateTime<Utc>> {
@@ -141,6 +141,41 @@ impl From<MessageRow> for StoredMessage {
             seq: row.rowid,
         }
     }
+}
+
+/// The session-wide arrival page, as a query. Split out so a test can pin its
+/// plan: this read is only cheap while SQLite answers `ORDER BY rowid DESC` by
+/// walking the table's own B-tree backwards, and nothing in the SQL says so.
+fn arrival_page_query(
+    device_id: i32,
+    after: Option<ArrivalCursor>,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    limit: i64,
+) -> schema::messages::BoxedQuery<'static, diesel::sqlite::Sqlite> {
+    use diesel::sql_types::{Bool, Integer};
+    use schema::messages::dsl;
+    // The unary `+` keeps `device_id` off the index the planner would otherwise
+    // reach for. `idx_messages_by_id` leads with `device_id`, so SQLite scores
+    // it as the better entry point and then pays a temp B-tree to put the whole
+    // device's messages back in rowid order — a full sort of the table on every
+    // page, to return one page. Denied that index, it reads the table backwards
+    // and stops at LIMIT, which is the plan this feed is designed around.
+    let mut query = dsl::messages
+        .filter(diesel::dsl::sql::<Bool>("+device_id = ").bind::<Integer, _>(device_id))
+        .into_boxed();
+    if let Some(cursor) = after {
+        query = query.filter(dsl::rowid.lt(cursor.seq));
+    }
+    // Wall-clock bounds are predicates over the arrival scan, never the
+    // ordering key: see `messages_by_arrival_in_range`.
+    if let Some(since_ms) = since_ms {
+        query = query.filter(dsl::timestamp_ms.ge(since_ms));
+    }
+    if let Some(until_ms) = until_ms {
+        query = query.filter(dsl::timestamp_ms.lt(until_ms));
+    }
+    query.order(dsl::rowid.desc()).limit(limit)
 }
 
 impl ChatStore {
@@ -332,6 +367,77 @@ impl ChatStore {
                 query
                     .order((dsl::timestamp_ms.desc(), dsl::rowid.desc()))
                     .limit(limit)
+                    .load(conn)
+                    .map_err(db_err)
+            })
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// One page of the whole session's messages, every chat interleaved, newest
+    /// arrival first. Pass the cursor of the last message you already have to
+    /// get the page after it.
+    ///
+    /// This is the read a reconciliation consumer wants — "everything that
+    /// landed since I last looked, across all chats" — which the chat list plus
+    /// [`messages`](Self::messages) can only answer by paging every thread.
+    ///
+    /// Equivalent to [`messages_by_arrival_in_range`](Self::messages_by_arrival_in_range)
+    /// with no bounds.
+    pub async fn messages_by_arrival(
+        &self,
+        after: Option<ArrivalCursor>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        self.messages_by_arrival_in_range(after, None, None, limit)
+            .await
+    }
+
+    /// The arrival feed restricted to a half-open wall-clock window,
+    /// `since <= timestamp < until`. Either end may be `None` for unbounded.
+    ///
+    /// The window is a filter over the scan, not a seek: cost tracks the rows
+    /// walked, not the rows returned, so a narrow window over an old part of a
+    /// large store reads everything newer than it before yielding anything.
+    /// Narrowing that would take a `(device_id, timestamp_ms)` index, which
+    /// costs every message write; the feed itself does not need one.
+    ///
+    /// # Ordering
+    ///
+    /// Arrival, not timestamp — [`StoredMessage::seq`] descending. History-sync
+    /// backfill inserts old conversations at new `seq`, so a poller keyed on
+    /// `timestamp` would skip those rows forever while an arrival-keyed one
+    /// sees them on its next pull. That is also why paging runs newest-first
+    /// against a volatile cursor: `seq` is comparable but a `VACUUM` may
+    /// renumber it, and a consumer that always re-enters at the newest row and
+    /// walks down can only ever re-read rows after one, never skip them.
+    /// Callers dedupe on `(chat_jid, id)`.
+    ///
+    /// Tombstones (revoked messages) and undecryptable placeholders are rows
+    /// like any other and appear here; a consumer reconciling state wants both.
+    ///
+    /// # Cost
+    ///
+    /// A reverse walk of the `messages` B-tree, which is why the session-wide
+    /// read needs no index of its own. The session's `device_id` rides along as
+    /// a predicate, so a database file holding several devices walks past its
+    /// siblings' rows to fill a page.
+    pub async fn messages_by_arrival_in_range(
+        &self,
+        after: Option<ArrivalCursor>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        // A negative LIMIT means "unbounded" to SQLite; never let that happen.
+        let limit = limit.max(0);
+        let device_id = self.device_id();
+        let since_ms = since.map(|t| t.timestamp_millis());
+        let until_ms = until.map(|t| t.timestamp_millis());
+        let rows: Vec<MessageRow> = self
+            .db()
+            .read(move |conn| {
+                arrival_page_query(device_id, after, since_ms, until_ms, limit)
                     .load(conn)
                     .map_err(db_err)
             })
@@ -552,5 +658,77 @@ impl ChatStore {
                 downloaded_at: ms_to_utc(downloaded_at_ms).unwrap_or_default(),
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArrivalCursor, arrival_page_query};
+    use diesel::prelude::*;
+    use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+
+    const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+    #[derive(diesel::QueryableByName)]
+    struct PlanRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        detail: String,
+    }
+
+    /// `EXPLAIN QUERY PLAN` for the query as diesel actually renders it. Binds
+    /// stay unbound: the planner does not need their values, and asking it
+    /// about hand-written SQL would pin a string this crate never runs.
+    fn plan(sql: &str) -> String {
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        conn.run_pending_migrations(MIGRATIONS).expect("migrate");
+        let rows: Vec<PlanRow> = diesel::sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
+            .load(&mut conn)
+            .expect("explain");
+        rows.into_iter()
+            .map(|row| row.detail)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn rendered_sql(after: Option<ArrivalCursor>, since_ms: Option<i64>) -> String {
+        let query = arrival_page_query(1, after, since_ms, None, 50);
+        let debug = diesel::debug_query::<diesel::sqlite::Sqlite, _>(&query).to_string();
+        // `debug_query` appends the bind list after the statement.
+        match debug.split_once(" -- binds") {
+            Some((sql, _)) => sql.to_string(),
+            None => debug,
+        }
+    }
+
+    /// The whole point of ordering the feed by arrival: SQLite answers it by
+    /// walking the `messages` B-tree backwards — a plain reverse `SCAN`, or a
+    /// `SEARCH ... USING INTEGER PRIMARY KEY` that seeks to the cursor first —
+    /// so a page costs no index and no sort.
+    ///
+    /// Left to itself the planner does the opposite: `idx_messages_by_id` leads
+    /// with `device_id`, so it enters there and pays a temp B-tree to recover
+    /// rowid order, turning every page into a full sort of the device's
+    /// messages. That is what the `+device_id` in the query prevents, and this
+    /// is the test that notices if it stops working.
+    #[test]
+    fn arrival_page_reads_the_table_in_arrival_order_without_sorting() {
+        for (label, sql) in [
+            ("first page", rendered_sql(None, None)),
+            (
+                "resumed page",
+                rendered_sql(Some(ArrivalCursor { seq: 4_096 }), None),
+            ),
+            ("windowed page", rendered_sql(None, Some(1_700_000_000_000))),
+        ] {
+            let plan = plan(&sql);
+            assert!(
+                plan.contains("messages") && !plan.contains("USING INDEX"),
+                "{label}: expected the table itself, got:\n{plan}"
+            );
+            assert!(
+                !plan.contains("TEMP B-TREE"),
+                "{label}: ordering must stream from the table, got:\n{plan}"
+            );
+        }
     }
 }
