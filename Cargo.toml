@@ -391,8 +391,11 @@ strip = false
 # inputs instead of routing through `pow2k(1)`, a `mul121666` specialized on
 # the constant's sparse limbs, and a `sub_unreduced` that drops the trailing
 # reduction where the ladder's own bounds allow it — that are not upstream
-# yet. x25519-dalek 3.0 resolves through the same 5.x requirement, so both
-# wrappers pick it up.
+# yet. It also batches the field inversions in Edwards lookup-table
+# construction under Montgomery's trick, which is the XEdDSA side of the same
+# bill: sender-key messages carry a signature per message.
+# x25519-dalek 3.0 resolves through the same 5.x requirement, so both wrappers
+# pick it up.
 # Revert to the crates.io release once the changes land upstream.
 [patch.crates-io]
 curve25519-dalek = { git = "https://github.com/jlucaso1/curve25519-dalek", branch = "claude/x25519-field-arithmetic-5293gk" }

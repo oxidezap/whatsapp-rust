@@ -942,7 +942,7 @@ dependencies = [
 [[package]]
 name = "curve25519-dalek"
 version = "5.0.0"
-source = "git+https://github.com/jlucaso1/curve25519-dalek?branch=claude%2Fx25519-field-arithmetic-5293gk#a286fc9abdb103c65cac55aaf69068b4eb7195a5"
+source = "git+https://github.com/jlucaso1/curve25519-dalek?branch=claude%2Fx25519-field-arithmetic-5293gk#165711dc9965b7f3c1311ba6acc11067a85d7062"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
