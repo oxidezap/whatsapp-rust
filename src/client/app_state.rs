@@ -1817,6 +1817,13 @@ impl Client {
                 // still owes. Anything else — a timeout, a server error, a
                 // response that would not parse — is a genuine failure and keeps
                 // travelling as one.
+                //
+                // `retryable` is exact here even if the server did receive the
+                // IQ. This one only ever reads: its `<collection>` carries a name
+                // and a cursor, never a `<patch>` — that is
+                // `send_app_state_patch`, and the difference is why a lost answer
+                // leaves nothing half-done to reason about. Whatever the server
+                // did with it, this side did not advance.
                 Err(e) if e.is_transport_unavailable() => {
                     warn!(
                         target: "Client/AppState",
@@ -2089,9 +2096,12 @@ impl Client {
                 }
             }
 
-            // Raised only now: the collections this round did apply have been
-            // dispatched, and `outcome` carries them, so the caller's error is
-            // about the round rather than about work it never heard of.
+            // Raised only now, so that everything this round did apply has been
+            // dispatched and reconciled first. The buckets do not survive the
+            // trip — the caller gets `Err` and `outcome` is dropped with it — so
+            // what the deferral buys is not a report but the dispatch itself:
+            // mutations already persisted reach their consumer instead of being
+            // stranded behind a cursor that has moved past them.
             if let Some(e) = apply_error {
                 return Err(e);
             }
