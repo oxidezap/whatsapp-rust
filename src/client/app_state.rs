@@ -5051,6 +5051,22 @@ mod critical_bootstrap_tests {
     use super::*;
     use crate::types::events::{EventHandler, EventInterest, EventKind};
 
+    /// Retires the connection from inside the `Connected` handler, the way a
+    /// consumer that disconnects the moment it connects does.
+    struct RetireOnConnected(Arc<AtomicU64>);
+
+    impl EventHandler for RetireOnConnected {
+        fn handle_event(&self, event: Arc<Event>) {
+            if matches!(&*event, Event::Connected(_)) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn interest(&self) -> EventInterest {
+            EventInterest::of(&[EventKind::Connected])
+        }
+    }
+
     #[derive(Default)]
     struct BootstrapRecorder {
         connected: AtomicU64,
@@ -5509,5 +5525,47 @@ mod critical_bootstrap_tests {
             [false].as_slice()
         );
         assert!(client.needs_initial_full_sync.is_armed());
+    }
+
+    /// Publishing runs consumer handlers synchronously, so one that disconnects
+    /// retires the generation between the announcement and the report. The
+    /// report is deliberately withheld there rather than published to whatever
+    /// took the connection's place: a consumer's documented response to a
+    /// refusal is to log out or force a recovery, and that would land on the
+    /// wrong session. Nothing is lost, because the gate was armed before the
+    /// announcement and the replacement connection runs the bootstrap again.
+    #[tokio::test]
+    async fn a_handler_that_disconnects_takes_the_report_with_it() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-reentrant").await;
+        let retire = Arc::new(RetireOnConnected(Arc::clone(&client.connection_generation)));
+        let _retire_subscription = client.subscribe(retire.interest(), retire as _);
+
+        let scope = client.sync_scope(None);
+        let stalled = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stalled);
+
+        assert!(
+            !client
+                .finish_critical_bootstrap(scope, &plan, &stalled)
+                .await,
+            "the caller must not start background work for a retired connection"
+        );
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            1,
+            "the announcement is what ran the handler"
+        );
+        assert!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .is_empty(),
+            "the outcome belongs to a connection that no longer exists"
+        );
+        assert!(
+            client.needs_initial_full_sync.is_armed(),
+            "and the replacement inherits the work through the gate"
+        );
     }
 }
