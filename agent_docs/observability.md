@@ -132,8 +132,18 @@ test counter answers the question in a fixture, and the question here is what a
 *deployed* client gets — an embedder whose registry writes are noisier than any
 fixture's would have no way to see its own hit rate. It costs one indexed
 relaxed `fetch_add` per resolver call, twice per group send. Measured against
-`skdm_target_resolution_warm`, the tightest thing the counters sit inside, the
-whole instrumentation is +8 instructions per resolve, flat in group size.
+the tightest thing the counters sit inside (SKDM target resolution on the
+memo-hit path, callgrind, min of 3, K=10001 so the fixture's setup jitter
+divides away): **+16 Ir per resolve at 8 members, +25 at 512**, against 4,419
+and 4,408 without them. At whole-send scale it is under the fixture's own
+run-to-run spread.
+
+Record the outcome **on the branch that decided it**. An earlier revision
+classified into an enum and then matched on it again to act; that second
+dispatch, plus moving the SKDM memo entry (a five-field tuple carrying a `Jid`
+and a `Vec<Jid>`) into a temporary to classify it, cost 126 Ir per resolve
+instead of 16. A counter meant to be free on the hit path has to be written
+that way.
 
 ### 4. `BotBuilder::with_task_instrument` — CPU / custom attribution (opt-in)
 

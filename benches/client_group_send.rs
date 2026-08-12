@@ -17,7 +17,10 @@
 //! - **LID addressing.** The fixture is PN-addressed, so
 //!   `GroupInfo::phone_jid_for_lid_user` is never reached. A LID sweep needs a
 //!   registry seeded with LID↔PN mappings, which is a different fixture rather
-//!   than a parameter on this one.
+//!   than a parameter on this one. The *hit-rate* question is covered for LID
+//!   groups by `repeat_lid_group_sends_hit_both_device_memos_on_every_send`
+//!   in `src/send/mod.rs`, which is what settles whether that function is on
+//!   a warm send's bill at all — it runs only inside the uncached resolve.
 //! - **The SQLite backend.** The fixture stores through `InMemoryBackend`, so
 //!   the storage engine's own per-send cost is excluded by construction.
 //! - **First contact.** The fixture reaches its steady state before measuring,
@@ -120,9 +123,12 @@ fn skdm_target_resolution_warm(bencher: divan::Bencher, group_size: usize) {
 /// `skdm_target_resolution_warm` is what the memo is worth per send. Measuring
 /// both is what separates "the filter is expensive" from "the filter runs when
 /// it should not" — only the second is a bug, and only a hit-rate observation
-/// can tell them apart. That the steady state takes the memoized path is pinned
-/// as a test (`skdm_warm_memo_hits_on_every_repeat_send`), not asserted here: a
-/// benchmark measures how much it costs, not how often it happens.
+/// can tell them apart. Which one the steady state takes is not asserted here
+/// (a benchmark measures how much an outcome costs, not how often it happens):
+/// it is pinned by `skdm_warm_memo_hits_on_every_repeat_send` and, per term,
+/// by `repeat_group_sends_hit_both_device_memos_on_every_send`. At group sizes
+/// no unit test builds, read `GroupSendHarness::memo_stats` after a run of
+/// `warm_send`.
 #[divan::bench(args = GROUP_SIZES, sample_count = SAMPLE_COUNT, sample_size = SAMPLE_SIZE)]
 fn skdm_target_resolution_memo_cold(bencher: divan::Bencher, group_size: usize) {
     let harness = shared("skdm_target_resolution_memo_cold", group_size);
