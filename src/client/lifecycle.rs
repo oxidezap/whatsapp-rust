@@ -274,6 +274,14 @@ impl Client {
     /// no flag of its own: 429 and 503 mark the session rejected inline and fall
     /// through without retiring the generation, so every other condition here
     /// still reads as a healthy connection.
+    ///
+    /// Not atomic with those stores, and deliberately not: a rejection landing
+    /// between this read and the publication announces a connection that is
+    /// about to drop, which is what a rejection one instruction later does too.
+    /// Nothing durable comes of it, because `is_fully_ready` asks
+    /// `is_logged_in` again next to `is_ready`. Closing the window would mean
+    /// taking a lock on the read loop's stream-error path for a distinction no
+    /// consumer can observe.
     fn still_announceable(&self, expected_generation: u64) -> bool {
         self.connection_generation.load(Ordering::SeqCst) == expected_generation
             && !self.expected_disconnect.load(Ordering::Acquire)
