@@ -64,6 +64,12 @@ pub(crate) fn dispatch_call_log_mutation(
         }
     };
 
+    // The mutation's own time, which is metadata rather than the call's: WA Web
+    // measures it against the pairing timestamp to drop records that predate the
+    // device. A missing one falls back to now, as it does for every other
+    // app-state event — losing the whole call log over a field that is not even
+    // the call's time would trade the record for its envelope, and
+    // `record.start_time` is where the call's time actually is.
     let ts = m
         .action_value
         .as_ref()

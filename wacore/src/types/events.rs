@@ -2401,6 +2401,13 @@ pub struct CallLogSync {
     /// `isIncoming: fromMe`, so a consumer taking the field at its word files
     /// every call backwards.
     pub from_me: bool,
+    /// When the mutation was written, not when the call happened — the call's
+    /// own time is `record.start_time`.
+    ///
+    /// This is the field WA Web measures against the pairing timestamp to decide
+    /// whether a record predates the device, so it is worth having; it is not a
+    /// time to file the call under. A mutation that arrives without one falls
+    /// back to the moment it was received, as every other app-state event does.
     pub timestamp: DateTime<Utc>,
     pub record: Box<wa::CallLogRecord>,
     pub from_full_sync: bool,
