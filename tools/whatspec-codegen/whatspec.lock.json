@@ -1,0 +1,13 @@
+{
+  "repo": "https://github.com/oxidezap/whatspec",
+  "rev": "622d256be5c796750641ac5216b978d261c18fb2",
+  "waVersion": "2.3000.1044659339",
+  "files": {
+    "abprops/index.json": "sha256:8e935cd88d28fa8e2c87dee73405a4611266f7bdd4c0f6f62c2764656fc29c0a",
+    "appstate/index.json": "sha256:3ab0c56c54d0ba6c0e2e5b319737b799258f881a158deada1dcf8c6233d84eb8",
+    "manifest.json": "sha256:cf8db5f2fb9b8e5b7ab2cc3e5d5fb74a7a0a21f76efe946f7add27a8f6d461a1",
+    "mex/index.json": "sha256:e381c86874d16ec39d817fd85592b6b5e4423a68831219d5b790341993fd0b1f",
+    "proto/WAProto.proto": "sha256:021d53059e7b35d8553c97c09567da8d6aba7278c7f2510242eab686bff3647a",
+    "tokens/index.json": "sha256:6d45399515cdc6ec55528aa56e36ecf566f06290039e3ed37a5561a272cb89f9"
+  }
+}

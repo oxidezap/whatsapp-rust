@@ -34,6 +34,22 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  generated:
+    name: Generated Artifacts
+    runs-on: ubuntu-latest
+    # The vendored whatspec files are regenerated, never edited, and the tool
+    # that writes them pins the exact IR commit — so a hand-edit or a
+    # half-refreshed tree is a diff this job can name. Lives beside `format`
+    # rather than in a build job: it needs rustfmt and git, not protoc (--check
+    # never rebuilds the descriptor) and not a compiled workspace.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+          components: rustfmt
+      - run: cargo run -p whatspec-codegen -- --check
+
   clippy:
     name: Clippy Linter
     runs-on: ubuntu-latest

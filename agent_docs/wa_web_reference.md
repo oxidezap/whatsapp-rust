@@ -11,7 +11,27 @@ Before adding or changing protocol logic, check it against what the official cli
 
 [`oxidezap/whatspec`](https://github.com/oxidezap/whatspec) parses the WhatsApp Web JS bundle with an `oxc` AST and emits a language-neutral IR: IQ stanzas, protobuf schemas, GraphQL persisted operations, app-state actions, feature flags, wire enums, notification dispatch, binary-protocol token dictionaries. The IR is a derived model of the contract — a static reading of minified code, not the contract itself — and the committed Rust modules are one consumer of that model. Treat it as high-quality evidence, not as a specification; the limits are spelled out below.
 
-This repo already vendors parts of it — `wacore/src/iq/mex_operations.rs` is copied verbatim from `generated/mex/operations.rs`, and the protobuf and app-state work came from the same place. Refreshing a vendored file is a `cp`.
+This repo vendors parts of it. whatspec commits only the IR now (`generated/**/*.rs` is gitignored there), so the vendored files are produced here, by `tools/whatspec-codegen`:
+
+| Vendored file | Domain |
+| --- | --- |
+| `wacore/src/iq/abprops.rs` | `abprops` |
+| `wacore/src/iq/mex_operations.rs` | `mex` |
+| `wacore/appstate/src/schemas.rs` | `appstate` |
+| `wacore/binary/src/tokens.json` | `tokens` |
+| `waproto/src/whatsapp.proto` | `proto` |
+| `wacore/src/version/generated.rs` | `manifest.json`'s `waVersion` |
+
+```sh
+cargo run -p whatspec-codegen                    # regenerate from the pinned commit
+cargo run -p whatspec-codegen -- --check         # fail if the tree drifted from it
+cargo run -p whatspec-codegen -- --from ../whatspec/generated   # use a local checkout
+cargo run -p whatspec-codegen -- --update-lock --rev main       # move to a newer bundle
+```
+
+The pinned commit and the per-file digests live in `tools/whatspec-codegen/whatspec.lock.json`, and the WhatsApp build every artifact came from is generated as `wacore::version::WA_WEB_VERSION` — which is also the default a fresh device announces. Regeneration is all-or-nothing: refreshing one domain alone is how the tree ended up with abprops and mex describing two different WhatsApp releases, and `whatspec-codegen` refuses to write a set that does not agree.
+
+Writing the `.proto` also rebuilds `waproto/src/whatsapp.desc`, so `protoc` (the version in `.github/workflows/main.yml`'s `PROTOC_VERSION`) has to be on PATH; `--skip-proto-desc` defers it. Local additions to the schema are not hand-edits: a whole message goes in the emitter's `LOCAL_BLOCKS` (`tools/whatspec-codegen/src/emit/proto.rs`), a single field in `LOCAL_FIELDS` (`waproto/build.rs`). Either way it survives the next sync, and a sync that starts declaring the same name fails the build instead of shadowing it.
 
 ```sh
 git clone https://github.com/oxidezap/whatspec

@@ -28,6 +28,7 @@ members = [
     "storages/sqlite-storage",
     "tests/bench-integration",
     "tests/e2e",
+    "tools/whatspec-codegen",
     "transports/tokio-transport",
     "wacore",
     "wacore/appstate",

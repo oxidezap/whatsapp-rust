@@ -1,0 +1,217 @@
+//! The slice of the whatspec IR this repository consumes.
+//!
+//! Field names and the `untagged` variant order mirror `wa-ir` exactly. An
+//! untagged enum resolves to its first matching variant, so reordering `Scalar`
+//! or [`TypeNode`] silently retypes generated fields; keep them as declared.
+
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+
+/// The IR contract version this tool was written against. A whatspec bundle
+/// stamping a different major reshapes the documents below, so refuse it rather
+/// than deserialize a shape we no longer understand.
+pub const SUPPORTED_SCHEMA_MAJOR: &str = "2";
+
+/// Fields every domain document carries, used to prove the domains were all
+/// extracted from one WhatsApp build.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Envelope {
+    pub schema_version: String,
+    pub wa_version: String,
+}
+
+/// `generated/manifest.json`, reduced to the stamp we check.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Manifest {
+    pub schema_version: String,
+    pub wa_version: String,
+}
+
+/// A JSON scalar literal. `untagged`, so it renders as the bare JSON value and
+/// the surrounding `valueType` says which arm to expect.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Scalar {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+/// The declared value type of an A/B prop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AbPropType {
+    Bool,
+    Int,
+    String,
+    Float,
+}
+
+/// One feature flag: name, the numeric code sent in the `<props>` IQ, and its
+/// default. A flag can appear in more than one registry, so `module` is part of
+/// its identity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbPropConfig {
+    pub module: String,
+    pub name: String,
+    pub code: u32,
+    pub value_type: AbPropType,
+    pub default: Scalar,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbPropsIr {
+    pub wa_version: String,
+    pub configs: Vec<AbPropConfig>,
+}
+
+/// One element of an action's mutation index; `type` discriminates the shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+pub enum IndexPart {
+    #[serde(rename = "literal")]
+    Literal { value: String },
+    #[serde(rename = "jid")]
+    Jid { name: String },
+    #[serde(rename = "boolString")]
+    BoolString { name: String },
+    #[serde(rename = "jidOrZero")]
+    JidOrZero { name: String },
+    #[serde(rename = "enum", rename_all = "camelCase")]
+    Enum { name: String, proto_enum: String },
+    #[serde(rename = "string")]
+    StringPart { name: String },
+    #[serde(rename = "unknown")]
+    Unknown { name: String },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppstateAction {
+    pub module: String,
+    pub name: String,
+    pub collection: Option<String>,
+    pub version: Option<u32>,
+    pub scope: String,
+    pub value_field: Option<String>,
+    pub value_proto_type: Option<String>,
+    pub value_enum_fields: Option<BTreeMap<String, String>>,
+    pub chat_jid_index: Option<i64>,
+    pub index_parts: Vec<IndexPart>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppstateIr {
+    pub wa_version: String,
+    pub collections: Vec<String>,
+    pub actions: BTreeMap<String, AppstateAction>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MexOperationKind {
+    Query,
+    Mutation,
+}
+
+impl MexOperationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::Mutation => "mutation",
+        }
+    }
+}
+
+/// A node in a `variablesShape` / `response` type tree: an object, a
+/// single-element array standing for a plural field, or a scalar type tag
+/// (`"string"`, `"number"`, `"boolean"`, `"enum:A|B"`, `"unknown"`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TypeNode {
+    Object(BTreeMap<String, TypeNode>),
+    Array(Vec<TypeNode>),
+    Leaf(String),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MexOperation {
+    pub original_name: String,
+    pub doc_id: String,
+    pub operation_kind: MexOperationKind,
+    #[serde(default)]
+    pub variables_shape: BTreeMap<String, TypeNode>,
+    #[serde(default)]
+    pub response: BTreeMap<String, TypeNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MexIr {
+    pub wa_version: String,
+    pub operations: BTreeMap<String, MexOperation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokensIr {
+    pub single_byte: Vec<String>,
+    pub double_byte: Vec<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_arms_follow_the_json_type() {
+        let parse = |s: &str| serde_json::from_str::<Scalar>(s).expect("scalar");
+        assert!(matches!(parse("true"), Scalar::Bool(true)));
+        assert!(matches!(parse("7"), Scalar::Int(7)));
+        assert!(matches!(parse("1.5"), Scalar::Float(_)));
+        assert!(matches!(parse("\"x\""), Scalar::Str(_)));
+        // A whole-number JSON literal is an Int even when the flag is declared
+        // float; the emitter renders the arm, not the declared type.
+        assert!(matches!(parse("0"), Scalar::Int(0)));
+    }
+
+    #[test]
+    fn type_node_prefers_object_then_array_then_leaf() {
+        let parse = |s: &str| serde_json::from_str::<TypeNode>(s).expect("node");
+        assert!(matches!(parse(r#"{"a":"string"}"#), TypeNode::Object(_)));
+        assert!(matches!(parse(r#"["string"]"#), TypeNode::Array(_)));
+        assert!(matches!(parse(r#""number""#), TypeNode::Leaf(_)));
+    }
+
+    #[test]
+    fn index_part_reads_every_wire_tag() {
+        let parts: Vec<IndexPart> = serde_json::from_str(
+            r#"[{"type":"literal","value":"a"},
+                {"type":"jid","name":"chatJid"},
+                {"type":"boolString","name":"fromMe"},
+                {"type":"jidOrZero","name":"participant"},
+                {"type":"enum","name":"k","protoEnum":"A.B"},
+                {"type":"string","name":"id"},
+                {"type":"unknown","name":"x"}]"#,
+        )
+        .expect("index parts");
+        assert_eq!(parts.len(), 7);
+        assert!(matches!(&parts[4], IndexPart::Enum { proto_enum, .. } if proto_enum == "A.B"));
+    }
+
+    #[test]
+    fn an_unknown_index_part_tag_is_rejected() {
+        // A whatspec release that adds an index-part kind must fail loudly here
+        // rather than emit a registry missing an index slot.
+        let err = serde_json::from_str::<IndexPart>(r#"{"type":"quantum","name":"x"}"#);
+        assert!(err.is_err(), "unknown index-part tag must not deserialize");
+    }
+}
