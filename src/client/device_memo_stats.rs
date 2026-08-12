@@ -60,8 +60,7 @@ pub(crate) enum GroupDevicesMemoOutcome {
 #[repr(usize)]
 pub(crate) enum SkdmTargetsMemoOutcome {
     Hit,
-    /// No entry: first send, an eviction, or a previous send whose targets
-    /// were not memoizable (see [`SkdmTargetsMemoStats::not_stored`]).
+    /// No entry at all: first send for this group, or an eviction.
     MissAbsent,
     /// The resolved device-set `Arc` differs from the memoized one. This is
     /// the cascade term: the devices come straight out of the group memo, so
@@ -75,18 +74,110 @@ pub(crate) enum SkdmTargetsMemoOutcome {
     /// A different sending identity (PN↔LID re-addressing, or a re-pair).
     MissSender,
     Bypassed,
+    /// The prerequisite device resolution failed, so no memo term was ever
+    /// evaluated. Recorded so that one call to `resolve_skdm_targets_memoized`
+    /// is always one counter: without it a client whose sends were failing
+    /// before the memo lookup would report a healthy hit rate over a
+    /// shrinking denominator.
+    ResolveFailed,
 }
 
 const GROUP_OUTCOMES: usize = 6;
-const SKDM_OUTCOMES: usize = 7;
+const SKDM_OUTCOMES: usize = 8;
+
+/// Array slot for one group-memo outcome.
+///
+/// Exhaustive on purpose. `record_group_devices` indexes by `as usize`, which
+/// is fast and unchecked-looking; what makes it safe is that adding a variant
+/// *anywhere* — including after the current last one — makes this match
+/// non-exhaustive and the crate stops compiling. A bounds assertion on the
+/// last variant alone would keep passing and let the new variant index off the
+/// end of the array on the send path, which has no other symptom.
+const fn group_slot(outcome: GroupDevicesMemoOutcome) -> usize {
+    let slot = match outcome {
+        GroupDevicesMemoOutcome::Hit => 0,
+        GroupDevicesMemoOutcome::Restamp => 1,
+        GroupDevicesMemoOutcome::MissAbsent => 2,
+        GroupDevicesMemoOutcome::MissGroupInfo => 3,
+        GroupDevicesMemoOutcome::MissTopology => 4,
+        GroupDevicesMemoOutcome::Bypassed => 5,
+    };
+    assert!(slot < GROUP_OUTCOMES);
+    slot
+}
+
+/// Array slot for one SKDM-memo outcome. Same contract as [`group_slot`].
+const fn skdm_slot(outcome: SkdmTargetsMemoOutcome) -> usize {
+    let slot = match outcome {
+        SkdmTargetsMemoOutcome::Hit => 0,
+        SkdmTargetsMemoOutcome::MissAbsent => 1,
+        SkdmTargetsMemoOutcome::MissDevices => 2,
+        SkdmTargetsMemoOutcome::MissMap => 3,
+        SkdmTargetsMemoOutcome::MissMapGeneration => 4,
+        SkdmTargetsMemoOutcome::MissSender => 5,
+        SkdmTargetsMemoOutcome::Bypassed => 6,
+        SkdmTargetsMemoOutcome::ResolveFailed => 7,
+    };
+    assert!(slot < SKDM_OUTCOMES);
+    slot
+}
+
+/// Every variant indexes inside its array, and its slot agrees with the
+/// discriminant the recorders use. Const-evaluated, so a mismatch is a build
+/// failure rather than a panic on the first send.
+const _: () = {
+    assert!(group_slot(GroupDevicesMemoOutcome::Hit) == GroupDevicesMemoOutcome::Hit as usize);
+    assert!(
+        group_slot(GroupDevicesMemoOutcome::Restamp) == GroupDevicesMemoOutcome::Restamp as usize
+    );
+    assert!(
+        group_slot(GroupDevicesMemoOutcome::MissAbsent)
+            == GroupDevicesMemoOutcome::MissAbsent as usize
+    );
+    assert!(
+        group_slot(GroupDevicesMemoOutcome::MissGroupInfo)
+            == GroupDevicesMemoOutcome::MissGroupInfo as usize
+    );
+    assert!(
+        group_slot(GroupDevicesMemoOutcome::MissTopology)
+            == GroupDevicesMemoOutcome::MissTopology as usize
+    );
+    assert!(
+        group_slot(GroupDevicesMemoOutcome::Bypassed) == GroupDevicesMemoOutcome::Bypassed as usize
+    );
+    assert!(skdm_slot(SkdmTargetsMemoOutcome::Hit) == SkdmTargetsMemoOutcome::Hit as usize);
+    assert!(
+        skdm_slot(SkdmTargetsMemoOutcome::MissAbsent)
+            == SkdmTargetsMemoOutcome::MissAbsent as usize
+    );
+    assert!(
+        skdm_slot(SkdmTargetsMemoOutcome::MissDevices)
+            == SkdmTargetsMemoOutcome::MissDevices as usize
+    );
+    assert!(skdm_slot(SkdmTargetsMemoOutcome::MissMap) == SkdmTargetsMemoOutcome::MissMap as usize);
+    assert!(
+        skdm_slot(SkdmTargetsMemoOutcome::MissMapGeneration)
+            == SkdmTargetsMemoOutcome::MissMapGeneration as usize
+    );
+    assert!(
+        skdm_slot(SkdmTargetsMemoOutcome::MissSender)
+            == SkdmTargetsMemoOutcome::MissSender as usize
+    );
+    assert!(
+        skdm_slot(SkdmTargetsMemoOutcome::Bypassed) == SkdmTargetsMemoOutcome::Bypassed as usize
+    );
+    assert!(
+        skdm_slot(SkdmTargetsMemoOutcome::ResolveFailed)
+            == SkdmTargetsMemoOutcome::ResolveFailed as usize
+    );
+};
 
 /// The counters themselves. One per `Client`.
 ///
 /// Arrays rather than named fields so recording an outcome is
 /// `slot[outcome as usize].fetch_add(1, Relaxed)` — one indexed atomic add, no
-/// branch on which variant it was. The `_OUTCOMES` lengths are asserted
-/// against the variants below, so adding a variant without widening the array
-/// fails to compile rather than panicking at the first send.
+/// branch on which variant it was. [`group_slot`] and [`skdm_slot`] are what
+/// keep that indexing in range as the enums grow.
 #[derive(Debug, Default)]
 pub(crate) struct DeviceMemoCounters {
     group: [AtomicU64; GROUP_OUTCOMES],
@@ -105,10 +196,9 @@ impl DeviceMemoCounters {
         self.skdm[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A resolved target set that could not be memoized, so the next send is
-    /// an [`SkdmTargetsMemoOutcome::MissAbsent`] by construction. Recorded in
-    /// addition to that call's own outcome, not instead of it — it describes
-    /// the *store*, not the lookup.
+    /// A resolved target set that could not be memoized, so the next call
+    /// cannot hit. Recorded in addition to that call's own outcome, not
+    /// instead of it — it describes the *store*, not the lookup.
     pub(crate) fn record_skdm_not_stored(&self) {
         self.skdm_not_stored.fetch_add(1, Ordering::Relaxed);
     }
@@ -136,17 +226,11 @@ impl DeviceMemoCounters {
                 miss_sender: skdm(SkdmTargetsMemoOutcome::MissSender),
                 not_stored: self.skdm_not_stored.load(Ordering::Relaxed),
                 bypassed: skdm(SkdmTargetsMemoOutcome::Bypassed),
+                resolve_failed: skdm(SkdmTargetsMemoOutcome::ResolveFailed),
             },
         }
     }
 }
-
-/// The array index of the last variant must be in range, or a recorded outcome
-/// would index out of bounds on a path with no other symptom.
-const _: () = {
-    assert!(GroupDevicesMemoOutcome::Bypassed as usize == GROUP_OUTCOMES - 1);
-    assert!(SkdmTargetsMemoOutcome::Bypassed as usize == SKDM_OUTCOMES - 1);
-};
 
 /// Outcomes of `resolve_group_devices_memoized`, one per call.
 ///
@@ -203,11 +287,22 @@ pub struct SkdmTargetsMemoStats {
     pub miss_map_generation: u64,
     pub miss_sender: u64,
     /// Resolutions whose target set was neither empty nor own-devices-only, so
-    /// nothing was memoized. Each of these guarantees the next call is a
-    /// [`Self::miss_absent`], which is why it is reported next to them rather
-    /// than folded into the miss counts.
+    /// nothing was memoized. Each of these guarantees the *next* call cannot
+    /// hit — but not that it reports [`Self::miss_absent`]: when a stale entry
+    /// was already there it is left in place (nothing overwrites it, and it
+    /// can never become valid again — the map generation only moves forward
+    /// and the `Weak` keeps the old device allocation alive, so no `ptr::eq`
+    /// can spuriously match). The next call then reports whichever term is
+    /// still failing. A run of these means the group is not settling into the
+    /// warm steady state at all, which is why it is reported next to the miss
+    /// counts rather than folded into them.
     pub not_stored: u64,
     pub bypassed: u64,
+    /// Calls that never reached a memo term because the device resolution they
+    /// depend on returned an error. Counted so [`Self::calls`] stays one per
+    /// call to `resolve_skdm_targets_memoized`; a rising value here means
+    /// group sends are failing upstream of anything this report describes.
+    pub resolve_failed: u64,
 }
 
 impl SkdmTargetsMemoStats {
@@ -219,6 +314,7 @@ impl SkdmTargetsMemoStats {
             + self.miss_map_generation
             + self.miss_sender
             + self.bypassed
+            + self.resolve_failed
     }
 
     /// Share of calls that skipped `filter_skdm_targets`. `None` when nothing
@@ -272,6 +368,7 @@ impl DeviceMemoStats {
                 miss_sender: skdm.miss_sender.saturating_sub(skdm_was.miss_sender),
                 not_stored: skdm.not_stored.saturating_sub(skdm_was.not_stored),
                 bypassed: skdm.bypassed.saturating_sub(skdm_was.bypassed),
+                resolve_failed: skdm.resolve_failed.saturating_sub(skdm_was.resolve_failed),
             },
         }
     }
@@ -295,7 +392,7 @@ impl std::fmt::Display for DeviceMemoStats {
         )?;
         write!(
             f,
-            "  skdm_targets:  {} calls, {} hit, miss: {} absent / {} devices / {} map / {} map_gen / {} sender, {} not stored, {} bypassed",
+            "  skdm_targets:  {} calls, {} hit, miss: {} absent / {} devices / {} map / {} map_gen / {} sender, {} not stored, {} bypassed, {} resolve failed",
             skdm.calls(),
             skdm.hits,
             skdm.miss_absent,
@@ -304,7 +401,8 @@ impl std::fmt::Display for DeviceMemoStats {
             skdm.miss_map_generation,
             skdm.miss_sender,
             skdm.not_stored,
-            skdm.bypassed
+            skdm.bypassed,
+            skdm.resolve_failed
         )
     }
 }
@@ -350,6 +448,7 @@ mod tests {
             SkdmTargetsMemoOutcome::MissMapGeneration,
             SkdmTargetsMemoOutcome::MissSender,
             SkdmTargetsMemoOutcome::Bypassed,
+            SkdmTargetsMemoOutcome::ResolveFailed,
         ] {
             counters.record_skdm_targets(outcome);
         }
@@ -357,8 +456,8 @@ mod tests {
         counters.record_skdm_not_stored();
 
         let stats = counters.snapshot();
-        assert_eq!(stats.group_devices.calls(), 6);
-        assert_eq!(stats.skdm_targets.calls(), 7);
+        assert_eq!(stats.group_devices.calls(), GROUP_OUTCOMES as u64);
+        assert_eq!(stats.skdm_targets.calls(), SKDM_OUTCOMES as u64);
         assert_eq!(stats.skdm_targets.not_stored, 1);
     }
 

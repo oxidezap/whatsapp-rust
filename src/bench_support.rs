@@ -188,9 +188,9 @@ impl GroupSendHarness {
     ///
     /// The benchmarks below force their memo outcome, which is what makes them
     /// measurable — and what makes them unable to say which outcome a client
-    /// in regime takes. Reading the counters after a run of [`Self::warm_send`]
-    /// is how the sweep answers that at group sizes the unit tests do not
-    /// reach.
+    /// takes once the group is in its steady state. Reading the counters after
+    /// a run of [`Self::warm_send`] is how the sweep answers that at group
+    /// sizes the unit tests do not reach.
     pub fn memo_stats(&self) -> crate::client::DeviceMemoStats {
         self.client.device_memo_stats()
     }

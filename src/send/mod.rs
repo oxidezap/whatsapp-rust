@@ -1595,15 +1595,24 @@ impl Client {
                             )
                             .await;
                     } else {
-                        // Nothing stored, so the next call is a MissAbsent by
-                        // construction rather than by eviction. Counted apart
-                        // so that distinction survives into the report.
+                        // Nothing stored, so the next call cannot hit. Any
+                        // stale entry is deliberately left in place rather
+                        // than cleared: it can never become valid again (the
+                        // map generation only moves forward, and the `Weak`
+                        // keeps the old device allocation alive so no
+                        // `ptr::eq` can spuriously match), so removing it
+                        // would buy a cache write and change nothing.
                         self.device_memo_counters.record_skdm_not_stored();
                     }
                 }
                 Some((all_devices, needs_skdm))
             }
             Err(e) => {
+                // Recorded so `SkdmTargetsMemoStats::calls()` really is one
+                // per call: a client failing here would otherwise report a
+                // healthy hit rate over a denominator that quietly shrank.
+                self.device_memo_counters
+                    .record_skdm_targets(Outcome::ResolveFailed);
                 log::warn!(
                     "Failed to resolve devices for SKDM check in {}: {:?}",
                     group_jid,
@@ -3378,9 +3387,9 @@ mod tests {
     ///
     /// `skdm_target_resolution_warm` and `skdm_target_resolution_memo_cold`
     /// bound the cost of a hit and of a miss, but both force their outcome, so
-    /// neither can say which one a client in regime gets — and an external
-    /// profile of a different client implied "miss, on all 30 of 30". This is
-    /// the missing middle: N consecutive sends through the real
+    /// neither can say which one a client gets once the group is warm — and an
+    /// external profile of a different client implied "miss, on all 30 of 30".
+    /// This is the missing middle: N consecutive sends through the real
     /// `send_message`, reading the per-term counters over the window.
     ///
     /// Asserted on the terms and not just on a rate, because the two memos are
@@ -3610,7 +3619,7 @@ mod tests {
         //    moved, and the log proves the change missed this group.
         fixture.send_text("re-warm").await;
         let before = fixture.client.device_memo_stats();
-        fixture.client.device_topology.record(["15555550123"]);
+        fixture.client.device_topology.record(["12025550111"]);
         fixture.send_text("after an unrelated user changed").await;
         let window = fixture.client.device_memo_stats().since(&before);
         assert_eq!(
