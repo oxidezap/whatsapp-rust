@@ -124,8 +124,20 @@ that the group memo returned, so **a group-memo recompute forces
 Two counters do not fit the "one per call" shape and are documented as such:
 `restamps` (served like a hit, but paid the `unchanged_for` scan first) and
 `not_stored` (a resolution whose target set was neither empty nor
-own-devices-only, so nothing was memoized and the *next* call is a
-`miss_absent` by construction, not by eviction).
+own-devices-only, so nothing was memoized). `not_stored` guarantees the next
+call **cannot hit** — not that it reports `miss_absent`. A stale entry that was
+already there is deliberately left in place, because it can never become valid
+again (the sender-key map generation only moves forward, the map `Arc` is
+replaced wholesale on a rebuild, and the device-set `Weak` keeps the old
+allocation alive so no `ptr::eq` can spuriously match), so the next call
+reports whichever term is still failing. Reading a run of `not_stored` as
+eviction pressure is therefore the wrong conclusion: it means the group is not
+settling into the warm steady state at all.
+
+Every other SKDM outcome is exactly one per call, including `resolve_failed`,
+which covers the calls that never reached a memo term because the device
+resolution they depend on errored. Without it `hit_rate()` would look healthy
+over a denominator that quietly shrank as sends started failing.
 
 Why always-on rather than `#[cfg(test)]` like `dm_devices_memo_recomputes`: a
 test counter answers the question in a fixture, and the question here is what a
