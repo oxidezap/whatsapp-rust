@@ -235,10 +235,7 @@ impl Client {
                     .login_transition
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if self.connection_generation.load(Ordering::SeqCst) != expected_generation
-                    || self.expected_disconnect.load(Ordering::Acquire)
-                    || self.is_paused()
-                {
+                if !self.still_announceable(expected_generation) {
                     debug!(
                         "Skipping Connected dispatch after generation {expected_generation} retired"
                     );
@@ -256,18 +253,32 @@ impl Client {
             .login_transition
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // `paused` alongside the retirement checks: a pause spends up to four
-        // seconds flushing before it closes the socket, and a post-login task
-        // finishing in that window passes its generation check and would
-        // announce a session that is being taken offline.
-        if self.connection_generation.load(Ordering::SeqCst) != expected_generation
-            || self.expected_disconnect.load(Ordering::Acquire)
-            || self.is_paused()
-        {
+        if !self.still_announceable(expected_generation) {
             debug!("Skipping Connected dispatch after its connection retired");
             return;
         }
         self.publish_connected();
+    }
+
+    /// Whether `expected_generation` is still a connection worth announcing.
+    ///
+    /// Asked under `login_transition` at the point of publication, never before
+    /// it: the lifecycle path awaits an extension host's readiness hook first,
+    /// and a check made on the near side of that await answers for a connection
+    /// the far side may no longer have.
+    ///
+    /// `paused` alongside the retirement checks: a pause spends up to four
+    /// seconds flushing before it closes the socket, and a post-login task
+    /// finishing in that window passes its generation check and would announce a
+    /// session that is being taken offline. `is_logged_in` for the case that has
+    /// no flag of its own: 429 and 503 mark the session rejected inline and fall
+    /// through without retiring the generation, so every other condition here
+    /// still reads as a healthy connection.
+    fn still_announceable(&self, expected_generation: u64) -> bool {
+        self.connection_generation.load(Ordering::SeqCst) == expected_generation
+            && !self.expected_disconnect.load(Ordering::Acquire)
+            && !self.is_paused()
+            && self.is_logged_in()
     }
 
     fn publish_connected(&self) {

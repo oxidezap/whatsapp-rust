@@ -1275,19 +1275,15 @@ impl Client {
         if !self.scope_is_current(scope) {
             return false;
         }
-        // Reachability, not just a live generation: 429 and 503 clear
-        // `is_logged_in` inline and fall through without retiring the connection
-        // (`handle_stream_error`), so the scope check alone still admits a
-        // session the client has already stopped treating as authenticated, and
-        // `dispatch_connected` does not ask either. The replacement connection
-        // announces itself; this one has nothing left to announce.
-        //
         // Presence is NOT sent here. WhatsApp Web sends presence from the
         // setting_pushName mutation handler (WAWebPushNameSync), not from
         // criticalSyncDone. Our setting_pushName handler already does this.
-        if self.can_reach_server() {
-            self.dispatch_connected(scope.generation).await;
-        }
+        //
+        // Whether the connection is still worth announcing is asked inside, at
+        // the point of publication, and not duplicated here: this scope check
+        // sits on the near side of a lifecycle readiness hook it would be
+        // answering across.
+        self.dispatch_connected(scope.generation).await;
         // After the readiness transition, not before: the report claims the
         // session is usable, and until `Connected` is actually published that
         // claim can still be falsified by a disconnect during the resubscribe
@@ -5469,6 +5465,48 @@ mod critical_bootstrap_tests {
                 .as_slice(),
             [false].as_slice(),
             "and the report has to say the connection never happened"
+        );
+        assert!(client.needs_initial_full_sync.is_armed());
+    }
+
+    /// A pause does not retire the generation, so the bootstrap runs to the end
+    /// on a connection the application has just asked to have closed. It must
+    /// not announce that, and it must still hand the leftovers over: the sync
+    /// parks on `await_connection` and picks them up after the resume, which is
+    /// the whole reason the return value tracks retirement rather than
+    /// publication.
+    #[tokio::test]
+    async fn a_paused_connection_announces_nothing_but_keeps_its_retries() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-paused").await;
+        let scope = client.sync_scope(None);
+        let stalled = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stalled);
+
+        client.pause().await;
+        assert_eq!(
+            client.sync_scope(None).generation(),
+            scope.generation(),
+            "a pause must not retire the generation, or this proves nothing"
+        );
+
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &stalled)
+                .await,
+            "the leftovers still belong to the background sync"
+        );
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            0,
+            "a session being taken offline must not be announced"
+        );
+        assert_eq!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .as_slice(),
+            [false].as_slice()
         );
         assert!(client.needs_initial_full_sync.is_armed());
     }
