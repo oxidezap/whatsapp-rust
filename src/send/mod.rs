@@ -321,7 +321,10 @@ pub struct SendOptions {
     /// Override the auto-generated message ID.
     /// Useful for resending a failed message with the same ID or idempotency.
     pub message_id: Option<String>,
-    /// Extra XML child nodes on the message stanza.
+    /// Extra XML child nodes on the message stanza. A node the send already
+    /// derives from the message content — `<biz>`, and `<bot>` on a DM — is
+    /// refused with [`SendError::InvalidRequest`] rather than stacked next to
+    /// the derived one, which the receiving client renders as nothing.
     pub extra_stanza_nodes: Vec<Node>,
     /// Ephemeral duration in seconds. Sets `contextInfo.expiration` on the
     /// message (WA Web `EProtoGenerator.js:183` parity).
@@ -755,21 +758,49 @@ fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::Intera
     msg.interactive_message.as_option()
 }
 
+/// Refuse a caller node that repeats one this send already derives.
+///
+/// A `<message>` carries at most one `<biz>` and one `<bot>`: WA Web's outgoing
+/// builders declare both non-repeating and its message parser reads them with a
+/// single-child accessor, so a second copy is a shape no client produces and
+/// none of them agrees on how to read. Which one the server honours is not
+/// observable from here, so neither side silently wins the other's slot; the
+/// caller hears about the conflict instead of watching a message get acked,
+/// delivered and then rendered as nothing.
+fn reject_duplicate_extra_stanza_node(tag: &str, user_nodes: &[Node]) -> Result<(), SendError> {
+    if user_nodes.iter().any(|node| node.tag == tag) {
+        return Err(SendError::InvalidRequest(format!(
+            "extra stanza child <{tag}> conflicts with the one this send derives from the message"
+        )));
+    }
+    Ok(())
+}
+
 /// Assemble the `extra_stanza_nodes` vector for a non-newsletter send.
 ///
 /// Order: `inferred_meta`, optional `<bot biz_bot="1"/>` (DM only), `<biz>`,
 /// then any user-provided extra nodes. Pure so the caller stays trivial and
 /// the assembly logic is unit-testable.
+///
+/// `<meta>` is deliberately not covered by the duplicate check: WA Web's own
+/// fanout builder emits two of them in one message, so a caller adding a second
+/// is asking for a shape the protocol already carries.
 fn build_extra_stanza_nodes(
     to: &Jid,
     inferred_meta: Option<Node>,
     biz: Option<Node>,
     user_nodes: Vec<Node>,
-) -> Vec<Node> {
+) -> Result<Vec<Node>, SendError> {
     if inferred_meta.is_none() && biz.is_none() {
-        return user_nodes;
+        return Ok(user_nodes);
     }
     let bot_emitted = biz.is_some() && !to.is_group();
+    if biz.is_some() {
+        reject_duplicate_extra_stanza_node("biz", &user_nodes)?;
+        if bot_emitted {
+            reject_duplicate_extra_stanza_node("bot", &user_nodes)?;
+        }
+    }
     let extra = inferred_meta.is_some() as usize + biz.is_some() as usize + bot_emitted as usize;
     let mut nodes = Vec::with_capacity(user_nodes.len() + extra);
     nodes.extend(inferred_meta);
@@ -780,7 +811,7 @@ fn build_extra_stanza_nodes(
         nodes.push(node);
     }
     nodes.extend(user_nodes);
-    nodes
+    Ok(nodes)
 }
 
 fn build_revoke_message(
@@ -1045,7 +1076,7 @@ impl Client {
         let biz = infer_biz_node(&message, sent_at.unix_secs_u64());
 
         let extra_nodes =
-            build_extra_stanza_nodes(&to, inferred_meta, biz, options.extra_stanza_nodes);
+            build_extra_stanza_nodes(&to, inferred_meta, biz, options.extra_stanza_nodes)?;
         // send_message_impl now boxes each branch future itself, so its own
         // frame (prologue + epilogue) embeds here without a second box; the
         // shim's Box::pin above still keeps `send_message`'s future
@@ -5249,11 +5280,21 @@ mod tests {
             Jid::from_str(s).expect("valid jid in test")
         }
 
+        fn assemble(
+            to: &Jid,
+            inferred_meta: Option<Node>,
+            biz: Option<Node>,
+            user_nodes: Vec<Node>,
+        ) -> Vec<Node> {
+            build_extra_stanza_nodes(to, inferred_meta, biz, user_nodes)
+                .expect("no caller node conflicts here")
+        }
+
         /// DM: `<bot biz_bot="1"/>` is prepended before the `<biz>`. The
         /// order matters because it is part of the wire shape.
         #[test]
         fn dm_emits_bot_before_biz() {
-            let nodes = build_extra_stanza_nodes(
+            let nodes = assemble(
                 &jid("5511999999999@s.whatsapp.net"),
                 None,
                 Some(quick_reply_biz()),
@@ -5275,7 +5316,7 @@ mod tests {
         /// Group: `<bot>` is NOT emitted; only `<biz>`.
         #[test]
         fn group_omits_bot() {
-            let nodes = build_extra_stanza_nodes(
+            let nodes = assemble(
                 &jid("120363000000000001@g.us"),
                 None,
                 Some(quick_reply_biz()),
@@ -5288,7 +5329,7 @@ mod tests {
         /// LID DM (non-group): `<bot>` is still emitted.
         #[test]
         fn lid_dm_emits_bot() {
-            let nodes = build_extra_stanza_nodes(
+            let nodes = assemble(
                 &jid("100000000000001@lid"),
                 None,
                 Some(payment_biz()),
@@ -5302,8 +5343,7 @@ mod tests {
         #[test]
         fn no_biz_no_meta_passthrough() {
             let user_nodes = vec![NodeBuilder::new("custom").build()];
-            let nodes =
-                build_extra_stanza_nodes(&jid("X@s.whatsapp.net"), None, None, user_nodes.clone());
+            let nodes = assemble(&jid("X@s.whatsapp.net"), None, None, user_nodes.clone());
             assert_eq!(nodes.len(), 1);
             assert_eq!(nodes[0].tag, "custom");
         }
@@ -5314,7 +5354,7 @@ mod tests {
             let meta = NodeBuilder::new("meta").attr("appdata", "default").build();
             let user_a = NodeBuilder::new("user_a").build();
             let user_b = NodeBuilder::new("user_b").build();
-            let nodes = build_extra_stanza_nodes(
+            let nodes = assemble(
                 &jid("X@s.whatsapp.net"),
                 Some(meta),
                 Some(quick_reply_biz()),
@@ -5333,11 +5373,137 @@ mod tests {
         fn meta_only_preserves_order() {
             let meta = NodeBuilder::new("meta").build();
             let user = NodeBuilder::new("u").build();
-            let nodes =
-                build_extra_stanza_nodes(&jid("X@s.whatsapp.net"), Some(meta), None, vec![user]);
+            let nodes = assemble(&jid("X@s.whatsapp.net"), Some(meta), None, vec![user]);
             assert_eq!(nodes.len(), 2);
             assert_eq!(nodes[0].tag, "meta");
             assert_eq!(nodes[1].tag, "u");
+        }
+
+        fn conflict(to: &str, user_nodes: Vec<Node>) -> SendError {
+            build_extra_stanza_nodes(&jid(to), None, Some(payment_biz()), user_nodes)
+                .expect_err("caller node duplicating a derived one must be refused")
+        }
+
+        /// A caller that hands us its own `<biz>` next to the one we derive
+        /// used to get both on the wire, and the button rendered nowhere.
+        #[test]
+        fn caller_biz_next_to_derived_biz_is_refused() {
+            for to in ["120363000000000001@g.us", "5511999999999@s.whatsapp.net"] {
+                let error = conflict(
+                    to,
+                    vec![
+                        NodeBuilder::new("biz")
+                            .attr("native_flow_name", "payment_info")
+                            .build(),
+                    ],
+                );
+                assert!(matches!(error, SendError::InvalidRequest(_)), "{to}");
+                assert!(error.to_string().contains("<biz>"), "{to}: {error}");
+            }
+        }
+
+        /// A caller asking for a different flow name than the button implies is
+        /// the same conflict: we cannot tell which one the server honours, so
+        /// the send is refused rather than picking a winner.
+        #[test]
+        fn caller_biz_with_a_diverging_flow_name_is_refused() {
+            let error = conflict(
+                "120363000000000001@g.us",
+                vec![
+                    NodeBuilder::new("biz")
+                        .attr("native_flow_name", "review_and_pay")
+                        .build(),
+                ],
+            );
+            assert!(error.to_string().contains("<biz>"), "{error}");
+        }
+
+        /// DM: the derived `<bot biz_bot="1"/>` collides the same way.
+        #[test]
+        fn caller_bot_next_to_derived_bot_is_refused() {
+            let error = conflict(
+                "5511999999999@s.whatsapp.net",
+                vec![NodeBuilder::new("bot").attr("biz_bot", "1").build()],
+            );
+            assert!(error.to_string().contains("<bot>"), "{error}");
+        }
+
+        /// Groups get no `<bot>`, so a caller's own `<bot>` collides with
+        /// nothing and still reaches the stanza.
+        #[test]
+        fn caller_bot_reaches_a_group_stanza() {
+            let nodes = assemble(
+                &jid("120363000000000001@g.us"),
+                None,
+                Some(payment_biz()),
+                vec![NodeBuilder::new("bot").build()],
+            );
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0].tag, "biz");
+            assert_eq!(nodes[1].tag, "bot");
+        }
+
+        /// Nothing derived means nothing to collide with: a caller driving a
+        /// shape we do not infer keeps its escape hatch.
+        #[test]
+        fn caller_biz_alone_passes_through() {
+            let nodes = assemble(
+                &jid("5511999999999@s.whatsapp.net"),
+                None,
+                None,
+                vec![NodeBuilder::new("biz").attr("campaign_id", "x").build()],
+            );
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].tag, "biz");
+        }
+
+        /// The case that already worked: derived `<biz>` alone, attrs intact,
+        /// exactly one on the stanza.
+        #[test]
+        fn derived_biz_alone_is_unchanged() {
+            let nodes = assemble(
+                &jid("120363000000000001@g.us"),
+                None,
+                Some(payment_biz()),
+                vec![],
+            );
+            assert_eq!(nodes.iter().filter(|node| node.tag == "biz").count(), 1);
+            assert_biz_common_attrs(&nodes[0], "derived biz");
+            assert_eq!(
+                nodes[0]
+                    .attrs()
+                    .optional_string("native_flow_name")
+                    .unwrap()
+                    .as_ref(),
+                "payment_info"
+            );
+        }
+
+        /// A caller node on a tag we do not emit keeps its slot after the
+        /// derived ones.
+        #[test]
+        fn non_colliding_caller_node_keeps_its_position() {
+            let nodes = assemble(
+                &jid("5511999999999@s.whatsapp.net"),
+                Some(NodeBuilder::new("meta").build()),
+                Some(payment_biz()),
+                vec![NodeBuilder::new("custom-extension").build()],
+            );
+            assert_eq!(nodes.len(), 4);
+            assert_eq!(nodes[3].tag, "custom-extension");
+        }
+
+        /// `<meta>` is not part of the rule: WA Web itself puts two of them on
+        /// one message, so a caller adding one is not a conflict.
+        #[test]
+        fn caller_meta_is_not_a_conflict() {
+            let nodes = assemble(
+                &jid("120363000000000001@g.us"),
+                Some(NodeBuilder::new("meta").attr("appdata", "default").build()),
+                Some(payment_biz()),
+                vec![NodeBuilder::new("meta").attr("origin", "x").build()],
+            );
+            assert_eq!(nodes.iter().filter(|node| node.tag == "meta").count(), 2);
         }
     }
 
