@@ -33,6 +33,7 @@ use anyhow::{Context, Result, bail, ensure};
 use source::{Ir, Lock};
 
 /// Where the IR comes from.
+#[derive(Debug)]
 enum Origin {
     /// The commit the lock pins, fetched into the target directory.
     Pinned,
@@ -40,6 +41,7 @@ enum Origin {
     Local(PathBuf),
 }
 
+#[derive(Debug)]
 struct Options {
     origin: Origin,
     check: bool,
@@ -149,6 +151,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Options> {
         !(opts.check && opts.update_lock),
         "--check and --update-lock contradict each other"
     );
+    // A lock says "commit X hashes to these digests". Resolving the rev against
+    // the remote while hashing an unrelated local tree writes a claim nobody
+    // ever checked, and it only surfaces on the next pinned run.
+    ensure!(
+        !(opts.update_lock && matches!(opts.origin, Origin::Local(_))),
+        "--from and --update-lock contradict each other: the lock would pin a remote rev and record local digests"
+    );
     Ok(opts)
 }
 
@@ -221,7 +230,7 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         },
         Artifact {
             path: "wacore/src/iq/abprops.rs",
-            content: emit::abprops::generate(&abprops),
+            content: emit::abprops::generate(&abprops)?,
             rust: true,
         },
         Artifact {
@@ -231,7 +240,7 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         },
         Artifact {
             path: "wacore/appstate/src/schemas.rs",
-            content: emit::appstate::generate(&appstate),
+            content: emit::appstate::generate(&appstate)?,
             rust: true,
         },
         Artifact {
@@ -306,7 +315,10 @@ fn finalize(root: &Path, a: &Artifact) -> Result<String> {
 fn rustfmt(root: &Path, source: &str) -> Result<String> {
     let dir = root.join("target/whatspec-codegen");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join("scratch.rs");
+    // Per-process, because CI's `--check` and a developer regenerating in the
+    // same checkout would otherwise overwrite each other's scratch between the
+    // write and the read-back, and the loser commits the winner's bytes.
+    let path = dir.join(format!("scratch-{}.rs", std::process::id()));
     std::fs::write(&path, source)?;
     let out = Command::new("rustfmt")
         .current_dir(root)
@@ -320,7 +332,9 @@ fn rustfmt(root: &Path, source: &str) -> Result<String> {
         "rustfmt rejected generated source: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
-    std::fs::read_to_string(&path).context("reading back the formatted source")
+    let formatted = std::fs::read_to_string(&path).context("reading back the formatted source")?;
+    let _ = std::fs::remove_file(&path);
+    Ok(formatted)
 }
 
 /// Rebuild `whatsapp.desc` from the `.proto` we just wrote.
@@ -378,6 +392,14 @@ mod tests {
         // --check proves the tree matches the lock; --update-lock rewrites the
         // lock to match the tree. Together they prove nothing.
         assert!(parse(&["--check", "--update-lock"]).is_err());
+        // A lock recording remote rev X against digests read from an unrelated
+        // local tree is a claim that was never checked.
+        let err = parse(&["--from", "/tmp/ir", "--update-lock"])
+            .expect_err("--from cannot source an updated lock");
+        assert!(
+            err.to_string().contains("--from and --update-lock"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! `wacore/appstate/src/schemas.rs`: the syncd action registry.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use anyhow::{Context, Result};
 
 use crate::ir::{AppstateIr, IndexPart};
-use crate::naming::{pascal_case, rust_lit, snake_case, unique_ident};
+use crate::naming::{pascal_case, rust_lit, snake_case, unique_ident, unique_type_ident};
 
 const HEADER: &str = "\
 //! Typed registry of syncd actions: collection, version, scope, value proto type,
@@ -62,42 +64,58 @@ pub struct Schema {
 
 ";
 
-pub fn generate(ir: &AppstateIr) -> String {
+pub fn generate(ir: &AppstateIr) -> Result<String> {
     let mut out = super::header("AppState (syncd) action schemas", &ir.wa_version);
     out.push_str(HEADER);
 
-    out.push_str(&render_enum(
+    let (collection_enum, collection_variants) = render_enum(
         "/// A syncd collection (mutation bucket / priority).",
         "Collection",
         ir.collections.iter().map(String::as_str),
-    ));
+    );
+    out.push_str(&collection_enum);
     let scopes: BTreeSet<&str> = ir.actions.values().map(|a| a.scope.as_str()).collect();
-    out.push_str(&render_enum(
-        "/// The index scope an action applies to.",
-        "Scope",
-        scopes.iter().copied(),
-    ));
+    out.push_str(
+        &render_enum(
+            "/// The index scope an action applies to.",
+            "Scope",
+            scopes.iter().copied(),
+        )
+        .0,
+    );
     out.push_str(INDEX_PART_AND_SCHEMA);
 
+    // Every `Collection::` below has to name a variant the enum just declared,
+    // or the generated file does not compile and the failure lands on whoever
+    // runs the next build instead of on this run.
+    let variant = |wire: &str| -> Result<String> {
+        collection_variants
+            .get(wire)
+            .map(|v| format!("Collection::{v}"))
+            .with_context(|| format!("collection {wire:?} is not in the IR's collection list"))
+    };
     let collections: Vec<String> = ir
         .collections
         .iter()
-        .map(|c| format!("Collection::{}", pascal_case(c)))
-        .collect();
+        .map(|c| variant(c))
+        .collect::<Result<_>>()?;
     out.push_str(&format!(
         "/// All syncd collections, in dependency order.\npub const COLLECTIONS: &[Collection] = &[{}];\n\n",
         collections.join(", ")
     ));
+    // The bucket an action falls into when the bundle names none.
+    let default_collection = variant("regular").context(
+        "the IR declares no `regular` collection, so the no-bucket fallback would not compile",
+    )?;
 
     let mut all_entries: Vec<String> = Vec::new();
     let mut used_consts = HashSet::new();
     for (key, action) in &ir.actions {
         let const_name = unique_ident(&snake_case(key).to_uppercase(), &mut used_consts, "ACTION");
-        let collection = action
-            .collection
-            .as_deref()
-            .map(|c| format!("Collection::{}", pascal_case(c)))
-            .unwrap_or_else(|| "Collection::Regular".to_string());
+        let collection = match action.collection.as_deref() {
+            Some(c) => variant(c).with_context(|| format!("action {key}"))?,
+            None => default_collection.clone(),
+        };
         let enum_fields = match &action.value_enum_fields {
             Some(m) if !m.is_empty() => format!(
                 "&[{}]",
@@ -147,7 +165,7 @@ pub fn generate(ir: &AppstateIr) -> String {
          pub fn by_name(key: &str) -> Option<&'static Schema> {\n\
          \x20   ALL.iter().find(|s| s.key == key)\n}\n",
     );
-    out
+    Ok(out)
 }
 
 fn opt_lit(v: Option<&str>) -> String {
@@ -158,24 +176,42 @@ fn opt_lit(v: Option<&str>) -> String {
 }
 
 /// A C-like enum over wire strings, plus the `as_str` that maps back.
-fn render_enum<'a>(doc: &str, name: &str, values: impl Iterator<Item = &'a str> + Clone) -> String {
+///
+/// Returns the rendered enum and the wire-string-to-variant map, because
+/// `pascal_case` is not injective (`critical_block` and `criticalBlock` both
+/// give `CriticalBlock`) and every site that names a variant has to agree with
+/// the declaration on which of the two got suffixed.
+fn render_enum<'a>(
+    doc: &str,
+    name: &str,
+    values: impl Iterator<Item = &'a str>,
+) -> (String, BTreeMap<String, String>) {
+    let mut used = HashSet::new();
+    let variants: Vec<(&str, String)> = values
+        .map(|v| (v, unique_type_ident(&pascal_case(v), &mut used, "V")))
+        .collect();
+
     let mut s =
         format!("{doc}\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum {name} {{\n");
-    for v in values.clone() {
-        s.push_str(&format!("    {},\n", pascal_case(v)));
+    for (_, variant) in &variants {
+        s.push_str(&format!("    {variant},\n"));
     }
     s.push_str(&format!(
         "}}\n\nimpl {name} {{\n    pub const fn as_str(self) -> &'static str {{\n        match self {{\n"
     ));
-    for v in values {
+    for (wire, variant) in &variants {
         s.push_str(&format!(
-            "            {name}::{} => {},\n",
-            pascal_case(v),
-            rust_lit(v)
+            "            {name}::{variant} => {},\n",
+            rust_lit(wire)
         ));
     }
     s.push_str("        }\n    }\n}\n\n");
-    s
+
+    let map = variants
+        .into_iter()
+        .map(|(wire, variant)| (wire.to_string(), variant))
+        .collect();
+    (s, map)
 }
 
 fn render_index_part(part: &IndexPart) -> String {
@@ -205,6 +241,12 @@ fn render_index_part(part: &IndexPart) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The emitters are fallible now; a test IR that trips a guard should
+    /// fail the test, not be silently skipped.
+    fn emitted(ir: &AppstateIr) -> String {
+        generate(ir).expect("emitter rejected the test IR")
+    }
     use crate::ir::AppstateAction;
     use std::collections::BTreeMap;
 
@@ -240,8 +282,46 @@ mod tests {
     }
 
     #[test]
+    fn an_action_naming_an_undeclared_collection_is_rejected() {
+        // The variant would not exist on the enum, so the emitted file would
+        // not compile and the failure would land on the next build instead.
+        let err = generate(&ir(vec![(
+            "Agent",
+            action("deviceAgent", "account", Some("no_such_bucket")),
+        )]))
+        .expect_err("an undeclared collection must not be emitted");
+        assert!(format!("{err:#}").contains("no_such_bucket"), "{err:#}");
+    }
+
+    #[test]
+    fn an_ir_without_the_regular_collection_is_rejected() {
+        // Actions with no declared bucket fall back to it, so its absence is
+        // the same dangling reference one step removed.
+        let mut bad = ir(vec![("Nux", action("nux", "account", None))]);
+        bad.collections = vec!["critical_block".into()];
+        let err = generate(&bad).expect_err("the fallback bucket must exist");
+        assert!(err.to_string().contains("regular"), "{err}");
+    }
+
+    #[test]
+    fn collection_names_that_pascal_case_alike_stay_distinct_variants() {
+        let mut ir = ir(vec![("Agent", action("deviceAgent", "account", None))]);
+        ir.collections = vec![
+            "regular".into(),
+            "criticalBlock".into(),
+            "critical_block".into(),
+        ];
+        let code = emitted(&ir);
+        assert!(code.contains("    CriticalBlock,\n"), "{code}");
+        assert!(code.contains("    CriticalBlock2,\n"), "{code}");
+        // Each variant keeps its own wire string.
+        assert!(code.contains("Collection::CriticalBlock => \"criticalBlock\","));
+        assert!(code.contains("Collection::CriticalBlock2 => \"critical_block\","));
+    }
+
+    #[test]
     fn emits_a_const_per_action_with_its_index() {
-        let code = generate(&ir(vec![(
+        let code = emitted(&ir(vec![(
             "Agent",
             action("deviceAgent", "account", Some("regular")),
         )]));
@@ -263,7 +343,7 @@ mod tests {
         // WA Web builds a few actions with no declared bucket; the wire default
         // is the regular collection, and emitting `Collection::` alone would not
         // compile.
-        let code = generate(&ir(vec![("Nux", action("nux", "account", None))]));
+        let code = emitted(&ir(vec![("Nux", action("nux", "account", None))]));
         assert!(code.contains("collection: Collection::Regular,"));
     }
 
@@ -278,7 +358,7 @@ mod tests {
             "settingKey".to_string(),
             "SettingsSyncAction.SettingKey".to_string(),
         )]));
-        let code = generate(&ir(vec![("SettingsSync", a)]));
+        let code = emitted(&ir(vec![("SettingsSync", a)]));
         assert!(code.contains(
             "IndexPart::Enum { name: \"k\", proto_enum: \"SettingsSyncAction.SettingKey\" }"
         ));
@@ -289,7 +369,7 @@ mod tests {
 
     #[test]
     fn two_keys_that_upper_case_alike_do_not_collide() {
-        let code = generate(&ir(vec![
+        let code = emitted(&ir(vec![
             ("Agent", action("deviceAgent", "account", Some("regular"))),
             ("AGENT", action("deviceAgent2", "account", Some("regular"))),
         ]));

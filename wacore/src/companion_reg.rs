@@ -328,6 +328,7 @@ mod tests {
             P::TCL_TV,
             P::CLOUD_API,
             P::SMARTGLASSES,
+            P::WAIL,
         ] {
             assert_eq!(
                 companion_web_client_type_for_platform(pt),

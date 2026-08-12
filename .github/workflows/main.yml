@@ -42,12 +42,24 @@ jobs:
     # half-refreshed tree is a diff this job can name. Lives beside `format`
     # rather than in a build job: it needs rustfmt and git, not protoc (--check
     # never rebuilds the descriptor) and not a compiled workspace.
+    # Bounded because the step fetches an external repository: a hung fetch
+    # would otherwise hold a required check open for the full six hours.
+    timeout-minutes: 15
     steps:
+      # This job never pushes, and the codegen shells out to `git fetch` against
+      # a different repository; the checkout token has no business being left in
+      # .git/config for that.
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
           components: rustfmt
+      # RUSTC_WRAPPER is set workspace-wide, so cargo needs sccache on PATH even
+      # in a job this small.
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - run: cargo run -p whatspec-codegen -- --check
 
   clippy:

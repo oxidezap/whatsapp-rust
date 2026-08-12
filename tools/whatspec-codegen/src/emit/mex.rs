@@ -27,6 +27,10 @@ pub fn generate(ir: &MexIr) -> String {
         // An operation named e.g. `match` would otherwise emit `pub mod match`.
         let module = unique_ident(&snake_case(short), &mut used_mods, "op");
         let mut b = Builder::default();
+        // Both before either walk: a nested object inside `variables_shape` can
+        // just as easily want the name `Response`.
+        b.reserve("Variables");
+        b.reserve("Response");
         b.register("Variables", &op.variables_shape);
         b.register("Response", &op.response);
 
@@ -102,20 +106,41 @@ struct Builder {
     /// Struct name to its signature, to merge identical shapes and disambiguate
     /// distinct shapes that want the same name.
     by_name: BTreeMap<String, String>,
+    /// Names the operation module has to expose verbatim.
+    reserved: HashSet<String>,
 }
 
 impl Builder {
+    /// Claim a name for a top-level struct before any nested object can take it.
+    ///
+    /// Children are interned before their parent, so without this a response
+    /// field literally named `response` renames the operation's own `Response`
+    /// to `Response2` — a generated-API break that depends on field naming luck.
+    fn reserve(&mut self, name: &str) {
+        self.reserved.insert(name.to_string());
+    }
+
     fn register(&mut self, name: &str, fields: &BTreeMap<String, TypeNode>) -> String {
+        let def = self.struct_def(name, fields);
+        self.intern(def, true)
+    }
+
+    /// Build one struct, interning any object-typed field as its own struct.
+    fn struct_def(&mut self, name: &str, fields: &BTreeMap<String, TypeNode>) -> StructDef {
         let mut def = StructDef {
             name: name.to_string(),
             fields: Vec::new(),
         };
+        // `rust_ident` is not injective: `fooBar` and `foo_bar` are one Rust
+        // field. Two of them in the same object would emit the field twice.
+        let mut used_fields = HashSet::new();
         for (key, node) in fields {
             let ty = self.field_type(node, &pascal_case(key));
+            let field = unique_ident(&rust_ident(key), &mut used_fields, "f");
             def.fields
-                .push((rust_ident(key), key.clone(), format!("Option<{ty}>")));
+                .push((field, key.clone(), format!("Option<{ty}>")));
         }
-        self.intern(def)
+        def
     }
 
     fn field_type(&mut self, node: &TypeNode, name_hint: &str) -> String {
@@ -131,21 +156,13 @@ impl Builder {
                 format!("Vec<{inner}>")
             }
             TypeNode::Object(map) => {
-                let mut def = StructDef {
-                    name: name_hint.to_string(),
-                    fields: Vec::new(),
-                };
-                for (key, child) in map {
-                    let ty = self.field_type(child, &pascal_case(key));
-                    def.fields
-                        .push((rust_ident(key), key.clone(), format!("Option<{ty}>")));
-                }
-                self.intern(def)
+                let def = self.struct_def(name_hint, map);
+                self.intern(def, false)
             }
         }
     }
 
-    fn intern(&mut self, mut def: StructDef) -> String {
+    fn intern(&mut self, mut def: StructDef, top_level: bool) -> String {
         if def.name.is_empty() {
             def.name = "Item".to_string();
         }
@@ -154,6 +171,11 @@ impl Builder {
         let mut name = base.clone();
         let mut n = 2;
         loop {
+            if !top_level && self.reserved.contains(&name) {
+                name = format!("{base}{n}");
+                n += 1;
+                continue;
+            }
             match self.by_name.get(&name) {
                 Some(existing) if *existing == sig => return name,
                 Some(_) => {
@@ -305,6 +327,41 @@ mod tests {
         ));
         assert_eq!(code.matches("pub struct Node {").count(), 1);
         assert!(!code.contains("pub struct Node2"));
+    }
+
+    #[test]
+    fn a_nested_object_cannot_take_the_top_level_struct_names() {
+        // `op::Variables` and `op::Response` are the generated API. A field
+        // named after either one must not push the real struct to `Response2`.
+        let code = generate(&ir(
+            "FetchThing",
+            op(
+                &[("response", obj(&[("a", leaf("string"))]))],
+                &[("variables", obj(&[("b", leaf("string"))]))],
+            ),
+        ));
+        assert!(code.contains("pub struct Variables {"), "{code}");
+        assert!(code.contains("pub struct Response {"), "{code}");
+        assert!(code.contains("pub struct Response2 {"), "{code}");
+        assert!(code.contains("pub struct Variables2 {"), "{code}");
+    }
+
+    #[test]
+    fn two_keys_that_snake_case_alike_stay_two_fields() {
+        // `rust_ident` is not injective, and a struct cannot declare the same
+        // field twice.
+        let code = generate(&ir(
+            "FetchThing",
+            op(
+                &[],
+                &[("fooBar", leaf("string")), ("foo_bar", leaf("string"))],
+            ),
+        ));
+        assert_eq!(code.matches("pub foo_bar:").count(), 1, "{code}");
+        assert_eq!(code.matches("pub foo_bar_2:").count(), 1, "{code}");
+        // Both keys still deserialize from their own wire name.
+        assert!(code.contains("#[serde(rename = \"fooBar\")]"), "{code}");
+        assert!(code.contains("#[serde(rename = \"foo_bar\")]"), "{code}");
     }
 
     #[test]

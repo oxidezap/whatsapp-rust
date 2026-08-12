@@ -165,11 +165,56 @@ pub fn resolve_rev(repo: &str, git_ref: &str) -> Result<String> {
         String::from_utf8_lossy(&out.stderr).trim()
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let sha = stdout
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().next())
-        .with_context(|| format!("{repo} has no ref matching {git_ref:?}"))?;
+    resolve_from_ls_remote(&stdout, repo, git_ref)
+}
+
+/// Pick the one commit a `git ls-remote` listing pins the requested ref to.
+///
+/// `ls-remote` matches the *tail* of a ref name, so asking for `main` also
+/// prints `refs/heads/feature/main`. Taking the first line would then pin a
+/// commit nobody asked for, and the lock records that as fact. Only a ref whose
+/// name is exactly `<ref>`, `refs/heads/<ref>` or `refs/tags/<ref>` counts.
+fn resolve_from_ls_remote(stdout: &str, repo: &str, git_ref: &str) -> Result<String> {
+    let wanted = [
+        git_ref.to_string(),
+        format!("refs/heads/{git_ref}"),
+        format!("refs/tags/{git_ref}"),
+    ];
+    let mut exact: Vec<(&str, &str)> = Vec::new();
+    for line in stdout.lines() {
+        let mut cols = line.split_whitespace();
+        let (Some(sha), Some(name)) = (cols.next(), cols.next()) else {
+            continue;
+        };
+        // An annotated tag prints twice; the `^{}` line carries the commit the
+        // tag points at, which is what a checkout would land on.
+        let bare = name.strip_suffix("^{}").unwrap_or(name);
+        if wanted.iter().any(|w| w == bare) {
+            exact.push((sha, name));
+        }
+    }
+    ensure!(
+        !exact.is_empty(),
+        "{repo} has no ref named exactly {git_ref:?}"
+    );
+    let names: Vec<&str> = exact
+        .iter()
+        .map(|(_, n)| *n)
+        .filter(|n| !n.ends_with("^{}"))
+        .collect();
+    ensure!(
+        names.len() <= 1,
+        "{git_ref:?} is ambiguous in {repo}: it names {}",
+        names.join(", ")
+    );
+    let sha = exact
+        .iter()
+        .find(|(_, n)| n.ends_with("^{}"))
+        .map_or(exact[0].0, |(sha, _)| *sha);
+    ensure!(
+        sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "`git ls-remote {repo} {git_ref}` returned {sha:?}, which is not a commit sha"
+    );
     Ok(sha.to_string())
 }
 
@@ -182,7 +227,7 @@ pub fn verify(ir: &Ir, lock: &Lock) -> Result<()> {
         })?;
         let got = actual
             .get(*rel)
-            .expect("digests cover exactly the files that were read");
+            .with_context(|| format!("IR file {rel} was never read"))?;
         ensure!(
             want == got,
             "IR file {rel} does not match the lock\n  expected {want}\n  got      {got}"
@@ -254,6 +299,41 @@ mod tests {
         let lock = lock_with(BTreeMap::from([(IR_FILES[0].to_string(), digest(b"x"))]));
         let err = verify(&ir_with(&full_ir("x")), &lock).expect_err("incomplete lock");
         assert!(err.to_string().contains("--update-lock"), "{err}");
+    }
+
+    #[test]
+    fn a_ref_resolves_only_against_an_exact_ref_name() {
+        let sha = "a".repeat(40);
+        let other = "b".repeat(40);
+        // `ls-remote` matches ref-name tails, so asking for `main` also prints
+        // `feature/main`. Pinning that would record a commit nobody asked for.
+        let only_tail = format!("{other}\trefs/heads/feature/main\n");
+        let err = resolve_from_ls_remote(&only_tail, "r", "main").expect_err("tail is not a match");
+        assert!(err.to_string().contains("no ref named exactly"), "{err}");
+
+        let both = format!("{sha}\trefs/heads/main\n{other}\trefs/heads/feature/main\n");
+        assert_eq!(
+            resolve_from_ls_remote(&both, "r", "main").expect("exact"),
+            sha
+        );
+    }
+
+    #[test]
+    fn an_annotated_tag_resolves_to_the_commit_it_points_at() {
+        let tag = "c".repeat(40);
+        let commit = "d".repeat(40);
+        let out = format!("{tag}\trefs/tags/v1.0\n{commit}\trefs/tags/v1.0^{{}}\n");
+        assert_eq!(
+            resolve_from_ls_remote(&out, "r", "v1.0").expect("peeled"),
+            commit
+        );
+    }
+
+    #[test]
+    fn a_ref_line_that_is_not_a_sha_is_rejected() {
+        let err = resolve_from_ls_remote("not-a-sha\trefs/heads/main\n", "r", "main")
+            .expect_err("a lock may only pin a commit");
+        assert!(err.to_string().contains("not a commit sha"), "{err}");
     }
 
     #[test]

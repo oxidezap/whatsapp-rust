@@ -12,7 +12,7 @@ const RUST_KEYWORDS: &[&str] = &[
     "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
     "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
     "while", "async", "await", "dyn", "gen", "abstract", "become", "box", "do", "final", "macro",
-    "override", "priv", "typeof", "unsized", "virtual", "yield",
+    "override", "priv", "try", "typeof", "unsized", "virtual", "yield",
 ];
 
 /// Keywords a raw identifier cannot spell (`r#self` is a compile error), so they
@@ -140,6 +140,27 @@ pub fn unique_ident(base: &str, used: &mut HashSet<String>, fallback_prefix: &st
             n += 1;
         }
         name = format!("{name}_{n}");
+    }
+    used.insert(name.clone());
+    name
+}
+
+/// [`unique_ident`] for a name that has to stay UpperCamelCase.
+///
+/// The `_2` suffix would make an enum variant trip `non_camel_case_types`, and
+/// the generated file is compiled with warnings denied.
+pub fn unique_type_ident(base: &str, used: &mut HashSet<String>, fallback_prefix: &str) -> String {
+    let mut name = ensure_ident(if base.is_empty() {
+        fallback_prefix
+    } else {
+        base
+    });
+    if used.contains(&name) {
+        let mut n = 2;
+        while used.contains(&format!("{name}{n}")) {
+            n += 1;
+        }
+        name = format!("{name}{n}");
     }
     used.insert(name.clone());
     name

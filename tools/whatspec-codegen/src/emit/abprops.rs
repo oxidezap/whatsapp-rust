@@ -2,6 +2,8 @@
 
 use std::collections::HashSet;
 
+use anyhow::{Result, ensure};
+
 use crate::ir::{AbPropConfig, AbPropType, AbPropsIr, Scalar};
 use crate::naming::{float_lit, rust_lit, snake_case, unique_ident};
 
@@ -39,16 +41,24 @@ pub struct AbProp {
 
 ";
 
-pub fn generate(ir: &AbPropsIr) -> String {
+pub fn generate(ir: &AbPropsIr) -> Result<String> {
     let mut out = super::header("A/B-props registry", &ir.wa_version);
     out.push_str(HEADER);
 
     // `configs` arrives sorted by (module, name); one Rust module per run.
     let mut module_idents = HashSet::new();
     let mut emitted: Vec<String> = Vec::new();
+    // Interleaved modules would visit the same registry twice and split it
+    // across `web` and `web_2` — a silent API rename that `--check` would then
+    // bless. Fail on the IR instead.
+    let mut seen_modules: HashSet<&str> = HashSet::new();
     let mut i = 0;
     while i < ir.configs.len() {
         let wa_module = ir.configs[i].module.as_str();
+        ensure!(
+            seen_modules.insert(wa_module),
+            "abprops IR is not grouped by module: {wa_module} appears in two runs"
+        );
         let mut j = i;
         while j < ir.configs.len() && ir.configs[j].module == wa_module {
             j += 1;
@@ -67,7 +77,7 @@ pub fn generate(ir: &AbPropsIr) -> String {
         out.push_str(&format!("    {m}::ALL,\n"));
     }
     out.push_str("];\n");
-    out
+    Ok(out)
 }
 
 fn render_module(ident: &str, wa_module: &str, group: &[AbPropConfig]) -> String {
@@ -135,6 +145,12 @@ fn default_lit(s: &Scalar) -> String {
 mod tests {
     use super::*;
 
+    /// The emitters are fallible now; a test IR that trips a guard should
+    /// fail the test, not be silently skipped.
+    fn emitted(ir: &AbPropsIr) -> String {
+        generate(ir).expect("emitter rejected the test IR")
+    }
+
     fn cfg(module: &str, name: &str, code: u32, ty: AbPropType, default: Scalar) -> AbPropConfig {
         AbPropConfig {
             module: module.into(),
@@ -154,7 +170,7 @@ mod tests {
 
     #[test]
     fn emits_one_tree_shakeable_const_per_flag() {
-        let code = generate(&ir(vec![
+        let code = emitted(&ir(vec![
             cfg(
                 "WAWebABPropsConfigs",
                 "flag_b",
@@ -181,7 +197,7 @@ mod tests {
 
     #[test]
     fn keeps_registries_apart_and_disambiguates_names() {
-        let code = generate(&ir(vec![
+        let code = emitted(&ir(vec![
             cfg(
                 "WAWebABPropsConfigs",
                 "shared",
@@ -213,8 +229,39 @@ mod tests {
     }
 
     #[test]
+    fn an_ir_not_grouped_by_module_is_rejected() {
+        // The run-grouping loop would visit the same registry twice and split
+        // it across `web` and `web_2`, renaming half the flags in silence.
+        let err = generate(&ir(vec![
+            cfg(
+                "WAWebABPropsConfigs",
+                "a",
+                1,
+                AbPropType::Bool,
+                Scalar::Bool(false),
+            ),
+            cfg(
+                "WAWebHybridABPropsConfigs",
+                "b",
+                2,
+                AbPropType::Bool,
+                Scalar::Bool(false),
+            ),
+            cfg(
+                "WAWebABPropsConfigs",
+                "c",
+                3,
+                AbPropType::Bool,
+                Scalar::Bool(false),
+            ),
+        ]))
+        .expect_err("interleaved modules must not be emitted");
+        assert!(err.to_string().contains("two runs"), "{err}");
+    }
+
+    #[test]
     fn a_non_finite_float_default_still_renders_a_literal() {
-        let code = generate(&ir(vec![cfg(
+        let code = emitted(&ir(vec![cfg(
             "WAWebABPropsConfigs",
             "nanflag",
             1,
@@ -227,7 +274,7 @@ mod tests {
 
     #[test]
     fn a_default_holding_quotes_stays_a_valid_literal() {
-        let code = generate(&ir(vec![cfg(
+        let code = emitted(&ir(vec![cfg(
             "WAWebABPropsConfigs",
             "quoted",
             1,
