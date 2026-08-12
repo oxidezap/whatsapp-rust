@@ -19,8 +19,9 @@ use wacore::types::events::{
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
-/// Error returned by app-state (syncd) mutations — the shared failure domain
-/// of chat actions ([`ChatActions`]) and labels ([`crate::Labels`]).
+/// Error returned by app-state (syncd) requests — the shared failure domain of
+/// chat actions ([`ChatActions`]), labels ([`crate::Labels`]) and re-syncs
+/// ([`crate::Client::resync_app_state`]).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AppStateError {
@@ -29,6 +30,11 @@ pub enum AppStateError {
     /// label id).
     #[error("invalid app-state request: {0}")]
     InvalidRequest(String),
+    /// The transport, not the request, is what stopped it: the client is
+    /// shutting down, was never started, or lost the socket before the request
+    /// could be sent or answered.
+    #[error("no usable connection for the app-state request")]
+    NotConnected,
     /// Encoding, key lookup, or sending the app-state patch failed.
     #[error("{0}")]
     Internal(#[from] anyhow::Error),

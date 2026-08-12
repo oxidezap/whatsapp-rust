@@ -2227,6 +2227,9 @@ mod tests {
         client
             .connection_generation
             .store(CURRENT_GENERATION, Ordering::SeqCst);
+        // Announcing now requires an authenticated session, so the fixture has to
+        // be one; this test is about which generation wins, not about login.
+        client.is_logged_in.store(true, Ordering::Relaxed);
         let registration = client.lifecycle.as_ref().expect("lifecycle registration");
         assert!(registration.begin_scope_if_current(CURRENT_GENERATION, || true));
 

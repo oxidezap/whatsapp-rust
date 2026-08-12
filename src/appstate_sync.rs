@@ -575,7 +575,7 @@ mod tests {
     /// pl.snapshot/pl.patches afterwards (get_missing_key_ids, has_more bookkeeping).
     #[tokio::test]
     async fn process_patch_list_returns_snapshot_and_patches_to_caller() {
-        let (_backend, processor, mut patch_list, _) = snapshot_resync_scenario().await;
+        let (backend, processor, mut patch_list, _) = snapshot_resync_scenario().await;
 
         let key_id_bytes = b"snap_key_id".to_vec();
         let master_key = [9u8; 32];
@@ -614,6 +614,20 @@ mod tests {
             .expect("snapshot + patches should process");
 
         assert_eq!(state.version, 4);
+        // Load-bearing beyond this test: the batched sync stopped writing the
+        // returned state back, on the strength of the processor having persisted
+        // it already. A second write there lands after a reconnect may have let
+        // the replacement connection move the collection on, putting the older
+        // version back next to newer mutation MACs.
+        assert_eq!(
+            backend
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .unwrap()
+                .version,
+            state.version,
+            "the state handed back must be the state already persisted"
+        );
         assert_eq!(
             mutations.len(),
             3,
@@ -785,6 +799,41 @@ mod tests {
             patch.snapshot_mac.as_deref(),
             Some(expected_snapshot_mac.as_slice()),
             "snapshot_mac must reflect subtract(old)+add(new); a broken prev-MAC prefetch diverges here"
+        );
+    }
+
+    /// The stale-snapshot guard stops a snapshot from rewinding a collection,
+    /// and nothing lifts it — a rebuild stands the collection down to unsynced
+    /// first, so the snapshot it then receives is never measured against a
+    /// version at all.
+    #[tokio::test]
+    async fn a_snapshot_at_the_persisted_version_is_discarded() {
+        let (backend, processor, patch_list, stale_index_mac) = snapshot_resync_scenario().await;
+        // The snapshot is v2; persisting v2 makes it exactly as new, which the
+        // guard treats as stale.
+        backend
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                HashState {
+                    version: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept version");
+
+        processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("a discarded snapshot is not an error");
+
+        assert!(
+            backend
+                .get_mutation_mac(WAPatchName::Regular.as_str(), &stale_index_mac)
+                .await
+                .unwrap()
+                .is_some(),
+            "the snapshot must not have been applied"
         );
     }
 

@@ -1351,6 +1351,8 @@ impl Client {
                     "Starting Initial App State Sync (flag_set={flag_set}, needs_pushname={needs_pushname_from_sync})"
                 );
 
+                const CRITICAL_COLLECTIONS: [WAPatchName; 2] =
+                    [WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow];
                 // Single deadline for the whole critical path (key-share grace + batched
                 // IQ + missing-key fallback). Matches WhatsApp Web's WAWebSyncBootstrap
                 // 180s critical-data deadline. Armed before the wait so every step below
@@ -1358,16 +1360,23 @@ impl Client {
                 const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
                 let critical_deadline = wacore::time::Instant::now()
                     + Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS);
-                // Explicit "critical sync completed" signal for the watchdog. A push_name
-                // check is not a reliable proxy: a business account gets push_name set
-                // from business_name at pairing (src/pair.rs) while still needing the
-                // full sync, so the watchdog would wrongly stand down on a failed sync.
-                let critical_sync_done =
+                // Claimed by whichever of the sync and the watchdog gets there
+                // first, and never by both. A plain "the sync finished" flag is not
+                // enough: `reconnect_immediately` sets `expected_disconnect` and
+                // then awaits seconds of bounded flushes before it closes the
+                // socket, so a sync landing in that window would abort the
+                // watchdog mid-teardown and leave the connection up, flagged for a
+                // disconnect that never comes, with `dispatch_connected` declining
+                // to announce it. The claim is also not a push_name check, which
+                // was never a reliable proxy: a business account gets push_name
+                // set from business_name at pairing (src/pair.rs) while still
+                // needing the full sync.
+                let critical_sync_settled =
                     Arc::new(AtomicBool::new(false));
                 let timeout_client = client_clone.clone();
                 let timeout_generation = task_generation;
                 let timeout_rt = client_clone.runtime.clone();
-                let timeout_done = critical_sync_done.clone();
+                let timeout_settled = critical_sync_settled.clone();
                 let critical_sync_timeout_handle = timeout_rt.spawn(Box::pin(async move {
                     timeout_client.runtime.sleep(Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS)).await;
                     // Check generation — if connection was replaced, this timeout is stale
@@ -1376,15 +1385,15 @@ impl Client {
                     {
                         return;
                     }
-                    if timeout_done.load(Ordering::SeqCst) {
+                    if timeout_settled.swap(true, Ordering::SeqCst) {
                         debug!(
                             target: "Client/AppState",
-                            "Critical sync timeout fired but critical sync already completed"
+                            "Critical sync timeout fired but the sync already settled"
                         );
                     } else {
                         warn!(
                             target: "Client/AppState",
-                            "Critical app state sync did not complete within {CRITICAL_SYNC_TIMEOUT_SECS}s. \
+                            "Critical app state sync produced no answer within {CRITICAL_SYNC_TIMEOUT_SECS}s. \
                              Reconnecting to retry."
                         );
                         // WhatsApp Web does socketLogout here which clears device identity.
@@ -1428,151 +1437,70 @@ impl Client {
                 // The deadline lets the missing-key fallback recover a late/never-shared
                 // key on this connection instead of stalling to the watchdog.
                 check_generation!();
-                // Critical collections that missed for a reason a retry can still
-                // fix. Only filled on the refused path below, which connects
-                // anyway: the watchdog cannot be the retry there, because the
-                // collection the server refused would fail again on every
-                // reconnect and the two would loop for good. So they ride along
-                // with the background sync instead of being dropped.
-                let mut critical_retry: Vec<WAPatchName> = Vec::new();
-                // Whether a critical collection was refused outright. Terminal,
-                // so it is not retried, but it still means the bootstrap never
-                // finished.
-                let mut critical_refused = false;
                 let critical_scope = client_clone.sync_scope(Some(critical_deadline));
-                match client_clone
-                    .sync_collections_batched(
-                        vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
-                        critical_scope,
-                    )
-                    .await
-                {
-                    Ok(outcome) if outcome.all_synced() => {
-                        // Critical sync completed — signal the watchdog, then cancel it.
-                        critical_sync_done.store(true, Ordering::SeqCst);
-                        critical_sync_timeout_handle.abort();
+                let result = client_clone
+                    .sync_collections_batched(CRITICAL_COLLECTIONS.to_vec(), critical_scope)
+                    .await;
 
-                        check_generation!();
+                // Whatever it says, this is the answer the watchdog was waiting
+                // for, so it stands down here rather than per branch. It cannot
+                // be the retry for a bad answer: the collection that failed
+                // would fail the same way on every reconnect, and the two would
+                // loop for good, announcing and dropping a live session every
+                // 180s, since `needs_pushname_from_sync` is derived from the
+                // persisted push name and survives even a restart. What did not
+                // sync rides along with the background sync instead, on this
+                // connection, which is also where a late app state key lands.
+                if critical_sync_settled.swap(true, Ordering::SeqCst) {
+                    // The watchdog claimed it first and is already retiring this
+                    // connection. Aborting it now would strand the teardown, and
+                    // announcing a connection it is closing would be a lie; the
+                    // replacement it brings up announces itself. detach() because
+                    // dropping the handle would abort the task.
+                    debug!(
+                        target: "Client/AppState",
+                        "Critical app state sync answered after the watchdog fired; leaving the reconnect to it"
+                    );
+                    critical_sync_timeout_handle.detach();
+                    return;
+                }
+                critical_sync_timeout_handle.abort();
 
-                        client_clone
-                            .resubscribe_presence_subscriptions(task_generation)
-                            .await;
-
-                        check_generation!();
-
-                        // Dispatch Connected after critical sync completes.
-                        // Presence is NOT sent here — WhatsApp Web sends presence from the
-                        // setting_pushName mutation handler (WAWebPushNameSync), not from
-                        // criticalSyncDone. Our setting_pushName handler already does this.
-                        client_clone.dispatch_connected(task_generation).await;
-                    }
-                    // The server refused a critical collection outright, and it
-                    // will refuse the same request again. Reconnecting cannot
-                    // clear a 400/404, and `needs_initial_full_sync` is only
-                    // cleared further down, so leaving the watchdog armed here
-                    // would reconnect into this same state every 180s — for
-                    // good, since `needs_pushname_from_sync` is derived from the
-                    // persisted push name and survives a restart.
-                    //
-                    // WA Web's answer is to notify the primary and log out
-                    // (`WAWebSyncdFatal`), which a library must not do on a
-                    // consumer's behalf. So: stop retrying, connect without the
-                    // collection, and hand the decision over as an event. The
-                    // account is reachable but missing whatever that collection
-                    // carried — for `critical_block` that includes the push
-                    // name, so presence stays unavailable until it arrives.
-                    Ok(outcome) if !outcome.fatal.is_empty() => {
-                        critical_sync_timeout_handle.abort();
-                        // Armed first, before anything a consumer handler can
-                        // interrupt. A refusal means the bootstrap is unfinished
-                        // whatever happens next, and everything below —
-                        // resubscribe, `Connected`, the failure event — can
-                        // retire this generation and take the decision with it,
-                        // leaving the flag false with the push name already
-                        // populated so the replacement skips what it still owes.
-                        client_clone.settle_bootstrap(critical_scope, true);
-                        // A refusal does not make the batch's other misses
-                        // terminal, and leaving them to the watchdog is not an
-                        // option once we connect. Retry them below instead.
-                        critical_retry
-                            .extend(outcome.retryable.iter().chain(&outcome.skipped).copied());
-                        // The refusal is not in `critical_retry` — retrying it
-                        // is pointless — but the bootstrap is still unfinished
-                        // because of it. Without carrying that, a clean
-                        // background run would stand the gate down for a
-                        // collection that never synced.
-                        critical_refused = true;
-                        warn!(
-                            target: "Client/AppState",
-                            "Critical app state sync refused for {:?}; connecting without it (retrying {:?})",
-                            outcome.fatal, critical_retry
-                        );
-                        check_generation!();
-                        client_clone
-                            .resubscribe_presence_subscriptions(task_generation)
-                            .await;
-                        check_generation!();
-                        client_clone.dispatch_connected(task_generation).await;
-                        // After the readiness transition, not before: the report
-                        // claims the session is usable, and until `Connected` is
-                        // actually published that claim can still be falsified by
-                        // a disconnect during the resubscribe above.
-                        //
-                        // Re-checked once more here because publishing
-                        // `Connected` runs consumer handlers, and one of them
-                        // disconnecting would retire this generation between the
-                        // two dispatches — long enough to hand the next session
-                        // a refusal it never earned.
-                        check_generation!();
-                        client_clone.dispatch_app_state_sync_failed(
-                            &outcome,
-                            client_clone.is_ready.load(Ordering::Relaxed),
-                        );
-                    }
-                    // Nothing terminal: a retryable error, a decode key that
-                    // never landed, or a collection held by another writer. The
-                    // watchdog stays alive to force the reconnect that retries.
-                    // detach() so this early return doesn't abort it on drop
-                    // (AbortHandle aborts the task when dropped).
+                // WA Web's answer to a critical collection it cannot get is to
+                // notify the primary and log out (`WAWebSyncdFatal`), which a
+                // library must not do on a consumer's behalf. Having chosen to
+                // keep the session, it owes the consumer the other half: the
+                // connection is announced and the gap is reported, because by
+                // this point `set_passive(false)` has already been sent and
+                // offline stanzas are being delivered to a consumer that still
+                // believes nothing ever connected.
+                let outcome = match result {
                     Ok(outcome) => {
-                        warn!(
-                            target: "Client/AppState",
-                            "Critical app state sync incomplete (retryable={:?} skipped={:?}); will retry",
-                            outcome.retryable, outcome.skipped
-                        );
-                        // Same reason as the arm above: never publish an outcome
-                        // that belongs to a retired socket. Returning here drops
-                        // the watchdog handle, which aborts it — correct for a
-                        // generation that already has its own.
-                        check_generation!();
-                        // Armed before returning, because the watchdog is not the
-                        // whole guarantee. This path is reachable with the flag
-                        // already false — an empty push name alone opens the
-                        // bootstrap — and a mixed response can apply
-                        // `critical_block`, push name included, while leaving
-                        // `critical_unblock_low` behind. The forced reconnect
-                        // would then see a populated name and a clear flag, take
-                        // the ordinary path, and never retry what is missing.
-                        client_clone.settle_bootstrap(critical_scope, true);
-                        client_clone.dispatch_app_state_sync_failed(&outcome, false);
-                        critical_sync_timeout_handle.detach();
-                        return;
+                        if !outcome.all_synced() {
+                            warn!(
+                                target: "Client/AppState",
+                                "Critical app state sync incomplete (fatal={:?} retryable={:?} skipped={:?}); connecting anyway",
+                                outcome.fatal, outcome.retryable, outcome.skipped
+                            );
+                        }
+                        outcome
                     }
                     Err(e) => {
                         client_clone.log_sync_error("critical app state sync", &e);
-                        // Armed for the same reason as the incomplete arm above,
-                        // and it matters just as much here: a batch can fail
-                        // partway, after `critical_block` already dispatched and
-                        // persisted `setting_pushName`. The watchdog's reconnect
-                        // would then find a populated push name and a clear flag
-                        // and take the ordinary path, never retrying the rest.
-                        //
-                        client_clone.settle_bootstrap(critical_scope, true);
-                        // The sync failed — the watchdog must stay alive to force a reconnect.
-                        critical_sync_timeout_handle.detach();
-                        return;
+                        BatchedSyncOutcome::all_retryable(&CRITICAL_COLLECTIONS)
                     }
+                };
+                let plan = CriticalSyncPlan::from_outcome(&outcome);
+
+                if !client_clone
+                    .finish_critical_bootstrap(critical_scope, &plan, &outcome)
+                    .await
+                {
+                    return;
                 }
+
+                let critical_retry = plan.retry;
+                let critical_refused = plan.stranded;
 
                 // Spawn remaining non-critical collections in background
                 let sync_client = client_clone.clone();
@@ -1583,7 +1511,7 @@ impl Client {
                         return;
                     }
 
-                    // Any critical collection the refused path handed over goes
+                    // Any critical collection the bootstrap handed over goes
                     // first: it is the one the account actually needs.
                     let mut to_sync = critical_retry;
                     to_sync.extend([

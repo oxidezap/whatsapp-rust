@@ -65,6 +65,13 @@ pub(crate) mod test_alloc {
     }
 }
 
+/// The app-state collections, named as they appear on the wire. Part of the
+/// public surface because [`Client::resync_app_state`] takes them.
+///
+/// [`WAPatchName::Unknown`] is not one of them: it is what parsing an
+/// unrecognised collection name yields, so the server has nothing under that
+/// name. `resync_app_state` rejects a request naming it.
+pub use wacore::appstate::patch_decode::WAPatchName;
 pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
 /// Optional metrics emission (the `metrics` feature). No-op when the feature is off.
@@ -201,24 +208,25 @@ pub mod usync;
 
 pub mod features;
 pub use features::{
-    AppStateError, AppStateSettings, BUSINESS_PROFILE_MAX_WEBSITES, BatchGroupResult, Blocking,
-    BlockingError, BlocklistEntry, BotDefault, BotList, BotListEntry, BotListSection,
-    BotListVersion, BotSectionDisplayType, BotSectionType, BotTheme, BotThemeMode, Bots, Business,
-    BusinessCategory, BusinessError, BusinessHourMode, BusinessHours, BusinessHoursConfig,
-    BusinessHoursUpdate, BusinessProfile, BusinessProfileUpdate, BusinessProfileUpdateError,
-    CappingMvStatus, CappingOteStatus, CappingStatus, Catalog, CatalogOptions, ChatActions,
-    ChatStateError, ChatStateType, Chatstate, Collection, CollectionOptions, Collections, Comments,
-    Community, CommunityError, CommunitySubgroup, ContactError, Contacts, CoverPhotoUpload,
-    CreateCommunityOptions, CreateCommunityResult, CreateGroupResult, DayOfWeek, EncType,
-    EncryptedEdit, EventCreationParams, EventResponseType, Events, GroupAppealStatus,
-    GroupCreateOptions, GroupDescription, GroupEphemeralSettings, GroupError, GroupJoinError,
-    GroupMetadata, GroupParticipant, GroupParticipantDetails, GroupParticipantOptions,
-    GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo, ImporterAddress,
-    InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult,
-    MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
-    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
-    MessageEditError, MessageRetransmission, Mex, MexError, MexErrorExtensions, MexGraphQLError,
-    MexRequest, MexResponse, NackReason, NewChatMessageCapping, Newsletter, NewsletterAdminInfo,
+    AppStateError, AppStateResyncMode, AppStateResyncReport, AppStateSettings,
+    BUSINESS_PROFILE_MAX_WEBSITES, BatchGroupResult, Blocking, BlockingError, BlocklistEntry,
+    BotDefault, BotList, BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType,
+    BotSectionType, BotTheme, BotThemeMode, Bots, Business, BusinessCategory, BusinessError,
+    BusinessHourMode, BusinessHours, BusinessHoursConfig, BusinessHoursUpdate, BusinessProfile,
+    BusinessProfileUpdate, BusinessProfileUpdateError, CappingMvStatus, CappingOteStatus,
+    CappingStatus, Catalog, CatalogOptions, ChatActions, ChatStateError, ChatStateType, Chatstate,
+    Collection, CollectionOptions, Collections, Comments, Community, CommunityError,
+    CommunitySubgroup, ContactError, Contacts, CoverPhotoUpload, CreateCommunityOptions,
+    CreateCommunityResult, CreateGroupResult, DayOfWeek, EncType, EncryptedEdit,
+    EventCreationParams, EventResponseType, Events, GroupAppealStatus, GroupCreateOptions,
+    GroupDescription, GroupEphemeralSettings, GroupError, GroupJoinError, GroupMetadata,
+    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture,
+    GroupSubject, GroupType, Groups, GrowthLockInfo, ImporterAddress, InviteInfoError,
+    IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult, MediaRetryResult,
+    MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode, MemberLinkMode,
+    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, MessageEditError,
+    MessageRetransmission, Mex, MexError, MexErrorExtensions, MexGraphQLError, MexRequest,
+    MexResponse, NackReason, NewChatMessageCapping, Newsletter, NewsletterAdminInfo,
     NewsletterAdminProfile, NewsletterError, NewsletterFollower, NewsletterMessage,
     NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
     NewsletterState, NewsletterVerification, Order, OrderPriceDetails, OrderProduct,

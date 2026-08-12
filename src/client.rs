@@ -1,7 +1,9 @@
 mod accessors;
 mod adapters;
 mod app_state;
-pub(crate) use app_state::SyncSettles;
+pub(crate) use app_state::{BatchedSyncOutcome, BatchedSyncRequest, CriticalSyncPlan, SyncSettles};
+#[cfg(test)]
+pub(crate) use app_state::{SyncHolder, batched_sync_outcome_tests::batch_result};
 mod builder;
 mod context_impl;
 mod device_memo_stats;
@@ -1447,10 +1449,10 @@ pub struct Client {
     /// Notifier for when the noise socket is established (before login).
     /// Use this to wait for the socket to be ready for sending messages.
     pub(crate) socket_ready_notifier: Arc<event_listener::Event>,
-    /// Set to `true` only when `dispatch_connected()` fires (after critical sync
-    /// completes). Reset on each new connection attempt. Used by
-    /// `wait_for_connected()` to avoid a false-positive fast path when the
-    /// client is logged in but critical app state hasn't synced yet.
+    /// Set to `true` only when `dispatch_connected()` fires (once the critical
+    /// sync has an answer, clean or not). Reset on each new connection attempt.
+    /// Used by `wait_for_connected()` to avoid a false-positive fast path when
+    /// the client is logged in but critical app state hasn't been asked for yet.
     pub(crate) is_ready: Arc<AtomicBool>,
     /// Notifier for when the client is fully connected and logged in.
     /// Triggered after Event::Connected is dispatched.

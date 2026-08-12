@@ -283,6 +283,7 @@ pub enum EventKind {
     DisableLinkPreviewsUpdate,
     ContactRemoved,
     EncDecryptFailed,
+    CallLogSync,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -296,7 +297,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::EncDecryptFailed as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::CallLogSync as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -651,6 +652,13 @@ pub struct SelfPushNameUpdated {
 /// [`Event::Connected`] anyway and is usable, minus whatever those collections
 /// carry — for `critical_block` that includes the push name, so presence stays
 /// unavailable until it syncs.
+///
+/// The initial sync that follows pairing normally connects, so its report
+/// normally carries `connected: true`. A `false` means no [`Event::Connected`]
+/// accompanied this report: a sync that ran before the connection was ready,
+/// such as one a `syncd_app_state` dirty bit started while the offline backlog
+/// was still being processed, or an initial sync whose connection was paused,
+/// superseded or rejected by the server as it finished.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct AppStateSyncFailed {
@@ -1034,6 +1042,9 @@ pub enum Event {
     /// Last, like every new variant: a binary `Serialize` format writes the
     /// variant index, so inserting in the middle renumbers everything after it.
     EncDecryptFailed(EncDecryptFailed),
+
+    /// A call-history record synced from the primary device.
+    CallLogSync(CallLogSync),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1127,6 +1138,7 @@ impl Event {
             Event::DisableLinkPreviewsUpdate(_) => EventKind::DisableLinkPreviewsUpdate,
             Event::ContactRemoved(_) => EventKind::ContactRemoved,
             Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
+            Event::CallLogSync(_) => EventKind::CallLogSync,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -1429,6 +1441,20 @@ pub struct ClientOutdated {
     pub raw: Option<Node>,
 }
 
+/// The session is authenticated and has asked the server to leave passive mode.
+///
+/// That request is best effort: a failure to go active is logged and the
+/// connection is announced anyway, on the same reasoning as below, so treat this
+/// as "the client believes stanzas should be flowing" rather than a guarantee
+/// that the server agrees.
+///
+/// After a fresh pairing the client waits for the critical app-state
+/// collections before publishing this, so the push name and blocklist are
+/// normally in place by now. It waits, but it does not withhold: a critical
+/// collection the server refused or could not deliver is reported as
+/// [`AppStateSyncFailed`] and the connection is announced regardless, because a
+/// session already delivering messages is not one a consumer should be left
+/// believing never opened.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct Connected {}
@@ -2371,6 +2397,43 @@ pub struct ContactRemoved {
     pub from_full_sync: bool,
 }
 
+/// A call placed or received on the primary device, synced through app state.
+///
+/// The only channel that carries a call the companion never saw signalling for:
+/// a call placed on the phone puts nothing on this socket, so
+/// [`Event::IncomingCall`] and friends cannot see it.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct CallLogSync {
+    /// Who started the call, from the mutation's index.
+    ///
+    /// The index rather than the record: `record.call_creator_jid` is optional
+    /// and WA Web leaves it unset for calls it received none for, while it fills
+    /// the index in either way — falling back to this account for a call it
+    /// placed, or to the peer for one it took.
+    pub call_creator_jid: Jid,
+    /// The call's identifier, from the mutation's index (the same value
+    /// `record.call_id` carries when the record carries one).
+    pub call_id: String,
+    /// Whether *this account* placed the call.
+    ///
+    /// Read this rather than `record.is_incoming`, which despite its name holds
+    /// the same thing rather than its opposite: WA Web writes the record with
+    /// `isIncoming: fromMe`, so a consumer taking the field at its word files
+    /// every call backwards.
+    pub from_me: bool,
+    /// When the mutation was written, not when the call happened — the call's
+    /// own time is `record.start_time`.
+    ///
+    /// This is the field WA Web measures against the pairing timestamp to decide
+    /// whether a record predates the device, so it is worth having; it is not a
+    /// time to file the call under. A mutation that arrives without one falls
+    /// back to the moment it was received, as every other app-state event does.
+    pub timestamp: DateTime<Utc>,
+    pub record: Box<wa::CallLogRecord>,
+    pub from_full_sync: bool,
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
@@ -2403,6 +2466,8 @@ mod tests {
         assert_eq!(EventKind::PairingQrCodesExhausted as u8, 58);
         assert_eq!(EventKind::PairingCodeError as u8, 59);
         assert_eq!(EventKind::AppStateSyncFailed as u8, 60);
+        assert_eq!(EventKind::EncDecryptFailed as u8, 67);
+        assert_eq!(EventKind::CallLogSync as u8, 68);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted
