@@ -180,40 +180,30 @@ impl Client {
         // and serve their effects stale.
         let generation = self.device_topology.current();
 
-        // Classified before acting, so the counter names the term that decided
-        // the call. The arms are the validity terms in the order they gate
-        // each other: no entry, then `GroupInfo` identity, then the generation
-        // stamp, then the scoped-invalidation proof. Evaluating them in any
-        // other order would attribute a miss to a term that never ran.
-        let cached = self.group_devices_memo.get(group).await;
-        let outcome = match &cached {
-            None => Outcome::MissAbsent,
-            Some(memo) if !std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info)) => {
-                Outcome::MissGroupInfo
-            }
-            Some(memo) if memo.generation == generation => Outcome::Hit,
-            // Stale stamp: when every change since it touched only users
-            // outside this group, re-stamp instead of recomputing, so write
-            // storms on unrelated groups don't tank the hit rate. Any doubt
-            // (log overflow, member touched) falls through to the recompute.
-            Some(memo)
-                if self
-                    .device_topology
-                    .unchanged_for(memo.generation, |user| memo.members.contains(user)) =>
-            {
-                Outcome::Restamp
-            }
-            Some(_) => Outcome::MissTopology,
-        };
-        self.device_memo_counters.record_group_devices(outcome);
-
-        match (outcome, &cached) {
-            // Refcount bump: the snapshot is immutable, so a hit shares
-            // it instead of cloning the device Vec.
-            (Outcome::Hit, Some(memo)) => {
+        // Each exit records the term that decided it, on the branch that
+        // decided it, rather than classifying into a value and dispatching on
+        // it twice — the counter is meant to be free on the hit path, and a
+        // second dispatch is not free.
+        if let Some(memo) = self.group_devices_memo.get(group).await {
+            if !std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info)) {
+                self.device_memo_counters
+                    .record_group_devices(Outcome::MissGroupInfo);
+            } else if memo.generation == generation {
+                // Refcount bump: the snapshot is immutable, so a hit shares
+                // it instead of cloning the device Vec.
+                self.device_memo_counters.record_group_devices(Outcome::Hit);
                 return Ok(Arc::clone(&memo.devices));
-            }
-            (Outcome::Restamp, Some(memo)) => {
+            } else if self
+                .device_topology
+                .unchanged_for(memo.generation, |user| memo.members.contains(user))
+            {
+                // Stale stamp, but every change since it touched only users
+                // outside this group: re-stamp instead of recomputing, so
+                // write storms on unrelated groups don't tank the hit rate.
+                // Any doubt (log overflow, member touched) falls through to
+                // the recompute below.
+                self.device_memo_counters
+                    .record_group_devices(Outcome::Restamp);
                 self.group_devices_memo
                     .insert(
                         group.clone(),
@@ -226,8 +216,13 @@ impl Client {
                     )
                     .await;
                 return Ok(Arc::clone(&memo.devices));
+            } else {
+                self.device_memo_counters
+                    .record_group_devices(Outcome::MissTopology);
             }
-            _ => {}
+        } else {
+            self.device_memo_counters
+                .record_group_devices(Outcome::MissAbsent);
         }
 
         let devices = self

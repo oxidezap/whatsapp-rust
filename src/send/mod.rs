@@ -1538,21 +1538,29 @@ impl Client {
                     self.device_memo_counters
                         .record_skdm_targets(Outcome::Bypassed);
                 } else {
-                    let memo = self.skdm_warm_memo.get(group).await;
-                    let stale = match &memo {
-                        None => Some(Outcome::MissAbsent),
-                        Some(memo) => skdm_memo_entry_stale_term(
-                            memo,
-                            &all_devices,
-                            &cached_map,
-                            cached_map_gen,
-                            own_sending_jid,
-                        ),
-                    };
-                    self.device_memo_counters
-                        .record_skdm_targets(stale.unwrap_or(Outcome::Hit));
-                    if let (None, Some(memo)) = (stale, memo) {
-                        return Some((all_devices, memo.4));
+                    // Recorded on the deciding branch, and the entry is never
+                    // moved out of the `Some` arm: it is an owned clone of a
+                    // five-field tuple carrying a `Jid` and a `Vec<Jid>`, so
+                    // shuffling it around to classify first is not free.
+                    match self.skdm_warm_memo.get(group).await {
+                        Some(memo) => {
+                            match skdm_memo_entry_stale_term(
+                                &memo,
+                                &all_devices,
+                                &cached_map,
+                                cached_map_gen,
+                                own_sending_jid,
+                            ) {
+                                None => {
+                                    self.device_memo_counters.record_skdm_targets(Outcome::Hit);
+                                    return Some((all_devices, memo.4));
+                                }
+                                Some(term) => self.device_memo_counters.record_skdm_targets(term),
+                            }
+                        }
+                        None => self
+                            .device_memo_counters
+                            .record_skdm_targets(Outcome::MissAbsent),
                     }
                 }
                 let needs_skdm = self.filter_skdm_targets(
