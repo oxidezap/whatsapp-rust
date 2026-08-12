@@ -1,3 +1,4 @@
+mod app_state_resync;
 pub(crate) mod app_state_settings;
 mod blocking;
 mod bots;
@@ -24,6 +25,8 @@ mod signal;
 mod stanza;
 pub(crate) mod status;
 mod tctoken;
+
+pub use app_state_resync::{AppStateResyncMode, AppStateResyncReport};
 
 pub use app_state_settings::AppStateSettings;
 

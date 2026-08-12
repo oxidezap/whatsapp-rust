@@ -272,7 +272,8 @@ pub(crate) enum SyncHolder {
 pub(crate) enum ReservationSkip {
     /// An equivalent sync already holds it, so it is already doing this work.
     EquivalentSyncInFlight,
-    /// The holder did not release within the bound.
+    /// Nobody else is covering the collection and this call did not get it: the
+    /// holder outlasted the bound, or the caller was not willing to wait.
     WaitTimedOut,
 }
 
@@ -302,6 +303,47 @@ pub(crate) enum ReservationWait {
     /// the snapshot while an incremental one asks for patches after the
     /// persisted version, so skipping would turn the request into a no-op.
     Always,
+    /// Take it if it is free, and report it otherwise. For a caller that has
+    /// already waited out the holders separately — waiting again here would be
+    /// waiting while holding the collections reserved before this one, which is
+    /// what that earlier wait exists to avoid.
+    TryOnce,
+}
+
+/// The two choices a batched sync makes for itself unless a caller overrides
+/// them.
+///
+/// Both defaults are right for a trigger the server raised — a `server_sync`
+/// notification, a dirty bit, the bootstrap — and wrong for a consumer that
+/// asked for a named collection by hand. Such a caller wants the collection
+/// re-read *now*: an equivalent sync in flight does not discharge its request
+/// (see [`ReservationWait`]), and a collection it has declared untrustworthy is
+/// not repaired by resuming from where it was. Overriding is deliberately not
+/// the default — a background trigger that waited on every holder would queue
+/// behind patch sends it has no reason to outrank, and one that rebuilt would
+/// re-download whole collections on every dirty bit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchedSyncRequest {
+    /// Stand each collection down to unsynced before asking, so the round that
+    /// follows rebuilds it from a snapshot instead of resuming from where it
+    /// was.
+    pub(crate) rebuild: bool,
+    /// Wait for whoever holds the collection rather than skipping behind an
+    /// equivalent sync. The bootstrap already does this on account of its
+    /// deadline; this is how a non-bootstrap caller asks for the same.
+    pub(crate) wait_for_holder: bool,
+}
+
+/// Whether a collection was stood down for a rebuild, or left alone because the
+/// connection it was being stood down for is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandDown {
+    /// The collection is unsynced now — either it was already, or both halves of
+    /// the reset landed.
+    Done,
+    /// Nothing was written. The collection is exactly as it was, and the caller
+    /// should treat it as one this run did not cover.
+    Declined(ScopeLost),
 }
 
 /// What a batched sync achieved, collection by collection.
@@ -452,7 +494,7 @@ pub(crate) struct SyncInFlight {
     next_token: AtomicU64,
     /// Notified whenever a reservation is released, so [`SyncInFlight::begin`]
     /// can wait for one instead of spinning.
-    released: event_listener::Event,
+    pub(crate) released: event_listener::Event,
 }
 
 impl SyncInFlight {
@@ -462,6 +504,19 @@ impl SyncInFlight {
             next_token: AtomicU64::new(0),
             released: event_listener::Event::new(),
         })
+    }
+
+    /// Whether anything holds `name` right now.
+    ///
+    /// A question, not a claim: reserving in order to find out would make this
+    /// briefly the holder, and a concurrent [`ReservationWait::SkipBehindSync`]
+    /// sync that looked in that window would stand down and report a collection
+    /// skipped that nothing was actually doing.
+    pub(crate) fn is_held(&self, name: WAPatchName) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&name)
     }
 
     /// Reserve `name` for `holder`, or report what already holds it.
@@ -1596,6 +1651,10 @@ impl Client {
             Err(SyncHolder::Sync) if wait == ReservationWait::SkipBehindSync => {
                 return Err(ReservationSkip::EquivalentSyncInFlight);
             }
+            Err(holder) if wait == ReservationWait::TryOnce => {
+                debug!(target: "Client/AppState", "Not waiting for the {holder:?} holding {name:?}");
+                return Err(ReservationSkip::WaitTimedOut);
+            }
             Err(holder) => {
                 debug!(target: "Client/AppState", "Waiting for the {holder:?} holding {name:?}");
             }
@@ -1613,6 +1672,97 @@ impl Client {
         .map_err(|_| ReservationSkip::WaitTimedOut)
     }
 
+    /// Stand `name` down to the state of a collection that has never synced.
+    ///
+    /// The only way to ask the server to replay a collection: it sends a
+    /// snapshot when the request carries no version, and the processor applies
+    /// one only over a version older than its own — so a rebuild is expressed by
+    /// having nothing rather than by asking for something. That also keeps this
+    /// on the path the first sync already takes, instead of teaching the
+    /// snapshot rules a second shape to recognise.
+    ///
+    /// The version goes first. Either write can be the last one a cancelled or
+    /// failed rebuild completes, and of the two halves it can stop at, `v0` with
+    /// stale MACs is the recoverable one: `process_patch_list` clears them
+    /// itself before applying anything to an empty baseline. The other order
+    /// leaves the collection claiming a version whose MACs are gone, which
+    /// nothing downstream is looking for.
+    ///
+    /// Callers hold the collection's reservation across this, so no other writer
+    /// can observe the half-stood-down state while the rebuild runs — while the
+    /// scope holds. A reconnect clears the reservation registry out from under
+    /// live tasks, so the scope is re-asked before each write, and a rebuild
+    /// that has lost it leaves the collection exactly as it was rather than half
+    /// reset.
+    ///
+    /// Those checks narrow the window; they do not close it. A connection that
+    /// retires while one of these writes is in flight is not seen, so the write
+    /// still lands — the same shape as the apply itself, whose three writes sit
+    /// behind one admission check in
+    /// [`sync_collections_batched_inner`](Self::sync_collections_batched_inner).
+    /// What remains is bounded by how long a local store write takes, against a
+    /// replacement connection that would have to handshake, reserve and apply
+    /// inside it. Closing it properly means a store that refuses writes from a
+    /// retired generation, which is the same change the apply wants and does not
+    /// belong to one caller.
+    async fn stand_collection_down(
+        &self,
+        backend: &dyn wacore::store::traits::Backend,
+        name: WAPatchName,
+        scope: SyncScope,
+    ) -> Result<StandDown> {
+        let state = backend.get_version(name.as_str()).await?;
+        if state.version == 0 {
+            return Ok(StandDown::Done);
+        }
+        if let Err(lost) = self.admits(scope) {
+            return Ok(StandDown::Declined(lost));
+        }
+        debug!(
+            target: "Client/AppState",
+            "Batched sync: standing {name:?} down from v{} to rebuild it",
+            state.version
+        );
+        backend
+            .set_version(name.as_str(), wacore::appstate::hash::HashState::default())
+            .await?;
+        if let Err(lost) = self.admits(scope) {
+            // The version is already down, and that half is the recoverable one:
+            // the next sync sees an unsynced collection and rebuilds it, clearing
+            // the MACs on the way. Stopping here is still better than writing on,
+            // because by now another generation may own the collection.
+            return Ok(StandDown::Declined(lost));
+        }
+        backend.clear_mutation_macs(name.as_str()).await?;
+        Ok(StandDown::Done)
+    }
+
+    /// Wait out whoever holds any of `collections`, taking nothing.
+    ///
+    /// Only useful before a batch that waits: it moves the waiting to a point
+    /// where this call holds no reservation, so a slow holder of one collection
+    /// cannot block writers to the others through us. Each collection is waited
+    /// for and released immediately — the reservation is not the point, the
+    /// holder being gone is.
+    ///
+    /// Best effort by construction. A holder that outlasts the bound, or a
+    /// collection taken again before the caller reserves it, is left to the
+    /// caller's own pass to report.
+    async fn wait_for_contended(&self, collections: &[WAPatchName], scope: SyncScope) {
+        for &name in collections {
+            if !self.app_state_syncing.is_held(name) {
+                continue;
+            }
+            if self.admits(scope).is_err() {
+                return;
+            }
+            debug!(target: "Client/AppState", "Waiting out the holder of {name:?} before reserving the batch");
+            let _ = self
+                .reserve_for_sync(name, ReservationWait::Always, scope)
+                .await;
+        }
+    }
+
     /// Sync multiple collections in a single IQ request, re-fetching those with `has_more_patches`.
     /// Mirrors WA Web's `serverSync()` outer loop (`WAWebSyncdServerSync`).
     ///
@@ -1623,11 +1773,27 @@ impl Client {
     /// deadline also bounds the missing-key wait, letting the explicit
     /// `AppStateSyncKeyRequest` fallback recover a late key on this connection
     /// without running past the watchdog.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len()), err(Debug)))]
+    ///
+    /// Not instrumented itself: it forwards to
+    /// [`Self::sync_collections_batched_with`], whose span would otherwise nest
+    /// inside an identical one.
     pub(crate) async fn sync_collections_batched(
         &self,
         collections: Vec<WAPatchName>,
         scope: SyncScope,
+    ) -> Result<BatchedSyncOutcome> {
+        self.sync_collections_batched_with(collections, scope, BatchedSyncRequest::default())
+            .await
+    }
+
+    /// [`Self::sync_collections_batched`] with the two decisions a background
+    /// trigger takes for granted spelled out — see [`BatchedSyncRequest`].
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len(), rebuild = request.rebuild), err(Debug)))]
+    pub(crate) async fn sync_collections_batched_with(
+        &self,
+        collections: Vec<WAPatchName>,
+        scope: SyncScope,
+        request: BatchedSyncRequest,
     ) -> Result<BatchedSyncOutcome> {
         let mut outcome = BatchedSyncOutcome::default();
         if collections.is_empty() {
@@ -1644,10 +1810,20 @@ impl Client {
         // collection under both `synced` and `skipped`, making `all_synced()`
         // false and publishing a failure that blames a writer who never existed.
         let mut seen = HashSet::with_capacity(collections.len());
-        let collections: Vec<WAPatchName> = collections
+        let mut collections: Vec<WAPatchName> = collections
             .into_iter()
             .filter(|name| seen.insert(*name))
             .collect();
+
+        // Reserved in a fixed order, because the loop below holds every guard it
+        // has taken while waiting for the next one. Two batches that wait —
+        // `ReservationWait::Always` — and name overlapping collections in
+        // opposite orders would otherwise each hold the other's next collection
+        // and make no progress until both waits time out, minutes later, for
+        // work neither was slow at. A single order over a shared set is what
+        // makes that cycle unconstructible. The name is the only ordering both
+        // callers can agree on without coordinating.
+        collections.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
 
         // The bootstrap cannot skip: it has to know the collection is synced
         // before it dispatches Connected, and an equivalent sync in flight only
@@ -1656,11 +1832,33 @@ impl Client {
         // finding the collection already synced afterwards is the fast case.
         // Background callers still skip, because for them the in-flight sync
         // genuinely does the work.
-        let wait = if scope.is_bootstrap() {
+        let wait = if request.wait_for_holder {
+            // The waiting already happened, above, holding nothing. Waiting again
+            // here would do it holding every collection reserved before this one
+            // — and a collection taken back in the gap between the two passes is
+            // the one case that gap can produce, so it is reported rather than
+            // waited on.
+            ReservationWait::TryOnce
+        } else if scope.is_bootstrap() {
             ReservationWait::Always
         } else {
             ReservationWait::SkipBehindSync
         };
+
+        // A caller that waits does not wait *holding*. The loop below keeps every
+        // guard it has taken while it waits for the next collection, which for a
+        // wait of [`APP_STATE_RESERVATION_WAIT`] blocks writers to a collection
+        // this call is not even asking about yet — and `send_app_state_patch`
+        // takes the global send lock before it waits for its own reservation, so
+        // one held collection stalls patch sends to all of them. Clearing the way
+        // first costs a pass over an at-most-five-element set and leaves the wait
+        // holding nothing. It is not atomic — a collection can be taken again in
+        // the gap between the two passes — which is why the pass below does not
+        // wait: it reports what it cannot get, so the gap costs a retry rather
+        // than reopening the blocking this exists to prevent.
+        if request.wait_for_holder {
+            self.wait_for_contended(&collections, scope).await;
+        }
 
         let mut guards = Vec::with_capacity(collections.len());
         let mut pending = Vec::with_capacity(collections.len());
@@ -1697,7 +1895,7 @@ impl Client {
             return Ok(outcome);
         }
 
-        self.sync_collections_batched_inner(pending, scope, &mut outcome)
+        self.sync_collections_batched_inner(pending, scope, request, &mut outcome)
             .await?;
 
         // A run that crossed its deadline is not a clean one, even if every
@@ -1726,6 +1924,7 @@ impl Client {
         &self,
         mut pending: Vec<WAPatchName>,
         scope: SyncScope,
+        request: BatchedSyncRequest,
         outcome: &mut BatchedSyncOutcome,
     ) -> Result<()> {
         use wacore::appstate::patch_decode::CollectionSyncError;
@@ -1737,6 +1936,20 @@ impl Client {
         // that is still making progress.
         const MAX_ITERATIONS: usize = 500;
         let mut iteration = 0;
+        // Spent on the first round: the rebuild is what stands the collection
+        // down, and every round after it is the pagination that follows from
+        // there — re-standing it down would throw away the page just applied and
+        // re-page the collection for as long as the server keeps setting
+        // `has_more_patches`.
+        let mut rebuild = request.rebuild;
+        // Which collections are mid-replay, kept across rounds rather than
+        // rebuilt per round. A snapshot that answers `has_more_patches` is still
+        // being replayed on the pages that follow it, and those pages carry the
+        // same rebuild — `process_app_state_sync_task` holds its own `full_sync`
+        // across pagination for exactly this reason. Rebuilding it per round
+        // dispatched page two onward as live changes, which is what a consumer
+        // reads `from_full_sync` to tell apart.
+        let mut replaying_snapshot: HashSet<WAPatchName> = HashSet::new();
 
         while !pending.is_empty() && iteration < MAX_ITERATIONS {
             // With the cap at WA Web's 500, a collection paging healthily can
@@ -1763,12 +1976,21 @@ impl Client {
 
             // Build multi-collection IQ, tracking which collections need a snapshot
             let mut collection_nodes = Vec::with_capacity(pending.len());
-            let mut was_snapshot = HashSet::new();
             for &name in &pending {
+                if rebuild
+                    && let StandDown::Declined(lost) =
+                        self.stand_collection_down(&*backend, name, scope).await?
+                {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: not rebuilding {name:?} ({lost:?})"
+                    );
+                    continue;
+                }
                 let state = backend.get_version(name.as_str()).await?;
                 let want_snapshot = state.version == 0;
                 if want_snapshot {
-                    was_snapshot.insert(name);
+                    replaying_snapshot.insert(name);
                 }
                 let mut builder = NodeBuilder::new("collection")
                     .attr("name", name.as_str())
@@ -1780,6 +2002,20 @@ impl Client {
                     builder = builder.attr("version", state.version);
                 }
                 collection_nodes.push(builder.build());
+            }
+            rebuild = false;
+
+            // Every collection declined its rebuild, so there is nothing to ask
+            // about. A collection left out of the request is reconciled as
+            // retryable below, but only once a response comes back — and sending
+            // an empty `<sync>` to get one is a round trip for no work.
+            if collection_nodes.is_empty() {
+                warn!(
+                    target: "Client/AppState",
+                    "Batched sync: nothing left to ask about for {pending:?}"
+                );
+                outcome.retryable.extend(pending);
+                return Ok(());
             }
 
             let sync_node = NodeBuilder::new("sync").children(collection_nodes).build();
@@ -1797,7 +2033,33 @@ impl Client {
             // and an IQ that errors or times out spent one just as much as one
             // that answered.
             outcome.note_reached_server();
-            let resp = self.send_iq(iq).await?;
+            let resp = match self.send_iq(iq).await {
+                Ok(resp) => resp,
+                // Losing the transport is what the buckets are for, not what an
+                // error is for: the collections this round was carrying are not
+                // covered by anyone, and the rounds before it are already applied
+                // and dispatched into `outcome`. Raising instead would throw that
+                // away and tell the caller nothing about which collections it
+                // still owes. Anything else — a timeout, a server error, a
+                // response that would not parse — is a genuine failure and keeps
+                // travelling as one.
+                //
+                // `retryable` is exact here even if the server did receive the
+                // IQ. This one only ever reads: its `<collection>` carries a name
+                // and a cursor, never a `<patch>` — that is
+                // `send_app_state_patch`, and the difference is why a lost answer
+                // leaves nothing half-done to reason about. Whatever the server
+                // did with it, this side did not advance.
+                Err(e) if e.is_transport_unavailable() => {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: transport went while asking about {pending:?} ({e})"
+                    );
+                    outcome.retryable.extend(pending);
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             // The IQ can outrun the scope, so the round is re-admitted before
             // any of it is trusted.
@@ -1919,6 +2181,13 @@ impl Client {
             // available without teaching `wacore` about connections, and it caps
             // what a retired scope can commit at one collection instead of five.
             let mut results = Vec::with_capacity(patch_lists.len());
+            // Held rather than raised with `?`, for the same reason the dispatch
+            // loop below refuses to drop a collection: each list this loop
+            // finished is already persisted, so failing out from here would strand
+            // its mutations behind an advanced cursor that no later sync re-reads.
+            // The error still ends the run — after what was applied has been
+            // dispatched.
+            let mut apply_error = None;
             for pl in patch_lists {
                 if let Err(lost) = self.admits(scope) {
                     warn!(
@@ -1927,7 +2196,13 @@ impl Client {
                     );
                     break;
                 }
-                results.push(proc.process_one_patch_list(pl, &download, true).await?);
+                match proc.process_one_patch_list(pl, &download, true).await {
+                    Ok(applied) => results.push(applied),
+                    Err(e) => {
+                        apply_error = Some(e);
+                        break;
+                    }
+                }
             }
 
             let mut needs_refetch = Vec::new();
@@ -2000,19 +2275,25 @@ impl Client {
                 self.request_missing_keys_with_dedup(&missing, APP_STATE_KEY_REQUEST_DEDUP)
                     .await;
 
-                // full_sync is true only when this collection had a snapshot
-                // (version was 0 before sync). This prevents server_sync-triggered
-                // incremental syncs from being incorrectly marked as full syncs.
-                let full_sync = was_snapshot.contains(&name);
+                // full_sync marks a rebuild rather than a live change, so it is
+                // true for every page of a replay a snapshot started — not only
+                // the page the snapshot itself arrived on. A `server_sync`
+                // fetching patches for an already-synced collection never enters
+                // the set, which is what keeps it from reading as a full sync.
+                let full_sync = replaying_snapshot.contains(&name);
                 wacore::telemetry::appstate_mutations(mutations.len() as u64);
                 for m in mutations {
                     self.dispatch_app_state_mutation(&m, full_sync).await;
                 }
 
-                // Save version
-                backend
-                    .set_version(name.as_str(), new_state.clone())
-                    .await?;
+                // No version write here. `process_one_patch_list` already
+                // persisted this exact state — alongside the mutation MACs it
+                // belongs with, which is what makes the pair agree — so rewriting
+                // it only widened the window in which it could be wrong. A
+                // reconnect between the apply and here clears the reservation
+                // registry, so the replacement connection can reserve the same
+                // collection and move it on; this write would then land after it
+                // and put the older version back, next to the newer MACs.
 
                 // Check if this collection needs more patches
                 if list.has_more_patches {
@@ -2039,6 +2320,16 @@ impl Client {
                     );
                     outcome.retryable.push(name);
                 }
+            }
+
+            // Raised only now, so that everything this round did apply has been
+            // dispatched and reconciled first. The buckets do not survive the
+            // trip — the caller gets `Err` and `outcome` is dropped with it — so
+            // what the deferral buys is not a report but the dispatch itself:
+            // mutations already persisted reach their consumer instead of being
+            // stranded behind a cursor that has moved past them.
+            if let Some(e) = apply_error {
+                return Err(e);
             }
 
             pending = needs_refetch;
@@ -3641,6 +3932,37 @@ pub(crate) mod batched_sync_outcome_tests {
         assert!(
             transport.sent().is_empty(),
             "a skipped batch must not reach the wire"
+        );
+    }
+
+    /// A caller that waited out the holders separately must not wait again while
+    /// reserving: by then it holds the collections it got first, and waiting on
+    /// top of them is the head-of-line blocking the earlier wait exists to
+    /// avoid. A collection taken back in the gap between the two passes is
+    /// reported instead, costing a retry.
+    #[tokio::test]
+    async fn a_second_pass_reservation_reports_rather_than_waits() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let _held = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::Regular, SyncHolder::PatchSend)
+            .expect("reserve the collection first");
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.reserve_for_sync(
+                WAPatchName::Regular,
+                ReservationWait::TryOnce,
+                client.sync_scope(None),
+            ),
+        )
+        .await
+        .expect("the second pass must not wait on the holder");
+
+        assert_eq!(
+            refused.map(drop),
+            Err(ReservationSkip::WaitTimedOut),
+            "a collection nobody is covering, that this call could not take"
         );
     }
 
