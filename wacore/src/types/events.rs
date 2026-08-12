@@ -2376,10 +2376,32 @@ pub struct ContactRemoved {
     pub from_full_sync: bool,
 }
 
-/// A call-history record delivered through app-state synchronization.
+/// A call placed or received on the primary device, synced through app state.
+///
+/// The only channel that carries a call the companion never saw signalling for:
+/// a call placed on the phone puts nothing on this socket, so
+/// [`Event::IncomingCall`] and friends cannot see it.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct CallLogSync {
+    /// Who started the call, from the mutation's index.
+    ///
+    /// The index rather than the record: `record.call_creator_jid` is optional
+    /// and WA Web leaves it unset for calls it received none for, while it fills
+    /// the index in either way — falling back to this account for a call it
+    /// placed, or to the peer for one it took.
+    pub call_creator_jid: Jid,
+    /// The call's identifier, from the mutation's index (the same value
+    /// `record.call_id` carries when the record carries one).
+    pub call_id: String,
+    /// Whether *this account* placed the call.
+    ///
+    /// Read this rather than `record.is_incoming`, which despite its name holds
+    /// the same thing rather than its opposite: WA Web writes the record with
+    /// `isIncoming: fromMe`, so a consumer taking the field at its word files
+    /// every call backwards.
+    pub from_me: bool,
+    pub timestamp: DateTime<Utc>,
     pub record: Box<wa::CallLogRecord>,
     pub from_full_sync: bool,
 }
