@@ -113,8 +113,9 @@ group send depends on, `resolve_group_devices_memoized` and
 
 The reason it is per-term rather than a hit/miss pair: the group memo has three
 validity terms (entry present, `GroupInfo` `Arc` identity, topology generation
-— with a scoped re-stamp between the last two) and the SKDM memo has four
-(device `Arc`, sender-key-map `Arc`, map generation, sending identity). An
+— with a scoped re-stamp between the last two) and the SKDM memo has four stale
+terms (device `Arc`, sender-key-map `Arc`, map generation, sending identity)
+plus the entry-absent condition, which is why it reports five miss counters. An
 aggregate "N misses" cannot separate an in-place cold flip from a metadata
 refresh from a memo that was never stored, and those have different fixes. It
 also cannot separate cause from consequence: the SKDM memo compares the `Arc`
