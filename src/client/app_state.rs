@@ -3055,8 +3055,15 @@ impl Client {
             return;
         }
 
-        if crate::features::call_log::dispatch_call_log_mutation(&self.core.event_bus, m, full_sync)
-        {
+        // A call's direction is its creator compared against this account; the
+        // predicate is only consulted once the mutation is known to be a call
+        // log, so the other mutation kinds do not pay for the snapshot.
+        if crate::features::call_log::dispatch_call_log_mutation(
+            &self.core.event_bus,
+            m,
+            full_sync,
+            |jid| self.is_own_jid(jid),
+        ) {
             return;
         }
 

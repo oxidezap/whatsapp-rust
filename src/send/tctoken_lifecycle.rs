@@ -4,7 +4,13 @@ impl Client {
     /// Whether `jid` is our own account (PN or LID). The privacy-token paths
     /// never attach to or issue for ourselves; a single source of truth keeps
     /// the message and call paths from drifting apart.
-    fn is_own_jid(&self, jid: &Jid) -> bool {
+    ///
+    /// Both identities, because a JID reaches us as a phone number or a LID
+    /// depending on the thread's migration state and only one of the two will
+    /// match. That is also what makes this the right test for a synced call
+    /// log's direction (`features::call_log`), which is its creator compared
+    /// against this account.
+    pub(crate) fn is_own_jid(&self, jid: &Jid) -> bool {
         let snapshot = self.persistence_manager.get_device_snapshot();
         snapshot
             .pn
