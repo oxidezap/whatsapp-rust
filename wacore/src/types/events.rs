@@ -2415,14 +2415,14 @@ pub struct CallLogSync {
     /// The call's identifier, from the mutation's index (the same value
     /// `record.call_id` carries when the record carries one).
     pub call_id: String,
-    /// Whether *this account* placed the call.
+    /// Whether *this account* placed the call, from
+    /// [`call_creator_jid`](Self::call_creator_jid) compared against this
+    /// account.
     ///
-    /// Derived by comparing [`call_creator_jid`](Self::call_creator_jid)
-    /// against this account, which is what WA Web's own reader does. Read this
-    /// rather than `record.is_incoming`: that field means the opposite of its
-    /// name in mutations WA Web wrote and exactly its name in ones the phone
-    /// wrote, so no fixed reading of it is right for both, and a consumer
-    /// taking it at its word files some calls backwards.
+    /// Read this rather than `record.is_incoming`, which is not reliable in
+    /// either direction: it means the opposite of its name in mutations WA Web
+    /// wrote and exactly its name in ones the phone wrote, so a consumer taking
+    /// it at its word files some calls backwards.
     pub from_me: bool,
     /// When the mutation was written, not when the call happened — the call's
     /// own time is `record.start_time`.

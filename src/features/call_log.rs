@@ -74,9 +74,8 @@ pub(crate) fn dispatch_call_log_mutation(
         log::warn!("Skipping call_log mutation: missing call id in index");
         return true;
     };
-    // The creator, not the index's fourth part and not `record.is_incoming`:
-    // those two disagree between writers, and this comparison is what WA Web's
-    // own reader does. See the module docs.
+    // Direction comes from the creator; see the module docs for why not from
+    // either field that claims to carry it.
     let from_me = is_own_jid(&call_creator_jid);
 
     // The mutation's own time, which is metadata rather than the call's: WA Web

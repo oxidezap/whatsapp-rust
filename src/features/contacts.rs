@@ -231,14 +231,7 @@ impl<'a> Contacts<'a> {
         }
 
         // Skip own JID: server never responds when tctoken is sent for self
-        let is_own_jid = {
-            let snap = self.client.persistence_manager.get_device_snapshot();
-            snap.pn.as_ref().is_some_and(|pn| pn.is_same_user_as(jid))
-                || snap
-                    .lid
-                    .as_ref()
-                    .is_some_and(|lid| lid.is_same_user_as(jid))
-        };
+        let is_own_jid = self.client.is_own_jid(jid);
         if !jid.is_group()
             && !jid.is_newsletter()
             && !jid.is_bot()
