@@ -21,7 +21,7 @@ must follow.
 - **No PII.** Snapshots and reports carry numbers only, never JIDs/phone
   numbers, matching the `wacore::telemetry` label rules.
 
-## The three surfaces
+## The four surfaces
 
 ### 1. `Client::stats()` — wire I/O counters (always on)
 
@@ -104,7 +104,38 @@ resource teardown panics, publication failures, and queue drops mark only the
 responsible plugin as degraded. Concurrent snapshots are intentionally
 approximate, and carry no message content, JIDs, or phone numbers.
 
-### 3. `BotBuilder::with_task_instrument` — CPU / custom attribution (opt-in)
+### 3. `Client::device_memo_stats()` — group-path memo outcomes (always on)
+
+`DeviceMemoStats`: per-term hit/miss counts for the two device-list memos a
+group send depends on, `resolve_group_devices_memoized` and
+`resolve_skdm_targets_memoized`. Cumulative for the client's lifetime;
+`DeviceMemoStats::since` subtracts an earlier snapshot to scope a workload.
+
+The reason it is per-term rather than a hit/miss pair: the group memo has three
+validity terms (entry present, `GroupInfo` `Arc` identity, topology generation
+— with a scoped re-stamp between the last two) and the SKDM memo has four
+(device `Arc`, sender-key-map `Arc`, map generation, sending identity). An
+aggregate "N misses" cannot separate an in-place cold flip from a metadata
+refresh from a memo that was never stored, and those have different fixes. It
+also cannot separate cause from consequence: the SKDM memo compares the `Arc`
+that the group memo returned, so **a group-memo recompute forces
+`skdm_targets.miss_devices` no matter what**. Read the group half first.
+
+Two counters do not fit the "one per call" shape and are documented as such:
+`restamps` (served like a hit, but paid the `unchanged_for` scan first) and
+`not_stored` (a resolution whose target set was neither empty nor
+own-devices-only, so nothing was memoized and the *next* call is a
+`miss_absent` by construction, not by eviction).
+
+Why always-on rather than `#[cfg(test)]` like `dm_devices_memo_recomputes`: a
+test counter answers the question in a fixture, and the question here is what a
+*deployed* client gets — an embedder whose registry writes are noisier than any
+fixture's would have no way to see its own hit rate. It costs one indexed
+relaxed `fetch_add` per resolver call, twice per group send. Measured against
+`skdm_target_resolution_warm`, the tightest thing the counters sit inside, the
+whole instrumentation is +8 instructions per resolve, flat in group size.
+
+### 4. `BotBuilder::with_task_instrument` — CPU / custom attribution (opt-in)
 
 `wacore::stats::TaskInstrument` is an object-safe enter/exit hook called
 around every poll of the client's internal tasks and around its blocking

@@ -538,6 +538,7 @@ impl Client {
                 .build(),
             #[cfg(test)]
             dm_devices_memo_recomputes: AtomicU64::new(0),
+            device_memo_counters: DeviceMemoCounters::default(),
             // A live lane also protects recipient-tracker reset/update ordering.
             group_distribution_locks: Cache::builder()
                 .max_capacity(cache_config.group_distribution_locks_capacity.max(1))

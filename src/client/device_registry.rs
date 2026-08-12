@@ -156,11 +156,14 @@ impl Client {
         group_info: &Arc<wacore::client::context::GroupInfo>,
         own_sending_jid: &Jid,
     ) -> Result<Arc<wacore::send::ResolvedGroupDevices>, anyhow::Error> {
+        use crate::client::GroupDevicesMemoOutcome as Outcome;
         // Store-backed registry or mapping caches can be written by OTHER
         // processes (e.g. shared Redis across pods), which this process's
         // topology tracker cannot observe; the memo's freshness contract
         // doesn't hold there, so it is disabled and every send resolves.
         if !self.device_memos_enabled {
+            self.device_memo_counters
+                .record_group_devices(Outcome::Bypassed);
             return Ok(Arc::new(wacore::send::ResolvedGroupDevices::new(
                 self.resolve_group_devices_uncached(
                     group_info,
@@ -177,22 +180,40 @@ impl Client {
         // and serve their effects stale.
         let generation = self.device_topology.current();
 
-        if let Some(memo) = self.group_devices_memo.get(group).await
-            && std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info))
-        {
-            if memo.generation == generation {
-                // Refcount bump: the snapshot is immutable, so a hit shares
-                // it instead of cloning the device Vec.
-                return Ok(Arc::clone(&memo.devices));
+        // Classified before acting, so the counter names the term that decided
+        // the call. The arms are the validity terms in the order they gate
+        // each other: no entry, then `GroupInfo` identity, then the generation
+        // stamp, then the scoped-invalidation proof. Evaluating them in any
+        // other order would attribute a miss to a term that never ran.
+        let cached = self.group_devices_memo.get(group).await;
+        let outcome = match &cached {
+            None => Outcome::MissAbsent,
+            Some(memo) if !std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info)) => {
+                Outcome::MissGroupInfo
             }
+            Some(memo) if memo.generation == generation => Outcome::Hit,
             // Stale stamp: when every change since it touched only users
             // outside this group, re-stamp instead of recomputing, so write
             // storms on unrelated groups don't tank the hit rate. Any doubt
             // (log overflow, member touched) falls through to the recompute.
-            if self
-                .device_topology
-                .unchanged_for(memo.generation, |user| memo.members.contains(user))
+            Some(memo)
+                if self
+                    .device_topology
+                    .unchanged_for(memo.generation, |user| memo.members.contains(user)) =>
             {
+                Outcome::Restamp
+            }
+            Some(_) => Outcome::MissTopology,
+        };
+        self.device_memo_counters.record_group_devices(outcome);
+
+        match (outcome, &cached) {
+            // Refcount bump: the snapshot is immutable, so a hit shares
+            // it instead of cloning the device Vec.
+            (Outcome::Hit, Some(memo)) => {
+                return Ok(Arc::clone(&memo.devices));
+            }
+            (Outcome::Restamp, Some(memo)) => {
                 self.group_devices_memo
                     .insert(
                         group.clone(),
@@ -206,6 +227,7 @@ impl Client {
                     .await;
                 return Ok(Arc::clone(&memo.devices));
             }
+            _ => {}
         }
 
         let devices = self

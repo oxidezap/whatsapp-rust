@@ -4,6 +4,7 @@ mod app_state;
 pub(crate) use app_state::SyncSettles;
 mod builder;
 mod context_impl;
+mod device_memo_stats;
 mod device_registry;
 pub(crate) mod device_topology;
 #[cfg(feature = "client-lifecycle")]
@@ -20,6 +21,10 @@ mod sessions;
 mod voip;
 use builder::{ClientAssembly, ClientExtensions};
 pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
+pub(crate) use device_memo_stats::{
+    DeviceMemoCounters, GroupDevicesMemoOutcome, SkdmTargetsMemoOutcome,
+};
+pub use device_memo_stats::{DeviceMemoStats, GroupDevicesMemoStats, SkdmTargetsMemoStats};
 #[cfg(feature = "client-lifecycle")]
 use extension_lifecycle::LifecycleRegistration;
 #[cfg(feature = "client-lifecycle")]
@@ -1563,6 +1568,13 @@ pub struct Client {
     /// repeat send really served the memo instead of redoing the resolution.
     #[cfg(test)]
     pub(crate) dm_devices_memo_recomputes: AtomicU64,
+
+    /// Per-term hit/miss counts for the two group-path device memos above,
+    /// read through [`Client::device_memo_stats`]. Which term invalidated is
+    /// the only thing that distinguishes "this memo is doing its job" from
+    /// "this memo has never hit", and no benchmark can observe it: a fixture
+    /// that forces the outcome measures the cost of the outcome it forced.
+    pub(crate) device_memo_counters: DeviceMemoCounters,
 
     /// Single-flight for cold SKDM distribution, keyed per group. Concurrent
     /// cold sends each re-ran the full per-member fan-out before any of them
