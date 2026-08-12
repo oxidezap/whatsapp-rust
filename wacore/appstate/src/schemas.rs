@@ -1,4 +1,4 @@
-//! Auto-generated AppState (syncd) action schemas (WhatsApp 2.3000.1042742319). DO NOT EDIT.
+//! Auto-generated AppState (syncd) action schemas (WhatsApp 2.3000.1044659339). DO NOT EDIT.
 //!
 //! Typed registry of syncd actions: collection, version, scope, value proto type,
 //! enum fields, and the mutation-index parts. `const`/`&'static`, no deps.
@@ -580,23 +580,6 @@ pub const DETECTED_OUTCOME_STATUS: Schema = Schema {
     }],
 };
 
-/// `DeviceCapabilities` — module `WAWebDeviceCapabilitiesSync`.
-pub const DEVICE_CAPABILITIES: Schema = Schema {
-    key: "DeviceCapabilities",
-    name: "device_capabilities",
-    module: "WAWebDeviceCapabilitiesSync",
-    collection: Collection::RegularLow,
-    version: 7,
-    scope: Scope::Account,
-    value_field: Some("deviceCapabilities"),
-    value_proto_type: Some("DeviceCapabilities"),
-    value_enum_fields: &[],
-    chat_jid_index: None,
-    index_parts: &[IndexPart::Literal {
-        value: "device_capabilities",
-    }],
-};
-
 /// `DisableLinkPreviews` — module `WAWebDisableLinkPreviewsSync`.
 pub const DISABLE_LINK_PREVIEWS: Schema = Schema {
     key: "DisableLinkPreviews",
@@ -751,6 +734,29 @@ pub const LABEL_REORDERING: Schema = Schema {
     }],
 };
 
+/// `LabelSublist` — module `WAWebLabelSublistSync`.
+pub const LABEL_SUBLIST: Schema = Schema {
+    key: "LabelSublist",
+    name: "label_sublist",
+    module: "WAWebLabelSublistSync",
+    collection: Collection::Regular,
+    version: 1,
+    scope: Scope::ChatOrContact,
+    value_field: Some("labelSublistAction"),
+    value_proto_type: Some("SyncActionValue.LabelSublistAction"),
+    value_enum_fields: &[],
+    chat_jid_index: Some(2),
+    index_parts: &[
+        IndexPart::Literal {
+            value: "label_sublist",
+        },
+        IndexPart::StringPart {
+            name: "predefinedId",
+        },
+        IndexPart::Jid { name: "chatJid" },
+    ],
+};
+
 /// `LidContact` — module `WAWebLidContactSync`.
 pub const LID_CONTACT: Schema = Schema {
     key: "LidContact",
@@ -836,7 +842,10 @@ pub const MARKETING_MESSAGE: Schema = Schema {
     scope: Scope::Account,
     value_field: Some("marketingMessageAction"),
     value_proto_type: Some("SyncActionValue.MarketingMessageAction"),
-    value_enum_fields: &[],
+    value_enum_fields: &[(
+        "type",
+        "MarketingMessageAction.MarketingMessagePrototypeType",
+    )],
     chat_jid_index: None,
     index_parts: &[
         IndexPart::Literal {
@@ -1252,10 +1261,7 @@ pub const STATUS_PRIVACY: Schema = Schema {
     scope: Scope::Account,
     value_field: Some("statusPrivacy"),
     value_proto_type: Some("SyncActionValue.StatusPrivacyAction"),
-    value_enum_fields: &[
-        ("mode", "StatusPrivacyAction.StatusDistributionMode"),
-        ("modes", "StatusPrivacyAction.StatusDistributionMode"),
-    ],
+    value_enum_fields: &[],
     chat_jid_index: None,
     index_parts: &[IndexPart::Literal {
         value: "status_privacy",
@@ -1377,7 +1383,10 @@ pub const WASA_ROOT_SECRET: Schema = Schema {
     scope: Scope::Chat,
     value_field: Some("wasaRootSecretAction"),
     value_proto_type: Some("SyncActionValue.WASARootSecretAction"),
-    value_enum_fields: &[],
+    value_enum_fields: &[(
+        "secrets.status",
+        "WASARootSecretAction.RootSecretEntry.Status",
+    )],
     chat_jid_index: Some(1),
     index_parts: &[
         IndexPart::Literal {
@@ -1413,7 +1422,6 @@ pub const ALL: &[Schema] = &[
     DELETE_CHAT,
     DELETE_MESSAGE_FOR_ME,
     DETECTED_OUTCOME_STATUS,
-    DEVICE_CAPABILITIES,
     DISABLE_LINK_PREVIEWS,
     EXTERNAL_WEB_BETA,
     FAVORITE_STICKER,
@@ -1422,6 +1430,7 @@ pub const ALL: &[Schema] = &[
     LABEL_EDIT,
     LABEL_JID,
     LABEL_REORDERING,
+    LABEL_SUBLIST,
     LID_CONTACT,
     LOCALE_SETTING,
     LOCK_CHAT,

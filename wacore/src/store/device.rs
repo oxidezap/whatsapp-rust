@@ -437,9 +437,12 @@ impl Device {
             adv_secret_key,
             account: None,
             push_name: String::new(),
-            app_version_primary: 2,
-            app_version_secondary: 3000,
-            app_version_tertiary: 1042742319,
+            // The build the vendored whatspec artifacts describe, so a device
+            // that never reaches sw.js still announces a version whose stanza
+            // shapes and feature flags this client actually implements.
+            app_version_primary: crate::version::WA_WEB_VERSION.0,
+            app_version_secondary: crate::version::WA_WEB_VERSION.1,
+            app_version_tertiary: crate::version::WA_WEB_VERSION.2,
             app_version_last_fetched_ms: 0,
             device_props: Arc::new(DEVICE_PROPS.clone()),
             client_profile: ClientProfile::web(),

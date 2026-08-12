@@ -1,3 +1,7 @@
+mod generated;
+
+pub use generated::{WA_WEB_VERSION, WA_WEB_VERSION_STR};
+
 const REVISION_KEY: &str = "client_revision";
 const ASSETS_KEY: &str = "assets-manifest-";
 
