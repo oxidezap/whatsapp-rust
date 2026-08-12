@@ -113,8 +113,15 @@ fn main() -> Result<()> {
     if opts.check {
         return check(&repo_root, &artifacts);
     }
-    write(&repo_root, &artifacts)?;
 
+    // Before anything is written, for the same reason. `write` replaces the
+    // `.proto` but not the descriptor beside it, so discovering a missing protoc
+    // afterwards leaves a tree whose two halves describe different schemas and
+    // which does not build.
+    if !opts.skip_proto_desc {
+        require_protoc()?;
+    }
+    write(&repo_root, &artifacts)?;
     if !opts.skip_proto_desc {
         regenerate_proto_descriptor(&repo_root)?;
     }
@@ -418,6 +425,21 @@ fn rustfmt(root: &Path, source: &str) -> Result<String> {
 /// The descriptor is what `waproto`'s build script compiles, and it carries a
 /// hash of the `.proto` beside it, so leaving it behind fails the next build
 /// rather than shipping a stale schema.
+/// Fail before writing when the descriptor step could not run afterwards.
+fn require_protoc() -> Result<()> {
+    let found = Command::new("protoc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    ensure!(
+        found,
+        "protoc is not on PATH, and the descriptor is regenerated from the schema this run \
+         writes.\nInstall it, or pass --skip-proto-desc and run scripts/regenerate-proto-desc.sh \
+         yourself."
+    );
+    Ok(())
+}
+
 fn regenerate_proto_descriptor(root: &Path) -> Result<()> {
     let script = root.join("scripts/regenerate-proto-desc.sh");
     let status = Command::new("bash")

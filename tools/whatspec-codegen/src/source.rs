@@ -117,7 +117,12 @@ pub fn read_generated_dir(dir: &Path) -> Result<Ir> {
 pub fn fetch_pinned(repo: &str, rev: &str, cache: &Path) -> Result<Ir> {
     let dir = cache.join(rev);
     let generated = dir.join("generated");
-    if !generated.is_dir() {
+    // Completeness, not existence: an interrupted checkout leaves the directory
+    // behind, and treating that as a finished cache entry makes every later run
+    // skip the fetch and fail in `read_generated_dir` with no way out but
+    // deleting the cache by hand.
+    let complete = IR_FILES.iter().all(|rel| generated.join(rel).is_file());
+    if !complete {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating the IR cache at {}", dir.display()))?;
         git(&dir, &["init", "--quiet", "."])?;
@@ -299,6 +304,29 @@ mod tests {
         let lock = lock_with(BTreeMap::from([(IR_FILES[0].to_string(), digest(b"x"))]));
         let err = verify(&ir_with(&full_ir("x")), &lock).expect_err("incomplete lock");
         assert!(err.to_string().contains("--update-lock"), "{err}");
+    }
+
+    #[test]
+    fn a_half_written_cache_entry_is_not_reused() {
+        // An interrupted checkout leaves `generated/` behind. Reusing it would
+        // make every later run fail the same way, with no ordinary retry that
+        // repairs it.
+        let cache = std::env::temp_dir().join("whatspec-codegen-cache-test");
+        let _ = std::fs::remove_dir_all(&cache);
+        let generated = cache.join("deadbeef").join("generated");
+        std::fs::create_dir_all(generated.join("abprops")).expect("partial cache");
+        std::fs::write(generated.join("manifest.json"), b"{}").expect("one file");
+
+        // No network: the reuse branch would have returned a read error for the
+        // missing files, so reaching git at all is what proves the entry was
+        // rejected.
+        let msg = match fetch_pinned("file:///nonexistent-whatspec", "deadbeef", &cache) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("an incomplete entry must be refetched"),
+        };
+        assert!(!msg.contains("reading IR file"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
     #[test]
