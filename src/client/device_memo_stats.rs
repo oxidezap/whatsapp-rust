@@ -317,8 +317,14 @@ impl SkdmTargetsMemoStats {
             + self.resolve_failed
     }
 
-    /// Share of calls that skipped `filter_skdm_targets`. `None` when nothing
-    /// was resolved yet.
+    /// Memo hits over *every* call to the resolver, [`Self::resolve_failed`]
+    /// included. `None` when nothing was resolved yet.
+    ///
+    /// Deliberately not "share that skipped `filter_skdm_targets`": a call
+    /// whose device resolution errored also never reached the filter, and
+    /// crediting it would let a client whose group sends are failing report a
+    /// rising hit rate. Keeping those in the denominator makes the rate sag
+    /// under exactly the condition worth noticing.
     pub fn hit_rate(&self) -> Option<f64> {
         let calls = self.calls();
         (calls > 0).then(|| self.hits as f64 / calls as f64)
