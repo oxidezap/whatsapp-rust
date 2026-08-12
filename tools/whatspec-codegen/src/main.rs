@@ -32,6 +32,12 @@ use anyhow::{Context, Result, bail, ensure};
 
 use source::{Ir, Lock};
 
+/// The one IR document that is not JSON, so the envelope loop cannot reach it.
+const PROTO_IR: &str = "proto/WAProto.proto";
+
+/// Its committed counterpart, whose descriptor `--check` also validates.
+const PROTO_ARTIFACT: &str = "waproto/src/whatsapp.proto";
+
 /// Where the IR comes from.
 #[derive(Debug)]
 enum Origin {
@@ -91,12 +97,7 @@ fn main() -> Result<()> {
     };
 
     let wa_version = stamped_version(&ir)?;
-    if opts.update_lock {
-        lock.wa_version = wa_version.clone();
-        lock.files = ir.digests();
-        lock.write(&lock_path)?;
-        println!("wrote {}", lock_path.display());
-    } else {
+    if !opts.update_lock {
         source::verify(&ir, &lock)?;
         ensure!(
             lock.wa_version == wa_version,
@@ -105,6 +106,9 @@ fn main() -> Result<()> {
         );
     }
 
+    // Before the lock is touched: the emitters reject a lost proto anchor, an
+    // invalid token table and an unrepresentable version, and a lock pinning a
+    // build that no committed artifact describes is worse than no new lock.
     let artifacts = build(&ir, &wa_version)?;
     if opts.check {
         return check(&repo_root, &artifacts);
@@ -113,6 +117,12 @@ fn main() -> Result<()> {
 
     if !opts.skip_proto_desc {
         regenerate_proto_descriptor(&repo_root)?;
+    }
+    if opts.update_lock {
+        lock.wa_version = wa_version.clone();
+        lock.files = ir.digests();
+        lock.write(&lock_path)?;
+        println!("wrote {}", lock_path.display());
     }
     println!(
         "regenerated {} artifacts at WhatsApp {wa_version}",
@@ -209,6 +219,22 @@ fn stamped_version(ir: &Ir) -> Result<String> {
             manifest.schema_version
         );
     }
+
+    // The proto is the one domain with no JSON envelope, so skipping it here is
+    // how a schema from a different build reaches `whatsapp.proto` while every
+    // JSON-derived registry agrees. It carries the same stamp as a comment.
+    let proto = ir.text(PROTO_IR)?;
+    let stamped = proto
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("/// WhatsApp Version:"))
+        .map(str::trim)
+        .with_context(|| format!("{PROTO_IR} carries no `/// WhatsApp Version:` header"))?;
+    ensure!(
+        stamped == manifest.wa_version,
+        "{PROTO_IR} stamps WhatsApp {stamped} but the manifest stamps {}",
+        manifest.wa_version
+    );
+
     Ok(manifest.wa_version)
 }
 
@@ -249,8 +275,8 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
             rust: false,
         },
         Artifact {
-            path: "waproto/src/whatsapp.proto",
-            content: emit::proto::generate(&ir.text("proto/WAProto.proto")?)?,
+            path: PROTO_ARTIFACT,
+            content: emit::proto::generate(&ir.text(PROTO_IR)?)?,
             rust: false,
         },
     ])
@@ -294,8 +320,58 @@ fn check(root: &Path, artifacts: &[Artifact]) -> Result<()> {
         "these artifacts do not match the pinned IR: {}\nrun `cargo run -p whatspec-codegen`",
         stale.join(", ")
     );
+    let proto = artifacts
+        .iter()
+        .find(|a| a.path == PROTO_ARTIFACT)
+        .with_context(|| format!("{PROTO_ARTIFACT} is not in the artifact set"))?;
+    check_proto_descriptor(root, &proto.content)?;
     println!("all artifacts match the pinned IR");
     Ok(())
+}
+
+/// The descriptor beside the `.proto` describes the same schema.
+///
+/// `--check` would otherwise pass on a tree regenerated with `--skip-proto-desc`
+/// or with a hand-edited `.desc`, and the contradiction would surface much later
+/// as a `waproto` build failure in a different job. Comparing the recorded
+/// hashes catches it here and needs no protoc.
+fn check_proto_descriptor(root: &Path, proto: &str) -> Result<()> {
+    let hashes = root.join("waproto/src/whatsapp.desc.sha256");
+    let text = std::fs::read_to_string(&hashes)
+        .with_context(|| format!("reading {}", hashes.display()))?;
+    let recorded = |key: &str| -> Result<String> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key).map(|h| h.trim().to_string()))
+            .with_context(|| format!("{} has no `{key}` line", hashes.display()))
+    };
+    let desc = std::fs::read(root.join("waproto/src/whatsapp.desc"))
+        .context("reading waproto/src/whatsapp.desc")?;
+    for (what, want, got) in [
+        ("proto", recorded("proto ")?, sha256_hex(proto.as_bytes())),
+        ("desc", recorded("desc ")?, sha256_hex(&desc)),
+    ] {
+        ensure!(
+            want == got,
+            "waproto/src/whatsapp.desc.sha256 records {what} {want} but the {} hashes to {got}\n\
+             run `cargo run -p whatspec-codegen` (or scripts/regenerate-proto-desc.sh)",
+            if what == "proto" {
+                "generated schema"
+            } else {
+                "committed descriptor"
+            }
+        );
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut s, b| {
+            s.push_str(&format!("{b:02x}"));
+            s
+        })
 }
 
 /// The exact bytes an artifact should have on disk, rustfmt included.
@@ -392,14 +468,25 @@ mod tests {
         // --check proves the tree matches the lock; --update-lock rewrites the
         // lock to match the tree. Together they prove nothing.
         assert!(parse(&["--check", "--update-lock"]).is_err());
-        // A lock recording remote rev X against digests read from an unrelated
-        // local tree is a claim that was never checked.
         let err = parse(&["--from", "/tmp/ir", "--update-lock"])
             .expect_err("--from cannot source an updated lock");
         assert!(
             err.to_string().contains("--from and --update-lock"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn the_committed_descriptor_hashes_match_the_generated_schema() {
+        // The real tree, so this fails if someone regenerates the `.proto` with
+        // --skip-proto-desc and commits without rerunning protoc.
+        let root = repo_root();
+        let proto = std::fs::read_to_string(root.join(PROTO_ARTIFACT)).expect("the proto");
+        check_proto_descriptor(&root, &proto).expect("descriptor agrees with the schema");
+
+        let err = check_proto_descriptor(&root, "syntax = \"proto2\";\n")
+            .expect_err("a different schema must not pass");
+        assert!(format!("{err:#}").contains("records proto"), "{err:#}");
     }
 
     #[test]
@@ -421,14 +508,29 @@ mod tests {
         format!(r#"{{"schemaVersion":"{schema}","waVersion":"{wa}"}}"#)
     }
 
+    /// The proto carries its stamp as a comment rather than a JSON envelope.
+    fn proto_stub(wa: &str) -> String {
+        format!("syntax = \"proto2\";\n\n/// WhatsApp Version: {wa}\n")
+    }
+
+    fn ir_files(schema: &str, wa: &str) -> Vec<(&'static str, String)> {
+        source::IR_FILES
+            .iter()
+            .map(|f| {
+                let body = if *f == PROTO_IR {
+                    proto_stub(wa)
+                } else {
+                    envelope(schema, wa)
+                };
+                (*f, body)
+            })
+            .collect()
+    }
+
     #[test]
     fn stamped_version_agrees_across_domains() {
-        let files: Vec<(&str, String)> = source::IR_FILES
-            .iter()
-            .map(|f| (*f, envelope("2.0.0", "2.3000.7")))
-            .collect();
         assert_eq!(
-            stamped_version(&ir_from(&files)).expect("stamp"),
+            stamped_version(&ir_from(&ir_files("2.0.0", "2.3000.7"))).expect("stamp"),
             "2.3000.7"
         );
     }
@@ -437,10 +539,7 @@ mod tests {
     fn a_domain_from_another_build_stops_the_run() {
         // The exact drift this tool replaces: abprops and mex vendored from two
         // different WhatsApp releases.
-        let mut files: Vec<(&str, String)> = source::IR_FILES
-            .iter()
-            .map(|f| (*f, envelope("2.0.0", "2.3000.7")))
-            .collect();
+        let mut files = ir_files("2.0.0", "2.3000.7");
         let mex = files
             .iter_mut()
             .find(|(f, _)| *f == "mex/index.json")
@@ -451,12 +550,35 @@ mod tests {
     }
 
     #[test]
+    fn a_proto_from_another_build_stops_the_run() {
+        // The proto has no JSON envelope, so the loop above cannot see it. It is
+        // the one domain whose drift would otherwise reach whatsapp.proto with
+        // every other registry agreeing.
+        let mut files = ir_files("2.0.0", "2.3000.7");
+        let proto = files
+            .iter_mut()
+            .find(|(f, _)| *f == PROTO_IR)
+            .expect("proto");
+        proto.1 = proto_stub("2.3000.8");
+        let err = stamped_version(&ir_from(&files)).expect_err("mixed builds");
+        assert!(err.to_string().contains(PROTO_IR), "{err}");
+    }
+
+    #[test]
+    fn a_proto_with_no_version_header_stops_the_run() {
+        let mut files = ir_files("2.0.0", "2.3000.7");
+        let proto = files
+            .iter_mut()
+            .find(|(f, _)| *f == PROTO_IR)
+            .expect("proto");
+        proto.1 = "syntax = \"proto2\";\n".to_string();
+        let err = stamped_version(&ir_from(&files)).expect_err("no stamp to compare");
+        assert!(err.to_string().contains("carries no"), "{err}");
+    }
+
+    #[test]
     fn an_unsupported_ir_schema_major_stops_the_run() {
-        let files: Vec<(&str, String)> = source::IR_FILES
-            .iter()
-            .map(|f| (*f, envelope("3.0.0", "2.3000.7")))
-            .collect();
-        let err = stamped_version(&ir_from(&files)).expect_err("schema 3");
+        let err = stamped_version(&ir_from(&ir_files("3.0.0", "2.3000.7"))).expect_err("schema 3");
         assert!(err.to_string().contains("not supported"), "{err}");
     }
 }

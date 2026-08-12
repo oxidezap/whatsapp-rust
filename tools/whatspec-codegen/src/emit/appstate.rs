@@ -75,24 +75,29 @@ pub fn generate(ir: &AppstateIr) -> Result<String> {
     );
     out.push_str(&collection_enum);
     let scopes: BTreeSet<&str> = ir.actions.values().map(|a| a.scope.as_str()).collect();
-    out.push_str(
-        &render_enum(
-            "/// The index scope an action applies to.",
-            "Scope",
-            scopes.iter().copied(),
-        )
-        .0,
+    let (scope_enum, scope_variants) = render_enum(
+        "/// The index scope an action applies to.",
+        "Scope",
+        scopes.iter().copied(),
     );
+    out.push_str(&scope_enum);
     out.push_str(INDEX_PART_AND_SCHEMA);
 
-    // Every `Collection::` below has to name a variant the enum just declared,
-    // or the generated file does not compile and the failure lands on whoever
-    // runs the next build instead of on this run.
+    // Every `Collection::` and `Scope::` below has to name the variant the enum
+    // just declared. Re-deriving it with `pascal_case` is how two wire strings
+    // that normalize alike end up sharing one variant: the file still compiles
+    // and one action silently carries the other's value.
     let variant = |wire: &str| -> Result<String> {
         collection_variants
             .get(wire)
             .map(|v| format!("Collection::{v}"))
             .with_context(|| format!("collection {wire:?} is not in the IR's collection list"))
+    };
+    let scope_variant = |wire: &str| -> Result<String> {
+        scope_variants
+            .get(wire)
+            .map(|v| format!("Scope::{v}"))
+            .with_context(|| format!("scope {wire:?} is not in the declared scope set"))
     };
     let collections: Vec<String> = ir
         .collections
@@ -136,7 +141,7 @@ pub fn generate(ir: &AppstateIr) -> Result<String> {
         out.push_str(&format!(
             "/// `{key}` — module `{module}`.\npub const {const_name}: Schema = Schema {{\n\
              \x20   key: {key_lit},\n    name: {name_lit},\n    module: {module_lit},\n    collection: {collection},\n\
-             \x20   version: {version},\n    scope: Scope::{scope},\n    value_field: {value_field},\n\
+             \x20   version: {version},\n    scope: {scope},\n    value_field: {value_field},\n\
              \x20   value_proto_type: {value_proto},\n    value_enum_fields: {enum_fields},\n\
              \x20   chat_jid_index: {chat_jid_index},\n    index_parts: &[{index_parts}],\n}};\n\n",
             module = action.module,
@@ -144,7 +149,7 @@ pub fn generate(ir: &AppstateIr) -> Result<String> {
             name_lit = rust_lit(&action.name),
             module_lit = rust_lit(&action.module),
             version = action.version.unwrap_or(0),
-            scope = pascal_case(&action.scope),
+            scope = scope_variant(&action.scope).with_context(|| format!("action {key}"))?,
             value_field = opt_lit(action.value_field.as_deref()),
             value_proto = opt_lit(action.value_proto_type.as_deref()),
             chat_jid_index = match action.chat_jid_index {
@@ -317,6 +322,35 @@ mod tests {
         // Each variant keeps its own wire string.
         assert!(code.contains("Collection::CriticalBlock => \"criticalBlock\","));
         assert!(code.contains("Collection::CriticalBlock2 => \"critical_block\","));
+    }
+
+    #[test]
+    fn scope_names_that_pascal_case_alike_stay_distinct_variants() {
+        // Worse than the collection case: re-deriving the name would compile
+        // and silently give one action the other's scope.
+        let code = emitted(&ir(vec![
+            ("A", action("a", "critical_block", None)),
+            ("B", action("b", "criticalBlock", None)),
+        ]));
+        assert!(
+            code.contains("Scope::CriticalBlock => \"criticalBlock\","),
+            "{code}"
+        );
+        assert!(
+            code.contains("Scope::CriticalBlock2 => \"critical_block\","),
+            "{code}"
+        );
+        assert!(code.contains("scope: Scope::CriticalBlock2,"), "{code}");
+        assert!(code.contains("scope: Scope::CriticalBlock,"), "{code}");
+    }
+
+    #[test]
+    fn a_scope_whose_pascal_case_is_escaped_still_names_the_declared_variant() {
+        // `ensure_ident` escapes `Self` to `Self_`; formatting the variant
+        // independently would emit `Scope::Self`, which does not exist.
+        let code = emitted(&ir(vec![("A", action("a", "self", None))]));
+        assert!(code.contains("Scope::Self_ => \"self\","), "{code}");
+        assert!(code.contains("scope: Scope::Self_,"), "{code}");
     }
 
     #[test]
