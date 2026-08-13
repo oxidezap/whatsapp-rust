@@ -1337,6 +1337,25 @@ impl DeviceStore for InMemoryBackend {
 /// not the map length. Counting the never-expire rows toward it would make a
 /// store that holds many of them (a backend reused across a `Full` -> `Managed`
 /// switch) evict every finite row it has and still not reach the bound.
+///
+/// # Where the alias grouping stops
+///
+/// A message's sender alias rows are kept together at the cutoff, which is
+/// where an arbitrary choice would otherwise be made. Rows *below* the cutoff
+/// go individually. Those two rows are separate keys, so nothing merges their
+/// deadlines, and a write that dated one of them differently -- a later capture
+/// under another retention class -- can leave a pair straddling the cutoff and
+/// split it.
+///
+/// That gap is deliberate. Closing it means grouping every evictable row, not
+/// just the cutoff's tie bucket, and the index that needs costs about 1.0 MiB
+/// of committed linear memory on wasm32 and roughly half again the eviction's
+/// CPU (measured, 30k sends: 5.88 -> 6.88 MiB). Linear memory is never returned
+/// there, so the fix permanently spends an eighth of what this cap is here to
+/// reclaim, against a split that needs one message's aliases to be written at
+/// different times under different classes. If that trade ever stops holding --
+/// a producer that routinely dates aliases apart -- the group index is the
+/// answer, and it belongs in the eviction, not in another guard above it.
 fn trim_msg_secrets(map: &mut MsgSecretMap, rescan_at: &mut usize) {
     // Evictable rows are a subset of the map, so this O(1) test is a sound
     // early-out for the O(n) one below and keeps the common insert allocation-
