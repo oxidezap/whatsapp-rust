@@ -1010,28 +1010,45 @@ impl MsgSecretStore for InMemoryBackend {
         // Initial history batches are overwhelmingly new rows, so reserve
         // once. Once populated, a batch may be mostly overwrites; reserving its
         // full length then would grow the table without adding any rows.
+        // Clamped to the cap: a seed batch larger than it would otherwise size
+        // the table for rows this store is about to evict anyway.
         if state.msg_secrets.is_empty() {
-            state.msg_secrets.reserve(stored);
+            state.msg_secrets.reserve(stored.min(MAX_MSG_SECRETS));
         }
-        for entry in entries {
-            let key = MsgSecretKey {
-                chat: entry.chat,
-                sender: entry.sender,
-                msg_id: entry.msg_id,
-            };
-            match state.msg_secrets.entry(key) {
-                Entry::Occupied(mut occupied) => {
-                    let (secret, expires_at, message_ts) = occupied.get_mut();
-                    *secret = entry.secret;
-                    *expires_at = merge_msg_secret_expiry(*expires_at, entry.expires_at);
-                    *message_ts = merge_msg_secret_message_ts(*message_ts, entry.message_ts);
-                }
-                Entry::Vacant(vacant) => {
-                    vacant.insert((entry.secret, entry.expires_at, entry.message_ts));
+        // Evict between chunks rather than once at the end. A batch bigger than
+        // the cap -- a history-sync seed goes straight to the backend, skipping
+        // the write-behind buffer's own high-water mark -- would otherwise be
+        // inserted whole, and by the time the eviction ran the table would
+        // already have doubled past the bound. `retain` frees rows but not the
+        // allocation, and on wasm32 that allocation is never returned, so the
+        // footprint bound has to hold going up, not just coming down.
+        let mut entries = entries.into_iter();
+        loop {
+            let mut inserted = 0usize;
+            for entry in entries.by_ref().take(MAX_MSG_SECRETS / 4) {
+                inserted += 1;
+                let key = MsgSecretKey {
+                    chat: entry.chat,
+                    sender: entry.sender,
+                    msg_id: entry.msg_id,
+                };
+                match state.msg_secrets.entry(key) {
+                    Entry::Occupied(mut occupied) => {
+                        let (secret, expires_at, message_ts) = occupied.get_mut();
+                        *secret = entry.secret;
+                        *expires_at = merge_msg_secret_expiry(*expires_at, entry.expires_at);
+                        *message_ts = merge_msg_secret_message_ts(*message_ts, entry.message_ts);
+                    }
+                    Entry::Vacant(vacant) => {
+                        vacant.insert((entry.secret, entry.expires_at, entry.message_ts));
+                    }
                 }
             }
+            if inserted == 0 {
+                break;
+            }
+            trim_msg_secrets(&mut state.msg_secrets);
         }
-        trim_msg_secrets(&mut state.msg_secrets);
         Ok(stored)
     }
 
@@ -1244,11 +1261,18 @@ impl DeviceStore for InMemoryBackend {
 /// documented contract is unbounded retention, so they are never candidates.
 /// A store holding nothing but those still grows without bound -- that is the
 /// policy the caller asked for.
+///
+/// For the same reason the cap is measured against the evictable rows alone,
+/// not the map length. Counting the never-expire rows toward it would make a
+/// store that holds many of them (a backend reused across a `Full` -> `Managed`
+/// switch) evict every finite row it has and still not reach the bound.
 fn trim_msg_secrets(map: &mut MsgSecretMap) {
+    // Evictable rows are a subset of the map, so this O(1) test is a sound
+    // early-out for the O(n) one below and keeps the common insert allocation-
+    // free.
     if map.len() <= MAX_MSG_SECRETS {
         return;
     }
-    let target = MAX_MSG_SECRETS * 3 / 4;
     // Only the deadlines are collected: cloning every key to sort them would
     // allocate three `Arc<str>` bumps per retained row on each eviction while
     // holding the state lock. `select_nth_unstable` finds the cutoff in O(n)
@@ -1258,10 +1282,10 @@ fn trim_msg_secrets(map: &mut MsgSecretMap) {
         .filter(|(_, expires_at, _)| *expires_at != 0)
         .map(|(_, expires_at, _)| *expires_at)
         .collect();
-    let drop_count = map.len().saturating_sub(target).min(deadlines.len());
-    if drop_count == 0 {
+    if deadlines.len() <= MAX_MSG_SECRETS {
         return;
     }
+    let drop_count = deadlines.len() - MAX_MSG_SECRETS * 3 / 4;
     let (_, &mut cutoff, _) = deadlines.select_nth_unstable(drop_count - 1);
     // Two passes apply the cutoff, because map iteration order is arbitrary and
     // a single pass could evict a row AT the cutoff while keeping one below it.
@@ -1908,6 +1932,92 @@ mod tests {
                 .is_none(),
             "oldest deadline must be evicted first"
         );
+    }
+
+    /// A history-sync seed reaches `put_msg_secrets` as one oversized batch.
+    /// Trimming only after the whole batch landed would bound the row count but
+    /// not the table, and on wasm32 that allocation is never returned -- so what
+    /// this asserts is the allocation, not the length: one big batch must cost
+    /// no more table than the same rows trickling in one at a time.
+    #[tokio::test]
+    async fn one_oversized_msg_secret_batch_costs_no_more_table_than_trickling() {
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let now = crate::time::now_secs();
+        let total = MAX_MSG_SECRETS * 4;
+        let row = |i: usize| {
+            MsgSecretEntry::new(
+                &chat,
+                &chat,
+                &format!("m{i:07}"),
+                [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                now + i as i64,
+                now,
+            )
+        };
+
+        let batched = InMemoryBackend::new();
+        batched
+            .put_msg_secrets((0..total).map(row).collect())
+            .await
+            .unwrap();
+
+        let trickled = InMemoryBackend::new();
+        for i in 0..total {
+            trickled.put_msg_secrets(vec![row(i)]).await.unwrap();
+        }
+
+        let batched_capacity = batched.state.lock().await.msg_secrets.capacity();
+        let trickled_capacity = trickled.state.lock().await.msg_secrets.capacity();
+        assert!(
+            batched_capacity <= trickled_capacity,
+            "an oversized batch grew the table past the bound: \
+             batched {batched_capacity} > trickled {trickled_capacity}"
+        );
+        assert!(batched.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS);
+    }
+
+    /// A backend reused across a `Full` -> `Managed` switch holds enough
+    /// never-expire rows to exceed the cap on their own. Measuring the cap
+    /// against the map length there would evict every finite row and still not
+    /// reach the bound, so the managed secrets have to survive.
+    #[tokio::test]
+    async fn msg_secrets_cap_does_not_wipe_finite_rows_behind_permanent_ones() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let c = chat.to_string();
+        let now = crate::time::now_secs();
+        let put = async |id: String, expires_at: i64| {
+            backend
+                .put_msg_secrets(vec![MsgSecretEntry::new(
+                    &chat,
+                    &chat,
+                    &id,
+                    [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                    expires_at,
+                    now,
+                )])
+                .await
+                .unwrap();
+        };
+
+        // Permanent rows alone already exceed the cap.
+        for i in 0..MAX_MSG_SECRETS + 1000 {
+            put(format!("perm{i:07}"), 0).await;
+        }
+        for i in 0..100 {
+            put(format!("fin{i:07}"), now + 1 + i as i64).await;
+        }
+
+        for i in 0..100 {
+            assert!(
+                backend
+                    .get_msg_secret(&c, &c, &format!("fin{i:07}"))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "finite row {i} was evicted to make room for un-evictable rows"
+            );
+        }
     }
 
     /// `MsgSecretPolicy::Full` writes `expires_at = 0` and promises unbounded
