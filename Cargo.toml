@@ -428,4 +428,4 @@ strip = false
 # `claude/x25519-field-arithmetic-5293gk`.
 # Revert to the crates.io release once the changes land upstream.
 [patch.crates-io]
-curve25519-dalek = { git = "https://github.com/jlucaso1/curve25519-dalek", rev = "c41b249220f7037bf43346c93280e839972f4a91" }
+curve25519-dalek = { git = "https://github.com/jlucaso1/curve25519-dalek", rev = "f261a975757c659105c163cad3da053b16e0af2c" }
