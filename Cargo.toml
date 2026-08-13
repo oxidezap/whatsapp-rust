@@ -399,10 +399,15 @@ strip = false
 #                         specialized on the constant's sparse limbs, a
 #                         `sub_unreduced` that drops the trailing reduction
 #                         where the operands' own bounds allow it, and a
-#                         field multiply re-emitted to stop spilling
+#                         field multiply and squaring re-emitted by operand
+#                         scanning, to stop spilling
 #   fixed-base ladder     given a vector implementation at all — it ran in
-#                         `serial::u64` even with AVX2 live — which is every
-#                         ephemeral ratchet key and every prekey
+#                         `serial::u64` even with AVX2 live — and reached
+#                         through both spellings, `EdwardsPoint::mul_base`
+#                         and `&scalar * ED25519_BASEPOINT_TABLE`; we use the
+#                         table one in `calculate_signature` and
+#                         `compute_edwards_cache`, so it covers every XEdDSA
+#                         signature as well as every ephemeral key and prekey
 #   Edwards / XEdDSA      a column-major vector multiply and a fused blend in
 #                         point doubling, both on the AVX2 backend that
 #                         signature verification runs on
@@ -423,4 +428,4 @@ strip = false
 # `claude/x25519-field-arithmetic-5293gk`.
 # Revert to the crates.io release once the changes land upstream.
 [patch.crates-io]
-curve25519-dalek = { git = "https://github.com/jlucaso1/curve25519-dalek", rev = "fc70cc9bed57c7b48c85d9635037c1b322b2d8c3" }
+curve25519-dalek = { git = "https://github.com/jlucaso1/curve25519-dalek", rev = "c41b249220f7037bf43346c93280e839972f4a91" }
