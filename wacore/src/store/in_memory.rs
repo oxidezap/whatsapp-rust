@@ -1363,29 +1363,46 @@ fn trim_msg_secrets(map: &mut MsgSecretMap, rescan_at: &mut usize) {
     // arbitrary subset of the bucket -- keeping one alias, losing the other --
     // would make decryption depend on which identity the later stanza happens
     // to carry. Choose whole messages instead of whole rows.
-    let mut doomed: HbHashSet<MsgGroupKey, RandomState> = HbHashSet::default();
+    //
+    // Each group is counted in full before anything is committed to. Charging
+    // the budget per visited row instead would undercount every group whose
+    // partner iteration had not reached yet -- and since a message's two rows
+    // hash independently, most of them -- so a 2049-row budget could remove
+    // close to 4098 rows and leave the store at half the target. That is not a
+    // bound being overshot, it is thousands of retainable secrets thrown away.
+    let mut bucket: HbHashMap<MsgGroupKey, usize, RandomState> = HbHashMap::default();
     for (key, (_, expires_at, _)) in map.iter() {
-        if remaining == 0 {
-            break;
-        }
         if *expires_at != cutoff {
             continue;
         }
-        if !doomed.contains(&MsgGroupKeyRef {
+        if let Some(rows) = bucket.get_mut(&MsgGroupKeyRef {
             chat: &key.chat,
             msg_id: &key.msg_id,
         }) {
-            doomed.insert(MsgGroupKey {
-                chat: Arc::clone(&key.chat),
-                msg_id: Arc::clone(&key.msg_id),
-            });
+            *rows += 1;
+        } else {
+            bucket.insert(
+                MsgGroupKey {
+                    chat: Arc::clone(&key.chat),
+                    msg_id: Arc::clone(&key.msg_id),
+                },
+                1,
+            );
         }
-        remaining -= 1;
     }
-    // A group whose second row was never visited (the budget ran out first, or
-    // iteration order separated them) still goes whole, so this can overshoot
-    // `drop_count` by at most one row per doomed group. Overshooting a memory
-    // bound is harmless; splitting an alias pair is not.
+    // Skipping a group that does not fit rather than stopping outright lets a
+    // smaller one still use the remainder. Falling a row or two short of the
+    // target is fine: the next insert re-enters through the length guard.
+    let mut doomed: HbHashSet<MsgGroupKey, RandomState> = HbHashSet::default();
+    for (group, rows) in bucket {
+        if remaining == 0 {
+            break;
+        }
+        if rows <= remaining {
+            remaining -= rows;
+            doomed.insert(group);
+        }
+    }
     map.retain(|key, (_, expires_at, _)| {
         *expires_at != cutoff
             || !doomed.contains(&MsgGroupKeyRef {
@@ -2075,6 +2092,11 @@ mod tests {
         let deadline = now + 30 * 86_400;
 
         let total = MAX_MSG_SECRETS * 2;
+        // The low-water mark right after an eviction, which is what says
+        // whether the budget was overcharged. The length at the end of the run
+        // is not: it lands anywhere in the oscillation between evictions.
+        let mut low_water = usize::MAX;
+        let mut evicted_once = false;
         for i in 0..total {
             let id = format!("m{i:07}");
             // Both aliases of one message land in the same batch, exactly as
@@ -2097,7 +2119,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let len = backend.state.lock().await.msg_secrets.len();
+            evicted_once |= len >= MAX_MSG_SECRETS;
+            if evicted_once {
+                low_water = low_water.min(len);
+            }
         }
+        assert!(evicted_once, "the run never reached the cap");
 
         let c = chat.to_string();
         let (a, b) = (alias_a.to_string(), alias_b.to_string());
@@ -2113,6 +2141,14 @@ mod tests {
             pairs += usize::from(got_a);
         }
         assert!(pairs > 0, "eviction removed every message");
+        // And the budget must be charged per group, not per row visited. Every
+        // group here holds two rows, so undercounting them would evict about
+        // twice the intended number and leave the store near half the target.
+        assert!(
+            low_water >= MAX_MSG_SECRETS * 3 / 4,
+            "eviction overshot: dropped to {low_water} rows, target is {}",
+            MAX_MSG_SECRETS * 3 / 4
+        );
     }
 
     /// A backend reused across a `Full` -> `Managed` switch holds enough
