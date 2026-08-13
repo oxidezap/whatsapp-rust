@@ -1043,9 +1043,21 @@ impl ProtocolStore for InMemoryBackend {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MsgSecretStore for InMemoryBackend {
-    async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
+    async fn put_msg_secrets(&self, mut entries: Vec<MsgSecretEntry>) -> Result<usize> {
         use crate::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
         let stored = entries.len();
+        // Only a batch long enough to be chunked below can have a chunk boundary
+        // fall inside a message, and only then does the order matter. Sorting
+        // groups a message's sender alias rows together so the boundary check
+        // can see them: the client's write-behind buffer snapshots its pending
+        // set from a `HashMap`, so the aliases it queued back to back reach the
+        // store scattered. In place, so this costs no allocation on the one
+        // path -- a history-sync seed -- that is ever long enough to reach it.
+        if stored > MAX_MSG_SECRETS / 4 {
+            entries.sort_unstable_by(|a, b| {
+                (a.chat.as_ref(), a.msg_id.as_ref()).cmp(&(b.chat.as_ref(), b.msg_id.as_ref()))
+            });
+        }
         let mut state = self.state.lock().await;
         // Initial history batches are overwhelmingly new rows, so reserve
         // once. Once populated, a batch may be mostly overwrites; reserving its
@@ -1073,10 +1085,9 @@ impl MsgSecretStore for InMemoryBackend {
                 // free to drop the one it can see, after which the other lands
                 // and survives alone. That is the identity-dependent decryption
                 // failure the grouping in `trim_msg_secrets` exists to prevent,
-                // reintroduced one level up. Both producers emit a message's
-                // aliases consecutively (`history_msg_secret_senders`, and the
-                // inbound capture's alias batch), so holding the chunk open
-                // while the next entry names the same message is enough.
+                // reintroduced one level up. The sort above put a message's rows
+                // next to each other, so holding the chunk open while the next
+                // entry names the same message is enough.
                 let boundary_group = (inserted >= MAX_MSG_SECRETS / 4)
                     .then(|| (Arc::clone(&entry.chat), Arc::clone(&entry.msg_id)));
                 let key = MsgSecretKey {
@@ -2246,6 +2257,55 @@ mod tests {
         assert!(
             backend.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS,
             "the oversized batch escaped the cap"
+        );
+    }
+
+    /// The write-behind buffer snapshots its pending set from a `HashMap`, so
+    /// the aliases the inbound capture queued back to back reach the store in
+    /// arbitrary order. Worst case of that: every first alias, then every
+    /// second. Chunking must still not evict one half of a message before the
+    /// other half has been inserted.
+    #[tokio::test]
+    async fn msg_secret_chunking_groups_aliases_that_arrive_scattered() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let alias_a: wacore_binary::Jid = "2@s.whatsapp.net".parse().unwrap();
+        let alias_b: wacore_binary::Jid = "3@lid".parse().unwrap();
+        let now = crate::time::now_secs();
+        let deadline = now + 30 * 86_400;
+
+        let total = MAX_MSG_SECRETS * 3;
+        let row = |i: usize, sender: &wacore_binary::Jid| {
+            MsgSecretEntry::new(
+                &chat,
+                sender,
+                &format!("m{i:07}"),
+                [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                deadline - i as i64,
+                now,
+            )
+        };
+        let mut batch: Vec<_> = (0..total).map(|i| row(i, &alias_a)).collect();
+        batch.extend((0..total).map(|i| row(i, &alias_b)));
+        backend.put_msg_secrets(batch).await.unwrap();
+
+        let c = chat.to_string();
+        let (a, b) = (alias_a.to_string(), alias_b.to_string());
+        let mut survivors = 0usize;
+        for i in 0..total {
+            let id = format!("m{i:07}");
+            let got_a = backend.get_msg_secret(&c, &a, &id).await.unwrap().is_some();
+            let got_b = backend.get_msg_secret(&c, &b, &id).await.unwrap().is_some();
+            assert_eq!(
+                got_a, got_b,
+                "message {i} kept one sender alias but not the other"
+            );
+            survivors += usize::from(got_a);
+        }
+        assert!(survivors > 0, "eviction removed every message");
+        assert!(
+            backend.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS,
+            "the scattered batch escaped the cap"
         );
     }
 
