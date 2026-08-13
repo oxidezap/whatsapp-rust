@@ -114,6 +114,24 @@ struct InMemoryState {
 /// time window); this cap only guards against a burst between sweeps.
 const MAX_SENT_MESSAGES: usize = 4096;
 
+/// Hard cap on retained message secrets, the `msg_secrets` counterpart of
+/// [`MAX_SENT_MESSAGES`] and there for the same reason: time-based pruning
+/// (`delete_expired_msg_secrets`, driven by the client's keepalive sweep)
+/// cannot reclaim anything inside a session, because the default `Managed`
+/// policy dates every row 30-90 days out. Without a cap the map is one row per
+/// message for the life of the process.
+///
+/// That is a footprint bug specifically on wasm32, where the allocator never
+/// returns pages: the table doubles by reallocation, so the old and the new
+/// table are briefly live together, and the ~1.5x spike stays committed in
+/// linear memory even after the rows are dropped. A 30k-message session
+/// reallocated this table to 4.56 MiB (65536 buckets x 73 B) and committed
+/// ~7 MiB it never gave back.
+///
+/// Sized at 2x [`MAX_SENT_MESSAGES`] and 2x the client's message-secret
+/// write-behind high-water mark, so a burst that fills both still fits.
+const MAX_MSG_SECRETS: usize = 8192;
+
 /// In-memory implementation of the full [`Backend`] trait.
 ///
 /// Thread-safe and runtime-agnostic (uses [`async_lock::Mutex`]).
@@ -1013,6 +1031,7 @@ impl MsgSecretStore for InMemoryBackend {
                 }
             }
         }
+        trim_msg_secrets(&mut state.msg_secrets);
         Ok(stored)
     }
 
@@ -1210,6 +1229,62 @@ impl DeviceStore for InMemoryBackend {
             pages: Some(rows),
             ..Default::default()
         }
+    }
+}
+
+/// Drop the soonest-to-expire secrets once the map exceeds
+/// [`MAX_MSG_SECRETS`], down to 3/4 of the cap so the scan amortizes across
+/// many inserts (same shape as `store_sent_message`'s eviction).
+///
+/// Ordering by `expires_at` rather than by insertion evicts the row closest to
+/// being pruned anyway, which also keeps the longer horizons: a poll/event
+/// secret (90 days) outlives a text secret (30 days) of the same age.
+///
+/// Rows with no deadline are what `MsgSecretPolicy::Full` writes, and its
+/// documented contract is unbounded retention, so they are never candidates.
+/// A store holding nothing but those still grows without bound -- that is the
+/// policy the caller asked for.
+fn trim_msg_secrets(map: &mut MsgSecretMap) {
+    if map.len() <= MAX_MSG_SECRETS {
+        return;
+    }
+    let target = MAX_MSG_SECRETS * 3 / 4;
+    // Only the deadlines are collected: cloning every key to sort them would
+    // allocate three `Arc<str>` bumps per retained row on each eviction while
+    // holding the state lock. `select_nth_unstable` finds the cutoff in O(n)
+    // without ordering the rest.
+    let mut deadlines: Vec<i64> = map
+        .values()
+        .filter(|(_, expires_at, _)| *expires_at != 0)
+        .map(|(_, expires_at, _)| *expires_at)
+        .collect();
+    let drop_count = map.len().saturating_sub(target).min(deadlines.len());
+    if drop_count == 0 {
+        return;
+    }
+    let (_, &mut cutoff, _) = deadlines.select_nth_unstable(drop_count - 1);
+    // Two passes apply the cutoff, because map iteration order is arbitrary and
+    // a single pass could evict a row AT the cutoff while keeping one below it.
+    // `cutoff` is never 0, so the never-expire rows stay out of both passes.
+    let mut removed = 0usize;
+    map.retain(|_, (_, expires_at, _)| {
+        if *expires_at != 0 && *expires_at < cutoff {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    let mut remaining = drop_count.saturating_sub(removed);
+    if remaining > 0 {
+        map.retain(|_, (_, expires_at, _)| {
+            if remaining > 0 && *expires_at == cutoff {
+                remaining -= 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -1777,6 +1852,95 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// The cap is a footprint bound, so what it must guarantee is that a
+    /// session sending far more messages than the cap never grows the table
+    /// past it -- on wasm32 the doubling realloc commits linear memory that is
+    /// never returned.
+    #[tokio::test]
+    async fn msg_secrets_stay_bounded_and_evict_soonest_deadline_first() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let now = crate::time::now_secs();
+
+        // 4x the cap, each row dated further out than the last.
+        let total = MAX_MSG_SECRETS * 4;
+        for i in 0..total {
+            backend
+                .put_msg_secrets(vec![MsgSecretEntry::new(
+                    &chat,
+                    &chat,
+                    &format!("m{i:07}"),
+                    [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                    now + i as i64,
+                    now,
+                )])
+                .await
+                .unwrap();
+            assert!(
+                backend.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS,
+                "msg_secrets exceeded the cap at insert {i}"
+            );
+        }
+
+        // The survivors are the latest deadlines, i.e. the most recent sends.
+        let len = backend.state.lock().await.msg_secrets.len();
+        assert!(len > MAX_MSG_SECRETS * 3 / 4 - 1 && len <= MAX_MSG_SECRETS);
+        assert!(
+            backend
+                .get_msg_secret(
+                    &chat.to_string(),
+                    &chat.to_string(),
+                    &format!("m{:07}", total - 1)
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "newest row must survive"
+        );
+        assert!(
+            backend
+                .get_msg_secret(&chat.to_string(), &chat.to_string(), "m0000000")
+                .await
+                .unwrap()
+                .is_none(),
+            "oldest deadline must be evicted first"
+        );
+    }
+
+    /// `MsgSecretPolicy::Full` writes `expires_at = 0` and promises unbounded
+    /// retention, so the cap must not touch those rows.
+    #[tokio::test]
+    async fn msg_secrets_cap_never_evicts_never_expire_rows() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let c = chat.to_string();
+
+        let total = MAX_MSG_SECRETS * 2;
+        for i in 0..total {
+            backend
+                .put_msg_secrets(vec![MsgSecretEntry::new(
+                    &chat,
+                    &chat,
+                    &format!("m{i:07}"),
+                    [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                    0,
+                    0,
+                )])
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(backend.state.lock().await.msg_secrets.len(), total);
+        assert!(
+            backend
+                .get_msg_secret(&c, &c, "m0000000")
+                .await
+                .unwrap()
+                .is_some(),
+            "a never-expire row is not an eviction candidate"
         );
     }
 
