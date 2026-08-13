@@ -5,7 +5,7 @@
 //! when the struct is dropped.
 
 use hashbrown::hash_map::Entry;
-use hashbrown::{Equivalent, HashMap as HbHashMap};
+use hashbrown::{Equivalent, HashMap as HbHashMap, HashSet as HbHashSet};
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::hash::Hash;
@@ -67,6 +67,42 @@ impl Equivalent<MsgSecretKey> for MsgSecretKeyRef<'_> {
 
 type MsgSecretMap = HbHashMap<MsgSecretKey, MsgSecretRow, RandomState>;
 
+/// One logical secret, ignoring which sender alias a row was filed under.
+/// Eviction groups by this so a message's aliases are kept or dropped together.
+///
+/// Only `msg_id` is hashed. A stanza id already names one message across the
+/// account, so mixing `chat` into the hash buys no selectivity and doubles the
+/// string hashing on a path that runs over every row of the cutoff's tie
+/// bucket. `chat` still decides equality, so a collision stays correct.
+#[derive(Eq, PartialEq)]
+struct MsgGroupKey {
+    chat: Arc<str>,
+    msg_id: Arc<str>,
+}
+
+impl Hash for MsgGroupKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.msg_id.hash(state);
+    }
+}
+
+struct MsgGroupKeyRef<'a> {
+    chat: &'a str,
+    msg_id: &'a str,
+}
+
+impl Hash for MsgGroupKeyRef<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.msg_id.hash(state);
+    }
+}
+
+impl Equivalent<MsgGroupKey> for MsgGroupKeyRef<'_> {
+    fn equivalent(&self, key: &MsgGroupKey) -> bool {
+        self.chat == key.chat.as_ref() && self.msg_id == key.msg_id.as_ref()
+    }
+}
+
 /// Inner state protected by the mutex.
 #[derive(Default)]
 struct InMemoryState {
@@ -102,6 +138,10 @@ struct InMemoryState {
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
     /// event time is unknown. The keepalive cleanup prunes expired rows.
     msg_secrets: MsgSecretMap,
+    /// Map length at which `trim_msg_secrets` is next allowed to do its O(n)
+    /// evictable-row scan. Purely an optimisation: a stale value can only cause
+    /// an extra scan, never a missed eviction.
+    msg_secrets_rescan_at: usize,
 
     // --- Device ---
     device: Option<Device>,
@@ -1047,7 +1087,8 @@ impl MsgSecretStore for InMemoryBackend {
             if inserted == 0 {
                 break;
             }
-            trim_msg_secrets(&mut state.msg_secrets);
+            let state = &mut *state;
+            trim_msg_secrets(&mut state.msg_secrets, &mut state.msg_secrets_rescan_at);
         }
         Ok(stored)
     }
@@ -1266,11 +1307,17 @@ impl DeviceStore for InMemoryBackend {
 /// not the map length. Counting the never-expire rows toward it would make a
 /// store that holds many of them (a backend reused across a `Full` -> `Managed`
 /// switch) evict every finite row it has and still not reach the bound.
-fn trim_msg_secrets(map: &mut MsgSecretMap) {
+fn trim_msg_secrets(map: &mut MsgSecretMap, rescan_at: &mut usize) {
     // Evictable rows are a subset of the map, so this O(1) test is a sound
     // early-out for the O(n) one below and keeps the common insert allocation-
     // free.
-    if map.len() <= MAX_MSG_SECRETS {
+    //
+    // `rescan_at` is the second guard, and it is what keeps a `Full`-policy
+    // store off the O(n) path. There `map.len()` sits above the cap forever
+    // while nothing is ever evictable, so the length test alone would scan the
+    // whole map on every single write -- O(n) per insert, O(n^2) over a
+    // session, all under the state lock.
+    if map.len() <= MAX_MSG_SECRETS || map.len() < *rescan_at {
         return;
     }
     // Only the deadlines are collected: cloning every key to sort them would
@@ -1283,8 +1330,13 @@ fn trim_msg_secrets(map: &mut MsgSecretMap) {
         .map(|(_, expires_at, _)| *expires_at)
         .collect();
     if deadlines.len() <= MAX_MSG_SECRETS {
+        // Nothing to evict yet. Every row added between now and the next scan
+        // adds at most one evictable row, so the cap cannot be reached before
+        // that many more arrive -- exact, not a heuristic.
+        *rescan_at = map.len() + (MAX_MSG_SECRETS - deadlines.len()) + 1;
         return;
     }
+    *rescan_at = 0;
     let drop_count = deadlines.len() - MAX_MSG_SECRETS * 3 / 4;
     let (_, &mut cutoff, _) = deadlines.select_nth_unstable(drop_count - 1);
     // Two passes apply the cutoff, because map iteration order is arbitrary and
@@ -1300,16 +1352,47 @@ fn trim_msg_secrets(map: &mut MsgSecretMap) {
         }
     });
     let mut remaining = drop_count.saturating_sub(removed);
-    if remaining > 0 {
-        map.retain(|_, (_, expires_at, _)| {
-            if remaining > 0 && *expires_at == cutoff {
-                remaining -= 1;
-                false
-            } else {
-                true
-            }
-        });
+    if remaining == 0 {
+        return;
     }
+    // The rows sitting exactly on the cutoff. One message can own two of them:
+    // history seeding and inbound bot capture persist a secret under two sender
+    // aliases (`MAX_HISTORY_SECRET_SENDERS`), and those rows carry the same
+    // deadline because it is derived from the same parent event. The pair
+    // exists so a lookup succeeds under either identity, so dropping an
+    // arbitrary subset of the bucket -- keeping one alias, losing the other --
+    // would make decryption depend on which identity the later stanza happens
+    // to carry. Choose whole messages instead of whole rows.
+    let mut doomed: HbHashSet<MsgGroupKey, RandomState> = HbHashSet::default();
+    for (key, (_, expires_at, _)) in map.iter() {
+        if remaining == 0 {
+            break;
+        }
+        if *expires_at != cutoff {
+            continue;
+        }
+        if !doomed.contains(&MsgGroupKeyRef {
+            chat: &key.chat,
+            msg_id: &key.msg_id,
+        }) {
+            doomed.insert(MsgGroupKey {
+                chat: Arc::clone(&key.chat),
+                msg_id: Arc::clone(&key.msg_id),
+            });
+        }
+        remaining -= 1;
+    }
+    // A group whose second row was never visited (the budget ran out first, or
+    // iteration order separated them) still goes whole, so this can overshoot
+    // `drop_count` by at most one row per doomed group. Overshooting a memory
+    // bound is harmless; splitting an alias pair is not.
+    map.retain(|key, (_, expires_at, _)| {
+        *expires_at != cutoff
+            || !doomed.contains(&MsgGroupKeyRef {
+                chat: &key.chat,
+                msg_id: &key.msg_id,
+            })
+    });
 }
 
 /// Bytes a hash table's single allocation occupies. hashbrown reserves a
@@ -1974,6 +2057,62 @@ mod tests {
              batched {batched_capacity} > trickled {trickled_capacity}"
         );
         assert!(batched.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS);
+    }
+
+    /// History seeding and inbound bot capture file one secret under two sender
+    /// aliases, and both rows carry the same deadline because it comes from the
+    /// same parent event. Every row here shares one deadline, so the whole map
+    /// is the cutoff's tie bucket -- the case where eviction picks an arbitrary
+    /// subset. A surviving half-pair would make decryption depend on which
+    /// identity the later stanza carries, so each message must be all or none.
+    #[tokio::test]
+    async fn msg_secret_eviction_keeps_a_message_s_sender_aliases_together() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let alias_a: wacore_binary::Jid = "2@s.whatsapp.net".parse().unwrap();
+        let alias_b: wacore_binary::Jid = "3@lid".parse().unwrap();
+        let now = crate::time::now_secs();
+        let deadline = now + 30 * 86_400;
+
+        let total = MAX_MSG_SECRETS * 2;
+        for i in 0..total {
+            let id = format!("m{i:07}");
+            // Both aliases of one message land in the same batch, exactly as
+            // the history seed collector emits them.
+            backend
+                .put_msg_secrets(
+                    [&alias_a, &alias_b]
+                        .into_iter()
+                        .map(|sender| {
+                            MsgSecretEntry::new(
+                                &chat,
+                                sender,
+                                &id,
+                                [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                                deadline,
+                                now,
+                            )
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let c = chat.to_string();
+        let (a, b) = (alias_a.to_string(), alias_b.to_string());
+        let mut pairs = 0usize;
+        for i in 0..total {
+            let id = format!("m{i:07}");
+            let got_a = backend.get_msg_secret(&c, &a, &id).await.unwrap().is_some();
+            let got_b = backend.get_msg_secret(&c, &b, &id).await.unwrap().is_some();
+            assert_eq!(
+                got_a, got_b,
+                "message {i} kept one sender alias but not the other"
+            );
+            pairs += usize::from(got_a);
+        }
+        assert!(pairs > 0, "eviction removed every message");
     }
 
     /// A backend reused across a `Full` -> `Managed` switch holds enough
