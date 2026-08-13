@@ -1088,16 +1088,22 @@ fn setup_with_archived_session() -> (User, User, Bytes) {
 
 /// Rejecting a PreKey envelope as a plain Signal envelope is a format-probing
 /// benchmark, not a session-decryption benchmark.
+///
+/// The envelope is built once here rather than in `with_inputs`, which would
+/// run a full X3DH per iteration. The parse is pure and costs ~169
+/// instructions; the setup costs four orders of magnitude more, so with the
+/// setup inside the loop this benchmark tracked session establishment and
+/// reported it under the name of a parse — moving several percent whenever
+/// anything changed the cost of key agreement.
 #[divan::bench]
 fn bench_reject_prekey_as_signal(bencher: divan::Bencher) {
-    bencher
-        .with_inputs(setup_dm_with_first_message)
-        .bench_refs(|data| {
-            let (_, _, ciphertext) = data;
-            let parsed = wacore_libsignal::protocol::SignalMessage::try_from(ciphertext.as_slice());
-            assert!(parsed.is_err());
-            drop(black_box(parsed));
-        });
+    let (_, _, ciphertext) = setup_dm_with_first_message();
+    bencher.bench(|| {
+        let parsed =
+            wacore_libsignal::protocol::SignalMessage::try_from(black_box(ciphertext.as_slice()));
+        assert!(parsed.is_err());
+        drop(black_box(parsed));
+    });
 }
 
 /// Decrypt a valid Signal envelope by searching the deepest archived session.
