@@ -1062,11 +1062,23 @@ impl MsgSecretStore for InMemoryBackend {
         // already have doubled past the bound. `retain` frees rows but not the
         // allocation, and on wasm32 that allocation is never returned, so the
         // footprint bound has to hold going up, not just coming down.
-        let mut entries = entries.into_iter();
+        let mut entries = entries.into_iter().peekable();
         loop {
             let mut inserted = 0usize;
-            for entry in entries.by_ref().take(MAX_MSG_SECRETS / 4) {
+            while let Some(entry) = entries.next() {
                 inserted += 1;
+                // The chunk boundary must not fall between a message's sender
+                // alias rows. Eviction runs as soon as the chunk closes, and it
+                // would see the first alias with the second not yet inserted --
+                // free to drop the one it can see, after which the other lands
+                // and survives alone. That is the identity-dependent decryption
+                // failure the grouping in `trim_msg_secrets` exists to prevent,
+                // reintroduced one level up. Both producers emit a message's
+                // aliases consecutively (`history_msg_secret_senders`, and the
+                // inbound capture's alias batch), so holding the chunk open
+                // while the next entry names the same message is enough.
+                let boundary_group = (inserted >= MAX_MSG_SECRETS / 4)
+                    .then(|| (Arc::clone(&entry.chat), Arc::clone(&entry.msg_id)));
                 let key = MsgSecretKey {
                     chat: entry.chat,
                     sender: entry.sender,
@@ -1082,6 +1094,13 @@ impl MsgSecretStore for InMemoryBackend {
                     Entry::Vacant(vacant) => {
                         vacant.insert((entry.secret, entry.expires_at, entry.message_ts));
                     }
+                }
+                if let Some((chat, msg_id)) = boundary_group
+                    && !entries
+                        .peek()
+                        .is_some_and(|next| next.chat == chat && next.msg_id == msg_id)
+                {
+                    break;
                 }
             }
             if inserted == 0 {
@@ -2097,6 +2116,7 @@ mod tests {
         // is not: it lands anywhere in the oscillation between evictions.
         let mut low_water = usize::MAX;
         let mut evicted_once = false;
+        let mut previous_len = 0usize;
         for i in 0..total {
             let id = format!("m{i:07}");
             // Both aliases of one message land in the same batch, exactly as
@@ -2120,12 +2140,21 @@ mod tests {
                 .await
                 .unwrap();
             let len = backend.state.lock().await.msg_secrets.len();
-            evicted_once |= len >= MAX_MSG_SECRETS;
-            if evicted_once {
+            assert!(
+                len <= MAX_MSG_SECRETS,
+                "msg_secrets exceeded the cap after message {i}"
+            );
+            // A drop in length is the only proof trimming actually ran.
+            // Reaching the cap is not: a multi-alias batch that stopped being
+            // trimmed at all would sail past it and still satisfy every other
+            // assertion here.
+            if len < previous_len {
+                evicted_once = true;
                 low_water = low_water.min(len);
             }
+            previous_len = len;
         }
-        assert!(evicted_once, "the run never reached the cap");
+        assert!(evicted_once, "eviction never ran");
 
         let c = chat.to_string();
         let (a, b) = (alias_a.to_string(), alias_b.to_string());
@@ -2148,6 +2177,75 @@ mod tests {
             low_water >= MAX_MSG_SECRETS * 3 / 4,
             "eviction overshot: dropped to {low_water} rows, target is {}",
             MAX_MSG_SECRETS * 3 / 4
+        );
+    }
+
+    /// The same alias invariant, but across the insertion chunk boundary rather
+    /// than the eviction cutoff. One oversized batch is split into fixed-size
+    /// chunks with an eviction after each, so a boundary landing between a
+    /// message's two rows would let the first be evicted before the second is
+    /// even inserted. Every row shares a deadline so eviction has to choose, and
+    /// every third message carries a single alias so the pairs fall out of step
+    /// with the chunk size instead of aligning to it.
+    #[tokio::test]
+    async fn msg_secret_chunking_does_not_split_alias_groups() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let alias_a: wacore_binary::Jid = "2@s.whatsapp.net".parse().unwrap();
+        let alias_b: wacore_binary::Jid = "3@lid".parse().unwrap();
+        let now = crate::time::now_secs();
+        let deadline = now + 30 * 86_400;
+
+        let total = MAX_MSG_SECRETS * 3;
+        let mut batch = Vec::new();
+        for i in 0..total {
+            let id = format!("m{i:07}");
+            // Message 0 contributes a single row. That one-row offset puts every
+            // pair on an odd boundary, so every fixed-size chunk boundary lands
+            // between a message's two rows rather than between messages.
+            let senders: &[&wacore_binary::Jid] = if i == 0 {
+                &[&alias_a]
+            } else {
+                &[&alias_a, &alias_b]
+            };
+            for sender in senders {
+                batch.push(MsgSecretEntry::new(
+                    &chat,
+                    sender,
+                    &id,
+                    [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                    // Deadlines fall as the batch goes on, so the row sitting on
+                    // a chunk boundary is always among the soonest to expire and
+                    // is evicted by the very next trim -- deterministically,
+                    // rather than depending on where the cutoff's tie bucket
+                    // happens to be walked.
+                    deadline - i as i64,
+                    now,
+                ));
+            }
+        }
+        backend.put_msg_secrets(batch).await.unwrap();
+
+        let c = chat.to_string();
+        let (a, b) = (alias_a.to_string(), alias_b.to_string());
+        let mut survivors = 0usize;
+        for i in 0..total {
+            if i == 0 {
+                continue;
+            }
+            let id = format!("m{i:07}");
+            let got_a = backend.get_msg_secret(&c, &a, &id).await.unwrap().is_some();
+            let got_b = backend.get_msg_secret(&c, &b, &id).await.unwrap().is_some();
+            assert_eq!(
+                got_a, got_b,
+                "message {i} kept one sender alias but not the other"
+            );
+            survivors += usize::from(got_a);
+        }
+        assert!(survivors > 0, "eviction removed every paired message");
+        assert!(
+            backend.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS,
+            "the oversized batch escaped the cap"
         );
     }
 
