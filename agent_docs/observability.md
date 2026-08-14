@@ -64,19 +64,48 @@ run loop. VoIP relay sockets pass `SendObservers::default()` and are not counted
 
 `devices_unkeyed_no_bundle`, `devices_unkeyed_session_setup` and
 `devices_unkeyed_rejected` (sum: `StatsSnapshot::devices_unkeyed_total()`) count
-recipients dropped from a stanza because no key material could be obtained for
-them. Dropping them and sending to the rest is parity with WA Web and is not up
-for change; what these answer is *how often it happens*, which is the difference
+failed attempts to obtain key material for one device. Usually the device is then
+dropped and the send continues, which is parity with WA Web and is not up for
+change; what these answer is *how often it happens*, which is the difference
 between "the session repair worked" and a screenshot of a chat stuck on
 "Waiting for this message".
+
+**Per attempt, not per delivered stanza**, and the distinction is not academic:
+a batch-wide `406` and a `Required` distribution that cannot reach every target
+both abort the send, and both are counted. Skipping them would make the metric
+quietest exactly when keying is failing hardest, and on the `Required` path the
+session layer would have to learn the caller's error policy to know whether its
+own failure "counts" — which would make the number depend on who called it. A
+retry that fails the same way counts again, the same way `messages_sent` counts
+attempts.
 
 The reasons are disjoint, which is the only property worth defending here: a
 device the server named is counted as a rejection and never also as a missing
 bundle, and a batch-wide `406` is counted once per device it answered for
-instead of as N absent bundles. `wacore::send::encrypt` reaches the counters
-through `SendContextResolver::on_unkeyable_devices` (like
-`on_local_identity_change`, since a spawned encrypt task holds no borrow of the
-client); `Client::fetch_and_establish_sessions` records its own directly.
+instead of as N absent bundles. That batch case has its own reason
+(`refused_batch`) rather than borrowing `rejected_406`, because the refusal
+names nobody: a registered device can sit in a refused batch, so reporting it
+as a named rejection would dress an attribution up as a fact.
+`wacore::send::encrypt` reaches the counters through
+`SendContextResolver::on_unkeyable_devices` (like `on_local_identity_change`,
+since a spawned encrypt task holds no borrow of the client);
+`Client::fetch_and_establish_sessions` records its own directly.
+
+Two things these do **not** measure, both known and neither a bug to fix by
+tightening the counter:
+
+- **Distinct devices.** A cold DM runs session establishment twice — the
+  `ensure_e2e_sessions` preflight, then `encrypt_for_devices_into` — so one send
+  can record the same device twice, or record a failure the second pass then
+  recovers from. Counting only at the final fan-out would blind the paths that
+  never reach one (retry handling, primary-phone establishment) and would make
+  the number depend on which caller reached the session layer.
+- **Devices dropped at encrypt.** `push_raw_result` logs and skips a device
+  whose `message_encrypt` fails — an unusable stored session, the case session
+  repair exists for — and none of these counters moves. Covering it needs
+  `SessionPlan` to carry the set already dropped at setup, since a device that
+  failed setup fails encrypt too and would otherwise be counted twice; that is a
+  change to the fan-out's contract rather than an instrumentation addition.
 
 `StatsSnapshot` carries totals only. The per-code breakdown lives on the
 `metrics` facade (`wa_unkeyable_device_total{reason}`), whose label set is

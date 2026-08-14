@@ -653,9 +653,11 @@ pub async fn ensure_sessions_for_devices(
                 had_406 = true;
                 // The refusal answers for the whole batch, so every device in it
                 // is unkeyable for that reason rather than for an absent bundle.
+                // Its own reason, not `Rejected`: the batch names nobody, so
+                // this is an attribution and must not read as a per-device fact.
                 batch_refused = true;
                 resolver.on_unkeyable_devices(
-                    UnkeyableDevice::Rejected(UNREGISTERED_DEVICE_CODE),
+                    UnkeyableDevice::BatchRefused,
                     jids_for_fetch.len() as u64,
                 );
                 // Best-effort callers still skip these devices, while a required

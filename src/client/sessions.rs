@@ -456,10 +456,11 @@ impl Client {
                      refreshing their device lists before failing the send",
                     jids.len()
                 );
-                self.stats.record_unkeyable_devices(
-                    UnkeyableDevice::Rejected(UNREGISTERED_DEVICE_CODE),
-                    jids.len() as u64,
-                );
+                // `BatchRefused`, not `Rejected`: one IQ answered for the whole
+                // batch without naming a device, so a registered device can be
+                // in here and the label must not claim otherwise.
+                self.stats
+                    .record_unkeyable_devices(UnkeyableDevice::BatchRefused, jids.len() as u64);
                 self.invalidate_device_caches_for(jids).await;
                 return Err(e);
             }
@@ -720,6 +721,58 @@ mod tests {
             );
             assert_eq!(stats.devices_unkeyed_total(), 1);
         }
+    }
+
+    /// A batch-wide 406 answers for every device at once and fails the send, so
+    /// nothing goes on the wire. It is still counted, once per device it
+    /// answered for: the counters measure keying attempts, and a metric that
+    /// went quiet on the batch failure would be quietest exactly when keying is
+    /// failing hardest.
+    #[tokio::test]
+    async fn a_batch_wide_refusal_counts_every_device_even_though_it_fails_the_send() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let first = Jid::pn_device("5511900000063", 0);
+        let second = Jid::pn_device("5511900000064", 0);
+
+        let fetch = tokio::spawn({
+            let client = client.clone();
+            let jids = vec![first, second];
+            async move { client.fetch_and_establish_sessions(&jids).await }
+        });
+
+        let iq = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request_id = iq
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("the prekey fetch carries an id")
+            .into_owned();
+        let refusal = NodeBuilder::new("iq")
+            .attr("id", request_id.as_str())
+            .attr("type", "error")
+            .children([NodeBuilder::new("error")
+                .attr("code", "406")
+                .attr("text", "not-acceptable")
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &request_id, &refusal).await;
+
+        fetch
+            .await
+            .expect("join")
+            .expect_err("a batch-wide 406 fails the send rather than shortening the fan-out");
+
+        assert_eq!(
+            client.stats().devices_unkeyed_rejected,
+            2,
+            "both devices the refusal answered for are counted"
+        );
+        assert_eq!(
+            UnkeyableDevice::BatchRefused.label(),
+            "refused_batch",
+            "a batch refusal must not carry the label of a named rejection"
+        );
+        assert_eq!(client.stats().devices_unkeyed_no_bundle, 0);
     }
 
     /// The other half of the same response: a device the server simply omits.

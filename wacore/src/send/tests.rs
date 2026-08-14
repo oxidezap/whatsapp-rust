@@ -4157,7 +4157,9 @@ mod mark_full_distribution_list {
     }
 
     /// A batch-wide 406 names nobody, so every device it answered for is
-    /// counted under it rather than as an absent bundle.
+    /// counted under it rather than as an absent bundle — and under its own
+    /// reason, because attributing a named rejection to each device would claim
+    /// per-device knowledge the refusal does not carry.
     #[tokio::test]
     async fn a_batch_wide_refusal_counts_every_device_it_answered_for() {
         let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
@@ -4168,7 +4170,7 @@ mod mark_full_distribution_list {
 
         assert_eq!(
             resolver.captured_unkeyable(),
-            vec![(crate::stats::UnkeyableDevice::Rejected(406), 2)],
+            vec![(crate::stats::UnkeyableDevice::BatchRefused, 2)],
             "the whole batch is one refusal covering both devices"
         );
     }

@@ -32,13 +32,19 @@ use crate::sync_marker::MaybeSendSync;
 
 // ── Wire/session counters ────────────────────────────────────────────────────
 
-/// Why one device could not be given key material, and was therefore left out
-/// of the stanza it was a recipient of.
+/// Why one attempt to obtain key material for a device failed.
 ///
-/// Dropping the device and sending to the rest is the intended behavior (WA Web
-/// catches the same failure and continues); this type exists so the drop is
-/// countable, because a participant stuck on "Waiting for this message" is
-/// otherwise only visible in a log line.
+/// Usually that device is then dropped and the send continues to the rest,
+/// which is the intended behavior (WA Web catches the same failure and carries
+/// on) and is why a participant stuck on "Waiting for this message" was only
+/// ever visible in a log line.
+///
+/// **Counted per attempt, not per delivered stanza.** A failure that aborts the
+/// send outright — a batch-wide `406`, a `Required` distribution that cannot
+/// reach all its targets — is counted too, and a later retry that fails the
+/// same way counts again. The question these answer is how often keying fails,
+/// which a counter that skipped the abort paths would answer worst exactly when
+/// keying is failing most.
 ///
 /// The variants are disjoint: a device the server named is recorded as
 /// [`Rejected`](Self::Rejected) and never also as [`NoBundle`](Self::NoBundle).
@@ -54,6 +60,12 @@ pub enum UnkeyableDevice {
     /// The server refused this device by name, with the `<error code>` it
     /// attached. `406` means unregistered and is the only code acted on.
     Rejected(u16),
+    /// The server refused the whole prekey batch this device was in (always a
+    /// `406`; the fetch is one IQ). Kept apart from [`Rejected`](Self::Rejected)
+    /// because that one is a fact about the device and this one is an
+    /// attribution: the refusal names nobody, so a registered device can sit in
+    /// a batch that is counted this way.
+    BatchRefused,
 }
 
 impl UnkeyableDevice {
@@ -71,6 +83,7 @@ impl UnkeyableDevice {
             Self::Rejected(400..=499) => "rejected_4xx",
             Self::Rejected(500..=599) => "rejected_5xx",
             Self::Rejected(_) => "rejected_other",
+            Self::BatchRefused => "refused_batch",
         }
     }
 }
@@ -92,8 +105,8 @@ pub struct SessionStats {
     /// full (opt-in `EventDelivery::Ordered`). Non-zero means a slow consumer is
     /// shedding events; the durability hook is the at-least-once escape hatch.
     events_dropped: AtomicU64,
-    /// Devices dropped from a stanza's recipient set because no key material
-    /// could be obtained for them, split by [`UnkeyableDevice`].
+    /// Attempts to obtain key material for one device that failed, split by
+    /// [`UnkeyableDevice`].
     devices_unkeyed_no_bundle: AtomicU64,
     devices_unkeyed_session_setup: AtomicU64,
     devices_unkeyed_rejected: AtomicU64,
@@ -136,14 +149,16 @@ pub struct StatsSnapshot {
     /// Inbound events shed because a consumer's bounded delivery mailbox was
     /// full. A non-zero, growing value flags a consumer that can't keep up.
     pub events_dropped: u64,
-    /// Devices a send asked the server about and got no bundle for, with no
-    /// per-device reason given. Each one is a recipient that received nothing.
+    /// Keying attempts that asked the server about a device and got no bundle
+    /// for it, with no per-device reason given.
     pub devices_unkeyed_no_bundle: u64,
-    /// Devices whose bundle arrived but whose Signal session could not be
-    /// built from it.
+    /// Keying attempts whose bundle arrived but whose Signal session could not
+    /// be built from it.
     pub devices_unkeyed_session_setup: u64,
-    /// Devices the server refused by name. `stats()` carries the total; the
-    /// per-code breakdown is on the `metrics` facade, which has labels.
+    /// Keying attempts the server refused, whether it named the device or
+    /// refused the whole batch. `stats()` carries the total; the split by code,
+    /// and between named and batch-wide, is on the `metrics` facade, which has
+    /// labels.
     pub devices_unkeyed_rejected: u64,
     /// Reconnect attempts started by the auto-reconnect loop.
     pub reconnects: u64,
@@ -156,8 +171,9 @@ pub struct StatsSnapshot {
 }
 
 impl StatsSnapshot {
-    /// Every device this client could not key, whatever the reason. A rising
-    /// value is participants going quiet; the three fields say why.
+    /// Every keying attempt this client lost, whatever the reason. A rising
+    /// value is participants going quiet; the three fields say why. See
+    /// [`UnkeyableDevice`] for what one count is and is not.
     pub fn devices_unkeyed_total(&self) -> u64 {
         self.devices_unkeyed_no_bundle
             + self.devices_unkeyed_session_setup
@@ -260,7 +276,7 @@ impl SessionStats {
         self.events_dropped.load(Ordering::Relaxed)
     }
 
-    /// One device left without key material for this send.
+    /// One failed attempt to obtain key material for a device.
     #[inline]
     pub fn record_unkeyable_device(&self, reason: UnkeyableDevice) {
         self.record_unkeyable_devices(reason, 1);
@@ -277,7 +293,9 @@ impl SessionStats {
         let counter = match reason {
             UnkeyableDevice::NoBundle => &self.devices_unkeyed_no_bundle,
             UnkeyableDevice::SessionSetup => &self.devices_unkeyed_session_setup,
-            UnkeyableDevice::Rejected(_) => &self.devices_unkeyed_rejected,
+            UnkeyableDevice::Rejected(_) | UnkeyableDevice::BatchRefused => {
+                &self.devices_unkeyed_rejected
+            }
         };
         counter.fetch_add(count, Ordering::Relaxed);
         crate::telemetry::unkeyable_device(reason.label(), count);
@@ -899,12 +917,17 @@ mod tests {
         stats.record_unkeyable_device(UnkeyableDevice::SessionSetup);
         stats.record_unkeyable_devices(UnkeyableDevice::Rejected(406), 4);
         stats.record_unkeyable_device(UnkeyableDevice::Rejected(503));
+        stats.record_unkeyable_devices(UnkeyableDevice::BatchRefused, 2);
 
         let snap = stats.snapshot();
         assert_eq!(snap.devices_unkeyed_no_bundle, 1);
         assert_eq!(snap.devices_unkeyed_session_setup, 1);
-        assert_eq!(snap.devices_unkeyed_rejected, 5);
-        assert_eq!(snap.devices_unkeyed_total(), 7);
+        assert_eq!(
+            snap.devices_unkeyed_rejected, 7,
+            "a batch refusal is a refusal: it shares the snapshot total and \
+             only the metrics label separates it"
+        );
+        assert_eq!(snap.devices_unkeyed_total(), 9);
 
         assert_eq!(SessionStats::new().snapshot().devices_unkeyed_total(), 0);
     }
@@ -925,6 +948,13 @@ mod tests {
         for code in [0, 302, 600, u16::MAX] {
             assert_eq!(UnkeyableDevice::Rejected(code).label(), "rejected_other");
         }
+        // A batch refusal names nobody, so it must never share a label with a
+        // rejection the server attached to a specific device.
+        assert_eq!(UnkeyableDevice::BatchRefused.label(), "refused_batch");
+        assert_ne!(
+            UnkeyableDevice::BatchRefused.label(),
+            UnkeyableDevice::Rejected(406).label()
+        );
     }
 
     #[test]
