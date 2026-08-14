@@ -9,6 +9,7 @@ use wacore::libsignal::protocol::{
     IdentityChange, PreKeyBundle, SignalProtocolError, UsePQRatchet, process_prekey_bundle,
 };
 use wacore::libsignal::store::SessionStore;
+use wacore::stats::UnkeyableDevice;
 use wacore::types::jid::JidExt;
 use wacore_binary::Jid;
 
@@ -455,6 +456,10 @@ impl Client {
                      refreshing their device lists before failing the send",
                     jids.len()
                 );
+                self.stats.record_unkeyable_devices(
+                    UnkeyableDevice::Rejected(UNREGISTERED_DEVICE_CODE),
+                    jids.len() as u64,
+                );
                 self.invalidate_device_caches_for(jids).await;
                 return Err(e);
             }
@@ -468,6 +473,15 @@ impl Client {
         // them would deliver to fewer devices for a reason that only concerns
         // the named ones.
         if !prekey_bundles.rejected.is_empty() {
+            // Only a 406 claims the device is gone, so only a 406 pays for a
+            // device-list refresh. Every other code is counted under its class
+            // and left alone: a 5xx or a rate limit says the server could not
+            // answer, and refreshing on those turns a server-side wobble into a
+            // usync fan-out across every group the bot sends to.
+            for device in &prekey_bundles.rejected {
+                self.stats
+                    .record_unkeyable_device(UnkeyableDevice::Rejected(device.code));
+            }
             let rejected: Vec<Jid> = prekey_bundles
                 .rejected
                 .iter()
@@ -504,11 +518,23 @@ impl Client {
                     }
                     Err(e) => {
                         failed_count += 1;
+                        self.stats
+                            .record_unkeyable_device(UnkeyableDevice::SessionSetup);
                         log::warn!("Failed to establish session with {}: {}", jid.observe(), e);
                     }
                 }
             } else {
                 missing_count += 1;
+                // A device the server named is counted as that rejection above;
+                // counting it here too would report one drop as two.
+                if !prekey_bundles
+                    .rejected
+                    .iter()
+                    .any(|device| device.jid == *jid)
+                {
+                    self.stats
+                        .record_unkeyable_device(UnkeyableDevice::NoBundle);
+                }
                 if jid.device == 0 {
                     log::warn!(
                         "Server did not return prekeys for primary phone {}",
@@ -617,7 +643,171 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wacore_binary::{JidExt, Server};
+    use wacore_binary::builder::NodeBuilder;
+    use wacore_binary::{JidExt, Node, NodeValue, Server};
+
+    /// Answer the prekey fetch the client just wrote with a `<list>` of
+    /// `users`, so a test can hand the session path exactly the response shape
+    /// it wants to account for.
+    async fn answer_prekey_fetch(
+        client: &Arc<Client>,
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        users: Vec<Node>,
+    ) {
+        let iq = crate::test_utils::decode_sent_iq(transport, 0).await;
+        let request_id = iq
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("the prekey fetch carries an id")
+            .into_owned();
+        let response = NodeBuilder::new("iq")
+            .attr("id", request_id.as_str())
+            .attr("type", "result")
+            .children([NodeBuilder::new("list").children(users).build()])
+            .build();
+        crate::test_utils::answer_iq(client, &request_id, &response).await;
+    }
+
+    /// A device that comes back with an `<error>` instead of key material is
+    /// one the next send cannot reach. `stats()` is the surface a consumer
+    /// polls, so the count has to be readable there and not only in a log.
+    ///
+    /// The non-406 half also pins the behavior decision: a code that does not
+    /// claim the device is gone is counted and nothing else, so a server-side
+    /// failure cannot trigger a device-list refresh storm.
+    #[tokio::test]
+    async fn a_rejected_device_is_counted_on_the_stats_snapshot() {
+        for code in ["406", "503"] {
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let gone = Jid::pn_device("5511900000060", 0);
+
+            let fetch = tokio::spawn({
+                let client = client.clone();
+                let jids = vec![gone.clone()];
+                async move { client.fetch_and_establish_sessions(&jids).await }
+            });
+
+            answer_prekey_fetch(
+                &client,
+                &transport,
+                vec![
+                    NodeBuilder::new("user")
+                        .attr("jid", NodeValue::Jid(gone.clone()))
+                        .children([NodeBuilder::new("error")
+                            .attr("code", code)
+                            .attr("text", "not-acceptable")
+                            .build()])
+                        .build(),
+                ],
+            )
+            .await;
+
+            let established = fetch
+                .await
+                .expect("join")
+                .expect("the fetch itself is fine");
+            assert_eq!(established, 0, "a rejected device establishes no session");
+
+            let stats = client.stats();
+            assert_eq!(
+                stats.devices_unkeyed_rejected, 1,
+                "the {code} rejection must be counted"
+            );
+            assert_eq!(
+                stats.devices_unkeyed_no_bundle, 0,
+                "the rejection is why the bundle is missing; counting both reports one drop as two"
+            );
+            assert_eq!(stats.devices_unkeyed_total(), 1);
+        }
+    }
+
+    /// The other half of the same response: a device the server simply omits.
+    /// It is ambiguous rather than condemned, and it is counted as such.
+    #[tokio::test]
+    async fn a_device_that_came_back_without_a_bundle_is_counted_on_the_snapshot() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let absent = Jid::pn_device("5511900000061", 0);
+
+        let fetch = tokio::spawn({
+            let client = client.clone();
+            let jids = vec![absent.clone()];
+            async move { client.fetch_and_establish_sessions(&jids).await }
+        });
+
+        answer_prekey_fetch(&client, &transport, Vec::new()).await;
+
+        fetch
+            .await
+            .expect("join")
+            .expect("an empty list is not an error");
+
+        let stats = client.stats();
+        assert_eq!(stats.devices_unkeyed_no_bundle, 1);
+        assert_eq!(stats.devices_unkeyed_rejected, 0);
+    }
+
+    /// Nothing is counted when the device is keyed, so the counters measure
+    /// breakage rather than traffic.
+    #[tokio::test]
+    async fn a_device_that_establishes_counts_nothing() {
+        use wacore::iq::prekeys::PreKeyBundleUserNode;
+        use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, PreKeyBundle};
+        use wacore::protocol::ProtocolNode;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        assert_eq!(
+            client.stats().devices_unkeyed_total(),
+            0,
+            "a fresh client has counted nothing"
+        );
+        let peer = Jid::pn_device("5511900000062", 0);
+
+        // A bundle whose signed-prekey signature verifies, so X3DH completes.
+        let mut rng = rand::make_rng::<StdRng>();
+        let receiver = IdentityKeyPair::generate(&mut rng);
+        let spk = KeyPair::generate(&mut rng);
+        let opk = KeyPair::generate(&mut rng);
+        let signature = receiver
+            .private_key()
+            .calculate_signature(&spk.public_key.serialize(), &mut rng)
+            .expect("sign the signed prekey");
+        let bundle = PreKeyBundle::new(
+            1,
+            0u32.into(),
+            Some((1u32.into(), opk.public_key)),
+            1u32.into(),
+            spk.public_key,
+            signature.to_vec(),
+            *receiver.identity_key(),
+        )
+        .expect("build the bundle");
+
+        let fetch = tokio::spawn({
+            let client = client.clone();
+            let jids = vec![peer.clone()];
+            async move { client.fetch_and_establish_sessions(&jids).await }
+        });
+
+        answer_prekey_fetch(
+            &client,
+            &transport,
+            vec![
+                PreKeyBundleUserNode::from_bundle(peer.clone(), &bundle, None)
+                    .expect("build the user node")
+                    .into_node(),
+            ],
+        )
+        .await;
+
+        let established = fetch.await.expect("join").expect("establish");
+        assert_eq!(established, 1, "the session must actually be established");
+        assert_eq!(
+            client.stats().devices_unkeyed_total(),
+            0,
+            "a device that was keyed must not reach any of the counters"
+        );
+    }
 
     /// The 406 the preflight now tolerates is recognised by its server code and
     /// nothing else: any other failure must still fail the send, or a transport

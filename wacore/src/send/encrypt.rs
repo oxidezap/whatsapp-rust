@@ -1,6 +1,7 @@
 //! Per-device Signal encryption fanout and the bounded spawn helper.
 
 use super::*;
+use crate::stats::UnkeyableDevice;
 use anyhow::Context;
 
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
@@ -150,6 +151,16 @@ pub fn needs_device_identity(
 /// fan-out. Picked from the `perf-audit` benchmark: speedup plateaus around
 /// 16 on Oracle ARM64; 32 gives only ~10% more for double the task overhead.
 const ENCRYPT_FANOUT_CONCURRENCY: usize = 16;
+
+/// What one session-establishment task did with its device, shipped back to the
+/// orchestrator because a spawned task holds no borrow of the resolver.
+enum SessionOutcome {
+    /// Session ready; `Some` when establishing it replaced a stored identity.
+    Established(Option<Jid>),
+    /// Dropped from the fan-out. `None` when the prekey fetch already counted
+    /// the drop, which is the case for a device the server named.
+    Dropped(Option<UnkeyableDevice>),
+}
 
 /// Per-task encrypt result, shipped from a spawned task back to the orchestrator.
 struct EncryptOneResult {
@@ -593,6 +604,11 @@ pub async fn ensure_sessions_for_devices(
             .iter()
             .map(|&i| devices[i].clone())
             .collect();
+        // Devices whose drop the fetch already counted, so the per-device
+        // branch below does not report one drop twice: a rejection *is* the
+        // reason that device's bundle is missing.
+        let mut server_named: Vec<crate::prekeys::RejectedDevice> = Vec::new();
+        let mut batch_refused = false;
         // A batch-wide 406 is all-or-nothing — per-device retries just wasted
         // N·RTT with the same failure. Mark `had_406` so the caller invalidates
         // the users and the next send re-fetches. Matches WA Web's
@@ -606,6 +622,9 @@ pub async fn ensure_sessions_for_devices(
             .await
         {
             Ok(outcome) => {
+                for device in &outcome.rejected {
+                    resolver.on_unkeyable_devices(UnkeyableDevice::Rejected(device.code), 1);
+                }
                 rejected_devices.extend(
                     outcome
                         .rejected
@@ -621,6 +640,7 @@ pub async fn ensure_sessions_for_devices(
                     );
                     had_406 = true;
                 }
+                server_named = outcome.rejected;
                 outcome.bundles
             }
             Err(e) if is_device_unregistered_error(&e) => {
@@ -631,6 +651,13 @@ pub async fn ensure_sessions_for_devices(
                     jids_for_fetch.len()
                 );
                 had_406 = true;
+                // The refusal answers for the whole batch, so every device in it
+                // is unkeyable for that reason rather than for an absent bundle.
+                batch_refused = true;
+                resolver.on_unkeyable_devices(
+                    UnkeyableDevice::Rejected(UNREGISTERED_DEVICE_CODE),
+                    jids_for_fetch.len() as u64,
+                );
                 // Best-effort callers still skip these devices, while a required
                 // distribution can surface the typed server failure without
                 // reconstructing it or reducing the source chain to a string.
@@ -657,6 +684,8 @@ pub async fn ensure_sessions_for_devices(
             let encryption_jid = encryption_override_at(&encryption_overrides, idx)
                 .cloned()
                 .unwrap_or_else(|| lookup_jid.clone());
+            let counted_at_fetch =
+                batch_refused || server_named.iter().any(|device| device.jid == lookup_jid);
 
             let bundles = prekey_bundles.clone();
             let mut session_store = stores.session_store.clone_box();
@@ -673,7 +702,9 @@ pub async fn ensure_sessions_for_devices(
                         "No pre-key bundle returned for device {}. This device will be skipped for encryption.",
                         addr
                     );
-                    return Ok::<Option<Jid>, anyhow::Error>(None);
+                    return Ok::<SessionOutcome, anyhow::Error>(SessionOutcome::Dropped(
+                        (!counted_at_fetch).then_some(UnkeyableDevice::NoBundle),
+                    ));
                 };
 
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -692,8 +723,10 @@ pub async fn ensure_sessions_for_devices(
                 {
                     // Surface a replaced identity so the caller can react
                     // (resolver has no 'static handle into this spawned task).
-                    Ok(IdentityChange::ReplacedExisting) => Ok(Some(encryption_jid)),
-                    Ok(IdentityChange::NewOrUnchanged) => Ok(None),
+                    Ok(IdentityChange::ReplacedExisting) => {
+                        Ok(SessionOutcome::Established(Some(encryption_jid)))
+                    }
+                    Ok(IdentityChange::NewOrUnchanged) => Ok(SessionOutcome::Established(None)),
                     Err(error) => Err(anyhow::Error::new(error)
                         .context(format!("failed to process pre-key bundle for {addr}"))),
                 }
@@ -709,14 +742,22 @@ pub async fn ensure_sessions_for_devices(
             match spawn_result {
                 // Some(jid) => establishing this session replaced a stored
                 // identity; notify the client so it can react off-path.
-                Ok(Ok(Some(changed_jid))) => resolver.on_local_identity_change(&changed_jid),
-                Ok(Ok(None)) => {}
+                Ok(Ok(SessionOutcome::Established(Some(changed_jid)))) => {
+                    resolver.on_local_identity_change(&changed_jid)
+                }
+                Ok(Ok(SessionOutcome::Established(None))) => {}
+                Ok(Ok(SessionOutcome::Dropped(reason))) => {
+                    if let Some(reason) = reason {
+                        resolver.on_unkeyable_devices(reason, 1);
+                    }
+                }
                 // Isolate the failure to this device so one participant can't abort
                 // the cohort's SKDM (matching WA Web GroupKeyDistributionMsg's
                 // per-device try/catch). The sessionless device is dropped by the
                 // fan-out below.
                 Ok(Err(e)) => {
                     log::warn!("Group session setup failed for a device, skipping it: {e}");
+                    resolver.on_unkeyable_devices(UnkeyableDevice::SessionSetup, 1);
                     if first_error.is_none() {
                         first_error = Some(e);
                     }
@@ -725,6 +766,7 @@ pub async fn ensure_sessions_for_devices(
                     log::warn!(
                         "Session-establishment task did not deliver a result; skipping device."
                     );
+                    resolver.on_unkeyable_devices(UnkeyableDevice::SessionSetup, 1);
                     if first_error.is_none() {
                         first_error = Some(anyhow::Error::new(error));
                     }

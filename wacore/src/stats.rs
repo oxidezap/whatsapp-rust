@@ -32,6 +32,49 @@ use crate::sync_marker::MaybeSendSync;
 
 // ── Wire/session counters ────────────────────────────────────────────────────
 
+/// Why one device could not be given key material, and was therefore left out
+/// of the stanza it was a recipient of.
+///
+/// Dropping the device and sending to the rest is the intended behavior (WA Web
+/// catches the same failure and continues); this type exists so the drop is
+/// countable, because a participant stuck on "Waiting for this message" is
+/// otherwise only visible in a log line.
+///
+/// The variants are disjoint: a device the server named is recorded as
+/// [`Rejected`](Self::Rejected) and never also as [`NoBundle`](Self::NoBundle).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnkeyableDevice {
+    /// The prekey fetch came back without a bundle for it and without naming
+    /// it, so nothing says whether the device is gone or the server was
+    /// merely unhelpful this round.
+    NoBundle,
+    /// A bundle did come back, but building the Signal session from it failed.
+    SessionSetup,
+    /// The server refused this device by name, with the `<error code>` it
+    /// attached. `406` means unregistered and is the only code acted on.
+    Rejected(u16),
+}
+
+impl UnkeyableDevice {
+    /// Categorical label for the `metrics` facade.
+    ///
+    /// A closed set of `&'static str`: the server's code is bucketed by class
+    /// rather than formatted, so an unfamiliar code stays countable without
+    /// minting a label (or an allocation) per value. `406` keeps its own label
+    /// because it is the one code with a defined meaning here.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoBundle => "no_bundle",
+            Self::SessionSetup => "session_setup",
+            Self::Rejected(code) if code == crate::send::UNREGISTERED_DEVICE_CODE => "rejected_406",
+            Self::Rejected(400..=499) => "rejected_4xx",
+            Self::Rejected(500..=599) => "rejected_5xx",
+            Self::Rejected(_) => "rejected_other",
+        }
+    }
+}
+
 /// Cumulative per-session counters, updated at the client's wire chokepoints.
 ///
 /// All counters are monotonic over the lifetime of the owning client (they
@@ -49,6 +92,11 @@ pub struct SessionStats {
     /// full (opt-in `EventDelivery::Ordered`). Non-zero means a slow consumer is
     /// shedding events; the durability hook is the at-least-once escape hatch.
     events_dropped: AtomicU64,
+    /// Devices dropped from a stanza's recipient set because no key material
+    /// could be obtained for them, split by [`UnkeyableDevice`].
+    devices_unkeyed_no_bundle: AtomicU64,
+    devices_unkeyed_session_setup: AtomicU64,
+    devices_unkeyed_rejected: AtomicU64,
     reconnects: AtomicU64,
     /// Timestamp (ms since UNIX epoch) of the last received WebSocket data.
     /// WA Web: `parseAndHandleStanza` → `deadSocketTimer.cancel()`.
@@ -88,6 +136,15 @@ pub struct StatsSnapshot {
     /// Inbound events shed because a consumer's bounded delivery mailbox was
     /// full. A non-zero, growing value flags a consumer that can't keep up.
     pub events_dropped: u64,
+    /// Devices a send asked the server about and got no bundle for, with no
+    /// per-device reason given. Each one is a recipient that received nothing.
+    pub devices_unkeyed_no_bundle: u64,
+    /// Devices whose bundle arrived but whose Signal session could not be
+    /// built from it.
+    pub devices_unkeyed_session_setup: u64,
+    /// Devices the server refused by name. `stats()` carries the total; the
+    /// per-code breakdown is on the `metrics` facade, which has labels.
+    pub devices_unkeyed_rejected: u64,
     /// Reconnect attempts started by the auto-reconnect loop.
     pub reconnects: u64,
     /// Consecutive reconnect failures (resets on success).
@@ -96,6 +153,16 @@ pub struct StatsSnapshot {
     /// chats.
     pub resends_throttled: u64,
     pub last_data_received_ms: u64,
+}
+
+impl StatsSnapshot {
+    /// Every device this client could not key, whatever the reason. A rising
+    /// value is participants going quiet; the three fields say why.
+    pub fn devices_unkeyed_total(&self) -> u64 {
+        self.devices_unkeyed_no_bundle
+            + self.devices_unkeyed_session_setup
+            + self.devices_unkeyed_rejected
+    }
 }
 
 impl SessionStats {
@@ -193,6 +260,29 @@ impl SessionStats {
         self.events_dropped.load(Ordering::Relaxed)
     }
 
+    /// One device left without key material for this send.
+    #[inline]
+    pub fn record_unkeyable_device(&self, reason: UnkeyableDevice) {
+        self.record_unkeyable_devices(reason, 1);
+    }
+
+    /// `count` devices left without key material for the same reason, which is
+    /// what a batch-wide refusal produces.
+    ///
+    /// The metrics emission rides here rather than at the call sites so the
+    /// per-client total and the labelled process-global counter can never
+    /// disagree about what happened.
+    #[inline]
+    pub fn record_unkeyable_devices(&self, reason: UnkeyableDevice, count: u64) {
+        let counter = match reason {
+            UnkeyableDevice::NoBundle => &self.devices_unkeyed_no_bundle,
+            UnkeyableDevice::SessionSetup => &self.devices_unkeyed_session_setup,
+            UnkeyableDevice::Rejected(_) => &self.devices_unkeyed_rejected,
+        };
+        counter.fetch_add(count, Ordering::Relaxed);
+        crate::telemetry::unkeyable_device(reason.label(), count);
+    }
+
     /// Zero the activity timestamps on connection teardown so the dead-socket
     /// watchdog never reads a previous connection's values. Traffic counters
     /// are cumulative and survive.
@@ -227,6 +317,11 @@ impl SessionStats {
             messages_sent: self.messages_sent.load(Ordering::Relaxed),
             messages_received: self.messages_received.load(Ordering::Relaxed),
             events_dropped: self.events_dropped.load(Ordering::Relaxed),
+            devices_unkeyed_no_bundle: self.devices_unkeyed_no_bundle.load(Ordering::Relaxed),
+            devices_unkeyed_session_setup: self
+                .devices_unkeyed_session_setup
+                .load(Ordering::Relaxed),
+            devices_unkeyed_rejected: self.devices_unkeyed_rejected.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
             reconnect_errors: 0,
             resends_throttled: 0,
@@ -795,6 +890,41 @@ mod tests {
         assert_eq!(snap.reconnects, 1);
         assert_eq!(snap.events_dropped, 2);
         assert!(snap.last_data_received_ms > 0);
+    }
+
+    #[test]
+    fn unkeyable_devices_land_in_the_snapshot_split_by_reason() {
+        let stats = SessionStats::new();
+        stats.record_unkeyable_device(UnkeyableDevice::NoBundle);
+        stats.record_unkeyable_device(UnkeyableDevice::SessionSetup);
+        stats.record_unkeyable_devices(UnkeyableDevice::Rejected(406), 4);
+        stats.record_unkeyable_device(UnkeyableDevice::Rejected(503));
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.devices_unkeyed_no_bundle, 1);
+        assert_eq!(snap.devices_unkeyed_session_setup, 1);
+        assert_eq!(snap.devices_unkeyed_rejected, 5);
+        assert_eq!(snap.devices_unkeyed_total(), 7);
+
+        assert_eq!(SessionStats::new().snapshot().devices_unkeyed_total(), 0);
+    }
+
+    /// The metrics label is a closed set: a server code we have never seen must
+    /// bucket rather than mint a label of its own.
+    #[test]
+    fn a_rejection_label_is_bucketed_by_class() {
+        assert_eq!(UnkeyableDevice::NoBundle.label(), "no_bundle");
+        assert_eq!(UnkeyableDevice::SessionSetup.label(), "session_setup");
+        assert_eq!(UnkeyableDevice::Rejected(406).label(), "rejected_406");
+        for code in [400, 401, 403, 404, 409, 429] {
+            assert_eq!(UnkeyableDevice::Rejected(code).label(), "rejected_4xx");
+        }
+        for code in [500, 503, 599] {
+            assert_eq!(UnkeyableDevice::Rejected(code).label(), "rejected_5xx");
+        }
+        for code in [0, 302, 600, u16::MAX] {
+            assert_eq!(UnkeyableDevice::Rejected(code).label(), "rejected_other");
+        }
     }
 
     #[test]

@@ -62,6 +62,10 @@ impl SendContextResolver for Client {
         self.react_to_local_identity_change(jid);
     }
 
+    fn on_unkeyable_devices(&self, reason: wacore::stats::UnkeyableDevice, count: u64) {
+        self.stats.record_unkeyable_devices(reason, count);
+    }
+
     async fn lock_device_sessions(
         &self,
         device_jids: &[Jid],

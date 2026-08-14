@@ -251,6 +251,16 @@ pub trait SendContextResolver: crate::sync_marker::MaybeSendSync {
         let _ = jid;
     }
 
+    /// Notify that `count` devices were dropped from this send's recipient set
+    /// for `reason`, so the drop lands on a counter instead of only in a log.
+    ///
+    /// Dropping them is deliberate and unchanged. Default is a no-op; like
+    /// [`Self::on_local_identity_change`], the resolver is the only handle back
+    /// to the client available inside the encrypt fan-out.
+    fn on_unkeyable_devices(&self, reason: crate::stats::UnkeyableDevice, count: u64) {
+        let _ = (reason, count);
+    }
+
     /// Acquire the per-device pairwise session locks for the SKDM fan-out targets,
     /// in the same deadlock-free order the DM send path uses, so a group send and a
     /// concurrent DM (or another group send) sharing a device can't advance that

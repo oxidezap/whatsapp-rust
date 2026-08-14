@@ -52,6 +52,13 @@ mod imp {
     pub fn retry_refused() {
         counter!("wa_retry_refused_total").increment(1);
     }
+    /// Devices a stanza could not be encrypted for, by reason
+    /// (`no_bundle`/`session_setup`/`rejected_406`/`rejected_4xx`/...). Each one
+    /// is a recipient that gets nothing while the send succeeds for everyone
+    /// else, so this is the rate to watch after a session-repair change.
+    pub fn unkeyable_device(reason: &'static str, count: u64) {
+        counter!("wa_unkeyable_device_total", "reason" => reason).increment(count);
+    }
     /// Base-key collision that forced a fresh session (same base key after a
     /// re-key, so the session was deleted and recreated).
     pub fn base_key_collision() {
@@ -153,6 +160,11 @@ mod imp {
             "Retries refused at the MAX_RETRY loop guard"
         );
         describe_counter!(
+            "wa_unkeyable_device_total",
+            Unit::Count,
+            "Devices a stanza could not be encrypted for, by reason"
+        );
+        describe_counter!(
             "wa_base_key_collision_total",
             Unit::Count,
             "Base-key collisions that forced a fresh session"
@@ -237,6 +249,8 @@ mod imp {
     pub fn retry_unknown_device(_sender_type: &'static str) {}
     #[inline]
     pub fn retry_refused() {}
+    #[inline]
+    pub fn unkeyable_device(_reason: &'static str, _count: u64) {}
     #[inline]
     pub fn base_key_collision() {}
     #[inline]

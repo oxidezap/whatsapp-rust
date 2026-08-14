@@ -60,6 +60,31 @@ still sending?" for free. Message-level counters piggyback on the existing
 run loop. VoIP relay sockets pass `SendObservers::default()` and are not counted
 — this is the main WA session socket only.
 
+#### Devices a send could not key
+
+`devices_unkeyed_no_bundle`, `devices_unkeyed_session_setup` and
+`devices_unkeyed_rejected` (sum: `StatsSnapshot::devices_unkeyed_total()`) count
+recipients dropped from a stanza because no key material could be obtained for
+them. Dropping them and sending to the rest is parity with WA Web and is not up
+for change; what these answer is *how often it happens*, which is the difference
+between "the session repair worked" and a screenshot of a chat stuck on
+"Waiting for this message".
+
+The reasons are disjoint, which is the only property worth defending here: a
+device the server named is counted as a rejection and never also as a missing
+bundle, and a batch-wide `406` is counted once per device it answered for
+instead of as N absent bundles. `wacore::send::encrypt` reaches the counters
+through `SendContextResolver::on_unkeyable_devices` (like
+`on_local_identity_change`, since a spawned encrypt task holds no borrow of the
+client); `Client::fetch_and_establish_sessions` records its own directly.
+
+`StatsSnapshot` carries totals only. The per-code breakdown lives on the
+`metrics` facade (`wa_unkeyable_device_total{reason}`), whose label set is
+closed: `406` keeps its own label because it is the one code that changes
+behavior, and everything else buckets by class. Formatting a code into a label
+would be an allocation per dropped device on the SKDM fan-out and an unbounded
+label set on the backend.
+
 ### 2. `Client::memory_report()` — retained memory (on demand)
 
 Walks every internal collection and returns entry counts plus estimated
