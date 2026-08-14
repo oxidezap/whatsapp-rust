@@ -387,6 +387,7 @@ impl StanzaHandler for CallHandler {
                                 &client,
                                 call.action.call_id(),
                                 generation,
+                                &sender,
                             )
                             .await;
                         }
@@ -1007,7 +1008,12 @@ async fn apply_current_group_control(client: &Client, call: &IncomingCall) -> bo
 /// entry on their side to apply one against. Upright needs no stanza — that is
 /// what the offer already said.
 #[cfg(feature = "voip-runtime")]
-async fn announce_orientation_on_accept(client: &Arc<Client>, call_id: &str, generation: u64) {
+async fn announce_orientation_on_accept(
+    client: &Arc<Client>,
+    call_id: &str,
+    generation: u64,
+    to: &Jid,
+) {
     let registry = client.call_registry();
     let orientation = registry
         .local_video_orientation(call_id, generation)
@@ -1026,7 +1032,9 @@ async fn announce_orientation_on_accept(client: &Arc<Client>, call_id: &str, gen
     };
     let stanza = build_video_state(&VideoStateParams {
         call_id,
-        to: &session.call_creator,
+        // The device that answered, not `call_creator`: on an outgoing call that
+        // is our own LID, and the stanza would come straight back to us.
+        to,
         id: &client.generate_request_id(),
         call_creator: &session.call_creator,
         state: VideoState::Enabled,
@@ -3047,6 +3055,75 @@ mod tests {
         client
             .call_registry()
             .remove_if_current("CALL-ID-0001", generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    /// A rotation set while the call was ringing has to reach the device that
+    /// answered. `call_creator` is our own LID on an outgoing call, so a stanza
+    /// addressed there comes straight back to us and the callee stays upright.
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn the_deferred_orientation_goes_to_the_device_that_answered() {
+        let client = make_sending_client().await;
+        let (_event_rx, generation) = register_native_opus_call(&client, Vec::new());
+        assert!(
+            client
+                .call_registry()
+                .set_is_video("CALL-ID-0001", generation, true)
+        );
+        assert!(
+            client
+                .call_registry()
+                .set_local_video_orientation("CALL-ID-0001", generation, 3)
+        );
+
+        let answering_device = fake_caller_lid().with_device(4);
+        let accept = NodeBuilder::new("call")
+            .attr("from", Jid::new("CALL-ID-0001", Server::Call))
+            .attr("participant", answering_device.clone())
+            .attr("id", "STANZA-ID-ORIENTATION-ACCEPT")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("accept")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CALL-ID-0001")
+                .children([NodeBuilder::new("audio")
+                    .attr("enc", "opus")
+                    .attr("rate", "16000")
+                    .build()])
+                .build()])
+            .build();
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&accept), &mut cancelled)
+                .await
+        );
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("the deferred rotation must be announced on accept")
+            .expect("waiter");
+
+        let r = sent.as_node_ref();
+        assert_eq!(
+            r.attrs().optional_string("to").as_deref(),
+            Some(answering_device.to_string().as_str()),
+            "the rotation must be addressed to the device that answered"
+        );
+        let action = r
+            .children()
+            .into_iter()
+            .flatten()
+            .find(|child| child.tag == "video")
+            .expect("a <video> carrying the rotation");
+        assert_eq!(
+            action
+                .attrs()
+                .optional_string("device_orientation")
+                .as_deref(),
+            Some("3")
+        );
     }
 
     #[cfg(feature = "voip-runtime")]
