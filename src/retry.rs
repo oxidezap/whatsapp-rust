@@ -1653,15 +1653,24 @@ impl Client {
         }
 
         // Only the bit this client can observe: the stanza carried an
-        // `<enc decrypt-fail="hide">`, so its failure was never shown. The node
-        // is built only when the bitmask is non-zero, and only while the prop
-        // that introduced it is on -- with a cold props cache the prop reads
-        // false and the receipt goes out in its pre-bitmask shape, which is
-        // what a server that never enabled the flag expects anyway.
+        // `<enc decrypt-fail="hide">`, so its failure was never shown.
+        //
+        // Two independent props, both required. `receipt_mode_bitmask_enabled`
+        // introduces the `<meta mode>` node at all; `web_send_hid_failed_decrypt_
+        // in_receipts_enabled` is a separate experiment covering this one bit,
+        // so an account in the first and not the second must not send it. Both
+        // default to false, which is also what a cold props cache reads, so
+        // early receipts go out in the shape this client has always sent.
         let mode = if decrypt_fail_mode == crate::types::events::DecryptFailMode::Hide
             && self
                 .ab_props()
                 .is_enabled(wacore::iq::abprops::web::RECEIPT_MODE_BITMASK_ENABLED)
+                .await
+            && self
+                .ab_props()
+                .is_enabled(
+                    wacore::iq::abprops::web::WEB_SEND_HID_FAILED_DECRYPT_IN_RECEIPTS_ENABLED,
+                )
                 .await
         {
             wacore::protocol::retry::RECEIPT_MODE_HID_FAILED_DECRYPT

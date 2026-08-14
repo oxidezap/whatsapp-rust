@@ -128,8 +128,34 @@ impl Client {
         node: &OwnedNodeRef,
     ) -> Option<ClassifiedMessage> {
         let nr = node.get();
-        let mut info = match self.parse_message_info(nr).await {
-            Ok(info) => Arc::new(info),
+
+        // The `<enc>` nodes are enumerated before the parse so the media type
+        // they declare lands on `MessageInfo` while it is still owned. Every
+        // holder of the Arc -- a custom enc handler, a per-node failure event,
+        // the classified message -- then sees the same finished struct, which
+        // finishing the field after the decrypt loop could not promise.
+        let own_jid = nr
+            .get_optional_child("participants")
+            .and_then(|_| self.pn());
+        let mut all_enc_nodes: Vec<&NodeRef<'_>> = Vec::with_capacity(4);
+        let mut media_type: Option<crate::types::message::EncMediaType> = None;
+        for enc_node in message_enc_nodes_for_device(nr, own_jid.as_ref()) {
+            // The declared media type belongs to the message, not to a device
+            // copy, so the first `<enc>` carrying one settles it for the whole
+            // stanza and a divergent later value is dropped.
+            if media_type.is_none()
+                && let Some(value) = enc_node.attrs().optional_string("mediatype")
+            {
+                media_type = Some(crate::types::message::EncMediaType::from(value.as_ref()));
+            }
+            all_enc_nodes.push(enc_node);
+        }
+
+        let info = match self.parse_message_info(nr).await {
+            Ok(mut info) => {
+                info.media_type = media_type;
+                Arc::new(info)
+            }
             Err(e) => {
                 let id = nr.get_attr("id").map(|v| v.as_str());
                 let from = nr.get_attr("from").map(|v| v.as_str());
@@ -154,12 +180,6 @@ impl Client {
         let sender_encryption_jid = self.resolve_encryption_jid(&info.source.sender).await;
 
         let unavailable_node = nr.get_optional_child("unavailable");
-
-        let own_jid = nr
-            .get_optional_child("participants")
-            .and_then(|_| self.pn());
-        let mut all_enc_nodes: Vec<&NodeRef<'_>> = Vec::with_capacity(4);
-        all_enc_nodes.extend(message_enc_nodes_for_device(nr, own_jid.as_ref()));
 
         if all_enc_nodes.is_empty() && unavailable_node.is_none() {
             log::warn!(
@@ -244,7 +264,6 @@ impl Client {
         let mut has_hide_fail = false;
         let mut had_unknown_enc = false;
         let mut had_custom_handler = false;
-        let mut media_type: Option<crate::types::message::EncMediaType> = None;
 
         // Custom enc handlers are set once at Bot::build and immutable after, so
         // read the map lock-free once instead of acquiring an async RwLock guard
@@ -253,18 +272,6 @@ impl Client {
 
         for (enc_index, enc_node) in all_enc_nodes.iter().enumerate() {
             max_sender_retry_count = max_sender_retry_count.max(sender_retry_count(enc_node));
-
-            // The declared media type belongs to the message, not to a device
-            // copy, so the first `<enc>` carrying one settles it for the whole
-            // stanza and a divergent later value is dropped. Read here rather
-            // than in the parser so the fan-out nodes under
-            // <participants><to> count too, and so the stanza's children are
-            // walked once.
-            if media_type.is_none()
-                && let Some(value) = enc_node.attrs().optional_string("mediatype")
-            {
-                media_type = Some(crate::types::message::EncMediaType::from(value.as_ref()));
-            }
 
             // Parse decrypt-fail attribute (WA Web: e.maybeAttrString("decrypt-fail") === "hide")
             if enc_node
@@ -355,15 +362,6 @@ impl Client {
                 &mut group_payloads
             };
             push_enc_payload(bucket, all_enc_nodes.len(), payload);
-        }
-
-        // The media type is only known once the `<enc>` nodes have been walked,
-        // and the parser that built `info` never saw them. Nothing has cloned
-        // this Arc on the path every message takes, so finishing the struct
-        // here costs a refcount check; the failure paths that did clone it pay
-        // one copy rather than leaving the field unset.
-        if let Some(media_type) = media_type {
-            Arc::make_mut(&mut info).media_type = Some(media_type);
         }
 
         // WA Web diagnostic: validate skmsg is not first in multi-enc messages.

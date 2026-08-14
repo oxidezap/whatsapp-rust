@@ -8901,6 +8901,12 @@ async fn fan_out_media_type_takes_the_first_enc_that_declares_one() {
         Some(EncMediaType::Image),
         "the first declared mediatype wins over a divergent sibling"
     );
+    assert_eq!(
+        Arc::strong_count(&classified.info),
+        1,
+        "the media type must be set before anything can clone the Arc, so no \
+         holder can observe a half-finished MessageInfo"
+    );
 }
 
 /// A `state` attribute belongs to the one `<enc>` that carried it, so it must
@@ -8961,12 +8967,23 @@ fn retry_receipt_meta_mode(frames: &[bytes::Bytes]) -> Result<Option<u64>, &'sta
     Err("no retry receipt reached the wire")
 }
 
-async fn enable_receipt_mode_bitmask(client: &Arc<Client>) {
-    let prop = wacore::iq::abprops::web::RECEIPT_MODE_BITMASK_ENABLED;
-    client.ab_props().watch(prop).await;
+/// Both props the `<meta mode>` bit is gated on. `only` restricts the seed to
+/// one of them, so a test can prove the other gate independently.
+async fn enable_receipt_mode_props(client: &Arc<Client>, only: Option<u32>) {
+    let props = [
+        wacore::iq::abprops::web::RECEIPT_MODE_BITMASK_ENABLED,
+        wacore::iq::abprops::web::WEB_SEND_HID_FAILED_DECRYPT_IN_RECEIPTS_ENABLED,
+    ];
+    client.ab_props().watch_many(&props).await;
     client
         .ab_props()
-        .apply_props(false, std::iter::once((prop.code, "1".into())))
+        .apply_props(
+            false,
+            props
+                .iter()
+                .filter(|prop| only.is_none_or(|code| code == prop.code))
+                .map(|prop| (prop.code, "1".into())),
+        )
         .await;
 }
 
@@ -8979,7 +8996,7 @@ async fn retry_receipt_reports_the_hidden_decrypt_fail_bit() {
     use wacore::protocol::retry::RECEIPT_MODE_HID_FAILED_DECRYPT;
 
     let (client, transport) = capturing_client("retry_meta_hide").await;
-    enable_receipt_mode_bitmask(&client).await;
+    enable_receipt_mode_props(&client, None).await;
     let info = create_test_message_info(
         "5511999998888@s.whatsapp.net",
         "RETRY_META_HIDE",
@@ -9010,7 +9027,7 @@ async fn retry_receipt_without_hidden_failures_carries_no_meta() {
     use crate::types::events::DecryptFailMode;
 
     let (client, transport) = capturing_client("retry_meta_show").await;
-    enable_receipt_mode_bitmask(&client).await;
+    enable_receipt_mode_props(&client, None).await;
     let info = create_test_message_info(
         "5511999998888@s.whatsapp.net",
         "RETRY_META_SHOW",
@@ -9031,10 +9048,42 @@ async fn retry_receipt_without_hidden_failures_carries_no_meta() {
     assert_eq!(retry_receipt_meta_mode(&transport.sent()), Ok(None));
 }
 
-/// With the prop off -- which is also what a cold props cache reads -- the
+/// The bit has its own experiment on top of the one that introduces the node,
+/// so an account in the bitmask prop alone must not send it.
+#[tokio::test]
+async fn retry_receipt_omits_meta_without_the_hid_specific_prop() {
+    use crate::types::events::DecryptFailMode;
+
+    let (client, transport) = capturing_client("retry_meta_hid_off").await;
+    enable_receipt_mode_props(
+        &client,
+        Some(wacore::iq::abprops::web::RECEIPT_MODE_BITMASK_ENABLED.code),
+    )
+    .await;
+    let info = create_test_message_info(
+        "5511999998888@s.whatsapp.net",
+        "RETRY_META_HID_OFF",
+        "5511777776666@s.whatsapp.net",
+    );
+
+    client
+        .send_retry_receipt(
+            &info,
+            1,
+            RetryReason::UnknownError,
+            false,
+            DecryptFailMode::Hide,
+        )
+        .await
+        .expect("the retry receipt should be sent");
+
+    assert_eq!(retry_receipt_meta_mode(&transport.sent()), Ok(None));
+}
+
+/// With both props off -- which is also what a cold props cache reads -- the
 /// receipt keeps its pre-bitmask shape even for a hidden failure.
 #[tokio::test]
-async fn retry_receipt_omits_meta_while_the_prop_is_off() {
+async fn retry_receipt_omits_meta_while_the_props_are_off() {
     use crate::types::events::DecryptFailMode;
 
     let (client, transport) = capturing_client("retry_meta_gated").await;
