@@ -178,11 +178,7 @@ pub const RECEIPT_MODE_HID_FAILED_DECRYPT: u32 = 1 << 2;
 /// WA Web omits the node rather than sending a zero, so the empty case is
 /// `None` instead of `<meta mode="0"/>`.
 pub fn build_receipt_meta_node(mode: u32) -> Option<Node> {
-    (mode != 0).then(|| {
-        NodeBuilder::new("meta")
-            .attr("mode", mode.to_string())
-            .build()
-    })
+    (mode != 0).then(|| NodeBuilder::new("meta").attr("mode", mode).build())
 }
 
 /// Builds the `<keys>` bundle embedded in a retry receipt (type, identity, one-time prekey,

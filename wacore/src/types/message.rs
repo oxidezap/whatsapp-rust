@@ -504,6 +504,12 @@ pub struct MessageInfo {
     /// are dropped; a consumer that needs per-node values reads them from
     /// [`DecryptedPayload`](crate::types::events::DecryptedPayload).
     ///
+    /// Those fan-out nodes are a wider source than WA Web's parser, which maps
+    /// only the direct `<enc>` children. The two agree on every stanza seen so
+    /// far, since the attribute describes the message and every device copy
+    /// repeats it, so the wider read only fills the field on a stanza whose
+    /// direct children carry nothing.
+    ///
     /// `None` when no `<enc>` carried the attribute.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<EncMediaType>,
