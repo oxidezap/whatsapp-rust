@@ -3626,6 +3626,84 @@ mod mark_full_distribution_list {
         );
     }
 
+    /// What a device the server returns no bundle for costs, measured on both
+    /// halves: it gets no SKDM, and it produces no refresh signal either, since
+    /// `stale_users_for` only reports users once a device came back 406. So the
+    /// device stays on the participant list and fails the same way next send —
+    /// its only way back is the `<keys>` its own retry receipt carries.
+    #[tokio::test]
+    async fn keyless_device_gets_no_skdm_and_no_refresh_signal() {
+        let group: Jid = "120363000000000002@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+        let a: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let b: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let (mut ss, mut is) = established_stores(&a).await;
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        // Empty resolver: B's prekey fetch returns no bundle at all, which is
+        // not the 406 the stale-user signal keys off.
+        let resolver = MockSendContextResolver::new();
+        let group_info = GroupInfo::new(
+            vec![own_jid.to_non_ad(), a.to_non_ad(), b.to_non_ad()],
+            AddressingMode::Pn,
+        );
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &resolver,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "KEYLESSDEVICE",
+                force_distribution: false,
+                distribution_targets: Some(vec![a.clone(), b.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await
+        .expect("a best-effort send survives a device it cannot encrypt for");
+
+        let targets = prepared
+            .node
+            .get_optional_child("participants")
+            .expect("a key-distributing send carries <participants>")
+            .children()
+            .expect("participant children");
+        assert_eq!(targets.len(), 1, "the keyless device receives no SKDM");
+        assert_eq!(
+            targets[0].attrs().optional_string("jid").unwrap().as_ref(),
+            a.to_string()
+        );
+        assert!(
+            prepared.stale_device_users.is_empty(),
+            "an absent bundle is not a 406, so no device list is re-resolved"
+        );
+    }
+
     /// The group send shares one message encode between the reporting token and the skmsg
     /// plaintext (gated on no top-level `message_context_info`). The byte-equivalence of
     /// the shared-encode helpers is locked in `messages`/`reporting_token`; pin the
