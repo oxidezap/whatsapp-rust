@@ -9328,7 +9328,14 @@ async fn app_state_sync_key_share_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "AKS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", padded.clone(), 2, 0, None, None, &Arc::new(info))
+        .handle_decrypted_plaintext(
+            "msg",
+            padded.clone(),
+            2,
+            0,
+            Default::default(),
+            &Arc::new(info),
+        )
         .await
         .unwrap();
     assert!(
@@ -9352,7 +9359,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", padded, 2, 0, None, None, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, 0, Default::default(), &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -9508,8 +9515,7 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
             MessageUtils::encode_and_pad(&request),
             2,
             0,
-            None,
-            None,
+            Default::default(),
             &info,
         ),
     )
@@ -9534,8 +9540,7 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
             MessageUtils::encode_and_pad(&request),
             2,
             0,
-            None,
-            None,
+            Default::default(),
             &info,
         ),
     )
@@ -9843,7 +9848,14 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "LMS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", padded.clone(), 2, 0, None, None, &Arc::new(info))
+        .handle_decrypted_plaintext(
+            "msg",
+            padded.clone(),
+            2,
+            0,
+            Default::default(),
+            &Arc::new(info),
+        )
         .await
         .unwrap();
     assert!(
@@ -9859,7 +9871,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", padded, 2, 0, None, None, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, 0, Default::default(), &Arc::new(info))
         .await
         .unwrap();
     assert_eq!(
@@ -13278,7 +13290,7 @@ async fn decrypted_payloads_are_not_forwarded_without_a_lease() {
         ..Default::default()
     });
     client
-        .handle_decrypted_plaintext("msg", padded, 2, 0, None, None, &info)
+        .handle_decrypted_plaintext("msg", padded, 2, 0, Default::default(), &info)
         .await
         .expect("decodes");
 
@@ -13315,8 +13327,7 @@ async fn a_lease_forwards_the_payload_before_it_is_decoded() {
             MessageUtils::encode_and_pad(&message),
             2,
             3,
-            None,
-            None,
+            Default::default(),
             &info,
         )
         .await
@@ -13355,7 +13366,14 @@ async fn a_payload_that_fails_to_decode_is_still_forwarded() {
         "5510000@s.whatsapp.net",
     ));
     let outcome = client
-        .handle_decrypted_plaintext("msg", undecodable_payload(), 2, 0, None, None, &info)
+        .handle_decrypted_plaintext(
+            "msg",
+            undecodable_payload(),
+            2,
+            0,
+            Default::default(),
+            &info,
+        )
         .await;
 
     assert!(outcome.is_err(), "the fixture must actually fail to decode");
@@ -13390,7 +13408,7 @@ async fn forwarding_stops_when_the_last_lease_drops() {
     let first = client.acquire_decrypted_payload_forwarding();
     let second = client.acquire_decrypted_payload_forwarding();
     client
-        .handle_decrypted_plaintext("msg", payload(), 2, 0, None, None, &info)
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, Default::default(), &info)
         .await
         .expect("decodes");
     assert!(events.try_recv().is_ok());
@@ -13398,14 +13416,14 @@ async fn forwarding_stops_when_the_last_lease_drops() {
     // One lease left: still on.
     drop(first);
     client
-        .handle_decrypted_plaintext("msg", payload(), 2, 0, None, None, &info)
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, Default::default(), &info)
         .await
         .expect("decodes");
     assert!(events.try_recv().is_ok(), "one lease still holds it open");
 
     drop(second);
     client
-        .handle_decrypted_plaintext("msg", payload(), 2, 0, None, None, &info)
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, Default::default(), &info)
         .await
         .expect("decodes");
     assert!(

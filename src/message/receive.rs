@@ -746,6 +746,10 @@ impl Client {
                 state,
                 session_type,
             } = payload;
+            let annotations = EncNodeAnnotations {
+                state: state.as_deref(),
+                session_type: session_type.as_deref(),
+            };
             let enc_type_str = enc_type.as_wire_str();
             #[cfg(feature = "tracing")]
             let ciphertext_len = ciphertext.len();
@@ -1033,8 +1037,7 @@ impl Client {
                                             enc_type,
                                             padding_version,
                                             enc_index,
-                                            state.as_deref(),
-                                            session_type.as_deref(),
+                                            annotations,
                                             info,
                                             &session_mutex,
                                             &mut session_guard,
@@ -1152,8 +1155,7 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
-                                state.as_deref(),
-                                session_type.as_deref(),
+                                annotations,
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1208,8 +1210,7 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
-                                state.as_deref(),
-                                session_type.as_deref(),
+                                annotations,
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1282,8 +1283,7 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
-                                state.as_deref(),
-                                session_type.as_deref(),
+                                annotations,
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1408,8 +1408,10 @@ impl Client {
                     plaintext,
                     padding_version,
                     enc_index,
-                    state.as_deref(),
-                    session_type.as_deref(),
+                    EncNodeAnnotations {
+                        state: state.as_deref(),
+                        session_type: session_type.as_deref(),
+                    },
                     info,
                 )
                 .await
@@ -1514,8 +1516,7 @@ impl Client {
                             padded_plaintext,
                             padding_version,
                             enc_index,
-                            payload.state.as_deref(),
-                            payload.session_type.as_deref(),
+                            payload.annotations(),
                             info,
                         )
                         .await
@@ -1706,8 +1707,7 @@ impl Client {
         padded_plaintext: Vec<u8>,
         padding_version: u8,
         enc_index: usize,
-        enc_state: Option<&str>,
-        enc_session_type: Option<&str>,
+        annotations: EncNodeAnnotations<'_>,
         info: &Arc<MessageInfo>,
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
         let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)?;
@@ -1721,8 +1721,8 @@ impl Client {
                     .info(Arc::clone(info))
                     .enc_index(enc_index)
                     .enc_type(enc_type)
-                    .maybe_state(enc_state.map(str::to_owned))
-                    .maybe_session_type(enc_session_type.map(str::to_owned))
+                    .maybe_state(annotations.state.map(str::to_owned))
+                    .maybe_session_type(annotations.session_type.map(str::to_owned))
                     .payload(source.clone())
                     .build(),
             ));
@@ -1919,8 +1919,7 @@ impl Client {
         enc_type: &'static str,
         padding_version: u8,
         enc_index: usize,
-        enc_state: Option<&str>,
-        enc_session_type: Option<&str>,
+        annotations: EncNodeAnnotations<'_>,
         info: &Arc<MessageInfo>,
         session_mutex: &Arc<async_lock::Mutex<()>>,
         session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
@@ -1981,8 +1980,8 @@ impl Client {
                     plaintext: decrypted.plaintext,
                     padding_version,
                     enc_index,
-                    state: enc_state.map(str::to_owned),
-                    session_type: enc_session_type.map(str::to_owned),
+                    state: annotations.state.map(str::to_owned),
+                    session_type: annotations.session_type.map(str::to_owned),
                 });
                 MigrationDecryptResult::Decrypted
             }

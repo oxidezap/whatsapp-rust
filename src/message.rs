@@ -134,6 +134,24 @@ impl EncPayload {
     }
 }
 
+/// The `<enc>` attributes this build carries to the consumer without acting on
+/// them. Borrowed from the payload they came from, so passing them costs
+/// nothing on a node that declared neither.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EncNodeAnnotations<'a> {
+    pub state: Option<&'a str>,
+    pub session_type: Option<&'a str>,
+}
+
+impl EncPayload {
+    pub(crate) fn annotations(&self) -> EncNodeAnnotations<'_> {
+        EncNodeAnnotations {
+            state: self.state.as_deref(),
+            session_type: self.session_type.as_deref(),
+        }
+    }
+}
+
 /// Parsed and classified message ready for decryption. All data is owned --
 /// the original node tree is no longer borrowed.
 pub(crate) struct ClassifiedMessage {
