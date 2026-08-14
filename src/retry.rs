@@ -587,14 +587,19 @@ impl Client {
             let jid = self
                 .resolve_retransmission_encryption_jid(route, &info.requester)
                 .await?;
-            if uses_sender_key {
-                self.mark_requester_for_fresh_skdm(&info, &jid).await;
-            }
             if !self
                 .install_retry_key_bundle(&info, &jid, nr, is_peer)
                 .await
             {
                 return Ok(());
+            }
+            // The cold mark goes last, and under the distribution guard, so a
+            // device is only ever published as cold once its session can carry
+            // the SKDM. A send that took the guard first sees it still warm and
+            // skips it, rather than distributing to a device it cannot encrypt
+            // for and marking the whole list warm again on the way out.
+            if uses_sender_key {
+                self.mark_requester_for_fresh_skdm(&info, &jid).await;
             }
             Some(jid)
         };
@@ -3390,6 +3395,71 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// The cold mark is what invites the next send to distribute, so it may not
+    /// be published before the session can carry the SKDM. A send holding the
+    /// distribution guard would otherwise see a cold device, fail its SKDM
+    /// against the still-missing session, and mark the whole list warm on its
+    /// way out, putting the device right back in the state this repair exists
+    /// to clear. The guard doubles as the observation point: while it is held,
+    /// the install must already be visible and the mark must not be.
+    #[tokio::test]
+    async fn the_bundle_lands_before_the_device_is_published_cold() {
+        let client = retry_repair_client("retry_repair_mark_order").await;
+        let group: Jid = "120363021033254961@g.us".parse().unwrap();
+        let group_key = group.to_string();
+        let participant: Jid = "555003333@lid".parse().unwrap();
+
+        client
+            .persistence_manager
+            .set_sender_key_status(&group_key, &[(participant.to_string().as_str(), true)])
+            .await
+            .unwrap();
+
+        let guard = client.group_distribution_lock(&group).await;
+        let repair = {
+            let client = Arc::clone(&client);
+            let group = group.clone();
+            let participant = participant.clone();
+            tokio::spawn(async move {
+                drive_group_retry_with_keys(&client, &group, &participant, "MARKORDER001").await;
+            })
+        };
+
+        // The install runs outside the guard, so it lands while the mark waits.
+        let installed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !has_session(&client, &participant).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            installed.is_ok(),
+            "the bundle must install without waiting on the distribution guard"
+        );
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(&group_key)
+                .await
+                .unwrap(),
+            vec![(participant.to_string(), true)],
+            "the device stays warm until its session exists, so a send that holds \
+             the guard skips it instead of failing an SKDM against it"
+        );
+
+        drop(guard);
+        repair.await.unwrap();
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(&group_key)
+                .await
+                .unwrap(),
+            vec![(participant.to_string(), false)],
+            "and the cold mark lands once the send releases the guard"
+        );
     }
 
     /// The abort contract the hoist has to preserve, now that it fires before
