@@ -16,15 +16,121 @@ use wacore_binary::OwnedNodeRef;
 /// per chunk, so a large catch-up doesn't produce one oversized stanza.
 const MAX_RECEIPT_IDS_PER_STANZA: usize = 256;
 
-fn normalize_self_fanout_type(receipt_type: ReceiptType, is_self_fanout: bool) -> ReceiptType {
-    if !is_self_fanout {
-        return receipt_type;
+/// Whether `chat` names a DM thread — the shape WA Web hands to
+/// `handleChatSimpleReceipt`. Same exclusions as
+/// [`MessageSource::is_self_fanout`](crate::types::message::MessageSource::is_self_fanout),
+/// so the two cannot disagree on what counts as one.
+fn is_peer_thread(chat: &Jid) -> bool {
+    !chat.is_group() && !chat.is_status_broadcast() && !chat.is_newsletter()
+}
+
+/// How a simple `<receipt>` is addressed once the author is known.
+struct ReceiptAddressing {
+    chat: Jid,
+    recipient: Option<Jid>,
+    is_from_me: bool,
+    receipt_type: ReceiptType,
+}
+
+impl ReceiptAddressing {
+    /// The receipt exactly as it arrived on the wire, for every shape this
+    /// classification does not act on. `is_from_me` stays unset there rather
+    /// than half-classifying: a consumer would otherwise find a receipt flagged
+    /// as ours and still addressed to our own account.
+    fn as_received(from: Jid, receipt_type: ReceiptType) -> Self {
+        Self {
+            chat: from,
+            recipient: None,
+            is_from_me: false,
+            receipt_type,
+        }
+    }
+}
+
+/// Classify a simple `<receipt>` the way WA Web's `handleChatSimpleReceipt` and
+/// `handleGroupSimpleReceipt` do — `h = !isSender && isMeAccount(author)`, where
+/// the author is `from` on a DM and `participant` on a group. Extracted from the
+/// handler so the addressing can be asserted without spinning a transport;
+/// `author_is_own_account` is the caller's `is_own_jid` verdict on that author.
+fn address_receipt(
+    from: Jid,
+    recipient: Option<Jid>,
+    receipt_type: ReceiptType,
+    is_group: bool,
+    author_is_own_account: bool,
+) -> ReceiptAddressing {
+    if !author_is_own_account {
+        return ReceiptAddressing::as_received(from, receipt_type);
     }
 
-    match receipt_type {
+    // Only a read or a play is actionable when we authored it: WA Web gates the
+    // self branch on `isReadOrPlayedReceipt` and drops every other flavour. Two
+    // of the ones it drops matter here.
+    //
+    // A delivery we authored says one of our own devices received the message,
+    // not that the peer did, so re-addressing it would put a delivered tick on
+    // the peer's thread on our own device's behalf.
+    //
+    // A retry is the one receipt whose target another pipeline re-derives for
+    // itself: `resolve_retry_chat_info` reads `chat` as the wire `from` to spot a
+    // retry from one of our own devices, so handing it a chat we already
+    // re-addressed makes it aim the re-encryption at the peer thread instead of
+    // the device that asked for it.
+    if !matches!(
+        receipt_type,
+        ReceiptType::Read | ReceiptType::ReadSelf | ReceiptType::Played | ReceiptType::PlayedSelf
+    ) {
+        return ReceiptAddressing::as_received(from, receipt_type);
+    }
+
+    // On a DM the thread is the peer named by `recipient`; `from` is our own
+    // account, so keeping it would file the read under a thread with ourselves.
+    // On a group the thread is already `from`, and the attribute names the author
+    // of the read message rather than a recipient, so it is not carried as one.
+    let (chat, recipient) = if is_group {
+        (from, None)
+    } else {
+        match recipient {
+            // WA Web rejects a self receipt that names no peer thread. We keep
+            // the event rather than drop it, but exactly as it arrived: a
+            // `ReadSelf` still addressed to our own account would advance read
+            // state on a thread that is really us.
+            None => {
+                log::warn!(
+                    "Own-account receipt from {} names no peer thread; leaving it unclassified",
+                    from.observe()
+                );
+                return ReceiptAddressing::as_received(from, receipt_type);
+            }
+            Some(peer) if !is_peer_thread(&peer) => {
+                log::warn!(
+                    "Own-account receipt from {} names {} as its peer thread; \
+                     leaving it unclassified",
+                    from.observe(),
+                    peer.observe()
+                );
+                return ReceiptAddressing::as_received(from, receipt_type);
+            }
+            Some(peer) => (peer.to_non_ad(), Some(peer)),
+        }
+    };
+
+    // WA Web maps `read` and `read-self` onto one ack (`RECEIPT_TYPES_TO_ACK`):
+    // the wire type does not carry self-ness, the author does. Folding it in
+    // keeps that fact in the type consumers already branch on, so a read synced
+    // from another device reaches the same handler whether or not this account
+    // has read receipts enabled.
+    let receipt_type = match receipt_type {
         ReceiptType::Read => ReceiptType::ReadSelf,
         ReceiptType::Played => ReceiptType::PlayedSelf,
         receipt_type => receipt_type,
+    };
+
+    ReceiptAddressing {
+        chat,
+        recipient,
+        is_from_me: true,
+        receipt_type,
     }
 }
 
@@ -453,9 +559,6 @@ impl Client {
         let recipient = attrs.optional_jid("recipient");
         // participant_pn -> sender_alt so the LID-PN cache warms from receipts too.
         let participant_pn = attrs.optional_jid("participant_pn");
-        // A primary-device read/played receipt can be fanned out with our own
-        // PN/LID in `from` and the actual peer chat in `recipient`.
-        let is_self_fanout = recipient.is_some() && self.is_own_jid(&from);
         // Present when this receipt was drained from the offline queue on reconnect.
         let offline = attrs.optional_string("offline").is_some();
         let stanza_ts = attrs
@@ -469,7 +572,6 @@ impl Client {
         // <error reason="lid" type="feature-incapable"> (the LID peer can't receive it).
         let receipt_type =
             wacore::stanza::receipt::downgrade_for_feature_incapable(nr, receipt_type);
-        let receipt_type = normalize_self_fanout_type(receipt_type, is_self_fanout);
         let is_view = receipt_type_str == "view";
         let is_group = from.is_group();
         let default_sender = if is_group {
@@ -483,6 +585,12 @@ impl Client {
         // user so per-user type/timestamp/sender are not lost. Retries and
         // enc_rekey_retry never use the aggregated shape, so this short-circuits
         // before the retry pipeline below.
+        //
+        // No own-account classification here: WA Web only aggregates group and
+        // broadcast receipts (`handleAggregateReceipt` rejects anything else) and
+        // never parses `recipient` in this shape, so a self fan-out cannot arrive
+        // aggregated — and each `<user>` names a different peer, which no single
+        // stanza-level `recipient` could re-address.
         if let Some(part_node) = nr.get_optional_child("participants") {
             let (agg_msg_id, agg_key, users) =
                 wacore::stanza::receipt::parse_participants(part_node);
@@ -516,17 +624,11 @@ impl Client {
                     ),
                     None => receipt_type.clone(),
                 };
-                let effective_type = normalize_self_fanout_type(effective_type, is_self_fanout);
                 let r = Receipt::builder()
                     .message_ids(vec![fan_out_id.clone()])
                     .source(crate::types::message::MessageSource {
-                        chat: if is_self_fanout {
-                            recipient.clone().unwrap_or_else(|| from.clone())
-                        } else {
-                            from.clone()
-                        },
+                        chat: from.clone(),
                         sender: user.jid,
-                        is_from_me: is_self_fanout,
                         sender_alt: user.participant_pn,
                         ..Default::default()
                     })
@@ -550,21 +652,29 @@ impl Client {
             from.observe()
         );
 
+        // A chat read on another of our own devices comes back as a receipt our
+        // own account authored: `from` on a DM, the `participant` on a group —
+        // which is exactly what `default_sender` already holds.
+        let addressing = address_receipt(
+            from,
+            recipient,
+            receipt_type,
+            is_group,
+            self.is_own_jid(&default_sender),
+        );
+
         let receipt = Receipt::builder()
             .message_ids(message_ids)
             .source(crate::types::message::MessageSource {
-                chat: if is_self_fanout {
-                    recipient.unwrap_or(from)
-                } else {
-                    from
-                },
+                chat: addressing.chat,
                 sender: default_sender,
-                is_from_me: is_self_fanout,
+                is_from_me: addressing.is_from_me,
+                recipient: addressing.recipient,
                 sender_alt: participant_pn,
                 ..Default::default()
             })
             .timestamp(stanza_ts)
-            .r#type(receipt_type)
+            .r#type(addressing.receipt_type)
             .offline(offline)
             .build();
 
@@ -2081,8 +2191,217 @@ mod tests {
         (client, collector)
     }
 
+    /// A DM read we authored names the peer thread it belongs to, so the event
+    /// has to move there: `from` is our own account, and a read filed under it
+    /// lands on a thread with ourselves.
+    #[test]
+    fn a_read_we_authored_moves_to_the_peer_thread() {
+        let addressing = address_receipt(
+            jid("5511000000001:3@s.whatsapp.net"),
+            Some(jid("5511999990000@s.whatsapp.net")),
+            ReceiptType::Read,
+            false,
+            true,
+        );
+
+        assert_eq!(addressing.chat, jid("5511999990000@s.whatsapp.net"));
+        assert_eq!(
+            addressing.recipient,
+            Some(jid("5511999990000@s.whatsapp.net"))
+        );
+        assert!(addressing.is_from_me);
+        assert_eq!(addressing.receipt_type, ReceiptType::ReadSelf);
+    }
+
+    /// `chat` is a thread key and `recipient` is the wire value, so a device on
+    /// the attribute is dropped from one and kept on the other — the same split
+    /// `parse_message_info` makes for a message we sent.
+    #[test]
+    fn the_peer_thread_key_drops_a_device_the_recipient_keeps() {
+        let addressing = address_receipt(
+            jid("5511000000001@s.whatsapp.net"),
+            Some(jid("5511999990000:12@s.whatsapp.net")),
+            ReceiptType::Read,
+            false,
+            true,
+        );
+
+        assert_eq!(addressing.chat, jid("5511999990000@s.whatsapp.net"));
+        assert_eq!(
+            addressing.recipient,
+            Some(jid("5511999990000:12@s.whatsapp.net"))
+        );
+    }
+
+    #[test]
+    fn a_played_we_authored_becomes_a_self_play() {
+        let addressing = address_receipt(
+            jid("100000000000001:7@lid"),
+            Some(jid("200000000000002@lid")),
+            ReceiptType::Played,
+            false,
+            true,
+        );
+
+        assert_eq!(addressing.chat, jid("200000000000002@lid"));
+        assert_eq!(addressing.receipt_type, ReceiptType::PlayedSelf);
+    }
+
+    /// With read receipts turned off the primary already sends `read-self`, so
+    /// there is nothing to promote — but the thread is still ours and still has
+    /// to move to the peer before the read state is applied to it.
+    #[test]
+    fn a_read_self_we_authored_still_moves_to_the_peer_thread() {
+        let addressing = address_receipt(
+            jid("5511000000001:3@s.whatsapp.net"),
+            Some(jid("5511999990000@s.whatsapp.net")),
+            ReceiptType::ReadSelf,
+            false,
+            true,
+        );
+
+        assert_eq!(addressing.chat, jid("5511999990000@s.whatsapp.net"));
+        assert!(addressing.is_from_me);
+        assert_eq!(addressing.receipt_type, ReceiptType::ReadSelf);
+    }
+
+    /// A delivery we authored says one of our own devices received the message,
+    /// not that the peer did. Re-addressing it would put a delivered tick on the
+    /// peer's thread that no peer earned.
+    #[test]
+    fn a_delivery_we_authored_is_left_alone() {
+        let addressing = address_receipt(
+            jid("5511000000001@s.whatsapp.net"),
+            Some(jid("5511999990000@s.whatsapp.net")),
+            ReceiptType::Delivered,
+            false,
+            true,
+        );
+
+        assert_eq!(addressing.chat, jid("5511000000001@s.whatsapp.net"));
+        assert_eq!(addressing.recipient, None);
+        assert!(!addressing.is_from_me);
+        assert_eq!(addressing.receipt_type, ReceiptType::Delivered);
+    }
+
+    /// WA Web rejects a self receipt that names no peer thread. We keep the
+    /// event but must not promote it: a `ReadSelf` addressed to our own account
+    /// would advance read state on a thread that does not exist.
+    #[test]
+    fn a_read_we_authored_without_a_peer_thread_is_left_alone() {
+        let addressing = address_receipt(
+            jid("5511000000001@s.whatsapp.net"),
+            None,
+            ReceiptType::Read,
+            false,
+            true,
+        );
+
+        assert_eq!(addressing.chat, jid("5511000000001@s.whatsapp.net"));
+        assert_eq!(addressing.recipient, None);
+        assert!(!addressing.is_from_me);
+        assert_eq!(addressing.receipt_type, ReceiptType::Read);
+    }
+
+    /// A DM `recipient` is a user JID on every shape WA Web produces. If one
+    /// ever names a thread that is not a DM, it is not the peer chat this
+    /// re-addressing is for.
+    #[test]
+    fn a_read_we_authored_naming_a_non_peer_thread_is_left_alone() {
+        for not_a_peer in [
+            "120363000000000001@g.us",
+            "status@broadcast",
+            "120363000000000002@newsletter",
+        ] {
+            let addressing = address_receipt(
+                jid("5511000000001@s.whatsapp.net"),
+                Some(jid(not_a_peer)),
+                ReceiptType::Read,
+                false,
+                true,
+            );
+
+            assert_eq!(
+                addressing.chat,
+                jid("5511000000001@s.whatsapp.net"),
+                "{not_a_peer} should not be taken for a peer thread"
+            );
+            assert_eq!(addressing.receipt_type, ReceiptType::Read);
+            assert!(!addressing.is_from_me);
+        }
+    }
+
+    /// In a group the thread is already the group. WA Web's
+    /// `handleGroupSimpleReceipt` reads `recipient` as the author of the message
+    /// that was read, not as a chat, so it is not carried as a recipient either.
+    #[test]
+    fn a_group_read_we_authored_keeps_the_group_as_its_chat() {
+        let addressing = address_receipt(
+            jid("120363000000000001@g.us"),
+            Some(jid("5511999990000@s.whatsapp.net")),
+            ReceiptType::Read,
+            true,
+            true,
+        );
+
+        assert_eq!(addressing.chat, jid("120363000000000001@g.us"));
+        assert_eq!(addressing.recipient, None);
+        assert!(addressing.is_from_me);
+        assert_eq!(addressing.receipt_type, ReceiptType::ReadSelf);
+    }
+
+    /// A retry from another of our own devices carries a `recipient` too, and
+    /// `resolve_retry_chat_info` reads `chat` as the wire `from` to spot exactly
+    /// that shape. Re-addressing it here would make the retry pipeline take the
+    /// peer for the requester and re-encrypt to the wrong device.
+    #[test]
+    fn a_retry_we_authored_keeps_the_wire_from() {
+        let addressing = address_receipt(
+            jid("5511000000001:3@s.whatsapp.net"),
+            Some(jid("5511999990000@s.whatsapp.net")),
+            ReceiptType::Retry,
+            false,
+            true,
+        );
+
+        assert_eq!(addressing.chat, jid("5511000000001:3@s.whatsapp.net"));
+        assert_eq!(addressing.recipient, None);
+        assert!(!addressing.is_from_me);
+        assert_eq!(addressing.receipt_type, ReceiptType::Retry);
+    }
+
+    #[test]
+    fn a_receipt_someone_else_authored_is_untouched() {
+        let addressing = address_receipt(
+            jid("5511888880000@s.whatsapp.net"),
+            Some(jid("5511999990000@s.whatsapp.net")),
+            ReceiptType::Read,
+            false,
+            false,
+        );
+
+        assert_eq!(addressing.chat, jid("5511888880000@s.whatsapp.net"));
+        assert_eq!(addressing.recipient, None);
+        assert!(!addressing.is_from_me);
+        assert_eq!(addressing.receipt_type, ReceiptType::Read);
+    }
+
+    fn dispatched_receipts(collector: &TestEventCollector) -> Vec<Receipt> {
+        collector
+            .events()
+            .iter()
+            .filter_map(|event| match &**event {
+                Event::Receipt(receipt) => Some(receipt.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The reported shape: the primary reads a DM, the server fans its `read`
+    /// back to this companion addressed from our own account, and the chat
+    /// store only clears the badge for a self receipt.
     #[tokio::test]
-    async fn own_read_receipt_is_readdressed_and_promoted() {
+    async fn a_primary_device_read_reaches_the_companion_as_a_self_read() {
         let (client, collector) = setup_client_with_identities().await;
         client
             .handle_receipt(node_to_arc(
@@ -2101,49 +2420,99 @@ mod tests {
             ))
             .await;
 
-        let events = collector.events();
-        let receipt = events
-            .iter()
-            .find_map(|event| match &**event {
-                Event::Receipt(receipt) => Some(receipt),
-                _ => None,
-            })
-            .expect("receipt event");
-        assert_eq!(receipt.r#type, ReceiptType::ReadSelf);
-        assert_eq!(receipt.source.chat, jid("5511999990000@s.whatsapp.net"));
-        assert!(receipt.source.is_from_me);
-        assert_eq!(receipt.message_ids, vec!["READ-1", "READ-2", "READ-OWN"]);
+        let receipts = dispatched_receipts(&collector);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].r#type, ReceiptType::ReadSelf);
+        assert_eq!(receipts[0].source.chat, jid("5511999990000@s.whatsapp.net"));
+        assert!(receipts[0].source.is_from_me);
+        // The device stays on `sender`: it names which of our devices read.
+        assert_eq!(
+            receipts[0].source.sender,
+            jid("5511000000001:3@s.whatsapp.net")
+        );
+        assert_eq!(
+            receipts[0].message_ids,
+            vec!["READ-1", "READ-2", "READ-OWN"]
+        );
     }
 
+    /// The same fan-out addressed from our own LID, which is how a LID-migrated
+    /// account sees it: `is_own_jid` has to match on that identity as well as
+    /// the PN, or the classification only ever works for half the accounts.
     #[tokio::test]
-    async fn own_lid_played_receipt_is_readdressed_and_promoted() {
+    async fn a_primary_device_read_from_our_own_lid_is_recognized() {
         let (client, collector) = setup_client_with_identities().await;
         client
             .handle_receipt(node_to_arc(
                 NodeBuilder::new("receipt")
-                    .attr("from", "100000000000001:7@lid")
-                    .attr("recipient", "5511999990000@lid")
-                    .attr("id", "PLAYED-OWN")
-                    .attr("type", "played")
+                    .attr("from", "100000000000001:2@lid")
+                    .attr("recipient", "200000000000002@lid")
+                    .attr("id", "READ-OWN-LID")
+                    .attr("type", "read")
                     .build(),
             ))
             .await;
 
-        let events = collector.events();
-        let receipt = events
-            .iter()
-            .find_map(|event| match &**event {
-                Event::Receipt(receipt) => Some(receipt),
-                _ => None,
-            })
-            .expect("receipt event");
-        assert_eq!(receipt.r#type, ReceiptType::PlayedSelf);
-        assert_eq!(receipt.source.chat, jid("5511999990000@lid"));
-        assert!(receipt.source.is_from_me);
+        let receipts = dispatched_receipts(&collector);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].r#type, ReceiptType::ReadSelf);
+        assert_eq!(receipts[0].source.chat, jid("200000000000002@lid"));
+        assert!(receipts[0].source.is_from_me);
     }
 
+    /// In a group the author is the `participant`, so the `from` check alone
+    /// would never see it.
     #[tokio::test]
-    async fn own_aggregated_receipts_normalize_inherited_and_per_user_types() {
+    async fn a_group_read_from_our_own_participant_is_a_self_read() {
+        let (client, collector) = setup_client_with_identities().await;
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "120363000000000001@g.us")
+                    .attr("participant", "100000000000001:2@lid")
+                    .attr("recipient", "200000000000002@lid")
+                    .attr("id", "READ-OWN-GROUP")
+                    .attr("type", "read")
+                    .build(),
+            ))
+            .await;
+
+        let receipts = dispatched_receipts(&collector);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].r#type, ReceiptType::ReadSelf);
+        assert_eq!(receipts[0].source.chat, jid("120363000000000001@g.us"));
+        assert!(receipts[0].source.is_from_me);
+    }
+
+    /// An ordinary peer read keeps every field it had before this classification
+    /// existed, `recipient` attribute or not.
+    #[tokio::test]
+    async fn a_peer_read_is_dispatched_unchanged() {
+        let (client, collector) = setup_client_with_identities().await;
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "5511888880000@s.whatsapp.net")
+                    .attr("recipient", "5511999990000@s.whatsapp.net")
+                    .attr("id", "PEER-READ")
+                    .attr("type", "read")
+                    .build(),
+            ))
+            .await;
+
+        let receipts = dispatched_receipts(&collector);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].r#type, ReceiptType::Read);
+        assert_eq!(receipts[0].source.chat, jid("5511888880000@s.whatsapp.net"));
+        assert!(!receipts[0].source.is_from_me);
+        assert_eq!(receipts[0].source.recipient, None);
+    }
+
+    /// Aggregated receipts stay untouched: WA Web only ever aggregates group and
+    /// broadcast acks, and each `<user>` names a different peer, so no single
+    /// stanza-level `recipient` could re-address them.
+    #[tokio::test]
+    async fn an_aggregated_receipt_is_never_classified_as_ours() {
         let (client, collector) = setup_client_with_identities().await;
         client
             .handle_receipt(node_to_arc(
@@ -2168,58 +2537,15 @@ mod tests {
             ))
             .await;
 
-        let events = collector.events();
-        let receipts: Vec<_> = events
-            .iter()
-            .filter_map(|event| match &**event {
-                Event::Receipt(receipt) => Some(receipt),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(receipts.len(), 2);
-        assert_eq!(receipts[0].r#type, ReceiptType::ReadSelf);
-        assert_eq!(receipts[1].r#type, ReceiptType::PlayedSelf);
-        for receipt in receipts {
-            assert_eq!(receipt.source.chat, jid("5511999990000@s.whatsapp.net"));
-            assert!(receipt.source.is_from_me);
-            assert_eq!(receipt.message_ids, vec!["AGG-MESSAGE"]);
-        }
-    }
-
-    #[tokio::test]
-    async fn peer_receipts_and_missing_recipient_keep_ordinary_semantics() {
-        let (client, collector) = setup_client_with_identities().await;
-        for node in [
-            NodeBuilder::new("receipt")
-                .attr("from", "5511888880000@s.whatsapp.net")
-                .attr("recipient", "5511999990000@s.whatsapp.net")
-                .attr("id", "PEER-READ")
-                .attr("type", "read")
-                .build(),
-            NodeBuilder::new("receipt")
-                .attr("from", "5511000000001@s.whatsapp.net")
-                .attr("id", "OWN-NO-RECIPIENT")
-                .attr("type", "read")
-                .build(),
-        ] {
-            client.handle_receipt(node_to_arc(node)).await;
-        }
-
-        let events = collector.events();
-        let receipts: Vec<_> = events
-            .iter()
-            .filter_map(|event| match &**event {
-                Event::Receipt(receipt) => Some(receipt),
-                _ => None,
-            })
-            .collect();
+        let receipts = dispatched_receipts(&collector);
         assert_eq!(receipts.len(), 2);
         assert_eq!(receipts[0].r#type, ReceiptType::Read);
-        assert_eq!(receipts[0].source.chat, jid("5511888880000@s.whatsapp.net"));
-        assert!(!receipts[0].source.is_from_me);
-        assert_eq!(receipts[1].r#type, ReceiptType::Read);
-        assert_eq!(receipts[1].source.chat, jid("5511000000001@s.whatsapp.net"));
-        assert!(!receipts[1].source.is_from_me);
+        assert_eq!(receipts[1].r#type, ReceiptType::Played);
+        for receipt in receipts {
+            assert_eq!(receipt.source.chat, jid("5511000000001@s.whatsapp.net"));
+            assert!(!receipt.source.is_from_me);
+            assert_eq!(receipt.message_ids, vec!["AGG-MESSAGE"]);
+        }
     }
 
     /// Verify that enc_rekey_retry receipt is dispatched as a Receipt event
