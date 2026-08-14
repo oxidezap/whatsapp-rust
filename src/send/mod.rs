@@ -1421,7 +1421,7 @@ impl Client {
     ///
     /// No empty-cache early-exit: WA Web iterates an empty `senderKey` Map
     /// as `false` per participant, so the filter must run unconditionally.
-    fn filter_skdm_targets(
+    pub(crate) fn filter_skdm_targets(
         &self,
         group_jid: &str,
         all_devices: &[Jid],

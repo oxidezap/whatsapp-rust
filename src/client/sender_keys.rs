@@ -1,6 +1,7 @@
 //! Sender key tracking and message cache methods for Client.
 
 use anyhow::Result;
+use smallvec::SmallVec;
 use wacore::types::message::ChatMessageId;
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;
@@ -35,7 +36,10 @@ impl Client {
                 || !(own_lid_user.is_some_and(|user| user == jid.user)
                     || own_pn_user.is_some_and(|user| user == jid.user))
         };
-        let device_ids: Vec<String> = device_jids
+        // The retry repair marks exactly one device, and it runs once per inbound
+        // retry receipt; inline capacity keeps that case off the heap entirely
+        // while a real send's device list spills like the Vec it replaces.
+        let device_ids: SmallVec<[String; 4]> = device_jids
             .iter()
             .filter(keep)
             .map(ToString::to_string)
@@ -44,7 +48,8 @@ impl Client {
             return Ok(());
         }
 
-        let entries: Vec<(&str, bool)> = device_ids.iter().map(|s| (s.as_str(), has_key)).collect();
+        let entries: SmallVec<[(&str, bool); 4]> =
+            device_ids.iter().map(|s| (s.as_str(), has_key)).collect();
         self.persistence_manager
             .set_sender_key_status(group_jid, &entries)
             .await?;
