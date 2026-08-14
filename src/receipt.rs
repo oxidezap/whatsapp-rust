@@ -16,6 +16,18 @@ use wacore_binary::OwnedNodeRef;
 /// per chunk, so a large catch-up doesn't produce one oversized stanza.
 const MAX_RECEIPT_IDS_PER_STANZA: usize = 256;
 
+fn normalize_self_fanout_type(receipt_type: ReceiptType, is_self_fanout: bool) -> ReceiptType {
+    if !is_self_fanout {
+        return receipt_type;
+    }
+
+    match receipt_type {
+        ReceiptType::Read => ReceiptType::ReadSelf,
+        ReceiptType::Played => ReceiptType::PlayedSelf,
+        receipt_type => receipt_type,
+    }
+}
+
 /// Pure builder for the delivery `<receipt>` node. Extracted so unit tests
 /// can assert wire shape without spinning a transport. Mirrors WA Web's
 /// `Send/DeliveryReceiptJob.js` — the participant gate there is
@@ -438,8 +450,12 @@ impl Client {
         let receipt_type_cow = attrs.optional_string("type");
         let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
         let participant = attrs.optional_jid("participant");
+        let recipient = attrs.optional_jid("recipient");
         // participant_pn -> sender_alt so the LID-PN cache warms from receipts too.
         let participant_pn = attrs.optional_jid("participant_pn");
+        // A primary-device read/played receipt can be fanned out with our own
+        // PN/LID in `from` and the actual peer chat in `recipient`.
+        let is_self_fanout = recipient.is_some() && self.is_own_jid(&from);
         // Present when this receipt was drained from the offline queue on reconnect.
         let offline = attrs.optional_string("offline").is_some();
         let stanza_ts = attrs
@@ -453,6 +469,7 @@ impl Client {
         // <error reason="lid" type="feature-incapable"> (the LID peer can't receive it).
         let receipt_type =
             wacore::stanza::receipt::downgrade_for_feature_incapable(nr, receipt_type);
+        let receipt_type = normalize_self_fanout_type(receipt_type, is_self_fanout);
         let is_view = receipt_type_str == "view";
         let is_group = from.is_group();
         let default_sender = if is_group {
@@ -499,11 +516,17 @@ impl Client {
                     ),
                     None => receipt_type.clone(),
                 };
+                let effective_type = normalize_self_fanout_type(effective_type, is_self_fanout);
                 let r = Receipt::builder()
                     .message_ids(vec![fan_out_id.clone()])
                     .source(crate::types::message::MessageSource {
-                        chat: from.clone(),
+                        chat: if is_self_fanout {
+                            recipient.clone().unwrap_or_else(|| from.clone())
+                        } else {
+                            from.clone()
+                        },
                         sender: user.jid,
+                        is_from_me: is_self_fanout,
                         sender_alt: user.participant_pn,
                         ..Default::default()
                     })
@@ -530,8 +553,13 @@ impl Client {
         let receipt = Receipt::builder()
             .message_ids(message_ids)
             .source(crate::types::message::MessageSource {
-                chat: from,
+                chat: if is_self_fanout {
+                    recipient.unwrap_or(from)
+                } else {
+                    from
+                },
                 sender: default_sender,
+                is_from_me: is_self_fanout,
                 sender_alt: participant_pn,
                 ..Default::default()
             })
@@ -2034,6 +2062,164 @@ mod tests {
         let collector = Arc::new(TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
         (client, collector)
+    }
+
+    async fn setup_client_with_identities() -> (Arc<Client>, Arc<TestEventCollector>) {
+        let (client, collector) = setup_client_with_collector().await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetId(Some(jid(
+                "5511000000001@s.whatsapp.net",
+            ))))
+            .await;
+        client
+            .persistence_manager
+            .process_command(crate::store::commands::DeviceCommand::SetLid(Some(jid(
+                "100000000000001@lid",
+            ))))
+            .await;
+        (client, collector)
+    }
+
+    #[tokio::test]
+    async fn own_read_receipt_is_readdressed_and_promoted() {
+        let (client, collector) = setup_client_with_identities().await;
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "5511000000001:3@s.whatsapp.net")
+                    .attr("recipient", "5511999990000@s.whatsapp.net")
+                    .attr("id", "READ-OWN")
+                    .attr("type", "read")
+                    .children([NodeBuilder::new("list")
+                        .children([
+                            NodeBuilder::new("item").attr("id", "READ-1").build(),
+                            NodeBuilder::new("item").attr("id", "READ-2").build(),
+                        ])
+                        .build()])
+                    .build(),
+            ))
+            .await;
+
+        let events = collector.events();
+        let receipt = events
+            .iter()
+            .find_map(|event| match &**event {
+                Event::Receipt(receipt) => Some(receipt),
+                _ => None,
+            })
+            .expect("receipt event");
+        assert_eq!(receipt.r#type, ReceiptType::ReadSelf);
+        assert_eq!(receipt.source.chat, jid("5511999990000@s.whatsapp.net"));
+        assert!(receipt.source.is_from_me);
+        assert_eq!(receipt.message_ids, vec!["READ-1", "READ-2", "READ-OWN"]);
+    }
+
+    #[tokio::test]
+    async fn own_lid_played_receipt_is_readdressed_and_promoted() {
+        let (client, collector) = setup_client_with_identities().await;
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "100000000000001:7@lid")
+                    .attr("recipient", "5511999990000@lid")
+                    .attr("id", "PLAYED-OWN")
+                    .attr("type", "played")
+                    .build(),
+            ))
+            .await;
+
+        let events = collector.events();
+        let receipt = events
+            .iter()
+            .find_map(|event| match &**event {
+                Event::Receipt(receipt) => Some(receipt),
+                _ => None,
+            })
+            .expect("receipt event");
+        assert_eq!(receipt.r#type, ReceiptType::PlayedSelf);
+        assert_eq!(receipt.source.chat, jid("5511999990000@lid"));
+        assert!(receipt.source.is_from_me);
+    }
+
+    #[tokio::test]
+    async fn own_aggregated_receipts_normalize_inherited_and_per_user_types() {
+        let (client, collector) = setup_client_with_identities().await;
+        client
+            .handle_receipt(node_to_arc(
+                NodeBuilder::new("receipt")
+                    .attr("from", "5511000000001@s.whatsapp.net")
+                    .attr("recipient", "5511999990000@s.whatsapp.net")
+                    .attr("id", "AGG-STANZA")
+                    .attr("type", "read")
+                    .children([NodeBuilder::new("participants")
+                        .attr("message_id", "AGG-MESSAGE")
+                        .children([
+                            NodeBuilder::new("user")
+                                .attr("jid", "5511999990000@s.whatsapp.net")
+                                .build(),
+                            NodeBuilder::new("user")
+                                .attr("jid", "5511888880000@s.whatsapp.net")
+                                .attr("type", "played")
+                                .build(),
+                        ])
+                        .build()])
+                    .build(),
+            ))
+            .await;
+
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &**event {
+                Event::Receipt(receipt) => Some(receipt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].r#type, ReceiptType::ReadSelf);
+        assert_eq!(receipts[1].r#type, ReceiptType::PlayedSelf);
+        for receipt in receipts {
+            assert_eq!(receipt.source.chat, jid("5511999990000@s.whatsapp.net"));
+            assert!(receipt.source.is_from_me);
+            assert_eq!(receipt.message_ids, vec!["AGG-MESSAGE"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_receipts_and_missing_recipient_keep_ordinary_semantics() {
+        let (client, collector) = setup_client_with_identities().await;
+        for node in [
+            NodeBuilder::new("receipt")
+                .attr("from", "5511888880000@s.whatsapp.net")
+                .attr("recipient", "5511999990000@s.whatsapp.net")
+                .attr("id", "PEER-READ")
+                .attr("type", "read")
+                .build(),
+            NodeBuilder::new("receipt")
+                .attr("from", "5511000000001@s.whatsapp.net")
+                .attr("id", "OWN-NO-RECIPIENT")
+                .attr("type", "read")
+                .build(),
+        ] {
+            client.handle_receipt(node_to_arc(node)).await;
+        }
+
+        let events = collector.events();
+        let receipts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &**event {
+                Event::Receipt(receipt) => Some(receipt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].r#type, ReceiptType::Read);
+        assert_eq!(receipts[0].source.chat, jid("5511888880000@s.whatsapp.net"));
+        assert!(!receipts[0].source.is_from_me);
+        assert_eq!(receipts[1].r#type, ReceiptType::Read);
+        assert_eq!(receipts[1].source.chat, jid("5511000000001@s.whatsapp.net"));
+        assert!(!receipts[1].source.is_from_me);
     }
 
     /// Verify that enc_rekey_retry receipt is dispatched as a Receipt event
