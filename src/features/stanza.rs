@@ -83,6 +83,7 @@ pub enum StanzaResponseError {
 pub struct RetryRequestOptions {
     reason: RetryReason,
     force_include_keys: bool,
+    decrypt_fail_mode: wacore::types::events::DecryptFailMode,
 }
 
 impl RetryRequestOptions {
@@ -91,6 +92,7 @@ impl RetryRequestOptions {
         Self {
             reason: RetryReason::UnknownError,
             force_include_keys: false,
+            decrypt_fail_mode: wacore::types::events::DecryptFailMode::Show,
         }
     }
 
@@ -114,6 +116,24 @@ impl RetryRequestOptions {
     /// Whether key material is required before the normal retry threshold.
     pub const fn force_include_keys(self) -> bool {
         self.force_include_keys
+    }
+
+    /// Record that the stanza being retried asked for its decryption failures
+    /// to be hidden, which the receipt reports back in its `<meta mode>`.
+    ///
+    /// Defaults to [`DecryptFailMode::Show`](wacore::types::events::DecryptFailMode::Show),
+    /// so a caller that does not set it sends no `<meta>` at all.
+    pub const fn with_decrypt_fail_mode(
+        mut self,
+        decrypt_fail_mode: wacore::types::events::DecryptFailMode,
+    ) -> Self {
+        self.decrypt_fail_mode = decrypt_fail_mode;
+        self
+    }
+
+    /// How the stanza being retried asked its failures to be surfaced.
+    pub const fn decrypt_fail_mode(self) -> wacore::types::events::DecryptFailMode {
+        self.decrypt_fail_mode
     }
 }
 

@@ -500,6 +500,8 @@ impl Client {
         // Read off before the payload is consumed below.
         let enc_index = payload.enc_index;
         let enc_type = payload.enc_type.as_wire_str();
+        let enc_state = payload.state.clone();
+        let enc_session_type = payload.session_type.clone();
 
         let ms_msg = match waproto::codec::message_secret_message_decode(&payload.ciphertext) {
             Ok(m) => m,
@@ -801,6 +803,8 @@ impl Client {
                     .info(Arc::clone(info))
                     .enc_index(enc_index)
                     .enc_type(enc_type)
+                    .maybe_state(enc_state.clone())
+                    .maybe_session_type(enc_session_type.clone())
                     .payload(plaintext.clone())
                     .build(),
             ));

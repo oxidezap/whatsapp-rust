@@ -13,13 +13,14 @@ pub use wacore::iq::contacts::SetProfilePictureResponse;
 use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
     BatchGetGroupInfoIq, CancelMembershipRequestsIq, DemoteParticipantsIq, GetGroupInviteInfoIq,
-    GetGroupInviteLinkIq, GetGroupProfilePicturesIq, GetMembershipRequestsIq, GroupCreateIq,
-    GroupInfoOutcome, GroupInfoResponse, GroupParticipantResponse, GroupParticipatingIq,
-    GroupQueryIq, LeaveGroupIq, MembershipRequestActionIq, PromoteParticipantsIq,
-    RemoveParticipantsIncludingLinkedGroupsIq, RemoveParticipantsIq, RevokeRequestCodeIq,
-    SetAllowAdminReportsIq, SetGroupAnnouncementIq, SetGroupDescriptionIq, SetGroupEphemeralIq,
-    SetGroupHistoryIq, SetGroupLockedIq, SetGroupMembershipApprovalIq, SetGroupSubjectIq,
-    SetMemberAddModeIq, SetNoFrequentlyForwardedIq, normalize_participants,
+    GetGroupInviteLinkIq, GetGroupProfilePicturesIq, GetMembershipRequestsIq,
+    GetReportedGroupMessagesIq, GroupCreateIq, GroupInfoOutcome, GroupInfoResponse,
+    GroupParticipantResponse, GroupParticipatingIq, GroupQueryIq, LeaveGroupIq,
+    MembershipRequestActionIq, PromoteParticipantsIq, RemoveParticipantsIncludingLinkedGroupsIq,
+    RemoveParticipantsIq, ReportGroupMessagesIq, RevokeRequestCodeIq, SetAllowAdminReportsIq,
+    SetGroupAnnouncementIq, SetGroupDescriptionIq, SetGroupEphemeralIq, SetGroupHistoryIq,
+    SetGroupLockedIq, SetGroupMembershipApprovalIq, SetGroupSubjectIq, SetMemberAddModeIq,
+    SetNoFrequentlyForwardedIq, normalize_participants,
 };
 use wacore::iq::mex_operations::update_group_property;
 use wacore::types::message::AddressingMode;
@@ -28,10 +29,11 @@ use wacore_binary::{Jid, JidExt as _};
 use wacore::iq::groups::BatchGroupInfoResult as RawBatchResult;
 pub use wacore::iq::groups::{
     GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings,
-    GroupJoinError, GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture,
-    GroupSubject, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
-    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
-    ParticipantType, PictureType,
+    GroupJoinError, GroupMessageReporter, GroupParticipantDetails, GroupParticipantOptions,
+    GroupProfilePicture, GroupSubject, GrowthLockInfo, InviteInfoError, JoinGroupResult,
+    MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
+    MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
+    ReportedGroupMessage, ReportedGroupMessages,
 };
 
 /// Error returned by group operations (metadata queries, participant and
@@ -1083,6 +1085,35 @@ impl<'a> Groups<'a> {
         Ok(self
             .client
             .execute(GetMembershipRequestsIq::new(jid))
+            .await?)
+    }
+
+    /// Report messages to the group's admins.
+    ///
+    /// Reports to the group's own admins, not to WhatsApp; the group has to
+    /// allow admin reports for the server to accept it. The result is empty on
+    /// success and says nothing about which ids were accepted.
+    pub async fn report_messages_to_admins(
+        &self,
+        jid: impl Into<Jid>,
+        message_ids: &[String],
+    ) -> Result<(), GroupError> {
+        let jid = &jid.into();
+        Ok(self
+            .client
+            .execute(ReportGroupMessagesIq::new(jid, message_ids))
+            .await?)
+    }
+
+    /// Fetch the messages reported to this group's admins.
+    pub async fn get_reported_messages(
+        &self,
+        jid: impl Into<Jid>,
+    ) -> Result<ReportedGroupMessages, GroupError> {
+        let jid = &jid.into();
+        Ok(self
+            .client
+            .execute(GetReportedGroupMessagesIq::new(jid))
             .await?)
     }
 

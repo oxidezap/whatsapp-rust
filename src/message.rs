@@ -81,6 +81,12 @@ pub(crate) struct EncPayload {
     /// payload are skipped, so a position within a bucket is not a position in
     /// the stanza.
     pub enc_index: usize,
+    /// The node's `state` attribute, verbatim. Absent on ordinary traffic, so
+    /// the common case allocates nothing.
+    pub state: Option<String>,
+    /// The node's `session_type` attribute, verbatim. Absent on ordinary
+    /// traffic, so the common case allocates nothing.
+    pub session_type: Option<String>,
 }
 
 impl EncPayload {
@@ -91,11 +97,16 @@ impl EncPayload {
     ) -> Option<Self> {
         let enc_type = EncType::from_wire(enc_node.attrs().optional_string("type")?.as_ref())?;
         let padding_version = enc_node.attrs().optional_u64("v").unwrap_or(2) as u8;
+        let mut attrs = enc_node.attrs();
         Some(Self {
             ciphertext,
             enc_type,
             padding_version,
             enc_index,
+            state: attrs.optional_string("state").map(|s| s.into_owned()),
+            session_type: attrs
+                .optional_string("session_type")
+                .map(|s| s.into_owned()),
         })
     }
 
@@ -233,6 +244,8 @@ struct DeferredPlaintext {
     /// Which `<enc>` in the stanza produced this — [`EncPayload::enc_index`],
     /// carried through because the buffer drains after the decrypt loop.
     enc_index: usize,
+    state: Option<String>,
+    session_type: Option<String>,
 }
 
 fn should_process_skmsg_after_session(

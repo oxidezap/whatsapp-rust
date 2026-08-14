@@ -1085,7 +1085,8 @@ pub fn parse_message_info(
     own_lid: Option<&wacore_binary::Jid>,
 ) -> Result<crate::types::message::MessageInfo> {
     use crate::types::message::{
-        AddressingMode, EditAttribute, MessageCategory, MessageInfo, MessageSource,
+        AddressingMode, EditAttribute, MessageCategory, MessageInfo, MessageSource, PollType,
+        StanzaMessageType,
     };
     use wacore_binary::{JidExt as _, STATUS_BROADCAST_USER, Server};
 
@@ -1206,6 +1207,14 @@ pub fn parse_message_info(
         .map(|s| MessageCategory::from(s.as_ref()))
         .unwrap_or_default();
 
+    // WA Web's parser requires this attribute and rejects the stanza without
+    // it. Rejecting here would drop a message this client currently delivers,
+    // for an attribute nothing downstream needs, so absence is recorded as
+    // `None` and an unrecognized value keeps its wire bytes.
+    let stanza_type = attrs
+        .optional_string("type")
+        .map(|s| StanzaMessageType::from(s.as_ref()));
+
     let server_id = attrs
         .optional_u64("server_id")
         .filter(|&v| (99..=2_147_476_647).contains(&v))
@@ -1247,6 +1256,16 @@ pub fn parse_message_info(
         meta_info.target_id = ma.optional_string("target_id").map(|s| s.into_owned());
         meta_info.target_sender = ma.optional_jid("target_sender_jid");
         meta_info.target_chat = ma.optional_jid("target_chat_jid");
+        meta_info.thread_message_id = ma.optional_string("thread_msg_id").map(|s| s.into_owned());
+        meta_info.thread_message_sender_jid = ma.optional_jid("thread_msg_sender_jid");
+        // WA Web scopes `polltype` to poll envelopes, so a value on any other
+        // type is not the poll stage and is not recorded as one. Unknown
+        // values parse to None (the attribute is enum-or-null upstream).
+        if stanza_type == Some(StanzaMessageType::Poll) {
+            meta_info.poll_type = ma
+                .optional_string("polltype")
+                .and_then(|s| PollType::try_from(s.as_ref()).ok());
+        }
     }
     if let Some(reporting) = node.get_optional_child("reporting")
         && let Some(tag) = reporting.get_optional_child("reporting_tag")
@@ -1290,6 +1309,7 @@ pub fn parse_message_info(
         source,
         id,
         server_id,
+        r#type: stanza_type,
         push_name: attrs
             .optional_string("notify")
             .map(|s| s.to_string())
@@ -1995,6 +2015,140 @@ mod parse_message_info_tests {
         assert!(
             info.bcl_participants.is_empty(),
             "group fanout participants are not a bcl"
+        );
+    }
+
+    fn envelope(stanza_type: Option<&str>) -> wacore_binary::Node {
+        let mut builder = NodeBuilder::new("message")
+            .attr("from", "559980000001@s.whatsapp.net")
+            .attr("id", "MSG-TYPE-1")
+            .attr("t", "1777415965");
+        if let Some(stanza_type) = stanza_type {
+            builder = builder.attr("type", stanza_type);
+        }
+        builder.build()
+    }
+
+    fn parse(node: &wacore_binary::Node) -> crate::types::message::MessageInfo {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        parse_message_info(&node.as_node_ref(), &own_pn, None).expect("envelope should parse")
+    }
+
+    /// Every variant of the envelope type has to survive a wire round trip.
+    /// Written as an exhaustive match so a variant added without a `#[wire]`
+    /// mapping fails to compile rather than silently parsing as `Unknown`.
+    #[test]
+    fn every_envelope_type_round_trips_through_the_wire() {
+        use crate::types::message::StanzaMessageType as T;
+        let all = [
+            T::Text,
+            T::Media,
+            T::MediaNotify,
+            T::Pay,
+            T::Poll,
+            T::Reaction,
+            T::Event,
+            T::Unknown("sticker_pack_share".to_owned()),
+        ];
+        for variant in &all {
+            // Exhaustive on purpose: a new variant lands here first.
+            let expected_wire = match variant {
+                T::Text => "text",
+                T::Media => "media",
+                T::MediaNotify => "medianotify",
+                T::Pay => "pay",
+                T::Poll => "poll",
+                T::Reaction => "reaction",
+                T::Event => "event",
+                T::Unknown(raw) => raw.as_str(),
+            };
+            assert_eq!(variant.as_str(), expected_wire);
+            assert_eq!(
+                parse(&envelope(Some(expected_wire))).r#type.as_ref(),
+                Some(variant),
+                "envelope type {expected_wire} did not round trip"
+            );
+        }
+    }
+
+    /// The official parser rejects both of these; this one keeps the stanza and
+    /// distinguishes them, so neither collapses into the other or into `text`.
+    #[test]
+    fn absent_and_unknown_envelope_types_stay_distinguishable() {
+        use crate::types::message::StanzaMessageType as T;
+        assert_eq!(parse(&envelope(None)).r#type, None);
+        assert_eq!(
+            parse(&envelope(Some("newsletter_admin_invite"))).r#type,
+            Some(T::Unknown("newsletter_admin_invite".to_owned()))
+        );
+    }
+
+    #[test]
+    fn polltype_is_read_only_on_a_poll_envelope() {
+        use crate::types::message::{PollType, StanzaMessageType as T};
+        let with_meta = |stanza_type: &str| {
+            let node = NodeBuilder::new("message")
+                .attr("from", "559980000001@s.whatsapp.net")
+                .attr("id", "MSG-POLL-1")
+                .attr("t", "1777415965")
+                .attr("type", stanza_type)
+                .children([NodeBuilder::new("meta").attr("polltype", "vote").build()])
+                .build();
+            parse(&node)
+        };
+
+        let poll = with_meta("poll");
+        assert_eq!(poll.r#type, Some(T::Poll));
+        assert_eq!(poll.meta_info.poll_type, Some(PollType::Vote));
+
+        let text = with_meta("text");
+        assert_eq!(text.r#type, Some(T::Text));
+        assert_eq!(
+            text.meta_info.poll_type, None,
+            "polltype belongs to poll envelopes only"
+        );
+    }
+
+    /// `attrEnumOrNullIfUnknown` upstream: a poll stage this build does not
+    /// model is dropped, not preserved as raw text.
+    #[test]
+    fn unknown_polltype_parses_as_absent() {
+        let node = NodeBuilder::new("message")
+            .attr("from", "559980000001@s.whatsapp.net")
+            .attr("id", "MSG-POLL-2")
+            .attr("t", "1777415965")
+            .attr("type", "poll")
+            .children([NodeBuilder::new("meta")
+                .attr("polltype", "retraction")
+                .build()])
+            .build();
+        assert_eq!(parse(&node).meta_info.poll_type, None);
+    }
+
+    #[test]
+    fn meta_thread_attributes_reach_message_info() {
+        let node = NodeBuilder::new("message")
+            .attr("from", "120363000000000001@g.us")
+            .attr("participant", "559980000001@s.whatsapp.net")
+            .attr("id", "MSG-THREAD-1")
+            .attr("t", "1777415965")
+            .attr("type", "text")
+            .children([NodeBuilder::new("meta")
+                .attr("thread_msg_id", "PARENT-1")
+                .attr("thread_msg_sender_jid", "559980000002@s.whatsapp.net")
+                .build()])
+            .build();
+        let info = parse(&node);
+        assert_eq!(
+            info.meta_info.thread_message_id.as_deref(),
+            Some("PARENT-1")
+        );
+        assert_eq!(
+            info.meta_info
+                .thread_message_sender_jid
+                .as_ref()
+                .map(|jid| jid.user.as_str()),
+            Some("559980000002")
         );
     }
 }

@@ -494,7 +494,7 @@ impl Client {
         Ok(MessageInfo {
             id: id.unwrap_or_default().to_owned(),
             server_id: 0,
-            r#type: String::new(),
+            r#type: None,
             source: MessageSource {
                 chat: remote_jid,
                 sender,
@@ -510,7 +510,7 @@ impl Client {
             push_name: push_name.unwrap_or_default().to_owned(),
             category: MessageCategory::default(),
             multicast: false,
-            media_type: String::new(),
+            media_type: None,
             edit: EditAttribute::default(),
             bot_info: None,
             meta_info: MsgMetaInfo::default(),

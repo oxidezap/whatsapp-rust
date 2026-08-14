@@ -1750,6 +1750,19 @@ pub struct DecryptedPayload {
     pub enc_index: usize,
     /// The `type` attribute the `<enc>` carried: `msg`, `pkmsg`, `skmsg`, …
     pub enc_type: &'static str,
+    /// The `state` attribute the `<enc>` carried, verbatim, or `None` when it
+    /// carried none.
+    ///
+    /// The server's own annotation of the session this copy was encrypted
+    /// under. This build does not model the values and does not act on them;
+    /// they are handed over as text so a consumer can.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// The `session_type` attribute the `<enc>` carried, verbatim, or `None`
+    /// when it carried none. Unmodelled and unacted-on, like
+    /// [`state`](Self::state).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_type: Option<String>,
     /// The plaintext, unpadded, exactly as decoding will receive it.
     ///
     /// A `Bytes`, so forwarding it costs a refcount bump rather than a copy.

@@ -47,6 +47,170 @@ pub enum PushPriority {
     HighForce,
 }
 
+/// The `type` attribute of an incoming `<message>` envelope.
+///
+/// The server declares which class of payload the stanza carries before any
+/// `<enc>` is decrypted. WhatsApp Web treats the attribute as required and
+/// fails the parse when it is absent or carries a value outside its list; this
+/// client keeps the stanza instead, so absence surfaces as `None` on
+/// [`MessageInfo::type`](MessageInfo) and an unrecognized value as
+/// [`Unknown`](Self::Unknown) holding the exact wire bytes.
+///
+/// Says nothing about the decrypted content: it is the envelope's own claim,
+/// which nothing verifies against the `Message` that comes out of the
+/// ciphertext.
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+pub enum StanzaMessageType {
+    #[wire = "text"]
+    Text,
+    #[wire = "media"]
+    Media,
+    #[wire = "medianotify"]
+    MediaNotify,
+    #[wire = "pay"]
+    Pay,
+    #[wire = "poll"]
+    Poll,
+    #[wire = "reaction"]
+    Reaction,
+    #[wire = "event"]
+    Event,
+    /// A value this build does not model, kept verbatim.
+    #[wire_fallback]
+    Unknown(String),
+}
+
+/// The `polltype` attribute of an incoming `<message><meta>` node.
+///
+/// Read only when the envelope declares [`StanzaMessageType::Poll`], mirroring
+/// the official parser, which scopes the attribute to poll envelopes. Closed
+/// on purpose: the attribute is `attrEnumOrNullIfUnknown` upstream, so a value
+/// outside this list parses as `None` rather than being preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
+pub enum PollType {
+    #[wire = "creation"]
+    Creation,
+    #[wire = "quiz_creation"]
+    QuizCreation,
+    #[wire = "vote"]
+    Vote,
+    #[wire = "result_snapshot"]
+    ResultSnapshot,
+    #[wire = "edit"]
+    Edit,
+}
+
+/// The `mediatype` attribute of an `<enc>` node.
+///
+/// A hint about the payload the ciphertext carries, available before the
+/// decryption that would reveal it. It is the sender's claim and nothing
+/// checks it against the decrypted `Message`, so it is useful for routing and
+/// telemetry and not for deciding what a message is.
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+pub enum EncMediaType {
+    #[wire = "image"]
+    Image,
+    #[wire = "video"]
+    Video,
+    #[wire = "ptv"]
+    Ptv,
+    #[wire = "audio"]
+    Audio,
+    #[wire = "ptt"]
+    Ptt,
+    #[wire = "location"]
+    Location,
+    #[wire = "vcard"]
+    Vcard,
+    #[wire = "document"]
+    Document,
+    #[wire = "url"]
+    Url,
+    #[wire = "call"]
+    Call,
+    #[wire = "gif"]
+    Gif,
+    #[wire = "future"]
+    Future,
+    #[wire = "contact_array"]
+    ContactArray,
+    #[wire = "livelocation"]
+    LiveLocation,
+    #[wire = "profile_pic"]
+    ProfilePic,
+    #[wire = "sticker"]
+    Sticker,
+    #[wire = "sticker_pack"]
+    StickerPack,
+    #[wire = "hsm"]
+    Hsm,
+    #[wire = "product_image"]
+    ProductImage,
+    #[wire = "template"]
+    Template,
+    #[wire = "md_app_state"]
+    MdAppState,
+    #[wire = "md_history_sync"]
+    MdHistorySync,
+    #[wire = "list"]
+    List,
+    #[wire = "list_response"]
+    ListResponse,
+    #[wire = "button"]
+    Button,
+    #[wire = "button_response"]
+    ButtonResponse,
+    #[wire = "order"]
+    Order,
+    #[wire = "product"]
+    Product,
+    #[wire = "native_flow_response"]
+    NativeFlowResponse,
+    #[wire = "group_history"]
+    GroupHistory,
+    /// A value this build does not model, kept verbatim.
+    #[wire_fallback]
+    Unknown(String),
+}
+
+/// Whether an envelope's declared type agrees with the server's request to
+/// hide decryption failures for it.
+///
+/// WhatsApp Web crosses `decrypt-fail="hide"` on any `<enc>` with the
+/// envelope's `type` and refuses to nack a stanza whose combination it calls
+/// incoherent. The two legs are different lists: with hiding requested only a
+/// reaction or a poll vote qualifies, without it the four content types do.
+/// `pay` and `event` fall outside both.
+///
+/// This answers the question and nothing more. It drives no decision in this
+/// client: what gets acknowledged, retried or nacked is unchanged by it, and a
+/// caller that wants the official gate has to apply it itself.
+///
+/// An absent or [`Unknown`](StanzaMessageType::Unknown) type is never coherent,
+/// because neither leg's list can contain it.
+pub fn envelope_is_coherent(
+    stanza_type: Option<&StanzaMessageType>,
+    poll_type: Option<PollType>,
+    decrypt_fail_mode: crate::types::events::DecryptFailMode,
+) -> bool {
+    let Some(stanza_type) = stanza_type else {
+        return false;
+    };
+    match decrypt_fail_mode {
+        crate::types::events::DecryptFailMode::Hide => matches!(
+            (stanza_type, poll_type),
+            (StanzaMessageType::Reaction, _) | (StanzaMessageType::Poll, Some(PollType::Vote))
+        ),
+        crate::types::events::DecryptFailMode::Show => matches!(
+            stanza_type,
+            StanzaMessageType::Text
+                | StanzaMessageType::Media
+                | StanzaMessageType::MediaNotify
+                | StanzaMessageType::Poll
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
 pub enum PrivacySensitiveType {
     #[wire = "1"]
@@ -279,12 +443,23 @@ pub struct MsgMetaInfo {
     /// lookup; see WA Web `decryptMsmsgBotMessage`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_chat: Option<Jid>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deprecated_lid_session: Option<bool>,
+    /// `<meta thread_msg_id="…">` — the message this one threads under, for a
+    /// stanza the server routes into an existing thread.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_message_id: Option<MessageId>,
+    /// `<meta thread_msg_sender_jid="…">` — who authored
+    /// [`thread_message_id`](Self::thread_message_id). Absent whenever that is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_message_sender_jid: Option<Jid>,
+    /// `<meta polltype="…">` — which stage of a poll's lifecycle the envelope
+    /// carries.
+    ///
+    /// Read only when the envelope declares [`StanzaMessageType::Poll`], so a
+    /// `<meta polltype>` on any other type is ignored rather than recorded. An
+    /// unrecognized value is `None`, indistinguishable from the attribute being
+    /// absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_type: Option<PollType>,
     /// `<meta content_type=...>` attr. Server marks reactions/edits as
     /// `"add_on"`; mirrors `WAWebHandleMsgParser` b()'s metadata read.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -310,13 +485,28 @@ pub struct MessageInfo {
     pub source: MessageSource,
     pub id: MessageId,
     pub server_id: MessageServerId,
-    pub r#type: String,
+    /// The envelope's `type` attribute. `None` when the stanza carried none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<StanzaMessageType>,
     pub push_name: String,
     #[serde(serialize_with = "chrono::serde::ts_seconds::serialize")]
     pub timestamp: DateTime<Utc>,
     pub category: MessageCategory,
     pub multicast: bool,
-    pub media_type: String,
+    /// The `mediatype` the stanza's `<enc>` nodes declared, aggregated to one
+    /// value per message.
+    ///
+    /// A fan-out stanza carries one `<enc>` per device and the attribute is a
+    /// property of the message, not of a device copy, so the first `<enc>` that
+    /// carries one wins in the order the client enumerates them: the direct
+    /// `<enc>` children first, then this device's under `<participants><to>`.
+    /// Divergent values across a fan-out are not reconciled and the later ones
+    /// are dropped; a consumer that needs per-node values reads them from
+    /// [`DecryptedPayload`](crate::types::events::DecryptedPayload).
+    ///
+    /// `None` when no `<enc>` carried the attribute.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<EncMediaType>,
     pub edit: EditAttribute,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_info: Option<MsgBotInfo>,
@@ -747,5 +937,52 @@ mod tests {
             EditAttribute::infer_from_message(&wrapped_pin),
             Some(EditAttribute::PinInChat)
         );
+    }
+
+    /// The full cross product of envelope type against the hide flag, so a
+    /// change to either leg's list shows up as a diff here rather than as a
+    /// quiet behaviour change. `pay` and `event` are listed explicitly: they
+    /// are the two types that fall outside both legs.
+    #[test]
+    fn coherence_covers_both_legs_of_the_rule() {
+        use crate::types::events::DecryptFailMode::{Hide, Show};
+        use StanzaMessageType as T;
+
+        let cases: &[(T, Option<PollType>, bool, bool)] = &[
+            // (type, polltype, coherent when hidden, coherent when shown)
+            (T::Text, None, false, true),
+            (T::Media, None, false, true),
+            (T::MediaNotify, None, false, true),
+            (T::Pay, None, false, false),
+            (T::Poll, None, false, true),
+            (T::Poll, Some(PollType::Vote), true, true),
+            (T::Poll, Some(PollType::Creation), false, true),
+            (T::Reaction, None, true, false),
+            (T::Reaction, Some(PollType::Vote), true, false),
+            (T::Event, None, false, false),
+            (T::Unknown("archive".to_owned()), None, false, false),
+        ];
+
+        for (stanza_type, poll_type, when_hidden, when_shown) in cases {
+            assert_eq!(
+                envelope_is_coherent(Some(stanza_type), *poll_type, Hide),
+                *when_hidden,
+                "hide leg disagrees for {stanza_type:?} / {poll_type:?}"
+            );
+            assert_eq!(
+                envelope_is_coherent(Some(stanza_type), *poll_type, Show),
+                *when_shown,
+                "show leg disagrees for {stanza_type:?} / {poll_type:?}"
+            );
+        }
+    }
+
+    /// Neither leg's list can hold a type that was never on the wire.
+    #[test]
+    fn an_absent_envelope_type_is_never_coherent() {
+        use crate::types::events::DecryptFailMode::{Hide, Show};
+        assert!(!envelope_is_coherent(None, None, Hide));
+        assert!(!envelope_is_coherent(None, Some(PollType::Vote), Hide));
+        assert!(!envelope_is_coherent(None, None, Show));
     }
 }

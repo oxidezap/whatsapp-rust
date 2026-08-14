@@ -3334,7 +3334,7 @@ fn create_test_message_info(chat: &str, msg_id: &str, sender: &str) -> MessageIn
     MessageInfo {
         id: msg_id.to_string(),
         server_id: 0,
-        r#type: "text".to_string(),
+        r#type: Some(wacore::types::message::StanzaMessageType::Text),
         source: MessageSource {
             chat: chat_jid.clone(),
             sender: sender_jid,
@@ -3350,7 +3350,7 @@ fn create_test_message_info(chat: &str, msg_id: &str, sender: &str) -> MessageIn
         push_name: "Test User".to_string(),
         category: MessageCategory::default(),
         multicast: false,
-        media_type: "".to_string(),
+        media_type: None,
         edit: EditAttribute::default(),
         bot_info: None,
         meta_info: MsgMetaInfo::default(),
@@ -6784,6 +6784,8 @@ async fn pkmsg_parse_error_dispatches_parsing_error_nack() {
         ciphertext: bytes::Bytes::from_static(&[0xFF]),
         enc_type: EncType::PreKeyMessage,
         padding_version: 2,
+        state: None,
+        session_type: None,
     };
 
     let outcome = client
@@ -6828,6 +6830,8 @@ async fn signal_message_parse_error_dispatches_parsing_error_nack() {
         ciphertext: bytes::Bytes::from_static(&[0xFF]),
         enc_type: EncType::Message,
         padding_version: 2,
+        state: None,
+        session_type: None,
     };
 
     let outcome = client
@@ -8856,6 +8860,204 @@ async fn enc_index_is_the_position_in_the_stanza_not_in_its_bucket() {
     assert_eq!(group, [2], "the skmsg is its third, not its first");
 }
 
+/// The `mediatype` is a property of the message, and a fan-out repeats the
+/// message once per device. The first `<enc>` that declares one settles it;
+/// a divergent later value is dropped rather than overwriting it.
+#[tokio::test]
+async fn fan_out_media_type_takes_the_first_enc_that_declares_one() {
+    use wacore::types::message::EncMediaType;
+
+    let (client, _transport) = capturing_client("fanout_mediatype").await;
+    let node = NodeBuilder::new("message")
+        .attr("from", "5511777776666@s.whatsapp.net")
+        .attr("id", "FANOUT_MEDIATYPE")
+        .attr("type", "media")
+        .children([
+            // No mediatype at all: the aggregation must not stop here.
+            NodeBuilder::new("enc")
+                .attr("type", "pkmsg")
+                .bytes(vec![0u8; 8])
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "msg")
+                .attr("mediatype", "image")
+                .bytes(vec![0u8; 8])
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "msg")
+                .attr("mediatype", "document")
+                .bytes(vec![0u8; 8])
+                .build(),
+        ])
+        .build();
+
+    let classified = client
+        .classify_incoming_message(&node_to_arc(node))
+        .await
+        .expect("a stanza with decryptable encs must classify");
+
+    assert_eq!(
+        classified.info.media_type,
+        Some(EncMediaType::Image),
+        "the first declared mediatype wins over a divergent sibling"
+    );
+}
+
+/// A `state` attribute belongs to the one `<enc>` that carried it, so it must
+/// not be smeared across the stanza's other nodes.
+#[tokio::test]
+async fn enc_state_and_session_type_stay_on_their_own_node() {
+    let (client, _transport) = capturing_client("enc_state").await;
+    let node = NodeBuilder::new("message")
+        .attr("from", "5511777776666@s.whatsapp.net")
+        .attr("id", "ENC_STATE")
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("enc")
+                .attr("type", "pkmsg")
+                .attr("state", "resumed")
+                .attr("session_type", "lid")
+                .bytes(vec![0u8; 8])
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "msg")
+                .bytes(vec![0u8; 8])
+                .build(),
+        ])
+        .build();
+
+    let classified = client
+        .classify_incoming_message(&node_to_arc(node))
+        .await
+        .expect("a stanza with decryptable encs must classify");
+
+    let states: Vec<_> = classified
+        .session_payloads
+        .iter()
+        .map(|payload| (payload.state.as_deref(), payload.session_type.as_deref()))
+        .collect();
+    assert_eq!(states, [(Some("resumed"), Some("lid")), (None, None)]);
+}
+
+/// Finds the `<meta mode>` of the first `<receipt type="retry">` on the wire.
+/// `Ok(None)` means a retry receipt went out carrying no `<meta>` at all.
+fn retry_receipt_meta_mode(frames: &[bytes::Bytes]) -> Result<Option<u64>, &'static str> {
+    for (i, frame) in frames.iter().enumerate() {
+        let Some(buf) = decode_frame(i, frame) else {
+            continue;
+        };
+        let Ok(node) = wacore_binary::marshal::unmarshal_packed_ref(&buf) else {
+            continue;
+        };
+        if node.tag.as_ref() != "receipt"
+            || node.get_attr("type").map(|v| v.as_str()).as_deref() != Some("retry")
+        {
+            continue;
+        }
+        return Ok(node
+            .get_optional_child("meta")
+            .map(|meta| meta.attrs().optional_u64("mode").unwrap_or_default()));
+    }
+    Err("no retry receipt reached the wire")
+}
+
+async fn enable_receipt_mode_bitmask(client: &Arc<Client>) {
+    let prop = wacore::iq::abprops::web::RECEIPT_MODE_BITMASK_ENABLED;
+    client.ab_props().watch(prop).await;
+    client
+        .ab_props()
+        .apply_props(false, std::iter::once((prop.code, "1".into())))
+        .await;
+}
+
+/// A retry for a stanza whose `<enc>` asked for its failure to be hidden
+/// reports the HID_FAILED_DECRYPT bit. Read as an integer off the wire, not
+/// compared as a string, so the bit position stays the thing under test.
+#[tokio::test]
+async fn retry_receipt_reports_the_hidden_decrypt_fail_bit() {
+    use crate::types::events::DecryptFailMode;
+    use wacore::protocol::retry::RECEIPT_MODE_HID_FAILED_DECRYPT;
+
+    let (client, transport) = capturing_client("retry_meta_hide").await;
+    enable_receipt_mode_bitmask(&client).await;
+    let info = create_test_message_info(
+        "5511999998888@s.whatsapp.net",
+        "RETRY_META_HIDE",
+        "5511777776666@s.whatsapp.net",
+    );
+
+    client
+        .send_retry_receipt(
+            &info,
+            1,
+            RetryReason::UnknownError,
+            false,
+            DecryptFailMode::Hide,
+        )
+        .await
+        .expect("the retry receipt should be sent");
+
+    assert_eq!(
+        retry_receipt_meta_mode(&transport.sent()),
+        Ok(Some(u64::from(RECEIPT_MODE_HID_FAILED_DECRYPT))),
+    );
+}
+
+/// The case that matters: an ordinary failure sets no bit, and an all-zero
+/// bitmask means the node is not built at all.
+#[tokio::test]
+async fn retry_receipt_without_hidden_failures_carries_no_meta() {
+    use crate::types::events::DecryptFailMode;
+
+    let (client, transport) = capturing_client("retry_meta_show").await;
+    enable_receipt_mode_bitmask(&client).await;
+    let info = create_test_message_info(
+        "5511999998888@s.whatsapp.net",
+        "RETRY_META_SHOW",
+        "5511777776666@s.whatsapp.net",
+    );
+
+    client
+        .send_retry_receipt(
+            &info,
+            1,
+            RetryReason::UnknownError,
+            false,
+            DecryptFailMode::Show,
+        )
+        .await
+        .expect("the retry receipt should be sent");
+
+    assert_eq!(retry_receipt_meta_mode(&transport.sent()), Ok(None));
+}
+
+/// With the prop off -- which is also what a cold props cache reads -- the
+/// receipt keeps its pre-bitmask shape even for a hidden failure.
+#[tokio::test]
+async fn retry_receipt_omits_meta_while_the_prop_is_off() {
+    use crate::types::events::DecryptFailMode;
+
+    let (client, transport) = capturing_client("retry_meta_gated").await;
+    let info = create_test_message_info(
+        "5511999998888@s.whatsapp.net",
+        "RETRY_META_GATED",
+        "5511777776666@s.whatsapp.net",
+    );
+
+    client
+        .send_retry_receipt(
+            &info,
+            1,
+            RetryReason::UnknownError,
+            false,
+            DecryptFailMode::Hide,
+        )
+        .await
+        .expect("the retry receipt should be sent");
+
+    assert_eq!(retry_receipt_meta_mode(&transport.sent()), Ok(None));
+}
+
 /// Unknown-only stanzas (e.g. msmsg) must be acked or they loop the queue.
 #[tokio::test]
 async fn unknown_only_enc_is_transport_acked() {
@@ -9126,7 +9328,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "AKS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", padded.clone(), 2, 0, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded.clone(), 2, 0, None, None, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -9150,7 +9352,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", padded, 2, 0, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, 0, None, None, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -9306,6 +9508,8 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
             MessageUtils::encode_and_pad(&request),
             2,
             0,
+            None,
+            None,
             &info,
         ),
     )
@@ -9330,6 +9534,8 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
             MessageUtils::encode_and_pad(&request),
             2,
             0,
+            None,
+            None,
             &info,
         ),
     )
@@ -9637,7 +9843,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "LMS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", padded.clone(), 2, 0, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded.clone(), 2, 0, None, None, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -9653,7 +9859,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", padded, 2, 0, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, 0, None, None, &Arc::new(info))
         .await
         .unwrap();
     assert_eq!(
@@ -13072,7 +13278,7 @@ async fn decrypted_payloads_are_not_forwarded_without_a_lease() {
         ..Default::default()
     });
     client
-        .handle_decrypted_plaintext("msg", padded, 2, 0, &info)
+        .handle_decrypted_plaintext("msg", padded, 2, 0, None, None, &info)
         .await
         .expect("decodes");
 
@@ -13104,7 +13310,15 @@ async fn a_lease_forwards_the_payload_before_it_is_decoded() {
     ));
 
     client
-        .handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&message), 2, 3, &info)
+        .handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&message),
+            2,
+            3,
+            None,
+            None,
+            &info,
+        )
         .await
         .expect("decodes");
 
@@ -13141,7 +13355,7 @@ async fn a_payload_that_fails_to_decode_is_still_forwarded() {
         "5510000@s.whatsapp.net",
     ));
     let outcome = client
-        .handle_decrypted_plaintext("msg", undecodable_payload(), 2, 0, &info)
+        .handle_decrypted_plaintext("msg", undecodable_payload(), 2, 0, None, None, &info)
         .await;
 
     assert!(outcome.is_err(), "the fixture must actually fail to decode");
@@ -13176,7 +13390,7 @@ async fn forwarding_stops_when_the_last_lease_drops() {
     let first = client.acquire_decrypted_payload_forwarding();
     let second = client.acquire_decrypted_payload_forwarding();
     client
-        .handle_decrypted_plaintext("msg", payload(), 2, 0, &info)
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, None, None, &info)
         .await
         .expect("decodes");
     assert!(events.try_recv().is_ok());
@@ -13184,14 +13398,14 @@ async fn forwarding_stops_when_the_last_lease_drops() {
     // One lease left: still on.
     drop(first);
     client
-        .handle_decrypted_plaintext("msg", payload(), 2, 0, &info)
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, None, None, &info)
         .await
         .expect("decodes");
     assert!(events.try_recv().is_ok(), "one lease still holds it open");
 
     drop(second);
     client
-        .handle_decrypted_plaintext("msg", payload(), 2, 0, &info)
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, None, None, &info)
         .await
         .expect("decodes");
     assert!(

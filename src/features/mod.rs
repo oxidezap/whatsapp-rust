@@ -69,11 +69,12 @@ pub use events::{EventCreationParams, EventResponseType, Events};
 
 pub use groups::{
     BatchGroupResult, CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
-    GroupEphemeralSettings, GroupError, GroupJoinError, GroupMetadata, GroupParticipant,
-    GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture, GroupSubject, Groups,
-    GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
-    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
-    ParticipantType, PictureType, PreviousDescription,
+    GroupEphemeralSettings, GroupError, GroupJoinError, GroupMessageReporter, GroupMetadata,
+    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture,
+    GroupSubject, Groups, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode,
+    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
+    ParticipantChangeResponse, ParticipantType, PictureType, PreviousDescription,
+    ReportedGroupMessage, ReportedGroupMessages,
 };
 
 pub use labels::Labels;

@@ -1513,6 +1513,8 @@ impl Client {
     ///   know which attempt this is. The sender may use this to decide whether to resend.
     /// * `reason` - The retry reason code (matches WhatsApp Web's RetryReason enum). This helps
     ///   the sender understand why the message couldn't be decrypted.
+    /// * `decrypt_fail_mode` - How the failing stanza asked its failures to be surfaced,
+    ///   reported back in the receipt's `<meta mode>` bitmask.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.send_receipt", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), retry = retry_count), err(Debug)))]
     pub(crate) async fn send_retry_receipt(
         &self,
@@ -1520,6 +1522,7 @@ impl Client {
         retry_count: u8,
         reason: RetryReason,
         force_include_keys: bool,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) -> Result<RetryReceiptSendOutcome, RetryRequestError> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 
@@ -1649,15 +1652,36 @@ impl Client {
             }
         }
 
+        // Only the bit this client can observe: the stanza carried an
+        // `<enc decrypt-fail="hide">`, so its failure was never shown. The node
+        // is built only when the bitmask is non-zero, and only while the prop
+        // that introduced it is on -- with a cold props cache the prop reads
+        // false and the receipt goes out in its pre-bitmask shape, which is
+        // what a server that never enabled the flag expects anyway.
+        let mode = if decrypt_fail_mode == crate::types::events::DecryptFailMode::Hide
+            && self
+                .ab_props()
+                .is_enabled(wacore::iq::abprops::web::RECEIPT_MODE_BITMASK_ENABLED)
+                .await
+        {
+            wacore::protocol::retry::RECEIPT_MODE_HID_FAILED_DECRYPT
+        } else {
+            0
+        };
+        let meta_node = wacore::protocol::retry::build_receipt_meta_node(mode);
+
         // Build the final child list after the policy has decided whether this
         // request carries key material.
-        let receipt_node = if let Some(keys) = keys_node {
-            builder
-                .children([retry_node, registration_node, keys])
-                .build()
-        } else {
-            builder.children([retry_node, registration_node]).build()
-        };
+        let mut children = Vec::with_capacity(4);
+        children.push(retry_node);
+        children.push(registration_node);
+        if let Some(keys) = keys_node {
+            children.push(keys);
+        }
+        if let Some(meta) = meta_node {
+            children.push(meta);
+        }
+        let receipt_node = builder.children(children).build();
 
         drop(device_snapshot);
         self.send_node(receipt_node).await?;

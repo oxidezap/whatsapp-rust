@@ -470,7 +470,9 @@ impl NackSource for MessageInfo {
     }
 
     fn stanza_type(&self) -> Option<NodeValue> {
-        (!self.r#type.is_empty()).then(|| NodeValue::from(&self.r#type))
+        self.r#type
+            .as_ref()
+            .map(|stanza_type| NodeValue::from(stanza_type.as_str()))
     }
 }
 
@@ -1815,7 +1817,7 @@ mod tests {
     #[test]
     fn nack_includes_type_when_present() {
         let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
-        info.r#type = "text".to_string();
+        info.r#type = Some(wacore::types::message::StanzaMessageType::Text);
         let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None)
             .expect("valid message should produce a nack");
         assert_eq!(
@@ -1825,9 +1827,9 @@ mod tests {
     }
 
     #[test]
-    fn nack_omits_type_when_empty() {
+    fn nack_omits_type_when_absent() {
         let mut info = info_with("12345@s.whatsapp.net", "12345@s.whatsapp.net", false);
-        info.r#type = String::new();
+        info.r#type = None;
         let node = build_nack_node(&info, &own_pn(), NackReason::ParsingError, None)
             .expect("valid message should produce a nack");
         assert!(node.attrs.get("type").is_none());

@@ -3518,10 +3518,292 @@ impl IqSpec for GetGroupProfilePicturesIq {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Report-to-admin IQ Specs
+// ---------------------------------------------------------------------------
+
+/// One account that reported a message to a group's admins.
+///
+/// The identity attributes are a mixin the server may attach to the same node,
+/// so a `<reporter>` addressed by LID can also carry the reporter's phone
+/// number and username. Both are absent as often as not, and neither is
+/// verified here beyond parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMessageReporter {
+    /// The reporting account, in whatever addressing the response declares.
+    pub jid: Jid,
+    /// When the report was filed, in seconds since the Unix epoch.
+    pub timestamp: u64,
+    /// The reporter's phone-number JID, when the identity mixin carries one.
+    pub phone_number: Option<Jid>,
+    /// The reporter's username, when the identity mixin carries one.
+    pub username: Option<String>,
+}
+
+/// One reported message and everyone who reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedGroupMessage {
+    /// The reported message's stanza id. Nothing guarantees this device holds
+    /// the message it names.
+    pub message_id: String,
+    pub reporters: Vec<GroupMessageReporter>,
+}
+
+/// The outstanding reports an admin can see for a group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedGroupMessages {
+    /// The addressing the server used for the JIDs in this response, when it
+    /// declared one.
+    pub addressing_mode: Option<AddressingMode>,
+    pub reports: Vec<ReportedGroupMessage>,
+}
+
+/// Report messages to a group's admins.
+///
+/// Distinct from the `spam` IQ in [`crate::iq::spam_report`], which reports to
+/// WhatsApp: this one stays inside the group and is what the group's own
+/// `allow_admin_reports` property gates (see [`SetAllowAdminReportsIq`]).
+///
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{group_jid}">
+///   <reports><report message_id="{id}"/></reports>
+/// </iq>
+/// ```
+///
+/// The server answers an empty result, so nothing here reports which of the
+/// listed ids it accepted. A refusal arrives as an IQ error instead: 403
+/// (`forbidden`) for a group that does not allow admin reports or a sender who
+/// may not report in it, 429 (`rate-overlimit`) for too many reports in
+/// sequence, 404 (`item-not-found`) for an unknown group or message, 423
+/// (`locked`) for a locked group, 400 (`bad-request`) for a malformed list.
+#[derive(Debug, Clone)]
+pub struct ReportGroupMessagesIq {
+    pub group_jid: Jid,
+    pub message_ids: Vec<String>,
+}
+
+impl ReportGroupMessagesIq {
+    pub fn new(group_jid: &Jid, message_ids: &[String]) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            message_ids: message_ids.to_vec(),
+        }
+    }
+}
+
+impl IqSpec for ReportGroupMessagesIq {
+    type Response = ();
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let reports = NodeBuilder::new("reports")
+            .children(self.message_ids.iter().map(|id| {
+                NodeBuilder::new("report")
+                    .attr("message_id", id.as_str())
+                    .build()
+            }))
+            .build();
+
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![reports])),
+        )
+    }
+
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+        Ok(())
+    }
+}
+
+/// Fetch the messages already reported to a group's admins.
+///
+/// ```xml
+/// <iq type="get" xmlns="w:g2" to="{group_jid}"><reports/></iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct GetReportedGroupMessagesIq {
+    pub group_jid: Jid,
+}
+
+impl GetReportedGroupMessagesIq {
+    pub fn new(group_jid: &Jid) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+        }
+    }
+}
+
+impl IqSpec for GetReportedGroupMessagesIq {
+    type Response = ReportedGroupMessages;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::get_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("reports").build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        let addressing_mode = response
+            .attrs()
+            .optional_string("addressing_mode")
+            .and_then(|s| AddressingMode::try_from(s.as_ref()).ok());
+
+        let reports_node = required_child(response, "reports")?;
+        let mut reports = Vec::new();
+        for report in reports_node.get_children_by_tag("report") {
+            let message_id = required_attr(report, "message_id")?;
+            let mut reporters = Vec::new();
+            for reporter in report.get_children_by_tag("reporter") {
+                let mut attrs = reporter.attrs();
+                let jid = attrs
+                    .optional_jid("jid")
+                    .ok_or_else(|| anyhow!("reporter of {message_id} has no jid"))?;
+                let timestamp = attrs
+                    .optional_u64("timestamp")
+                    .ok_or_else(|| anyhow!("reporter of {message_id} has no timestamp"))?;
+                reporters.push(GroupMessageReporter {
+                    jid,
+                    timestamp,
+                    phone_number: attrs.optional_jid("phone_number"),
+                    username: attrs.optional_string("username").map(|s| s.into_owned()),
+                });
+            }
+            reports.push(ReportedGroupMessage {
+                message_id,
+                reporters,
+            });
+        }
+
+        Ok(ReportedGroupMessages {
+            addressing_mode,
+            reports,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::request::InfoQueryType;
+
+    #[test]
+    fn report_messages_iq_matches_the_group_report_shape() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let iq = ReportGroupMessagesIq::new(&jid, &["MSG-AAA".to_string(), "MSG-BBB".to_string()])
+            .build_iq();
+
+        assert_eq!(iq.namespace, GROUP_IQ_NAMESPACE);
+        assert_eq!(iq.query_type, InfoQueryType::Set);
+        assert_eq!(iq.to, jid, "a group report is addressed to the group");
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].tag, "reports");
+        let Some(NodeContent::Nodes(reports)) = &nodes[0].content else {
+            panic!("expected <report> children");
+        };
+        let ids: Vec<_> = reports
+            .iter()
+            .map(|report| {
+                assert_eq!(report.tag, "report");
+                report.attrs.get("message_id").expect("message_id").as_str()
+            })
+            .collect();
+        assert_eq!(ids, ["MSG-AAA", "MSG-BBB"]);
+    }
+
+    #[test]
+    fn get_reported_messages_iq_is_an_empty_reports_get() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let iq = GetReportedGroupMessagesIq::new(&jid).build_iq();
+
+        assert_eq!(iq.namespace, GROUP_IQ_NAMESPACE);
+        assert_eq!(iq.query_type, InfoQueryType::Get);
+        assert_eq!(iq.to, jid);
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].tag, "reports");
+        assert!(nodes[0].content.is_none(), "the get carries no children");
+    }
+
+    #[test]
+    fn reported_messages_response_parses_repeats_and_the_identity_mixin() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let spec = GetReportedGroupMessagesIq::new(&jid);
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("addressing_mode", "lid")
+            .children([NodeBuilder::new("reports")
+                .children([
+                    NodeBuilder::new("report")
+                        .attr("message_id", "MSG-AAA")
+                        .children([
+                            NodeBuilder::new("reporter")
+                                .attr("jid", "100000000000001@lid")
+                                .attr("timestamp", "1777415965")
+                                .attr("phone_number", "559980000001@s.whatsapp.net")
+                                .attr("username", "reporter.one")
+                                .build(),
+                            NodeBuilder::new("reporter")
+                                .attr("jid", "100000000000002@lid")
+                                .attr("timestamp", "1777415999")
+                                .build(),
+                        ])
+                        .build(),
+                    NodeBuilder::new("report")
+                        .attr("message_id", "MSG-BBB")
+                        .children([NodeBuilder::new("reporter")
+                            .attr("jid", "100000000000003@lid")
+                            .attr("timestamp", "1777416100")
+                            .build()])
+                        .build(),
+                ])
+                .build()])
+            .build();
+
+        let parsed = spec
+            .parse_response(&response.as_node_ref())
+            .expect("a well-formed reports response should parse");
+
+        assert_eq!(parsed.addressing_mode, Some(AddressingMode::Lid));
+        assert_eq!(parsed.reports.len(), 2);
+        assert_eq!(parsed.reports[0].message_id, "MSG-AAA");
+        assert_eq!(parsed.reports[0].reporters.len(), 2);
+
+        let first = &parsed.reports[0].reporters[0];
+        assert_eq!(first.jid.user, "100000000000001");
+        assert_eq!(first.timestamp, 1_777_415_965);
+        assert_eq!(
+            first.phone_number.as_ref().map(|pn| pn.user.as_str()),
+            Some("559980000001"),
+            "the identity mixin is the LID to PN mapping this response carries"
+        );
+        assert_eq!(first.username.as_deref(), Some("reporter.one"));
+
+        let second = &parsed.reports[0].reporters[1];
+        assert_eq!(second.phone_number, None);
+        assert_eq!(second.username, None);
+
+        assert_eq!(parsed.reports[1].message_id, "MSG-BBB");
+        assert_eq!(parsed.reports[1].reporters.len(), 1);
+    }
+
+    #[test]
+    fn reported_messages_response_without_reports_is_rejected() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let spec = GetReportedGroupMessagesIq::new(&jid);
+        let response = NodeBuilder::new("iq").attr("type", "result").build();
+        assert!(spec.parse_response(&response.as_node_ref()).is_err());
+    }
 
     #[test]
     fn group_query_iq_with_phash_emits_attr() {

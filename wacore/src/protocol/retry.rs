@@ -161,6 +161,30 @@ pub fn should_drop_unknown_device_retry(keys_present: bool, device_known: bool) 
     !keys_present && !device_known
 }
 
+/// The `HID_FAILED_DECRYPT` bit of a receipt's `<meta mode>` bitmask.
+///
+/// WA Web's receipt mode is a set of bit *positions*, not values; this is
+/// position 2 already shifted. It says the failure that prompted the receipt
+/// came from an `<enc decrypt-fail="hide">`, so the sender knows the receiver
+/// showed the user nothing for it.
+///
+/// The other two positions WA Web defines (`ORPHAN`, `NO_CHECKMARK_UX`) name
+/// states this client does not model, so it never sets them.
+pub const RECEIPT_MODE_HID_FAILED_DECRYPT: u32 = 1 << 2;
+
+/// The `<meta mode="…">` child of a receipt, or `None` when no bit is set.
+///
+/// An all-zero bitmask carries nothing the server does not already assume, and
+/// WA Web omits the node rather than sending a zero, so the empty case is
+/// `None` instead of `<meta mode="0"/>`.
+pub fn build_receipt_meta_node(mode: u32) -> Option<Node> {
+    (mode != 0).then(|| {
+        NodeBuilder::new("meta")
+            .attr("mode", mode.to_string())
+            .build()
+    })
+}
+
 /// Builds the `<keys>` bundle embedded in a retry receipt (type, identity, one-time prekey,
 /// signed prekey, device identity) so a peer can re-establish the Signal session.
 ///

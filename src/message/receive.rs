@@ -128,7 +128,7 @@ impl Client {
         node: &OwnedNodeRef,
     ) -> Option<ClassifiedMessage> {
         let nr = node.get();
-        let info = match self.parse_message_info(nr).await {
+        let mut info = match self.parse_message_info(nr).await {
             Ok(info) => Arc::new(info),
             Err(e) => {
                 let id = nr.get_attr("id").map(|v| v.as_str());
@@ -244,6 +244,7 @@ impl Client {
         let mut has_hide_fail = false;
         let mut had_unknown_enc = false;
         let mut had_custom_handler = false;
+        let mut media_type: Option<crate::types::message::EncMediaType> = None;
 
         // Custom enc handlers are set once at Bot::build and immutable after, so
         // read the map lock-free once instead of acquiring an async RwLock guard
@@ -252,6 +253,18 @@ impl Client {
 
         for (enc_index, enc_node) in all_enc_nodes.iter().enumerate() {
             max_sender_retry_count = max_sender_retry_count.max(sender_retry_count(enc_node));
+
+            // The declared media type belongs to the message, not to a device
+            // copy, so the first `<enc>` carrying one settles it for the whole
+            // stanza and a divergent later value is dropped. Read here rather
+            // than in the parser so the fan-out nodes under
+            // <participants><to> count too, and so the stanza's children are
+            // walked once.
+            if media_type.is_none()
+                && let Some(value) = enc_node.attrs().optional_string("mediatype")
+            {
+                media_type = Some(crate::types::message::EncMediaType::from(value.as_ref()));
+            }
 
             // Parse decrypt-fail attribute (WA Web: e.maybeAttrString("decrypt-fail") === "hide")
             if enc_node
@@ -342,6 +355,15 @@ impl Client {
                 &mut group_payloads
             };
             push_enc_payload(bucket, all_enc_nodes.len(), payload);
+        }
+
+        // The media type is only known once the `<enc>` nodes have been walked,
+        // and the parser that built `info` never saw them. Nothing has cloned
+        // this Arc on the path every message takes, so finishing the struct
+        // here costs a refcount check; the failure paths that did clone it pay
+        // one copy rather than leaving the field unset.
+        if let Some(media_type) = media_type {
+            Arc::make_mut(&mut info).media_type = Some(media_type);
         }
 
         // WA Web diagnostic: validate skmsg is not first in multi-enc messages.
@@ -721,6 +743,8 @@ impl Client {
                 enc_type,
                 padding_version,
                 enc_index,
+                state,
+                session_type,
             } = payload;
             let enc_type_str = enc_type.as_wire_str();
             #[cfg(feature = "tracing")]
@@ -851,6 +875,8 @@ impl Client {
                         plaintext: decrypted.plaintext,
                         padding_version,
                         enc_index,
+                        state: state.clone(),
+                        session_type: session_type.clone(),
                     });
                 }
                 Err(e) => {
@@ -974,6 +1000,8 @@ impl Client {
                                     plaintext: decrypted.plaintext,
                                     padding_version,
                                     enc_index,
+                                    state: state.clone(),
+                                    session_type: session_type.clone(),
                                 });
                             }
                             Err(retry_err) => {
@@ -1005,6 +1033,8 @@ impl Client {
                                             enc_type,
                                             padding_version,
                                             enc_index,
+                                            state.as_deref(),
+                                            session_type.as_deref(),
                                             info,
                                             &session_mutex,
                                             &mut session_guard,
@@ -1122,6 +1152,8 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
+                                state.as_deref(),
+                                session_type.as_deref(),
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1176,6 +1208,8 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
+                                state.as_deref(),
+                                session_type.as_deref(),
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1248,6 +1282,8 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
+                                state.as_deref(),
+                                session_type.as_deref(),
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1362,10 +1398,20 @@ impl Client {
             plaintext,
             padding_version,
             enc_index,
+            state,
+            session_type,
         } in deferred
         {
             match self
-                .handle_decrypted_plaintext(enc_type, plaintext, padding_version, enc_index, info)
+                .handle_decrypted_plaintext(
+                    enc_type,
+                    plaintext,
+                    padding_version,
+                    enc_index,
+                    state.as_deref(),
+                    session_type.as_deref(),
+                    info,
+                )
                 .await
             {
                 Ok(plaintext_outcome) => {
@@ -1468,6 +1514,8 @@ impl Client {
                             padded_plaintext,
                             padding_version,
                             enc_index,
+                            payload.state.as_deref(),
+                            payload.session_type.as_deref(),
                             info,
                         )
                         .await
@@ -1658,6 +1706,8 @@ impl Client {
         padded_plaintext: Vec<u8>,
         padding_version: u8,
         enc_index: usize,
+        enc_state: Option<&str>,
+        enc_session_type: Option<&str>,
         info: &Arc<MessageInfo>,
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
         let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)?;
@@ -1671,6 +1721,8 @@ impl Client {
                     .info(Arc::clone(info))
                     .enc_index(enc_index)
                     .enc_type(enc_type)
+                    .maybe_state(enc_state.map(str::to_owned))
+                    .maybe_session_type(enc_session_type.map(str::to_owned))
                     .payload(source.clone())
                     .build(),
             ));
@@ -1867,6 +1919,8 @@ impl Client {
         enc_type: &'static str,
         padding_version: u8,
         enc_index: usize,
+        enc_state: Option<&str>,
+        enc_session_type: Option<&str>,
         info: &Arc<MessageInfo>,
         session_mutex: &Arc<async_lock::Mutex<()>>,
         session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
@@ -1927,6 +1981,8 @@ impl Client {
                     plaintext: decrypted.plaintext,
                     padding_version,
                     enc_index,
+                    state: enc_state.map(str::to_owned),
+                    session_type: enc_session_type.map(str::to_owned),
                 });
                 MigrationDecryptResult::Decrypted
             }
@@ -2011,6 +2067,8 @@ mod enc_bucket_tests {
             ciphertext: bytes::Bytes::from_static(b"ct"),
             enc_type,
             padding_version: 2,
+            state: None,
+            session_type: None,
         }
     }
 

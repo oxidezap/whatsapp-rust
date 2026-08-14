@@ -223,7 +223,9 @@ impl Client {
             }
             // Only ack once the resend request is actually out; otherwise leave
             // the stanza queued so the server redelivers and we retry.
-            let resend_sent = client.run_retry_receipt(&info, reason).await;
+            let resend_sent = client
+                .run_retry_receipt(&info, reason, decrypt_fail_mode)
+                .await;
             if resend_sent {
                 client.send_transport_ack(&info).await;
             }
@@ -337,7 +339,9 @@ impl Client {
         let client = Arc::clone(self);
         let info = Arc::clone(info);
         self.outbound_flush.spawn(&*self.runtime, async move {
-            client.run_retry_receipt(&info, reason).await;
+            client
+                .run_retry_receipt(&info, reason, crate::types::events::DecryptFailMode::Show)
+                .await;
         });
     }
 
@@ -384,7 +388,13 @@ impl Client {
         }
 
         let send_result = self
-            .send_retry_receipt(info, retry_count, reason, options.force_include_keys())
+            .send_retry_receipt(
+                info,
+                retry_count,
+                reason,
+                options.force_include_keys(),
+                options.decrypt_fail_mode(),
+            )
             .await;
 
         // PDO is an independent first-attempt recovery path. Preserve it even
@@ -434,11 +444,14 @@ impl Client {
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         reason: RetryReason,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) -> bool {
         match self
             .request_retry_for_info(
                 info,
-                crate::features::RetryRequestOptions::new().with_reason(reason),
+                crate::features::RetryRequestOptions::new()
+                    .with_reason(reason)
+                    .with_decrypt_fail_mode(decrypt_fail_mode),
                 None,
             )
             .await
