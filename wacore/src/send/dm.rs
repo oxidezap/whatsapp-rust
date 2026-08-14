@@ -79,6 +79,7 @@ impl PartitionedDmDevices {
 /// thing to the caller: nothing reached the recipient, and the device list is
 /// the suspect, so a retry is worth making with a forced device refresh.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum NoRecipientDeviceError {
     /// Every device resolved for the recipient failed to encrypt. `source` is
     /// the first of those failures (missing session, refused pre-key bundle).
