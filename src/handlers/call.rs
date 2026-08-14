@@ -849,7 +849,14 @@ impl StanzaHandler for CallHandler {
                                             call_creator: call.action.call_creator(),
                                             state: VideoState::UpgradeAccept,
                                             dec: Some("H264,AV1"),
-                                            device_orientation: Some(0),
+                                            // Ours, not the peer's: accepting an
+                                            // upgrade announces a direction, so it
+                                            // carries the rotation the app set.
+                                            device_orientation: Some(
+                                                registry
+                                                    .local_video_orientation(call_id, generation)
+                                                    .unwrap_or(0),
+                                            ),
                                         });
                                         if let Err(e) = client.send_node(accept).await {
                                             warn!(
@@ -866,7 +873,11 @@ impl StanzaHandler for CallHandler {
                                             call_creator: call.action.call_creator(),
                                             state: VideoState::Enabled,
                                             dec: Some("H264"),
-                                            device_orientation: Some(0),
+                                            device_orientation: Some(
+                                                registry
+                                                    .local_video_orientation(call_id, generation)
+                                                    .unwrap_or(0),
+                                            ),
                                         });
                                         if let Err(e) = client.send_node(enabled).await {
                                             warn!(

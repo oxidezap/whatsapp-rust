@@ -71,6 +71,17 @@ pub enum PeerVideoTransition {
 struct VideoNegotiation {
     self_state: VideoState,
     peer_state: VideoState,
+    /// The rotation this side announces, as `<video device_orientation>`, in
+    /// `0..=3`.
+    ///
+    /// Ours, not the peer's: theirs arrives on their `<video>` and travels the
+    /// other way, into `Engine::set_peer_video_orientation`, where it stamps the
+    /// frames they send. The two are independent facts about two devices.
+    ///
+    /// Kept with the negotiation rather than beside the media plane because
+    /// every `<video>` has to carry it, and the ones the inbound handler sends
+    /// when it accepts the peer's upgrade never touch a plane.
+    self_orientation: u8,
     peer_request_epoch: u64,
     pending_peer_request: Option<u64>,
     self_request_epoch: u64,
@@ -87,6 +98,7 @@ impl VideoNegotiation {
         Self {
             self_state: state,
             peer_state: state,
+            self_orientation: 0,
             peer_request_epoch: 0,
             pending_peer_request: None,
             self_request_epoch: 0,
@@ -2350,6 +2362,38 @@ impl CallRegistry {
             .get(call_id)
             .filter(|entry| entry.generation == generation)
             .map(|entry| (entry.video.self_state, entry.video.peer_state))
+    }
+
+    /// The rotation this side announces on `<video>`, or `None` when the call is
+    /// gone. Always in `0..=3`.
+    pub fn local_video_orientation(&self, call_id: &str, generation: u64) -> Option<u8> {
+        self.active_calls()
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.video.self_orientation)
+    }
+
+    /// Record the rotation to announce, rejecting a value the wire has no room
+    /// for rather than folding it into range: `4` is a caller that counted
+    /// something other than quarter turns, and answering it with `0` would turn
+    /// that into an upright picture that stays wrong for the rest of the call.
+    ///
+    /// `false` when the value is out of range or the call is gone — the two the
+    /// caller has to tell apart anyway, and it knows which it asked about.
+    pub fn set_local_video_orientation(
+        &self,
+        call_id: &str,
+        generation: u64,
+        orientation: u8,
+    ) -> bool {
+        if orientation > 3 {
+            return false;
+        }
+        self.active_calls()
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.video.self_orientation = orientation)
+            .is_some()
     }
 
     /// Send a mid-call video-plane command to the current drive loop.
