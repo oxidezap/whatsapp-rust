@@ -71,17 +71,6 @@ pub enum PeerVideoTransition {
 struct VideoNegotiation {
     self_state: VideoState,
     peer_state: VideoState,
-    /// The rotation this side announces, as `<video device_orientation>`, in
-    /// `0..=3`.
-    ///
-    /// Ours, not the peer's: theirs arrives on their `<video>` and travels the
-    /// other way, into `Engine::set_peer_video_orientation`, where it stamps the
-    /// frames they send. The two are independent facts about two devices.
-    ///
-    /// Kept with the negotiation rather than beside the media plane because
-    /// every `<video>` has to carry it, and the ones the inbound handler sends
-    /// when it accepts the peer's upgrade never touch a plane.
-    self_orientation: u8,
     peer_request_epoch: u64,
     pending_peer_request: Option<u64>,
     self_request_epoch: u64,
@@ -98,7 +87,6 @@ impl VideoNegotiation {
         Self {
             self_state: state,
             peer_state: state,
-            self_orientation: 0,
             peer_request_epoch: 0,
             pending_peer_request: None,
             self_request_epoch: 0,
@@ -270,6 +258,19 @@ struct CallEntry {
     /// Wakes a pending call-link media builder on admission, replacement, or terminal teardown.
     group_update_event: Arc<event_listener::Event>,
     video: VideoNegotiation,
+    /// The rotation this side announces, as `<video device_orientation>`, in
+    /// `0..=3`.
+    ///
+    /// Ours, not the peer's: theirs arrives on their `<video>` and travels the
+    /// other way, into `Engine::set_peer_video_orientation`, where it stamps the
+    /// frames they send. The two are independent facts about two devices.
+    ///
+    /// Beside the negotiation rather than inside it, because a camera does not
+    /// un-rotate when a negotiation restarts: six paths rebuild
+    /// `VideoNegotiation` (a group downgrade, a re-offer, glare), and a rotation
+    /// has to survive all of them or the next `<video>` announces a camera that
+    /// is not the one pointing at the user.
+    self_video_orientation: u8,
     /// Explicit group identity exists before the first authoritative roster arrives.
     is_group_call: bool,
     /// This generation originated from a reusable call-link join and may accept waiting-room state.
@@ -1422,6 +1423,9 @@ impl CallRegistry {
             state
         });
         CallEntry {
+            // A fresh call starts upright; the app announces a rotation when it
+            // has one, and it then outlives every negotiation rebuild.
+            self_video_orientation: 0,
             session,
             media_task: None,
             waiting_room_task: None,
@@ -2370,7 +2374,7 @@ impl CallRegistry {
         self.active_calls()
             .get(call_id)
             .filter(|entry| entry.generation == generation)
-            .map(|entry| entry.video.self_orientation)
+            .map(|entry| entry.self_video_orientation)
     }
 
     /// Record the rotation to announce, rejecting a value the wire has no room
@@ -2392,7 +2396,7 @@ impl CallRegistry {
         self.active_calls()
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
-            .map(|entry| entry.video.self_orientation = orientation)
+            .map(|entry| entry.self_video_orientation = orientation)
             .is_some()
     }
 

@@ -3238,6 +3238,7 @@ impl CallHandle {
             target_devices: &devices,
             participants: &participants,
             video,
+            device_orientation: self.local_video_orientation(),
         })
         .map_err(|error| CallError::Response(error.to_string()))?;
         self.ensure_current()?;
@@ -3387,18 +3388,36 @@ impl CallHandle {
     /// applied to the frames they send. The two are independent, and this sets
     /// neither of the other's.
     ///
+    /// The stanzas that open a call — offer, accept, preaccept, a call-link join
+    /// — announce upright, because they are built before this handle exists and
+    /// nothing could have set a rotation for them. An app that starts rotated
+    /// calls this once the handle is in hand, and the `<video>` it sends is what
+    /// corrects the peer.
+    ///
     /// `Err` when the call is over, when the value is out of range, or when the
     /// stanza could not be sent. A value rejected for range is not stored.
     pub async fn set_video_orientation(&self, orientation: u8) -> Result<(), CallError> {
         self.ensure_current()?;
-        // Range first, so the two ways this can fail stay distinguishable: the
-        // registry refuses an out-of-range value and a call that is gone with the
-        // same `false`, and the caller needs to know which it hit.
+        // Range first: rejecting it costs nothing and does not need the lock.
         if orientation > 3 {
             return Err(CallError::Media(
                 "video orientation must be quarter turns in 0..=3",
             ));
         }
+
+        // Store and announce under the same lock the state transitions take. Two
+        // handles rotating at once would otherwise interleave — one storing `1`
+        // and pausing while the other stores and sends `2` — and the first would
+        // then send its stale `1`, leaving the peer at a rotation the registry
+        // does not record. The lock also keeps a rotation from putting a
+        // `state=1` on the wire after `stop_video`'s `state=6`.
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
+
         if !self.client_registry.set_local_video_orientation(
             &self.call_id,
             self.generation,
@@ -3407,20 +3426,8 @@ impl CallHandle {
             return Err(CallError::Media("call no longer active"));
         }
 
-        // Under the same lock the state transitions take: without it a rotation
-        // racing `stop_video` can put a `state=1` on the wire after the
-        // `state=6`, and the peer would keep a torn-down direction enabled.
-        let transition_lock = self
-            .client_registry
-            .video_transition_lock(&self.call_id, self.generation)
-            .ok_or(CallError::Media("call no longer active"))?;
-        let _transition_guard = transition_lock.lock().await;
-        self.ensure_current()?;
-
         // Nothing to announce until there is a direction to announce it for. The
         // value is kept either way, so the stanza that enables video carries it.
-        // Read under the lock, so it cannot go stale between the check and the
-        // send.
         let sending_video = self
             .client_registry
             .video_states(&self.call_id, self.generation)
@@ -3437,7 +3444,9 @@ impl CallHandle {
             call_creator: &self.call_creator,
             state: VideoState::Enabled,
             dec: Some(VIDEO_DEC_REQUEST),
-            device_orientation: Some(orientation),
+            // Read back rather than reusing the argument: under the lock they
+            // agree, and reading makes that the invariant rather than a habit.
+            device_orientation: Some(self.local_video_orientation()),
         });
         client.send_node(stanza).await?;
         Ok(())
@@ -8263,6 +8272,45 @@ mod tests {
         assert_eq!(
             ar.attrs().optional_string("device_orientation").as_deref(),
             Some("1")
+        );
+        handle.hangup().await;
+    }
+
+    /// A camera does not un-rotate because a negotiation restarted. Six paths
+    /// rebuild `VideoNegotiation` — a group downgrade among them — and a rotation
+    /// stored before one of them has to still be there for the `<video>` that
+    /// starts video again.
+    #[tokio::test]
+    async fn a_rotation_survives_a_video_negotiation_rebuild() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        handle.set_video_orientation(3).await.expect("rotate");
+        handle.stop_video().await.expect("stop_video");
+
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation("CID-FACADE", handle.generation),
+            Some(3),
+            "the device is still rotated, whatever the negotiation did"
+        );
+
+        let (vsrc, vsink) = video_endpoints();
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.start_video(vsrc, vsink).await.expect("restart");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("restart must be sent")
+            .expect("waiter");
+        assert_eq!(
+            call_action_of(&node)
+                .as_node_ref()
+                .attrs()
+                .optional_string("device_orientation")
+                .as_deref(),
+            Some("3"),
+            "restarting video must announce the rotation still in force"
         );
         handle.hangup().await;
     }
