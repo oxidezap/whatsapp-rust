@@ -286,7 +286,7 @@ fn validate_retry_prekey_presence(
 }
 
 // No retry_count in the key: concurrent receipts for the same participant must
-// serialize, otherwise two update_local_signal_session calls race on session state.
+// serialize, otherwise two session-repair calls race on session state.
 fn build_retry_processing_key(chat: &Jid, message_id: &str, participant_jid: &Jid) -> String {
     let mut key = String::with_capacity(message_id.len() + 64);
     chat.push_to(&mut key);
@@ -425,7 +425,7 @@ impl Client {
     /// `HIGH_RETRY_COUNT` (the `MAX_RETRY_COUNT` refusal), `MESSAGE_EXPIRED` /
     /// `RECORD_MISSING` (the recent-message cache miss), and `DEVICE_NOT_IN_DATABASE`
     /// (`should_drop_unknown_device_retry`); identity changes are handled during
-    /// repair (reg-id mismatch + base-key collision in `update_local_signal_session`).
+    /// repair (reg-id mismatch + base-key collision in `reconcile_retry_session`).
     /// `ALREADY_DELIVERED` and `DEVICE_NOT_RECIPIENT` need a per-(message, device)
     /// receipt store we do not keep, so they are a known parity gap, not enforced here.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.handle_receipt", level = "debug", skip_all, fields(chat = %receipt.source.chat.observe(), sender = %receipt.source.sender.observe(), count = tracing::field::Empty), err(Debug)))]
@@ -585,9 +585,9 @@ impl Client {
             self.mark_requester_for_fresh_skdm(&info, &jid).await;
             // The receipt's own bundle is the only recovery for a device the
             // server has no prekeys for, so it cannot wait behind the message
-            // lookup. DM repairs after it: the stored message settles its namespace.
+            // lookup. DM installs after it: the stored message settles its namespace.
             if !self
-                .update_local_signal_session(&info, &jid, &message_id, retry_count, nr, is_peer)
+                .install_retry_key_bundle(&info, &jid, nr, is_peer)
                 .await
             {
                 return Ok(());
@@ -725,22 +725,18 @@ impl Client {
                 .await;
         }
 
-        // DM only: the sender-key routes repaired before the lookup. Both stay
-        // ahead of ensureE2ESessions, so a session deleted here is rebuilt there.
+        // DM only: the sender-key routes installed before the lookup.
         if !uses_sender_key
             && !self
-                .update_local_signal_session(
-                    &info,
-                    &resolved_jid,
-                    &message_id,
-                    retry_count,
-                    nr,
-                    is_peer,
-                )
+                .install_retry_key_bundle(&info, &resolved_jid, nr, is_peer)
                 .await
         {
             return Ok(());
         }
+        // Every route reconciles here, behind the lookup: these steps delete
+        // sessions and write message-keyed rows that only the resend undoes.
+        self.reconcile_retry_session(&resolved_jid, &message_id, retry_count, nr)
+            .await;
 
         // Whatsmeow parity (`retry.go:284`). WA Web's regId/base-key check
         // doesn't catch silently-diverged sessions; this fallback does.
@@ -1045,100 +1041,111 @@ impl Client {
         }
     }
 
-    /// Mirrors WAWebUpdateLocalSignalSession (`WAWeb/Update/LocalSignalSession.js`)
-    /// from its `processKeyBundle` step on; the preceding `markForgetSenderKey` is
-    /// hoisted into `mark_requester_for_fresh_skdm`. Runs before ensureE2ESessions
-    /// and sendRetry for all chat types (DM, group, status); the sender-key routes
-    /// call it before the recent-message lookup too. Order and semantics
-    /// follow the WA Web implementation:
+    /// Step 1 of WAWebUpdateLocalSignalSession: install the bundle the receipt
+    /// carries. Purely additive and free of network I/O, since the `<keys>` are
+    /// already in hand, which is what lets the sender-key routes run it before
+    /// the recent-message lookup. Returns false when a bundle was present and
+    /// rejected, which aborts the retry.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.install_key_bundle", level = "debug", skip_all, fields(chat = %info.chat.observe(), peer = %resolved_jid.observe())))]
+    async fn install_retry_key_bundle(
+        &self,
+        info: &RetryChatInfo,
+        resolved_jid: &Jid,
+        node: &NodeRef<'_>,
+        is_peer: bool,
+    ) -> bool {
+        // Previously gated behind `!is_status_broadcast()`; WA Web (L51) runs it
+        // unconditionally.
+        let Err(error) = self
+            .process_retry_key_bundle(node, resolved_jid, is_peer, info.is_fbid_bot_retry)
+            .await
+        else {
+            return true;
+        };
+
+        if node.get_optional_child("keys").is_none() {
+            // The happy path for a peer retry without a re-key: no bundle to
+            // install, and the reg-ID branch of the reconcile below handles it.
+            log::debug!(
+                "No key bundle in retry receipt for {}: {error}",
+                resolved_jid.observe()
+            );
+            return true;
+        }
+
+        log::warn!(
+            "Key bundle present but rejected for {}: {error} — aborting retry resend",
+            resolved_jid.observe()
+        );
+        false
+    }
+
+    /// The rest of WAWebUpdateLocalSignalSession
+    /// (`WAWeb/Update/LocalSignalSession.js`); its leading `markForgetSenderKey`
+    /// is hoisted into `mark_requester_for_fresh_skdm`. The routine is split in
+    /// two so only the non-destructive half can precede the message lookup:
     ///
-    ///   1. processKeyBundle if `<keys>` present
+    ///   1. processKeyBundle if `<keys>` present — [`Self::install_retry_key_bundle`]
     ///   2. If no bundle AND stored regId differs → delete session
     ///   3. retry == 2 → save current base key, return (no delete)
     ///   4. retry > 2 AND same base key → delete session (force re-establish)
     ///
+    /// Steps 2-4 live here. Every one of them either deletes a session or writes
+    /// a row keyed by the message id, and both are only undone by the resend the
+    /// lookup gates: a deleted session is rebuilt by the pairwise
+    /// `ensure_e2e_sessions_resolved` call in `retransmit_message_prepared` (the
+    /// status route rebuilds it inside `prepare_group_stanza` under
+    /// `SenderKeyDistributionPolicy::Required`), and a saved base key is cleared
+    /// only by a later retry for the same id. So this stays behind the lookup for
+    /// every route, and a retry naming a message we no longer hold changes nothing.
+    ///
     /// Unlike the previous DM-only path, this does NOT unconditionally delete
     /// the session on every retry — WA Web preserves it on retry==1 and on
     /// retry>2 when the base key already changed (session was regenerated
-    /// legitimately). A deleted session is rebuilt by the pairwise
-    /// `ensure_e2e_sessions_resolved` call in `retransmit_message_prepared`; the
-    /// status route instead rebuilds it inside `prepare_group_stanza` under
-    /// `SenderKeyDistributionPolicy::Required`.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.update_local_session", level = "debug", skip_all, fields(chat = %info.chat.observe(), peer = %resolved_jid.observe(), retry = retry_count)))]
-    async fn update_local_signal_session(
+    /// legitimately).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.reconcile_session", level = "debug", skip_all, fields(peer = %resolved_jid.observe(), retry = retry_count)))]
+    async fn reconcile_retry_session(
         &self,
-        info: &RetryChatInfo,
         resolved_jid: &Jid,
         message_id: &str,
         retry_count: u8,
         node: &NodeRef<'_>,
-        is_peer: bool,
-    ) -> bool {
-        // 1. processKeyBundle (WA Web L51). Previously gated behind
-        //    `!is_status_broadcast()`; WA Web runs it unconditionally.
-        let keys_node_present = node.get_optional_child("keys").is_some();
-        let key_bundle_result = self
-            .process_retry_key_bundle(node, resolved_jid, is_peer, info.is_fbid_bot_retry)
-            .await;
-        let key_bundle_processed = key_bundle_result.is_ok();
-
+    ) {
         // 2. No bundle + regId mismatch → delete session (WA Web L52-65).
-        //    Gate on `!keys_node_present` so a rejected bundle (security
-        //    refusal for peer reg-ID change, parse errors, invalid reg ID)
-        //    doesn't trigger destructive session deletion as a side effect.
-        if !key_bundle_processed && keys_node_present {
-            log::warn!(
-                "Key bundle present but rejected for {}: {:?} — aborting retry resend",
-                resolved_jid.observe(),
-                key_bundle_result.as_ref().err()
-            );
-            return false;
-        }
-        if !key_bundle_processed && !keys_node_present {
-            if let Err(ref e) = key_bundle_result {
-                // Demoted to debug on the happy path (peer retry without re-key):
-                // only warn when a regId mismatch triggers a delete below.
-                log::debug!(
-                    "No key bundle in retry receipt for {}: {}. Checking for reg ID mismatch.",
-                    resolved_jid.observe(),
-                    e
-                );
-            }
-
-            if let Some(received_reg_id) =
+        //    A present bundle was already installed (or aborted the retry) in
+        //    `install_retry_key_bundle`, so reaching here with one means it
+        //    succeeded and neither branch below applies.
+        if node.get_optional_child("keys").is_none()
+            && let Some(received_reg_id) =
                 wacore::protocol::retry::extract_registration_id_from_node_ref(node)
-            {
-                let signal_address = resolved_jid.to_protocol_address();
-                let device_snapshot = self.persistence_manager.get_device_snapshot();
-                let session = self
-                    .signal_cache
-                    .peek_session(&signal_address, &*device_snapshot.backend)
-                    .await
-                    .ok()
-                    .flatten();
+        {
+            let signal_address = resolved_jid.to_protocol_address();
+            let device_snapshot = self.persistence_manager.get_device_snapshot();
+            let session = self
+                .signal_cache
+                .peek_session(&signal_address, &*device_snapshot.backend)
+                .await
+                .ok()
+                .flatten();
 
-                if let Some(session) = session
-                    && let Ok(stored_reg_id) = session.remote_registration_id()
-                    && stored_reg_id != 0
-                    && stored_reg_id != received_reg_id
-                {
-                    info!(
-                        "Registration ID mismatch for {} (stored: {}, received: {}). \
-                         Deleting session since no key bundle provided.",
-                        wacore::types::jid::observe_protocol_address(&signal_address),
-                        stored_reg_id,
-                        received_reg_id
-                    );
-                    let lock = self.session_lock_for(signal_address.as_str()).await;
-                    let _guard = lock.lock().await;
-                    self.signal_cache.delete_session(&signal_address).await;
-                    drop(_guard);
-                    self.flush_signal_cache_batch_safe_logged(
-                        "reg ID mismatch session deletion",
-                        None,
-                    )
+            if let Some(session) = session
+                && let Ok(stored_reg_id) = session.remote_registration_id()
+                && stored_reg_id != 0
+                && stored_reg_id != received_reg_id
+            {
+                info!(
+                    "Registration ID mismatch for {} (stored: {}, received: {}). \
+                     Deleting session since no key bundle provided.",
+                    wacore::types::jid::observe_protocol_address(&signal_address),
+                    stored_reg_id,
+                    received_reg_id
+                );
+                let lock = self.session_lock_for(signal_address.as_str()).await;
+                let _guard = lock.lock().await;
+                self.signal_cache.delete_session(&signal_address).await;
+                drop(_guard);
+                self.flush_signal_cache_batch_safe_logged("reg ID mismatch session deletion", None)
                     .await;
-                }
             }
         }
 
@@ -1154,10 +1161,10 @@ impl Client {
             .flatten();
 
         let Some(session) = session else {
-            return true;
+            return;
         };
         let Ok(current_base_key) = session.alice_base_key() else {
-            return true;
+            return;
         };
 
         let addr_str = signal_address.as_str();
@@ -1179,7 +1186,7 @@ impl Client {
                     e
                 ),
             }
-            return true;
+            return;
         }
 
         if retry_count > MIN_RETRY_FOR_BASE_KEY_CHECK {
@@ -1236,7 +1243,6 @@ impl Client {
                 }
             }
         }
-        true
     }
 
     /// Mirrors whatsmeow's `shouldRecreateSession`. Returns `Some(reason)`
@@ -2425,7 +2431,7 @@ mod tests {
 
     /// Build a minimal `<receipt>` Node representing an incoming retry receipt
     /// without `<keys>`. Used by tests that exercise the no-bundle path of
-    /// `update_local_signal_session`.
+    /// `reconcile_retry_session`.
     fn build_retry_receipt_without_keys() -> Node {
         use wacore_binary::builder::NodeBuilder;
         NodeBuilder::new("receipt").build()
@@ -2441,17 +2447,6 @@ mod tests {
                 .bytes(reg_id.to_be_bytes().to_vec())
                 .build()])
             .build()
-    }
-
-    fn dm_retry_info(resolved_jid: &Jid) -> RetryChatInfo {
-        RetryChatInfo {
-            chat: resolved_jid.to_non_ad(),
-            requester: resolved_jid.clone(),
-            original_from: resolved_jid.clone(),
-            recipient: None,
-            is_bot: false,
-            is_fbid_bot_retry: false,
-        }
     }
 
     // Produces a parseable SessionRecord so peek_session succeeds and
@@ -2486,7 +2481,7 @@ mod tests {
     /// unnecessary prekey bundle fetches.
     /// Ref: `WAWeb/Update/LocalSignalSession.js` (no delete on retry==1)
     #[tokio::test]
-    async fn update_local_signal_session_preserves_dm_session_at_retry_1() {
+    async fn reconcile_retry_session_preserves_dm_session_at_retry_1() {
         let client =
             crate::test_utils::create_test_client_with_failing_http("retry_preserve_retry_1").await;
         let user = "100000000000088".to_string();
@@ -2513,14 +2508,7 @@ mod tests {
         let node = build_retry_receipt_without_keys();
         let node_ref = node.as_node_ref();
         client
-            .update_local_signal_session(
-                &dm_retry_info(&resolved_jid),
-                &resolved_jid,
-                "MSG-RETRY-1",
-                1,
-                &node_ref,
-                false,
-            )
+            .reconcile_retry_session(&resolved_jid, "MSG-RETRY-1", 1, &node_ref)
             .await;
         client.flush_signal_cache().await.unwrap();
 
@@ -2547,7 +2535,7 @@ mod tests {
     /// our stored session. WA Web deletes the session (LocalSignalSession.js
     /// L52-65) so the next ensureE2ESessions fetches a fresh bundle.
     #[tokio::test]
-    async fn update_local_signal_session_deletes_on_regid_mismatch() {
+    async fn reconcile_retry_session_deletes_on_regid_mismatch() {
         let client =
             crate::test_utils::create_test_client_with_failing_http("retry_regid_mismatch").await;
         let resolved_jid = Jid::lid_device("100000000000099".to_string(), 17);
@@ -2566,14 +2554,7 @@ mod tests {
         let node = build_retry_receipt_with_registration(received_regid);
         let node_ref = node.as_node_ref();
         client
-            .update_local_signal_session(
-                &dm_retry_info(&resolved_jid),
-                &resolved_jid,
-                "MSG-REGID",
-                1,
-                &node_ref,
-                false,
-            )
+            .reconcile_retry_session(&resolved_jid, "MSG-REGID", 1, &node_ref)
             .await;
         client.flush_signal_cache().await.unwrap();
 
@@ -2591,7 +2572,7 @@ mod tests {
     /// so every branch that dereferences a session is skipped. Verifies we
     /// don't panic or re-process stale bytes when the record can't decode.
     #[tokio::test]
-    async fn update_local_signal_session_handles_unparseable_session_gracefully() {
+    async fn reconcile_retry_session_handles_unparseable_session_gracefully() {
         let client =
             crate::test_utils::create_test_client_with_failing_http("retry_unparseable_session")
                 .await;
@@ -2607,14 +2588,7 @@ mod tests {
         let node = build_retry_receipt_with_registration(0xDEAD_BEEF);
         let node_ref = node.as_node_ref();
         client
-            .update_local_signal_session(
-                &dm_retry_info(&resolved_jid),
-                &resolved_jid,
-                "MSG-REGID",
-                1,
-                &node_ref,
-                false,
-            )
+            .reconcile_retry_session(&resolved_jid, "MSG-REGID", 1, &node_ref)
             .await;
         client.flush_signal_cache().await.unwrap();
 
@@ -2632,29 +2606,22 @@ mod tests {
     /// This is the common case for retries from devices we haven't messaged
     /// yet (e.g., a new companion device).
     #[tokio::test]
-    async fn update_local_signal_session_no_session_is_noop() {
+    async fn reconcile_retry_session_no_session_is_noop() {
         let client =
             crate::test_utils::create_test_client_with_failing_http("retry_no_session").await;
         let resolved_jid = Jid::lid_device("100000000000199".to_string(), 42);
         let node = build_retry_receipt_without_keys();
         let node_ref = node.as_node_ref();
         client
-            .update_local_signal_session(
-                &dm_retry_info(&resolved_jid),
-                &resolved_jid,
-                "MSG-NOSESS",
-                1,
-                &node_ref,
-                false,
-            )
+            .reconcile_retry_session(&resolved_jid, "MSG-NOSESS", 1, &node_ref)
             .await;
     }
 
-    /// Group/status at retry #1 must not delete any session. Group/status
-    /// previously skipped the base-key path entirely; now it runs but the
-    /// retry==1 short-circuit still prevents deletion.
+    /// The retry==1 short-circuit holds for a session reached through the
+    /// group/status route: the routine takes no chat info, so every route lands
+    /// on the same branch and none of them may delete at retry #1.
     #[tokio::test]
-    async fn update_local_signal_session_preserves_group_session_at_retry_1() {
+    async fn reconcile_retry_session_preserves_group_session_at_retry_1() {
         let client =
             crate::test_utils::create_test_client_with_failing_http("retry_group_preserve").await;
         let resolved_jid = Jid::lid_device("100000000000088".to_string(), 33);
@@ -2667,20 +2634,10 @@ mod tests {
             .await
             .unwrap();
 
-        let group_chat: Jid = "120363042537531116@g.us".parse().unwrap();
-        let info = RetryChatInfo {
-            chat: group_chat.clone(),
-            requester: resolved_jid.clone(),
-            original_from: group_chat,
-            recipient: None,
-            is_bot: false,
-            is_fbid_bot_retry: false,
-        };
-
         let node = build_retry_receipt_without_keys();
         let node_ref = node.as_node_ref();
         client
-            .update_local_signal_session(&info, &resolved_jid, "MSG-GRP-1", 1, &node_ref, false)
+            .reconcile_retry_session(&resolved_jid, "MSG-GRP-1", 1, &node_ref)
             .await;
         client.flush_signal_cache().await.unwrap();
 
@@ -2977,7 +2934,7 @@ mod tests {
 
         // Inbound group retry from a device-0 LID participant: has_device's
         // device-0 fast path makes it known, LID skips rotateKey, and no <keys>
-        // leaves update_local_signal_session a noop on a missing session.
+        // leaves the session repair a noop on a missing session.
         let node = NodeBuilder::new("receipt")
             .attr("participant", "555000111@lid")
             .children([NodeBuilder::new("retry")
@@ -3039,6 +2996,19 @@ mod tests {
         msg_id: &str,
         offline: bool,
     ) {
+        drive_group_retry_at(client, group, participant, msg_id, "1", offline).await
+    }
+
+    /// `drive_group_retry` with an explicit retry count, for the branches of the
+    /// repair that only run at counts 2 and above.
+    async fn drive_group_retry_at(
+        client: &Arc<Client>,
+        group: &Jid,
+        participant: &str,
+        msg_id: &str,
+        count: &str,
+        offline: bool,
+    ) {
         use wacore_binary::builder::NodeBuilder;
 
         client.set_resend_rate_limit(1, 0);
@@ -3048,7 +3018,7 @@ mod tests {
             .attr("participant", participant)
             .children([NodeBuilder::new("retry")
                 .attr("id", msg_id)
-                .attr("count", "1")
+                .attr("count", count)
                 .build()])
             .build();
         let node_ref = crate::test_utils::node_to_owned_ref(&node);
@@ -3391,6 +3361,95 @@ mod tests {
             .handle_retry_receipt(&receipt, &node_ref)
             .await
             .unwrap();
+    }
+
+    /// The base-key collision delete forces a fresh session, which only the
+    /// resend rebuilds. So it stays behind the lookup: on a miss it would strand
+    /// the device with no session at all, and no bundle to build one from.
+    #[tokio::test]
+    async fn base_key_collision_does_not_delete_the_session_without_the_message() {
+        for cached in [true, false] {
+            let client = retry_repair_client("retry_repair_collision").await;
+            let group: Jid = "120363021033254958@g.us".parse().unwrap();
+            let participant: Jid = "555000999@lid".parse().unwrap();
+            let address = participant.to_protocol_address();
+            let msg_id = "COLLISIONMISS001";
+            let base_key = vec![0xAB; 32];
+
+            let backend = client.persistence_manager.backend();
+            backend
+                .put_session(
+                    address.as_str(),
+                    &valid_serialized_session(4242, base_key.clone()),
+                )
+                .await
+                .unwrap();
+            // The stamp retry #2 would have left, so retry #3 sees an unchanged
+            // base key and calls the session diverged.
+            backend
+                .save_base_key(address.as_str(), msg_id, &base_key)
+                .await
+                .unwrap();
+            if cached {
+                client
+                    .add_recent_message(&group, msg_id, &hello(), None)
+                    .await;
+            }
+
+            drive_group_retry_at(&client, &group, "555000999@lid", msg_id, "3", false).await;
+            client.flush_signal_cache().await.unwrap();
+
+            assert_eq!(
+                backend
+                    .get_session(address.as_str())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                cached,
+                "cached={cached}: only a retry that resends may force a fresh session"
+            );
+        }
+    }
+
+    /// The retry #2 base-key stamp is keyed by message id and cleared only by a
+    /// later retry for that same id, so a peer naming ids we never sent could
+    /// grow the table without bound. Keeping the write behind the lookup bounds
+    /// it to messages we actually hold.
+    #[tokio::test]
+    async fn base_key_is_not_stamped_for_a_message_we_no_longer_hold() {
+        for cached in [true, false] {
+            let client = retry_repair_client("retry_repair_base_key_stamp").await;
+            let group: Jid = "120363021033254959@g.us".parse().unwrap();
+            let participant: Jid = "555001111@lid".parse().unwrap();
+            let address = participant.to_protocol_address();
+            let msg_id = "BASEKEYSTAMP001";
+            let base_key = vec![0xCD; 32];
+
+            let backend = client.persistence_manager.backend();
+            backend
+                .put_session(
+                    address.as_str(),
+                    &valid_serialized_session(4243, base_key.clone()),
+                )
+                .await
+                .unwrap();
+            if cached {
+                client
+                    .add_recent_message(&group, msg_id, &hello(), None)
+                    .await;
+            }
+
+            drive_group_retry_at(&client, &group, "555001111@lid", msg_id, "2", false).await;
+
+            assert_eq!(
+                backend
+                    .has_same_base_key(address.as_str(), msg_id, &base_key)
+                    .await
+                    .unwrap(),
+                cached,
+                "cached={cached}: a retry for an absent message must stamp nothing"
+            );
+        }
     }
 
     /// A device the server returns no prekey bundle for is dropped from the SKDM
