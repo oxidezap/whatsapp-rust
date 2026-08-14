@@ -76,6 +76,7 @@ pub const WATCHED: &[abprops::AbProp] = &[
     abprops::web::TCTOKEN_NUM_BUCKETS,
     abprops::web::TCTOKEN_NUM_BUCKETS_SENDER,
     abprops::web::WA_NCT_TOKEN_SEND_ENABLED,
+    abprops::web::RECEIPT_MODE_BITMASK_ENABLED,
     stale::PRIVACY_TOKEN_ONLY_CHECK_LID,
     stale::PROFILE_PIC_PRIVACY_TOKEN,
 ];

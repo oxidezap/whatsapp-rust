@@ -224,6 +224,10 @@ mod tests {
             ),
             (web::TCTOKEN_DURATION.code, CompactString::from("604800")),
             (web::TCTOKEN_NUM_BUCKETS.code, CompactString::from("4")),
+            (
+                web::RECEIPT_MODE_BITMASK_ENABLED.code,
+                CompactString::from("1"),
+            ),
             (99999u32, CompactString::from("unwatched")),
         ];
         cache.apply_props(false, props.into_iter()).await;
@@ -237,6 +241,10 @@ mod tests {
         assert!(cache.is_enabled(web::WA_NCT_TOKEN_SEND_ENABLED).await);
         assert_eq!(cache.get_int(web::TCTOKEN_DURATION).await, 604800);
         assert_eq!(cache.get_int(web::TCTOKEN_NUM_BUCKETS).await, 4);
+        // A flag whose registry default is false is the case that proves the
+        // interest set matters: without it the server's "on" is dropped and
+        // the read falls through to false forever.
+        assert!(cache.is_enabled(web::RECEIPT_MODE_BITMASK_ENABLED).await);
         // Unwatched code should NOT be retained
         assert_eq!(cache.get(flag(99999)).await, None);
     }
