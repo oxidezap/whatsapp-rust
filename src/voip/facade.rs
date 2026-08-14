@@ -3363,6 +3363,17 @@ impl CallHandle {
         self.muted.load(Ordering::Relaxed)
     }
 
+    /// Announce the local camera rotation as quarter turns clockwise (0..=3):
+    /// the peer rotates this side's rendered stream by `orientation` x 90 deg.
+    /// Carried in outbound RTP orientation metadata; values sent faster than
+    /// the drive loop consumes them coalesce to the newest.
+    pub fn set_video_orientation(&self, orientation: u8) -> Result<(), CallError> {
+        self.ensure_current()?;
+        self.video
+            .send_control(VideoControl::SetOrientation(orientation % 4));
+        Ok(())
+    }
+
     /// UPGRADE the call to video (we initiate): attaches the endpoints, enables the media plane,
     /// and sends `<video state=11 dec="H264" device_orientation="0" voip_settings="video">`.
     /// The peer answers with
