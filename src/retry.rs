@@ -1111,6 +1111,9 @@ impl Client {
         retry_count: u8,
         node: &NodeRef<'_>,
     ) {
+        let signal_address = resolved_jid.to_protocol_address();
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+
         // 2. No bundle + regId mismatch → delete session (WA Web L52-65).
         //    A present bundle was already installed (or aborted the retry) in
         //    `install_retry_key_bundle`, so reaching here with one means it
@@ -1119,8 +1122,6 @@ impl Client {
             && let Some(received_reg_id) =
                 wacore::protocol::retry::extract_registration_id_from_node_ref(node)
         {
-            let signal_address = resolved_jid.to_protocol_address();
-            let device_snapshot = self.persistence_manager.get_device_snapshot();
             let session = self
                 .signal_cache
                 .peek_session(&signal_address, &*device_snapshot.backend)
@@ -1150,9 +1151,8 @@ impl Client {
         }
 
         // 3-4. Base-key collision logic (WA Web L66-80). Applied to ALL chat
-        //      types now — previously only ran in the DM branch.
-        let signal_address = resolved_jid.to_protocol_address();
-        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        //      types now — previously only ran in the DM branch. The session is
+        //      re-read, not reused: the branch above may have deleted it.
         let session = self
             .signal_cache
             .peek_session(&signal_address, &*device_snapshot.backend)
