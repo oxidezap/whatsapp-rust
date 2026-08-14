@@ -443,15 +443,15 @@ pub struct MsgMetaInfo {
     /// lookup; see WA Web `decryptMsmsgBotMessage`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_chat: Option<Jid>,
-    /// `<meta thread_msg_id="…">` — the message this one threads under, for a
+    /// `<meta thread_msg_id="…">`: the message this one threads under, for a
     /// stanza the server routes into an existing thread.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_message_id: Option<MessageId>,
-    /// `<meta thread_msg_sender_jid="…">` — who authored
+    /// `<meta thread_msg_sender_jid="…">`: who authored
     /// [`thread_message_id`](Self::thread_message_id). Absent whenever that is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_message_sender_jid: Option<Jid>,
-    /// `<meta polltype="…">` — which stage of a poll's lifecycle the envelope
+    /// `<meta polltype="…">`: which stage of a poll's lifecycle the envelope
     /// carries.
     ///
     /// Read only when the envelope declares [`StanzaMessageType::Poll`], so a
