@@ -57,6 +57,13 @@ pub enum UnkeyableDevice {
     NoBundle,
     /// A bundle did come back, but building the Signal session from it failed.
     SessionSetup,
+    /// The local session store could not answer whether a session exists, which
+    /// abandons the whole fan-out before any device is keyed. Shares
+    /// [`SessionSetup`](Self::SessionSetup)'s snapshot counter — both are the
+    /// session phase failing to produce a session — and keeps its own label,
+    /// because this one is a local storage fault and points nowhere near the
+    /// peer.
+    SessionLookup,
     /// The server refused this device by name, with the `<error code>` it
     /// attached. `406` means unregistered and is the only code acted on.
     Rejected(u16),
@@ -91,6 +98,7 @@ impl UnkeyableDevice {
         match self {
             Self::NoBundle => "no_bundle",
             Self::SessionSetup => "session_setup",
+            Self::SessionLookup => "session_lookup",
             Self::Rejected(code) if code == crate::send::UNREGISTERED_DEVICE_CODE => "rejected_406",
             Self::Rejected(400..=499) => "rejected_4xx",
             Self::Rejected(500..=599) => "rejected_5xx",
@@ -168,8 +176,9 @@ pub struct StatsSnapshot {
     /// Keying attempts that asked the server about a device and got no bundle
     /// for it, with no per-device reason given.
     pub devices_unkeyed_no_bundle: u64,
-    /// Keying attempts whose bundle arrived but whose Signal session could not
-    /// be built from it.
+    /// Keying attempts the session phase could not give a session to: the local
+    /// store would not answer, or a bundle arrived and building from it failed.
+    /// The `metrics` facade separates the two.
     pub devices_unkeyed_session_setup: u64,
     /// Keying attempts the server refused, whether it named the device or
     /// refused the whole batch. `stats()` carries the total; the split by code,
@@ -181,7 +190,7 @@ pub struct StatsSnapshot {
     /// particular. This is the one that moves during an outage.
     pub devices_unkeyed_fetch_failed: u64,
     /// Keying attempts that had a session and still produced no ciphertext.
-    /// Unlike the other three this one is not about the server: a non-zero
+    /// Alone among these, this one is not about the server: a non-zero
     /// value points at stored session state, which is what session repair
     /// operates on.
     pub devices_unkeyed_encrypt: u64,
@@ -197,7 +206,7 @@ pub struct StatsSnapshot {
 
 impl StatsSnapshot {
     /// Every keying attempt this client lost, whatever the reason. A rising
-    /// value is participants going quiet; the three fields say why. See
+    /// value is participants going quiet; the individual fields say why. See
     /// [`UnkeyableDevice`] for what one count is and is not.
     pub fn devices_unkeyed_total(&self) -> u64 {
         self.devices_unkeyed_no_bundle
@@ -325,7 +334,9 @@ impl SessionStats {
         }
         let counter = match reason {
             UnkeyableDevice::NoBundle => &self.devices_unkeyed_no_bundle,
-            UnkeyableDevice::SessionSetup => &self.devices_unkeyed_session_setup,
+            UnkeyableDevice::SessionSetup | UnkeyableDevice::SessionLookup => {
+                &self.devices_unkeyed_session_setup
+            }
             UnkeyableDevice::Rejected(_) | UnkeyableDevice::BatchRefused => {
                 &self.devices_unkeyed_rejected
             }

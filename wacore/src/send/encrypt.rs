@@ -419,7 +419,10 @@ pub async fn encrypt_for_devices(
 /// Report the devices an encrypt fan-out dropped on its own, for callers that
 /// hold a resolver. Session-setup drops are reported where they happen, so this
 /// covers only the ones the fan-out is the first to see.
-fn report_encrypt_drops(resolver: &dyn SendContextResolver, unkeyed_at_encrypt: u64) {
+///
+/// The "nothing to report" case lives here rather than at each call site, so a
+/// resolver only ever sees a call that means something.
+pub(crate) fn report_encrypt_drops(resolver: &dyn SendContextResolver, unkeyed_at_encrypt: u64) {
     if unkeyed_at_encrypt > 0 {
         resolver.on_unkeyable_devices(UnkeyableDevice::Encrypt, unkeyed_at_encrypt);
     }
@@ -542,6 +545,29 @@ impl SessionPlan {
     }
 }
 
+/// `has_session`, counting the whole fan-out as unkeyable if the store cannot
+/// answer.
+///
+/// A store failure abandons the plan before any device is keyed, and a
+/// best-effort group send then carries on distributing to nobody, so without
+/// this the loudest local fault a send can hit would move no counter at all.
+/// Every device is affected, not just the one being probed: the error takes the
+/// plan with it.
+async fn has_session_or_report(
+    session_store: &(dyn CloneableSessionStore + Send + Sync),
+    addr: &ProtocolAddress,
+    resolver: &dyn SendContextResolver,
+    devices: &[Jid],
+) -> Result<bool> {
+    match wacore_libsignal::protocol::has_session(session_store, addr).await {
+        Ok(present) => Ok(present),
+        Err(error) => {
+            resolver.on_unkeyable_devices(UnkeyableDevice::SessionLookup, devices.len() as u64);
+            Err(error.into())
+        }
+    }
+}
+
 /// The LID address recorded for `index`, or `None` when that device encrypts
 /// against its own JID. Indexing tolerates the empty (no-override) map, which
 /// is what a warm send carries.
@@ -606,7 +632,8 @@ pub async fn ensure_sessions_for_devices(
             let lid_jid = Jid::lid_device(lid_user, device_jid.device);
             lid_jid.reset_protocol_address(&mut reusable_addr);
 
-            if wacore_libsignal::protocol::has_session(stores.session_store, &reusable_addr).await?
+            if has_session_or_report(stores.session_store, &reusable_addr, resolver, devices)
+                .await?
             {
                 log::debug!(
                     "Using LID session {} for PN {} (LID-first lookup)",
@@ -619,7 +646,7 @@ pub async fn ensure_sessions_for_devices(
         }
 
         device_jid.reset_protocol_address(&mut reusable_addr);
-        if wacore_libsignal::protocol::has_session(stores.session_store, &reusable_addr).await? {
+        if has_session_or_report(stores.session_store, &reusable_addr, resolver, devices).await? {
             continue;
         }
 
@@ -867,6 +894,11 @@ pub async fn ensure_sessions_for_devices(
 /// under locks that must not span I/O. A device whose session is still
 /// missing (e.g. its bundle was absent) fails its encrypt and is skipped,
 /// matching the combined path's behavior.
+///
+/// Holding no resolver, this cannot report the devices it skipped. Every
+/// in-tree path goes through [`encrypt_for_devices`], [`encrypt_for_devices_into`]
+/// or the raw variant instead; a caller that wants the tally wants
+/// [`encrypt_for_devices_with_sessions_raw`], whose result carries it.
 pub async fn encrypt_for_devices_with_sessions(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'_>,
@@ -1049,10 +1081,15 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             let mut session_store = stores.session_store.clone_box();
             let mut identity_store = stores.identity_store.clone_box();
 
-            // The chunk's size rides along so a chunk that never delivers can
-            // report how many devices it took down with it, instead of leaving
-            // the count to an estimate.
-            let chunk_len = (chunk_end - chunk_start) as u64;
+            // The chunk's countable size rides along so a chunk that never
+            // delivers reports exactly how many devices it took down with it,
+            // instead of leaving the count to an estimate. Devices session setup
+            // already gave up on are excluded here for the same reason the
+            // per-device branch excludes them: they are counted once, there.
+            let chunk_countable = jobs
+                .iter()
+                .filter(|(_, device_jid)| !unkeyed_devices.contains(device_jid))
+                .count() as u64;
             let task = spawn_oneshot(runtime, async move {
                 let mut out = Vec::with_capacity(jobs.len());
                 for (addr, device_jid) in jobs {
@@ -1069,9 +1106,9 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                 }
                 out
             });
-            in_flight.push(async move { (chunk_len, task.await) });
+            in_flight.push(async move { (chunk_countable, task.await) });
         }
-        while let Some((chunk_len, spawn_result)) = in_flight.next().await {
+        while let Some((chunk_countable, spawn_result)) = in_flight.next().await {
             match spawn_result {
                 Ok(results) => {
                     for res in results {
@@ -1089,9 +1126,9 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                     // A whole chunk drops (not one device); its members stay
                     // un-warm and are re-targeted next send.
                     log::warn!(
-                        "Encrypt chunk did not deliver a result; {chunk_len} device(s) skipped this send."
+                        "Encrypt chunk did not deliver a result; {chunk_countable} further device(s) skipped this send."
                     );
-                    unkeyed_at_encrypt += chunk_len;
+                    unkeyed_at_encrypt += chunk_countable;
                     if first_error.is_none() {
                         first_error = Some(anyhow::Error::new(error));
                     }

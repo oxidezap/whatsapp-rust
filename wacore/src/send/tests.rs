@@ -3156,6 +3156,39 @@ mod mark_full_distribution_list {
         }
     }
 
+    /// A store whose reads fail, standing in for a backend that is down.
+    #[derive(Clone)]
+    struct FailingSessionStore;
+    #[async_trait::async_trait]
+    impl SessionStore for FailingSessionStore {
+        async fn load_session(
+            &self,
+            _: &ProtocolAddress,
+        ) -> SigResult<Option<crate::libsignal::protocol::SessionRecord>> {
+            Err(
+                crate::libsignal::protocol::SignalProtocolError::InvalidState(
+                    "load_session",
+                    "session store is unavailable".to_string(),
+                ),
+            )
+        }
+        async fn has_session(&self, _: &ProtocolAddress) -> SigResult<bool> {
+            Err(
+                crate::libsignal::protocol::SignalProtocolError::InvalidState(
+                    "has_session",
+                    "session store is unavailable".to_string(),
+                ),
+            )
+        }
+        async fn store_session(
+            &mut self,
+            _: &ProtocolAddress,
+            _: crate::libsignal::protocol::SessionRecord,
+        ) -> SigResult<()> {
+            unreachable!("nothing is stored once the reads fail")
+        }
+    }
+
     #[derive(Clone)]
     struct MemIdentityStore {
         pair: IdentityKeyPair,
@@ -4226,6 +4259,52 @@ mod mark_full_distribution_list {
             vec![(crate::stats::UnkeyableDevice::FetchFailed, 2)],
             "both devices the fetch asked about are counted, under a reason that \
              claims nothing about them"
+        );
+    }
+
+    /// A session store that cannot answer abandons the plan before any device
+    /// is keyed, and a best-effort group send then distributes to nobody. The
+    /// loudest local fault a send can hit has to move a counter.
+    #[tokio::test]
+    async fn a_session_store_that_cannot_answer_counts_every_device() {
+        let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let second: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut sessions = FailingSessionStore;
+        let mut identities = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sender_keys = MemSenderKeyStore::default();
+        let mut prekeys = UnusedPreKeyStore;
+        let signed_prekeys = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_keys,
+            session_store: &mut sessions,
+            identity_store: &mut identities,
+            prekey_store: &mut prekeys,
+            signed_prekey_store: &signed_prekeys,
+        };
+        let resolver = MockSendContextResolver::new();
+
+        assert!(
+            ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[first, second]
+            )
+            .await
+            .is_err(),
+            "a store that cannot answer still fails the session half"
+        );
+
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::SessionLookup, 2)],
+            "the error takes the whole plan with it, so every device is unkeyed"
         );
     }
 

@@ -1487,8 +1487,9 @@ async fn fanout_group_epoch_for_generation(
         encrypted
     };
     let encrypted = encrypted?;
-    // The offer path asserts sessions upstream instead of establishing them, so
-    // nothing else has counted a device this fan-out could not encrypt for.
+    // This path asserts sessions upstream instead of establishing them, so
+    // nothing else has counted a device the fan-out could not encrypt for.
+    // Recorded before the checks below, which can return early.
     client
         .stats
         .record_unkeyable_devices(UnkeyableDevice::Encrypt, encrypted.unkeyed_at_encrypt);
@@ -1671,6 +1672,11 @@ async fn place_call(
         )
         .await
         .map_err(|e| CallError::Setup(e.to_string()))?;
+        // Before the persist below, which can bail with `?`: the devices this
+        // fan-out dropped are dropped whether or not the offer goes out.
+        client
+            .stats
+            .record_unkeyable_devices(UnkeyableDevice::Encrypt, raw.unkeyed_at_encrypt);
         drop(_session_guards);
         client
             .persist_signal_state_pre_wire()
@@ -1678,9 +1684,6 @@ async fn place_call(
             .map_err(|e| CallError::Setup(e.to_string()))?;
         raw
     };
-    client
-        .stats
-        .record_unkeyable_devices(UnkeyableDevice::Encrypt, raw.unkeyed_at_encrypt);
 
     // The raw fan-out yields survivors in completion order; re-order to the input `devices` order so
     // the offer addresses devices deterministically (the offer's `<destination><to>` order).

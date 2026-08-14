@@ -52,10 +52,12 @@ mod imp {
     pub fn retry_refused() {
         counter!("wa_retry_refused_total").increment(1);
     }
-    /// Devices a stanza could not be encrypted for, by reason
-    /// (`no_bundle`/`session_setup`/`rejected_406`/`rejected_4xx`/...). Each one
-    /// is a recipient that gets nothing while the send succeeds for everyone
-    /// else, so this is the rate to watch after a session-repair change.
+    /// Failed attempts to obtain key material for one device, by reason
+    /// (`no_bundle`/`session_setup`/`session_lookup`/`rejected_406`/
+    /// `refused_batch`/`fetch_failed`/`encrypt`/...). Each one is a recipient
+    /// that gets nothing — usually while the send carries on to everyone else,
+    /// and also when the failure aborts the send outright. This is the rate to
+    /// watch after a session-repair change.
     pub fn unkeyable_device(reason: &'static str, count: u64) {
         counter!("wa_unkeyable_device_total", "reason" => reason).increment(count);
     }
@@ -162,7 +164,7 @@ mod imp {
         describe_counter!(
             "wa_unkeyable_device_total",
             Unit::Count,
-            "Devices a stanza could not be encrypted for, by reason"
+            "Failed device keying attempts, by reason"
         );
         describe_counter!(
             "wa_base_key_collision_total",

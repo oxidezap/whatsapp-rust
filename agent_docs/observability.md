@@ -90,7 +90,11 @@ as a named rejection would dress an attribution up as a fact. A fetch that never
 answered at all — timeout, dropped socket, 429/5xx — is `fetch_failed` for the
 same reason, and it is counted rather than skipped because a best-effort group
 send swallows that error and distributes to nobody: the metric has to be loudest
-during an outage, not silent.
+during an outage, not silent. A local session store that cannot answer at all is
+`session_lookup`, counted for every device in the fan-out, since that error
+takes the whole plan with it (it shares `devices_unkeyed_session_setup` in the
+snapshot — both are the session phase failing to produce a session — and keeps
+its own label, because it points at local storage rather than at the peer).
 `wacore::send::encrypt` reaches the counters through
 `SendContextResolver::on_unkeyable_devices` (like `on_local_identity_change`,
 since a spawned encrypt task holds no borrow of the client);
