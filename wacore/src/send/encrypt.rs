@@ -387,9 +387,9 @@ pub struct EncryptFanoutSummary {
     /// True if any device returned 406 (unregistered) during prekey fetch.
     pub had_unregistered_device: bool,
     /// First failure of the fan-out (session, prekey fetch or spawn), or `None`
-    /// when every device produced a node. Already computed for the group path's
-    /// [`EncryptAttempt`], so a caller that turns "nothing encrypted" into an
-    /// error can name the cause instead of reporting a bare count.
+    /// when every device produced a node. Already collected for the group
+    /// path's detailed attempt, so a caller that turns "nothing encrypted"
+    /// into an error can name the cause instead of reporting a bare count.
     pub first_error: Option<anyhow::Error>,
 }
 
