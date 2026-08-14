@@ -62,8 +62,9 @@ run loop. VoIP relay sockets pass `SendObservers::default()` and are not counted
 
 #### Devices a send could not key
 
-`devices_unkeyed_no_bundle`, `devices_unkeyed_session_setup` and
-`devices_unkeyed_rejected` (sum: `StatsSnapshot::devices_unkeyed_total()`) count
+`devices_unkeyed_no_bundle`, `devices_unkeyed_session_setup`,
+`devices_unkeyed_rejected`, `devices_unkeyed_fetch_failed` and
+`devices_unkeyed_encrypt` (sum: `StatsSnapshot::devices_unkeyed_total()`) count
 failed attempts to obtain key material for one device. Usually the device is then
 dropped and the send continues, which is parity with WA Web and is not up for
 change; what these answer is *how often it happens*, which is the difference
@@ -85,27 +86,44 @@ bundle, and a batch-wide `406` is counted once per device it answered for
 instead of as N absent bundles. That batch case has its own reason
 (`refused_batch`) rather than borrowing `rejected_406`, because the refusal
 names nobody: a registered device can sit in a refused batch, so reporting it
-as a named rejection would dress an attribution up as a fact.
+as a named rejection would dress an attribution up as a fact. A fetch that never
+answered at all — timeout, dropped socket, 429/5xx — is `fetch_failed` for the
+same reason, and it is counted rather than skipped because a best-effort group
+send swallows that error and distributes to nobody: the metric has to be loudest
+during an outage, not silent.
 `wacore::send::encrypt` reaches the counters through
 `SendContextResolver::on_unkeyable_devices` (like `on_local_identity_change`,
 since a spawned encrypt task holds no borrow of the client);
 `Client::fetch_and_establish_sessions` records its own directly.
 
-Two things these do **not** measure, both known and neither a bug to fix by
-tightening the counter:
+The last drop point is the encrypt fan-out itself: `push_raw_result` skips a
+device whose `message_encrypt` fails, which is where an unusable *stored*
+session surfaces — the failure session repair exists for, and the one nothing
+upstream can see, because `has_session` says a session is there. That is
+`devices_unkeyed_encrypt`, and it is the one counter that points at local state
+rather than at the server.
 
-- **Distinct devices.** A cold DM runs session establishment twice — the
-  `ensure_e2e_sessions` preflight, then `encrypt_for_devices_into` — so one send
-  can record the same device twice, or record a failure the second pass then
-  recovers from. Counting only at the final fan-out would blind the paths that
-  never reach one (retry handling, primary-phone establishment) and would make
-  the number depend on which caller reached the session layer.
-- **Devices dropped at encrypt.** `push_raw_result` logs and skips a device
-  whose `message_encrypt` fails — an unusable stored session, the case session
-  repair exists for — and none of these counters moves. Covering it needs
-  `SessionPlan` to carry the set already dropped at setup, since a device that
-  failed setup fails encrypt too and would otherwise be counted twice; that is a
-  change to the fan-out's contract rather than an instrumentation addition.
+Getting it disjoint is why `SessionPlan` carries the devices it already gave up
+on **by name**. Testing the error instead does not work: libsignal reports a
+degenerate stored session as `SessionNotFound`, identical to a device that has
+no session at all, so an error-shaped rule would suppress exactly the case worth
+counting. The list is empty on any send that keyed everyone, so the membership
+check costs nothing there. Two consequences worth knowing:
+
+- A `SessionPlan::assume_ready` plan (the voip offer) names nothing, because it
+  gave up on nothing — so a missing session at encrypt *is* counted there, which
+  is right: no setup pass ran to count it first.
+- A session-establishment task that dies with the runtime cannot join the list
+  (the task took the device's identity with it), so that drop is deliberately
+  left to the encrypt fan-out to count instead of being counted twice.
+
+One thing these do **not** measure, known and not a bug to fix by tightening the
+counter: **distinct devices**. A cold DM runs session establishment twice — the
+`ensure_e2e_sessions` preflight, then `encrypt_for_devices_into` — so one send
+can record the same device twice, or record a failure the second pass then
+recovers from. Counting only at the final fan-out would blind the paths that
+never reach one (retry handling, primary-phone establishment) and would make the
+number depend on which caller reached the session layer.
 
 `StatsSnapshot` carries totals only. The per-code breakdown lives on the
 `metrics` facade (`wa_unkeyable_device_total{reason}`), whose label set is

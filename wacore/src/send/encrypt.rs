@@ -100,6 +100,9 @@ pub struct EncryptResult {
 pub(crate) struct EncryptAttempt {
     pub result: EncryptResult,
     pub first_error: Option<anyhow::Error>,
+    /// Devices the encrypt fan-out itself dropped, excluding the ones already
+    /// accounted for during session setup. See [`unkeyed_at_encrypt`].
+    pub unkeyed_at_encrypt: u64,
 }
 
 /// One device's encrypted ciphertext, node-agnostic. The DM/peer paths map this
@@ -121,6 +124,13 @@ pub struct EncryptForDevicesRaw {
     pub had_unregistered_device: bool,
     /// See [`EncryptResult::rejected_devices`].
     pub rejected_devices: Vec<Jid>,
+    /// Devices this fan-out dropped that session setup had not already given up
+    /// on — a stored session that exists and cannot be used, or a whole chunk
+    /// whose task died. A device that reached here with no session at all is
+    /// excluded: setup counted it. Report it through
+    /// [`SendContextResolver::on_unkeyable_devices`] with
+    /// [`UnkeyableDevice::Encrypt`], or it goes unobserved.
+    pub unkeyed_at_encrypt: u64,
 }
 
 struct RawEncryptAttempt {
@@ -157,9 +167,14 @@ const ENCRYPT_FANOUT_CONCURRENCY: usize = 16;
 enum SessionOutcome {
     /// Session ready; `Some` when establishing it replaced a stored identity.
     Established(Option<Jid>),
-    /// Dropped from the fan-out. `None` when the prekey fetch already counted
-    /// the drop, which is the case for a device the server named.
-    Dropped(Option<UnkeyableDevice>),
+    /// Dropped here, so the encrypt fan-out must not count it a second time.
+    /// `reason` is `None` when the prekey fetch already counted the drop, which
+    /// is the case for a device the server named.
+    Dropped {
+        jid: Jid,
+        reason: Option<UnkeyableDevice>,
+        error: Option<anyhow::Error>,
+    },
 }
 
 /// Per-task encrypt result, shipped from a spawned task back to the orchestrator.
@@ -309,6 +324,8 @@ fn push_raw_result(
     devices: &mut Vec<EncryptedDevice>,
     includes_prekey_message: &mut bool,
     first_error: &mut Option<anyhow::Error>,
+    already_counted: &[Jid],
+    unkeyed_at_encrypt: &mut u64,
 ) {
     match res {
         Ok(Some(one)) => {
@@ -323,6 +340,12 @@ fn push_raw_result(
         Ok(None) => {}
         Err(error) => {
             log::warn!("Failed to encrypt for device: {error:#}. Skipping.");
+            // A device session setup already gave up on was counted there;
+            // counting it again here would report one drop as two. The list is
+            // empty on every send that keyed everyone, so this is a no-op scan.
+            if !already_counted.contains(&device_jid) {
+                *unkeyed_at_encrypt += 1;
+            }
             if first_error.is_none() {
                 *first_error = Some(error);
             }
@@ -379,7 +402,7 @@ pub async fn encrypt_for_devices(
     mediatype: Option<&str>,
 ) -> Result<EncryptResult> {
     let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
-    encrypt_for_devices_with_sessions(
+    let attempt = encrypt_for_devices_with_sessions_detailed(
         runtime,
         stores,
         devices,
@@ -388,7 +411,18 @@ pub async fn encrypt_for_devices(
         mediatype,
         plan,
     )
-    .await
+    .await?;
+    report_encrypt_drops(resolver, attempt.unkeyed_at_encrypt);
+    Ok(attempt.result)
+}
+
+/// Report the devices an encrypt fan-out dropped on its own, for callers that
+/// hold a resolver. Session-setup drops are reported where they happen, so this
+/// covers only the ones the fan-out is the first to see.
+fn report_encrypt_drops(resolver: &dyn SendContextResolver, unkeyed_at_encrypt: u64) {
+    if unkeyed_at_encrypt > 0 {
+        resolver.on_unkeyable_devices(UnkeyableDevice::Encrypt, unkeyed_at_encrypt);
+    }
 }
 
 /// What a fan-out reports back when its `<to><enc>` nodes went straight into
@@ -436,6 +470,7 @@ pub async fn encrypt_for_devices_into(
         plan,
     )
     .await?;
+    report_encrypt_drops(resolver, raw.unkeyed_at_encrypt);
 
     participant_nodes.reserve(raw.devices.len());
     for one in raw.devices {
@@ -478,6 +513,16 @@ pub struct SessionPlan {
     /// unrelated users for no reason.
     pub rejected_devices: Vec<Jid>,
     first_error: Option<anyhow::Error>,
+    /// Devices this plan already gave up on, and already counted. The encrypt
+    /// fan-out skips them when tallying its own drops, so one dropped device is
+    /// never reported as both a session-setup drop and an encrypt drop.
+    ///
+    /// Named devices rather than a flag, because "no session at encrypt" is not
+    /// a usable proxy: libsignal reports a *degenerate stored* session as
+    /// `SessionNotFound` too, and that one is the unusable-session case this
+    /// batch exists to surface. Empty on the warm path and on
+    /// [`SessionPlan::assume_ready`], so it costs no allocation there.
+    unkeyed_devices: Vec<Jid>,
 }
 
 impl SessionPlan {
@@ -492,6 +537,7 @@ impl SessionPlan {
             had_unregistered_device: false,
             rejected_devices: Vec::new(),
             first_error: None,
+            unkeyed_devices: Vec::new(),
         }
     }
 }
@@ -543,6 +589,8 @@ pub async fn ensure_sessions_for_devices(
     let mut indices_needing_prekeys: Vec<usize> = Vec::new();
     let mut had_406 = false;
     let mut rejected_devices: Vec<Jid> = Vec::new();
+    // Stays unallocated unless a device is actually dropped.
+    let mut unkeyed_devices: Vec<Jid> = Vec::new();
     let mut first_error = None;
 
     let mut reusable_addr = crate::types::jid::make_reusable_protocol_address();
@@ -666,7 +714,18 @@ pub async fn ensure_sessions_for_devices(
                 first_error = Some(e);
                 std::collections::HashMap::new()
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // A timeout, a transport failure or a 429/5xx leaves the same
+                // devices unkeyed as a refusal does, and a best-effort group
+                // send swallows this error and distributes to nobody. Counting
+                // only the refusal would make the signal go quiet during the
+                // outage that needs it loudest.
+                resolver.on_unkeyable_devices(
+                    UnkeyableDevice::FetchFailed,
+                    jids_for_fetch.len() as u64,
+                );
+                return Err(e);
+            }
         };
 
         // Parallel session establishment via process_prekey_bundle. Each
@@ -704,9 +763,11 @@ pub async fn ensure_sessions_for_devices(
                         "No pre-key bundle returned for device {}. This device will be skipped for encryption.",
                         addr
                     );
-                    return Ok::<SessionOutcome, anyhow::Error>(SessionOutcome::Dropped(
-                        (!counted_at_fetch).then_some(UnkeyableDevice::NoBundle),
-                    ));
+                    return SessionOutcome::Dropped {
+                        jid: lookup_jid,
+                        reason: (!counted_at_fetch).then_some(UnkeyableDevice::NoBundle),
+                        error: None,
+                    };
                 };
 
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -726,11 +787,17 @@ pub async fn ensure_sessions_for_devices(
                     // Surface a replaced identity so the caller can react
                     // (resolver has no 'static handle into this spawned task).
                     Ok(IdentityChange::ReplacedExisting) => {
-                        Ok(SessionOutcome::Established(Some(encryption_jid)))
+                        SessionOutcome::Established(Some(encryption_jid))
                     }
-                    Ok(IdentityChange::NewOrUnchanged) => Ok(SessionOutcome::Established(None)),
-                    Err(error) => Err(anyhow::Error::new(error)
-                        .context(format!("failed to process pre-key bundle for {addr}"))),
+                    Ok(IdentityChange::NewOrUnchanged) => SessionOutcome::Established(None),
+                    Err(error) => SessionOutcome::Dropped {
+                        jid: lookup_jid,
+                        reason: Some(UnkeyableDevice::SessionSetup),
+                        error: Some(
+                            anyhow::Error::new(error)
+                                .context(format!("failed to process pre-key bundle for {addr}")),
+                        ),
+                    },
                 }
             })
         };
@@ -744,31 +811,34 @@ pub async fn ensure_sessions_for_devices(
             match spawn_result {
                 // Some(jid) => establishing this session replaced a stored
                 // identity; notify the client so it can react off-path.
-                Ok(Ok(SessionOutcome::Established(Some(changed_jid)))) => {
+                Ok(SessionOutcome::Established(Some(changed_jid))) => {
                     resolver.on_local_identity_change(&changed_jid)
                 }
-                Ok(Ok(SessionOutcome::Established(None))) => {}
-                Ok(Ok(SessionOutcome::Dropped(reason))) => {
-                    if let Some(reason) = reason {
-                        resolver.on_unkeyable_devices(reason, 1);
-                    }
-                }
+                Ok(SessionOutcome::Established(None)) => {}
                 // Isolate the failure to this device so one participant can't abort
                 // the cohort's SKDM (matching WA Web GroupKeyDistributionMsg's
                 // per-device try/catch). The sessionless device is dropped by the
-                // fan-out below.
-                Ok(Err(e)) => {
-                    log::warn!("Group session setup failed for a device, skipping it: {e}");
-                    resolver.on_unkeyable_devices(UnkeyableDevice::SessionSetup, 1);
-                    if first_error.is_none() {
-                        first_error = Some(e);
+                // fan-out below, which skips it when tallying its own drops.
+                Ok(SessionOutcome::Dropped { jid, reason, error }) => {
+                    if let Some(reason) = reason {
+                        resolver.on_unkeyable_devices(reason, 1);
+                    }
+                    unkeyed_devices.push(jid);
+                    if let Some(error) = error {
+                        log::warn!("Group session setup failed for a device, skipping it: {error}");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
                     }
                 }
                 Err(error) => {
+                    // The task took the device's identity with it, so this drop
+                    // cannot join `unkeyed_devices` — and must not be counted
+                    // here either, or the encrypt fan-out (which will fail for
+                    // the same device) would count it a second time.
                     log::warn!(
                         "Session-establishment task did not deliver a result; skipping device."
                     );
-                    resolver.on_unkeyable_devices(UnkeyableDevice::SessionSetup, 1);
                     if first_error.is_none() {
                         first_error = Some(anyhow::Error::new(error));
                     }
@@ -787,6 +857,7 @@ pub async fn ensure_sessions_for_devices(
         had_unregistered_device: had_406,
         rejected_devices,
         first_error,
+        unkeyed_devices,
     })
 }
 
@@ -839,6 +910,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
         plan,
     )
     .await?;
+    let unkeyed_at_encrypt = raw.unkeyed_at_encrypt;
 
     // Map each ciphertext to the message path's `<to><enc>` node, preserving the
     // raw fan-out order so the wire output is identical to the pre-split path.
@@ -863,6 +935,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
             rejected_devices: raw.rejected_devices.clone(),
         },
         first_error,
+        unkeyed_at_encrypt,
     })
 }
 
@@ -910,10 +983,12 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         had_unregistered_device,
         rejected_devices,
         mut first_error,
+        unkeyed_devices,
     } = plan;
 
     let mut encrypted = Vec::with_capacity(devices.len());
     let mut includes_prekey_message = false;
+    let mut unkeyed_at_encrypt = 0u64;
 
     // The wire-order of `<to>` participants does not need to match the input
     // device order: WA Web's `phash` (computed both client and server side)
@@ -940,6 +1015,8 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             &mut encrypted,
             &mut includes_prekey_message,
             &mut first_error,
+            &unkeyed_devices,
+            &mut unkeyed_at_encrypt,
         );
     } else {
         // One task per chunk, not per device: the per-device fan-out allocated a
@@ -972,7 +1049,11 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             let mut session_store = stores.session_store.clone_box();
             let mut identity_store = stores.identity_store.clone_box();
 
-            in_flight.push(spawn_oneshot(runtime, async move {
+            // The chunk's size rides along so a chunk that never delivers can
+            // report how many devices it took down with it, instead of leaving
+            // the count to an estimate.
+            let chunk_len = (chunk_end - chunk_start) as u64;
+            let task = spawn_oneshot(runtime, async move {
                 let mut out = Vec::with_capacity(jobs.len());
                 for (addr, device_jid) in jobs {
                     out.push(
@@ -987,9 +1068,10 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                     );
                 }
                 out
-            }));
+            });
+            in_flight.push(async move { (chunk_len, task.await) });
         }
-        while let Some(spawn_result) = in_flight.next().await {
+        while let Some((chunk_len, spawn_result)) = in_flight.next().await {
             match spawn_result {
                 Ok(results) => {
                     for res in results {
@@ -998,6 +1080,8 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                             &mut encrypted,
                             &mut includes_prekey_message,
                             &mut first_error,
+                            &unkeyed_devices,
+                            &mut unkeyed_at_encrypt,
                         );
                     }
                 }
@@ -1005,9 +1089,9 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                     // A whole chunk drops (not one device); its members stay
                     // un-warm and are re-targeted next send.
                     log::warn!(
-                        "Encrypt chunk did not deliver a result; up to ~{} device(s) skipped this send.",
-                        total.div_ceil(num_chunks)
+                        "Encrypt chunk did not deliver a result; {chunk_len} device(s) skipped this send."
                     );
+                    unkeyed_at_encrypt += chunk_len;
                     if first_error.is_none() {
                         first_error = Some(anyhow::Error::new(error));
                     }
@@ -1022,6 +1106,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             includes_prekey_message,
             had_unregistered_device,
             rejected_devices,
+            unkeyed_at_encrypt,
         },
         first_error,
     })

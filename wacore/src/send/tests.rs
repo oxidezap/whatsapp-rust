@@ -4004,6 +4004,10 @@ mod mark_full_distribution_list {
         .await
         .expect("the send still succeeds; that part is parity and does not change");
 
+        // Exactly one entry, and this is also what pins the no-double-count
+        // rule: `bad` has no session, so it fails the encrypt fan-out too, and a
+        // fan-out that counted that failure would report one dropped device as
+        // both a session-setup drop and an encrypt drop.
         assert_eq!(
             resolver.captured_unkeyable(),
             vec![(crate::stats::UnkeyableDevice::SessionSetup, 1)],
@@ -4172,6 +4176,56 @@ mod mark_full_distribution_list {
             resolver.captured_unkeyable(),
             vec![(crate::stats::UnkeyableDevice::BatchRefused, 2)],
             "the whole batch is one refusal covering both devices"
+        );
+    }
+
+    /// A fetch that never answered — a timeout, a dropped socket, a 429 —
+    /// leaves the same devices unkeyed as a refusal does, and a best-effort
+    /// group send carries on without distributing to any of them. Counting only
+    /// the refusal would make the signal go quiet during the outage.
+    #[tokio::test]
+    async fn a_fetch_that_never_answered_counts_every_device_it_asked_about() {
+        let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let second: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+        let resolver = MockSendContextResolver::new().with_prekey_error(503);
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        // `expect_err` would need SessionPlan: Debug, which it has no other
+        // reason to carry.
+        assert!(
+            ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[first, second]
+            )
+            .await
+            .is_err(),
+            "a non-406 batch failure still fails the session half"
+        );
+
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::FetchFailed, 2)],
+            "both devices the fetch asked about are counted, under a reason that \
+             claims nothing about them"
         );
     }
 
@@ -4768,6 +4822,61 @@ mod local_identity_change_on_send {
 
         assert_eq!(raw.devices.len(), 1);
         assert_eq!(raw.devices[0].device_jid, device_ok);
+        // `assume_ready` ran no session setup, so nothing has counted this
+        // device yet and the fan-out is the first thing to see it dropped.
+        assert_eq!(raw.unkeyed_at_encrypt, 1);
+    }
+
+    /// A stored session that cannot be used is the failure session repair
+    /// exists for, and the fan-out is the only place that sees it: session
+    /// setup skips the device because `has_session` says one is there.
+    ///
+    /// This is also why the "already counted" set names devices instead of
+    /// testing the error: libsignal reports a degenerate stored session as
+    /// `SessionNotFound`, exactly like a device that has no session at all.
+    #[tokio::test]
+    async fn a_stored_session_that_cannot_be_used_is_counted_at_encrypt() {
+        let device = Jid::pn_device("15550000002", 0);
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut session_store = MemSessionStore::default();
+        let mut identity_store = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            known: HashMap::new(),
+        };
+        // A row that exists (so `has_session` is true) and carries no usable
+        // state, which is what an unusable stored session looks like.
+        session_store
+            .0
+            .insert(device.to_protocol_address(), Vec::new());
+
+        let mut prekey_store = UnusedPreKeyStore;
+        let signed_prekey_store = UnusedSignedPreKeyStore;
+        let mut sender_key_store = MemSenderKeyStore::default();
+        let mut stores = raw_fanout_stores(
+            &mut sender_key_store,
+            &mut session_store,
+            &mut identity_store,
+            &mut prekey_store,
+            &signed_prekey_store,
+        );
+
+        let devices = vec![device];
+        let raw = encrypt_for_devices_with_sessions_raw(
+            &TokioTestRuntime,
+            &mut stores,
+            &devices,
+            b"payload",
+            SessionPlan::assume_ready(devices.len()),
+        )
+        .await
+        .expect("the send carries on without the device");
+
+        assert!(raw.devices.is_empty());
+        assert_eq!(
+            raw.unkeyed_at_encrypt, 1,
+            "the drop nobody else can see must be the one this counter reports"
+        );
     }
 
     /// Regression: the chunked fan-out must return empty, not divide by zero, for

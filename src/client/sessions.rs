@@ -464,7 +464,13 @@ impl Client {
                 self.invalidate_device_caches_for(jids).await;
                 return Err(e);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Same devices left unkeyed as a refusal leaves, for a reason
+                // that names none of them: a timeout, a dropped socket, a 429.
+                self.stats
+                    .record_unkeyable_devices(UnkeyableDevice::FetchFailed, jids.len() as u64);
+                return Err(e);
+            }
         };
 
         // The server named these individually, which is the per-device signal a
@@ -773,6 +779,51 @@ mod tests {
             "a batch refusal must not carry the label of a named rejection"
         );
         assert_eq!(client.stats().devices_unkeyed_no_bundle, 0);
+    }
+
+    /// A fetch that fails for anything other than a 406 leaves the same devices
+    /// unkeyed and refuses none of them, so it gets its own reason instead of
+    /// counting nothing.
+    #[tokio::test]
+    async fn a_fetch_that_never_answered_is_counted_apart_from_a_refusal() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::pn_device("5511900000065", 0);
+
+        let fetch = tokio::spawn({
+            let client = client.clone();
+            let jids = vec![peer];
+            async move { client.fetch_and_establish_sessions(&jids).await }
+        });
+
+        let iq = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request_id = iq
+            .get()
+            .attrs()
+            .optional_string("id")
+            .expect("the prekey fetch carries an id")
+            .into_owned();
+        let unavailable = NodeBuilder::new("iq")
+            .attr("id", request_id.as_str())
+            .attr("type", "error")
+            .children([NodeBuilder::new("error")
+                .attr("code", "503")
+                .attr("text", "service-unavailable")
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &request_id, &unavailable).await;
+
+        fetch
+            .await
+            .expect("join")
+            .expect_err("a failed fetch still fails the establish");
+
+        let stats = client.stats();
+        assert_eq!(stats.devices_unkeyed_fetch_failed, 1);
+        assert_eq!(
+            stats.devices_unkeyed_rejected, 0,
+            "an outage refuses nobody; calling it a rejection would send the \
+             reader looking for a device that is gone"
+        );
     }
 
     /// The other half of the same response: a device the server simply omits.

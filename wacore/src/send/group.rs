@@ -429,7 +429,17 @@ pub async fn prepare_group_stanza(
                 Ok(EncryptAttempt {
                     result,
                     first_error,
+                    unkeyed_at_encrypt,
                 }) => {
+                    // The SKDM fan-out is the last place a group member can be
+                    // dropped, and it happens before the Required check below
+                    // can turn the send into an error.
+                    if unkeyed_at_encrypt > 0 {
+                        resolver.on_unkeyable_devices(
+                            crate::stats::UnkeyableDevice::Encrypt,
+                            unkeyed_at_encrypt,
+                        );
+                    }
                     let EncryptResult {
                         participant_nodes,
                         includes_prekey_message: result_includes_prekey,

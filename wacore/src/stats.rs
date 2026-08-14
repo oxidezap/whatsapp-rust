@@ -66,6 +66,18 @@ pub enum UnkeyableDevice {
     /// attribution: the refusal names nobody, so a registered device can sit in
     /// a batch that is counted this way.
     BatchRefused,
+    /// The prekey fetch produced no answer at all — a timeout, a transport
+    /// failure, or a server error that is not a refusal of these devices (429,
+    /// 5xx). Separate from [`BatchRefused`](Self::BatchRefused) because that one
+    /// says something about the devices and this one says the server never got
+    /// around to saying anything.
+    FetchFailed,
+    /// The encrypt fan-out itself could not produce ciphertext for the device:
+    /// a stored session that exists and cannot be used, or a fan-out task that
+    /// died with its whole chunk. A device that reached the fan-out with no
+    /// session is *not* counted here — [`SessionSetup`](Self::SessionSetup) or
+    /// one of the fetch reasons already owns it.
+    Encrypt,
 }
 
 impl UnkeyableDevice {
@@ -84,6 +96,8 @@ impl UnkeyableDevice {
             Self::Rejected(500..=599) => "rejected_5xx",
             Self::Rejected(_) => "rejected_other",
             Self::BatchRefused => "refused_batch",
+            Self::FetchFailed => "fetch_failed",
+            Self::Encrypt => "encrypt",
         }
     }
 }
@@ -110,6 +124,8 @@ pub struct SessionStats {
     devices_unkeyed_no_bundle: AtomicU64,
     devices_unkeyed_session_setup: AtomicU64,
     devices_unkeyed_rejected: AtomicU64,
+    devices_unkeyed_fetch_failed: AtomicU64,
+    devices_unkeyed_encrypt: AtomicU64,
     reconnects: AtomicU64,
     /// Timestamp (ms since UNIX epoch) of the last received WebSocket data.
     /// WA Web: `parseAndHandleStanza` → `deadSocketTimer.cancel()`.
@@ -160,6 +176,15 @@ pub struct StatsSnapshot {
     /// and between named and batch-wide, is on the `metrics` facade, which has
     /// labels.
     pub devices_unkeyed_rejected: u64,
+    /// Keying attempts whose prekey fetch never produced an answer: a timeout,
+    /// a transport failure, or a server error that refuses nothing in
+    /// particular. This is the one that moves during an outage.
+    pub devices_unkeyed_fetch_failed: u64,
+    /// Keying attempts that had a session and still produced no ciphertext.
+    /// Unlike the other three this one is not about the server: a non-zero
+    /// value points at stored session state, which is what session repair
+    /// operates on.
+    pub devices_unkeyed_encrypt: u64,
     /// Reconnect attempts started by the auto-reconnect loop.
     pub reconnects: u64,
     /// Consecutive reconnect failures (resets on success).
@@ -178,6 +203,8 @@ impl StatsSnapshot {
         self.devices_unkeyed_no_bundle
             + self.devices_unkeyed_session_setup
             + self.devices_unkeyed_rejected
+            + self.devices_unkeyed_fetch_failed
+            + self.devices_unkeyed_encrypt
     }
 }
 
@@ -290,12 +317,20 @@ impl SessionStats {
     /// disagree about what happened.
     #[inline]
     pub fn record_unkeyable_devices(&self, reason: UnkeyableDevice, count: u64) {
+        // Callers that pass a tally rather than a known-nonzero event get the
+        // "nothing went wrong" case for free, without an atomic or a metrics
+        // lookup.
+        if count == 0 {
+            return;
+        }
         let counter = match reason {
             UnkeyableDevice::NoBundle => &self.devices_unkeyed_no_bundle,
             UnkeyableDevice::SessionSetup => &self.devices_unkeyed_session_setup,
             UnkeyableDevice::Rejected(_) | UnkeyableDevice::BatchRefused => {
                 &self.devices_unkeyed_rejected
             }
+            UnkeyableDevice::FetchFailed => &self.devices_unkeyed_fetch_failed,
+            UnkeyableDevice::Encrypt => &self.devices_unkeyed_encrypt,
         };
         counter.fetch_add(count, Ordering::Relaxed);
         crate::telemetry::unkeyable_device(reason.label(), count);
@@ -340,6 +375,8 @@ impl SessionStats {
                 .devices_unkeyed_session_setup
                 .load(Ordering::Relaxed),
             devices_unkeyed_rejected: self.devices_unkeyed_rejected.load(Ordering::Relaxed),
+            devices_unkeyed_fetch_failed: self.devices_unkeyed_fetch_failed.load(Ordering::Relaxed),
+            devices_unkeyed_encrypt: self.devices_unkeyed_encrypt.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
             reconnect_errors: 0,
             resends_throttled: 0,
@@ -918,16 +955,27 @@ mod tests {
         stats.record_unkeyable_devices(UnkeyableDevice::Rejected(406), 4);
         stats.record_unkeyable_device(UnkeyableDevice::Rejected(503));
         stats.record_unkeyable_devices(UnkeyableDevice::BatchRefused, 2);
+        stats.record_unkeyable_devices(UnkeyableDevice::FetchFailed, 3);
+        stats.record_unkeyable_device(UnkeyableDevice::Encrypt);
+        stats.record_unkeyable_devices(UnkeyableDevice::Encrypt, 0);
 
         let snap = stats.snapshot();
         assert_eq!(snap.devices_unkeyed_no_bundle, 1);
         assert_eq!(snap.devices_unkeyed_session_setup, 1);
         assert_eq!(
+            snap.devices_unkeyed_fetch_failed, 3,
+            "an outage is its own field: it refuses nothing and answers nothing"
+        );
+        assert_eq!(
             snap.devices_unkeyed_rejected, 7,
             "a batch refusal is a refusal: it shares the snapshot total and \
              only the metrics label separates it"
         );
-        assert_eq!(snap.devices_unkeyed_total(), 9);
+        assert_eq!(
+            snap.devices_unkeyed_encrypt, 1,
+            "a zero-count tally must not move a counter"
+        );
+        assert_eq!(snap.devices_unkeyed_total(), 13);
 
         assert_eq!(SessionStats::new().snapshot().devices_unkeyed_total(), 0);
     }
@@ -955,6 +1003,8 @@ mod tests {
             UnkeyableDevice::BatchRefused.label(),
             UnkeyableDevice::Rejected(406).label()
         );
+        assert_eq!(UnkeyableDevice::FetchFailed.label(), "fetch_failed");
+        assert_eq!(UnkeyableDevice::Encrypt.label(), "encrypt");
     }
 
     #[test]
