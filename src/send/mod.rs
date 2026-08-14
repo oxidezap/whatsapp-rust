@@ -54,6 +54,13 @@ pub enum SendError {
     /// (e.g. a newsletter JID on the E2E path, an empty status recipient list).
     #[error("invalid send request: {0}")]
     InvalidRequest(String),
+    /// A DM could not be encrypted for a single device of the recipient, so
+    /// nothing was sent. Distinct from a transport failure: the connection is
+    /// fine and the message id was never on the wire, so the useful retry is
+    /// one that resolves the device list again
+    /// ([`crate::cache::Freshness::Refresh`]) rather than an immediate resend.
+    #[error("{0}")]
+    NoRecipientDevice(#[source] wacore::send::NoRecipientDeviceError),
     /// Catch-all for internal send failures (Signal encrypt, protobuf, group
     /// resolution) that have no dedicated variant yet. `Display` forwards to
     /// the inner error while `source()` still exposes it for downcast.
@@ -73,6 +80,13 @@ impl SendError {
         // stays matchable instead of collapsing into `Internal`.
         let err = match err.downcast::<SendError>() {
             Ok(send) => return send,
+            Err(other) => other,
+        };
+        // A DM that reached no device of its recipient is not an internal
+        // failure: the caller decides whether to refresh devices and retry, so
+        // it must be able to match on it instead of parsing a message.
+        let err = match err.downcast::<wacore::send::NoRecipientDeviceError>() {
+            Ok(no_recipient) => return SendError::NoRecipientDevice(no_recipient),
             Err(other) => other,
         };
         // A group-metadata IQ in the send path (e.g. query_info) bubbles up as
@@ -2539,6 +2553,7 @@ impl Client {
                 self,
                 wacore::send::DmStanzaRequest {
                     own_jid,
+                    own_lid: device_snapshot.lid.as_ref(),
                     account: device_snapshot.account.as_deref(),
                     to: &stanza_to,
                     message,
@@ -2744,6 +2759,40 @@ mod tests {
         ));
         assert!(validate_status_message_id(&revoke, Some("3EB0NEWSTANZAID")).is_ok());
         assert!(validate_status_message_id(&revoke, None).is_ok());
+    }
+
+    /// A DM that reached none of the recipient's devices must arrive at the
+    /// caller as its own variant. Folded into `Internal`, a gateway can only
+    /// tell it from a protobuf bug by matching on a message string.
+    #[test]
+    fn a_dm_with_no_recipient_device_stays_typed_through_the_send_path() {
+        use wacore::send::NoRecipientDeviceError;
+
+        let failed: anyhow::Error = NoRecipientDeviceError::EncryptionFailed {
+            attempted: 2,
+            source: anyhow!("session with 5511900000099:1 not found"),
+        }
+        .into();
+        // Wrapped the way the send path bubbles it: through `?` under context.
+        let mapped = SendError::from_anyhow(failed.context("sending dm"));
+        let SendError::NoRecipientDevice(NoRecipientDeviceError::EncryptionFailed {
+            attempted,
+            ..
+        }) = &mapped
+        else {
+            panic!("expected NoRecipientDevice, got {mapped:?}");
+        };
+        assert_eq!(*attempted, 2);
+
+        let unresolved = SendError::from_anyhow(NoRecipientDeviceError::Unresolved.into());
+        assert!(matches!(
+            unresolved,
+            SendError::NoRecipientDevice(NoRecipientDeviceError::Unresolved)
+        ));
+        assert!(
+            std::error::Error::source(&unresolved).is_some(),
+            "the typed cause must stay in the source chain"
+        );
     }
 
     #[test]

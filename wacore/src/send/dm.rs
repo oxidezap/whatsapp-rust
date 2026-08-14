@@ -69,6 +69,43 @@ impl PartitionedDmDevices {
     }
 }
 
+/// A DM that could not carry a single `<enc>` for its recipient, so it was not
+/// sent at all.
+///
+/// The recipient half of the fan-out and our own companion half write into one
+/// participant list, so "some device encrypted" is not the same question as
+/// "the recipient can read this": a stanza built from the own half alone is
+/// acked by the server and delivered to nobody. Both shapes below mean the same
+/// thing to the caller: nothing reached the recipient, and the device list is
+/// the suspect, so a retry is worth making with a forced device refresh.
+#[derive(Debug, thiserror::Error)]
+pub enum NoRecipientDeviceError {
+    /// Every device resolved for the recipient failed to encrypt. `source` is
+    /// the first of those failures (missing session, refused pre-key bundle).
+    #[error("encryption failed for all {attempted} recipient device(s)")]
+    EncryptionFailed {
+        attempted: usize,
+        #[source]
+        source: anyhow::Error,
+    },
+    /// The fan-out held no device for the recipient to begin with. Distinct
+    /// from the above: nothing was attempted, so there is no per-device cause.
+    #[error("no device resolved for the recipient")]
+    Unresolved,
+}
+
+impl NoRecipientDeviceError {
+    fn encryption_failed(attempted: usize, source: Option<anyhow::Error>) -> Self {
+        Self::EncryptionFailed {
+            attempted,
+            // A device can also drop out without an error (an encrypt that
+            // produced an unsupported ciphertext type), so the source is
+            // synthesised rather than left absent.
+            source: source.unwrap_or_else(|| anyhow!("no recipient device produced a ciphertext")),
+        }
+    }
+}
+
 /// Result of `prepare_dm_stanza` — carries the stanza node and the
 /// locally computed phash for server ACK validation.
 pub struct PreparedDmStanza {
@@ -85,6 +122,10 @@ pub struct PreparedDmStanza {
 
 pub struct DmStanzaRequest<'a> {
     pub own_jid: &'a Jid,
+    /// Our own LID, when known. Same value the fan-out was partitioned with, so
+    /// the self-chat check below classifies the destination exactly the way
+    /// `partition_dm_devices` classified its devices.
+    pub own_lid: Option<&'a Jid>,
     pub account: Option<&'a wa::ADVSignedDeviceIdentity>,
     pub to: &'a Jid,
     pub message: &'a wa::Message,
@@ -110,6 +151,7 @@ pub async fn prepare_dm_stanza(
 ) -> Result<PreparedDmStanza> {
     let DmStanzaRequest {
         own_jid,
+        own_lid,
         account,
         to: to_jid,
         message,
@@ -212,6 +254,22 @@ pub async fn prepare_dm_stanza(
         )
         .await?;
         includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
+        // The recipient half wrote into an empty buffer, so an emptiness test
+        // here is a recipient-node count without walking anything. Bailing
+        // before the own half also keeps a companion's sender chain from
+        // advancing for a stanza that is not going out.
+        if participant_nodes.is_empty() {
+            return Err(NoRecipientDeviceError::encryption_failed(
+                recipient_devices.len(),
+                summary.first_error,
+            )
+            .into());
+        }
+    } else if !to_jid.matches_user_or_lid(own_jid, own_lid) {
+        // No recipient half at all. For a self-chat that is the normal shape
+        // (every resolved device is ours, and the own-devices copy IS the
+        // message); for anyone else the fan-out lost them.
+        return Err(NoRecipientDeviceError::Unresolved.into());
     }
 
     if !own_other_devices.is_empty() {
@@ -229,12 +287,13 @@ pub async fn prepare_dm_stanza(
         includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
     }
 
-    // All per-device encrypts failed: an empty <participants> would silently
-    // drop the message. WA Web's encryptAndSendUserMsg rejects here too.
-    let attempted_devices = total_devices;
-    if participant_nodes.is_empty() && attempted_devices > 0 {
+    // Only reachable for a self-chat now (the recipient half returns above):
+    // every own device failed, and an empty <participants> would silently drop
+    // the message. WA Web's encryptAndSendUserMsg rejects an empty success set
+    // too, though it does not distinguish the two halves.
+    if participant_nodes.is_empty() && total_devices > 0 {
         return Err(anyhow!(
-            "encryption failed for all {attempted_devices} recipient device(s)"
+            "encryption failed for all {total_devices} own device(s)"
         ));
     }
 

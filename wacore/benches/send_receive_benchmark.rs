@@ -947,6 +947,7 @@ fn run_dm_fanout(d: &mut DmFanoutData) {
         &d.resolver,
         DmStanzaRequest {
             own_jid: &own_jid,
+            own_lid: None,
             account: Some(&d.account),
             to: &d.to_jid,
             message: &d.msg,

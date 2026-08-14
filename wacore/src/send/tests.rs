@@ -4942,6 +4942,7 @@ mod local_identity_change_on_send {
                 &resolver,
                 DmStanzaRequest {
                     own_jid: &own_jid,
+                    own_lid: None,
                     account: None,
                     to: &to,
                     message: &message,
@@ -4988,14 +4989,17 @@ mod local_identity_change_on_send {
             );
         }
 
-        /// The empty-participants guard still fires when every device drops
-        /// out: an empty `<participants>` would silently drop the message.
-        #[tokio::test]
-        async fn a_dm_whose_every_device_fails_is_refused() {
-            let own_jid: Jid = "5511900000020:0@s.whatsapp.net".parse().unwrap();
-            let recipient: Jid = "5511900000021:0@s.whatsapp.net".parse().unwrap();
-
-            let (mut session_store, mut identity_store) = stores_with_sessions(&[]).await;
+        /// Every case below runs through the real fan-out; only the device set,
+        /// the sessions we hold and the bundles the resolver refuses change.
+        async fn prepare_dm(
+            own_jid: &Jid,
+            to: &Jid,
+            devices: &ResolvedDmDevices,
+            with_sessions: &[Jid],
+            missing_bundles: &[Jid],
+            message_id: &str,
+        ) -> Result<PreparedDmStanza, anyhow::Error> {
+            let (mut session_store, mut identity_store) = stores_with_sessions(with_sessions).await;
             let mut prekey_store = UnusedPreKeyStore;
             let signed_prekey_store = UnusedSignedPreKeyStore;
             let mut sender_key_store = MemSenderKeyStore::default();
@@ -5006,30 +5010,53 @@ mod local_identity_change_on_send {
                 &mut prekey_store,
                 &signed_prekey_store,
             );
-            let resolver = MockSendContextResolver::new().with_missing_bundle(recipient.clone());
-            let devices =
-                ResolvedDmDevices::new(vec![recipient.clone(), own_jid.clone()], &own_jid, None);
-            let to = recipient.to_non_ad();
+            let resolver = missing_bundles
+                .iter()
+                .fold(MockSendContextResolver::new(), |resolver, device| {
+                    resolver.with_missing_bundle(device.clone())
+                });
             let message = wa::Message {
                 conversation: Some("hi".into()),
                 ..Default::default()
             };
 
-            let err = prepare_dm_stanza(
+            prepare_dm_stanza(
                 &TokioTestRuntime,
                 &mut stores,
                 &resolver,
                 DmStanzaRequest {
-                    own_jid: &own_jid,
+                    own_jid,
+                    own_lid: None,
                     account: None,
-                    to: &to,
+                    to,
                     message: &message,
-                    message_id: "DM_SINK_2",
+                    message_id,
                     edit: None,
                     extra_nodes: &[],
-                    devices: &devices,
+                    devices,
                     pre_encoded: None,
                 },
+            )
+            .await
+        }
+
+        /// The empty-participants guard still fires when every device drops
+        /// out: an empty `<participants>` would silently drop the message.
+        #[tokio::test]
+        async fn a_dm_whose_every_device_fails_is_refused() {
+            let own_jid: Jid = "5511900000020:0@s.whatsapp.net".parse().unwrap();
+            let recipient: Jid = "5511900000021:0@s.whatsapp.net".parse().unwrap();
+
+            let devices =
+                ResolvedDmDevices::new(vec![recipient.clone(), own_jid.clone()], &own_jid, None);
+
+            let err = prepare_dm(
+                &own_jid,
+                &recipient.to_non_ad(),
+                &devices,
+                &[],
+                std::slice::from_ref(&recipient),
+                "DM_SINK_2",
             )
             .await
             .err()
@@ -5037,6 +5064,175 @@ mod local_identity_change_on_send {
             assert!(
                 err.to_string().contains("encryption failed for all"),
                 "unexpected error: {err}"
+            );
+        }
+
+        /// Regression (issue #1298): the recipient's devices and our own
+        /// companions share one participant list, so "the list is not empty"
+        /// still held for a stanza carrying our own devices alone. That stanza
+        /// is acked, no receipt ever follows, and the caller was told `Ok`.
+        #[tokio::test]
+        async fn a_dm_no_recipient_device_encrypted_is_not_reported_as_sent() {
+            let own_jid: Jid = "5511900000030:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000030:2@s.whatsapp.net".parse().unwrap();
+            let recipient_primary: Jid = "5511900000031:0@s.whatsapp.net".parse().unwrap();
+            let recipient_companion: Jid = "5511900000031:1@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ],
+                &own_jid,
+                None,
+            );
+
+            let err = prepare_dm(
+                &own_jid,
+                &recipient_primary.to_non_ad(),
+                &devices,
+                std::slice::from_ref(&own_companion),
+                &[recipient_primary.clone(), recipient_companion.clone()],
+                "DM_SINK_3",
+            )
+            .await
+            .err()
+            .expect("a DM that reached no recipient device must not report success");
+
+            let typed = err
+                .downcast_ref::<NoRecipientDeviceError>()
+                .expect("the caller must be able to match on this, not parse it");
+            assert!(
+                matches!(
+                    typed,
+                    NoRecipientDeviceError::EncryptionFailed { attempted: 2, .. }
+                ),
+                "unexpected variant: {typed:?}"
+            );
+            assert!(
+                std::error::Error::source(typed).is_some(),
+                "the first per-device failure must stay reachable as the source"
+            );
+        }
+
+        /// One surviving recipient device is a real delivery: the stanza goes
+        /// out with the devices that encrypted, the failures are skipped, and
+        /// the caller still gets `Ok`.
+        #[tokio::test]
+        async fn a_dm_with_one_recipient_device_left_still_sends() {
+            let own_jid: Jid = "5511900000040:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000040:1@s.whatsapp.net".parse().unwrap();
+            let reachable: Jid = "5511900000041:0@s.whatsapp.net".parse().unwrap();
+            let unreachable: Jid = "5511900000041:3@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![
+                    reachable.clone(),
+                    unreachable.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &reachable.to_non_ad(),
+                &devices,
+                &[reachable.clone(), own_companion.clone()],
+                std::slice::from_ref(&unreachable),
+                "DM_SINK_4",
+            )
+            .await
+            .expect("a partially encrypted DM is still sent");
+
+            let entries = prepared
+                .node
+                .get_optional_child("participants")
+                .expect("stanza has a participants node")
+                .children()
+                .expect("participants has children");
+            assert_eq!(
+                participant_jids(entries),
+                vec![reachable.to_string(), own_companion.to_string()],
+                "the stanza carries what encrypted, recipients first"
+            );
+        }
+
+        /// A note to self has no recipient half at all: every resolved device is
+        /// ours and the own-devices copy IS the message, so this must not be
+        /// mistaken for a DM that lost its recipient.
+        #[tokio::test]
+        async fn a_self_chat_dm_carries_only_own_devices() {
+            let own_jid: Jid = "5511900000050:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000050:1@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![own_companion.clone(), own_jid.clone()],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &own_jid.to_non_ad(),
+                &devices,
+                std::slice::from_ref(&own_companion),
+                &[],
+                "DM_SINK_5",
+            )
+            .await
+            .expect("a self chat sends to our own companions");
+
+            let entries = prepared
+                .node
+                .get_optional_child("participants")
+                .expect("stanza has a participants node")
+                .children()
+                .expect("participants has children");
+            assert_eq!(
+                participant_jids(entries),
+                vec![own_companion.to_string()],
+                "only our own companion is addressable in a self chat"
+            );
+        }
+
+        /// The same empty recipient half with a destination that is not us: the
+        /// fan-out kept no device for them, so nothing was attempted and there
+        /// is nothing to deliver.
+        #[tokio::test]
+        async fn a_dm_whose_recipient_resolved_to_no_device_is_refused() {
+            let own_jid: Jid = "5511900000060:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000060:1@s.whatsapp.net".parse().unwrap();
+            let recipient: Jid = "5511900000061:0@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![own_companion.clone(), own_jid.clone()],
+                &own_jid,
+                None,
+            );
+
+            let err = prepare_dm(
+                &own_jid,
+                &recipient.to_non_ad(),
+                &devices,
+                std::slice::from_ref(&own_companion),
+                &[],
+                "DM_SINK_6",
+            )
+            .await
+            .err()
+            .expect("a DM with no recipient device must not report success");
+
+            assert!(
+                matches!(
+                    err.downcast_ref::<NoRecipientDeviceError>(),
+                    Some(NoRecipientDeviceError::Unresolved)
+                ),
+                "unexpected error: {err:#}"
             );
         }
     }

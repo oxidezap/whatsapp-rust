@@ -386,6 +386,11 @@ pub struct EncryptFanoutSummary {
     pub includes_prekey_message: bool,
     /// True if any device returned 406 (unregistered) during prekey fetch.
     pub had_unregistered_device: bool,
+    /// First failure of the fan-out (session, prekey fetch or spawn), or `None`
+    /// when every device produced a node. Already computed for the group path's
+    /// [`EncryptAttempt`], so a caller that turns "nothing encrypted" into an
+    /// error can name the cause instead of reporting a bare count.
+    pub first_error: Option<anyhow::Error>,
 }
 
 /// [`encrypt_for_devices`] for a caller that already owns the buffer the nodes
@@ -409,9 +414,10 @@ pub async fn encrypt_for_devices_into(
     participant_nodes: &mut Vec<Node>,
 ) -> Result<EncryptFanoutSummary> {
     let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
-    // `first_error` is dropped here exactly as `encrypt_for_devices` drops it:
-    // a DM reports failure through the empty-participants check, not per device.
-    let RawEncryptAttempt { result: raw, .. } = encrypt_for_devices_with_sessions_raw_detailed(
+    let RawEncryptAttempt {
+        result: raw,
+        first_error,
+    } = encrypt_for_devices_with_sessions_raw_detailed(
         runtime,
         stores,
         devices,
@@ -432,6 +438,7 @@ pub async fn encrypt_for_devices_into(
     Ok(EncryptFanoutSummary {
         includes_prekey_message: raw.includes_prekey_message,
         had_unregistered_device: raw.had_unregistered_device,
+        first_error,
     })
 }
 
