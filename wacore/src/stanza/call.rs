@@ -680,12 +680,11 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     )
 }
 
-/// The rotation the stanzas below announce.
+/// The rotation an offer, accept or preaccept announces.
 ///
-/// Upright, and not a parameter: an offer, an accept and a preaccept are all
-/// built before the call has a `CallHandle`, so nothing could have announced a
-/// rotation for it yet. The first one an app sets reaches the peer as a
-/// `<video>` of its own, through `CallHandle::set_video_orientation`.
+/// Upright, and not a parameter: none of them has a `CallHandle` yet, so no
+/// rotation can have been set for the call they open. `CallHandle::set_video_orientation`
+/// is where one is set and what carries it from there.
 const INITIAL_DEVICE_ORIENTATION: &str = "0";
 
 /// Default initiator-side geometry used by the WaCalls reference.

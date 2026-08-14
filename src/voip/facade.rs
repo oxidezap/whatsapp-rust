@@ -3375,24 +3375,15 @@ impl CallHandle {
     }
 
     /// Announce this side's camera rotation to the peer, as quarter turns in
-    /// `0..=3` carried by `<video device_orientation>`.
+    /// `0..=3`. See `CallEntry::self_video_orientation` for what the value is
+    /// and what it is not.
     ///
-    /// Every `<video>` this call sends from now on carries the value, so a
-    /// rotation set before video starts is announced by the stanza that starts
-    /// it. While video is running the change is announced immediately, with a
-    /// `<video state=1>` that re-states the current state — which is what the
-    /// peer's own rotations arrive as, and what makes it a no-op there beyond
-    /// the new orientation.
-    ///
-    /// Not the peer's rotation: that arrives on `<video>` from them and is
-    /// applied to the frames they send. The two are independent, and this sets
-    /// neither of the other's.
-    ///
-    /// The stanzas that open a call — offer, accept, preaccept, a call-link join
-    /// — announce upright, because they are built before this handle exists and
-    /// nothing could have set a rotation for them. An app that starts rotated
-    /// calls this once the handle is in hand, and the `<video>` it sends is what
-    /// corrects the peer.
+    /// Every `<video>` this call sends from now on carries it. While video is
+    /// running the change is announced at once, as a `<video state=1>` that
+    /// re-states the current state: that is the shape the peer's own rotations
+    /// arrive in, and a no-op there beyond the new orientation. A call still
+    /// ringing has nobody to tell — the peer has no call entry to apply it
+    /// against — so the value waits and is announced when they answer.
     ///
     /// `Err` when the call is over, when the value is out of range, or when the
     /// stanza could not be sent. A value rejected for range is not stored.
@@ -3426,13 +3417,22 @@ impl CallHandle {
             return Err(CallError::Media("call no longer active"));
         }
 
-        // Nothing to announce until there is a direction to announce it for. The
-        // value is kept either way, so the stanza that enables video carries it.
-        let sending_video = self
+        // Nothing to announce until there is a direction to announce it for, and
+        // nobody to announce it to until the call is answered: a video-from-start
+        // offer sets `self_state` to Enabled while the peer is still ringing, and
+        // it has no call entry to apply a `<video>` against, so one sent now is
+        // dropped. The value is kept either way — `announce_orientation_on_accept`
+        // sends it when the peer answers, and the stanza that enables video
+        // carries it for every other path.
+        let announceable = self
             .client_registry
             .video_states(&self.call_id, self.generation)
-            .is_some_and(|(self_state, _)| self_state == VideoState::Enabled);
-        if !sending_video {
+            .is_some_and(|(self_state, _)| self_state == VideoState::Enabled)
+            && self
+                .client_registry
+                .phase_if_current(&self.call_id, self.generation)
+                .is_some_and(|phase| phase != CallPhase::Ringing);
+        if !announceable {
             return Ok(());
         }
 
@@ -8258,6 +8258,13 @@ mod tests {
             handle.generation,
             VideoState::UpgradeAccept,
         );
+        // Answered: a call still ringing has no entry on the peer's side to
+        // apply a `<video>` against, and deliberately sends none.
+        assert!(client.call_registry().transition_if_current(
+            "CID-FACADE",
+            handle.generation,
+            CallPhase::Connecting
+        ));
 
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
         handle.set_video_orientation(1).await.expect("rotate");
@@ -8274,6 +8281,61 @@ mod tests {
             Some("1")
         );
         handle.hangup().await;
+    }
+
+    /// Every mutating method on `CallHandle` refuses a handle a replacement has
+    /// superseded, and a rotation is no exception: it would otherwise write the
+    /// live call's orientation from a handle that no longer owns it.
+    #[tokio::test]
+    async fn a_stale_handle_cannot_rotate_the_replacement() {
+        let client = make_client().await;
+        let spawn = |_client: &Client| {
+            let (_relay_tx, relay_rx) = async_channel::unbounded();
+            let factory = MockFactory {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                relay_rx: Mutex::new(Some(relay_rx)),
+                connects: Arc::new(AtomicUsize::new(0)),
+            };
+            let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+            let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+            (factory, Arc::new(mic_rx), Arc::new(spk_tx))
+        };
+
+        let (f1, mic1, spk1) = spawn(&client);
+        let stale = spawn_call(
+            &client,
+            mk_session(),
+            engine(),
+            &f1,
+            pcm_audio(mic1, spk1),
+            None,
+        )
+        .await
+        .expect("first spawn_call");
+        let (f2, mic2, spk2) = spawn(&client);
+        let live = spawn_call(
+            &client,
+            mk_session(),
+            engine(),
+            &f2,
+            pcm_audio(mic2, spk2),
+            None,
+        )
+        .await
+        .expect("replacement spawn_call");
+
+        stale
+            .set_video_orientation(3)
+            .await
+            .expect_err("a superseded handle must not rotate the call");
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation(&stale.call_id, live.generation),
+            Some(0),
+            "the live call keeps the rotation it had"
+        );
+        live.hangup().await;
     }
 
     /// A camera does not un-rotate because a negotiation restarted. Six paths
@@ -8311,6 +8373,55 @@ mod tests {
                 .as_deref(),
             Some("3"),
             "restarting video must announce the rotation still in force"
+        );
+        handle.hangup().await;
+    }
+
+    /// A video-from-start offer leaves `self_state` Enabled while the peer is
+    /// still ringing, so the direction check alone would send a `<video>` the
+    /// peer has no call entry to apply — dropped, and never resent, because such
+    /// a caller sends no further video stanza of its own. The value waits for
+    /// the answer instead.
+    #[tokio::test]
+    async fn a_ringing_call_stores_the_rotation_without_announcing_it() {
+        let (client, sent, handle, _relay_keepalive) = sending_handle().await;
+        // What a video-from-start offer leaves behind: the direction is already
+        // Enabled, from the offer, while the call is still ringing. The direction
+        // check alone would take that for a call that can be told about a
+        // rotation.
+        assert!(
+            client
+                .call_registry()
+                .set_is_video("CID-FACADE", handle.generation, true)
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states("CID-FACADE", handle.generation)
+                .map(|(self_state, _)| self_state),
+            Some(VideoState::Enabled)
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .phase_if_current("CID-FACADE", handle.generation),
+            Some(CallPhase::Ringing),
+            "and still ringing, which is the case under test"
+        );
+
+        let before = sent.load(Ordering::SeqCst);
+        handle.set_video_orientation(2).await.expect("store it");
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            before,
+            "a ringing call has nobody to announce to"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation("CID-FACADE", handle.generation),
+            Some(2),
+            "and the rotation is kept for the answer"
         );
         handle.hangup().await;
     }

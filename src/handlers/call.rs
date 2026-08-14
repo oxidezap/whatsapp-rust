@@ -380,6 +380,16 @@ impl StanzaHandler for CallHandler {
                         client
                             .call_registry()
                             .send_rekey(call.action.call_id(), sender.to_string());
+                        if let Some(generation) =
+                            client.call_registry().generation_of(call.action.call_id())
+                        {
+                            announce_orientation_on_accept(
+                                &client,
+                                call.action.call_id(),
+                                generation,
+                            )
+                            .await;
+                        }
                     }
                     // Caller-side multi-device dismiss: when one of the callee's devices accepts or
                     // rejects an outbound call of ours, tell the rest to stop ringing.
@@ -986,6 +996,46 @@ async fn apply_current_group_control(client: &Client, call: &IncomingCall) -> bo
         return false;
     }
     apply_group_control(client, call, generation).await
+}
+
+#[cfg(feature = "voip-runtime")]
+/// Announce a rotation the app set while the call was still ringing.
+///
+/// A video-from-start offer carries `device_orientation="0"`, and its caller
+/// sends no further `<video>` of its own, so a rotation set between `start()`
+/// and the answer would never reach the peer: while ringing there is no call
+/// entry on their side to apply one against. Upright needs no stanza — that is
+/// what the offer already said.
+#[cfg(feature = "voip-runtime")]
+async fn announce_orientation_on_accept(client: &Arc<Client>, call_id: &str, generation: u64) {
+    let registry = client.call_registry();
+    let orientation = registry
+        .local_video_orientation(call_id, generation)
+        .unwrap_or(0);
+    if orientation == 0 {
+        return;
+    }
+    let sending_video = registry
+        .video_states(call_id, generation)
+        .is_some_and(|(self_state, _)| self_state == VideoState::Enabled);
+    if !sending_video {
+        return;
+    }
+    let Some(session) = registry.snapshot_if_current(call_id, generation) else {
+        return;
+    };
+    let stanza = build_video_state(&VideoStateParams {
+        call_id,
+        to: &session.call_creator,
+        id: &client.generate_request_id(),
+        call_creator: &session.call_creator,
+        state: VideoState::Enabled,
+        dec: Some("H264"),
+        device_orientation: Some(orientation),
+    });
+    if let Err(e) = client.send_node(stanza).await {
+        warn!("call: failed to announce video orientation after accept: {e}");
+    }
 }
 
 #[cfg(feature = "voip-runtime")]

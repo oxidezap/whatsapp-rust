@@ -52,10 +52,7 @@ pub struct GroupInviteOfferParams<'a> {
     pub target_devices: &'a [Jid],
     pub participants: &'a [GroupCallParticipant],
     pub video: bool,
-    /// The rotation this side announces, in `0..=3`. An invitation sent during a
-    /// call the local camera is already rotated for has to describe that camera,
-    /// or the invitee renders it sideways until the next rotation happens to
-    /// come along.
+    /// The rotation this side announces, in `0..=3`. Out of range is an error.
     pub device_orientation: u8,
 }
 
@@ -135,9 +132,8 @@ pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result
     let audio_rate = params.audio_rate.to_string();
     let mut children = vec![audio_opus(&audio_rate)];
     if params.video {
-        // Upright: the call being offered has no handle yet, so nothing could
-        // have announced a rotation for it. The first one an app sets reaches
-        // the peers as a `<video>` of its own.
+        // No handle exists for a call still being offered, so no rotation can
+        // have been set for it yet.
         children.push(video_offer_node(0));
     }
     children.push(NodeBuilder::new("net").attr("medium", "3").build());
@@ -169,6 +165,10 @@ pub fn build_group_invite_offer(params: &GroupInviteOfferParams<'_>) -> Result<N
     }
     if params.participants.is_empty() {
         bail!("group invite requires an active roster");
+    }
+
+    if params.device_orientation > 3 {
+        bail!("group invite device orientation must be quarter turns in 0..=3");
     }
 
     let mut children = vec![audio_opus("16000")];
@@ -704,8 +704,7 @@ pub fn build_call_link_join_with_capability(
         children.push(
             NodeBuilder::new("video")
                 .attr("dec", "H264")
-                // Upright: a join request is built before the call has a handle,
-                // so nothing could have announced a rotation for it yet.
+                // No handle exists yet for the call being joined.
                 .attr("device_orientation", "0")
                 .build(),
         );
