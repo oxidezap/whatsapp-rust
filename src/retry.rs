@@ -1003,6 +1003,10 @@ impl Client {
     /// `@g.us` and `status@broadcast` pass through as an opaque group_jid.
     async fn mark_requester_for_fresh_skdm(&self, info: &RetryChatInfo, resolved_jid: &Jid) {
         let group_jid = info.chat.to_string();
+        // A send marks its whole distribution list warm in its epilogue, under
+        // this same guard. Without it a cold mark can land mid-send and be
+        // overwritten by a device the send never actually distributed to.
+        let _distribution_guard = self.group_distribution_lock(&info.chat).await;
         match self
             .mark_forget_sender_key(&group_jid, std::slice::from_ref(resolved_jid))
             .await
@@ -1035,8 +1039,9 @@ impl Client {
     /// Mirrors WAWebUpdateLocalSignalSession (`WAWeb/Update/LocalSignalSession.js`)
     /// from its `processKeyBundle` step on; the preceding `markForgetSenderKey` is
     /// hoisted into `mark_requester_for_fresh_skdm`. Runs before ensureE2ESessions
-    /// + sendRetry for all chat types (DM, group, status). Order and semantics
-    /// match the WA Web implementation:
+    /// and sendRetry for all chat types (DM, group, status). Order and semantics
+    /// follow the WA Web implementation:
+    ///
     ///   1. processKeyBundle if `<keys>` present
     ///   2. If no bundle AND stored regId differs → delete session
     ///   3. retry == 2 → save current base key, return (no delete)
@@ -1045,8 +1050,10 @@ impl Client {
     /// Unlike the previous DM-only path, this does NOT unconditionally delete
     /// the session on every retry — WA Web preserves it on retry==1 and on
     /// retry>2 when the base key already changed (session was regenerated
-    /// legitimately). The subsequent `ensure_e2e_sessions_resolved` call in
-    /// `handle_retry_receipt` rebuilds any session this function deleted.
+    /// legitimately). A deleted session is rebuilt by the pairwise
+    /// `ensure_e2e_sessions_resolved` call in `retransmit_message_prepared`; the
+    /// status route instead rebuilds it inside `prepare_group_stanza` under
+    /// `SenderKeyDistributionPolicy::Required`.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.retry.update_local_session", level = "debug", skip_all, fields(chat = %info.chat.observe(), peer = %resolved_jid.observe(), retry = retry_count)))]
     async fn update_local_signal_session(
         &self,
@@ -3150,6 +3157,61 @@ mod tests {
         );
     }
 
+    /// A send marks its whole distribution list warm in its epilogue, under the
+    /// group distribution guard, so a cold mark that lands mid-send would be
+    /// overwritten by a device the send never distributed to. The repair takes
+    /// the same guard: it waits for the in-flight send and lands after it.
+    #[tokio::test]
+    async fn the_repair_waits_for_an_in_flight_group_distribution() {
+        let client = retry_repair_client("retry_repair_distribution_lock").await;
+        let group: Jid = "120363021033254954@g.us".parse().unwrap();
+        let group_key = group.to_string();
+        let participant = "555000555@lid";
+
+        client
+            .persistence_manager
+            .set_sender_key_status(&group_key, &[(participant, true)])
+            .await
+            .unwrap();
+
+        let guard = client.group_distribution_lock(&group).await;
+        let mut repair = {
+            let client = Arc::clone(&client);
+            let group = group.clone();
+            tokio::spawn(async move {
+                drive_group_retry(&client, &group, participant, "LOCKED001", false).await;
+            })
+        };
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut repair)
+                .await
+                .is_err(),
+            "the repair must not proceed while a send holds the distribution guard"
+        );
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(&group_key)
+                .await
+                .unwrap(),
+            vec![(participant.to_string(), true)],
+            "nothing is marked cold until the guard is released"
+        );
+
+        drop(guard);
+        repair.await.unwrap();
+        assert_eq!(
+            client
+                .persistence_manager
+                .get_sender_key_devices(&group_key)
+                .await
+                .unwrap(),
+            vec![(participant.to_string(), false)],
+            "the repair lands once the send releases the guard"
+        );
+    }
+
     /// WA Web's `hasDevice` gate returns from `handleRetryRequest` before
     /// `updateLocalSignalSession`, so an unknown device is not a repair trigger.
     /// The message is cached here, so only the gate can stop the repair.
@@ -3192,7 +3254,7 @@ mod tests {
         use wacore_binary::builder::NodeBuilder;
 
         let client = retry_repair_client("retry_repair_dm_miss").await;
-        let peer: Jid = "555000222@s.whatsapp.net".parse().unwrap();
+        let peer: Jid = "12025550122@s.whatsapp.net".parse().unwrap();
         let chat_key = peer.to_string();
 
         // A row keyed by the DM JID is not something the send path writes; it is
