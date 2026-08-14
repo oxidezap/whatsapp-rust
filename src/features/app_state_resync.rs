@@ -205,13 +205,32 @@ impl Client {
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.resync", level = "debug", skip_all, fields(mode = ?mode), err(Debug)))]
     pub async fn resync_app_state(
         &self,
         collections: impl IntoIterator<Item = WAPatchName>,
         mode: AppStateResyncMode,
     ) -> Result<AppStateResyncReport, AppStateError> {
         let collections: Vec<WAPatchName> = collections.into_iter().collect();
+        self.resync_app_state_boxed(collections, mode).await
+    }
+
+    // Keep the deep traced sync graph behind a crate boundary: downstream
+    // callers should not have to instantiate its concrete future type.
+    #[inline(never)]
+    fn resync_app_state_boxed(
+        &self,
+        collections: Vec<WAPatchName>,
+        mode: AppStateResyncMode,
+    ) -> wacore::runtime::BoxFuture<'_, Result<AppStateResyncReport, AppStateError>> {
+        Box::pin(self.resync_app_state_graph(collections, mode))
+    }
+
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.resync", level = "debug", skip_all, fields(mode = ?mode), err(Debug)))]
+    async fn resync_app_state_graph(
+        &self,
+        collections: Vec<WAPatchName>,
+        mode: AppStateResyncMode,
+    ) -> Result<AppStateResyncReport, AppStateError> {
         // Checked before the wait, not after: a caller with nothing to ask for
         // must not park until a connection it does not need shows up.
         if collections.is_empty() {
