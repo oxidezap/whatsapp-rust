@@ -1119,6 +1119,37 @@ impl Client {
         node: &NodeRef<'_>,
     ) {
         let signal_address = resolved_jid.to_protocol_address();
+
+        // Both branches below decide to delete from a session they just read,
+        // and retry receipts for different message_ids from the same peer
+        // dispatch concurrently, so reading outside the lock would let a resend
+        // rebuild the session in between and this delete take the new one. Hold
+        // the per-peer lock across read, decision and delete. Same shape, and
+        // the same lock, as the recreate check in the caller.
+        let reason = {
+            let lock = self.session_lock_for(signal_address.as_str()).await;
+            let _guard = lock.lock().await;
+            self.reconcile_under_session_lock(&signal_address, message_id, retry_count, node)
+                .await
+        };
+        // The flush waits for the guard to drop: it can need the processing
+        // permit, whose holder may in turn want this session lock.
+        if let Some(reason) = reason {
+            self.flush_signal_cache_batch_safe_logged(reason, None)
+                .await;
+        }
+    }
+
+    /// The body of [`Self::reconcile_retry_session`], with the peer's session
+    /// lock already held. Returns the flush reason when it deleted a session,
+    /// since the flush has to happen after the guard is released.
+    async fn reconcile_under_session_lock(
+        &self,
+        signal_address: &wacore::libsignal::protocol::ProtocolAddress,
+        message_id: &str,
+        retry_count: u8,
+        node: &NodeRef<'_>,
+    ) -> Option<&'static str> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         // 2. No bundle + regId mismatch → delete session (WA Web L52-65).
@@ -1131,7 +1162,7 @@ impl Client {
         {
             let session = self
                 .signal_cache
-                .peek_session(&signal_address, &*device_snapshot.backend)
+                .peek_session(signal_address, &*device_snapshot.backend)
                 .await
                 .ok()
                 .flatten();
@@ -1144,34 +1175,27 @@ impl Client {
                 info!(
                     "Registration ID mismatch for {} (stored: {}, received: {}). \
                      Deleting session since no key bundle provided.",
-                    wacore::types::jid::observe_protocol_address(&signal_address),
+                    wacore::types::jid::observe_protocol_address(signal_address),
                     stored_reg_id,
                     received_reg_id
                 );
-                let lock = self.session_lock_for(signal_address.as_str()).await;
-                let _guard = lock.lock().await;
-                self.signal_cache.delete_session(&signal_address).await;
-                drop(_guard);
-                self.flush_signal_cache_batch_safe_logged("reg ID mismatch session deletion", None)
-                    .await;
+                self.signal_cache.delete_session(signal_address).await;
+                return Some("reg ID mismatch session deletion");
             }
         }
 
         // 3-4. Base-key collision logic (WA Web L66-80). Applied to ALL chat
-        //      types now — previously only ran in the DM branch. The session is
-        //      re-read, not reused: the branch above may have deleted it.
+        //      types now — previously only ran in the DM branch.
         let session = self
             .signal_cache
-            .peek_session(&signal_address, &*device_snapshot.backend)
+            .peek_session(signal_address, &*device_snapshot.backend)
             .await
             .ok()
             .flatten();
 
-        let Some(session) = session else {
-            return;
-        };
+        let session = session?;
         let Ok(current_base_key) = session.alice_base_key() else {
-            return;
+            return None;
         };
 
         let addr_str = signal_address.as_str();
@@ -1184,16 +1208,16 @@ impl Client {
             {
                 Ok(()) => info!(
                     "Saved base key for {} at retry #{} for collision detection",
-                    wacore::types::jid::observe_protocol_address(&signal_address),
+                    wacore::types::jid::observe_protocol_address(signal_address),
                     retry_count
                 ),
                 Err(e) => warn!(
                     "Failed to save base key for {}: {}",
-                    wacore::types::jid::observe_protocol_address(&signal_address),
+                    wacore::types::jid::observe_protocol_address(signal_address),
                     e
                 ),
             }
-            return;
+            return None;
         }
 
         if retry_count > MIN_RETRY_FOR_BASE_KEY_CHECK {
@@ -1210,7 +1234,7 @@ impl Client {
                     info!(
                         "Base key collision detected for {} (msg {}) at retry #{}. \
                          Session hasn't been regenerated. Forcing fresh session.",
-                        wacore::types::jid::observe_protocol_address(&signal_address),
+                        wacore::types::jid::observe_protocol_address(signal_address),
                         message_id,
                         retry_count
                     );
@@ -1219,20 +1243,13 @@ impl Client {
                         .backend
                         .delete_base_key(addr_str, message_id)
                         .await;
-                    let lock = self.session_lock_for(signal_address.as_str()).await;
-                    let _guard = lock.lock().await;
-                    self.signal_cache.delete_session(&signal_address).await;
-                    drop(_guard);
-                    self.flush_signal_cache_batch_safe_logged(
-                        "base key collision — forcing fresh session",
-                        None,
-                    )
-                    .await;
+                    self.signal_cache.delete_session(signal_address).await;
+                    return Some("base key collision — forcing fresh session");
                 }
                 Ok(false) => {
                     info!(
                         "Base key changed for {} (msg {}) at retry #{} - session regenerated",
-                        wacore::types::jid::observe_protocol_address(&signal_address),
+                        wacore::types::jid::observe_protocol_address(signal_address),
                         message_id,
                         retry_count
                     );
@@ -1244,12 +1261,13 @@ impl Client {
                 Err(e) => {
                     warn!(
                         "Failed to check base key for {}: {}",
-                        wacore::types::jid::observe_protocol_address(&signal_address),
+                        wacore::types::jid::observe_protocol_address(signal_address),
                         e
                     );
                 }
             }
         }
+        None
     }
 
     /// Mirrors whatsmeow's `shouldRecreateSession`. Returns `Some(reason)`
@@ -1471,7 +1489,13 @@ impl Client {
         self.install_prekey_bundle_cached(requester_jid, &bundle, &mut adapter, &mut rng)
             .await?;
 
-        self.flush_signal_cache_batch_safe().await?;
+        // Logged, not propagated: the session is installed either way, and the
+        // caller reads an error from here as "the peer's bundle was rejected",
+        // which would skip the cold mark and strand a device a later flush is
+        // still going to persist. `send_retry_stanza`'s pre-wire gate is what
+        // keeps an undurable advance off the wire.
+        self.flush_signal_cache_batch_safe_logged("retry key bundle install", None)
+            .await;
 
         info!(
             "Processed key bundle from retry receipt for {}",
@@ -3395,6 +3419,67 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Reading the session outside the per-peer lock let a concurrent resend
+    /// rebuild it between the read and the delete, so the delete took the new
+    /// session and left the peer worse off than before the retry. The read now
+    /// happens under the lock the delete uses, so a session that appears while
+    /// the lock is held is the one the decision is made against.
+    #[tokio::test]
+    async fn reconcile_reads_the_session_under_the_lock_it_deletes_with() {
+        use wacore::libsignal::protocol::SessionRecord;
+
+        let client = retry_repair_client("retry_repair_reconcile_lock").await;
+        let peer = Jid::lid_device("100000000000123".to_string(), 5);
+        let address = peer.to_protocol_address();
+
+        // Stale session: its reg ID differs from the receipt's, so a reconcile
+        // that reads it decides to delete.
+        client
+            .persistence_manager
+            .backend()
+            .put_session(
+                address.as_str(),
+                &valid_serialized_session(4242, vec![0xAA; 32]),
+            )
+            .await
+            .unwrap();
+
+        let lock = client.session_lock_for(address.as_str()).await;
+        let guard = lock.lock().await;
+        let reconcile = {
+            let client = Arc::clone(&client);
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                let node = build_retry_receipt_with_registration(9999);
+                client
+                    .reconcile_retry_session(&peer, "RECONCILELOCK001", 1, &node.as_node_ref())
+                    .await;
+            })
+        };
+        // Let it run until it blocks on the lock. Reading before that point is
+        // exactly the bug: it would pin the stale session as its decision.
+        tokio::task::yield_now().await;
+
+        // The resend that rebuilds the session, in the window the old order left
+        // open. Its reg ID matches the receipt, so nothing should delete it.
+        client
+            .signal_cache
+            .put_session(
+                &address,
+                SessionRecord::deserialize(&valid_serialized_session(9999, vec![0xBB; 32]))
+                    .unwrap(),
+            )
+            .await;
+
+        drop(guard);
+        reconcile.await.unwrap();
+
+        assert!(
+            has_session(&client, &peer).await,
+            "a session rebuilt while the lock was held must survive the reconcile"
+        );
     }
 
     /// The cold mark is what invites the next send to distribute, so it may not
