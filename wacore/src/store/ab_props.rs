@@ -77,6 +77,34 @@ impl AbPropsCache {
         }
     }
 
+    /// Panics in debug builds when `prop` is read without being watched.
+    ///
+    /// `apply_props` discards anything outside the interest set, so such a read
+    /// can never see the server's value: it returns the registry default now and
+    /// forever, with no error and no log line. That has silently disabled a
+    /// shipped feature gate more than once, and neither the type system nor a
+    /// test of the reading code can catch it, because the reading code is
+    /// correct -- what is missing sits in another file.
+    ///
+    /// Guards only the accessors that substitute a default. [`get`](Self::get)
+    /// returns `Option`, so a caller there is told the value is absent rather
+    /// than handed a plausible one.
+    #[cfg(debug_assertions)]
+    async fn debug_assert_watched(&self, prop: AbProp) {
+        assert!(
+            self.interest.read().await.contains(&prop.code),
+            "AB prop {:?} (code {}) was read but is not watched, so the server's \
+             value is discarded and this read always yields the registry default. \
+             Add it to `WATCHED` in wacore/src/iq/props.rs, or call `watch()` \
+             before the first fetch.",
+            prop.name,
+            prop.code,
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    async fn debug_assert_watched(&self, _prop: AbProp) {}
+
     pub async fn get(&self, prop: AbProp) -> Option<CompactString> {
         self.props.read().await.get(&prop.code).cloned()
     }
@@ -85,6 +113,7 @@ impl AbPropsCache {
     /// falling back to the flag's registry default when the server didn't send
     /// it. The registry is the single source of truth for the default.
     pub async fn is_enabled(&self, prop: AbProp) -> bool {
+        self.debug_assert_watched(prop).await;
         match self.props.read().await.get(&prop.code) {
             Some(value) => {
                 value == "1"
@@ -98,6 +127,7 @@ impl AbPropsCache {
     /// The cached int value, falling back to the flag's registry default when
     /// the server didn't send it (or it's not an int flag).
     pub async fn get_int(&self, prop: AbProp) -> i64 {
+        self.debug_assert_watched(prop).await;
         let fallback = match prop.default {
             AbDefault::Int(n) => n,
             _ => 0,
@@ -152,8 +182,11 @@ mod tests {
     #[tokio::test]
     async fn is_enabled_checks_truthy_values() {
         let cache = AbPropsCache::new();
+        // 999 is watched but never sent, which is the "absent" case asserted
+        // below. Watching it is what distinguishes absent-from-the-response
+        // from never-retained-at-all.
         cache
-            .watch_many(&[flag(1), flag(2), flag(3), flag(4), flag(5)])
+            .watch_many(&[flag(1), flag(2), flag(3), flag(4), flag(5), flag(999)])
             .await;
 
         let props = vec![
@@ -247,6 +280,15 @@ mod tests {
         assert!(cache.is_enabled(web::RECEIPT_MODE_BITMASK_ENABLED).await);
         // Unwatched code should NOT be retained
         assert_eq!(cache.get(flag(99999)).await, None);
+    }
+
+    /// The guard has to fire on the read, not on the fetch: at fetch time a
+    /// missing prop is indistinguishable from one the server chose not to send.
+    #[tokio::test]
+    #[should_panic(expected = "is not watched")]
+    #[cfg(debug_assertions)]
+    async fn reading_an_unwatched_prop_trips_the_guard() {
+        AbPropsCache::new().is_enabled(flag(4242)).await;
     }
 
     /// Verify seeded flag is only set AFTER all props are inserted (not before).
