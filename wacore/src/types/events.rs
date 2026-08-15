@@ -634,6 +634,16 @@ impl CoreEventBus {
     }
 }
 
+/// Payload of the retired [`Event::RetiredPushNameUpdate`], kept only so that
+/// variant can keep its position in an index-based `Serialize` format.
+///
+/// Deliberately empty: the fields it used to carry named a comparison this
+/// repository cannot make, and leaving them would keep promising it. Nothing
+/// constructs this and nothing dispatches the variant it fills.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct RetiredPushNameUpdate {}
+
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct SelfPushNameUpdated {
@@ -925,6 +935,17 @@ pub enum Event {
     /// Rejected call-log outcomes (`<terminate reason="accepted_elsewhere"|"rejected_elsewhere">`).
     CallEndedElsewhere(CallEndedElsewhere),
 
+    /// Retired: nothing dispatches this, and nothing can. The payload promised
+    /// an old-name/new-name comparison, and this repository holds no contact
+    /// store to source the previous name from. Read the current name from
+    /// [`crate::types::message::MessageInfo::push_name`] instead.
+    ///
+    /// The variant stays because its *position* is load-bearing, for the same
+    /// reason new variants are appended rather than inserted: an index-based
+    /// `Serialize` format keys variants by position, so dropping one renumbers
+    /// every variant after it and changes how already-stored events decode.
+    RetiredPushNameUpdate(RetiredPushNameUpdate),
+
     SelfPushNameUpdated(SelfPushNameUpdated),
     PinUpdate(PinUpdate),
     MuteUpdate(MuteUpdate),
@@ -1122,6 +1143,7 @@ impl Event {
             Event::IncomingCall(_) => EventKind::IncomingCall,
             Event::MissedCall(_) => EventKind::MissedCall,
             Event::CallEndedElsewhere(_) => EventKind::CallEndedElsewhere,
+            Event::RetiredPushNameUpdate(_) => EventKind::RetiredPushNameUpdate,
             Event::SelfPushNameUpdated(_) => EventKind::SelfPushNameUpdated,
             Event::AppStateSyncFailed(_) => EventKind::AppStateSyncFailed,
             Event::PinUpdate(_) => EventKind::PinUpdate,
