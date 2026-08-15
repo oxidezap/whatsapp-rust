@@ -132,7 +132,7 @@ pub enum EncMediaType {
     Unknown(String),
 }
 
-// `ReceiptModeBitPosition` in `WAWebSendReceiptJobCommon`. The catalog stores bit positions; these are already shifted.
+// Bits of a receipt's `<meta mode>` bitmask. `ReceiptModeBitPosition` in `WAWebSendReceiptJobCommon`. The catalog stores bit positions; these are already shifted.
 /// `ORPHAN` of `ReceiptModeBitPosition`.
 pub const RECEIPT_MODE_ORPHAN: u32 = 1 << 0;
 /// `NO_CHECKMARK_UX` of `ReceiptModeBitPosition`.

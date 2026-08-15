@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::ir::{EnumDef, EnumValueKind, EnumsIr, Scalar};
 use crate::naming::pascal_case;
@@ -40,9 +40,10 @@ pub enum Shape {
     /// The same, plus a `#[wire_fallback] Unknown(String)` arm keeping the wire
     /// bytes of a value this build does not model.
     Open,
-    /// Integer variants emitted as `pub const` masks. `bitPosition` entries are
-    /// shifted here so a caller never repeats the shift.
-    Masks { prefix: &'static str },
+    /// Integer variants emitted as `pub const` masks named `<rust>_<VARIANT>`.
+    /// `bitPosition` entries are shifted here so a caller never repeats the
+    /// shift.
+    Masks,
 }
 
 /// One catalog entry this repository binds, keyed the way the catalog is:
@@ -50,6 +51,8 @@ pub enum Shape {
 pub struct Wanted {
     pub module: &'static str,
     pub name: &'static str,
+    /// The Rust type name, or for [`Shape::Masks`] the prefix its constants
+    /// share.
     pub rust: &'static str,
     pub shape: Shape,
     /// Variant spellings the mechanical `pascal_case` gets wrong, as
@@ -101,11 +104,9 @@ pub const WANTED: &[Wanted] = &[
         module: "WAWebSendReceiptJobCommon",
         name: "ReceiptModeBitPosition",
         rust: "RECEIPT_MODE",
-        shape: Shape::Masks {
-            prefix: "RECEIPT_MODE_",
-        },
+        shape: Shape::Masks,
         renames: &[],
-        doc: "",
+        doc: "Bits of a receipt's `<meta mode>` bitmask.",
     },
 ];
 
@@ -117,7 +118,7 @@ pub fn generate(ir: &EnumsIr) -> Result<String> {
         let def = lookup(ir, wanted)?;
         match wanted.shape {
             Shape::Closed | Shape::Open => out.push_str(&wire_enum(wanted, def)?),
-            Shape::Masks { prefix } => out.push_str(&masks(wanted, def, prefix)?),
+            Shape::Masks => out.push_str(&masks(wanted, def)?),
         }
     }
     Ok(out)
@@ -212,7 +213,7 @@ fn wire_enum(wanted: &Wanted, def: &EnumDef) -> Result<String> {
     Ok(out)
 }
 
-fn masks(wanted: &Wanted, def: &EnumDef, prefix: &str) -> Result<String> {
+fn masks(wanted: &Wanted, def: &EnumDef) -> Result<String> {
     ensure!(
         def.value_kind == EnumValueKind::Int,
         "{}::{} carries strings, so it cannot be emitted as masks",
@@ -222,7 +223,8 @@ fn masks(wanted: &Wanted, def: &EnumDef, prefix: &str) -> Result<String> {
     let shifted = def.bit_position == Some(true);
 
     let mut out = format!(
-        "// `{}` in `{}`. {}\n",
+        "// {} `{}` in `{}`. {}\n",
+        wanted.doc,
         wanted.name,
         def.module,
         if shifted {
@@ -240,14 +242,30 @@ fn masks(wanted: &Wanted, def: &EnumDef, prefix: &str) -> Result<String> {
                 variant.name
             );
         };
+        // Checked here rather than left to the generated file: `1 << 32` trips
+        // rustc's overflow lint inside `wire_enums.rs`, which sends whoever hits
+        // it to the artifact instead of to the catalog entry that caused it.
         let expr = if shifted {
+            ensure!(
+                (0..u32::BITS as i64).contains(value),
+                "{}::{} variant {} is bit position {value}, which does not fit a u32 mask",
+                wanted.module,
+                wanted.name,
+                variant.name
+            );
             format!("1 << {value}")
         } else {
+            let value = u32::try_from(*value).with_context(|| {
+                format!(
+                    "{}::{} variant {} carries {value}, which is not a u32 mask",
+                    wanted.module, wanted.name, variant.name
+                )
+            })?;
             value.to_string()
         };
         out.push_str(&format!(
-            "/// `{}` of `{}`.\npub const {prefix}{}: u32 = {expr};\n",
-            variant.name, wanted.name, variant.name
+            "/// `{}` of `{}`.\npub const {}_{}: u32 = {expr};\n",
+            variant.name, wanted.name, wanted.rust, variant.name
         ));
     }
     out.push('\n');
@@ -264,6 +282,16 @@ fn rust_str(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ir::EnumVariant;
+
+    /// Entries are looked up by the identity they already carry. Indexing
+    /// `WANTED` by position would silently re-aim a test at another entry the
+    /// moment the table is reordered or grown at the top.
+    fn wanted(name: &str) -> &'static Wanted {
+        WANTED
+            .iter()
+            .find(|w| w.name == name)
+            .expect("WANTED holds the entry this test names")
+    }
 
     fn def(name: &str, module: &str, values: &[&str]) -> EnumDef {
         EnumDef {
@@ -284,9 +312,9 @@ mod tests {
 
     #[test]
     fn an_open_enum_gets_a_fallback_and_a_closed_one_does_not() {
-        let wanted = &WANTED[0];
+        let open = wanted("STANZA_MSG_TYPES");
         let out = wire_enum(
-            wanted,
+            open,
             &def("STANZA_MSG_TYPES", "m", &["text", "medianotify"]),
         )
         .expect("emit");
@@ -294,7 +322,8 @@ mod tests {
         assert!(out.contains("#[wire_fallback]"));
         assert!(!out.contains(", Copy,"));
 
-        let closed = wire_enum(&WANTED[1], &def("POLL_TYPES", "m", &["vote"])).expect("emit");
+        let closed =
+            wire_enum(wanted("POLL_TYPES"), &def("POLL_TYPES", "m", &["vote"])).expect("emit");
         assert!(!closed.contains("#[wire_fallback]"));
         assert!(closed.contains(", Copy,"));
     }
@@ -307,7 +336,7 @@ mod tests {
             wa_version: "2.0.0".to_string(),
             enums: vec![def("POLL_TYPES", "SomeOtherModule", &["vote"])],
         };
-        let err = lookup(&ir, &WANTED[1]).expect_err("the module does not match");
+        let err = lookup(&ir, wanted("POLL_TYPES")).expect_err("the module does not match");
         assert!(
             err.to_string()
                 .contains("has no WAWebHandleMsgCommon::POLL_TYPES")
@@ -322,7 +351,8 @@ mod tests {
             wa_version: "2.0.0".to_string(),
             enums: vec![entry],
         };
-        let err = lookup(&ir, &WANTED[1]).expect_err("synthetic names are not identities");
+        let err =
+            lookup(&ir, wanted("POLL_TYPES")).expect_err("synthetic names are not identities");
         assert!(err.to_string().contains("synthetic name"));
     }
 
@@ -341,11 +371,40 @@ mod tests {
             synthetic_name: None,
             bit_position: Some(true),
         };
-        let out = masks(&WANTED[3], &entry, "RECEIPT_MODE_").expect("emit");
+        let out = masks(wanted("ReceiptModeBitPosition"), &entry).expect("emit");
         assert!(out.contains("pub const RECEIPT_MODE_HID_FAILED_DECRYPT: u32 = 1 << 2;"));
 
         entry.bit_position = None;
-        let plain = masks(&WANTED[3], &entry, "RECEIPT_MODE_").expect("emit");
+        let plain = masks(wanted("ReceiptModeBitPosition"), &entry).expect("emit");
         assert!(plain.contains("pub const RECEIPT_MODE_HID_FAILED_DECRYPT: u32 = 2;"));
+    }
+
+    /// A value the generated file could not compile has to stop the generator,
+    /// where the offending catalog entry is still in hand. `1 << 32` would
+    /// otherwise surface as an overflow lint inside `wire_enums.rs`.
+    #[test]
+    fn an_out_of_range_mask_stops_the_generator() {
+        let mut entry = EnumDef {
+            name: "ReceiptModeBitPosition".to_string(),
+            module: "m".to_string(),
+            value_kind: EnumValueKind::Int,
+            variants: vec![EnumVariant {
+                name: "TOO_WIDE".to_string(),
+                value: Scalar::Int(32),
+            }],
+            synthetic_name: None,
+            bit_position: Some(true),
+        };
+        let err = masks(wanted("ReceiptModeBitPosition"), &entry).expect_err("32 is not a u32 bit");
+        assert!(err.to_string().contains("does not fit a u32 mask"), "{err}");
+
+        entry.variants[0].value = Scalar::Int(-1);
+        let err = masks(wanted("ReceiptModeBitPosition"), &entry).expect_err("negative position");
+        assert!(err.to_string().contains("does not fit a u32 mask"), "{err}");
+
+        entry.bit_position = None;
+        entry.variants[0].value = Scalar::Int(i64::from(u32::MAX) + 1);
+        let err = masks(wanted("ReceiptModeBitPosition"), &entry).expect_err("beyond u32");
+        assert!(err.to_string().contains("is not a u32 mask"), "{err}");
     }
 }
