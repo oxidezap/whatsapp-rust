@@ -59,10 +59,11 @@ pub struct Wanted {
     /// `(wire value, Rust identifier)`. `medianotify` is one word on the wire
     /// and two in English, and nothing in the bundle says so.
     pub renames: &'static [(&'static str, &'static str)],
-    /// The wire value that carries `#[wire_default]`, when the type has a
-    /// default that is not simply its first variant. Declared rather than
-    /// inferred because the catalog's variant order is not ours: reading the
-    /// default off position would silently change it the day upstream reorders.
+    /// The wire value that carries `#[wire_default]`. Declared rather than
+    /// inferred, even where it happens to lead the catalog today: the derive
+    /// falls back to the first variant, so leaving it unset would let an
+    /// upstream reorder change the default silently. `None` means the type has
+    /// no protocol default and the first variant standing in is immaterial.
     pub default: Option<&'static str>,
     pub doc: &'static str,
 }
@@ -135,7 +136,7 @@ pub const WANTED: &[Wanted] = &[
         rust: "MemberAddMode",
         shape: Shape::Closed,
         renames: &[],
-        default: None,
+        default: Some("admin_add"),
         doc: "Who may add participants to a group.",
     },
     Wanted {
@@ -171,7 +172,7 @@ pub const WANTED: &[Wanted] = &[
         rust: "CallLinkMedia",
         shape: Shape::Closed,
         renames: &[],
-        default: None,
+        default: Some("audio"),
         doc: "The media a call link carries.",
     },
 ];

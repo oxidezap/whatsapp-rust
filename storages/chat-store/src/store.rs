@@ -127,7 +127,6 @@ impl EventHandler for ChatStoreHandler {
             EventKind::ServerAck,
             EventKind::UndecryptableMessage,
             EventKind::HistorySync,
-            EventKind::PushNameUpdate,
             EventKind::ContactUpdate,
             EventKind::PinUpdate,
             EventKind::MuteUpdate,
@@ -978,16 +977,6 @@ fn apply_event(
             Ok(())
         }
         Event::HistorySync(lazy) => apply_history_sync(conn, device_id, lazy, cs),
-        Event::PushNameUpdate(update) => {
-            upsert_contact_push_name(
-                conn,
-                device_id,
-                &update.jid.to_string(),
-                &update.new_push_name,
-            )?;
-            cs.contacts = true;
-            Ok(())
-        }
         Event::ContactUpdate(update) => {
             upsert_contact_names(
                 conn,

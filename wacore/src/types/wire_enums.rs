@@ -160,6 +160,7 @@ pub enum DecryptFailMode {
 /// Generated from `MemberAddMode` in `WAWebSchemaGroupMetadata`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum MemberAddMode {
+    #[wire_default]
     #[wire = "admin_add"]
     AdminAdd,
     #[wire = "all_member_add"]
@@ -209,6 +210,7 @@ pub enum GroupParticipantType {
 /// Generated from `MediaType` in `WAWebStatusSetupController`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum CallLinkMedia {
+    #[wire_default]
     #[wire = "audio"]
     Audio,
     #[wire = "video"]
