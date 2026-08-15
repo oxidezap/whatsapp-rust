@@ -163,14 +163,14 @@ pub fn should_drop_unknown_device_retry(keys_present: bool, device_known: bool) 
 
 /// The `HID_FAILED_DECRYPT` bit of a receipt's `<meta mode>` bitmask.
 ///
-/// WA Web's receipt mode is a set of bit *positions*, not values; this is
-/// position 2 already shifted. It says the failure that prompted the receipt
-/// came from an `<enc decrypt-fail="hide">`, so the sender knows the receiver
-/// showed the user nothing for it.
+/// It says the failure that prompted the receipt came from an
+/// `<enc decrypt-fail="hide">`, so the sender knows the receiver showed the
+/// user nothing for it. The catalog stores bit *positions* rather than values,
+/// and the generated constant is already shifted, so nothing here repeats it.
 ///
-/// The other two positions WA Web defines (`ORPHAN`, `NO_CHECKMARK_UX`) name
-/// states this client does not model, so it never sets them.
-pub const RECEIPT_MODE_HID_FAILED_DECRYPT: u32 = 1 << 2;
+/// The other two positions the catalog defines (`ORPHAN`, `NO_CHECKMARK_UX`)
+/// name states this client does not model, so it never sets them.
+pub use crate::types::wire_enums::RECEIPT_MODE_HID_FAILED_DECRYPT;
 
 /// The `<meta mode="…">` child of a receipt, or `None` when no bit is set.
 ///

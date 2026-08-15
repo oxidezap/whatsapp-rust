@@ -11,7 +11,7 @@ use serde::Deserialize;
 /// The IR contract version this tool was written against. A whatspec bundle
 /// stamping a different major reshapes the documents below, so refuse it rather
 /// than deserialize a shape we no longer understand.
-pub const SUPPORTED_SCHEMA_MAJOR: &str = "2";
+pub const SUPPORTED_SCHEMA_MAJOR: &str = "4";
 
 /// Fields every domain document carries, used to prove the domains were all
 /// extracted from one WhatsApp build.
@@ -69,6 +69,50 @@ pub struct AbPropConfig {
 pub struct AbPropsIr {
     pub wa_version: String,
     pub configs: Vec<AbPropConfig>,
+}
+
+/// Whether an enum's variants carry strings or integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnumValueKind {
+    String,
+    Int,
+}
+
+/// One variant: the upstream member name and the value it carries on the wire.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnumVariant {
+    pub name: String,
+    pub value: Scalar,
+}
+
+/// One entry of the enum catalog. A name is only unique together with its
+/// module -- `ACK` and `ENUM_LID_PN` each appear in several -- so both halves
+/// are part of its identity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnumDef {
+    pub name: String,
+    pub module: String,
+    pub value_kind: EnumValueKind,
+    pub variants: Vec<EnumVariant>,
+    /// `true` when whatspec invented the name by concatenating the variant
+    /// values, because the bundle no longer carries the upstream one. Such a
+    /// name changes whenever a variant is added, so it cannot be a Rust type's
+    /// identity.
+    #[serde(default)]
+    pub synthetic_name: Option<bool>,
+    /// `true` when the integer values are bit *positions* rather than the
+    /// values themselves, so a consumer has to shift before masking.
+    #[serde(default)]
+    pub bit_position: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnumsIr {
+    pub wa_version: String,
+    pub enums: Vec<EnumDef>,
 }
 
 /// One element of an action's mutation index; `type` discriminates the shape.

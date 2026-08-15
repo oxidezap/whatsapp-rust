@@ -48,6 +48,7 @@ fn every_generated_rust_file_stamps_the_locked_version() {
         "wacore/src/iq/abprops.rs",
         "wacore/src/iq/mex_operations.rs",
         "wacore/appstate/src/schemas.rs",
+        "wacore/src/types/wire_enums.rs",
     ] {
         let text = read(rel);
         let got = stamped_in_header(&text)

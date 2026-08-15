@@ -20,6 +20,7 @@ pub const IR_FILES: &[&str] = &[
     "manifest.json",
     "abprops/index.json",
     "appstate/index.json",
+    "enums/index.json",
     "mex/index.json",
     "tokens/index.json",
     "proto/WAProto.proto",

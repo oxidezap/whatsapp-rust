@@ -1,13 +1,14 @@
 {
   "repo": "https://github.com/oxidezap/whatspec",
-  "rev": "622d256be5c796750641ac5216b978d261c18fb2",
+  "rev": "631f76b6379e04e9badd7bf8be8836ff11a8a707",
   "waVersion": "2.3000.1044659339",
   "files": {
-    "abprops/index.json": "sha256:8e935cd88d28fa8e2c87dee73405a4611266f7bdd4c0f6f62c2764656fc29c0a",
-    "appstate/index.json": "sha256:3ab0c56c54d0ba6c0e2e5b319737b799258f881a158deada1dcf8c6233d84eb8",
-    "manifest.json": "sha256:cf8db5f2fb9b8e5b7ab2cc3e5d5fb74a7a0a21f76efe946f7add27a8f6d461a1",
-    "mex/index.json": "sha256:e381c86874d16ec39d817fd85592b6b5e4423a68831219d5b790341993fd0b1f",
+    "abprops/index.json": "sha256:21f6f4a28fef514bf2f4e9006839c946d9a6b9e2df376c7170bd2e8520ae9abd",
+    "appstate/index.json": "sha256:655e50ecd5f3e592a9c5e5a32a98cfd40d9aa2e6a4b142f3f9203750116d6092",
+    "enums/index.json": "sha256:e0f9d1d71ab254f14a7ac2725db50e6f820a408900feb422bca481292e46c104",
+    "manifest.json": "sha256:a944729a9d7741c7a6b27ee952853f787d9ba6380c324eb9cdb8d9c76eef8601",
+    "mex/index.json": "sha256:7d14b1daf2169e9647adb3f18d31482bb7e0271344774ed7ae0e937392d8dbee",
     "proto/WAProto.proto": "sha256:021d53059e7b35d8553c97c09567da8d6aba7278c7f2510242eab686bff3647a",
-    "tokens/index.json": "sha256:6d45399515cdc6ec55528aa56e36ecf566f06290039e3ed37a5561a272cb89f9"
+    "tokens/index.json": "sha256:676ab4a648f64397e2b571293dee683bb27efc3a74dc58ef7b52390782ce960f"
   }
 }

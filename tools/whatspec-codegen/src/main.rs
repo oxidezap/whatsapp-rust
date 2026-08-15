@@ -250,6 +250,8 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         serde_json::from_str(&ir.text("abprops/index.json")?).context("parsing the abprops IR")?;
     let appstate: ir::AppstateIr = serde_json::from_str(&ir.text("appstate/index.json")?)
         .context("parsing the appstate IR")?;
+    let enums: ir::EnumsIr =
+        serde_json::from_str(&ir.text("enums/index.json")?).context("parsing the enums IR")?;
     let mex: ir::MexIr =
         serde_json::from_str(&ir.text("mex/index.json")?).context("parsing the mex IR")?;
     let tokens: ir::TokensIr =
@@ -264,6 +266,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         Artifact {
             path: "wacore/src/iq/abprops.rs",
             content: emit::abprops::generate(&abprops)?,
+            rust: true,
+        },
+        Artifact {
+            path: "wacore/src/types/wire_enums.rs",
+            content: emit::enums::generate(&enums)?,
             rust: true,
         },
         Artifact {
@@ -530,6 +537,21 @@ mod tests {
         format!(r#"{{"schemaVersion":"{schema}","waVersion":"{wa}"}}"#)
     }
 
+    /// A schema version this tool accepts, derived from the gate rather than
+    /// spelled out, so raising the supported major does not silently turn every
+    /// fixture below into a test of the rejection path.
+    fn supported_schema() -> String {
+        format!("{}.0.0", ir::SUPPORTED_SCHEMA_MAJOR)
+    }
+
+    /// The next major up, which the gate must refuse.
+    fn unsupported_schema() -> String {
+        let major: u32 = ir::SUPPORTED_SCHEMA_MAJOR
+            .parse()
+            .expect("the supported major is numeric");
+        format!("{}.0.0", major + 1)
+    }
+
     /// The proto carries its stamp as a comment rather than a JSON envelope.
     fn proto_stub(wa: &str) -> String {
         format!("syntax = \"proto2\";\n\n/// WhatsApp Version: {wa}\n")
@@ -552,7 +574,7 @@ mod tests {
     #[test]
     fn stamped_version_agrees_across_domains() {
         assert_eq!(
-            stamped_version(&ir_from(&ir_files("2.0.0", "2.3000.7"))).expect("stamp"),
+            stamped_version(&ir_from(&ir_files(&supported_schema(), "2.3000.7"))).expect("stamp"),
             "2.3000.7"
         );
     }
@@ -561,12 +583,12 @@ mod tests {
     fn a_domain_from_another_build_stops_the_run() {
         // The exact drift this tool replaces: abprops and mex vendored from two
         // different WhatsApp releases.
-        let mut files = ir_files("2.0.0", "2.3000.7");
+        let mut files = ir_files(&supported_schema(), "2.3000.7");
         let mex = files
             .iter_mut()
             .find(|(f, _)| *f == "mex/index.json")
             .expect("mex");
-        mex.1 = envelope("2.0.0", "2.3000.8");
+        mex.1 = envelope(&supported_schema(), "2.3000.8");
         let err = stamped_version(&ir_from(&files)).expect_err("mixed builds");
         assert!(err.to_string().contains("mex/index.json"), "{err}");
     }
@@ -576,7 +598,7 @@ mod tests {
         // The proto has no JSON envelope, so the loop above cannot see it. It is
         // the one domain whose drift would otherwise reach whatsapp.proto with
         // every other registry agreeing.
-        let mut files = ir_files("2.0.0", "2.3000.7");
+        let mut files = ir_files(&supported_schema(), "2.3000.7");
         let proto = files
             .iter_mut()
             .find(|(f, _)| *f == PROTO_IR)
@@ -588,7 +610,7 @@ mod tests {
 
     #[test]
     fn a_proto_with_no_version_header_stops_the_run() {
-        let mut files = ir_files("2.0.0", "2.3000.7");
+        let mut files = ir_files(&supported_schema(), "2.3000.7");
         let proto = files
             .iter_mut()
             .find(|(f, _)| *f == PROTO_IR)
@@ -600,7 +622,8 @@ mod tests {
 
     #[test]
     fn an_unsupported_ir_schema_major_stops_the_run() {
-        let err = stamped_version(&ir_from(&ir_files("3.0.0", "2.3000.7"))).expect_err("schema 3");
+        let err = stamped_version(&ir_from(&ir_files(&unsupported_schema(), "2.3000.7")))
+            .expect_err("a newer major is not readable");
         assert!(err.to_string().contains("not supported"), "{err}");
     }
 }
