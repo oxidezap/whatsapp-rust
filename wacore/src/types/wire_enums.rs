@@ -204,15 +204,3 @@ pub enum GroupParticipantType {
     #[wire = "participant"]
     Participant,
 }
-
-/// The media a call link carries.
-///
-/// Generated from `MediaType` in `WAWebStatusSetupController`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
-pub enum CallLinkMedia {
-    #[wire_default]
-    #[wire = "audio"]
-    Audio,
-    #[wire = "video"]
-    Video,
-}

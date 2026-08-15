@@ -6,8 +6,16 @@
 //! by concatenating the variant values, so adding one variant upstream renames
 //! the entry; names also repeat across modules (`ACK`, `ENUM_LID_PN`,
 //! `EventType`), and 17 are proto-nested names `waproto` already generates from
-//! the `.proto`. None of those can carry a stable Rust type identity. So the
-//! split is: [`WANTED`] binds a name, a shape and any variant spellings, and
+//! the `.proto`. None of those can carry a stable Rust type identity.
+//!
+//! What makes an entry bindable is that its module owns the wire format we
+//! parse, not that its variants match ours. Two enums can agree on every value
+//! and still be unrelated -- the catalog's only `audio`/`video` pair belongs to
+//! the status composer, and binding it to the call-link media type would let a
+//! kind added for composing a status arrive in `<call_link>`. A variant set is
+//! how a candidate is found; the module is what decides.
+//!
+//! So the split is: [`WANTED`] binds a name, a shape and any variant spellings, and
 //! the IR owns everything that can drift -- which variants exist, what they
 //! carry, and whether integers are bit positions. A variant added upstream
 //! lands here on the next sync, and `--check` fails if the tree disagrees.
@@ -183,14 +191,6 @@ pub const WANTED: &[Wanted] = &[
         shape: Shape::Closed(WireDefault::Wire("participant")),
         renames: &[("superadmin", "SuperAdmin")],
         doc: "A participant's role in a group.",
-    },
-    Wanted {
-        module: "WAWebStatusSetupController",
-        name: "MediaType",
-        rust: "CallLinkMedia",
-        shape: Shape::Closed(WireDefault::Wire("audio")),
-        renames: &[],
-        doc: "The media a call link carries.",
     },
 ];
 
