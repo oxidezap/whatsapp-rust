@@ -220,14 +220,7 @@ impl IqSpec for PrivacySettingsSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum DisallowedListAction {
-    #[wire_default]
-    #[wire = "add"]
-    Add,
-    #[wire = "remove"]
-    Remove,
-}
+pub use crate::types::wire_enums::DisallowedListAction;
 
 #[derive(Debug, Clone)]
 pub struct DisallowedListUserEntry {

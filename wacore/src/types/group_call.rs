@@ -14,14 +14,7 @@ pub const GROUP_CALL_MAX_PARTICIPANTS: usize = 32;
 /// The local endpoint consumes one membership slot.
 pub const GROUP_CALL_MAX_REMOTE_PARTICIPANTS: usize = GROUP_CALL_MAX_PARTICIPANTS - 1;
 
-/// Audio/video mode of a reusable call link.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
-pub enum CallLinkMedia {
-    #[wire = "audio"]
-    Audio,
-    #[wire = "video"]
-    Video,
-}
+pub use crate::types::wire_enums::CallLinkMedia;
 
 /// One device in an authoritative group-call roster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]

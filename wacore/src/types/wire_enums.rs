@@ -139,3 +139,78 @@ pub const RECEIPT_MODE_ORPHAN: u32 = 1 << 0;
 pub const RECEIPT_MODE_NO_CHECKMARK_UX: u32 = 1 << 1;
 /// `HID_FAILED_DECRYPT` of `ReceiptModeBitPosition`.
 pub const RECEIPT_MODE_HID_FAILED_DECRYPT: u32 = 1 << 2;
+
+/// The `decrypt-fail` attribute of an `<enc>` node.
+///
+/// `Hide` is the server asking that a failure to decrypt this
+/// stanza not be surfaced to the user.
+///
+/// Generated from `DecryptFailType` in `WAWebBackendJobs.flow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+pub enum DecryptFailMode {
+    #[wire = "hide"]
+    Hide,
+    #[wire_default]
+    #[wire = "show"]
+    Show,
+}
+
+/// Who may add participants to a group.
+///
+/// Generated from `MemberAddMode` in `WAWebSchemaGroupMetadata`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+pub enum MemberAddMode {
+    #[wire = "admin_add"]
+    AdminAdd,
+    #[wire = "all_member_add"]
+    AllMemberAdd,
+}
+
+/// Who may share a group's history with a new participant.
+///
+/// Generated from `MemberShareGroupHistoryMode` in `WAWebGroupHistoryShareMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+pub enum MemberShareHistoryMode {
+    #[wire_default]
+    #[wire = "admin_share"]
+    AdminShare,
+    #[wire = "all_member_share"]
+    AllMemberShare,
+}
+
+/// Whether a privacy disallowed-list entry is being added or removed.
+///
+/// Generated from `PrivacyUserAction` in `WAWebSetPrivacyJob`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+pub enum DisallowedListAction {
+    #[wire_default]
+    #[wire = "add"]
+    Add,
+    #[wire = "remove"]
+    Remove,
+}
+
+/// A participant's role in a group.
+///
+/// Generated from `GROUP_PARTICIPANT_TYPES` in `WAWebGroupApiConst`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+pub enum GroupParticipantType {
+    #[wire = "superadmin"]
+    SuperAdmin,
+    #[wire = "admin"]
+    Admin,
+    #[wire_default]
+    #[wire = "participant"]
+    Participant,
+}
+
+/// The media a call link carries.
+///
+/// Generated from `MediaType` in `WAWebStatusSetupController`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
+pub enum CallLinkMedia {
+    #[wire = "audio"]
+    Audio,
+    #[wire = "video"]
+    Video,
+}

@@ -52,14 +52,7 @@ pub enum MemberLinkMode {
     AllMemberLink,
 }
 
-/// Member add mode for who can add participants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum MemberAddMode {
-    #[wire = "admin_add"]
-    AdminAdd,
-    #[wire = "all_member_add"]
-    AllMemberAdd,
-}
+pub use crate::types::wire_enums::MemberAddMode;
 
 /// Membership approval mode for join requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -71,15 +64,7 @@ pub enum MembershipApprovalMode {
     On,
 }
 
-/// Who can share message history with new members.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum MemberShareHistoryMode {
-    #[wire_default]
-    #[wire = "admin_share"]
-    AdminShare,
-    #[wire = "all_member_share"]
-    AllMemberShare,
-}
+pub use crate::types::wire_enums::MemberShareHistoryMode;
 
 /// Review state for an appeal on a suspended group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -3689,6 +3674,61 @@ impl IqSpec for GetReportedGroupMessagesIq {
 mod tests {
     use super::*;
     use crate::request::InfoQueryType;
+
+    /// Whether a `w:g2` request is addressed to the group server or to one
+    /// group's own JID, checked against what the whatspec IR resolves for each
+    /// upstream builder.
+    ///
+    /// The IR only started answering this in schema 4: before it, every `w:g2`
+    /// stanza reported the namespace's base target of `s.whatsapp.net`, so a
+    /// request sent to the wrong one of the two looked exactly like a request
+    /// sent to the right one. It now splits them (26 `group_jid`, 6 `g.us`),
+    /// and a mistake here is otherwise silent -- the server ignores the IQ and
+    /// the caller waits out its timeout.
+    ///
+    /// This is a regression lock, not a derivation: the expectations below were
+    /// read off the IR by hand, since the IR is not available at test time.
+    #[test]
+    fn group_requests_are_addressed_the_way_the_ir_resolves_them() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let server = Jid::new("", Server::Group);
+
+        // `g.us`: the group server answers these, not any one group.
+        assert_eq!(LeaveGroupIq::new(&group).build_iq().to, server);
+        assert_eq!(GroupParticipatingIq::new().build_iq().to, server);
+        assert_eq!(
+            BatchGetGroupInfoIq::new(std::slice::from_ref(&group))
+                .build_iq()
+                .to,
+            server
+        );
+        assert_eq!(GetGroupInviteInfoIq::new("ABC123").build_iq().to, server);
+
+        // `group_jid`: addressed to the one group they act on.
+        assert_eq!(
+            SetGroupSubjectIq::new(&group, GroupSubject::new("x").unwrap())
+                .build_iq()
+                .to,
+            group
+        );
+        assert_eq!(
+            GetGroupInviteLinkIq::new(&group, false).build_iq().to,
+            group
+        );
+        assert_eq!(
+            GetGroupInviteLinkIq::new(&group, true).build_iq().to,
+            group,
+            "the reset overload the IR resolves to group_jid is the one with an \
+             empty <invite/>; the g.us overload carries a code and is not this"
+        );
+        assert_eq!(
+            ReportGroupMessagesIq::new(&group, &["M1".to_string()])
+                .build_iq()
+                .to,
+            group
+        );
+        assert_eq!(GetReportedGroupMessagesIq::new(&group).build_iq().to, group);
+    }
 
     #[test]
     fn report_messages_iq_matches_the_group_report_shape() {

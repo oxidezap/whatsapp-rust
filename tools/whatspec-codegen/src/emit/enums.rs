@@ -59,6 +59,11 @@ pub struct Wanted {
     /// `(wire value, Rust identifier)`. `medianotify` is one word on the wire
     /// and two in English, and nothing in the bundle says so.
     pub renames: &'static [(&'static str, &'static str)],
+    /// The wire value that carries `#[wire_default]`, when the type has a
+    /// default that is not simply its first variant. Declared rather than
+    /// inferred because the catalog's variant order is not ours: reading the
+    /// default off position would silently change it the day upstream reorders.
+    pub default: Option<&'static str>,
     pub doc: &'static str,
 }
 
@@ -69,6 +74,7 @@ pub const WANTED: &[Wanted] = &[
         rust: "StanzaMessageType",
         shape: Shape::Open,
         renames: &[("medianotify", "MediaNotify")],
+        default: None,
         doc: "The `type` attribute of an incoming `<message>` envelope.\n\
               ///\n\
               /// The official parser rejects a stanza whose `type` is absent or\n\
@@ -82,6 +88,7 @@ pub const WANTED: &[Wanted] = &[
         rust: "PollType",
         shape: Shape::Closed,
         renames: &[],
+        default: None,
         doc: "The `polltype` attribute of an incoming `<message><meta>` node.\n\
               ///\n\
               /// Closed on purpose: the attribute is `attrEnumOrNullIfUnknown`\n\
@@ -94,6 +101,7 @@ pub const WANTED: &[Wanted] = &[
         rust: "EncMediaType",
         shape: Shape::Open,
         renames: &[("livelocation", "LiveLocation")],
+        default: None,
         doc: "The `mediatype` attribute of an `<enc>` node.\n\
               ///\n\
               /// A hint about the payload the ciphertext carries, available\n\
@@ -106,7 +114,65 @@ pub const WANTED: &[Wanted] = &[
         rust: "RECEIPT_MODE",
         shape: Shape::Masks,
         renames: &[],
+        default: None,
         doc: "Bits of a receipt's `<meta mode>` bitmask.",
+    },
+    Wanted {
+        module: "WAWebBackendJobs.flow",
+        name: "DecryptFailType",
+        rust: "DecryptFailMode",
+        shape: Shape::Closed,
+        renames: &[],
+        default: Some("show"),
+        doc: "The `decrypt-fail` attribute of an `<enc>` node.\n\
+              ///\n\
+              /// `Hide` is the server asking that a failure to decrypt this\n\
+              /// stanza not be surfaced to the user.",
+    },
+    Wanted {
+        module: "WAWebSchemaGroupMetadata",
+        name: "MemberAddMode",
+        rust: "MemberAddMode",
+        shape: Shape::Closed,
+        renames: &[],
+        default: None,
+        doc: "Who may add participants to a group.",
+    },
+    Wanted {
+        module: "WAWebGroupHistoryShareMode",
+        name: "MemberShareGroupHistoryMode",
+        rust: "MemberShareHistoryMode",
+        shape: Shape::Closed,
+        renames: &[],
+        default: Some("admin_share"),
+        doc: "Who may share a group's history with a new participant.",
+    },
+    Wanted {
+        module: "WAWebSetPrivacyJob",
+        name: "PrivacyUserAction",
+        rust: "DisallowedListAction",
+        shape: Shape::Closed,
+        renames: &[],
+        default: Some("add"),
+        doc: "Whether a privacy disallowed-list entry is being added or removed.",
+    },
+    Wanted {
+        module: "WAWebGroupApiConst",
+        name: "GROUP_PARTICIPANT_TYPES",
+        rust: "GroupParticipantType",
+        shape: Shape::Closed,
+        renames: &[("superadmin", "SuperAdmin")],
+        default: Some("participant"),
+        doc: "A participant's role in a group.",
+    },
+    Wanted {
+        module: "WAWebStatusSetupController",
+        name: "MediaType",
+        rust: "CallLinkMedia",
+        shape: Shape::Closed,
+        renames: &[],
+        default: None,
+        doc: "The media a call link carries.",
     },
 ];
 
@@ -201,7 +267,21 @@ fn wire_enum(wanted: &Wanted, def: &EnumDef) -> Result<String> {
             wanted.module,
             wanted.name
         );
+        if wanted.default == Some(wire.as_str()) {
+            out.push_str("    #[wire_default]\n");
+        }
         out.push_str(&format!("    #[wire = {}]\n    {ident},\n", rust_str(wire)));
+    }
+
+    if let Some(default) = wanted.default {
+        ensure!(
+            def.variants
+                .iter()
+                .any(|v| matches!(&v.value, Scalar::Str(s) if s == default)),
+            "{}::{} declares {default:?} as its default, which the catalog does not carry",
+            wanted.module,
+            wanted.name
+        );
     }
 
     if wanted.shape == Shape::Open {
