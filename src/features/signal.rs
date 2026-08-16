@@ -1312,4 +1312,43 @@ mod tests {
             .signal_flush_test_block
             .store(false, Ordering::Release);
     }
+
+    /// The fallback decoder must read the same bytes the primary does.
+    ///
+    /// It runs only when the primary refused, and it hands the raw buffer to a
+    /// protobuf decoder — so the version byte the primary skips has to be
+    /// skipped here too. Left in, it is parsed as a field tag and the fallback
+    /// can never rescue anything.
+    #[tokio::test]
+    async fn sender_key_distribution_fallback_reads_past_the_version_byte() {
+        use buffa::Message as _;
+        use wacore::libsignal::protocol::KeyPair;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let body = waproto::whatsapp::SenderKeyDistributionMessage {
+            id: Some(7),
+            iteration: Some(0),
+            chain_key: Some(vec![0x11; 32]),
+            signing_key: Some(signing.public_key.serialize().to_vec()),
+        };
+        let mut size_cache = buffa::SizeCache::new();
+        let body_len = body.compute_size(&mut size_cache) as usize;
+
+        // A version the primary does not recognize is the reachable way into
+        // the fallback: the body is well-formed, only the envelope is not.
+        let mut serialized = Vec::with_capacity(1 + body_len);
+        serialized.push((9 << 4) | 9);
+        body.write_to(&mut size_cache, &mut serialized);
+
+        assert!(
+            SenderKeyDistributionMessage::try_from(&serialized[..]).is_err(),
+            "the primary must refuse this envelope, or the fallback is not exercised"
+        );
+
+        let decoded = decode_sender_key_distribution(&serialized)
+            .expect("the fallback must recover a well-formed body");
+        assert_eq!(decoded.chain_id(), 7);
+        assert_eq!(decoded.chain_key(), &[0x11u8; 32]);
+    }
 }
