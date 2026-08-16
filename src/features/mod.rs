@@ -11,6 +11,7 @@ mod community;
 mod contacts;
 mod events;
 mod groups;
+pub(crate) use groups::GroupMetadataRegistry;
 pub(crate) mod labels;
 mod media_reupload;
 pub mod message_edit;

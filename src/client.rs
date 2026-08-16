@@ -1296,6 +1296,13 @@ pub struct Client {
     /// rather than a capacity-bounded cache.
     pub(crate) ensure_inflight: Arc<sessions::EnsureRegistry>,
 
+    /// Group-metadata queries in flight, so a burst of callers for one group
+    /// shares a single round trip. See [`GroupMetadataRegistry`] for why only
+    /// `get_metadata` needs it.
+    ///
+    /// [`GroupMetadataRegistry`]: crate::features::GroupMetadataRegistry
+    pub(crate) group_metadata_inflight: Arc<crate::features::GroupMetadataRegistry>,
+
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.
     pub(crate) chat_lanes: Cache<Jid, ChatLane>,
