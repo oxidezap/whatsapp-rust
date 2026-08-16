@@ -391,9 +391,47 @@ enum FlightOutcome {
     /// callers behind one IQ black hole would otherwise serialize into twenty
     /// timeouts.
     Failed {
-        timed_out: bool,
+        kind: FailureKind,
         message: String,
     },
+}
+
+/// What a waiter needs to know about a failure it did not run.
+///
+/// The classification rather than the error: `GroupError` is not `Clone`, and
+/// what a caller acts on is whether the request timed out or the transport is
+/// gone — the two questions `ErrorChainExt` asks of it. Rebuilding the
+/// canonical variant of each class keeps `is_timeout` and
+/// `is_transport_unavailable` answering the same for a waiter as for the
+/// leader, and with them the `GroupError` to `SendError` mapping.
+#[derive(Clone, Copy)]
+enum FailureKind {
+    TimedOut,
+    TransportUnavailable,
+    Other,
+}
+
+impl FailureKind {
+    fn of(error: &GroupError) -> Self {
+        use crate::error::ErrorChainExt;
+        if error.is_timeout() {
+            Self::TimedOut
+        } else if error.is_transport_unavailable() {
+            Self::TransportUnavailable
+        } else {
+            Self::Other
+        }
+    }
+
+    fn into_error(self, message: &str) -> GroupError {
+        match self {
+            Self::TimedOut => GroupError::Iq(IqError::Timeout),
+            Self::TransportUnavailable => GroupError::Iq(IqError::NotConnected),
+            Self::Other => GroupError::Internal(anyhow::anyhow!(
+                "group query failed on a shared attempt: {message}"
+            )),
+        }
+    }
 }
 
 /// A server refusal, kept whole enough for a waiter to rebuild the error.
@@ -980,10 +1018,7 @@ impl<'a> Groups<'a> {
                             let outcome = match server_refusal(error) {
                                 Some(refusal) => FlightOutcome::Refused(refusal),
                                 None => FlightOutcome::Failed {
-                                    timed_out: {
-                                        use crate::error::ErrorChainExt;
-                                        error.is_timeout()
-                                    },
+                                    kind: FailureKind::of(error),
                                     message: error.to_string(),
                                 },
                             };
@@ -1002,14 +1037,8 @@ impl<'a> Groups<'a> {
                     Some(FlightOutcome::Refused(refusal)) => {
                         return Err(refusal.clone().into_error());
                     }
-                    Some(FlightOutcome::Failed { timed_out, message }) => {
-                        return Err(if *timed_out {
-                            GroupError::Iq(IqError::Timeout)
-                        } else {
-                            GroupError::Internal(anyhow::anyhow!(
-                                "group query failed on a shared attempt: {message}"
-                            ))
-                        });
+                    Some(FlightOutcome::Failed { kind, message }) => {
+                        return Err(kind.into_error(message));
                     }
                     None => {}
                 },
