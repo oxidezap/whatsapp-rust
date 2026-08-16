@@ -2956,4 +2956,27 @@ mod tests {
             "the owning call must clear its key even when the query fails"
         );
     }
+
+    /// A reservation belongs to the task that took it, for as long as that task
+    /// lives. Teardown must not sweep the set: a refresh spanning a reconnect
+    /// would then release a key the new connection had already taken, and the
+    /// next ack would start the duplicate query the set exists to prevent. The
+    /// scopeguard runs on drop too, so there is nothing stale to sweep anyway.
+    #[tokio::test]
+    async fn a_disconnect_does_not_release_a_live_reservation() {
+        let (client, pn, _lid) = client_with_peer_mapping().await;
+
+        client
+            .pending_lid_refreshes
+            .lock()
+            .unwrap()
+            .insert(pn.to_string());
+
+        client.disconnect().await;
+
+        assert!(
+            client.pending_lid_refreshes.lock().unwrap().contains(pn),
+            "teardown must leave a live reservation to its owner"
+        );
+    }
 }

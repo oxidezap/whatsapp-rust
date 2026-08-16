@@ -1789,12 +1789,13 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
-        // Same for in-flight LID refreshes: their queries died with the socket,
-        // so a leftover key would suppress the refresh the next ack asks for.
-        self.pending_lid_refreshes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
+        // `pending_lid_refreshes` is deliberately NOT cleared here. Its keys are
+        // released by a `scopeguard` that runs on drop as well as on completion,
+        // so a refresh whose query dies with the socket still frees its own key,
+        // and there is nothing stale left to sweep. Clearing anyway would drop a
+        // reservation belonging to a live task: a refresh spanning a reconnect
+        // would release a key the new connection had since taken, and the peer
+        // would get the duplicate query the set exists to prevent.
         // Commit any accumulated drain batch and settle the Signal cache in
         // ONE permit-held section (see teardown_inbound_commits_bounded):
         // persisting ratchet advances while dropping their uncommitted batch
