@@ -415,7 +415,13 @@ impl ServerRefusal {
 
 /// The shared side of one in-flight query.
 struct MetadataFlight {
-    /// Callers waiting on this flight, counted under the registry lock.
+    /// Callers admitted to this flight, counted under the registry lock.
+    ///
+    /// Admissions only: a waiter that is cancelled before the leader finishes
+    /// stays counted, so the leader can publish an answer nobody reads. That
+    /// costs one clone in a case where the alternative — a drop guard on the
+    /// waiter side — adds another ordering-sensitive path to a structure whose
+    /// bugs have all been ordering bugs.
     waiters: std::sync::atomic::AtomicUsize,
     /// Set by the leader before it releases. Absent means the leader produced
     /// nothing a waiter can act on, so a waiter asks for itself.
@@ -902,8 +908,17 @@ impl<'a> Groups<'a> {
     /// LID-addressed group, participant phone numbers the server left out are
     /// backfilled from known LID/PN mappings on a best-effort basis; a
     /// participant with no known mapping keeps `phone_number: None`. The query
-    /// always hits the network (no phash is sent, so the server never answers
+    /// hits the network (no phash is sent, so the server never answers
     /// `not-modified`) and the result does not populate the group cache.
+    ///
+    /// **Concurrent calls for one group share a round trip.** A call that
+    /// arrives while another is in flight is answered by that one instead of
+    /// sending its own, so the metadata it returns can describe an instant
+    /// slightly before the call was made — bounded by how long the query in
+    /// flight has been running. Sequential calls are unaffected: each sends its
+    /// own query. If you need a read that is strictly ordered after the moment
+    /// you asked, wait for the outstanding call rather than issuing a second
+    /// one alongside it.
     ///
     /// This is the right call for displaying or auditing a group. When you only
     /// need the participant list to send a message, prefer the cached
