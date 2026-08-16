@@ -288,6 +288,7 @@ pub enum EventKind {
     ContactRemoved,
     EncDecryptFailed,
     CallLogSync,
+    ClientExpirationChanged,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -301,7 +302,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::CallLogSync as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::ClientExpirationChanged as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -1069,6 +1070,9 @@ pub enum Event {
 
     /// A call-history record synced from the primary device.
     CallLogSync(CallLogSync),
+
+    /// The server pushed (or withdrew) a retirement deadline for this build.
+    ClientExpirationChanged(ClientExpirationChanged),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1163,6 +1167,7 @@ impl Event {
             Event::ContactRemoved(_) => EventKind::ContactRemoved,
             Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
             Event::CallLogSync(_) => EventKind::CallLogSync,
+            Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -1690,6 +1695,31 @@ pub struct DirtyState {
     pub dirty_type: crate::iq::dirty::DirtyType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<u64>,
+}
+
+/// The server pushed a retirement deadline for the running client build, via
+/// `<ib><client_expiration>`.
+///
+/// Dispatched only when the deadline actually changed, so a repeated stanza is
+/// silent. `expires_at` is the deadline as recorded, which is never sooner than
+/// three days out even when the server's own answer is; `withdrawn` marks the
+/// stanza that carries no deadline at all, retracting whatever was held.
+///
+/// Consumers own the response. This client keeps connecting until the server
+/// refuses it -- the deadline is notice, not an instruction to stop -- so a
+/// consumer that cares about uptime should treat this as the cue to move to a
+/// newer build before the date arrives.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct ClientExpirationChanged {
+    /// Unix seconds after which the server expects to stop accepting this
+    /// build. `None` when the deadline was withdrawn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// The build the deadline was issued against.
+    pub version: (u32, u32, u32),
+    /// `true` when the server retracted a deadline it had previously set.
+    pub withdrawn: bool,
 }
 
 pub use crate::types::wire_enums::DecryptFailMode;

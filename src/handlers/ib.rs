@@ -1,6 +1,8 @@
 use super::traits::StanzaHandler;
 use crate::client::Client;
-use crate::types::events::{DirtyState, Event, EventKind, OfflineSyncPreview};
+use crate::types::events::{
+    ClientExpirationChanged, DirtyState, Event, EventKind, OfflineSyncPreview,
+};
 use async_trait::async_trait;
 use futures::FutureExt;
 use log::{debug, info, warn};
@@ -8,6 +10,8 @@ use std::sync::Arc;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::iq::dirty::{DirtyBit, DirtyType};
 use wacore::stanza::wire_tags::StanzaTag;
+use wacore::store::commands::DeviceCommand;
+use wacore::store::device::{ClientExpirationUpdate, ServerClientExpiration};
 
 /// Handler for `<ib>` (information broadcast) stanzas.
 ///
@@ -275,6 +279,14 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                     }))
                     .detach();
             }
+            "client_expiration" => {
+                handle_client_expiration(&client, child).await;
+            }
+            // WA Web parses this into its info-bulletin union and then has no
+            // `case` for it in the dispatch switch, so it is a marker the
+            // server sends and the client is expected to do nothing with.
+            // Named here so it does not read as a gap.
+            "priority_offline_complete" => {}
             "thread_metadata" => {
                 // Present in some sessions; safe to ignore for now until feature implemented.
                 debug!("Received thread metadata, ignoring for now.");
@@ -286,11 +298,202 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
     }
 }
 
+/// `<ib><client_expiration t=...>`: the server naming the date it expects to
+/// stop accepting this build.
+///
+/// Recorded rather than acted on. The deadline is notice about the *build*, not
+/// about this connection: the server keeps serving until the date arrives, and
+/// what to do before then -- ship a newer version, alert an operator -- is the
+/// consumer's call, not something this client can decide by disconnecting.
+///
+/// Stamped with the running version, because a deadline issued against one
+/// build says nothing about the next.
+async fn handle_client_expiration(client: &Arc<Client>, child: &wacore_binary::NodeRef<'_>) {
+    // WA Web parses this as `attrIntRange(node, "t", 0, undefined)`: a
+    // non-negative unix time with no upper bound.
+    let t = child.attrs().optional_u64("t").map(|t| t as i64);
+    let snapshot = client.persistence_manager.get_device_snapshot();
+    let version = (
+        snapshot.app_version_primary,
+        snapshot.app_version_secondary,
+        snapshot.app_version_tertiary,
+    );
+    let decision = ServerClientExpiration::decide(
+        snapshot.server_client_expiration.as_ref(),
+        t,
+        wacore::time::now_secs() as i64,
+        version,
+    );
+
+    let (command, event) = match decision {
+        ClientExpirationUpdate::Unchanged => {
+            debug!(
+                target: "Client/Ib",
+                "client_expiration t={t:?} is not sooner than the deadline held; ignoring"
+            );
+            return;
+        }
+        ClientExpirationUpdate::Clear => {
+            // Nothing held means nothing to withdraw, and an event announcing a
+            // change that did not happen would be worse than silence.
+            if snapshot.server_client_expiration.is_none() {
+                return;
+            }
+            info!(target: "Client/Ib", "server withdrew the client expiration deadline");
+            (
+                None,
+                ClientExpirationChanged::builder()
+                    .version(version)
+                    .withdrawn(true)
+                    .build(),
+            )
+        }
+        ClientExpirationUpdate::Set(expiration) => {
+            info!(
+                target: "Client/Ib",
+                "server set the client expiration deadline to {} for build {:?}",
+                expiration.expires_at, expiration.version
+            );
+            let event = ClientExpirationChanged::builder()
+                .expires_at(expiration.expires_at)
+                .version(expiration.version)
+                .withdrawn(false)
+                .build();
+            (Some(expiration), event)
+        }
+    };
+
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetServerClientExpiration(command))
+        .await;
+    client
+        .core
+        .event_bus
+        .dispatch(Event::ClientExpirationChanged(event));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::{TestEventCollector, create_test_client};
     use wacore_binary::builder::NodeBuilder;
+
+    fn ib_with(child: wacore_binary::Node) -> wacore_binary::Node {
+        NodeBuilder::new("ib").children([child]).build()
+    }
+
+    fn client_expiration(t: Option<i64>) -> wacore_binary::Node {
+        let mut b = NodeBuilder::new("client_expiration");
+        if let Some(t) = t {
+            b = b.attr("t", t.to_string());
+        }
+        ib_with(b.build())
+    }
+
+    async fn stored_expiration(client: &Arc<Client>) -> Option<ServerClientExpiration> {
+        client
+            .persistence_manager
+            .get_device_snapshot()
+            .server_client_expiration
+            .clone()
+    }
+
+    /// The deadline is persisted, not just announced: a consumer that restarts
+    /// before the next `<ib>` still knows the build is being retired.
+    #[tokio::test]
+    async fn a_client_expiration_is_persisted_and_announced() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        let _subscription = client.subscribe_handler(collector.clone());
+
+        let far = wacore::time::now_secs() as i64 + 90 * 86_400;
+        handle_ib_impl(client.clone(), &client_expiration(Some(far)).as_node_ref()).await;
+
+        let stored = stored_expiration(&client).await.expect("deadline stored");
+        assert_eq!(stored.expires_at, far);
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        assert!(stored.applies_to((
+            snapshot.app_version_primary,
+            snapshot.app_version_secondary,
+            snapshot.app_version_tertiary,
+        )));
+
+        assert!(collector.events().iter().any(|event| matches!(
+            &**event,
+            Event::ClientExpirationChanged(ClientExpirationChanged {
+                expires_at: Some(t),
+                withdrawn: false,
+                ..
+            }) if *t == far
+        )));
+    }
+
+    /// A restatement that changes nothing must stay silent, or a consumer
+    /// wired to alert on this event would alert on every reconnect.
+    #[tokio::test]
+    async fn an_unchanged_deadline_is_not_reannounced() {
+        let client = create_test_client().await;
+        let far = wacore::time::now_secs() as i64 + 90 * 86_400;
+        handle_ib_impl(client.clone(), &client_expiration(Some(far)).as_node_ref()).await;
+
+        let collector = Arc::new(TestEventCollector::default());
+        let _subscription = client.subscribe_handler(collector.clone());
+        handle_ib_impl(client.clone(), &client_expiration(Some(far)).as_node_ref()).await;
+
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::ClientExpirationChanged(_))),
+            "restating the same deadline must not dispatch"
+        );
+        assert_eq!(
+            stored_expiration(&client).await.map(|e| e.expires_at),
+            Some(far)
+        );
+    }
+
+    /// `<client_expiration>` with no `t` retracts the deadline.
+    #[tokio::test]
+    async fn a_missing_t_withdraws_the_deadline() {
+        let client = create_test_client().await;
+        let far = wacore::time::now_secs() as i64 + 90 * 86_400;
+        handle_ib_impl(client.clone(), &client_expiration(Some(far)).as_node_ref()).await;
+
+        let collector = Arc::new(TestEventCollector::default());
+        let _subscription = client.subscribe_handler(collector.clone());
+        handle_ib_impl(client.clone(), &client_expiration(None).as_node_ref()).await;
+
+        assert!(stored_expiration(&client).await.is_none());
+        assert!(collector.events().iter().any(|event| matches!(
+            &**event,
+            Event::ClientExpirationChanged(ClientExpirationChanged {
+                expires_at: None,
+                withdrawn: true,
+                ..
+            })
+        )));
+    }
+
+    /// Nothing held means nothing to withdraw, so the common case -- a server
+    /// that never set a deadline -- announces nothing.
+    #[tokio::test]
+    async fn withdrawing_a_deadline_never_held_is_silent() {
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        let _subscription = client.subscribe_handler(collector.clone());
+
+        handle_ib_impl(client.clone(), &client_expiration(None).as_node_ref()).await;
+
+        assert!(stored_expiration(&client).await.is_none());
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::ClientExpirationChanged(_)))
+        );
+    }
 
     #[tokio::test]
     async fn valid_dirty_marker_dispatches_typed_event() {
