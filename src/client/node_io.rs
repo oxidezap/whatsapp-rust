@@ -3,6 +3,7 @@
 use super::*;
 use crate::client::{PhashWaiter, ResponseWaiter};
 use wacore::net::DisconnectReason;
+use wacore::stanza::wire_tags::StanzaTag;
 
 /// Non-error exits of [`Client::read_messages_loop`] — `ServerRecycle` keeps the
 /// routine reconnect path out of `Err`, so severity consumers (logs, the span's
@@ -646,10 +647,16 @@ impl Client {
     /// enqueue could put a group message ahead of the pkmsg that establishes its
     /// session. Acks and receipts qualify only while nothing observes them.
     pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        match node.tag.as_ref() {
-            "success" | "failure" | "stream:error" | "message" | "ib" => true,
-            "status" => is_status_broadcast_stanza(node),
-            "receipt" => {
+        match StanzaTag::try_from(node.tag.as_ref()) {
+            Ok(
+                StanzaTag::Success
+                | StanzaTag::Failure
+                | StanzaTag::StreamError
+                | StanzaTag::Message
+                | StanzaTag::InfoBanner,
+            ) => true,
+            Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Receipt) => {
                 !self.synchronous_ack
                     && !self.raw_node_forwarding_enabled()
                     && !self
@@ -657,7 +664,7 @@ impl Client {
                         .event_bus
                         .has_handler_for(wacore::types::events::EventKind::Receipt)
             }
-            "ack" => {
+            Ok(StanzaTag::Ack) => {
                 !self.raw_node_forwarding_enabled()
                     && !self
                         .core

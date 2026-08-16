@@ -53,11 +53,14 @@ const TAG_RENAMES: &[(&str, &str)] = &[
 /// The same, for notification types.
 const KIND_RENAMES: &[(&str, &str)] = &[("mediaretry", "MediaRetry")];
 
-/// Tags that name something other than a stanza this client can receive.
+/// Outgoing stanza types that never arrive under that tag.
 ///
-/// `privacy` is the type of an outgoing stanza only; it never arrives under
-/// that tag, so listing it would invite a handler that can never fire.
-const NOT_A_RECEIVED_TAG: &[&str] = &["privacy"];
+/// Filtered out of the outgoing document's contribution alone, not out of the
+/// merged set: the claim being made is only that *sending* a `privacy` stanza
+/// is not evidence of receiving one. Should a later bundle list it in the
+/// dispatcher table or among the server's requests, that is direct evidence it
+/// arrives, and it must survive into the enum.
+const OUTGOING_ONLY: &[&str] = &["privacy"];
 
 pub fn generate(notif: &NotifIr, srvreq: &SrvReqIr, stanza: &StanzaIr) -> Result<String> {
     let mut out = super::header("stanza and notification vocabulary", &notif.wa_version);
@@ -70,11 +73,9 @@ pub fn generate(notif: &NotifIr, srvreq: &SrvReqIr, stanza: &StanzaIr) -> Result
         stanza
             .stanzas
             .iter()
-            .filter_map(|s| s.stanza_type.as_deref()),
+            .filter_map(|s| s.stanza_type.as_deref())
+            .filter(|t| !OUTGOING_ONLY.contains(t)),
     );
-    for skip in NOT_A_RECEIVED_TAG {
-        tags.remove(skip);
-    }
 
     out.push_str(&wire_enum(
         "StanzaTag",
@@ -203,6 +204,18 @@ mod tests {
         let (n, s, o) = ir(&["message"], &[], &["privacy"], &["encrypt"]);
         let out = generate(&n, &s, &o).expect("emit");
         assert!(!out.contains("#[wire = \"privacy\"]"), "{out}");
+    }
+
+    /// The exclusion is about the outgoing document, not about the tag. A
+    /// bundle that starts dispatching `privacy` is saying it arrives, and
+    /// dropping it then would omit a tag upstream just told us to expect.
+    #[test]
+    fn a_dispatched_tag_survives_even_when_it_is_also_sent() {
+        for (dispatcher, requests) in [(vec!["privacy"], vec![]), (vec![], vec!["privacy"])] {
+            let (n, s, o) = ir(&dispatcher, &requests, &["privacy"], &["encrypt"]);
+            let out = generate(&n, &s, &o).expect("emit");
+            assert!(out.contains("#[wire = \"privacy\"]"), "{out}");
+        }
     }
 
     #[test]

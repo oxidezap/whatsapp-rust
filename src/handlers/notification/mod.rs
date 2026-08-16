@@ -46,10 +46,6 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
 
-    // Dispatching on the generated vocabulary rather than on string literals:
-    // a type renamed upstream then fails to parse here and lands in the raw
-    // event arm, instead of leaving a literal that still compiles, still reads
-    // correctly, and never matches again.
     let parsed = notification_type
         .as_deref()
         .and_then(|t| NotificationType::try_from(t).ok());

@@ -14,6 +14,7 @@ pub use wacore::media_retry::MediaRetryResult;
 use wacore::media_retry::{
     build_media_retry_receipt, encrypt_media_retry_receipt, parse_media_retry_notification,
 };
+use wacore::stanza::wire_tags::{NotificationType, StanzaTag};
 use wacore_binary::{Jid, JidExt as _};
 
 const MEDIA_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -109,8 +110,8 @@ impl<'a> MediaReupload<'a> {
 
         // Register waiter BEFORE sending (to avoid race)
         let waiter = self.client.wait_for_node(
-            NodeFilter::tag("notification")
-                .attr("type", "mediaretry")
+            NodeFilter::tag(StanzaTag::Notification.as_str())
+                .attr("type", NotificationType::MediaRetry.as_str())
                 .attr("id", req.msg_id),
         );
 
