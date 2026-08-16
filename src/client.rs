@@ -497,6 +497,10 @@ pub struct MemoryReport {
     /// [`Self::node_waiters`]. Each retains a filter and a oneshot sender.
     pub sent_node_waiters: usize,
     pub pending_retries: usize,
+    /// Numbers with a `refresh_lid` re-resolve in flight. Bounded by the
+    /// number of distinct peers acked at once; a value that stays high
+    /// means refreshes are not completing, not that many were requested.
+    pub pending_lid_refreshes: usize,
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
     /// Expanded app-state keys the processor holds in memory. No capacity cap
@@ -646,6 +650,11 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
         writeln!(f, "  sent_node_waiters:      {}", self.sent_node_waiters)?;
         writeln!(f, "  pending_retries:        {}", self.pending_retries)?;
+        writeln!(
+            f,
+            "  pending_lid_refreshes:  {}",
+            self.pending_lid_refreshes
+        )?;
         writeln!(
             f,
             "  presence_subscriptions: {}",
@@ -1301,6 +1310,12 @@ pub struct Client {
     pub(crate) pending_device_sync: crate::pending_device_sync::PendingDeviceSync,
 
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
+
+    /// Phone numbers with a `refresh_lid` re-resolve in flight, keyed by the
+    /// bare user. A burst of sends to one stale peer is acked one message at a
+    /// time, and every one of those acks carries the flag, so without this the
+    /// same query would go out once per ack while the first is still pending.
+    pub(crate) pending_lid_refreshes: Arc<std::sync::Mutex<HashSet<String>>>,
 
     /// Track retry attempts per message to prevent infinite retry loops.
     /// Key: "{chat}:{msg_id}:{sender}", Value: retry count plus the most

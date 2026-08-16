@@ -460,6 +460,8 @@ impl Client {
 
             pending_retries: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
+            pending_lid_refreshes: Arc::new(std::sync::Mutex::new(HashSet::new())),
+
             message_retry_counts: cache_config.message_retry_counts.build_with_ttl(),
 
             session_recreate_history: cache_config.session_recreate_history.build_with_ttl(),
@@ -1784,6 +1786,12 @@ impl Client {
         // Clear pending retries so stale keys from detached scopeguard
         // cleanup don't suppress the first retry after reconnect.
         self.pending_retries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        // Same for in-flight LID refreshes: their queries died with the socket,
+        // so a leftover key would suppress the refresh the next ack asks for.
+        self.pending_lid_refreshes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
