@@ -4,6 +4,8 @@ use crate::types::events::Event;
 use async_trait::async_trait;
 use log::debug;
 use std::sync::Arc;
+use wacore::stanza::wire_tags::NotificationType;
+use wacore::stanza::wire_tags::StanzaTag;
 use wacore_binary::OwnedNodeRef;
 
 /// Handler for `<notification>` stanzas.
@@ -20,7 +22,7 @@ pub struct NotificationHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for NotificationHandler {
     fn tag(&self) -> &'static str {
-        "notification"
+        StanzaTag::Notification.as_str()
     }
 
     async fn handle(
@@ -44,37 +46,54 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
 
-    match notification_type.as_deref().unwrap_or_default() {
-        "encrypt" => handle_encrypt_notification(client, nr).await,
-        "server_sync" => handle_server_sync_notification(client, nr),
-        "account_sync" => handle_account_sync_notification(client, nr).await,
-        "devices" => handle_devices_notification(client, nr).await,
-        "link_code_companion_reg" => {
+    // Dispatching on the generated vocabulary rather than on string literals:
+    // a type renamed upstream then fails to parse here and lands in the raw
+    // event arm, instead of leaving a literal that still compiles, still reads
+    // correctly, and never matches again.
+    let parsed = notification_type
+        .as_deref()
+        .and_then(|t| NotificationType::try_from(t).ok());
+
+    match parsed {
+        Some(NotificationType::Encrypt) => handle_encrypt_notification(client, nr).await,
+        Some(NotificationType::ServerSync) => handle_server_sync_notification(client, nr),
+        Some(NotificationType::AccountSync) => handle_account_sync_notification(client, nr).await,
+        Some(NotificationType::Devices) => handle_devices_notification(client, nr).await,
+        Some(NotificationType::LinkCodeCompanionReg) => {
             crate::pair_code::handle_pair_code_notification(client, nr).await;
         }
-        "companion_reg_refresh" => handle_companion_reg_refresh(client, nr).await,
-        "business" => handle_business_notification(client, nr).await,
-        "picture" => handle_picture_notification(client, nr),
-        "privacy_token" => handle_privacy_token_notification(client, nr).await,
-        "status" => handle_status_notification(client, nr),
-        "contacts" => handle_contacts_notification(client, nr).await,
-        "w:gp2" => handle_group_notification(client, Arc::clone(&node)).await,
-        "disappearing_mode" => handle_disappearing_mode_notification(client, nr),
-        "newsletter" => handle_newsletter_notification(client, Arc::clone(&node)),
-        "mex" => handle_mex_notification(client, nr),
-        crate::passkey::flow::NOTIF_PASSKEY_REQUEST => {
+        Some(NotificationType::CompanionRegRefresh) => {
+            handle_companion_reg_refresh(client, nr).await
+        }
+        Some(NotificationType::Business) => handle_business_notification(client, nr).await,
+        Some(NotificationType::Picture) => handle_picture_notification(client, nr),
+        Some(NotificationType::PrivacyToken) => handle_privacy_token_notification(client, nr).await,
+        Some(NotificationType::Status) => handle_status_notification(client, nr),
+        Some(NotificationType::Contacts) => handle_contacts_notification(client, nr).await,
+        Some(NotificationType::WGp2) => handle_group_notification(client, Arc::clone(&node)).await,
+        Some(NotificationType::DisappearingMode) => {
+            handle_disappearing_mode_notification(client, nr)
+        }
+        Some(NotificationType::Newsletter) => {
+            handle_newsletter_notification(client, Arc::clone(&node))
+        }
+        Some(NotificationType::Mex) => handle_mex_notification(client, nr),
+        Some(NotificationType::PasskeyPrologueRequest) => {
             crate::passkey::flow::handle_passkey_notification(client, Arc::clone(&node)).await;
         }
-        crate::passkey::flow::NOTIF_PASSKEY_CONTINUATION => {
+        Some(NotificationType::CrscContinuation) => {
             crate::passkey::flow::handle_passkey_continuation(client, Arc::clone(&node)).await;
         }
-        "mediaretry" => {
+        Some(NotificationType::MediaRetry) => {
             debug!(
                 "Received mediaretry notification for msg {}",
                 nr.attrs().optional_string("id").unwrap_or_default()
             );
         }
-        other => {
+        // A type the protocol carries that this client does not act on, or one
+        // it does not model at all. Both reach the consumer as a raw event.
+        _ => {
+            let other = notification_type.as_deref().unwrap_or_default();
             debug!("Unhandled notification type '{other}', dispatching raw event");
             client
                 .core

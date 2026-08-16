@@ -28,10 +28,6 @@ use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeContent, NodeRef, OwnedNodeRef, SERVER_JID, Server};
 use waproto::whatsapp as wa;
 
-/// `<notification type=...>` routing keys, consumed by the notification dispatcher.
-pub(crate) const NOTIF_PASSKEY_REQUEST: &str = "passkey_prologue_request";
-pub(crate) const NOTIF_PASSKEY_CONTINUATION: &str = "crsc_continuation";
-
 const MD_NAMESPACE: &str = "md";
 const TAG_REF: &str = "ref";
 const TAG_PASSKEY_REQUEST_OPTIONS: &str = "passkey_request_options";
@@ -618,6 +614,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
     use wacore::libsignal::protocol::PublicKey;
+    use wacore::stanza::wire_tags::NotificationType;
     use waproto::whatsapp as wa;
 
     fn server_notification(notif_type: &'static str, child: Option<Node>) -> Arc<OwnedNodeRef> {
@@ -895,7 +892,10 @@ mod tests {
             .bytes(options.as_bytes().to_vec())
             .build();
         client
-            .process_node(server_notification(NOTIF_PASSKEY_REQUEST, Some(child)))
+            .process_node(server_notification(
+                NotificationType::PasskeyPrologueRequest.as_str(),
+                Some(child),
+            ))
             .await;
 
         // The rotation is deferred to confirmation, so the stored secret is unchanged.
@@ -928,7 +928,7 @@ mod tests {
             .bytes(b"{}".to_vec())
             .build();
         let node = NodeBuilder::new("notification")
-            .attr("type", NOTIF_PASSKEY_REQUEST)
+            .attr("type", NotificationType::PasskeyPrologueRequest.as_str())
             .attr("from", "12345@s.whatsapp.net")
             .children([child])
             .build();
@@ -954,7 +954,10 @@ mod tests {
         // No inline options: the handler falls back to an IQ fetch. The test client
         // isn't connected, so the fetch fails and surfaces a non-continuation error.
         client
-            .process_node(server_notification(NOTIF_PASSKEY_REQUEST, None))
+            .process_node(server_notification(
+                NotificationType::PasskeyPrologueRequest.as_str(),
+                None,
+            ))
             .await;
 
         wait_for(&collector, |e| {
@@ -983,7 +986,10 @@ mod tests {
             .bytes(buffa::Message::encode_to_vec(&primary))
             .build();
         client
-            .process_node(server_notification(NOTIF_PASSKEY_CONTINUATION, Some(child)))
+            .process_node(server_notification(
+                NotificationType::CrscContinuation.as_str(),
+                Some(child),
+            ))
             .await;
 
         wait_for(

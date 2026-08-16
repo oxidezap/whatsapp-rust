@@ -35,6 +35,7 @@ use crate::client::CallError;
 use crate::client::Client;
 
 use super::traits::StanzaHandler;
+use wacore::stanza::wire_tags::StanzaTag;
 
 /// Router sends the generic `<ack>` via `should_ack`, so this handler only
 /// parses and dispatches. On `Offer` it also emits the `<receipt><offer/></receipt>`
@@ -46,7 +47,7 @@ pub struct CallHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for CallHandler {
     fn tag(&self) -> &'static str {
-        "call"
+        StanzaTag::Call.as_str()
     }
 
     #[cfg_attr(

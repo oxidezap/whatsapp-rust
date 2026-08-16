@@ -9,7 +9,10 @@
     "iq/index.json": "sha256:e8e68c739a74e7551393e786eb9e63ae413209aa46330549135b7912bfa2431c",
     "manifest.json": "sha256:a944729a9d7741c7a6b27ee952853f787d9ba6380c324eb9cdb8d9c76eef8601",
     "mex/index.json": "sha256:7d14b1daf2169e9647adb3f18d31482bb7e0271344774ed7ae0e937392d8dbee",
+    "notif/index.json": "sha256:bd9637539c7d439746fc1866e625ab5f7cbce333350b01e1322a3494496a1018",
     "proto/WAProto.proto": "sha256:021d53059e7b35d8553c97c09567da8d6aba7278c7f2510242eab686bff3647a",
+    "srvreq/index.json": "sha256:b7cc61c5811b028e24cd82e1ad54c1e26c5f6d1ccc8742515937e09e259bea9e",
+    "stanza/index.json": "sha256:5b0819a64a5d938759ddc58e1bd86f7594de0ba8bcacdf7d8a0013f8dc3b92d2",
     "tokens/index.json": "sha256:676ab4a648f64397e2b571293dee683bb27efc3a74dc58ef7b52390782ce960f"
   }
 }

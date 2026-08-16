@@ -7,6 +7,7 @@ use log::{debug, info, warn};
 use std::sync::Arc;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::iq::dirty::{DirtyBit, DirtyType};
+use wacore::stanza::wire_tags::StanzaTag;
 
 /// Handler for `<ib>` (information broadcast) stanzas.
 ///
@@ -22,7 +23,7 @@ pub struct IbHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for IbHandler {
     fn tag(&self) -> &'static str {
-        "ib"
+        StanzaTag::InfoBanner.as_str()
     }
 
     async fn handle(

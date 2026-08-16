@@ -288,7 +288,10 @@ fn wire_enum(wanted: &Wanted, def: &EnumDef) -> Result<String> {
             out.push_str("    #[wire_default]\n");
             marked += 1;
         }
-        out.push_str(&format!("    #[wire = {}]\n    {ident},\n", rust_str(wire)));
+        out.push_str(&format!(
+            "    #[wire = {}]\n    {ident},\n",
+            super::rust_str(wire)
+        ));
     }
 
     // Checked against what was emitted rather than against the catalog, so the
@@ -369,12 +372,6 @@ fn masks(wanted: &Wanted, def: &EnumDef) -> Result<String> {
     }
     out.push('\n');
     Ok(out)
-}
-
-/// A Rust string literal for a wire value. Wire values are ASCII identifiers in
-/// practice, so this only has to survive a quote or a backslash appearing.
-fn rust_str(s: &str) -> String {
-    format!("{s:?}")
 }
 
 #[cfg(test)]

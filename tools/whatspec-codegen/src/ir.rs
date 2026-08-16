@@ -157,6 +157,58 @@ pub struct IqIr {
     pub stanzas: Vec<IqStanza>,
 }
 
+/// One entry of the top-level stanza dispatcher, and one notification kind.
+///
+/// Both name a value this client compares against on the wire: a stanza's tag,
+/// and a `<notification type>`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifStanzaTag {
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifKind {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifIr {
+    pub wa_version: String,
+    pub stanza_tags: Vec<NotifStanzaTag>,
+    pub notifications: Vec<NotifKind>,
+}
+
+/// An incoming server request. Read only for the stanza tag it arrives under:
+/// `iq` appears here and in no other document.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SrvReq {
+    pub tag: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SrvReqIr {
+    pub requests: Vec<SrvReq>,
+}
+
+/// An outgoing stanza. Read only for its type, which is the tag it is sent
+/// under: `ack` appears here and in no dispatcher table.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutgoingStanza {
+    pub stanza_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StanzaIr {
+    pub stanzas: Vec<OutgoingStanza>,
+}
+
 /// One element of an action's mutation index; `type` discriminates the shape.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]

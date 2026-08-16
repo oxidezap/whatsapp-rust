@@ -2,6 +2,7 @@ use super::traits::StanzaHandler;
 use crate::client::Client;
 use async_trait::async_trait;
 use std::sync::Arc;
+use wacore::stanza::wire_tags::StanzaTag;
 use wacore_binary::OwnedNodeRef;
 
 /// Handler for `<success>` stanzas.
@@ -12,7 +13,7 @@ pub struct SuccessHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for SuccessHandler {
     fn tag(&self) -> &'static str {
-        "success"
+        StanzaTag::Success.as_str()
     }
 
     #[cfg_attr(
@@ -38,7 +39,7 @@ pub struct FailureHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for FailureHandler {
     fn tag(&self) -> &'static str {
-        "failure"
+        StanzaTag::Failure.as_str()
     }
 
     #[cfg_attr(
@@ -64,7 +65,7 @@ pub struct StreamErrorHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for StreamErrorHandler {
     fn tag(&self) -> &'static str {
-        "stream:error"
+        StanzaTag::StreamError.as_str()
     }
 
     #[cfg_attr(
@@ -90,7 +91,7 @@ pub struct AckHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for AckHandler {
     fn tag(&self) -> &'static str {
-        "ack"
+        StanzaTag::Ack.as_str()
     }
 
     async fn handle(

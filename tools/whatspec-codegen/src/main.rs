@@ -254,6 +254,12 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         serde_json::from_str(&ir.text("enums/index.json")?).context("parsing the enums IR")?;
     let iq: ir::IqIr =
         serde_json::from_str(&ir.text("iq/index.json")?).context("parsing the IQ IR")?;
+    let notif: ir::NotifIr =
+        serde_json::from_str(&ir.text("notif/index.json")?).context("parsing the notif IR")?;
+    let srvreq: ir::SrvReqIr =
+        serde_json::from_str(&ir.text("srvreq/index.json")?).context("parsing the srvreq IR")?;
+    let stanza: ir::StanzaIr =
+        serde_json::from_str(&ir.text("stanza/index.json")?).context("parsing the stanza IR")?;
     let mex: ir::MexIr =
         serde_json::from_str(&ir.text("mex/index.json")?).context("parsing the mex IR")?;
     let tokens: ir::TokensIr =
@@ -278,6 +284,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         Artifact {
             path: "wacore/src/iq/targets.rs",
             content: emit::iq_targets::generate(&iq)?,
+            rust: true,
+        },
+        Artifact {
+            path: "wacore/src/stanza/wire_tags.rs",
+            content: emit::notif::generate(&notif, &srvreq, &stanza)?,
             rust: true,
         },
         Artifact {

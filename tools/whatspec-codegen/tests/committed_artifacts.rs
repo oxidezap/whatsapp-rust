@@ -56,6 +56,7 @@ fn every_generated_rust_file_stamps_the_locked_version() {
         "wacore/appstate/src/schemas.rs",
         "wacore/src/types/wire_enums.rs",
         "wacore/src/iq/targets.rs",
+        "wacore/src/stanza/wire_tags.rs",
     ] {
         let text = read(rel);
         let got = stamped_in_header(&text)

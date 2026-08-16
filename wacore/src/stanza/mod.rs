@@ -11,6 +11,7 @@ pub mod groups;
 pub mod message;
 pub mod notification;
 pub mod receipt;
+pub mod wire_tags;
 
 pub use business::*;
 pub use devices::*;
