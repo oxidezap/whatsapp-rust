@@ -56,16 +56,28 @@ struct EnsureReservation {
 /// addresses before its first await and cannot leave a claim behind.
 struct EnsureLease {
     registry: Arc<EnsureRegistry>,
-    addresses: Vec<Box<str>>,
-    completed: Arc<std::sync::atomic::AtomicBool>,
+    /// Per address, because completion is per address: the fetch is chunked,
+    /// and a chunk the server answered stays answered even if a later one
+    /// fails. One flag for the whole lease would send waiters for an already
+    /// answered address back to re-ask it.
+    addresses: Vec<(Box<str>, Arc<std::sync::atomic::AtomicBool>)>,
     /// Closes on drop, waking every waiter registered against these addresses.
     _leader: async_channel::Sender<std::convert::Infallible>,
 }
 
 impl EnsureLease {
-    /// Record that this caller carried its addresses as far as it could.
-    fn mark_completed(&self) {
-        self.completed.store(true, Ordering::Release);
+    /// Record that these addresses were carried as far as this caller could.
+    fn mark_completed(&self, jids: &[Jid]) {
+        for jid in jids {
+            let address = jid.to_protocol_address_string();
+            if let Some((_, completed)) = self
+                .addresses
+                .iter()
+                .find(|(claimed, _)| claimed.as_ref() == address)
+            {
+                completed.store(true, Ordering::Release);
+            }
+        }
     }
 }
 
@@ -77,7 +89,7 @@ impl Drop for EnsureLease {
             // dropping, so leaving the entries is the lesser failure.
             return;
         };
-        for address in &self.addresses {
+        for (address, _) in &self.addresses {
             inflight.remove(address);
         }
     }
@@ -93,11 +105,6 @@ impl EnsureRegistry {
         use wacore::types::jid::JidExt;
 
         let (leader, released) = async_channel::bounded(1);
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let slot = EnsureSlot {
-            completed: completed.clone(),
-            released,
-        };
         let mut owned = Vec::with_capacity(jids.len());
         let mut addresses = Vec::with_capacity(jids.len());
         let mut deferred = Vec::new();
@@ -120,8 +127,12 @@ impl EnsureRegistry {
                         deferred.push((jid.clone(), entry.get().clone()));
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        addresses.push(entry.key().clone());
-                        entry.insert(slot.clone());
+                        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        addresses.push((entry.key().clone(), completed.clone()));
+                        entry.insert(EnsureSlot {
+                            completed,
+                            released: released.clone(),
+                        });
                         owned.push(jid.clone());
                     }
                 }
@@ -131,7 +142,6 @@ impl EnsureRegistry {
         let lease = (!addresses.is_empty()).then(|| EnsureLease {
             registry: self.clone(),
             addresses,
-            completed,
             _leader: leader,
         });
         EnsureReservation {
@@ -578,51 +588,55 @@ impl Client {
         use futures::StreamExt;
         const SESSION_PROBE_CONCURRENCY: usize = 16;
         let backend = device_snapshot.backend.clone();
-        let jids_needing_sessions: Vec<Jid> = futures::stream::iter(jids)
+        let probed: Vec<(Jid, bool)> = futures::stream::iter(jids)
             .map(|jid| {
                 let backend = backend.clone();
                 async move {
                     let signal_addr = jid.to_protocol_address();
                     // Check cache first (includes unflushed sessions), fall back to backend.
                     match self.signal_cache.has_session(&signal_addr, &*backend).await {
-                        Ok(true) => None,
-                        Ok(false) => Some(jid),
+                        Ok(true) => (jid, false),
+                        Ok(false) => (jid, true),
                         Err(e) => {
                             log::warn!("Failed to check session for {}: {}", jid.observe(), e);
-                            None
+                            (jid, false)
                         }
                     }
                 }
             })
             .buffer_unordered(SESSION_PROBE_CONCURRENCY)
-            .filter_map(|needed| async move { needed })
             .collect()
             .await;
+        let (needing, satisfied): (Vec<_>, Vec<_>) = probed
+            .into_iter()
+            .partition(|(_, needs_fetch)| *needs_fetch);
+        let jids_needing_sessions: Vec<Jid> = needing.into_iter().map(|(jid, _)| jid).collect();
+        let satisfied: Vec<Jid> = satisfied.into_iter().map(|(jid, _)| jid).collect();
 
-        if jids_needing_sessions.is_empty() {
-            if let Some(lease) = &lease {
-                lease.mark_completed();
+        // Nobody has to fetch for an address that already has a session, so it
+        // is complete whatever the rest of this call does.
+        if let Some(lease) = &lease {
+            lease.mark_completed(&satisfied);
+        }
+
+        // Marked per chunk, as each is answered: an answered fetch that carried
+        // no bundle for a device is still an answer, and our waiters must not
+        // re-ask it. A later chunk failing does not unanswer an earlier one.
+        let mut fetched = Ok(());
+        for batch in jids_needing_sessions.chunks(crate::session::SESSION_CHECK_BATCH_SIZE) {
+            match self.fetch_and_establish_sessions(batch).await {
+                Ok(_) => {
+                    if let Some(lease) = &lease {
+                        lease.mark_completed(batch);
+                    }
+                }
+                Err(error) => {
+                    fetched = Err(error);
+                    break;
+                }
             }
-            drop(lease);
-            return Ok(await_leaders(deferred).await);
         }
 
-        let fetched = async {
-            for batch in jids_needing_sessions.chunks(crate::session::SESSION_CHECK_BATCH_SIZE) {
-                self.fetch_and_establish_sessions(batch).await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-
-        // Marked whatever the server said: an answered fetch that carried no
-        // bundle for a device is still an answer, and our waiters must not
-        // re-ask it. Only a failure leaves the claim unmarked.
-        if let Some(lease) = &lease
-            && fetched.is_ok()
-        {
-            lease.mark_completed();
-        }
         // Release before waiting: a leader that keeps its claim while blocking
         // on someone else's would deadlock two callers whose batches overlap in
         // opposite order.

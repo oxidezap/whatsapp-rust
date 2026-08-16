@@ -1376,6 +1376,10 @@ mod tests {
         .expect("distribution")
         .into_serialized();
 
+        assert!(
+            SenderKeyDistributionMessage::try_from(&framed[..]).is_ok(),
+            "the framed shape must decode through the primary, not by falling back"
+        );
         let decoded = decode_sender_key_distribution(&framed).expect("framed distribution");
         assert_eq!(decoded.chain_id(), 7);
         assert_eq!(decoded.signing_key(), &signing.public_key);

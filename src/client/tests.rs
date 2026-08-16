@@ -6455,4 +6455,74 @@ mod ensure_sessions_concurrency {
             "a waiter must not re-ask a question its leader already got an answer to"
         );
     }
+
+    /// A fetch is chunked, and a chunk the server answered stays answered even
+    /// if a later one fails. Waiters for an address in the answered chunk must
+    /// not be sent back to re-ask it.
+    #[tokio::test]
+    async fn an_answered_chunk_stays_answered_when_a_later_one_fails() {
+        // Two chunks: one address over the batch size.
+        let batch = crate::session::SESSION_CHECK_BATCH_SIZE;
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let devices: Vec<Jid> = (0..=batch)
+            .map(|i| Jid::lid_device("666666666666666".to_string(), i as u16))
+            .collect();
+        let answered = devices[0].clone();
+
+        let leader = {
+            let client = client.clone();
+            let devices = devices.clone();
+            tokio::spawn(async move { client.ensure_e2e_sessions_resolved(&devices).await })
+        };
+
+        // First chunk: answered, with no bundle for anyone in it.
+        let first_id = pending_prekey_request(&transport, 0).await;
+        let empty = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &first_id)
+            .children([NodeBuilder::new("list").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &first_id, &empty).await;
+
+        // A waiter for an address the first chunk already covered.
+        let waiter = {
+            let client = client.clone();
+            let answered = answered.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&answered))
+                    .await
+            })
+        };
+
+        // Second chunk: refused, which fails the leader as a whole.
+        let second_id = pending_prekey_request(&transport, 1).await;
+        let refusal = NodeBuilder::new("iq")
+            .attr("type", "error")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &second_id)
+            .children([NodeBuilder::new("error")
+                .attr("code", "500")
+                .attr("text", "internal-server-error")
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &second_id, &refusal).await;
+
+        assert!(
+            leader.await.expect("leader task").is_err(),
+            "a failed chunk fails the call that owned it"
+        );
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("the waiter inherits the chunk that was answered");
+
+        assert_eq!(
+            prekey_requests(&transport).await,
+            2,
+            "one fetch per chunk; the waiter must not add a third for an address \
+             the first chunk already covered"
+        );
+    }
 }
