@@ -6685,4 +6685,48 @@ mod ensure_sessions_concurrency {
             .expect("second task")
             .expect("a caller after the claim retired must establish the session itself");
     }
+
+    /// The invariant behind the retirement ordering: a caller can never find a
+    /// slot that is registered and already complete.
+    ///
+    /// That state is what lets a caller which just deleted a session join a
+    /// finished claim and inherit a verdict about it, so the registry must
+    /// publish completion and unregister under one lock.
+    #[tokio::test]
+    async fn a_registered_claim_is_never_already_complete() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("999999999999999".to_string(), 0);
+        let keys = PeerKeys::generate();
+
+        let leader = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let request_id = pending_prekey_request(&transport, 0).await;
+
+        // Sampled while the claim is held, and again once it is answered: the
+        // pair (registered, complete) must never both hold.
+        assert!(
+            !client.ensure_inflight.any_completed_still_registered(),
+            "a claim in flight must not be complete"
+        );
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &keys.bundle_response(&peer, &request_id, 500),
+        )
+        .await;
+        leader.await.expect("leader task").expect("leader ensure");
+
+        assert!(
+            !client.ensure_inflight.any_completed_still_registered(),
+            "a completed claim must be unregistered by the same lock that completed it"
+        );
+        assert_eq!(client.ensure_inflight.len(), 0);
+    }
 }

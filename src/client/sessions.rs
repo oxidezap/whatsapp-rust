@@ -25,8 +25,8 @@ type EnsureWaiter = async_channel::Receiver<std::convert::Infallible>;
 /// What a waiter holds while another caller establishes its address.
 #[derive(Clone)]
 struct EnsureSlot {
-    /// Set by the leader when it finished its work, before it releases the
-    /// claim. Distinguishes "the leader ran and the server had nothing for this
+    /// Published by the leader, under the same lock that unregisters the slot.
+    /// Distinguishes "the leader ran and the server had nothing for this
     /// device" — where retrying only repeats an answered question — from "the
     /// leader died", where nobody has asked yet.
     completed: Arc<std::sync::atomic::AtomicBool>,
@@ -50,10 +50,6 @@ struct EnsureReservation {
     lease: Option<EnsureLease>,
 }
 
-/// The addresses this caller reserved, released on drop.
-///
-/// Reservation and release are both synchronous, so a caller can claim its
-/// addresses before its first await and cannot leave a claim behind.
 /// One address this caller claimed.
 ///
 /// Both halves are per address rather than per lease, because the fetch is
@@ -68,7 +64,10 @@ struct EnsureClaim {
     release: Option<async_channel::Sender<std::convert::Infallible>>,
 }
 
-/// The addresses this caller reserved, released on drop.
+/// The addresses this caller claimed, released on drop.
+///
+/// Claiming and releasing are both synchronous, so a caller can claim before
+/// its first await and cannot leave a claim behind.
 struct EnsureLease {
     registry: Arc<EnsureRegistry>,
     claims: Vec<EnsureClaim>,
@@ -83,24 +82,21 @@ impl EnsureLease {
             let address = jid.to_protocol_address_string();
             if let Some(claim) = self
                 .claims
-                .iter_mut()
+                .iter()
                 .find(|claim| claim.address.as_ref() == address)
             {
-                claim.completed.store(true, Ordering::Release);
                 finished.push(claim.address.clone());
             }
         }
 
-        // Retired from the registry now, not when the lease drops. A claim that
-        // outlives its work is a claim a later caller joins: retry recovery can
-        // delete this session and ensure it again while a sibling chunk is
-        // still in flight, and that caller must be able to become leader
-        // instead of inheriting an answer about the session it just deleted.
+        // Completion is published by the same lock that removes the slot, so
+        // "registered" and "complete" are never both true for an onlooker.
+        // Otherwise retry recovery deleting this session in that gap would join
+        // the slot and inherit a verdict about the session it just deleted.
         //
-        // Before the wake, not after. A slot that is both closed and complete
-        // answers instantly, so leaving it registered for even the width of
-        // this call is a window in which that same caller joins it.
-        self.registry.retire(&finished, &self.claims);
+        // Retired here rather than at the lease's drop for the same reason: a
+        // claim that outlives its work is a claim a later caller joins.
+        self.registry.complete_and_retire(&finished, &self.claims);
 
         for address in &finished {
             if let Some(claim) = self
@@ -140,16 +136,7 @@ impl EnsureRegistry {
         let mut deferred = Vec::new();
 
         {
-            let Ok(mut inflight) = self.inflight.lock() else {
-                // Without the registry there is no coalescing, only the
-                // pre-existing behaviour: every caller fetches. Degrade to that
-                // rather than fail the send.
-                return EnsureReservation {
-                    owned: jids.to_vec(),
-                    deferred,
-                    lease: None,
-                };
-            };
+            let mut inflight = self.map();
             for jid in jids {
                 let address = jid.to_protocol_address_string().into_boxed_str();
                 match inflight.entry(address) {
@@ -185,6 +172,18 @@ impl EnsureRegistry {
         }
     }
 
+    /// The registry map, ignoring poisoning.
+    ///
+    /// Nothing inside a critical section here can unwind — the sections do map
+    /// lookups and removals on already-owned values — so a poisoned lock would
+    /// mean a panic from elsewhere, and honouring it would strand every address
+    /// registered at that moment with no way to ever re-claim them.
+    fn map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<Box<str>, EnsureSlot>> {
+        self.inflight
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     /// Remove these addresses, but only where the registered slot is still the
     /// one `claims` describes.
     ///
@@ -193,15 +192,19 @@ impl EnsureRegistry {
     /// may have re-entered. Removing by address alone would evict that
     /// caller's live claim and let a third one fetch alongside it.
     fn retire(&self, addresses: &[Box<str>], claims: &[EnsureClaim]) {
+        self.retire_inner(addresses, claims, false);
+    }
+
+    /// [`retire`](Self::retire), publishing completion under the same lock.
+    fn complete_and_retire(&self, addresses: &[Box<str>], claims: &[EnsureClaim]) {
+        self.retire_inner(addresses, claims, true);
+    }
+
+    fn retire_inner(&self, addresses: &[Box<str>], claims: &[EnsureClaim], complete: bool) {
         if addresses.is_empty() {
             return;
         }
-        let Ok(mut inflight) = self.inflight.lock() else {
-            // A poisoned registry would strand every future reservation for
-            // these addresses; the waiters are already woken by the sender
-            // dropping, so leaving the entries is the lesser failure.
-            return;
-        };
+        let mut inflight = self.map();
         for address in addresses {
             let Some(claim) = claims.iter().find(|claim| &claim.address == address) else {
                 continue;
@@ -212,13 +215,28 @@ impl EnsureRegistry {
             {
                 entry.remove();
             }
+            if complete {
+                claim.completed.store(true, Ordering::Release);
+            }
         }
+    }
+
+    /// Whether any registered slot is already marked complete.
+    ///
+    /// Always false: completion and removal happen under one lock, so the pair
+    /// is unobservable. Exposed for the test that holds that invariant down,
+    /// since nothing else can see inside the registry.
+    #[cfg(test)]
+    pub(crate) fn any_completed_still_registered(&self) -> bool {
+        self.map()
+            .values()
+            .any(|slot| slot.completed.load(Ordering::Acquire))
     }
 
     /// Number of addresses currently being established. Reported by
     /// `memory_report()`; normally zero.
     pub(crate) fn len(&self) -> usize {
-        self.inflight.lock().map(|map| map.len()).unwrap_or(0)
+        self.map().len()
     }
 }
 
