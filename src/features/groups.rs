@@ -340,10 +340,6 @@ pub struct Groups<'a> {
     client: &'a Client,
 }
 
-/// Serializes one group's metadata publication with participant mutations and
-/// sender-key distribution, reusing the client's existing per-group lane.
-/// Keeping the guard in the type prevents persistence and cache publication
-/// from accidentally being split across an unlocked await.
 /// Metadata queries in flight, so a burst of callers for one group shares a
 /// single round trip instead of sending one query each.
 ///
@@ -455,6 +451,10 @@ impl GroupMetadataRegistry {
     }
 }
 
+/// Serializes one group's metadata publication with participant mutations and
+/// sender-key distribution, reusing the client's existing per-group lane.
+/// Keeping the guard in the type prevents persistence and cache publication
+/// from accidentally being split across an unlocked await.
 pub(crate) struct GroupMetadataGuard<'a> {
     client: &'a Client,
     jid: &'a Jid,
@@ -802,13 +802,16 @@ impl<'a> Groups<'a> {
         // with `maxConcurrency: 1`; ours is called directly, so the
         // deduplication has to live here.
         // A leader that produced nothing has answered for nobody, so its waiters
-        // try again — but by re-entering the registry, not by querying directly.
-        // Going straight to the query would turn one failed round trip into a
-        // simultaneous burst of retries, which is this fix in reverse and worst
-        // of all against the `rate-overlimit` that motivated it.
-        const METADATA_QUERY_ATTEMPTS: usize = 3;
-
-        for _ in 0..METADATA_QUERY_ATTEMPTS {
+        // try again — but by re-entering the registry, never by querying around
+        // it. An escape hatch here would let a run of failures release several
+        // waiters at once, which is this fix in reverse and lands hardest
+        // against the `rate-overlimit` that motivated it.
+        //
+        // Unbounded on purpose, and it terminates: each turn either makes this
+        // caller the leader, or waits on one that will finish. Only a leader
+        // queries, so however long a run of failures lasts, the wire carries one
+        // query for this group at a time.
+        loop {
             match self.client.group_metadata_inflight.claim(jid) {
                 MetadataClaim::Leader(lease) => {
                     let queried = self.query_metadata_uncoalesced(jid).await;
@@ -824,14 +827,9 @@ impl<'a> Groups<'a> {
                 }
             }
         }
-
-        // Bounded, because a group whose leaders keep failing would otherwise
-        // loop here for as long as that lasts. Falling through to our own query
-        // is what this call did before coalescing, and it returns a real error
-        // rather than one invented to describe someone else's failure.
-        self.query_metadata_uncoalesced(jid).await
     }
 
+    /// The query itself, with no coalescing. Only a leader reaches it.
     async fn query_metadata_uncoalesced(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
         // No phash is sent, so the server always returns the full group.
         match self.client.execute(GroupQueryIq::new(jid)).await? {
@@ -2755,5 +2753,64 @@ mod tests {
             .optional_string("id")
             .expect("an IQ carries an id")
             .to_string()
+    }
+
+    /// A run of failures stays one query at a time, however many callers are
+    /// waiting.
+    ///
+    /// The earlier revision bounded the retry loop and fell through to an
+    /// uncoalesced query, so a long enough run released several waiters at
+    /// once — the burst this registry exists to prevent, arriving after the
+    /// rate limit that caused the failures.
+    #[tokio::test]
+    async fn a_run_of_failed_metadata_flights_never_puts_two_queries_on_the_wire() {
+        const CALLERS: usize = 5;
+        const FAILURES: usize = 4;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let mut callers = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let client = client.clone();
+            let group = group.clone();
+            callers.push(tokio::spawn(async move {
+                client.groups().get_metadata(&group).await
+            }));
+        }
+
+        // Refuse the first few queries. After each refusal exactly one caller
+        // may take over, so the wire never holds two at once.
+        for attempt in 0..FAILURES {
+            let request_id = pending_group_query(&transport, attempt).await;
+            let refusal = iq_error(&request_id, &group, "429", "rate-overlimit");
+            crate::test_utils::answer_iq(&client, &request_id, &refusal).await;
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                transport.sent().len(),
+                attempt + 2,
+                "after {} refusal(s) exactly one retry may be in flight",
+                attempt + 1
+            );
+        }
+
+        // Let the next one succeed; everyone still waiting takes its answer.
+        let request_id = pending_group_query(&transport, FAILURES).await;
+        let response = group_result_with_description(&request_id, &group, None);
+        crate::test_utils::answer_iq(&client, &request_id, &response).await;
+
+        let mut succeeded = 0;
+        for caller in callers {
+            if caller.await.expect("caller task").is_ok() {
+                succeeded += 1;
+            }
+        }
+        assert_eq!(
+            succeeded,
+            CALLERS - FAILURES,
+            "each refusal answers exactly the caller that owned it"
+        );
     }
 }
