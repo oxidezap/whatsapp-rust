@@ -115,6 +115,48 @@ pub struct EnumsIr {
     pub enums: Vec<EnumDef>,
 }
 
+/// Who a request is addressed to, as whatspec resolves it from the builder.
+///
+/// The distinction only became visible in schema 4: before it, every `w:g2`
+/// stanza reported its namespace's base target, so a request sent to the wrong
+/// one of the two was indistinguishable from a correct one. The symptom is a
+/// server that never answers and a caller that waits out its timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum IqTarget {
+    /// The main server, `s.whatsapp.net`.
+    #[serde(rename = "s.whatsapp.net")]
+    MainServer,
+    /// The group server, `g.us`, which answers about groups in general.
+    #[serde(rename = "g.us")]
+    GroupServer,
+    /// The one group the request acts on.
+    #[serde(rename = "group_jid")]
+    GroupJid,
+    /// whatspec could not resolve the target from the builder.
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+/// One outgoing IQ builder found in the bundle. A name is unique only together
+/// with its module, and not always then: `resetGroupInviteCode` appears twice
+/// in `WAWebGroupInviteJob` with different targets.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IqStanza {
+    pub module_name: String,
+    pub namespace: String,
+    pub iq_type: String,
+    pub target: IqTarget,
+    pub exported_function: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IqIr {
+    pub wa_version: String,
+    pub stanzas: Vec<IqStanza>,
+}
+
 /// One element of an action's mutation index; `type` discriminates the shape.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]

@@ -252,6 +252,8 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         .context("parsing the appstate IR")?;
     let enums: ir::EnumsIr =
         serde_json::from_str(&ir.text("enums/index.json")?).context("parsing the enums IR")?;
+    let iq: ir::IqIr =
+        serde_json::from_str(&ir.text("iq/index.json")?).context("parsing the IQ IR")?;
     let mex: ir::MexIr =
         serde_json::from_str(&ir.text("mex/index.json")?).context("parsing the mex IR")?;
     let tokens: ir::TokensIr =
@@ -271,6 +273,11 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         Artifact {
             path: "wacore/src/types/wire_enums.rs",
             content: emit::enums::generate(&enums)?,
+            rust: true,
+        },
+        Artifact {
+            path: "wacore/src/iq/targets.rs",
+            content: emit::iq_targets::generate(&iq)?,
             rust: true,
         },
         Artifact {

@@ -20,5 +20,6 @@ pub mod profile;
 pub mod props;
 pub mod spam_report;
 pub mod spec;
+pub mod targets;
 pub mod tctoken;
 pub mod usync;

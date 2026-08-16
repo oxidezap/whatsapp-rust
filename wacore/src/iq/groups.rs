@@ -3690,44 +3690,102 @@ mod tests {
     /// read off the IR by hand, since the IR is not available at test time.
     #[test]
     fn group_requests_are_addressed_the_way_the_ir_resolves_them() {
+        use crate::iq::targets::{self, IqTarget};
+
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
         let server = Jid::new("", Server::Group);
 
-        // `g.us`: the group server answers these, not any one group.
-        assert_eq!(LeaveGroupIq::new(&group).build_iq().to, server);
-        assert_eq!(GroupParticipatingIq::new().build_iq().to, server);
-        assert_eq!(
+        // The expectation comes from the generated constants, so a request
+        // upstream moves between the two targets flips the constant on the next
+        // sync and fails here, rather than turning into a silent timeout.
+        let expect = |actual: Jid, want: IqTarget, spec: &str| {
+            let addressed = match want {
+                IqTarget::GroupServer => server.clone(),
+                IqTarget::GroupJid => group.clone(),
+                IqTarget::MainServer => Jid::new("", Server::Pn),
+            };
+            assert_eq!(actual, addressed, "{spec} is addressed to the wrong target");
+        };
+
+        expect(
+            LeaveGroupIq::new(&group).build_iq().to,
+            targets::LEAVE_GROUP,
+            "LeaveGroupIq",
+        );
+        expect(
+            GroupParticipatingIq::new().build_iq().to,
+            targets::GROUP_PARTICIPATING,
+            "GroupParticipatingIq",
+        );
+        expect(
             BatchGetGroupInfoIq::new(std::slice::from_ref(&group))
                 .build_iq()
                 .to,
-            server
+            targets::BATCH_GET_GROUP_INFO,
+            "BatchGetGroupInfoIq",
         );
-        assert_eq!(GetGroupInviteInfoIq::new("ABC123").build_iq().to, server);
-
-        // `group_jid`: addressed to the one group they act on.
-        assert_eq!(
+        expect(
+            GetGroupInviteInfoIq::new("ABC123").build_iq().to,
+            targets::GET_GROUP_INVITE_INFO,
+            "GetGroupInviteInfoIq",
+        );
+        expect(
+            GroupQueryIq::new(&group).build_iq().to,
+            targets::GROUP_QUERY,
+            "GroupQueryIq",
+        );
+        expect(
             SetGroupSubjectIq::new(&group, GroupSubject::new("x").unwrap())
                 .build_iq()
                 .to,
-            group
+            targets::SET_GROUP_SUBJECT,
+            "SetGroupSubjectIq",
         );
+        expect(
+            SetGroupDescriptionIq::new(&group, None, None).build_iq().to,
+            targets::SET_GROUP_DESCRIPTION,
+            "SetGroupDescriptionIq",
+        );
+        expect(
+            SetGroupLockedIq::lock(&group).build_iq().to,
+            targets::SET_GROUP_LOCKED,
+            "SetGroupLockedIq",
+        );
+        expect(
+            ReportGroupMessagesIq::new(&group, &["M1".to_string()])
+                .build_iq()
+                .to,
+            targets::REPORT_GROUP_MESSAGES,
+            "ReportGroupMessagesIq",
+        );
+        expect(
+            GetReportedGroupMessagesIq::new(&group).build_iq().to,
+            targets::GET_REPORTED_GROUP_MESSAGES,
+            "GetReportedGroupMessagesIq",
+        );
+        expect(
+            GetMembershipRequestsIq::new(&group).build_iq().to,
+            targets::GET_MEMBERSHIP_REQUESTS,
+            "GetMembershipRequestsIq",
+        );
+        expect(
+            MembershipRequestActionIq::approve(&group, &[])
+                .build_iq()
+                .to,
+            targets::MEMBERSHIP_REQUEST_ACTION,
+            "MembershipRequestActionIq",
+        );
+
+        // Still hand-asserted: `resetGroupInviteCode` has two entries in
+        // `WAWebGroupInviteJob` resolving to different targets, so the emitter
+        // refuses to pin either. Ours is the `group_jid` overload, the one with
+        // an empty `<invite/>`; the `g.us` overload carries a code and is a call
+        // this repository does not make.
         assert_eq!(
             GetGroupInviteLinkIq::new(&group, false).build_iq().to,
             group
         );
-        assert_eq!(
-            GetGroupInviteLinkIq::new(&group, true).build_iq().to,
-            group,
-            "the reset overload the IR resolves to group_jid is the one with an \
-             empty <invite/>; the g.us overload carries a code and is not this"
-        );
-        assert_eq!(
-            ReportGroupMessagesIq::new(&group, &["M1".to_string()])
-                .build_iq()
-                .to,
-            group
-        );
-        assert_eq!(GetReportedGroupMessagesIq::new(&group).build_iq().to, group);
+        assert_eq!(GetGroupInviteLinkIq::new(&group, true).build_iq().to, group);
     }
 
     #[test]
