@@ -423,6 +423,12 @@ impl GroupMetadataRegistry {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Number of groups currently being queried. Reported by `memory_report()`;
+    /// normally zero.
+    pub(crate) fn len(&self) -> usize {
+        self.map().len()
+    }
+
     /// Become the caller that queries this group, or join the one that already
     /// is.
     ///
@@ -795,22 +801,35 @@ impl<'a> Groups<'a> {
         // Web never gets there, since its `queryGroup` runs through a job queue
         // with `maxConcurrency: 1`; ours is called directly, so the
         // deduplication has to live here.
-        let lease = match self.client.group_metadata_inflight.claim(jid) {
-            MetadataClaim::Leader(lease) => lease,
-            // A leader that produced nothing has answered for nobody, so fall
-            // through to our own query rather than report a failure we cannot
-            // describe.
-            MetadataClaim::Joined(flight) => match flight.wait().await {
-                Some(metadata) => return Ok(metadata),
-                None => return self.query_metadata_uncoalesced(jid).await,
-            },
-        };
+        // A leader that produced nothing has answered for nobody, so its waiters
+        // try again — but by re-entering the registry, not by querying directly.
+        // Going straight to the query would turn one failed round trip into a
+        // simultaneous burst of retries, which is this fix in reverse and worst
+        // of all against the `rate-overlimit` that motivated it.
+        const METADATA_QUERY_ATTEMPTS: usize = 3;
 
-        let queried = self.query_metadata_uncoalesced(jid).await;
-        if let Ok(metadata) = &queried {
-            lease.publish(metadata.clone());
+        for _ in 0..METADATA_QUERY_ATTEMPTS {
+            match self.client.group_metadata_inflight.claim(jid) {
+                MetadataClaim::Leader(lease) => {
+                    let queried = self.query_metadata_uncoalesced(jid).await;
+                    if let Ok(metadata) = &queried {
+                        lease.publish(metadata.clone());
+                    }
+                    return queried;
+                }
+                MetadataClaim::Joined(flight) => {
+                    if let Some(metadata) = flight.wait().await {
+                        return Ok(metadata);
+                    }
+                }
+            }
         }
-        queried
+
+        // Bounded, because a group whose leaders keep failing would otherwise
+        // loop here for as long as that lasts. Falling through to our own query
+        // is what this call did before coalescing, and it returns a real error
+        // rather than one invented to describe someone else's failure.
+        self.query_metadata_uncoalesced(jid).await
     }
 
     async fn query_metadata_uncoalesced(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
@@ -2623,10 +2642,16 @@ mod tests {
         );
     }
 
-    /// A leader that failed has answered for nobody, so its waiters ask for
-    /// themselves rather than inherit a failure they have no answer for.
+    /// A leader that failed has answered for nobody, so its waiters try again —
+    /// one at a time, by re-entering the registry.
+    ///
+    /// Querying directly would turn one failed round trip into a simultaneous
+    /// burst of retries, which is this fix in reverse and worst of all against
+    /// the rate limit that motivated it.
     #[tokio::test]
-    async fn a_waiter_whose_metadata_leader_failed_queries_for_itself() {
+    async fn waiters_of_a_failed_metadata_leader_retry_one_at_a_time() {
+        const WAITERS: usize = 3;
+
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let group = description_test_group();
 
@@ -2637,20 +2662,23 @@ mod tests {
         };
         let first_id = pending_group_query(&transport, 0).await;
 
-        let waiter = {
+        let mut waiters = Vec::with_capacity(WAITERS);
+        for _ in 0..WAITERS {
             let client = client.clone();
             let group = group.clone();
-            tokio::spawn(async move { client.groups().get_metadata(&group).await })
-        };
-        // The claim is taken synchronously, so the leader's query reaching the
-        // wire means the waiter can only defer.
+            waiters.push(tokio::spawn(async move {
+                client.groups().get_metadata(&group).await
+            }));
+        }
+        // The claim is taken synchronously, so the leader's query being on the
+        // wire means every waiter can only defer.
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
         assert_eq!(
             transport.sent().len(),
             1,
-            "the second caller must defer, not send its own query"
+            "the waiters must defer, not send their own queries"
         );
 
         let refusal = iq_error(&first_id, &group, "500", "internal-server-error");
@@ -2660,13 +2688,25 @@ mod tests {
             "the leader reports its own failure"
         );
 
-        let waiter_id = pending_group_query(&transport, 1).await;
-        let response = group_result_with_description(&waiter_id, &group, None);
-        crate::test_utils::answer_iq(&client, &waiter_id, &response).await;
-        waiter
-            .await
-            .expect("waiter task")
-            .expect("a waiter must query for itself when its leader produced nothing");
+        // Exactly one retry, not one per waiter: the others re-joined it.
+        let retry_id = pending_group_query(&transport, 1).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            transport.sent().len(),
+            2,
+            "a failed leader must leave one retry in flight, not one per waiter"
+        );
+
+        let response = group_result_with_description(&retry_id, &group, None);
+        crate::test_utils::answer_iq(&client, &retry_id, &response).await;
+        for waiter in waiters {
+            waiter
+                .await
+                .expect("waiter task")
+                .expect("the retry answers every waiter");
+        }
     }
 
     /// A cancelled leader releases its claim, so the group is not locked out of

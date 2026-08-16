@@ -448,6 +448,7 @@ impl Client {
             pending_device_sync,
             session_locks: self.session_locks.entry_count(),
             ensure_inflight: self.ensure_inflight.len() as u64,
+            group_metadata_inflight: self.group_metadata_inflight.len() as u64,
             chat_lanes: self.chat_lanes.entry_count(),
             group_distribution_locks: group_distribution_locks.entries,
             group_distribution_lock_evictions: group_distribution_locks.evictions,
