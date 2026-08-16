@@ -350,12 +350,42 @@ pub(crate) struct GroupMetadataRegistry {
     inflight: std::sync::Mutex<HashMap<Jid, Arc<MetadataFlight>>>,
 }
 
+/// The server refusal behind a group error, if that is what it was.
+fn server_refusal(error: &GroupError) -> Option<ServerRefusal> {
+    use crate::error::ErrorChainExt;
+    error.server_rejection().map(|rejection| ServerRefusal {
+        code: rejection.code,
+        text: rejection.text.to_string(),
+    })
+}
+
+/// What one flight produced, for the callers that joined it.
+#[derive(Clone)]
+enum FlightOutcome {
+    Answered(Box<GroupMetadata>),
+    /// The server refused. Re-asking during a rate limit is what the refusal is
+    /// telling us not to do, so waiters report it instead of querying again.
+    Refused(ServerRefusal),
+}
+
+/// A server refusal, in the shape a waiter can rebuild an error from.
+///
+/// The chain is not carried across: `GroupError` is not `Clone`, and what a
+/// waiter needs is the verdict, not the leader's stack.
+#[derive(Clone)]
+struct ServerRefusal {
+    code: u16,
+    text: String,
+}
+
 /// The shared side of one in-flight query.
 struct MetadataFlight {
+    /// Callers waiting on this flight. Read by the leader to decide whether its
+    /// answer is worth cloning at all.
+    waiters: std::sync::atomic::AtomicUsize,
     /// Set by the leader before it releases. Absent means the leader produced
-    /// nothing, so a waiter has to ask for itself rather than report a failure
-    /// it has no answer for.
-    result: std::sync::Mutex<Option<GroupMetadata>>,
+    /// nothing a waiter can act on, so a waiter asks for itself.
+    result: std::sync::Mutex<Option<FlightOutcome>>,
     /// Closes when the leader's lease drops — on success, on failure, and on a
     /// cancelled or panicking leader alike.
     released: async_channel::Receiver<std::convert::Infallible>,
@@ -370,13 +400,16 @@ enum MetadataClaim {
 }
 
 impl MetadataFlight {
-    /// Wait for the leader to release, and take its answer if it produced one.
-    async fn wait(&self) -> Option<GroupMetadata> {
+    /// Wait for the leader to release, and read what it produced.
+    ///
+    /// Cloned rather than taken: every waiter needs its own copy, and taking
+    /// would leave all but the first to query again.
+    async fn wait(&self) -> Option<FlightOutcome> {
         let _ = self.released.recv().await;
         self.result().clone()
     }
 
-    fn result(&self) -> std::sync::MutexGuard<'_, Option<GroupMetadata>> {
+    fn result(&self) -> std::sync::MutexGuard<'_, Option<FlightOutcome>> {
         self.result
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -392,9 +425,21 @@ pub(crate) struct MetadataLease {
 }
 
 impl MetadataLease {
-    /// Hand this round trip's answer to everyone waiting on it.
-    fn publish(&self, metadata: GroupMetadata) {
-        *self.flight.result() = Some(metadata);
+    /// Whether anyone joined this flight.
+    ///
+    /// Read before cloning the answer: a group can carry thousands of
+    /// participants, and the uncontended call — which is most of them — has
+    /// nobody to hand a copy to.
+    fn has_waiters(&self) -> bool {
+        self.flight
+            .waiters
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+
+    /// Hand this round trip's outcome to everyone waiting on it.
+    fn publish(&self, outcome: FlightOutcome) {
+        *self.flight.result() = Some(outcome);
     }
 }
 
@@ -434,10 +479,16 @@ impl GroupMetadataRegistry {
     fn claim(self: &Arc<Self>, jid: &Jid) -> MetadataClaim {
         let mut inflight = self.map();
         if let Some(flight) = inflight.get(jid) {
+            // Counted under the registry lock, so a leader reading it has
+            // already seen every caller that could join before it publishes.
+            flight
+                .waiters
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             return MetadataClaim::Joined(flight.clone());
         }
         let (release, released) = async_channel::bounded(1);
         let flight = Arc::new(MetadataFlight {
+            waiters: std::sync::atomic::AtomicUsize::new(0),
             result: std::sync::Mutex::new(None),
             released,
         });
@@ -815,16 +866,35 @@ impl<'a> Groups<'a> {
             match self.client.group_metadata_inflight.claim(jid) {
                 MetadataClaim::Leader(lease) => {
                     let queried = self.query_metadata_uncoalesced(jid).await;
-                    if let Ok(metadata) = &queried {
-                        lease.publish(metadata.clone());
+                    match &queried {
+                        Ok(metadata) if lease.has_waiters() => {
+                            lease.publish(FlightOutcome::Answered(Box::new(metadata.clone())));
+                        }
+                        Err(error) => {
+                            // Only a refusal is passed on. A local failure — a
+                            // timeout, a dropped socket — says nothing about the
+                            // group, so a waiter is right to ask again.
+                            if let Some(refusal) = server_refusal(error) {
+                                lease.publish(FlightOutcome::Refused(refusal));
+                            }
+                        }
+                        Ok(_) => {}
                     }
                     return queried;
                 }
-                MetadataClaim::Joined(flight) => {
-                    if let Some(metadata) = flight.wait().await {
-                        return Ok(metadata);
+                MetadataClaim::Joined(flight) => match flight.wait().await {
+                    Some(FlightOutcome::Answered(metadata)) => return Ok(*metadata),
+                    // The server just told us to stop asking. Querying again
+                    // inside the cooldown it asked for is what produced the
+                    // refusal in the first place.
+                    Some(FlightOutcome::Refused(refusal)) => {
+                        return Err(GroupError::InvalidRequest(format!(
+                            "group query refused by the server: code={}, text='{}'",
+                            refusal.code, refusal.text
+                        )));
                     }
-                }
+                    None => {}
+                },
             }
         }
     }
@@ -2640,14 +2710,13 @@ mod tests {
         );
     }
 
-    /// A leader that failed has answered for nobody, so its waiters try again —
-    /// one at a time, by re-entering the registry.
+    /// A refusal is passed on, not re-asked.
     ///
-    /// Querying directly would turn one failed round trip into a simultaneous
-    /// burst of retries, which is this fix in reverse and worst of all against
-    /// the rate limit that motivated it.
+    /// The server telling us to back off is exactly the moment not to send the
+    /// same query again, so waiters report the refusal rather than each taking
+    /// a turn at re-provoking it.
     #[tokio::test]
-    async fn waiters_of_a_failed_metadata_leader_retry_one_at_a_time() {
+    async fn waiters_of_a_refused_metadata_query_do_not_ask_again() {
         const WAITERS: usize = 3;
 
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
@@ -2679,12 +2748,57 @@ mod tests {
             "the waiters must defer, not send their own queries"
         );
 
-        let refusal = iq_error(&first_id, &group, "500", "internal-server-error");
+        let refusal = iq_error(&first_id, &group, "429", "rate-overlimit");
         crate::test_utils::answer_iq(&client, &first_id, &refusal).await;
+
         assert!(
             leader.await.expect("leader task").is_err(),
-            "the leader reports its own failure"
+            "the leader reports the refusal"
         );
+        for waiter in waiters {
+            assert!(
+                waiter.await.expect("waiter task").is_err(),
+                "a waiter inherits the refusal instead of re-asking"
+            );
+        }
+        assert_eq!(
+            transport.sent().len(),
+            1,
+            "a refusal must not produce a second query for the same group"
+        );
+    }
+
+    /// A leader that died without an answer says nothing about the group, so a
+    /// waiter asks for itself — one at a time, by re-entering the registry.
+    #[tokio::test]
+    async fn waiters_of_a_cancelled_metadata_leader_retry_one_at_a_time() {
+        const WAITERS: usize = 3;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let leader = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+        };
+        pending_group_query(&transport, 0).await;
+
+        let mut waiters = Vec::with_capacity(WAITERS);
+        for _ in 0..WAITERS {
+            let client = client.clone();
+            let group = group.clone();
+            waiters.push(tokio::spawn(async move {
+                client.groups().get_metadata(&group).await
+            }));
+        }
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(transport.sent().len(), 1, "the waiters must defer");
+
+        leader.abort();
+        let _ = leader.await;
 
         // Exactly one retry, not one per waiter: the others re-joined it.
         let retry_id = pending_group_query(&transport, 1).await;
@@ -2694,7 +2808,7 @@ mod tests {
         assert_eq!(
             transport.sent().len(),
             2,
-            "a failed leader must leave one retry in flight, not one per waiter"
+            "a dead leader must leave one retry in flight, not one per waiter"
         );
 
         let response = group_result_with_description(&retry_id, &group, None);
@@ -2755,17 +2869,16 @@ mod tests {
             .to_string()
     }
 
-    /// A run of failures stays one query at a time, however many callers are
-    /// waiting.
+    /// A run of dead leaders stays one query at a time, however many callers
+    /// are waiting.
     ///
-    /// The earlier revision bounded the retry loop and fell through to an
+    /// An earlier revision bounded the retry loop and fell through to an
     /// uncoalesced query, so a long enough run released several waiters at
-    /// once — the burst this registry exists to prevent, arriving after the
-    /// rate limit that caused the failures.
+    /// once — the burst this registry exists to prevent.
     #[tokio::test]
-    async fn a_run_of_failed_metadata_flights_never_puts_two_queries_on_the_wire() {
+    async fn a_run_of_dead_metadata_leaders_never_puts_two_queries_on_the_wire() {
         const CALLERS: usize = 5;
-        const FAILURES: usize = 4;
+        const DEATHS: usize = 3;
 
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let group = description_test_group();
@@ -2779,38 +2892,30 @@ mod tests {
             }));
         }
 
-        // Refuse the first few queries. After each refusal exactly one caller
-        // may take over, so the wire never holds two at once.
-        for attempt in 0..FAILURES {
-            let request_id = pending_group_query(&transport, attempt).await;
-            let refusal = iq_error(&request_id, &group, "429", "rate-overlimit");
-            crate::test_utils::answer_iq(&client, &request_id, &refusal).await;
+        // Kill the leader repeatedly. After each death exactly one caller may
+        // take over, so the wire never holds two queries for this group.
+        for round in 0..DEATHS {
+            pending_group_query(&transport, round).await;
+            callers.remove(0).abort();
             for _ in 0..64 {
                 tokio::task::yield_now().await;
             }
             assert_eq!(
                 transport.sent().len(),
-                attempt + 2,
-                "after {} refusal(s) exactly one retry may be in flight",
-                attempt + 1
+                round + 2,
+                "after {} death(s) exactly one retry may be in flight",
+                round + 1
             );
         }
 
-        // Let the next one succeed; everyone still waiting takes its answer.
-        let request_id = pending_group_query(&transport, FAILURES).await;
+        let request_id = pending_group_query(&transport, DEATHS).await;
         let response = group_result_with_description(&request_id, &group, None);
         crate::test_utils::answer_iq(&client, &request_id, &response).await;
-
-        let mut succeeded = 0;
         for caller in callers {
-            if caller.await.expect("caller task").is_ok() {
-                succeeded += 1;
-            }
+            caller
+                .await
+                .expect("caller task")
+                .expect("the surviving callers share the answer");
         }
-        assert_eq!(
-            succeeded,
-            CALLERS - FAILURES,
-            "each refusal answers exactly the caller that owned it"
-        );
     }
 }
