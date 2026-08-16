@@ -2411,4 +2411,71 @@ mod tests {
             "a group with no description resolves to no token, not to a query"
         );
     }
+
+    /// Concurrent `get_metadata` for one group must reach the server once.
+    ///
+    /// Production shape (offline-sync drain): a burst of callers asked for the
+    /// same group's metadata and 20 identical `<iq xmlns="w:g2">` requests went
+    /// out inside 350 ms, which the server answered with `rate-overlimit`.
+    /// `get_metadata` goes straight to the IQ, with no cache, no lock and no
+    /// coalescing between callers.
+    #[tokio::test]
+    async fn concurrent_get_metadata_queries_the_group_once() {
+        const CONCURRENT_CALLS: usize = 6;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let mut tasks = Vec::with_capacity(CONCURRENT_CALLS);
+        for _ in 0..CONCURRENT_CALLS {
+            let client = client.clone();
+            let group = group.clone();
+            tasks.push(tokio::spawn(async move {
+                client.groups().get_metadata(&group).await
+            }));
+        }
+
+        // Answer whatever reaches the wire until the callers are done, counting
+        // the group queries. Frames are read by index because `decode_sent_iq`
+        // decrypts each one under the counter its position implies.
+        let mut next_frame = 0usize;
+        let mut queried = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut pending = CONCURRENT_CALLS;
+        while pending > 0 && tokio::time::Instant::now() < deadline {
+            if transport.sent().len() <= next_frame {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let node = crate::test_utils::decode_sent_iq(&transport, next_frame).await;
+            next_frame += 1;
+            let node_ref = node.get();
+            if node_ref.tag != "iq"
+                || node_ref.attrs().optional_string("xmlns").as_deref() != Some("w:g2")
+            {
+                continue;
+            }
+            let request_id = node_ref
+                .attrs()
+                .optional_string("id")
+                .expect("an IQ carries an id")
+                .to_string();
+            queried += 1;
+            let response = group_result_with_description(&request_id, &group, None);
+            crate::test_utils::answer_iq(&client, &request_id, &response).await;
+            pending = pending.saturating_sub(1);
+        }
+
+        for task in tasks {
+            task.await
+                .expect("metadata task should not panic")
+                .expect("every caller must get the group's metadata");
+        }
+
+        assert_eq!(
+            queried, 1,
+            "concurrent metadata callers for one group must share a single query, \
+             not send one each"
+        );
+    }
 }
