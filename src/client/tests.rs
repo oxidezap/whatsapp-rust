@@ -6113,7 +6113,7 @@ mod ensure_sessions_concurrency {
 
         let mut next_frame = 0usize;
         let mut served = 0usize;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while done.load(Ordering::Acquire) < CONCURRENT_CALLS
             && tokio::time::Instant::now() < deadline
         {

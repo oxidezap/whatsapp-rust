@@ -472,6 +472,8 @@ pub struct MemoryReport {
     pub pending_device_sync: usize,
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
+    /// Addresses with a session establishment in flight; normally zero.
+    pub ensure_inflight: u64,
     pub chat_lanes: u64,
     pub group_distribution_locks: u64,
     /// Cumulative capacity evictions; poll successive reports to derive a rate.
@@ -620,6 +622,7 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "  pdo_requested:          {}", self.pdo_requested)?;
         writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
+        writeln!(f, "  ensure_inflight:        {}", self.ensure_inflight)?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
         writeln!(
             f,
@@ -1276,6 +1279,22 @@ pub struct Client {
     /// Keys are Signal protocol address strings (e.g., "user@s.whatsapp.net:0")
     /// to match the SignalProtocolStoreAdapter's internal locking.
     pub(crate) session_locks: Cache<String, Arc<Mutex<()>>>,
+
+    /// Addresses whose session establishment is already in flight, so a
+    /// concurrent caller waits on it instead of fetching the same bundle again.
+    ///
+    /// An existence probe before the fetch cannot do this on its own: it answers
+    /// before the IQ goes out, so every caller in a burst reads the same "no
+    /// session" and every one of them fetches. Each answered bundle is then
+    /// installed over the last, retiring a session the peer may still be
+    /// encrypting under, and each fetch burns one of the peer's one-time
+    /// prekeys. WA Web keeps the same registration in
+    /// `WAWebManageE2ESessionsJob` (a module-level wid -> promise map, cleared
+    /// in a `finally`).
+    ///
+    /// Holds only what is in flight — normally empty — so it is a plain map
+    /// rather than a capacity-bounded cache.
+    pub(crate) ensure_inflight: Arc<sessions::EnsureRegistry>,
 
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.

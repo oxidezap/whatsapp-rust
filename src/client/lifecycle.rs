@@ -435,6 +435,7 @@ impl Client {
                 .max_capacity(cache_config.session_locks_capacity.max(1))
                 .evict_guard(|m| Arc::strong_count(m) <= 1)
                 .build(),
+            ensure_inflight: Arc::default(),
             chat_lanes: Cache::builder()
                 .max_capacity(cache_config.chat_lanes_capacity.max(1))
                 .evict_guard(|lane: &ChatLane| Arc::strong_count(&lane.enqueue_lock) <= 1)
