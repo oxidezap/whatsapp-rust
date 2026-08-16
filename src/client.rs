@@ -1311,11 +1311,14 @@ pub struct Client {
 
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
 
-    /// Phone numbers with a `refresh_lid` re-resolve in flight, keyed by the
-    /// bare user. A burst of sends to one stale peer is acked one message at a
-    /// time, and every one of those acks carries the flag, so without this the
-    /// same query would go out once per ack while the first is still pending.
-    pub(crate) pending_lid_refreshes: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Identities with a `refresh_lid` re-resolve in flight, keyed by
+    /// `(connection_generation, PN-side JID)`. A burst of sends to one stale
+    /// peer is acked one message at a time, and every one of those acks carries
+    /// the flag, so without this the same query would go out once per ack while
+    /// the first is still pending. The generation scopes a reservation to the
+    /// connection that took it, so a refresh left parked on a dead socket
+    /// cannot suppress the next connection's.
+    pub(crate) pending_lid_refreshes: Arc<std::sync::Mutex<HashSet<(u64, String)>>>,
 
     /// Track retry attempts per message to prevent infinite retry loops.
     /// Key: "{chat}:{msg_id}:{sender}", Value: retry count plus the most
