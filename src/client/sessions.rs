@@ -78,6 +78,7 @@ impl EnsureLease {
     /// Record that these addresses were carried as far as this caller could,
     /// and let their waiters go without waiting for the rest of the batch.
     fn mark_completed(&mut self, jids: &[Jid]) {
+        let mut finished = Vec::with_capacity(jids.len());
         for jid in jids {
             let address = jid.to_protocol_address_string();
             if let Some(claim) = self
@@ -87,22 +88,27 @@ impl EnsureLease {
             {
                 claim.completed.store(true, Ordering::Release);
                 drop(claim.release.take());
+                finished.push(claim.address.clone());
             }
         }
+        // Retired from the registry now, not when the lease drops. A claim that
+        // outlives its work is a claim a later caller joins: retry recovery can
+        // delete this session and ensure it again while a sibling chunk is
+        // still in flight, and that caller must be able to become leader
+        // instead of inheriting an answer about the session it just deleted.
+        self.registry.retire(&finished, &self.claims);
     }
 }
 
 impl Drop for EnsureLease {
     fn drop(&mut self) {
-        let Ok(mut inflight) = self.registry.inflight.lock() else {
-            // A poisoned registry would strand every future reservation for
-            // these addresses; the waiters are already woken by the sender
-            // dropping, so leaving the entries is the lesser failure.
-            return;
-        };
-        for claim in &self.claims {
-            inflight.remove(&claim.address);
-        }
+        let outstanding: Vec<Box<str>> = self
+            .claims
+            .iter()
+            .filter(|claim| claim.release.is_some())
+            .map(|claim| claim.address.clone())
+            .collect();
+        self.registry.retire(&outstanding, &self.claims);
     }
 }
 
@@ -162,6 +168,36 @@ impl EnsureRegistry {
             owned,
             deferred,
             lease,
+        }
+    }
+
+    /// Remove these addresses, but only where the registered slot is still the
+    /// one `claims` describes.
+    ///
+    /// Identity matters because a claim is retired as soon as its work is done,
+    /// which leaves the lease's later drop running against a map another caller
+    /// may have re-entered. Removing by address alone would evict that
+    /// caller's live claim and let a third one fetch alongside it.
+    fn retire(&self, addresses: &[Box<str>], claims: &[EnsureClaim]) {
+        if addresses.is_empty() {
+            return;
+        }
+        let Ok(mut inflight) = self.inflight.lock() else {
+            // A poisoned registry would strand every future reservation for
+            // these addresses; the waiters are already woken by the sender
+            // dropping, so leaving the entries is the lesser failure.
+            return;
+        };
+        for address in addresses {
+            let Some(claim) = claims.iter().find(|claim| &claim.address == address) else {
+                continue;
+            };
+            if let std::collections::hash_map::Entry::Occupied(entry) =
+                inflight.entry(address.clone())
+                && Arc::ptr_eq(&entry.get().completed, &claim.completed)
+            {
+                entry.remove();
+            }
         }
     }
 
@@ -548,6 +584,12 @@ impl Client {
             if jids.is_empty() {
                 return Ok(());
             }
+            // An abandoned leader can have installed a session and then failed
+            // to persist it, and the next pass's warm-cache probe would read
+            // that entry and call the address established. Re-run the flush
+            // here so the storage failure is reported to this caller rather
+            // than swallowed, as it was when every caller ran its own.
+            self.flush_signal_cache_batch_safe().await?;
         }
 
         // Reported, not swallowed: before coalescing, this caller would have
@@ -565,6 +607,14 @@ impl Client {
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_pass", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn ensure_sessions_pass(&self, mut jids: Vec<Jid>) -> Result<Vec<Jid>> {
         use wacore::types::jid::JidExt;
+
+        /// What the probe learned about one address.
+        enum Probed {
+            HasSession,
+            NeedsFetch,
+            /// The backend could not answer.
+            Unknown,
+        }
 
         // Warm-cache pre-filter: a cached session answers synchronously, so
         // the common live-send case skips the probe-stream machinery below
@@ -602,18 +652,18 @@ impl Client {
         use futures::StreamExt;
         const SESSION_PROBE_CONCURRENCY: usize = 16;
         let backend = device_snapshot.backend.clone();
-        let probed: Vec<(Jid, bool)> = futures::stream::iter(jids)
+        let probed: Vec<(Jid, Probed)> = futures::stream::iter(jids)
             .map(|jid| {
                 let backend = backend.clone();
                 async move {
                     let signal_addr = jid.to_protocol_address();
                     // Check cache first (includes unflushed sessions), fall back to backend.
                     match self.signal_cache.has_session(&signal_addr, &*backend).await {
-                        Ok(true) => (jid, false),
-                        Ok(false) => (jid, true),
+                        Ok(true) => (jid, Probed::HasSession),
+                        Ok(false) => (jid, Probed::NeedsFetch),
                         Err(e) => {
                             log::warn!("Failed to check session for {}: {}", jid.observe(), e);
-                            (jid, false)
+                            (jid, Probed::Unknown)
                         }
                     }
                 }
@@ -621,11 +671,19 @@ impl Client {
             .buffer_unordered(SESSION_PROBE_CONCURRENCY)
             .collect()
             .await;
-        let (needing, satisfied): (Vec<_>, Vec<_>) = probed
-            .into_iter()
-            .partition(|(_, needs_fetch)| *needs_fetch);
-        let jids_needing_sessions: Vec<Jid> = needing.into_iter().map(|(jid, _)| jid).collect();
-        let satisfied: Vec<Jid> = satisfied.into_iter().map(|(jid, _)| jid).collect();
+        let mut jids_needing_sessions = Vec::with_capacity(probed.len());
+        let mut satisfied = Vec::new();
+        for (jid, outcome) in probed {
+            match outcome {
+                Probed::NeedsFetch => jids_needing_sessions.push(jid),
+                Probed::HasSession => satisfied.push(jid),
+                // Neither fetched nor marked. Reporting a read error as an
+                // answer would spend one backend blip on the whole burst, which
+                // is the silently short fan-out `fetch_and_establish_sessions`
+                // refuses to produce for a refused batch.
+                Probed::Unknown => {}
+            }
+        }
 
         // Nobody has to fetch for an address that already has a session, so it
         // is complete whatever the rest of this call does.

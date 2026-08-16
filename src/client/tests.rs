@@ -6201,6 +6201,44 @@ mod ensure_sessions_concurrency {
             .collect()
     }
 
+    /// Give a spawned ensure the chance to reach its claim.
+    ///
+    /// The claim is taken synchronously right after an await that resolves
+    /// immediately on this client, so yielding is enough to get there. What
+    /// makes it observable is the frame count: a caller that failed to defer
+    /// would have put its own fetch on the wire, which the assertion after this
+    /// call catches.
+    async fn let_the_waiter_park(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        expected_frames: usize,
+    ) {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            transport.sent().len(),
+            expected_frames,
+            "the second caller must defer to the claim in flight, not fetch"
+        );
+    }
+
+    /// A device the first chunk actually asked for.
+    ///
+    /// The probe runs `buffer_unordered`, so which devices land in which chunk
+    /// does not follow the order they were passed in. A test that assumed it
+    /// would put its waiter's address in the *second* chunk half the time.
+    async fn first_chunk_member(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        devices: &[Jid],
+    ) -> Jid {
+        let asked = fetch_targets(transport, 0).await;
+        devices
+            .iter()
+            .find(|jid| asked.contains(&jid.to_string()))
+            .cloned()
+            .expect("the first chunk asks for at least one of the devices")
+    }
+
     /// How many prekey fetches reached the wire so far.
     async fn prekey_requests(
         transport: &Arc<crate::transport::mock::CapturingMockTransport>,
@@ -6467,8 +6505,6 @@ mod ensure_sessions_concurrency {
         let devices: Vec<Jid> = (0..=batch)
             .map(|i| Jid::lid_device("666666666666666".to_string(), i as u16))
             .collect();
-        let answered = devices[0].clone();
-
         let leader = {
             let client = client.clone();
             let devices = devices.clone();
@@ -6477,15 +6513,13 @@ mod ensure_sessions_concurrency {
 
         // First chunk: answered, with no bundle for anyone in it.
         let first_id = pending_prekey_request(&transport, 0).await;
-        let empty = NodeBuilder::new("iq")
-            .attr("type", "result")
-            .attr("from", "s.whatsapp.net")
-            .attr("id", &first_id)
-            .children([NodeBuilder::new("list").build()])
-            .build();
-        crate::test_utils::answer_iq(&client, &first_id, &empty).await;
+        // Taken from the frame rather than assumed: the probe is
+        // `buffer_unordered`, so the chunk split does not follow input order.
+        let answered = first_chunk_member(&transport, &devices).await;
 
-        // A waiter for an address the first chunk already covered.
+        // A waiter for an address the first chunk covers, joining while the
+        // claim is still held — a completed claim is retired, so a caller
+        // arriving after the answer would rightly become a leader instead.
         let waiter = {
             let client = client.clone();
             let answered = answered.clone();
@@ -6495,6 +6529,15 @@ mod ensure_sessions_concurrency {
                     .await
             })
         };
+        let_the_waiter_park(&transport, 1).await;
+
+        let empty = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &first_id)
+            .children([NodeBuilder::new("list").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &first_id, &empty).await;
 
         // Second chunk: refused, which fails the leader as a whole.
         let second_id = pending_prekey_request(&transport, 1).await;
@@ -6535,8 +6578,6 @@ mod ensure_sessions_concurrency {
         let devices: Vec<Jid> = (0..=batch)
             .map(|i| Jid::lid_device("777777777777777".to_string(), i as u16))
             .collect();
-        let answered = devices[0].clone();
-
         let leader = {
             let client = client.clone();
             let devices = devices.clone();
@@ -6544,6 +6585,7 @@ mod ensure_sessions_concurrency {
         };
 
         let first_id = pending_prekey_request(&transport, 0).await;
+        let answered = first_chunk_member(&transport, &devices).await;
         let waiter = {
             let client = client.clone();
             let answered = answered.clone();
@@ -6553,6 +6595,7 @@ mod ensure_sessions_concurrency {
                     .await
             })
         };
+        let_the_waiter_park(&transport, 1).await;
 
         let empty = NodeBuilder::new("iq")
             .attr("type", "result")
