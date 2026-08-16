@@ -385,6 +385,15 @@ enum FlightOutcome {
     /// The server refused. Re-asking during a rate limit is what the refusal is
     /// telling us not to do, so waiters report it instead of querying again.
     Refused(ServerRefusal),
+    /// The query ran and failed for a local reason — a timeout, a dropped
+    /// socket. Still an answer: the leader asked and got nowhere, so a waiter
+    /// taking its own turn would only wait out the same failure again. Twenty
+    /// callers behind one IQ black hole would otherwise serialize into twenty
+    /// timeouts.
+    Failed {
+        timed_out: bool,
+        message: String,
+    },
 }
 
 /// A server refusal, kept whole enough for a waiter to rebuild the error.
@@ -961,13 +970,25 @@ impl<'a> Groups<'a> {
                         Ok(metadata) => {
                             lease.finish(|| FlightOutcome::Answered(Box::new(metadata.clone())))
                         }
-                        // Only a refusal is passed on. A local failure — a
-                        // timeout, a dropped socket — says nothing about the
-                        // group, so a waiter is right to ask again.
-                        Err(error) => match server_refusal(error) {
-                            Some(refusal) => lease.finish(|| FlightOutcome::Refused(refusal)),
-                            None => drop(lease),
-                        },
+                        // Every completed outcome is passed on, failures
+                        // included: the leader asked and got an answer, even
+                        // when the answer is that it did not work. An empty
+                        // flight is reserved for a leader that never got that
+                        // far — cancelled or panicking — where nobody has asked
+                        // yet and a waiter is right to take a turn.
+                        Err(error) => {
+                            let outcome = match server_refusal(error) {
+                                Some(refusal) => FlightOutcome::Refused(refusal),
+                                None => FlightOutcome::Failed {
+                                    timed_out: {
+                                        use crate::error::ErrorChainExt;
+                                        error.is_timeout()
+                                    },
+                                    message: error.to_string(),
+                                },
+                            };
+                            lease.finish(|| outcome);
+                        }
                     }
                     return queried;
                 }
@@ -980,6 +1001,15 @@ impl<'a> Groups<'a> {
                     // so a caller can read its `backoff` as the leader could.
                     Some(FlightOutcome::Refused(refusal)) => {
                         return Err(refusal.clone().into_error());
+                    }
+                    Some(FlightOutcome::Failed { timed_out, message }) => {
+                        return Err(if *timed_out {
+                            GroupError::Iq(IqError::Timeout)
+                        } else {
+                            GroupError::Internal(anyhow::anyhow!(
+                                "group query failed on a shared attempt: {message}"
+                            ))
+                        });
                     }
                     None => {}
                 },
@@ -2718,12 +2748,6 @@ mod tests {
     }
 
     /// Concurrent `get_metadata` for one group must reach the server once.
-    ///
-    /// Production shape (offline-sync drain): a burst of callers asked for the
-    /// same group's metadata and 20 identical `<iq xmlns="w:g2">` requests went
-    /// out inside 350 ms, which the server answered with `rate-overlimit`.
-    /// `get_metadata` goes straight to the IQ, with no cache, no lock and no
-    /// coalescing between callers.
     #[tokio::test]
     async fn concurrent_get_metadata_queries_the_group_once() {
         const CONCURRENT_CALLS: usize = 6;
@@ -2743,6 +2767,12 @@ mod tests {
                 result
             }));
         }
+
+        // Every other caller has to have joined before the response goes in:
+        // one that had not yet claimed would become a leader and send its own
+        // query, and the count below would be asserting the scheduler.
+        pending_group_query(&transport, 0).await;
+        wait_for_joiners(&client, &group, CONCURRENT_CALLS - 1).await;
 
         // Answer whatever reaches the wire until the callers are done, counting
         // the group queries. Frames are read by index because `decode_sent_iq`
