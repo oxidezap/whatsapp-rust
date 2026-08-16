@@ -9,6 +9,7 @@ use log::{debug, info, warn};
 use std::sync::Arc;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::iq::dirty::{DirtyBit, DirtyType};
+use wacore::stanza::ib::InfoBulletinType;
 use wacore::stanza::wire_tags::StanzaTag;
 use wacore::store::commands::DeviceCommand;
 use wacore::store::device::{ClientExpirationUpdate, ServerClientExpiration};
@@ -47,8 +48,8 @@ impl StanzaHandler for IbHandler {
 )]
 async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) {
     for child in node.children().unwrap_or_default() {
-        match child.tag.as_ref() {
-            "dirty" => {
+        match InfoBulletinType::try_from(child.tag.as_ref()).unwrap_or(InfoBulletinType::Unknown) {
+            InfoBulletinType::Dirty => {
                 let mut attrs = child.attrs();
                 let dirty_type_str = match attrs.optional_string("type") {
                     Some(t) => t.to_string(),
@@ -181,7 +182,7 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                     }))
                     .detach();
             }
-            "edge_routing" => {
+            InfoBulletinType::EdgeRouting => {
                 // Edge routing info is used for optimized reconnection to WhatsApp servers.
                 // When present, it should be sent as a pre-intro before the Noise handshake.
                 // Format on wire: ED (2 bytes) + length (3 bytes BE) + routing_data + WA header
@@ -208,7 +209,7 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                         .detach();
                 }
             }
-            "offline_preview" => {
+            InfoBulletinType::OfflinePreview => {
                 let mut attrs = child.attrs();
                 let total = attrs.optional_u64("count").unwrap_or(0) as i32;
                 let app_data_changes = attrs.optional_u64("appdata").unwrap_or(0) as i32;
@@ -254,7 +255,7 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                         .detach();
                 }
             }
-            "offline" => {
+            InfoBulletinType::Offline => {
                 let mut attrs = child.attrs();
                 let count = attrs.optional_u64("count").unwrap_or(0) as i32;
 
@@ -279,19 +280,19 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                     }))
                     .detach();
             }
-            "client_expiration" => {
+            InfoBulletinType::ClientExpiration => {
                 handle_client_expiration(&client, child).await;
             }
             // WA Web parses this into its info-bulletin union and then has no
             // `case` for it in the dispatch switch, so it is a marker the
             // server sends and the client is expected to do nothing with.
             // Named here so it does not read as a gap.
-            "priority_offline_complete" => {}
-            "thread_metadata" => {
+            InfoBulletinType::PriorityOfflineComplete => {}
+            InfoBulletinType::ThreadMetadata => {
                 // Present in some sessions; safe to ignore for now until feature implemented.
                 debug!("Received thread metadata, ignoring for now.");
             }
-            _ => {
+            InfoBulletinType::Tos | InfoBulletinType::RecoveryNonce | InfoBulletinType::Unknown => {
                 warn!("Unhandled ib child: <{}>", child.tag);
             }
         }
@@ -309,9 +310,24 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
 /// Stamped with the running version, because a deadline issued against one
 /// build says nothing about the next.
 async fn handle_client_expiration(client: &Arc<Client>, child: &wacore_binary::NodeRef<'_>) {
-    // WA Web parses this as `attrIntRange(node, "t", 0, undefined)`: a
-    // non-negative unix time with no upper bound.
-    let t = child.attrs().optional_u64("t").map(|t| t as i64);
+    // WA Web parses this as `attrIntRange(node, "t", 0, undefined)`: present
+    // and non-negative, or a parse failure -- never silently absent. The
+    // distinction matters here because an absent `t` is a withdrawal, so a
+    // value we cannot read must not be mistaken for one and clear a deadline
+    // the server never retracted. Read presence first, then the value.
+    let raw = child.attrs().optional_string("t");
+    let t = match raw.as_deref() {
+        None => None,
+        // `parse::<i64>` rejects a non-numeric value and one past `i64::MAX` in
+        // one step; the sign check is WA Web's `min = 0`.
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(t) if t >= 0 => Some(t),
+            _ => {
+                warn!(target: "Client/Ib", "client_expiration carried an unusable t={raw:?}; ignoring");
+                return;
+            }
+        },
+    };
     let snapshot = client.persistence_manager.get_device_snapshot();
     let version = (
         snapshot.app_version_primary,
@@ -337,6 +353,21 @@ async fn handle_client_expiration(client: &Arc<Client>, child: &wacore_binary::N
             // Nothing held means nothing to withdraw, and an event announcing a
             // change that did not happen would be worse than silence.
             if snapshot.server_client_expiration.is_none() {
+                return;
+            }
+            // A record left from an earlier build is dropped -- it describes a
+            // build that is no longer running -- but silently: this build never
+            // had a deadline, so it has nothing withdrawn from it.
+            let applied = ServerClientExpiration::held_for(
+                snapshot.server_client_expiration.as_ref(),
+                version,
+            )
+            .is_some();
+            if !applied {
+                client
+                    .persistence_manager
+                    .process_command(DeviceCommand::SetServerClientExpiration(None))
+                    .await;
                 return;
             }
             info!(target: "Client/Ib", "server withdrew the client expiration deadline");
@@ -492,6 +523,36 @@ mod tests {
                 .events()
                 .iter()
                 .any(|e| matches!(&**e, Event::ClientExpirationChanged(_)))
+        );
+    }
+
+    /// A `t` we cannot read is not a withdrawal. Treating it as one would let
+    /// a malformed or out-of-range value clear a deadline the server never
+    /// retracted.
+    #[tokio::test]
+    async fn an_unusable_t_leaves_the_deadline_alone() {
+        let client = create_test_client().await;
+        let far = wacore::time::now_secs() as i64 + 90 * 86_400;
+        handle_ib_impl(client.clone(), &client_expiration(Some(far)).as_node_ref()).await;
+
+        let collector = Arc::new(TestEventCollector::default());
+        let _subscription = client.subscribe_handler(collector.clone());
+
+        for bad in ["9223372036854775808", "-1", "soon", ""] {
+            let node = ib_with(NodeBuilder::new("client_expiration").attr("t", bad).build());
+            handle_ib_impl(client.clone(), &node.as_node_ref()).await;
+            assert_eq!(
+                stored_expiration(&client).await.map(|e| e.expires_at),
+                Some(far),
+                "t={bad:?} must not disturb the stored deadline"
+            );
+        }
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|e| matches!(&**e, Event::ClientExpirationChanged(_))),
+            "an unusable t announces nothing"
         );
     }
 

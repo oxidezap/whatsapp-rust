@@ -408,7 +408,8 @@ impl ServerClientExpiration {
     /// WA Web's `handleServerClientExpiration`, as a decision over the state we
     /// already hold.
     ///
-    /// Two rules, both deliberate. A deadline is only ever brought *forward*:
+    /// Scoped to the running build first: see [`Self::held_for`]. What remains
+    /// is two rules, both deliberate. A deadline is only ever brought *forward*:
     /// the server retiring a build sooner is news, and a later answer -- a
     /// stale retransmit, or a reconnect to a host that has not caught up --
     /// must not hand the build an extension. And whatever the server says, the
@@ -428,16 +429,32 @@ impl ServerClientExpiration {
         now_secs: i64,
         version: (u32, u32, u32),
     ) -> ClientExpirationUpdate {
+        let held = Self::held_for(current, version);
         let Some(t) = t else {
             return ClientExpirationUpdate::Clear;
         };
-        if current.is_some_and(|held| t >= held.expires_at) {
+        if held.is_some_and(|held| t >= held.expires_at) {
             return ClientExpirationUpdate::Unchanged;
         }
         ClientExpirationUpdate::Set(Self {
             expires_at: t.max(now_secs.saturating_add(Self::MIN_NOTICE_SECS)),
             version,
         })
+    }
+
+    /// The held deadline, but only when it describes the build now running.
+    ///
+    /// A record left from an earlier build is not evidence about this one, so
+    /// every decision treats it as absent. Skipping this is how an upgrade
+    /// silences the new build: the old build's nearer date would read as
+    /// "sooner than the new one" and reject the only notice that applies.
+    ///
+    /// WA Web compares version-blind here, because its stored record is read
+    /// back by a consumer that checks `appVersion` itself. This record is the
+    /// client's own state and is what the comparison above consults, so the
+    /// scoping has to happen at the point of use instead.
+    pub fn held_for(current: Option<&Self>, version: (u32, u32, u32)) -> Option<&Self> {
+        current.filter(|held| held.applies_to(version))
     }
 
     /// Whether this deadline describes the build now running. A deadline
@@ -1275,6 +1292,40 @@ mod client_expiration_tests {
         assert_eq!(
             ServerClientExpiration::decide(None, None, NOW, V),
             ClientExpirationUpdate::Clear
+        );
+    }
+
+    /// The reason `held_for` exists. An upgrade leaves the previous build's
+    /// record in place, and comparing against it would reject the new build's
+    /// deadline as "not sooner" -- silencing the only notice that applies.
+    #[test]
+    fn an_old_builds_deadline_does_not_suppress_the_running_ones() {
+        let old_build = ServerClientExpiration {
+            expires_at: NOW + 1_000,
+            version: (2, 2999, 1),
+        };
+        let later = FAR;
+        assert!(
+            later >= old_build.expires_at,
+            "the case only bites when the new deadline is the later one"
+        );
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&old_build), Some(later), NOW, V),
+            ClientExpirationUpdate::Set(held(later))
+        );
+    }
+
+    /// The scoping is not a free pass either: within the running build the
+    /// comparison still applies.
+    #[test]
+    fn scoping_does_not_weaken_the_forward_only_rule() {
+        assert_eq!(
+            ServerClientExpiration::held_for(Some(&held(FAR)), V),
+            Some(&held(FAR))
+        );
+        assert_eq!(
+            ServerClientExpiration::held_for(Some(&held(FAR)), (2, 2999, 1)),
+            None
         );
     }
 
