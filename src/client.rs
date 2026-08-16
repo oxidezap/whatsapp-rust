@@ -70,6 +70,7 @@ use wacore_binary::Jid;
 use portable_atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use wacore::stanza::wire_tags::{NotificationType, StanzaTag};
 
 /// Lease that keeps decrypted-payload events enabled for one consumer.
 ///
@@ -1771,7 +1772,8 @@ fn ack_participant<'node, 'data>(
         .filter(|participant| match policy {
             AckParticipantPolicy::Preserve => true,
             AckParticipantPolicy::OmitReceiptDestinationDuplicate => {
-                node.tag != "receipt" || !value_refs_display_equal(participant, from)
+                node.tag != StanzaTag::Receipt.as_str()
+                    || !value_refs_display_equal(participant, from)
             }
         })
 }
@@ -1815,7 +1817,7 @@ fn encode_ack_bytes(
     };
 
     // WA Web stamps the own device JID for both classes.
-    let own_device_pn = if tag == "message" || tag == "status" {
+    let own_device_pn = if tag == StanzaTag::Message.as_str() || tag == StanzaTag::Status.as_str() {
         Some(own_device_pn.ok_or(crate::features::StanzaResponseError::MissingLocalIdentity)?)
     } else {
         None
@@ -1948,7 +1950,7 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
     attrs.insert("class", NodeValue::from(tag));
     attrs.insert("id", id);
     attrs.insert("to", from);
-    if tag == "message"
+    if tag == StanzaTag::Message.as_str()
         && let Some(own_device_pn) = own_device_pn
     {
         attrs.insert("from", NodeValue::Jid(own_device_pn.clone()));
@@ -1971,10 +1973,10 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
 
 /// WA Web omits `type` when ACKing `<notification type="encrypt"><identity/></notification>`.
 fn is_encrypt_identity_notification(node: &wacore_binary::NodeRef<'_>) -> bool {
-    node.tag == "notification"
+    node.tag == StanzaTag::Notification.as_str()
         && node
             .get_attr("type")
-            .is_some_and(|value| value == "encrypt")
+            .is_some_and(|value| value == NotificationType::Encrypt.as_str())
         && node.get_optional_child("identity").is_some()
 }
 

@@ -1,6 +1,7 @@
 //! Decrypt-failure handling, retry receipts and undecryptable events.
 
 use super::*;
+use wacore::stanza::wire_tags::StanzaTag;
 
 impl Client {
     /// Request retransmission of an inbound message stanza.
@@ -17,7 +18,7 @@ impl Client {
         stanza: &NodeRef<'_>,
         options: crate::features::RetryRequestOptions,
     ) -> Result<crate::features::RetryRequestOutcome, crate::features::RetryRequestError> {
-        if stanza.tag.as_ref() != "message" {
+        if stanza.tag.as_ref() != StanzaTag::Message.as_str() {
             return Err(crate::features::RetryRequestError::UnsupportedStanzaClass);
         }
         if stanza.get_attr("id").is_none() {

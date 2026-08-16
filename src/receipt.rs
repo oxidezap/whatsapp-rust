@@ -9,6 +9,7 @@ use wacore::types::message::MessageCategory;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, JidExt as _, NodeRef, NodeValue};
 
+use wacore::stanza::wire_tags::StanzaTag;
 use wacore_binary::OwnedNodeRef;
 
 /// Max message ids per read/played `<receipt>` stanza. WA Web's
@@ -421,7 +422,10 @@ trait NackSource {
 impl NackSource for NodeRef<'_> {
     fn class(&self, reason: NackReason) -> Result<&str, crate::features::StanzaResponseError> {
         if reason == NackReason::UnrecognizedStanza
-            || matches!(self.tag.as_ref(), "message" | "notification" | "receipt")
+            || matches!(
+                StanzaTag::try_from(self.tag.as_ref()),
+                Ok(StanzaTag::Message | StanzaTag::Notification | StanzaTag::Receipt)
+            )
         {
             Ok(self.tag.as_ref())
         } else {
