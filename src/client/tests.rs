@@ -6525,4 +6525,52 @@ mod ensure_sessions_concurrency {
              the first chunk already covered"
         );
     }
+
+    /// A waiter is released by its own address finishing, not by the whole
+    /// batch. A later chunk stalling must not hold it.
+    #[tokio::test]
+    async fn a_waiter_is_released_when_its_own_chunk_lands() {
+        let batch = crate::session::SESSION_CHECK_BATCH_SIZE;
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let devices: Vec<Jid> = (0..=batch)
+            .map(|i| Jid::lid_device("777777777777777".to_string(), i as u16))
+            .collect();
+        let answered = devices[0].clone();
+
+        let leader = {
+            let client = client.clone();
+            let devices = devices.clone();
+            tokio::spawn(async move { client.ensure_e2e_sessions_resolved(&devices).await })
+        };
+
+        let first_id = pending_prekey_request(&transport, 0).await;
+        let waiter = {
+            let client = client.clone();
+            let answered = answered.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&answered))
+                    .await
+            })
+        };
+
+        let empty = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &first_id)
+            .children([NodeBuilder::new("list").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &first_id, &empty).await;
+
+        // The second chunk is deliberately left unanswered: the waiter must
+        // finish anyway, since nothing it asked for is in that chunk.
+        pending_prekey_request(&transport, 1).await;
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("a waiter must not be held by a chunk it has no address in")
+            .expect("waiter task")
+            .expect("the waiter inherits the chunk that answered its address");
+
+        leader.abort();
+    }
 }

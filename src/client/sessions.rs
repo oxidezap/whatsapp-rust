@@ -54,28 +54,39 @@ struct EnsureReservation {
 ///
 /// Reservation and release are both synchronous, so a caller can claim its
 /// addresses before its first await and cannot leave a claim behind.
+/// One address this caller claimed.
+///
+/// Both halves are per address rather than per lease, because the fetch is
+/// chunked: an early chunk the server answered stays answered even if a later
+/// one fails, and its waiters should not wait on the later one either. Sharing
+/// either half would make an unrelated stalled IQ decide both.
+struct EnsureClaim {
+    address: Box<str>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+    /// Dropped to wake this address's waiters — on completion, or with the
+    /// lease if this caller never got that far.
+    release: Option<async_channel::Sender<std::convert::Infallible>>,
+}
+
+/// The addresses this caller reserved, released on drop.
 struct EnsureLease {
     registry: Arc<EnsureRegistry>,
-    /// Per address, because completion is per address: the fetch is chunked,
-    /// and a chunk the server answered stays answered even if a later one
-    /// fails. One flag for the whole lease would send waiters for an already
-    /// answered address back to re-ask it.
-    addresses: Vec<(Box<str>, Arc<std::sync::atomic::AtomicBool>)>,
-    /// Closes on drop, waking every waiter registered against these addresses.
-    _leader: async_channel::Sender<std::convert::Infallible>,
+    claims: Vec<EnsureClaim>,
 }
 
 impl EnsureLease {
-    /// Record that these addresses were carried as far as this caller could.
-    fn mark_completed(&self, jids: &[Jid]) {
+    /// Record that these addresses were carried as far as this caller could,
+    /// and let their waiters go without waiting for the rest of the batch.
+    fn mark_completed(&mut self, jids: &[Jid]) {
         for jid in jids {
             let address = jid.to_protocol_address_string();
-            if let Some((_, completed)) = self
-                .addresses
-                .iter()
-                .find(|(claimed, _)| claimed.as_ref() == address)
+            if let Some(claim) = self
+                .claims
+                .iter_mut()
+                .find(|claim| claim.address.as_ref() == address)
             {
-                completed.store(true, Ordering::Release);
+                claim.completed.store(true, Ordering::Release);
+                drop(claim.release.take());
             }
         }
     }
@@ -89,8 +100,8 @@ impl Drop for EnsureLease {
             // dropping, so leaving the entries is the lesser failure.
             return;
         };
-        for (address, _) in &self.addresses {
-            inflight.remove(address);
+        for claim in &self.claims {
+            inflight.remove(&claim.address);
         }
     }
 }
@@ -104,9 +115,8 @@ impl EnsureRegistry {
     fn reserve(self: &Arc<Self>, jids: &[Jid]) -> EnsureReservation {
         use wacore::types::jid::JidExt;
 
-        let (leader, released) = async_channel::bounded(1);
         let mut owned = Vec::with_capacity(jids.len());
-        let mut addresses = Vec::with_capacity(jids.len());
+        let mut claims = Vec::with_capacity(jids.len());
         let mut deferred = Vec::new();
 
         {
@@ -128,10 +138,15 @@ impl EnsureRegistry {
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        addresses.push((entry.key().clone(), completed.clone()));
+                        let (release, released) = async_channel::bounded(1);
+                        claims.push(EnsureClaim {
+                            address: entry.key().clone(),
+                            completed: completed.clone(),
+                            release: Some(release),
+                        });
                         entry.insert(EnsureSlot {
                             completed,
-                            released: released.clone(),
+                            released,
                         });
                         owned.push(jid.clone());
                     }
@@ -139,10 +154,9 @@ impl EnsureRegistry {
             }
         }
 
-        let lease = (!addresses.is_empty()).then(|| EnsureLease {
+        let lease = (!claims.is_empty()).then(|| EnsureLease {
             registry: self.clone(),
-            addresses,
-            _leader: leader,
+            claims,
         });
         EnsureReservation {
             owned,
@@ -574,7 +588,7 @@ impl Client {
         let EnsureReservation {
             owned: jids,
             deferred,
-            lease,
+            mut lease,
         } = self.ensure_inflight.reserve(&jids);
         if jids.is_empty() {
             return Ok(await_leaders(deferred).await);
@@ -615,7 +629,7 @@ impl Client {
 
         // Nobody has to fetch for an address that already has a session, so it
         // is complete whatever the rest of this call does.
-        if let Some(lease) = &lease {
+        if let Some(lease) = &mut lease {
             lease.mark_completed(&satisfied);
         }
 
@@ -626,7 +640,7 @@ impl Client {
         for batch in jids_needing_sessions.chunks(crate::session::SESSION_CHECK_BATCH_SIZE) {
             match self.fetch_and_establish_sessions(batch).await {
                 Ok(_) => {
-                    if let Some(lease) = &lease {
+                    if let Some(lease) = &mut lease {
                         lease.mark_completed(batch);
                     }
                 }

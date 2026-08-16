@@ -1321,13 +1321,8 @@ mod tests {
             .store(false, Ordering::Release);
     }
 
-    /// The unframed encoding — no version byte, bare 32-byte signing key — is
-    /// what the fallback is for, and it arrives as a *version* refusal from the
-    /// primary because a leading protobuf tag has a zero high nibble.
-    ///
-    /// Written after nearly "fixing" the fallback into alignment with the
-    /// primary, which would have made every distribution in this shape fail and
-    /// left the group undecryptable. There was no test holding it down.
+    /// Holds down the unframed encoding described on
+    /// [`decode_sender_key_distribution`], which nothing covered before.
     #[tokio::test]
     async fn unframed_sender_key_distribution_is_still_accepted() {
         use wacore::libsignal::protocol::KeyPair;
