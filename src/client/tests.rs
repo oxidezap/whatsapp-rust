@@ -5988,3 +5988,213 @@ async fn send_raw_bytes_refuses_a_payload_without_its_format_byte() {
         .expect("installed socket");
     assert_eq!(transport.sent().len(), 1);
 }
+
+/// Concurrent `ensure_e2e_sessions` for one address.
+///
+/// Production shape (offline-sync drain): a burst of undecryptable group
+/// messages from one peer emits one PDO placeholder resend per message, and
+/// each of those ensures a session with that same peer. Nine identical
+/// `<iq><key>` requests went out in 130 ms, and the five bundles that came back
+/// were each installed over the last.
+#[cfg(test)]
+mod ensure_sessions_concurrency {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SessionRecord};
+    use wacore::types::jid::JidExt;
+    use wacore_binary::builder::NodeBuilder;
+    use wacore_binary::{Jid, Node};
+
+    const CONCURRENT_CALLS: usize = 6;
+
+    /// One peer identity, reused across every bundle a test hands out, so each
+    /// response is a legitimate answer for the same address rather than a
+    /// different peer wearing the same jid.
+    struct PeerKeys {
+        identity: IdentityKeyPair,
+        signed: KeyPair,
+        signature: Vec<u8>,
+    }
+
+    impl PeerKeys {
+        fn generate() -> Self {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let identity = IdentityKeyPair::generate(&mut rng);
+            let signed = KeyPair::generate(&mut rng);
+            // `process_prekey_bundle` verifies this signature, so a filler byte
+            // pattern would fail before the behaviour under test is reached.
+            let signature = identity
+                .private_key()
+                .calculate_signature(&signed.public_key.serialize(), &mut rng)
+                .expect("signature over the signed prekey")
+                .to_vec();
+            Self {
+                identity,
+                signed,
+                signature,
+            }
+        }
+
+        /// A `<user>` bundle response. The one-time prekey id varies per call,
+        /// as the server's does: each fetch burns one of the peer's prekeys.
+        fn bundle_response(&self, jid: &Jid, request_id: &str, one_time_id: u32) -> Node {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let one_time = KeyPair::generate(&mut rng);
+            let id_bytes = |id: u32| id.to_be_bytes()[1..].to_vec();
+
+            NodeBuilder::new("iq")
+                .attr("type", "result")
+                .attr("from", "s.whatsapp.net")
+                .attr("id", request_id)
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", jid.to_string())
+                        .children([
+                            NodeBuilder::new("registration")
+                                .bytes(1234u32.to_be_bytes().to_vec())
+                                .build(),
+                            NodeBuilder::new("type").bytes(vec![5]).build(),
+                            NodeBuilder::new("identity")
+                                .bytes(self.identity.public_key().public_key_bytes().to_vec())
+                                .build(),
+                            NodeBuilder::new("skey")
+                                .children([
+                                    NodeBuilder::new("id").bytes(id_bytes(1)).build(),
+                                    NodeBuilder::new("value")
+                                        .bytes(self.signed.public_key.public_key_bytes().to_vec())
+                                        .build(),
+                                    NodeBuilder::new("signature")
+                                        .bytes(self.signature.clone())
+                                        .build(),
+                                ])
+                                .build(),
+                            NodeBuilder::new("key")
+                                .children([
+                                    NodeBuilder::new("id").bytes(id_bytes(one_time_id)).build(),
+                                    NodeBuilder::new("value")
+                                        .bytes(one_time.public_key.public_key_bytes().to_vec())
+                                        .build(),
+                                ])
+                                .build(),
+                        ])
+                        .build()])
+                    .build()])
+                .build()
+        }
+    }
+
+    /// Runs `CONCURRENT_CALLS` ensures for `peer` while answering every prekey
+    /// IQ the client writes, and reports how many it had to answer.
+    ///
+    /// Frames are read by index because `decode_sent_iq` decrypts each one
+    /// under the counter its position implies.
+    async fn ensure_concurrently(
+        client: &Arc<Client>,
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        peer: &Jid,
+    ) -> usize {
+        let keys = PeerKeys::generate();
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::with_capacity(CONCURRENT_CALLS);
+        for _ in 0..CONCURRENT_CALLS {
+            let client = client.clone();
+            let peer = peer.clone();
+            let done = done.clone();
+            tasks.push(tokio::spawn(async move {
+                let result = client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await;
+                done.fetch_add(1, Ordering::Release);
+                result
+            }));
+        }
+
+        let mut next_frame = 0usize;
+        let mut served = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while done.load(Ordering::Acquire) < CONCURRENT_CALLS
+            && tokio::time::Instant::now() < deadline
+        {
+            if transport.sent().len() <= next_frame {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let node = crate::test_utils::decode_sent_iq(transport, next_frame).await;
+            next_frame += 1;
+
+            let node_ref = node.get();
+            if node_ref.tag != "iq" || node_ref.get_optional_child("key").is_none() {
+                continue;
+            }
+            let request_id = node_ref
+                .attrs()
+                .optional_string("id")
+                .expect("an IQ carries an id")
+                .to_string();
+            served += 1;
+            let response = keys.bundle_response(peer, &request_id, 100 + served as u32);
+            crate::test_utils::answer_iq(client, &request_id, &response).await;
+        }
+
+        for task in tasks {
+            task.await.expect("ensure task should not panic").ok();
+        }
+        served
+    }
+
+    /// The cause: one address, one fetch, however many callers ask at once.
+    ///
+    /// Every redundant fetch burns one of the peer's one-time prekeys, so the
+    /// cost of getting this wrong is paid on the other side of the wire too.
+    #[tokio::test]
+    async fn concurrent_ensure_for_one_address_fetches_prekeys_once() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("111111111111111".to_string(), 0);
+
+        let served = ensure_concurrently(&client, &transport, &peer).await;
+
+        assert_eq!(
+            served, 1,
+            "concurrent ensures for one address must share a single prekey fetch, \
+             not one per caller"
+        );
+    }
+
+    /// The damage: each installed bundle retires the state before it, so N
+    /// concurrent ensures leave N sessions where one belongs.
+    ///
+    /// Every retired state is a session the peer may still be encrypting under
+    /// and a candidate the decrypt path has to try; in production this is what
+    /// left one peer with five states and no usable one.
+    #[tokio::test]
+    async fn concurrent_ensure_leaves_exactly_one_session_state() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("222222222222222".to_string(), 0);
+
+        ensure_concurrently(&client, &transport, &peer).await;
+        client
+            .flush_signal_cache_batch_safe()
+            .await
+            .expect("flush the established session");
+
+        let address = peer.to_protocol_address();
+        let stored = client
+            .persistence_manager
+            .get_device_snapshot()
+            .backend
+            .get_session(address.as_str())
+            .await
+            .expect("session read")
+            .expect("concurrent ensures must establish a session");
+        let record = SessionRecord::deserialize(&stored).expect("stored session decodes");
+        let archived = record.previous_session_states().count();
+
+        assert_eq!(
+            archived, 0,
+            "concurrent ensures for one address must leave a single session state; \
+             each extra one is a bundle installed over a session that was already good"
+        );
+    }
+}
