@@ -6144,6 +6144,67 @@ mod ensure_sessions_concurrency {
         served
     }
 
+    /// The request id of the prekey IQ at `index`, once it reaches the wire.
+    ///
+    /// Frames are addressed by index because `decode_sent_iq` decrypts each one
+    /// under the counter its position implies.
+    async fn pending_prekey_request(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        index: usize,
+    ) -> String {
+        let node = crate::test_utils::decode_sent_iq(transport, index).await;
+        let node_ref = node.get();
+        assert!(
+            node_ref.tag == "iq" && node_ref.get_optional_child("key").is_some(),
+            "frame {index} should be a prekey fetch"
+        );
+        node_ref
+            .attrs()
+            .optional_string("id")
+            .expect("an IQ carries an id")
+            .to_string()
+    }
+
+    /// The jids a prekey fetch asks for, in wire order.
+    async fn fetch_targets(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        index: usize,
+    ) -> Vec<String> {
+        let node = crate::test_utils::decode_sent_iq(transport, index).await;
+        let node_ref = node.get();
+        node_ref
+            .get_optional_child("key")
+            .expect("a prekey fetch carries <key>")
+            .children()
+            .iter()
+            .flat_map(|children| children.iter())
+            .filter(|child| child.tag == "user")
+            .map(|child| {
+                child
+                    .attrs()
+                    .optional_string("jid")
+                    .expect("a <user> carries a jid")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// How many prekey fetches reached the wire so far.
+    async fn prekey_requests(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+    ) -> usize {
+        let total = transport.sent().len();
+        let mut fetches = 0;
+        for index in 0..total {
+            let node = crate::test_utils::decode_sent_iq(transport, index).await;
+            let node_ref = node.get();
+            if node_ref.tag == "iq" && node_ref.get_optional_child("key").is_some() {
+                fetches += 1;
+            }
+        }
+        fetches
+    }
+
     /// The cause: one address, one fetch, however many callers ask at once.
     ///
     /// Every redundant fetch burns one of the peer's one-time prekeys, so the
@@ -6195,6 +6256,134 @@ mod ensure_sessions_concurrency {
             archived, 0,
             "concurrent ensures for one address must leave a single session state; \
              each extra one is a bundle installed over a session that was already good"
+        );
+    }
+
+    /// A waiter whose leader failed must fetch for itself, not report a
+    /// session that was never established.
+    ///
+    /// Sharing the leader's outcome would be wrong here: a timeout on one
+    /// caller is not evidence about the address, and a waiter that swallowed it
+    /// would hand the send an address with no session behind it.
+    #[tokio::test]
+    async fn a_waiter_whose_leader_failed_establishes_the_session_itself() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("333333333333333".to_string(), 0);
+        let keys = PeerKeys::generate();
+
+        let leader = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        // The claim is taken before the leader's first await, so its IQ
+        // reaching the wire means the address is registered.
+        let leader_id = pending_prekey_request(&transport, 0).await;
+
+        let waiter = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+
+        let refusal = NodeBuilder::new("iq")
+            .attr("type", "error")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &leader_id)
+            .children([NodeBuilder::new("error")
+                .attr("code", "500")
+                .attr("text", "internal-server-error")
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &leader_id, &refusal).await;
+        assert!(
+            leader.await.expect("leader task").is_err(),
+            "the leader reports its own fetch failure"
+        );
+
+        // The waiter's own attempt: without it, the failed leader would have
+        // left this caller with nothing and no way to know.
+        let waiter_id = pending_prekey_request(&transport, 1).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &waiter_id,
+            &keys.bundle_response(&peer, &waiter_id, 200),
+        )
+        .await;
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("a waiter must establish the session its leader failed to");
+    }
+
+    /// A batch that overlaps an in-flight address still resolves the rest of
+    /// its devices, and does not re-fetch the one already being established.
+    #[tokio::test]
+    async fn a_batch_overlapping_an_inflight_address_fetches_only_the_rest() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let shared = Jid::lid_device("444444444444444".to_string(), 0);
+        let extra = Jid::lid_device("444444444444444".to_string(), 3);
+        let keys = PeerKeys::generate();
+
+        let leader = {
+            let client = client.clone();
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&shared))
+                    .await
+            })
+        };
+        // Registered only once the leader has claimed it, which it does before
+        // its first await — so waiting for its IQ is waiting for the claim.
+        let leader_id = pending_prekey_request(&transport, 0).await;
+
+        let overlapping = {
+            let client = client.clone();
+            let batch = vec![shared.clone(), extra.clone()];
+            tokio::spawn(async move { client.ensure_e2e_sessions_resolved(&batch).await })
+        };
+
+        let second_id = pending_prekey_request(&transport, 1).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &second_id,
+            &keys.bundle_response(&extra, &second_id, 301),
+        )
+        .await;
+        crate::test_utils::answer_iq(
+            &client,
+            &leader_id,
+            &keys.bundle_response(&shared, &leader_id, 302),
+        )
+        .await;
+
+        leader.await.expect("leader task").expect("leader ensure");
+        overlapping
+            .await
+            .expect("overlapping task")
+            .expect("overlapping ensure");
+
+        // The count alone would not tell the two behaviours apart: without
+        // coalescing the second fetch is still one IQ, it just names the
+        // claimed address again. What it asks for is the discriminating fact.
+        assert_eq!(
+            prekey_requests(&transport).await,
+            2,
+            "one fetch each, with nothing left over"
+        );
+        assert_eq!(
+            fetch_targets(&transport, 1).await,
+            vec![extra.to_string()],
+            "the overlapping batch must ask only for the address nobody claimed"
         );
     }
 }

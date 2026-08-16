@@ -85,7 +85,12 @@ fn decode_sender_key_distribution(
     match SenderKeyDistributionMessage::try_from(bytes) {
         Ok(message) => Ok(message),
         Err(primary_error) => {
-            let fallback = waproto::codec::sender_key_distribution_message_decode(bytes)
+            // Same framing the primary reads: a leading version byte, then the
+            // protobuf body. Handing the whole buffer to a protobuf decoder
+            // parses that byte as a field tag, which no well-formed body
+            // survives.
+            let body = bytes.split_first().map_or(bytes, |(_version, rest)| rest);
+            let fallback = waproto::codec::sender_key_distribution_message_decode(body)
                 .map_err(|fallback_error| {
                     SignalError::InvalidInput(format!(
                         "sender-key distribution decode failed: primary={primary_error}; fallback={fallback_error}"
@@ -112,12 +117,14 @@ fn decode_sender_key_distribution(
                         value.len()
                     ))
                 })?;
-            let signing_key =
-                PublicKey::from_djb_public_key_bytes(&signing_key).map_err(|error| {
-                    SignalError::InvalidInput(format!(
-                        "sender-key distribution signing_key is invalid: {error}"
-                    ))
-                })?;
+            // Type-prefixed on the wire, as the primary's `PublicKey::deserialize`
+            // reads it. Taking the field as a bare 32-byte key rejects every
+            // real distribution on its length.
+            let signing_key = PublicKey::deserialize(&signing_key).map_err(|error| {
+                SignalError::InvalidInput(format!(
+                    "sender-key distribution signing_key is invalid: {error}"
+                ))
+            })?;
             Ok(SenderKeyDistributionMessage::new(
                 SENDERKEY_MESSAGE_CURRENT_VERSION,
                 id,
@@ -1321,25 +1328,15 @@ mod tests {
     /// can never rescue anything.
     #[tokio::test]
     async fn sender_key_distribution_fallback_reads_past_the_version_byte() {
-        use buffa::Message as _;
         use wacore::libsignal::protocol::KeyPair;
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let signing = KeyPair::generate(&mut rng);
-        let body = waproto::whatsapp::SenderKeyDistributionMessage {
-            id: Some(7),
-            iteration: Some(0),
-            chain_key: Some(vec![0x11; 32]),
-            signing_key: Some(signing.public_key.serialize().to_vec()),
-        };
-        let mut size_cache = buffa::SizeCache::new();
-        let body_len = body.compute_size(&mut size_cache) as usize;
-
         // A version the primary does not recognize is the reachable way into
         // the fallback: the body is well-formed, only the envelope is not.
-        let mut serialized = Vec::with_capacity(1 + body_len);
-        serialized.push((9 << 4) | 9);
-        body.write_to(&mut size_cache, &mut serialized);
+        let serialized = SenderKeyDistributionMessage::new(9, 7, 0, [0x11; 32], signing.public_key)
+            .expect("distribution")
+            .into_serialized();
 
         assert!(
             SenderKeyDistributionMessage::try_from(&serialized[..]).is_err(),
