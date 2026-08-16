@@ -68,9 +68,9 @@ fn from_jid_matches(
 /// reason.
 fn is_connection_critical(node: &wacore_binary::NodeRef<'_>) -> bool {
     matches!(
-        node.tag.as_ref(),
-        "success" | "failure" | "stream:error" | "ack"
-    ) || (node.tag.as_ref() == "iq" && is_ping_request(node))
+        StanzaTag::try_from(node.tag.as_ref()),
+        Ok(StanzaTag::Success | StanzaTag::Failure | StanzaTag::StreamError | StanzaTag::Ack)
+    ) || (node.tag.as_ref() == StanzaTag::Iq.as_str() && is_ping_request(node))
 }
 
 /// A server-initiated ping, which this client owes a pong.
@@ -353,7 +353,7 @@ impl Client {
     ) {
         // ACKs need shared ownership only for opt-in raw/node observers. The
         // usual response-waiter path borrows the node and can skip the Arc.
-        if node.tag() == "ack"
+        if node.tag() == StanzaTag::Ack.as_str()
             && !self.raw_node_forwarding_enabled()
             && self.node_waiter_count.load(Ordering::Acquire) == 0
             && !self.offline_sync_metrics.active.load(Ordering::Acquire)
@@ -379,7 +379,7 @@ impl Client {
         let nr = node.get();
 
         // --- Offline Sync Tracking ---
-        if nr.tag.as_ref() == "ib" {
+        if nr.tag.as_ref() == StanzaTag::InfoBanner.as_str() {
             // Check for offline_preview child to get expected count
             if let Some(preview) = nr.get_optional_child("offline_preview") {
                 let count: usize = preview
@@ -469,7 +469,7 @@ impl Client {
         }
         // --- End Tracking ---
 
-        if nr.tag.as_ref() == "iq"
+        if nr.tag.as_ref() == StanzaTag::Iq.as_str()
             && let Some(sync_node) = nr.get_optional_child("sync")
             && let Some(collection_node) = sync_node.get_optional_child("collection")
         {
@@ -491,7 +491,7 @@ impl Client {
                 .dispatch(Event::RawNode(Arc::clone(&node)));
         }
 
-        if nr.tag.as_ref() == "xmlstreamend" {
+        if nr.tag.as_ref() == StanzaTag::XmlStreamEnd.as_str() {
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 debug!("Received <xmlstreamend/>, expected disconnect.");
             } else {
@@ -508,7 +508,7 @@ impl Client {
             self.resolve_node_waiters(&node);
         }
 
-        if nr.tag.as_ref() == "iq"
+        if nr.tag.as_ref() == StanzaTag::Iq.as_str()
             && let Some(id) = nr.get_attr("id").map(|v| v.as_str())
             && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
         {
@@ -576,13 +576,13 @@ impl Client {
         // Bypass async_trait's boxed future for the hot built-in handlers while
         // retaining router registration for direct router callers.
         match nr.tag.as_ref() {
-            "ack" => {
+            t if t == StanzaTag::Ack.as_str() => {
                 self.handle_ack_response_arc(&node);
             }
-            "receipt" => {
+            t if t == StanzaTag::Receipt.as_str() => {
                 self.handle_receipt_inline(node);
             }
-            "message" => {
+            t if t == StanzaTag::Message.as_str() => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
                     node,
@@ -592,7 +592,7 @@ impl Client {
             }
             // Differs from a `<message>` only in tag, so WA Web retags it and
             // runs the same pipeline.
-            "status" if is_status_broadcast_stanza(nr) => {
+            t if t == StanzaTag::Status.as_str() && is_status_broadcast_stanza(nr) => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
                     node,
@@ -703,7 +703,7 @@ impl Client {
     /// would redeliver indefinitely. WA Web emits `<receipt context="status">`
     /// in the success path on top of this; the duplicate is tolerated.
     pub(crate) fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        let tag = node.tag.as_ref();
+        let tag = StanzaTag::try_from(node.tag.as_ref());
         if node.get_attr("id").is_none() {
             return false;
         }
@@ -711,9 +711,11 @@ impl Client {
             return false;
         }
         match tag {
-            "receipt" | "notification" | "call" => true,
-            "message" => from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast()),
-            "status" => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Receipt | StanzaTag::Notification | StanzaTag::Call) => true,
+            Ok(StanzaTag::Message) => {
+                from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast())
+            }
+            Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
             _ => false,
         }
     }
