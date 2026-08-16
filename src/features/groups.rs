@@ -459,27 +459,38 @@ pub(crate) struct MetadataLease {
 }
 
 impl MetadataLease {
-    /// Publish this round trip's outcome and close the flight to new joiners,
-    /// under one registry lock.
+    /// Close this flight to new joiners and, if anyone is waiting, publish what
+    /// the round trip produced.
     ///
-    /// The two have to be atomic: a caller admitted after the leader decided
-    /// nobody was waiting would find the flight closed and empty, and query
-    /// again on the strength of a round trip that had just succeeded.
+    /// Closing and deciding are atomic: a caller admitted after the leader
+    /// decided nobody was waiting would find the flight closed and empty, and
+    /// query again on the strength of a round trip that had just succeeded.
     ///
     /// `outcome` is only called when someone is actually waiting, so the
     /// uncontended call — which is most of them — never copies a group's
     /// participants just to drop the copy.
     fn finish(&self, outcome: impl FnOnce() -> FlightOutcome) {
-        let mut inflight = self.registry.map();
-        if self
-            .flight
-            .waiters
-            .load(std::sync::atomic::Ordering::Acquire)
-            > 0
-        {
+        let publish = {
+            let mut inflight = self.registry.map();
+            // Retired first, so nobody else can join; the count read after it,
+            // still under the lock, therefore covers everyone who could.
+            Self::retire(&mut inflight, &self.jid, &self.flight);
+            self.flight
+                .waiters
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+        };
+
+        // Built after the lock is released. The clone is a whole participant
+        // list — up to `GROUP_INFO_PARTICIPANT_LIMIT` of them — and the registry
+        // lock is shared by every group, so holding it across that would stall
+        // claims for unrelated groups and `memory_report()` with them.
+        //
+        // Safe to publish here because a waiter reads only once the flight is
+        // released, which is this lease being dropped, after this returns.
+        if publish {
             *self.flight.result() = Some(Arc::new(outcome()));
         }
-        Self::retire(&mut inflight, &self.jid, &self.flight);
     }
 
     /// Remove this flight, but only where the registered one is still ours: the
