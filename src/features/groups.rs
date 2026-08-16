@@ -532,6 +532,19 @@ impl GroupMetadataRegistry {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Callers admitted to this group's flight, if one is in flight.
+    ///
+    /// Exposed so a test can wait for a joiner to be registered instead of
+    /// yielding a fixed number of times and hoping: a joiner that had not
+    /// claimed yet would become a leader, and the test would be asserting the
+    /// scheduler.
+    #[cfg(test)]
+    pub(crate) fn waiters_for(&self, jid: &Jid) -> Option<usize> {
+        self.map()
+            .get(jid)
+            .map(|flight| flight.waiters.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     /// Number of groups currently being queried. Reported by `memory_report()`;
     /// normally zero.
     pub(crate) fn len(&self) -> usize {
@@ -2812,11 +2825,7 @@ mod tests {
                 client.groups().get_metadata(&group).await
             }));
         }
-        // The claim is taken synchronously, so the leader's query being on the
-        // wire means every waiter can only defer.
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_joiners(&client, &group, WAITERS).await;
         assert_eq!(
             transport.sent().len(),
             1,
@@ -2867,19 +2876,16 @@ mod tests {
                 client.groups().get_metadata(&group).await
             }));
         }
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_joiners(&client, &group, WAITERS).await;
         assert_eq!(transport.sent().len(), 1, "the waiters must defer");
 
         leader.abort();
         let _ = leader.await;
 
-        // Exactly one retry, not one per waiter: the others re-joined it.
+        // Exactly one retry, not one per waiter: one of them took the lease and
+        // the others joined it, which is what waiting for those joins proves.
         let retry_id = pending_group_query(&transport, 1).await;
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_joiners(&client, &group, WAITERS - 1).await;
         assert_eq!(
             transport.sent().len(),
             2,
@@ -2923,6 +2929,24 @@ mod tests {
         next.await
             .expect("next task")
             .expect("a cancelled leader must not lock the group out");
+    }
+
+    /// Block until `count` callers have joined the group's in-flight query.
+    ///
+    /// Polls the registry rather than yielding a fixed number of times, so the
+    /// test waits for the admission it depends on instead of assuming the
+    /// scheduler got there.
+    async fn wait_for_joiners(client: &Arc<Client>, group: &Jid, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if client.group_metadata_inflight.waiters_for(group) >= Some(count) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} caller(s) should join the flight"));
     }
 
     /// The request id of the group query at `index`, once it reaches the wire.
@@ -2972,9 +2996,7 @@ mod tests {
             let group = group.clone();
             tokio::spawn(async move { client.groups().get_metadata(&group).await })
         };
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_joiners(&client, &group, 1).await;
 
         let response = group_result_with_description(&request_id, &group, None);
         crate::test_utils::answer_iq(&client, &request_id, &response).await;
