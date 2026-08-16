@@ -1588,6 +1588,7 @@ impl Client {
         self: &Arc<Self>,
         node: &Arc<wacore_binary::OwnedNodeRef>,
     ) -> bool {
+        self.maybe_refresh_lid_from_ack(node.get());
         let Some(waiter) = self.take_ack_waiter(node.get()) else {
             return false;
         };
@@ -1611,6 +1612,7 @@ impl Client {
         self: &Arc<Self>,
         node: wacore_binary::OwnedNodeRef,
     ) -> bool {
+        self.maybe_refresh_lid_from_ack(node.get());
         let Some(waiter) = self.take_ack_waiter(node.get()) else {
             return false;
         };
@@ -1625,6 +1627,37 @@ impl Client {
             ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
         }
         true
+    }
+
+    /// `<ack refresh_lid="true">`: the server telling us the LID mapping we hold
+    /// for this peer is stale.
+    ///
+    /// It is the only invalidation this client gets. `lid_pn_cache` entries
+    /// never expire, so without acting here a mapping that has gone stale stays
+    /// stale for the lifetime of the process, and every Signal address derived
+    /// from it keeps resolving to the wrong identity.
+    ///
+    /// Both ack entry points call this before taking the waiter, because a send
+    /// ack carries the flag whether or not anything is waiting on it.
+    fn maybe_refresh_lid_from_ack(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) {
+        let Some(peer) = Self::refresh_lid_peer_from_ack(node) else {
+            return;
+        };
+        let client = Arc::clone(self);
+        self.runtime.spawn_detached(Box::pin(async move {
+            client.refresh_lid_mapping_for(peer).await;
+        }));
+    }
+
+    /// The peer an `<ack>` asks us to re-resolve, or `None` when it asks for
+    /// nothing. Split out from the spawn so the gate can be asserted directly.
+    fn refresh_lid_peer_from_ack(node: &wacore_binary::NodeRef<'_>) -> Option<Jid> {
+        // Absent on all but a handful of acks, so the common path is one failed
+        // attribute lookup on the read loop and nothing else.
+        if node.get_attr("refresh_lid")?.as_str() != "true" {
+            return None;
+        }
+        node.attrs().optional_jid("from")
     }
 
     /// Inline half of the phash check. The comparison is a string equality on
@@ -2042,5 +2075,58 @@ impl Client {
 
     pub(crate) fn update_server_time_offset(&self, node: &wacore_binary::NodeRef<'_>) {
         self.unified_session.update_server_time_offset(node);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ack(attrs: &[(&'static str, &str)]) -> Node {
+        attrs
+            .iter()
+            .fold(NodeBuilder::new("ack"), |b, (k, v)| b.attr(k, *v))
+            .build()
+    }
+
+    /// The flag is what asks for a refresh. Every other ack -- which is nearly
+    /// all of them -- must cost nothing beyond the attribute lookup.
+    #[test]
+    fn an_ack_without_the_flag_asks_for_no_refresh() {
+        for attrs in [
+            &[("from", "5511987650001@s.whatsapp.net")][..],
+            &[
+                ("from", "5511987650001@s.whatsapp.net"),
+                ("refresh_lid", "false"),
+            ][..],
+        ] {
+            let node = ack(attrs);
+            assert!(
+                Client::refresh_lid_peer_from_ack(&node.as_node_ref()).is_none(),
+                "{attrs:?} must not request a refresh"
+            );
+        }
+    }
+
+    /// The peer to re-resolve is the ack's sender, not the local device: the
+    /// server is telling us which mapping it disagrees with.
+    #[test]
+    fn a_flagged_ack_names_its_sender_as_the_peer() {
+        let node = ack(&[
+            ("from", "111000011112222@lid"),
+            ("refresh_lid", "true"),
+            ("id", "ACK-REFRESH-1"),
+        ]);
+        assert_eq!(
+            Client::refresh_lid_peer_from_ack(&node.as_node_ref()),
+            Some(Jid::new("111000011112222", wacore_binary::Server::Lid)),
+        );
+    }
+
+    /// A flag with no sender names nobody to refresh.
+    #[test]
+    fn a_flagged_ack_without_a_sender_asks_for_no_refresh() {
+        let node = ack(&[("refresh_lid", "true"), ("id", "ACK-REFRESH-2")]);
+        assert!(Client::refresh_lid_peer_from_ack(&node.as_node_ref()).is_none());
     }
 }

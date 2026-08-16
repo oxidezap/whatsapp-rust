@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use log::debug;
+use log::{debug, warn};
 use wacore::iq::usync::LidQuerySpec;
 use wacore::store::traits::{LidPnMappingEntry, SignalStore};
 use wacore_binary::Jid;
@@ -1194,6 +1194,58 @@ impl Client {
                 );
                 None
             }
+        }
+    }
+
+    /// The phone number a `refresh_lid` flag should be resolved under, or
+    /// `None` when there is nothing to refresh.
+    ///
+    /// A refresh is addressed by phone number because that is the side of the
+    /// pair the server resolves from: asking about a LID we already suspect is
+    /// wrong would look the answer up under the very key in doubt. WA Web does
+    /// the same, mapping the peer through `toPn` first and dropping the refresh
+    /// when no mapping exists to map through -- a peer we have never resolved
+    /// has nothing stale to correct.
+    async fn refresh_lid_target(&self, peer: &Jid) -> Option<Jid> {
+        if peer.is_lid() {
+            return self.swap_pn_lid_namespace(&peer.to_non_ad()).await;
+        }
+        if peer.is_pn() {
+            return Some(peer.to_non_ad());
+        }
+        None
+    }
+
+    /// Re-ask the server for a peer's LID after it flagged ours as stale.
+    ///
+    /// The query is `is_on_whatsapp`, which is this client's contact usync and
+    /// already persists both directions of the pair. WA Web reaches for its
+    /// contact-sync job instead, which asks for business, status and username
+    /// alongside the LID; those extras are what a contact list needs to render
+    /// and none of them is the mapping, so the narrower query refreshes exactly
+    /// what went stale.
+    pub(crate) async fn refresh_lid_mapping_for(&self, peer: Jid) {
+        let Some(pn) = self.refresh_lid_target(&peer).await else {
+            debug!(
+                "refresh_lid: no phone number to refresh {} under",
+                peer.observe()
+            );
+            return;
+        };
+
+        match self
+            .contacts()
+            .is_on_whatsapp(std::slice::from_ref(&pn))
+            .await
+        {
+            Ok(_) => debug!("refresh_lid: refreshed LID mapping for {}", pn.observe()),
+            // A failed refresh leaves the mapping exactly as stale as it was, so
+            // there is nothing to roll back and nothing the caller could retry
+            // more cheaply than the next ack carrying the flag again.
+            Err(e) => warn!(
+                "refresh_lid: contact query for {} failed: {e:?}",
+                pn.observe()
+            ),
         }
     }
 }
@@ -2775,5 +2827,62 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    // ── `<ack refresh_lid="true">` ────────────────────────────────────────
+
+    /// The refresh is answered under the phone number, so a flagged LID peer
+    /// is mapped through the cache first. The device suffix goes with it: the
+    /// mapping is per user, not per device.
+    #[tokio::test]
+    async fn refresh_lid_target_maps_a_lid_peer_to_its_phone_number() {
+        let (client, pn, lid) = client_with_peer_mapping().await;
+
+        let peer = Jid::new(lid, Server::Lid).with_device(7);
+        assert_eq!(
+            client.refresh_lid_target(&peer).await,
+            Some(Jid::new(pn, Server::Pn)),
+        );
+    }
+
+    /// A LID we have never resolved has nothing stale to correct, so the flag
+    /// must not turn into a usync for a peer we know nothing about.
+    #[tokio::test]
+    async fn refresh_lid_target_drops_a_lid_peer_with_no_mapping() {
+        let client = create_test_client().await;
+
+        let peer = Jid::new("111000099998888", Server::Lid);
+        assert_eq!(client.refresh_lid_target(&peer).await, None);
+    }
+
+    /// A phone-number peer is already the side the server resolves from, so it
+    /// is queried as-is rather than mapped to the LID under suspicion.
+    #[tokio::test]
+    async fn refresh_lid_target_queries_a_phone_number_peer_directly() {
+        let (client, pn, _lid) = client_with_peer_mapping().await;
+
+        let peer = Jid::new(pn, Server::Pn).with_device(2);
+        assert_eq!(
+            client.refresh_lid_target(&peer).await,
+            Some(Jid::new(pn, Server::Pn)),
+        );
+    }
+
+    /// Groups, newsletters and status broadcast carry no LID-PN pair.
+    #[tokio::test]
+    async fn refresh_lid_target_ignores_non_user_peers() {
+        let client = create_test_client().await;
+
+        for peer in [
+            Jid::new("120363098765432100", Server::Group),
+            Jid::new("120363298765432100", Server::Newsletter),
+            Jid::new("status", Server::Broadcast),
+        ] {
+            assert_eq!(
+                client.refresh_lid_target(&peer).await,
+                None,
+                "{peer} carries no LID-PN pair"
+            );
+        }
     }
 }
