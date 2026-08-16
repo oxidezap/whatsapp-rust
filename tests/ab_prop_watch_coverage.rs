@@ -16,10 +16,24 @@
 //! The scan is textual on purpose. Resolving these paths properly would mean
 //! running the compiler, and the failure being guarded is a name appearing in
 //! one file and not another -- exactly what text sees.
+//!
+//! What it looks for is the *read*, not the name: the argument to a cache
+//! accessor. Keying on the name alone is too loose -- the registry has
+//! thousands of flags, and `GROUP_CALL_MAX_PARTICIPANTS` (a `usize` derived
+//! from a flag) and the `PLACEHOLDER_MESSAGE_RESEND` proto enum variant both
+//! spell one without reading anything. Keying on a `web::` prefix is too
+//! tight, since a grouped `use ...::web::{FOO}` leaves the call site saying
+//! only `FOO`. The accessor argument is the thing that actually consults the
+//! cache, so it is neither.
+//!
+//! The one form that escapes is a prop bound to a differently-named local
+//! constant first. Nothing does that today, and the runtime `debug_assert`
+//! still covers it if anything ever does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use wacore::iq::abprops::{self, AbProp};
 use wacore::iq::props::WATCHED;
 
 fn manifest_path(relative: &str) -> PathBuf {
@@ -47,26 +61,48 @@ fn sources() -> Vec<(String, String)> {
     out
 }
 
-/// Screaming-snake identifiers qualified by a prop registry module, as
-/// (identifier, file). The emitter names each constant after the flag it
-/// carries, so `web::FOO_ENABLED` is the constant for `foo_enabled`.
-fn referenced_props(sources: &[(String, String)]) -> Vec<(String, String)> {
+/// Every flag the registries declare, keyed by the constant that carries it.
+/// The emitter names each constant after its flag, so `foo_enabled` is
+/// `FOO_ENABLED`; `props::stale` is hand-written to the same convention.
+fn registry() -> HashMap<String, AbProp> {
+    let mut out = HashMap::new();
+    for module in abprops::ALL {
+        for prop in *module {
+            out.insert(prop.name.to_uppercase(), *prop);
+        }
+    }
+    // `stale` holds flags the bundle no longer builds, so they are in no
+    // generated registry but are still read and still have to be watched.
+    for prop in WATCHED {
+        out.insert(prop.name.to_uppercase(), *prop);
+    }
+    out
+}
+
+/// The accessors that consult the cache for one flag. `watch`/`watch_many`
+/// are not reads, and a prop passed to them is registered by that very call.
+const ACCESSORS: &[&str] = &["is_enabled(", "get_int(", ".get("];
+
+/// Flags passed to a cache accessor, as (identifier, file).
+///
+/// Takes the argument's last `::` segment, so a qualified path and a bare name
+/// reduce to the same constant. Anything that is not a screaming-snake registry
+/// name -- a local, an expression -- is not a flag and is skipped.
+fn referenced_props(
+    sources: &[(String, String)],
+    registry: &HashMap<String, AbProp>,
+) -> Vec<(String, String)> {
     let mut found = Vec::new();
     for (file, text) in sources {
-        for module in ["web::", "stale::"] {
+        for accessor in ACCESSORS {
             let mut rest = text.as_str();
-            while let Some(at) = rest.find(module) {
-                rest = &rest[at + module.len()..];
-                let ident: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
-                    .collect();
-                // Lowercase or mixed means this was some other `web::` path,
-                // not a flag constant.
-                if ident.len() > 1
-                    && !rest[ident.len()..].starts_with(|c: char| c.is_alphanumeric())
-                {
-                    found.push((ident, file.clone()));
+            while let Some(at) = rest.find(accessor) {
+                rest = &rest[at + accessor.len()..];
+                let Some(end) = rest.find(')') else { continue };
+                let arg = rest[..end].trim().trim_end_matches(',').trim();
+                let ident = arg.rsplit("::").next().unwrap_or(arg).trim();
+                if registry.contains_key(ident) {
+                    found.push((ident.to_string(), file.clone()));
                 }
             }
         }
@@ -76,13 +112,11 @@ fn referenced_props(sources: &[(String, String)]) -> Vec<(String, String)> {
 
 #[test]
 fn every_ab_prop_this_crate_reads_is_watched() {
-    let watched: HashMap<String, u32> = WATCHED
-        .iter()
-        .map(|p| (p.name.to_uppercase(), p.code))
-        .collect();
+    let registry = registry();
+    let watched: HashSet<String> = WATCHED.iter().map(|p| p.name.to_uppercase()).collect();
 
     let sources = sources();
-    let referenced = referenced_props(&sources);
+    let referenced = referenced_props(&sources, &registry);
     assert!(
         !referenced.is_empty(),
         "the scan found no prop constants at all, so it is no longer guarding anything"
@@ -90,8 +124,11 @@ fn every_ab_prop_this_crate_reads_is_watched() {
 
     let mut unwatched: Vec<String> = referenced
         .iter()
-        .filter(|(ident, _)| !watched.contains_key(ident))
-        .map(|(ident, file)| format!("{ident} (read in {file})"))
+        .filter(|(ident, _)| !watched.contains(ident))
+        .map(|(ident, file)| {
+            let code = registry[ident].code;
+            format!("{ident} (code {code}, read in {file})")
+        })
         .collect();
     unwatched.sort();
     unwatched.dedup();
@@ -102,5 +139,37 @@ fn every_ab_prop_this_crate_reads_is_watched() {
          wacore/src/iq/props.rs, so the server's value is discarded and each \
          read yields the registry default forever:\n  {}",
         unwatched.join("\n  "),
+    );
+}
+
+/// The scan is only worth having if it sees a name that no `web::` prefix
+/// introduces, which is the form the previous version missed.
+#[test]
+fn a_grouped_import_is_still_seen() {
+    let registry = registry();
+    let watched_name = WATCHED[0].name.to_uppercase();
+    let source = vec![(
+        "fake.rs".to_string(),
+        format!(
+            "use wacore::iq::abprops::web::{{{watched_name}}};\n\
+             let on = cache.is_enabled({watched_name}).await;\n"
+        ),
+    )];
+    // Named without reading, which the scan must not treat as a read.
+    let decoy = vec![(
+        "decoy.rs".to_string(),
+        "let n = GROUP_CALL_MAX_PARTICIPANTS;\n\
+         let t = wa::message::PeerDataOperationRequestType::PLACEHOLDER_MESSAGE_RESEND;\n"
+            .to_string(),
+    )];
+    assert!(
+        referenced_props(&decoy, &registry).is_empty(),
+        "the scan counted a flag name that no accessor reads"
+    );
+
+    let found = referenced_props(&source, &registry);
+    assert!(
+        found.iter().any(|(ident, _)| *ident == watched_name),
+        "the scan missed {watched_name} brought in by a grouped import"
     );
 }

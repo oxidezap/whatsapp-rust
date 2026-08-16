@@ -43,12 +43,19 @@ fn locked_version() -> String {
 #[test]
 fn every_generated_rust_file_stamps_the_locked_version() {
     let want = locked_version();
+    // Every Rust artifact `build()` in the codegen emits. The list is repeated
+    // rather than shared because that lives in a binary crate an integration
+    // test cannot import, so a new artifact has to be added in both places --
+    // this check is the offline one, and the only thing that notices an
+    // artifact left over from another build when `--check` cannot reach the
+    // network to fetch the IR.
     for rel in [
         "wacore/src/version/generated.rs",
         "wacore/src/iq/abprops.rs",
         "wacore/src/iq/mex_operations.rs",
         "wacore/appstate/src/schemas.rs",
         "wacore/src/types/wire_enums.rs",
+        "wacore/src/iq/targets.rs",
     ] {
         let text = read(rel);
         let got = stamped_in_header(&text)
