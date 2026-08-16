@@ -84,6 +84,14 @@ fn decode_sender_key_distribution(
 ) -> Result<SenderKeyDistributionMessage, SignalError> {
     match SenderKeyDistributionMessage::try_from(bytes) {
         Ok(message) => Ok(message),
+        // The version nibble is a statement about semantics, not an encoding
+        // detail: a body this client cannot claim to understand must not be
+        // rebuilt as a current-version distribution and installed over sender
+        // key state. The fallback is for envelopes whose framing we do read.
+        Err(
+            version_error @ (SignalProtocolError::LegacyCiphertextVersion(_)
+            | SignalProtocolError::UnrecognizedCiphertextVersion(_)),
+        ) => Err(version_error.into()),
         Err(primary_error) => {
             // Same framing the primary reads: a leading version byte, then the
             // protobuf body. Handing the whole buffer to a protobuf decoder
@@ -1320,22 +1328,36 @@ mod tests {
             .store(false, Ordering::Release);
     }
 
-    /// The fallback decoder recovers a distribution the primary refused.
+    /// The fallback recovers a distribution whose framing the primary refuses.
+    ///
+    /// A `signing_key` with trailing bytes is the shape of divergence the
+    /// fallback exists for: the primary insists on exactly 33, while the key
+    /// itself parses fine.
     #[tokio::test]
     async fn sender_key_distribution_fallback_reads_past_the_version_byte() {
-        use wacore::libsignal::protocol::KeyPair;
+        use wacore::libsignal::protocol::{KeyPair, SENDERKEY_MESSAGE_CURRENT_VERSION};
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let signing = KeyPair::generate(&mut rng);
-        // An unrecognized version is the reachable way into the fallback: the
-        // body is well-formed, only the envelope is not.
-        let serialized = SenderKeyDistributionMessage::new(9, 7, 0, [0x11; 32], signing.public_key)
-            .expect("distribution")
-            .into_serialized();
+
+        // Hand-encoded so the oversized field is visible: id, iteration,
+        // chain_key, signing_key.
+        let mut body = vec![0x08, 7, 0x10, 0];
+        body.extend_from_slice(&[0x1A, 32]);
+        body.extend_from_slice(&[0x11; 32]);
+        let mut key_field = signing.public_key.serialize().to_vec();
+        key_field.push(0xFF);
+        body.extend_from_slice(&[0x22, key_field.len() as u8]);
+        body.extend_from_slice(&key_field);
+
+        let mut serialized = Vec::with_capacity(1 + body.len());
+        serialized
+            .push((SENDERKEY_MESSAGE_CURRENT_VERSION << 4) | SENDERKEY_MESSAGE_CURRENT_VERSION);
+        serialized.extend_from_slice(&body);
 
         assert!(
             SenderKeyDistributionMessage::try_from(&serialized[..]).is_err(),
-            "the primary must refuse this envelope, or the fallback is not exercised"
+            "the primary must refuse this framing, or the fallback is not exercised"
         );
 
         let decoded = decode_sender_key_distribution(&serialized)
@@ -1346,6 +1368,28 @@ mod tests {
             decoded.signing_key(),
             &signing.public_key,
             "the type-prefixed signing key must survive the fallback intact"
+        );
+    }
+
+    /// An unsupported version is refused outright, not rebuilt as a current one.
+    #[tokio::test]
+    async fn sender_key_distribution_refuses_an_unsupported_version() {
+        use wacore::libsignal::protocol::KeyPair;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let serialized = SenderKeyDistributionMessage::new(9, 7, 0, [0x11; 32], signing.public_key)
+            .expect("distribution")
+            .into_serialized();
+
+        let error = decode_sender_key_distribution(&serialized)
+            .expect_err("a version this client does not implement must not be adopted");
+        assert!(
+            matches!(
+                error,
+                SignalError::Protocol(SignalProtocolError::UnrecognizedCiphertextVersion(9))
+            ),
+            "the version refusal must reach the caller intact, got {error}"
         );
     }
 }

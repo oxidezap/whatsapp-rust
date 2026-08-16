@@ -595,8 +595,12 @@ impl Client {
         // on someone else's would deadlock two callers whose batches overlap in
         // opposite order.
         drop(lease);
-        await_leaders(waiters).await;
+        // Before waiting, not after: our own fetch already decided this call's
+        // answer, and a deferred leader can sit on a prekey IQ for the full
+        // request timeout. Waiting first would park a send that has nothing
+        // left to learn.
         fetched?;
+        await_leaders(waiters).await;
 
         Ok(deferred)
     }
