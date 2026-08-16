@@ -1,6 +1,6 @@
 use crate::client::Client;
 use crate::features::mex::{MexError, mex_request};
-use crate::request::IqError;
+use crate::request::{IqError, RejectionStanza};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -351,16 +351,35 @@ pub(crate) struct GroupMetadataRegistry {
 }
 
 /// The server refusal behind a group error, if that is what it was.
+///
+/// Matched on the variant rather than read through `server_rejection`, because
+/// a waiter has to rebuild the error, not just inspect it.
 fn server_refusal(error: &GroupError) -> Option<ServerRefusal> {
-    use crate::error::ErrorChainExt;
-    error.server_rejection().map(|rejection| ServerRefusal {
-        code: rejection.code,
-        text: rejection.text.to_string(),
+    let GroupError::Iq(IqError::ServerError {
+        code,
+        text,
+        error_type,
+        backoff,
+        response,
+    }) = error
+    else {
+        return None;
+    };
+    Some(ServerRefusal {
+        code: *code,
+        text: text.clone(),
+        error_type: error_type.clone(),
+        backoff: *backoff,
+        response: response.clone(),
     })
 }
 
 /// What one flight produced, for the callers that joined it.
-#[derive(Clone)]
+///
+/// Shared by refcount: a waiter clones the pointer while holding the flight's
+/// lock and the payload after releasing it. Cloning a group's participants
+/// under a `std::sync::Mutex` would serialize the waiters and block runtime
+/// threads while it happened.
 enum FlightOutcome {
     Answered(Box<GroupMetadata>),
     /// The server refused. Re-asking during a rate limit is what the refusal is
@@ -368,27 +387,59 @@ enum FlightOutcome {
     Refused(ServerRefusal),
 }
 
-/// A server refusal, in the shape a waiter can rebuild an error from.
+/// A server refusal, kept whole enough for a waiter to rebuild the error.
 ///
-/// The chain is not carried across: `GroupError` is not `Clone`, and what a
-/// waiter needs is the verdict, not the leader's stack.
+/// Everything the leader's error carried, so `ErrorChainExt::server_rejection`
+/// answers the same for a waiter — including the `backoff` a caller needs to
+/// honour the delay the server asked for.
 #[derive(Clone)]
 struct ServerRefusal {
     code: u16,
     text: String,
+    error_type: Option<String>,
+    backoff: Option<u32>,
+    response: RejectionStanza,
+}
+
+impl ServerRefusal {
+    fn into_error(self) -> GroupError {
+        GroupError::Iq(IqError::ServerError {
+            code: self.code,
+            text: self.text,
+            error_type: self.error_type,
+            backoff: self.backoff,
+            response: self.response,
+        })
+    }
 }
 
 /// The shared side of one in-flight query.
 struct MetadataFlight {
-    /// Callers waiting on this flight. Read by the leader to decide whether its
-    /// answer is worth cloning at all.
+    /// Callers waiting on this flight, counted under the registry lock.
     waiters: std::sync::atomic::AtomicUsize,
     /// Set by the leader before it releases. Absent means the leader produced
     /// nothing a waiter can act on, so a waiter asks for itself.
-    result: std::sync::Mutex<Option<FlightOutcome>>,
+    result: std::sync::Mutex<Option<Arc<FlightOutcome>>>,
     /// Closes when the leader's lease drops — on success, on failure, and on a
     /// cancelled or panicking leader alike.
     released: async_channel::Receiver<std::convert::Infallible>,
+}
+
+impl MetadataFlight {
+    /// Wait for the leader to release, and read what it produced.
+    ///
+    /// Returns the outcome behind its refcount: the caller derives its own copy
+    /// after this returns, with no lock held.
+    async fn wait(&self) -> Option<Arc<FlightOutcome>> {
+        let _ = self.released.recv().await;
+        self.result().clone()
+    }
+
+    fn result(&self) -> std::sync::MutexGuard<'_, Option<Arc<FlightOutcome>>> {
+        self.result
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 }
 
 /// What a caller got from [`GroupMetadataRegistry::claim`].
@@ -397,23 +448,6 @@ enum MetadataClaim {
     Leader(MetadataLease),
     /// Someone else is running it; wait on their flight.
     Joined(Arc<MetadataFlight>),
-}
-
-impl MetadataFlight {
-    /// Wait for the leader to release, and read what it produced.
-    ///
-    /// Cloned rather than taken: every waiter needs its own copy, and taking
-    /// would leave all but the first to query again.
-    async fn wait(&self) -> Option<FlightOutcome> {
-        let _ = self.released.recv().await;
-        self.result().clone()
-    }
-
-    fn result(&self) -> std::sync::MutexGuard<'_, Option<FlightOutcome>> {
-        self.result
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
 }
 
 /// The leader's side. Dropping it releases every waiter.
@@ -425,33 +459,50 @@ pub(crate) struct MetadataLease {
 }
 
 impl MetadataLease {
-    /// Whether anyone joined this flight.
+    /// Publish this round trip's outcome and close the flight to new joiners,
+    /// under one registry lock.
     ///
-    /// Read before cloning the answer: a group can carry thousands of
-    /// participants, and the uncontended call — which is most of them — has
-    /// nobody to hand a copy to.
-    fn has_waiters(&self) -> bool {
-        self.flight
+    /// The two have to be atomic: a caller admitted after the leader decided
+    /// nobody was waiting would find the flight closed and empty, and query
+    /// again on the strength of a round trip that had just succeeded.
+    ///
+    /// `outcome` is only called when someone is actually waiting, so the
+    /// uncontended call — which is most of them — never copies a group's
+    /// participants just to drop the copy.
+    fn finish(&self, outcome: impl FnOnce() -> FlightOutcome) {
+        let mut inflight = self.registry.map();
+        if self
+            .flight
             .waiters
             .load(std::sync::atomic::Ordering::Acquire)
             > 0
+        {
+            *self.flight.result() = Some(Arc::new(outcome()));
+        }
+        Self::retire(&mut inflight, &self.jid, &self.flight);
     }
 
-    /// Hand this round trip's outcome to everyone waiting on it.
-    fn publish(&self, outcome: FlightOutcome) {
-        *self.flight.result() = Some(outcome);
+    /// Remove this flight, but only where the registered one is still ours: the
+    /// entry may already belong to a later caller.
+    fn retire(
+        inflight: &mut HashMap<Jid, Arc<MetadataFlight>>,
+        jid: &Jid,
+        flight: &Arc<MetadataFlight>,
+    ) {
+        if let std::collections::hash_map::Entry::Occupied(entry) = inflight.entry(jid.clone())
+            && Arc::ptr_eq(entry.get(), flight)
+        {
+            entry.remove();
+        }
     }
 }
 
 impl Drop for MetadataLease {
     fn drop(&mut self) {
+        // Idempotent: a leader that reached `finish` is already gone from the
+        // map, and one that died never got there.
         let mut inflight = self.registry.map();
-        // Identity-checked: the entry may already belong to a later caller.
-        if let std::collections::hash_map::Entry::Occupied(entry) = inflight.entry(self.jid.clone())
-            && Arc::ptr_eq(entry.get(), &self.flight)
-        {
-            entry.remove();
-        }
+        Self::retire(&mut inflight, &self.jid, &self.flight);
     }
 }
 
@@ -479,8 +530,9 @@ impl GroupMetadataRegistry {
     fn claim(self: &Arc<Self>, jid: &Jid) -> MetadataClaim {
         let mut inflight = self.map();
         if let Some(flight) = inflight.get(jid) {
-            // Counted under the registry lock, so a leader reading it has
-            // already seen every caller that could join before it publishes.
+            // Counted under the registry lock, which is the same one the leader
+            // publishes under — so a caller either lands before the leader
+            // decides, and is seen, or cannot land at all.
             flight
                 .waiters
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -867,31 +919,28 @@ impl<'a> Groups<'a> {
                 MetadataClaim::Leader(lease) => {
                     let queried = self.query_metadata_uncoalesced(jid).await;
                     match &queried {
-                        Ok(metadata) if lease.has_waiters() => {
-                            lease.publish(FlightOutcome::Answered(Box::new(metadata.clone())));
+                        Ok(metadata) => {
+                            lease.finish(|| FlightOutcome::Answered(Box::new(metadata.clone())))
                         }
-                        Err(error) => {
-                            // Only a refusal is passed on. A local failure — a
-                            // timeout, a dropped socket — says nothing about the
-                            // group, so a waiter is right to ask again.
-                            if let Some(refusal) = server_refusal(error) {
-                                lease.publish(FlightOutcome::Refused(refusal));
-                            }
-                        }
-                        Ok(_) => {}
+                        // Only a refusal is passed on. A local failure — a
+                        // timeout, a dropped socket — says nothing about the
+                        // group, so a waiter is right to ask again.
+                        Err(error) => match server_refusal(error) {
+                            Some(refusal) => lease.finish(|| FlightOutcome::Refused(refusal)),
+                            None => drop(lease),
+                        },
                     }
                     return queried;
                 }
-                MetadataClaim::Joined(flight) => match flight.wait().await {
-                    Some(FlightOutcome::Answered(metadata)) => return Ok(*metadata),
+                MetadataClaim::Joined(flight) => match flight.wait().await.as_deref() {
+                    // Derived here, with no lock held.
+                    Some(FlightOutcome::Answered(metadata)) => return Ok((**metadata).clone()),
                     // The server just told us to stop asking. Querying again
                     // inside the cooldown it asked for is what produced the
-                    // refusal in the first place.
+                    // refusal in the first place, and the error is rebuilt whole
+                    // so a caller can read its `backoff` as the leader could.
                     Some(FlightOutcome::Refused(refusal)) => {
-                        return Err(GroupError::InvalidRequest(format!(
-                            "group query refused by the server: code={}, text='{}'",
-                            refusal.code, refusal.text
-                        )));
+                        return Err(refusal.clone().into_error());
                     }
                     None => {}
                 },
@@ -2869,53 +2918,50 @@ mod tests {
             .to_string()
     }
 
-    /// A run of dead leaders stays one query at a time, however many callers
-    /// are waiting.
+    /// A caller that joined a successful flight is answered by it.
     ///
-    /// An earlier revision bounded the retry loop and fell through to an
-    /// uncoalesced query, so a long enough run released several waiters at
-    /// once — the burst this registry exists to prevent.
+    /// Holds down the observable half of publishing under the registry lock —
+    /// that a joiner is answered rather than left to query again. The race the
+    /// lock closes (a caller admitted between the leader's decision and the
+    /// close) cannot be staged deterministically, so this does not claim to
+    /// prove it.
+    ///
+    /// Replaces a test that aborted `callers[0]` expecting it to be the leader:
+    /// Tokio does not promise spawn order, so it asserted the scheduler rather
+    /// than the invariant.
     #[tokio::test]
-    async fn a_run_of_dead_metadata_leaders_never_puts_two_queries_on_the_wire() {
-        const CALLERS: usize = 5;
-        const DEATHS: usize = 3;
-
+    async fn a_late_joiner_is_answered_rather_than_left_to_query_again() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let group = description_test_group();
 
-        let mut callers = Vec::with_capacity(CALLERS);
-        for _ in 0..CALLERS {
+        let leader = {
             let client = client.clone();
             let group = group.clone();
-            callers.push(tokio::spawn(async move {
-                client.groups().get_metadata(&group).await
-            }));
+            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+        };
+        let request_id = pending_group_query(&transport, 0).await;
+
+        let joiner = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+        };
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
         }
 
-        // Kill the leader repeatedly. After each death exactly one caller may
-        // take over, so the wire never holds two queries for this group.
-        for round in 0..DEATHS {
-            pending_group_query(&transport, round).await;
-            callers.remove(0).abort();
-            for _ in 0..64 {
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(
-                transport.sent().len(),
-                round + 2,
-                "after {} death(s) exactly one retry may be in flight",
-                round + 1
-            );
-        }
-
-        let request_id = pending_group_query(&transport, DEATHS).await;
         let response = group_result_with_description(&request_id, &group, None);
         crate::test_utils::answer_iq(&client, &request_id, &response).await;
-        for caller in callers {
-            caller
-                .await
-                .expect("caller task")
-                .expect("the surviving callers share the answer");
-        }
+
+        leader.await.expect("leader task").expect("leader query");
+        joiner
+            .await
+            .expect("joiner task")
+            .expect("a joined caller takes the leader's answer");
+        assert_eq!(
+            transport.sent().len(),
+            1,
+            "a caller that joined a successful flight must not query again"
+        );
     }
 }
