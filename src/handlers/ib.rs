@@ -422,12 +422,15 @@ mod tests {
         ib_with(b.build())
     }
 
-    async fn stored_expiration(client: &Arc<Client>) -> Option<ServerClientExpiration> {
+    /// The stored deadline, read by borrowing from the cached snapshot rather
+    /// than cloning the record out of it.
+    fn stored_deadline(client: &Arc<Client>) -> Option<i64> {
         client
             .persistence_manager
             .get_device_snapshot()
             .server_client_expiration
-            .clone()
+            .as_ref()
+            .map(|e| e.expires_at)
     }
 
     /// The deadline is persisted, not just announced: a consumer that restarts
@@ -441,9 +444,12 @@ mod tests {
         let far = wacore::time::now_secs() as i64 + 90 * 86_400;
         handle_ib_impl(client.clone(), &client_expiration(Some(far)).as_node_ref()).await;
 
-        let stored = stored_expiration(&client).await.expect("deadline stored");
-        assert_eq!(stored.expires_at, far);
         let snapshot = client.persistence_manager.get_device_snapshot();
+        let stored = snapshot
+            .server_client_expiration
+            .as_ref()
+            .expect("deadline stored");
+        assert_eq!(stored.expires_at, far);
         assert!(stored.applies_to((
             snapshot.app_version_primary,
             snapshot.app_version_secondary,
@@ -479,10 +485,7 @@ mod tests {
                 .any(|e| matches!(&**e, Event::ClientExpirationChanged(_))),
             "restating the same deadline must not dispatch"
         );
-        assert_eq!(
-            stored_expiration(&client).await.map(|e| e.expires_at),
-            Some(far)
-        );
+        assert_eq!(stored_deadline(&client), Some(far));
     }
 
     /// `<client_expiration>` with no `t` retracts the deadline.
@@ -496,7 +499,7 @@ mod tests {
         let _subscription = client.subscribe_handler(collector.clone());
         handle_ib_impl(client.clone(), &client_expiration(None).as_node_ref()).await;
 
-        assert!(stored_expiration(&client).await.is_none());
+        assert!(stored_deadline(&client).is_none());
         assert!(collector.events().iter().any(|event| matches!(
             &**event,
             Event::ClientExpirationChanged(ClientExpirationChanged {
@@ -517,7 +520,7 @@ mod tests {
 
         handle_ib_impl(client.clone(), &client_expiration(None).as_node_ref()).await;
 
-        assert!(stored_expiration(&client).await.is_none());
+        assert!(stored_deadline(&client).is_none());
         assert!(
             !collector
                 .events()
@@ -542,7 +545,7 @@ mod tests {
             let node = ib_with(NodeBuilder::new("client_expiration").attr("t", bad).build());
             handle_ib_impl(client.clone(), &node.as_node_ref()).await;
             assert_eq!(
-                stored_expiration(&client).await.map(|e| e.expires_at),
+                stored_deadline(&client),
                 Some(far),
                 "t={bad:?} must not disturb the stored deadline"
             );
