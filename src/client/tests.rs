@@ -6616,4 +6616,73 @@ mod ensure_sessions_concurrency {
 
         leader.abort();
     }
+
+    /// A claim is retired the moment its work lands, so a caller arriving
+    /// afterwards leads its own fetch instead of inheriting an answer.
+    ///
+    /// This is what lets retry recovery delete a session and immediately
+    /// re-establish it: joining the finished claim would hand it a verdict
+    /// about the session it had just deleted.
+    #[tokio::test]
+    async fn a_finished_claim_is_retired_so_the_next_caller_leads() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("888888888888888".to_string(), 0);
+        let keys = PeerKeys::generate();
+
+        let first = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let first_id = pending_prekey_request(&transport, 0).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &first_id,
+            &keys.bundle_response(&peer, &first_id, 400),
+        )
+        .await;
+        first.await.expect("first task").expect("first ensure");
+
+        assert_eq!(
+            client.ensure_inflight.len(),
+            0,
+            "a finished claim must not stay registered"
+        );
+
+        // Whatever established that session is gone again: the next ensure has
+        // to do the work itself.
+        client
+            .signal_cache
+            .delete_session(&peer.to_protocol_address())
+            .await;
+        client
+            .flush_signal_cache_batch_safe()
+            .await
+            .expect("flush the deletion");
+
+        let second = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let second_id = pending_prekey_request(&transport, 1).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &second_id,
+            &keys.bundle_response(&peer, &second_id, 401),
+        )
+        .await;
+        second
+            .await
+            .expect("second task")
+            .expect("a caller after the claim retired must establish the session itself");
+    }
 }

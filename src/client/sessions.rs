@@ -87,16 +87,30 @@ impl EnsureLease {
                 .find(|claim| claim.address.as_ref() == address)
             {
                 claim.completed.store(true, Ordering::Release);
-                drop(claim.release.take());
                 finished.push(claim.address.clone());
             }
         }
+
         // Retired from the registry now, not when the lease drops. A claim that
         // outlives its work is a claim a later caller joins: retry recovery can
         // delete this session and ensure it again while a sibling chunk is
         // still in flight, and that caller must be able to become leader
         // instead of inheriting an answer about the session it just deleted.
+        //
+        // Before the wake, not after. A slot that is both closed and complete
+        // answers instantly, so leaving it registered for even the width of
+        // this call is a window in which that same caller joins it.
         self.registry.retire(&finished, &self.claims);
+
+        for address in &finished {
+            if let Some(claim) = self
+                .claims
+                .iter_mut()
+                .find(|claim| &claim.address == address)
+            {
+                drop(claim.release.take());
+            }
+        }
     }
 }
 
