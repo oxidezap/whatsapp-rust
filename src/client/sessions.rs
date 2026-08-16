@@ -22,21 +22,30 @@ use crate::types::events::{Event, OfflineSyncCompleted};
 /// stranded by an outcome the leader never got to report.
 type EnsureWaiter = async_channel::Receiver<std::convert::Infallible>;
 
+/// What a waiter holds while another caller establishes its address.
+#[derive(Clone)]
+struct EnsureSlot {
+    /// Set by the leader when it finished its work, before it releases the
+    /// claim. Distinguishes "the leader ran and the server had nothing for this
+    /// device" — where retrying only repeats an answered question — from "the
+    /// leader died", where nobody has asked yet.
+    completed: Arc<std::sync::atomic::AtomicBool>,
+    released: EnsureWaiter,
+}
+
 /// Which addresses are currently having a session established, keyed by
 /// protocol address. See [`Client::ensure_inflight`] for why this exists.
 #[derive(Default)]
 pub(crate) struct EnsureRegistry {
-    inflight: std::sync::Mutex<std::collections::HashMap<Box<str>, EnsureWaiter>>,
+    inflight: std::sync::Mutex<std::collections::HashMap<Box<str>, EnsureSlot>>,
 }
 
 /// How one `ensure` pass split its input against what was already in flight.
 struct EnsureReservation {
     /// Claimed by this caller: probed and, if needed, fetched here.
     owned: Vec<Jid>,
-    /// Left to another caller's in-flight ensure.
-    deferred: Vec<Jid>,
-    /// One per deferred address, closed when its leader finishes or dies.
-    waiters: Vec<EnsureWaiter>,
+    /// Left to another caller's in-flight ensure, with the slot to wait on.
+    deferred: Vec<(Jid, EnsureSlot)>,
     /// `None` when nothing was claimed.
     lease: Option<EnsureLease>,
 }
@@ -48,8 +57,16 @@ struct EnsureReservation {
 struct EnsureLease {
     registry: Arc<EnsureRegistry>,
     addresses: Vec<Box<str>>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
     /// Closes on drop, waking every waiter registered against these addresses.
     _leader: async_channel::Sender<std::convert::Infallible>,
+}
+
+impl EnsureLease {
+    /// Record that this caller carried its addresses as far as it could.
+    fn mark_completed(&self) {
+        self.completed.store(true, Ordering::Release);
+    }
 }
 
 impl Drop for EnsureLease {
@@ -75,11 +92,15 @@ impl EnsureRegistry {
     fn reserve(self: &Arc<Self>, jids: &[Jid]) -> EnsureReservation {
         use wacore::types::jid::JidExt;
 
-        let (leader, waiter) = async_channel::bounded(1);
+        let (leader, released) = async_channel::bounded(1);
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let slot = EnsureSlot {
+            completed: completed.clone(),
+            released,
+        };
         let mut owned = Vec::with_capacity(jids.len());
         let mut addresses = Vec::with_capacity(jids.len());
         let mut deferred = Vec::new();
-        let mut waiters = Vec::new();
 
         {
             let Ok(mut inflight) = self.inflight.lock() else {
@@ -89,7 +110,6 @@ impl EnsureRegistry {
                 return EnsureReservation {
                     owned: jids.to_vec(),
                     deferred,
-                    waiters,
                     lease: None,
                 };
             };
@@ -97,12 +117,11 @@ impl EnsureRegistry {
                 let address = jid.to_protocol_address_string().into_boxed_str();
                 match inflight.entry(address) {
                     std::collections::hash_map::Entry::Occupied(entry) => {
-                        waiters.push(entry.get().clone());
-                        deferred.push(jid.clone());
+                        deferred.push((jid.clone(), entry.get().clone()));
                     }
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         addresses.push(entry.key().clone());
-                        entry.insert(waiter.clone());
+                        entry.insert(slot.clone());
                         owned.push(jid.clone());
                     }
                 }
@@ -112,12 +131,12 @@ impl EnsureRegistry {
         let lease = (!addresses.is_empty()).then(|| EnsureLease {
             registry: self.clone(),
             addresses,
+            completed,
             _leader: leader,
         });
         EnsureReservation {
             owned,
             deferred,
-            waiters,
             lease,
         }
     }
@@ -129,12 +148,18 @@ impl EnsureRegistry {
     }
 }
 
-/// Wait for every leader we deferred to. A closed channel is the only outcome
+/// Wait for every leader we deferred to, and report back the addresses whose
+/// leader died without doing the work. A closed channel is the only outcome
 /// there is: leaders never send, they drop.
-async fn await_leaders(waiters: Vec<EnsureWaiter>) {
-    for waiter in waiters {
-        let _ = waiter.recv().await;
+async fn await_leaders(deferred: Vec<(Jid, EnsureSlot)>) -> Vec<Jid> {
+    let mut abandoned = Vec::new();
+    for (jid, slot) in deferred {
+        let _ = slot.released.recv().await;
+        if !slot.completed.load(Ordering::Acquire) {
+            abandoned.push(jid);
+        }
     }
+    abandoned
 }
 
 impl Client {
@@ -485,16 +510,13 @@ impl Client {
     /// Core session-check + prekey-fetch logic shared by both entry points.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_inner", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn ensure_sessions_inner(&self, mut jids: Vec<Jid>) -> Result<()> {
-        // A pass returns the addresses it left to someone else's in-flight
-        // ensure. A leader that succeeded leaves a session behind, so its
-        // waiters drop out at the next pass's probe without fetching; only a
-        // leader that ended without one sends its waiters back around.
+        // A pass returns only the addresses whose leader died without doing the
+        // work — not everything it deferred. A leader that ran and found no
+        // bundle has already asked the question, so repeating its fetch would
+        // only ask again; a leader that was cancelled asked nothing.
         //
-        // Bounded, because an address a fresh caller keeps re-claiming would
-        // otherwise loop here for as long as the contention lasts. Exhausting
-        // the bound leaves the address unkeyed, which the fan-out already has
-        // to handle (a bundle can come back empty), so it is logged rather than
-        // raised.
+        // Bounded, because an address a fresh caller keeps claiming and then
+        // abandoning would otherwise loop here for as long as that lasts.
         const ENSURE_PASSES: usize = 3;
 
         for _ in 0..ENSURE_PASSES {
@@ -504,16 +526,18 @@ impl Client {
             }
         }
 
-        log::debug!(
-            "ensure sessions: {} address(es) still claimed by another ensure after \
-             {ENSURE_PASSES} passes; leaving them unkeyed",
+        // Reported, not swallowed: before coalescing, this caller would have
+        // run its own fetch and propagated whatever that returned. Succeeding
+        // here would hand the fan-out an address nobody ever fetched for.
+        Err(anyhow::anyhow!(
+            "session establishment for {} address(es) was abandoned by \
+             {ENSURE_PASSES} successive callers",
             jids.len()
-        );
-        Ok(())
+        ))
     }
 
-    /// One claim-probe-fetch pass. Returns the jids this call deferred to
-    /// another in-flight ensure, for the caller to re-examine.
+    /// One claim-probe-fetch pass. Returns the jids whose in-flight leader
+    /// ended without carrying them, for the caller to re-examine.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_pass", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
     async fn ensure_sessions_pass(&self, mut jids: Vec<Jid>) -> Result<Vec<Jid>> {
         use wacore::types::jid::JidExt;
@@ -540,12 +564,10 @@ impl Client {
         let EnsureReservation {
             owned: jids,
             deferred,
-            waiters,
             lease,
         } = self.ensure_inflight.reserve(&jids);
         if jids.is_empty() {
-            await_leaders(waiters).await;
-            return Ok(deferred);
+            return Ok(await_leaders(deferred).await);
         }
 
         let device_snapshot = self.persistence_manager.get_device_snapshot();
@@ -578,9 +600,11 @@ impl Client {
             .await;
 
         if jids_needing_sessions.is_empty() {
+            if let Some(lease) = &lease {
+                lease.mark_completed();
+            }
             drop(lease);
-            await_leaders(waiters).await;
-            return Ok(deferred);
+            return Ok(await_leaders(deferred).await);
         }
 
         let fetched = async {
@@ -591,6 +615,14 @@ impl Client {
         }
         .await;
 
+        // Marked whatever the server said: an answered fetch that carried no
+        // bundle for a device is still an answer, and our waiters must not
+        // re-ask it. Only a failure leaves the claim unmarked.
+        if let Some(lease) = &lease
+            && fetched.is_ok()
+        {
+            lease.mark_completed();
+        }
         // Release before waiting: a leader that keeps its claim while blocking
         // on someone else's would deadlock two callers whose batches overlap in
         // opposite order.
@@ -600,9 +632,8 @@ impl Client {
         // request timeout. Waiting first would park a send that has nothing
         // left to learn.
         fetched?;
-        await_leaders(waiters).await;
 
-        Ok(deferred)
+        Ok(await_leaders(deferred).await)
     }
 
     /// Fetch prekeys and establish sessions for a batch of JIDs.

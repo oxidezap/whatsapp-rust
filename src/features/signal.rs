@@ -79,26 +79,21 @@ impl SignalSessionMigration {
     }
 }
 
+/// Decode a sender-key distribution, tolerating the unframed encoding.
+///
+/// The primary parser reads WhatsApp's framed form: a version byte, then the
+/// protobuf body with a type-prefixed signing key. Peers also send the body on
+/// its own, and that shape reaches here as a version refusal rather than a
+/// decode error, because the leading protobuf tag (`0x08`) has a zero high
+/// nibble. So the fallback decodes the whole buffer and reads the signing key
+/// bare. Neither half is redundant, and neither may be aligned to the other.
 fn decode_sender_key_distribution(
     bytes: &[u8],
 ) -> Result<SenderKeyDistributionMessage, SignalError> {
     match SenderKeyDistributionMessage::try_from(bytes) {
         Ok(message) => Ok(message),
-        // The version nibble is a statement about semantics, not an encoding
-        // detail: a body this client cannot claim to understand must not be
-        // rebuilt as a current-version distribution and installed over sender
-        // key state. The fallback is for envelopes whose framing we do read.
-        Err(
-            version_error @ (SignalProtocolError::LegacyCiphertextVersion(_)
-            | SignalProtocolError::UnrecognizedCiphertextVersion(_)),
-        ) => Err(version_error.into()),
         Err(primary_error) => {
-            // Same framing the primary reads: a leading version byte, then the
-            // protobuf body. Handing the whole buffer to a protobuf decoder
-            // parses that byte as a field tag, which no well-formed body
-            // survives.
-            let body = bytes.split_first().map_or(bytes, |(_version, rest)| rest);
-            let fallback = waproto::codec::sender_key_distribution_message_decode(body)
+            let fallback = waproto::codec::sender_key_distribution_message_decode(bytes)
                 .map_err(|fallback_error| {
                     SignalError::InvalidInput(format!(
                         "sender-key distribution decode failed: primary={primary_error}; fallback={fallback_error}"
@@ -125,14 +120,12 @@ fn decode_sender_key_distribution(
                         value.len()
                     ))
                 })?;
-            // Type-prefixed on the wire, as the primary's `PublicKey::deserialize`
-            // reads it. Taking the field as a bare 32-byte key rejects every
-            // real distribution on its length.
-            let signing_key = PublicKey::deserialize(&signing_key).map_err(|error| {
-                SignalError::InvalidInput(format!(
-                    "sender-key distribution signing_key is invalid: {error}"
-                ))
-            })?;
+            let signing_key =
+                PublicKey::from_djb_public_key_bytes(&signing_key).map_err(|error| {
+                    SignalError::InvalidInput(format!(
+                        "sender-key distribution signing_key is invalid: {error}"
+                    ))
+                })?;
             Ok(SenderKeyDistributionMessage::new(
                 SENDERKEY_MESSAGE_CURRENT_VERSION,
                 id,
@@ -1328,68 +1321,63 @@ mod tests {
             .store(false, Ordering::Release);
     }
 
-    /// The fallback recovers a distribution whose framing the primary refuses.
+    /// The unframed encoding — no version byte, bare 32-byte signing key — is
+    /// what the fallback is for, and it arrives as a *version* refusal from the
+    /// primary because a leading protobuf tag has a zero high nibble.
     ///
-    /// A `signing_key` with trailing bytes is the shape of divergence the
-    /// fallback exists for: the primary insists on exactly 33, while the key
-    /// itself parses fine.
+    /// Written after nearly "fixing" the fallback into alignment with the
+    /// primary, which would have made every distribution in this shape fail and
+    /// left the group undecryptable. There was no test holding it down.
     #[tokio::test]
-    async fn sender_key_distribution_fallback_reads_past_the_version_byte() {
-        use wacore::libsignal::protocol::{KeyPair, SENDERKEY_MESSAGE_CURRENT_VERSION};
-
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let signing = KeyPair::generate(&mut rng);
-
-        // Hand-encoded so the oversized field is visible: id, iteration,
-        // chain_key, signing_key.
-        let mut body = vec![0x08, 7, 0x10, 0];
-        body.extend_from_slice(&[0x1A, 32]);
-        body.extend_from_slice(&[0x11; 32]);
-        let mut key_field = signing.public_key.serialize().to_vec();
-        key_field.push(0xFF);
-        body.extend_from_slice(&[0x22, key_field.len() as u8]);
-        body.extend_from_slice(&key_field);
-
-        let mut serialized = Vec::with_capacity(1 + body.len());
-        serialized
-            .push((SENDERKEY_MESSAGE_CURRENT_VERSION << 4) | SENDERKEY_MESSAGE_CURRENT_VERSION);
-        serialized.extend_from_slice(&body);
-
-        assert!(
-            SenderKeyDistributionMessage::try_from(&serialized[..]).is_err(),
-            "the primary must refuse this framing, or the fallback is not exercised"
-        );
-
-        let decoded = decode_sender_key_distribution(&serialized)
-            .expect("the fallback must recover a well-formed body");
-        assert_eq!(decoded.chain_id(), 7);
-        assert_eq!(decoded.chain_key(), &[0x11u8; 32]);
-        assert_eq!(
-            decoded.signing_key(),
-            &signing.public_key,
-            "the type-prefixed signing key must survive the fallback intact"
-        );
-    }
-
-    /// An unsupported version is refused outright, not rebuilt as a current one.
-    #[tokio::test]
-    async fn sender_key_distribution_refuses_an_unsupported_version() {
+    async fn unframed_sender_key_distribution_is_still_accepted() {
         use wacore::libsignal::protocol::KeyPair;
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let signing = KeyPair::generate(&mut rng);
-        let serialized = SenderKeyDistributionMessage::new(9, 7, 0, [0x11; 32], signing.public_key)
-            .expect("distribution")
-            .into_serialized();
 
-        let error = decode_sender_key_distribution(&serialized)
-            .expect_err("a version this client does not implement must not be adopted");
+        // Hand-encoded, because this shape has no constructor: id, iteration,
+        // chain_key, then the signing key with no type prefix.
+        let mut unframed = vec![0x08, 7, 0x10, 0];
+        unframed.extend_from_slice(&[0x1A, 32]);
+        unframed.extend_from_slice(&[0x11; 32]);
+        unframed.extend_from_slice(&[0x22, 32]);
+        unframed.extend_from_slice(signing.public_key.public_key_bytes());
+
         assert!(
             matches!(
-                error,
-                SignalError::Protocol(SignalProtocolError::UnrecognizedCiphertextVersion(9))
+                SenderKeyDistributionMessage::try_from(&unframed[..]),
+                Err(SignalProtocolError::LegacyCiphertextVersion(0))
             ),
-            "the version refusal must reach the caller intact, got {error}"
+            "the primary reads the leading protobuf tag as a version, which is \
+             how this shape reaches the fallback at all"
         );
+
+        let decoded = decode_sender_key_distribution(&unframed)
+            .expect("the unframed encoding must keep decoding");
+        assert_eq!(decoded.chain_id(), 7);
+        assert_eq!(decoded.chain_key(), &[0x11u8; 32]);
+        assert_eq!(decoded.signing_key(), &signing.public_key);
+    }
+
+    /// The framed encoding keeps working through the primary, unchanged.
+    #[tokio::test]
+    async fn framed_sender_key_distribution_decodes_through_the_primary() {
+        use wacore::libsignal::protocol::KeyPair;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let framed = SenderKeyDistributionMessage::new(
+            SENDERKEY_MESSAGE_CURRENT_VERSION,
+            7,
+            0,
+            [0x11; 32],
+            signing.public_key,
+        )
+        .expect("distribution")
+        .into_serialized();
+
+        let decoded = decode_sender_key_distribution(&framed).expect("framed distribution");
+        assert_eq!(decoded.chain_id(), 7);
+        assert_eq!(decoded.signing_key(), &signing.public_key);
     }
 }

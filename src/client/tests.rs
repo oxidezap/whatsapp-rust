@@ -6398,4 +6398,61 @@ mod ensure_sessions_concurrency {
             "the overlapping batch must ask only for the address nobody claimed"
         );
     }
+
+    /// A leader that got an answer with no bundle for the device has asked the
+    /// question. Its waiters must not ask it again.
+    ///
+    /// Without this, coalescing would hold for the happy path and quietly give
+    /// way for exactly the device that is most expensive to keep asking about:
+    /// one the server has no prekeys for.
+    #[tokio::test]
+    async fn a_leader_that_found_no_bundle_is_not_re_fetched_by_its_waiters() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("555555555555555".to_string(), 0);
+
+        let leader = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let leader_id = pending_prekey_request(&transport, 0).await;
+
+        let waiter = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+
+        // A result the server did answer, carrying no user for this device.
+        let empty = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &leader_id)
+            .children([NodeBuilder::new("list").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &leader_id, &empty).await;
+
+        leader
+            .await
+            .expect("leader task")
+            .expect("an answered fetch with no bundle is not an error");
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("the waiter inherits the answered question");
+
+        assert_eq!(
+            prekey_requests(&transport).await,
+            1,
+            "a waiter must not re-ask a question its leader already got an answer to"
+        );
+    }
 }
