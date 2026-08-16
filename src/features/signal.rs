@@ -1320,20 +1320,15 @@ mod tests {
             .store(false, Ordering::Release);
     }
 
-    /// The fallback decoder must read the same bytes the primary does.
-    ///
-    /// It runs only when the primary refused, and it hands the raw buffer to a
-    /// protobuf decoder — so the version byte the primary skips has to be
-    /// skipped here too. Left in, it is parsed as a field tag and the fallback
-    /// can never rescue anything.
+    /// The fallback decoder recovers a distribution the primary refused.
     #[tokio::test]
     async fn sender_key_distribution_fallback_reads_past_the_version_byte() {
         use wacore::libsignal::protocol::KeyPair;
 
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let signing = KeyPair::generate(&mut rng);
-        // A version the primary does not recognize is the reachable way into
-        // the fallback: the body is well-formed, only the envelope is not.
+        // An unrecognized version is the reachable way into the fallback: the
+        // body is well-formed, only the envelope is not.
         let serialized = SenderKeyDistributionMessage::new(9, 7, 0, [0x11; 32], signing.public_key)
             .expect("distribution")
             .into_serialized();
@@ -1347,5 +1342,10 @@ mod tests {
             .expect("the fallback must recover a well-formed body");
         assert_eq!(decoded.chain_id(), 7);
         assert_eq!(decoded.chain_key(), &[0x11u8; 32]);
+        assert_eq!(
+            decoded.signing_key(),
+            &signing.public_key,
+            "the type-prefixed signing key must survive the fallback intact"
+        );
     }
 }

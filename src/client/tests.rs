@@ -6114,9 +6114,12 @@ mod ensure_sessions_concurrency {
         let mut next_frame = 0usize;
         let mut served = 0usize;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while done.load(Ordering::Acquire) < CONCURRENT_CALLS
-            && tokio::time::Instant::now() < deadline
-        {
+        let mut timed_out = false;
+        while done.load(Ordering::Acquire) < CONCURRENT_CALLS {
+            if tokio::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
             if transport.sent().len() <= next_frame {
                 tokio::task::yield_now().await;
                 continue;
@@ -6138,8 +6141,17 @@ mod ensure_sessions_concurrency {
             crate::test_utils::answer_iq(client, &request_id, &response).await;
         }
 
+        // Reported before the results are checked: a timeout would otherwise
+        // surface as a fetch count of zero, which reads like a coalescing
+        // regression rather than a hang.
+        assert!(
+            !timed_out,
+            "the ensures did not finish in time; served {served} prekey fetch(es)"
+        );
         for task in tasks {
-            task.await.expect("ensure task should not panic").ok();
+            task.await
+                .expect("ensure task should not panic")
+                .expect("every ensure must succeed once the bundle arrives");
         }
         served
     }

@@ -484,18 +484,31 @@ impl Client {
 impl Client {
     /// Core session-check + prekey-fetch logic shared by both entry points.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.ensure_inner", level = "debug", skip_all, fields(count = jids.len()), err(Debug)))]
-    async fn ensure_sessions_inner(&self, jids: Vec<Jid>) -> Result<()> {
-        // Two passes at most. The first claims what it can and defers the rest;
-        // the second exists only for addresses whose leader finished without
-        // establishing a session (it failed, or it was cancelled), which then
-        // have nobody in flight and must not be silently reported as ensured.
-        // A leader that succeeded leaves a session behind, so its waiters drop
-        // out at the pass-two probe and no second fetch goes out.
-        let deferred = self.ensure_sessions_pass(jids).await?;
-        if deferred.is_empty() {
-            return Ok(());
+    async fn ensure_sessions_inner(&self, mut jids: Vec<Jid>) -> Result<()> {
+        // A pass returns the addresses it left to someone else's in-flight
+        // ensure. A leader that succeeded leaves a session behind, so its
+        // waiters drop out at the next pass's probe without fetching; only a
+        // leader that ended without one sends its waiters back around.
+        //
+        // Bounded, because an address a fresh caller keeps re-claiming would
+        // otherwise loop here for as long as the contention lasts. Exhausting
+        // the bound leaves the address unkeyed, which the fan-out already has
+        // to handle (a bundle can come back empty), so it is logged rather than
+        // raised.
+        const ENSURE_PASSES: usize = 3;
+
+        for _ in 0..ENSURE_PASSES {
+            jids = self.ensure_sessions_pass(jids).await?;
+            if jids.is_empty() {
+                return Ok(());
+            }
         }
-        self.ensure_sessions_pass(deferred).await?;
+
+        log::debug!(
+            "ensure sessions: {} address(es) still claimed by another ensure after \
+             {ENSURE_PASSES} passes; leaving them unkeyed",
+            jids.len()
+        );
         Ok(())
     }
 
