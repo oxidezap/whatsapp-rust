@@ -14880,7 +14880,7 @@ async fn undecryptable_events_are_per_sender_not_per_id() {
             info_for("111111111111111@lid"),
             false,
             crate::types::events::UnavailableType::Unknown,
-            crate::types::events::DecryptFailMode::Show,
+            DecryptFailMode::Show,
         )
         .await;
     let second = client
@@ -14888,7 +14888,7 @@ async fn undecryptable_events_are_per_sender_not_per_id() {
             info_for("222222222222222@lid"),
             false,
             crate::types::events::UnavailableType::Unknown,
-            crate::types::events::DecryptFailMode::Show,
+            DecryptFailMode::Show,
         )
         .await;
     let repeat = client
@@ -14896,7 +14896,7 @@ async fn undecryptable_events_are_per_sender_not_per_id() {
             info_for("111111111111111@lid"),
             false,
             crate::types::events::UnavailableType::Unknown,
-            crate::types::events::DecryptFailMode::Show,
+            DecryptFailMode::Show,
         )
         .await;
 

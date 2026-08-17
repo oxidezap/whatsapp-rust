@@ -147,8 +147,14 @@ impl Client {
         unavailable_type: crate::types::events::UnavailableType,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) -> bool {
-        let dedup_key =
-            wacore::types::message::ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+        // Keyed by sender as well as id: an id is the sending client's to
+        // choose, and one that two participants happen to share names two
+        // messages, not one. See `SenderMessageId`.
+        let dedup_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
         // The init future only runs for the winning caller. Others receive
         // the cached `()` and leave the flag as false.
         let fresh = Arc::new(std::sync::atomic::AtomicBool::new(false));

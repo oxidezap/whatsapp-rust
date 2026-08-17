@@ -1382,7 +1382,7 @@ pub struct Client {
     /// failed id re-enters the failure path and would otherwise fire a
     /// duplicate event. Mirrors WA Web's DB-level placeholder uniqueness
     /// in `WAWebMessageProcessPlaceholder`.
-    pub(crate) undecryptable_dispatched: Cache<ChatMessageId, ()>,
+    pub(crate) undecryptable_dispatched: Cache<wacore::types::message::SenderMessageId, ()>,
 
     pub enable_auto_reconnect: Arc<AtomicBool>,
     /// Set by [`Client::pause`] and cleared by [`Client::resume`]: the run loop

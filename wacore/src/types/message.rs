@@ -18,6 +18,26 @@ impl ChatMessageId {
     }
 }
 
+/// Identifies a message *and who sent it*.
+///
+/// Message ids come from the sending client and are not unique across senders,
+/// so `(chat, id)` names a message only when the sender is already known from
+/// context. WA Web says the same in `MsgKey`, which serializes as
+/// `[fromMe, remote, id, participant]`: two participants of one group using the
+/// same id are two messages, and folding them into one drops the second.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SenderMessageId {
+    pub chat: Jid,
+    pub id: MessageId,
+    pub sender: Jid,
+}
+
+impl SenderMessageId {
+    pub fn new(chat: Jid, id: MessageId, sender: Jid) -> Self {
+        Self { chat, id, sender }
+    }
+}
+
 /// Addressing mode for a group (phone number vs LID).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum AddressingMode {
