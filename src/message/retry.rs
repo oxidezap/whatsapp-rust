@@ -155,18 +155,6 @@ impl Client {
         // Keyed by sender as well as id: an id is the sending client's to
         // choose, and one that two participants happen to share names two
         // messages, not one. See `SenderMessageId`.
-        // Resolved to the encryption namespace first, as the retry key is: the
-        // wire sender is whatever the stanza said, and a redelivery after a
-        // PN/LID migration spells the same participant the other way.
-        //
-        // The `:device` stays. Two devices of one user are two senders, and the
-        // retry key draws the line in the same place.
-        let (chat, sender) = futures::join!(
-            self.resolve_encryption_jid(&info.source.chat),
-            self.resolve_encryption_jid(&info.source.sender),
-        );
-        let dedup_key = wacore::types::message::SenderMessageId::new(chat, info.id.clone(), sender);
-
         // Keyed on the wire spelling, deliberately unresolved.
         //
         // Resolving the sender to its encryption namespace looks like the

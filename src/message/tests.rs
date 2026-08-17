@@ -14902,27 +14902,6 @@ async fn undecryptable_events_are_per_sender_not_per_id() {
     );
 }
 
-/// The same participant spelled two ways is still one message.
-///
-/// `MessageSource::sender` is whatever the stanza said, and a redelivery after
-/// a PN/LID migration spells the same participant the other way. Dispatching
-/// again for it would break the once-per-message contract just as surely as
-
-/// The mapping can be learned between the two deliveries, and the message is
-/// still one message.
-///
-/// This is the transition the preloaded-mapping test cannot reach: the first
-/// delivery keys under the PN because nothing maps it yet, and the resend
-/// teaches us the LID — `receive.rs` updates the cache before dispatch — so a
-/// key derived only from the resolved sender would move and dispatch twice for
-
-/// The resend can also arrive under the *other* spelling, which is the
-/// direction the alternate-namespace probe exists for.
-///
-/// First delivery as PN with no mapping keys under the PN. The resend arrives
-/// as LID with `participant_pn`, so `receive.rs` learns the mapping and the LID
-/// is already canonical — the wire and resolved spellings match, and only a
-
 /// The accepted cost of an unresolved key: a redelivery that switches
 /// namespace mid-flight is seen as a second message.
 ///
