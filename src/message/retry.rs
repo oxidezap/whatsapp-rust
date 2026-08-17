@@ -155,11 +155,19 @@ impl Client {
         // Keyed by sender as well as id: an id is the sending client's to
         // choose, and one that two participants happen to share names two
         // messages, not one. See `SenderMessageId`.
-        let dedup_key = wacore::types::message::SenderMessageId::new(
-            info.source.chat.clone(),
-            info.id.clone(),
-            info.source.sender.clone(),
+        // Resolved to the encryption namespace first, as the retry key is: the
+        // wire sender is whatever the stanza said, and a redelivery after a
+        // PN/LID migration spells the same participant the other way. Without
+        // this, that redelivery reads as a second message and dispatches a
+        // second placeholder for one.
+        //
+        // The `:device` stays. Two devices of one user are two senders, and the
+        // retry key draws the line in the same place.
+        let (chat, sender) = futures::join!(
+            self.resolve_encryption_jid(&info.source.chat),
+            self.resolve_encryption_jid(&info.source.sender),
         );
+        let dedup_key = wacore::types::message::SenderMessageId::new(chat, info.id.clone(), sender);
         // The init future only runs for the winning caller. Others receive
         // the cached `()` and leave the flag as false.
         let fresh = Arc::new(std::sync::atomic::AtomicBool::new(false));

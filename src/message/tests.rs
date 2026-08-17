@@ -14901,3 +14901,60 @@ async fn undecryptable_events_are_per_sender_not_per_id() {
         "the same sender redelivering the same id is still a duplicate"
     );
 }
+
+/// The same participant spelled two ways is still one message.
+///
+/// `MessageSource::sender` is whatever the stanza said, and a redelivery after
+/// a PN/LID migration spells the same participant the other way. Dispatching
+/// again for it would break the once-per-message contract just as surely as
+/// folding two senders into one breaks the other half.
+#[tokio::test]
+async fn a_redelivery_under_the_other_namespace_is_not_a_new_message() {
+    let client = crate::test_utils::create_test_client().await;
+    let chat: Jid = "120363000000000002@g.us".parse().expect("group jid");
+    let pn: Jid = "15550001234@s.whatsapp.net".parse().expect("pn jid");
+    let lid: Jid = "444444444444444@lid".parse().expect("lid jid");
+
+    let entry = crate::lid_pn_cache::LidPnEntry::new(
+        lid.user.to_string(),
+        pn.user.to_string(),
+        crate::lid_pn_cache::LearningSource::PeerLidMessage,
+    );
+    client.lid_pn_cache.add(&entry).await;
+
+    let info_for = |sender: Jid| {
+        Arc::new(MessageInfo {
+            id: "3EB0NAMESPACE001".into(),
+            source: crate::types::message::MessageSource {
+                sender,
+                chat: chat.clone(),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+
+    let first = client
+        .dispatch_undecryptable_event(
+            info_for(pn),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+    let redelivered = client
+        .dispatch_undecryptable_event(
+            info_for(lid),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+
+    assert!(first, "the first delivery is dispatched");
+    assert!(
+        !redelivered,
+        "the same participant under the other namespace is the same message"
+    );
+}
