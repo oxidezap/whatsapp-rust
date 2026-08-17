@@ -146,19 +146,28 @@ impl Client {
         };
         let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reserved_clone = reserved.clone();
-        self.pdo_pending_requests
+        let holder = self
+            .pdo_pending_requests
             .get_with(cache_key.clone(), async move {
                 reserved_clone.store(true, std::sync::atomic::Ordering::Release);
                 pending
             })
             .await;
         if !reserved.load(std::sync::atomic::Ordering::Acquire) {
+            // Only when the slot belongs to a *different* sender. The gate
+            // cache has its own 512-entry capacity, so a burst can evict this
+            // sender's gate while its own request is still pending; a
+            // redelivery then recreates the gate, finds its own entry here,
+            // and removing it would let a later redelivery send a second
+            // request for a message that already has one out.
+            if holder.message_info.source.sender != info.source.sender {
+                self.pdo_requested.remove(&gate_key).await;
+            }
             // Another sender's request for this `(chat, id)` is in flight.
             // Nothing was sent for this one, so it must not keep the slot it
             // claimed: holding it would suppress this sender for the gate's
             // whole lifetime once that request is answered and the pending
             // entry clears.
-            self.pdo_requested.remove(&gate_key).await;
             debug!(
                 "PDO request already pending for message {} from {}",
                 info.id,
@@ -378,6 +387,7 @@ impl Client {
         let remote_jid_str = key.remote_jid.as_deref().unwrap_or("");
         let msg_id = key.id.as_deref().unwrap_or("");
         let response_participant = key.participant.as_deref().map(str::to_owned);
+        let response_from_me = key.from_me.unwrap_or(false);
 
         let cache_key = match remote_jid_str.parse::<Jid>() {
             Ok(jid) => ChatMessageId::new(jid, msg_id.to_owned()),
@@ -405,9 +415,11 @@ impl Client {
         // who sent what and is the same path a missing entry already takes.
         let pending = pending.filter(|entry| {
             let Some(participant) = response_participant.as_deref() else {
-                // Absent for a DM, where the chat names the sender and the key
-                // already agrees.
-                return true;
+                // Legitimately absent for a DM and for anything `from_me`, so
+                // the only thing left to agree on is the direction. An incoming
+                // and an outgoing message of one DM can share an id, and both
+                // their responses omit the participant.
+                return response_from_me == entry.message_info.source.is_from_me;
             };
             let Ok(participant) = participant.parse::<Jid>() else {
                 return false;
@@ -1189,6 +1201,84 @@ mod tests {
             dispatched[0].1,
             Some(wacore::types::message::AddressingMode::Lid),
             "keeping the entry keeps the addressing mode the delivery carried"
+        );
+    }
+
+    /// Two directions of one DM can share an id, and both their responses omit
+    /// the participant — so direction is the only thing left to agree on.
+    #[tokio::test]
+    async fn a_participant_less_response_checks_the_direction() {
+        use buffa::Message as _;
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::{ChatMessageId, MessageInfo, MessageSource};
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+
+        let peer = "5511999998888@s.whatsapp.net";
+        let msg_id = "PDO_DIRECTION";
+        let key = ChatMessageId::new(peer.parse().expect("chat jid"), msg_id.to_owned());
+
+        // The slot holds the outgoing half of the conversation.
+        let outgoing = MessageInfo {
+            id: msg_id.to_owned(),
+            source: MessageSource {
+                chat: peer.parse().expect("chat jid"),
+                sender: peer.parse().expect("chat jid"),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        client
+            .pdo_pending_requests
+            .insert(
+                key,
+                super::PendingPdoRequest {
+                    message_info: std::sync::Arc::new(outgoing),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        // The response answers the incoming one, and omits the participant too.
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(peer.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.to_owned()),
+                participant: None,
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
+        };
+
+        client
+            .handle_placeholder_resend_response(&response, "req-direction")
+            .await;
+
+        let from_me: Vec<bool> = {
+            let mut seen = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                for m in event.messages().filter(|m| m.info.id == msg_id) {
+                    seen.push(m.info.source.is_from_me);
+                }
+            }
+            seen
+        };
+        assert_eq!(from_me.len(), 1, "the response is dispatched");
+        assert!(
+            !from_me[0],
+            "the response is for the incoming message; the outgoing entry in \
+             the slot must not relabel it as ours"
         );
     }
 
