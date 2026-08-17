@@ -15019,3 +15019,61 @@ async fn learning_the_mapping_between_deliveries_does_not_redispatch() {
         "learning the mapping must not turn a resend into a second message"
     );
 }
+
+/// The resend can also arrive under the *other* spelling, which is the
+/// direction the alternate-namespace probe exists for.
+///
+/// First delivery as PN with no mapping keys under the PN. The resend arrives
+/// as LID with `participant_pn`, so `receive.rs` learns the mapping and the LID
+/// is already canonical — the wire and resolved spellings match, and only a
+/// probe of the *other* namespace finds what the first delivery stored.
+#[tokio::test]
+async fn a_resend_arriving_as_lid_finds_what_the_pn_delivery_stored() {
+    let client = crate::test_utils::create_test_client().await;
+    let chat: Jid = "120363000000000004@g.us".parse().expect("group jid");
+    let pn: Jid = "15550005555@s.whatsapp.net".parse().expect("pn jid");
+    let lid: Jid = "666666666666666@lid".parse().expect("lid jid");
+
+    let info_for = |sender: Jid| {
+        Arc::new(MessageInfo {
+            id: "3EB0REVERSE0001".into(),
+            source: crate::types::message::MessageSource {
+                sender,
+                chat: chat.clone(),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+
+    let first = client
+        .dispatch_undecryptable_event(
+            info_for(pn.clone()),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+    assert!(first, "the first delivery is dispatched");
+
+    let entry = crate::lid_pn_cache::LidPnEntry::new(
+        lid.user.to_string(),
+        pn.user.to_string(),
+        crate::lid_pn_cache::LearningSource::PeerLidMessage,
+    );
+    client.lid_pn_cache.add(&entry).await;
+
+    let resend = client
+        .dispatch_undecryptable_event(
+            info_for(lid),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+    assert!(
+        !resend,
+        "a resend under the other spelling is the same message"
+    );
+}

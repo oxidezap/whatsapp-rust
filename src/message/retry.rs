@@ -167,21 +167,27 @@ impl Client {
         );
         let dedup_key = wacore::types::message::SenderMessageId::new(chat, info.id.clone(), sender);
 
-        // Resolution is not stable over time: the first delivery can arrive
-        // before the LID mapping is known and key under the PN, and the resend
-        // can teach us the mapping — `receive.rs` updates the cache before
-        // dispatch — so the same message would resolve to a LID key and be
-        // dispatched twice. Remember the wire spelling alongside the resolved
-        // one, and treat a hit on either as the message already seen.
-        let wire_key = wacore::types::message::SenderMessageId::new(
-            info.source.chat.clone(),
-            info.id.clone(),
-            info.source.sender.clone(),
-        );
-        let aliased = wire_key != dedup_key;
-        if aliased && self.undecryptable_dispatched.get(&wire_key).await.is_some() {
+        // Resolution is not stable over time, and it moves in both directions.
+        // A first delivery can arrive as PN before any mapping exists and key
+        // under the PN; the resend can then arrive as PN with the mapping now
+        // known (resolving to LID), or arrive as LID directly — `receive.rs`
+        // updates the cache before dispatch either way. Both spellings have to
+        // count as the same message, so probe the other namespace, not merely
+        // the wire spelling: when the sender is already canonical the two are
+        // equal and comparing them would find nothing.
+        let alias = self.swap_pn_lid_namespace(&dedup_key.sender).await;
+        let alias_key = alias.map(|sender| {
+            wacore::types::message::SenderMessageId::new(
+                dedup_key.chat.clone(),
+                info.id.clone(),
+                sender,
+            )
+        });
+        if let Some(alias_key) = &alias_key
+            && self.undecryptable_dispatched.get(alias_key).await.is_some()
+        {
             log::debug!(
-                "[msg:{}] UndecryptableMessage already dispatched under the wire spelling; skipping duplicate event",
+                "[msg:{}] UndecryptableMessage already dispatched under the other namespace; skipping duplicate event",
                 info.id
             );
             return false;
@@ -197,9 +203,10 @@ impl Client {
             })
             .await;
         let was_fresh = fresh.load(Ordering::Acquire);
-        if was_fresh && aliased {
-            // So a later delivery that resolves the other way still finds it.
-            self.undecryptable_dispatched.insert(wire_key, ()).await;
+        if was_fresh && let Some(alias_key) = alias_key {
+            // Recorded under both spellings, so a later delivery finds it
+            // whichever way the sender is written by then.
+            self.undecryptable_dispatched.insert(alias_key, ()).await;
         }
         if was_fresh {
             wacore::telemetry::recv("undecryptable");
