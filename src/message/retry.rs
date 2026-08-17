@@ -167,31 +167,28 @@ impl Client {
         );
         let dedup_key = wacore::types::message::SenderMessageId::new(chat, info.id.clone(), sender);
 
-        // Resolution is not stable over time, and it moves in both directions.
-        // A first delivery can arrive as PN before any mapping exists and key
-        // under the PN; the resend can then arrive as PN with the mapping now
-        // known (resolving to LID), or arrive as LID directly — `receive.rs`
-        // updates the cache before dispatch either way. Both spellings have to
-        // count as the same message, so probe the other namespace, not merely
-        // the wire spelling: when the sender is already canonical the two are
-        // equal and comparing them would find nothing.
-        let alias = self.swap_pn_lid_namespace(&dedup_key.sender).await;
-        let alias_key = alias.map(|sender| {
-            wacore::types::message::SenderMessageId::new(
-                dedup_key.chat.clone(),
-                info.id.clone(),
-                sender,
-            )
-        });
-        if let Some(alias_key) = &alias_key
-            && self.undecryptable_dispatched.get(alias_key).await.is_some()
-        {
-            log::debug!(
-                "[msg:{}] UndecryptableMessage already dispatched under the other namespace; skipping duplicate event",
-                info.id
-            );
-            return false;
-        }
+        // Keyed on the wire spelling, deliberately unresolved.
+        //
+        // Resolving the sender to its encryption namespace looks like the
+        // careful thing to do, and it is a trap: the resolution depends on a
+        // LID mapping that is learned at runtime, so the key moves when the
+        // mapping appears. Chasing that with a second alias key spawns a
+        // problem per direction it can move — the chat migrates too in a 1:1,
+        // hosted namespaces are outside `swap_pn_lid_namespace`, two keys
+        // cannot be claimed under one atomic reservation, and every entry
+        // costs two slots of a bounded cache.
+        //
+        // So this key does not move at all, at a cost stated plainly: a
+        // redelivery that switches namespace mid-flight dispatches a second
+        // `UndecryptableMessage` for one message. That is the lesser harm.
+        // A duplicate placeholder is visible and recoverable; the alternative
+        // this replaced — one sender's message swallowing another's because
+        // they share an id — loses a message with nothing to say so.
+        let dedup_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
 
         // The init future only runs for the winning caller. Others receive
         // the cached `()` and leave the flag as false.
@@ -203,11 +200,6 @@ impl Client {
             })
             .await;
         let was_fresh = fresh.load(Ordering::Acquire);
-        if was_fresh && let Some(alias_key) = alias_key {
-            // Recorded under both spellings, so a later delivery finds it
-            // whichever way the sender is written by then.
-            self.undecryptable_dispatched.insert(alias_key, ()).await;
-        }
         if was_fresh {
             wacore::telemetry::recv("undecryptable");
             self.core.event_bus.dispatch(Event::UndecryptableMessage(
