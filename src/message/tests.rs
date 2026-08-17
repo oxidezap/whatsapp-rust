@@ -14843,3 +14843,70 @@ fn a_local_key_agreement_failure_is_not_the_peers() {
         EncDecryptFailureReason::LocalCryptoFailure,
     );
 }
+
+/// Two senders in one group can use the same message id, and each of their
+/// messages is its own message.
+///
+/// WA Web identifies a message by `MsgKey`, which serializes as
+/// `[fromMe, remote, id, participant]` (`WAWeb/Msg/Key.js`), so the participant
+/// is part of what makes a message that message. Keying only on `(chat, id)`
+/// silently drops the second sender's event: the consumer never learns the
+/// message arrived, and no placeholder is requested for it.
+///
+/// Not hypothetical — a production log has one sender reusing a single id
+/// across seventeen distinct messages, so ids are not unique in the wild.
+#[tokio::test]
+async fn undecryptable_events_are_per_sender_not_per_id() {
+    let client = crate::test_utils::create_test_client().await;
+    let chat: Jid = "120363000000000001@g.us".parse().expect("group jid");
+    let shared_id = "3EB0SHAREDID0001";
+
+    let info_for = |sender: &str| {
+        let sender: Jid = sender.parse().expect("sender jid");
+        Arc::new(MessageInfo {
+            id: shared_id.into(),
+            source: crate::types::message::MessageSource {
+                sender,
+                chat: chat.clone(),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+
+    let first = client
+        .dispatch_undecryptable_event(
+            info_for("111111111111111@lid"),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            crate::types::events::DecryptFailMode::Show,
+        )
+        .await;
+    let second = client
+        .dispatch_undecryptable_event(
+            info_for("222222222222222@lid"),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            crate::types::events::DecryptFailMode::Show,
+        )
+        .await;
+    let repeat = client
+        .dispatch_undecryptable_event(
+            info_for("111111111111111@lid"),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            crate::types::events::DecryptFailMode::Show,
+        )
+        .await;
+
+    assert!(first, "the first sender's message is dispatched");
+    assert!(
+        second,
+        "a different sender reusing the id is a different message, not a duplicate"
+    );
+    assert!(
+        !repeat,
+        "the same sender redelivering the same id is still a duplicate"
+    );
+}
