@@ -71,9 +71,11 @@ impl Client {
     /// promise — that a stanza's events all come from its receive task.
     ///
     /// Deliberately *not* deduplicated: `UndecryptableMessage` is single-flight
-    /// per `(chat, id)` because a UI must not show two placeholders for one
+    /// per [`SenderMessageId`] because a UI must not show two placeholders for one
     /// message, and that is exactly what makes it silent on the second delivery
     /// of a stanza that keeps failing. This one reports each delivery.
+    ///
+    /// [`SenderMessageId`]: wacore::types::message::SenderMessageId
     pub(crate) fn report_enc_decrypt_failure(
         &self,
         info: &Arc<MessageInfo>,
@@ -131,11 +133,14 @@ impl Client {
         ));
     }
 
-    /// Dispatch an `UndecryptableMessage` event at most once per `(chat, id)`
-    /// via the single-flight `get_with` semantic on `undecryptable_dispatched`.
+    /// Dispatch an `UndecryptableMessage` event at most once per
+    /// [`SenderMessageId`] via the single-flight `get_with` semantic on
+    /// `undecryptable_dispatched`.
     /// The atomic arm avoids the get-then-insert race where two concurrent
     /// callers would both dispatch. Mirrors WA Web's DB-level placeholder
     /// uniqueness in `WAWebMessageProcessPlaceholder`.
+    ///
+    /// [`SenderMessageId`]: wacore::types::message::SenderMessageId
     ///
     /// Returns `true` if this call dispatched the event, `false` if a
     /// previous call already did.

@@ -14845,16 +14845,7 @@ fn a_local_key_agreement_failure_is_not_the_peers() {
 }
 
 /// Two senders in one group can use the same message id, and each of their
-/// messages is its own message.
-///
-/// WA Web identifies a message by `MsgKey`, which serializes as
-/// `[fromMe, remote, id, participant]` (`WAWeb/Msg/Key.js`), so the participant
-/// is part of what makes a message that message. Keying only on `(chat, id)`
-/// silently drops the second sender's event: the consumer never learns the
-/// message arrived, and no placeholder is requested for it.
-///
-/// Not hypothetical — a production log has one sender reusing a single id
-/// across seventeen distinct messages, so ids are not unique in the wild.
+/// messages is its own message. See `SenderMessageId` for why.
 #[tokio::test]
 async fn undecryptable_events_are_per_sender_not_per_id() {
     let client = crate::test_utils::create_test_client().await;
