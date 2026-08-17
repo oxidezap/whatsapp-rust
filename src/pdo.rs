@@ -838,6 +838,59 @@ mod tests {
         );
     }
 
+    /// The once-per-message gate is per sender, because a message id belongs to
+    /// the sending client and two participants can pick the same one.
+    ///
+    /// Measured, not hypothetical: in a 14-hour production log, 2 of 851
+    /// `(chat, id)` pairs carried messages from two different participants.
+    /// Gating on `(chat, id)` alone means the second one never gets a
+    /// placeholder requested for it at all.
+    #[tokio::test]
+    async fn the_pdo_gate_lets_a_second_sender_ask_for_its_own_message() {
+        use wacore::types::message::SenderMessageId;
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+
+        let first = make_group_message_info(
+            "120363000000000001@g.us",
+            "203040904720543@lid",
+            "PDO_SHARED_ID",
+        );
+        let second = make_group_message_info(
+            "120363000000000001@g.us",
+            "111222333444555@lid",
+            "PDO_SHARED_ID",
+        );
+
+        // The first sender's request is already on record.
+        let first_key = SenderMessageId::new(
+            first.source.chat.clone(),
+            first.id.clone(),
+            first.source.sender.clone(),
+        );
+        client.pdo_requested.insert(first_key, ()).await;
+
+        // The second sender's message is a different message and must not be
+        // gated by it.
+        let second_key = SenderMessageId::new(
+            second.source.chat.clone(),
+            second.id.clone(),
+            second.source.sender.clone(),
+        );
+        assert!(
+            client.pdo_requested.get(&second_key).await.is_none(),
+            "the second sender starts ungated"
+        );
+
+        let _ = client.send_pdo_placeholder_resend_request(&second).await;
+
+        assert!(
+            client.pdo_requested.get(&second_key).await.is_some(),
+            "the second sender must claim its own once-per-message slot"
+        );
+    }
+
     /// A transient send failure must release the once-per-message slot, or
     /// one bad send would permanently block recovery for that message.
     #[tokio::test]
