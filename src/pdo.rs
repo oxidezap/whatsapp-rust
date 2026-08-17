@@ -377,6 +377,7 @@ impl Client {
         };
         let remote_jid_str = key.remote_jid.as_deref().unwrap_or("");
         let msg_id = key.id.as_deref().unwrap_or("");
+        let response_participant = key.participant.as_deref().map(str::to_owned);
 
         let cache_key = match remote_jid_str.parse::<Jid>() {
             Ok(jid) => ChatMessageId::new(jid, msg_id.to_owned()),
@@ -390,6 +391,24 @@ impl Client {
         };
 
         let pending = self.pdo_pending_requests.remove(&cache_key).await;
+
+        // The pending map is keyed by `(chat, id)`, which does not name a
+        // sender, and the slot expires and can be evicted while a request is
+        // still in flight. So the entry found here is not necessarily the one
+        // this response answers: another participant sharing the id may have
+        // reserved the key in between. Trusting it then would dispatch this
+        // sender's recovered content under the other's identity.
+        //
+        // Only keep it when the response names the same author. On anything
+        // else — a different author, or a spelling this cannot match — fall
+        // through to rebuilding from the response, which is the authority on
+        // who sent what and is the same path a missing entry already takes.
+        let pending = pending.filter(|entry| match response_participant.as_deref() {
+            Some(participant) => entry.message_info.source.sender.to_string() == participant,
+            // Absent for a DM, where the chat names the sender and the key
+            // already agrees.
+            None => true,
+        });
 
         let elapsed = pending
             .as_ref()
@@ -989,6 +1008,84 @@ mod tests {
         assert!(
             client.pdo_requested.get(&second_gate).await.is_none(),
             "a sender that sent nothing must not hold its once-per-message slot"
+        );
+    }
+
+    /// A pending entry that belongs to another sender must not be used to
+    /// attribute this response.
+    ///
+    /// The pending map is keyed by `(chat, id)` and its slot expires and can be
+    /// evicted, so the entry present when a response lands is not necessarily
+    /// the one it answers. Adopting it anyway would dispatch one sender's
+    /// recovered content under the other's identity — worse than the missing
+    /// placeholder this change set out to fix.
+    #[tokio::test]
+    async fn a_response_does_not_adopt_another_senders_pending_entry() {
+        use buffa::Message as _;
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+
+        let chat = "120363000000000001@g.us";
+        let msg_id = "PDO_ATTRIBUTION";
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+
+        // Whoever holds the slot when the response lands is not who it answers.
+        client
+            .pdo_pending_requests
+            .insert(
+                key.clone(),
+                super::PendingPdoRequest {
+                    message_info: make_group_message_info(chat, "203040904720543@lid", msg_id),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.to_owned()),
+                participant: Some("111222333444555@lid".to_owned()),
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
+        };
+
+        client
+            .handle_placeholder_resend_response(&response, "req-attr")
+            .await;
+
+        assert!(
+            client.pdo_pending_requests.get(&key).await.is_none(),
+            "the response still consumes the slot it found"
+        );
+
+        let senders: Vec<String> = {
+            let mut senders = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                for m in event.messages().filter(|m| m.info.id == msg_id) {
+                    senders.push(m.info.source.sender.to_string());
+                }
+            }
+            senders
+        };
+        assert_eq!(
+            senders,
+            vec!["111222333444555@lid".to_string()],
+            "the response names its own author; a stale pending entry must not \
+             relabel the recovered content as the other sender"
         );
     }
 
