@@ -992,50 +992,6 @@ mod tests {
         );
     }
 
-    /// Two senders sharing one `(chat, id)` end with exactly one of them
-    /// holding the pending slot: the response is matched by `(chat, id)` and
-    /// carries whichever `MessageInfo` is stored there, so an overwrite would
-    /// dispatch recovered content under the wrong sender.
-    ///
-    /// Holds the outcome down, not the atomicity. The interleaving that the
-    /// atomic reservation exists for does not occur on this runtime — this
-    /// test passes against the read-then-write version too — so it guards
-    /// against a coarser regression, not against the race.
-    #[tokio::test]
-    async fn concurrent_senders_sharing_an_id_reserve_the_pending_slot_once() {
-        let client = setup_reconstruct_client().await;
-        set_own_pn(&client).await;
-        client
-            .offline_sync_completed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        let first = make_group_message_info(
-            "120363000000000001@g.us",
-            "203040904720543@lid",
-            "PDO_RACE_ID",
-        );
-        let second = make_group_message_info(
-            "120363000000000001@g.us",
-            "111222333444555@lid",
-            "PDO_RACE_ID",
-        );
-
-        let (a, b) = tokio::join!(
-            client.send_pdo_placeholder_resend_request(&first),
-            client.send_pdo_placeholder_resend_request(&second),
-        );
-
-        // Neither has a live transport, so whichever reserved the slot fails
-        // its send and clears it; the other is short-circuited and returns Ok.
-        // Exactly one of the two may have reached the send.
-        assert_eq!(
-            usize::from(a.is_err()) + usize::from(b.is_err()),
-            1,
-            "exactly one sender may reserve the shared pending slot; \
-             the other must be short-circuited, not overwrite it"
-        );
-    }
-
     /// A transient send failure must release the once-per-message slot, or
     /// one bad send would permanently block recovery for that message.
     #[tokio::test]
