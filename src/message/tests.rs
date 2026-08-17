@@ -7999,7 +7999,7 @@ async fn skdm_processing_waits_for_sender_key_lock() {
         async move {
             started.wait().await;
             client
-                .handle_sender_key_distribution_message(&group, &sender, &bytes)
+                .handle_sender_key_distribution_message(&group, &sender, "3EB0TESTMSGID001", &bytes)
                 .await;
         }
     });
@@ -8043,7 +8043,7 @@ async fn public_group_decrypt_waits_for_sender_key_lock() {
         .axolotl_sender_key_distribution_message
         .expect("SKDM bytes");
     client
-        .handle_sender_key_distribution_message(&group, &alice.jid, &skdm_bytes)
+        .handle_sender_key_distribution_message(&group, &alice.jid, "3EB0TESTMSGID002", &skdm_bytes)
         .await;
 
     let plaintext = b"serialized group decrypt".to_vec();

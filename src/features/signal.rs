@@ -79,6 +79,20 @@ impl SignalSessionMigration {
     }
 }
 
+/// Fewest bytes either accepted sender-key distribution encoding can occupy.
+///
+/// Rejecting under it changes no outcome, only the message: the framed decoder
+/// wants a version byte plus a type-prefixed 33-byte key on top of the same
+/// fields, so it needs more than this, and the unframed one needs exactly this.
+///
+/// Both carry the same four protobuf fields and the unframed one is the
+/// shorter: `id` and `iteration` are two bytes each at their smallest, the
+/// 32-byte `chain_key` is 34 with its tag and length, and `signing_key` is a
+/// bare 32-byte key on that path, so 34 as well. A payload under this floor is
+/// not a distribution either decoder could have read, whatever the two of them
+/// happen to say about it.
+const MIN_SENDER_KEY_DISTRIBUTION_LEN: usize = 2 + 2 + 34 + 34;
+
 /// Decode a sender-key distribution, tolerating the unframed encoding.
 ///
 /// The primary parser reads WhatsApp's framed form: a version byte, then the
@@ -90,6 +104,13 @@ impl SignalSessionMigration {
 fn decode_sender_key_distribution(
     bytes: &[u8],
 ) -> Result<SenderKeyDistributionMessage, SignalError> {
+    if bytes.len() < MIN_SENDER_KEY_DISTRIBUTION_LEN {
+        return Err(SignalError::InvalidInput(format!(
+            "sender-key distribution is {} bytes, under the {MIN_SENDER_KEY_DISTRIBUTION_LEN}-byte \
+             minimum any accepted encoding needs",
+            bytes.len()
+        )));
+    }
     match SenderKeyDistributionMessage::try_from(bytes) {
         Ok(message) => Ok(message),
         Err(primary_error) => {
@@ -1352,6 +1373,49 @@ mod tests {
         assert_eq!(decoded.chain_id(), 7);
         assert_eq!(decoded.chain_key(), &[0x11u8; 32]);
         assert_eq!(decoded.signing_key(), &signing.public_key);
+    }
+
+    /// The shortest byte string either accepted encoding can produce: the
+    /// unframed one, with both varint fields at their one-byte minimum. It is
+    /// what makes `MIN_SENDER_KEY_DISTRIBUTION_LEN` a floor rather than a
+    /// guess, so the guard can never reject a distribution the fallback would
+    /// otherwise have accepted.
+    fn shortest_unframed_distribution() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x08, 0x00]); // id = 0
+        bytes.extend_from_slice(&[0x10, 0x00]); // iteration = 0
+        bytes.extend_from_slice(&[0x1a, 0x20]); // chain_key, 32 bytes
+        bytes.extend_from_slice(&[7u8; 32]);
+        bytes.extend_from_slice(&[0x22, 0x20]); // signing_key, bare 32 bytes
+        bytes.extend_from_slice(&[9u8; 32]);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn shortest_accepted_distribution_sits_exactly_on_the_minimum() {
+        let bytes = shortest_unframed_distribution();
+        assert_eq!(bytes.len(), MIN_SENDER_KEY_DISTRIBUTION_LEN);
+
+        let decoded = decode_sender_key_distribution(&bytes).expect("shortest unframed encoding");
+        assert_eq!(decoded.chain_id(), 0);
+        assert_eq!(decoded.iteration(), 0);
+        assert_eq!(decoded.chain_key(), &[7u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn undersized_distribution_names_the_minimum_instead_of_two_parser_errors() {
+        // 64 bytes is what a live peer sends: below the floor, and below it by
+        // enough that no framing recovers it. The message has to say that, or
+        // the two decoders' incidental protobuf errors read as a parser bug.
+        let error = decode_sender_key_distribution(&[0xab; 64])
+            .expect_err("64 bytes cannot hold a distribution");
+        let text = error.to_string();
+        assert!(text.contains("64"), "{text}");
+        assert!(
+            text.contains(&MIN_SENDER_KEY_DISTRIBUTION_LEN.to_string()),
+            "{text}"
+        );
+        assert!(!text.contains("wire type"), "{text}");
     }
 
     /// The framed encoding keeps working through the primary, unchanged.

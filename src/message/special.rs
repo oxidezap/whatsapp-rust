@@ -367,6 +367,7 @@ impl Client {
         self: &Arc<Self>,
         group_jid: &Jid,
         sender_jid: &Jid,
+        message_id: &str,
         axolotl_bytes: &[u8],
     ) {
         if let Err(e) = self
@@ -374,8 +375,13 @@ impl Client {
             .process_sender_key_distribution_cached(group_jid, sender_jid, axolotl_bytes)
             .await
         {
-            log::error!(
-                "Failed to process SenderKeyDistributionMessage from {}: {:?}",
+            // What the sender put in the field, not a fault of ours, and WA Web
+            // logs it at WARN too. The message id is what separates one peer
+            // resending a bad stanza from a peer whose every stanza is bad, and
+            // a burst of redeliveries is the shape this arrives in.
+            log::warn!(
+                "[msg:{}] Failed to process SenderKeyDistributionMessage from {}: {:?}",
+                message_id,
                 sender_jid.observe(),
                 e
             );

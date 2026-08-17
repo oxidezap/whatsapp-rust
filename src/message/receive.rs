@@ -1774,6 +1774,7 @@ impl Client {
             self.handle_sender_key_distribution_message(
                 &info.source.chat,
                 &info.source.sender,
+                &info.id,
                 axolotl_bytes,
             )
             .await;
