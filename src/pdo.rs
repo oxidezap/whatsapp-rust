@@ -403,11 +403,30 @@ impl Client {
         // else — a different author, or a spelling this cannot match — fall
         // through to rebuilding from the response, which is the authority on
         // who sent what and is the same path a missing entry already takes.
-        let pending = pending.filter(|entry| match response_participant.as_deref() {
-            Some(participant) => entry.message_info.source.sender.to_string() == participant,
-            // Absent for a DM, where the chat names the sender and the key
-            // already agrees.
-            None => true,
+        let pending = pending.filter(|entry| {
+            let Some(participant) = response_participant.as_deref() else {
+                // Absent for a DM, where the chat names the sender and the key
+                // already agrees.
+                return true;
+            };
+            let Ok(participant) = participant.parse::<Jid>() else {
+                return false;
+            };
+            // Against both spellings the stanza gave us, not the raw string.
+            // A LID-addressed group stores the LID in `sender` and its PN in
+            // `sender_alt`, while the phone answers in PN, so comparing one
+            // spelling would reject every genuine entry and throw away the
+            // addressing mode, sender alias and stanza metadata with it.
+            //
+            // Both come from the delivery itself rather than from a mapping
+            // learned at runtime, so this comparison does not move under us.
+            let participant = participant.to_non_ad();
+            let source = &entry.message_info.source;
+            source.sender.to_non_ad() == participant
+                || source
+                    .sender_alt
+                    .as_ref()
+                    .is_some_and(|alt| alt.to_non_ad() == participant)
         });
 
         let elapsed = pending
@@ -1086,6 +1105,90 @@ mod tests {
             vec!["111222333444555@lid".to_string()],
             "the response names its own author; a stale pending entry must not \
              relabel the recovered content as the other sender"
+        );
+    }
+
+    /// The phone answers in PN while a LID-addressed group stored the LID, and
+    /// that is the same author — the entry must be kept.
+    ///
+    /// Comparing one spelling would reject every genuine entry from a LID
+    /// group and fall back to rebuilding, discarding the addressing mode,
+    /// the sender alias and the stanza metadata the original delivery carried.
+    #[tokio::test]
+    async fn a_pn_response_matches_the_lid_sender_it_was_requested_for() {
+        use buffa::Message as _;
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+
+        let chat = "120363000000000001@g.us";
+        let msg_id = "PDO_LID_ALIAS";
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+
+        // What a LID-addressed group delivery leaves behind: LID in `sender`,
+        // the PN the stanza carried in `sender_alt`.
+        let mut info = (*make_group_message_info(chat, "203040904720543@lid", msg_id)).clone();
+        info.source.sender_alt = Some("15550001234@s.whatsapp.net".parse().expect("pn"));
+        info.source.addressing_mode = Some(wacore::types::message::AddressingMode::Lid);
+        client
+            .pdo_pending_requests
+            .insert(
+                key,
+                super::PendingPdoRequest {
+                    message_info: std::sync::Arc::new(info),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.to_owned()),
+                // The phone answers in PN.
+                participant: Some("15550001234@s.whatsapp.net".to_owned()),
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
+        };
+
+        client
+            .handle_placeholder_resend_response(&response, "req-alias")
+            .await;
+
+        let dispatched: Vec<(String, Option<wacore::types::message::AddressingMode>)> = {
+            let mut seen = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                for m in event.messages().filter(|m| m.info.id == msg_id) {
+                    seen.push((
+                        m.info.source.sender.to_string(),
+                        m.info.source.addressing_mode,
+                    ));
+                }
+            }
+            seen
+        };
+        assert_eq!(dispatched.len(), 1, "the response is dispatched");
+        assert_eq!(
+            dispatched[0].0, "203040904720543@lid",
+            "the pending entry is the same author under its other spelling, so \
+             its record is kept rather than rebuilt from the response"
+        );
+        assert_eq!(
+            dispatched[0].1,
+            Some(wacore::types::message::AddressingMode::Lid),
+            "keeping the entry keeps the addressing mode the delivery carried"
         );
     }
 
