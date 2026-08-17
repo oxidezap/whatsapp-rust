@@ -133,12 +133,31 @@ impl Client {
             return Ok(());
         }
 
-        if self.pdo_pending_requests.get(&cache_key).await.is_some() {
-            // Nothing was sent for this sender, so it must not keep the slot.
-            // The pending map is shared by `(chat, id)`, so another sender's
-            // in-flight request lands here; holding the gate would suppress
-            // this one for the gate's whole lifetime once that request is
-            // answered and the pending entry clears.
+        // Reserved atomically, not read-then-written. Two senders sharing one
+        // `(chat, id)` hold distinct gates and arrive here concurrently, and a
+        // `get` followed by an `insert` would let both see the slot empty,
+        // both overwrite it, and both send. The response is removed by
+        // `(chat, id)` and carries whichever `MessageInfo` won the overwrite,
+        // so the recovered content would be dispatched under the other
+        // sender's identity.
+        let pending = PendingPdoRequest {
+            message_info: Arc::clone(info),
+            requested_at: wacore::time::Instant::now(),
+        };
+        let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reserved_clone = reserved.clone();
+        self.pdo_pending_requests
+            .get_with(cache_key.clone(), async move {
+                reserved_clone.store(true, std::sync::atomic::Ordering::Release);
+                pending
+            })
+            .await;
+        if !reserved.load(std::sync::atomic::Ordering::Acquire) {
+            // Another sender's request for this `(chat, id)` is in flight.
+            // Nothing was sent for this one, so it must not keep the slot it
+            // claimed: holding it would suppress this sender for the gate's
+            // whole lifetime once that request is answered and the pending
+            // entry clears.
             self.pdo_requested.remove(&gate_key).await;
             debug!(
                 "PDO request already pending for message {} from {}",
@@ -147,14 +166,6 @@ impl Client {
             );
             return Ok(());
         }
-
-        let pending = PendingPdoRequest {
-            message_info: Arc::clone(info),
-            requested_at: wacore::time::Instant::now(),
-        };
-        self.pdo_pending_requests
-            .insert(cache_key.clone(), pending)
-            .await;
 
         let message_key = wa::MessageKey {
             remote_jid: Some(resolved_jid.to_string()),
@@ -978,6 +989,50 @@ mod tests {
         assert!(
             client.pdo_requested.get(&second_gate).await.is_none(),
             "a sender that sent nothing must not hold its once-per-message slot"
+        );
+    }
+
+    /// Two senders sharing one `(chat, id)` end with exactly one of them
+    /// holding the pending slot: the response is matched by `(chat, id)` and
+    /// carries whichever `MessageInfo` is stored there, so an overwrite would
+    /// dispatch recovered content under the wrong sender.
+    ///
+    /// Holds the outcome down, not the atomicity. The interleaving that the
+    /// atomic reservation exists for does not occur on this runtime — this
+    /// test passes against the read-then-write version too — so it guards
+    /// against a coarser regression, not against the race.
+    #[tokio::test]
+    async fn concurrent_senders_sharing_an_id_reserve_the_pending_slot_once() {
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        client
+            .offline_sync_completed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let first = make_group_message_info(
+            "120363000000000001@g.us",
+            "203040904720543@lid",
+            "PDO_RACE_ID",
+        );
+        let second = make_group_message_info(
+            "120363000000000001@g.us",
+            "111222333444555@lid",
+            "PDO_RACE_ID",
+        );
+
+        let (a, b) = tokio::join!(
+            client.send_pdo_placeholder_resend_request(&first),
+            client.send_pdo_placeholder_resend_request(&second),
+        );
+
+        // Neither has a live transport, so whichever reserved the slot fails
+        // its send and clears it; the other is short-circuited and returns Ok.
+        // Exactly one of the two may have reached the send.
+        assert_eq!(
+            usize::from(a.is_err()) + usize::from(b.is_err()),
+            1,
+            "exactly one sender may reserve the shared pending slot; \
+             the other must be short-circuited, not overwrite it"
         );
     }
 
