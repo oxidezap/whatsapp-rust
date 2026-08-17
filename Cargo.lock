@@ -942,8 +942,7 @@ dependencies = [
 [[package]]
 name = "curve25519-dalek"
 version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5eed333089e2e1c1ac8c6c0398e5e2497b4c9926ca6d0365ed1e099afa5bc23"
+source = "git+https://github.com/jlucaso1/curve25519-dalek?rev=f261a975757c659105c163cad3da053b16e0af2c#f261a975757c659105c163cad3da053b16e0af2c"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
