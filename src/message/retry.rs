@@ -157,9 +157,7 @@ impl Client {
         // messages, not one. See `SenderMessageId`.
         // Resolved to the encryption namespace first, as the retry key is: the
         // wire sender is whatever the stanza said, and a redelivery after a
-        // PN/LID migration spells the same participant the other way. Without
-        // this, that redelivery reads as a second message and dispatches a
-        // second placeholder for one.
+        // PN/LID migration spells the same participant the other way.
         //
         // The `:device` stays. Two devices of one user are two senders, and the
         // retry key draws the line in the same place.
@@ -168,6 +166,27 @@ impl Client {
             self.resolve_encryption_jid(&info.source.sender),
         );
         let dedup_key = wacore::types::message::SenderMessageId::new(chat, info.id.clone(), sender);
+
+        // Resolution is not stable over time: the first delivery can arrive
+        // before the LID mapping is known and key under the PN, and the resend
+        // can teach us the mapping — `receive.rs` updates the cache before
+        // dispatch — so the same message would resolve to a LID key and be
+        // dispatched twice. Remember the wire spelling alongside the resolved
+        // one, and treat a hit on either as the message already seen.
+        let wire_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
+        let aliased = wire_key != dedup_key;
+        if aliased && self.undecryptable_dispatched.get(&wire_key).await.is_some() {
+            log::debug!(
+                "[msg:{}] UndecryptableMessage already dispatched under the wire spelling; skipping duplicate event",
+                info.id
+            );
+            return false;
+        }
+
         // The init future only runs for the winning caller. Others receive
         // the cached `()` and leave the flag as false.
         let fresh = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -178,6 +197,10 @@ impl Client {
             })
             .await;
         let was_fresh = fresh.load(Ordering::Acquire);
+        if was_fresh && aliased {
+            // So a later delivery that resolves the other way still finds it.
+            self.undecryptable_dispatched.insert(wire_key, ()).await;
+        }
         if was_fresh {
             wacore::telemetry::recv("undecryptable");
             self.core.event_bus.dispatch(Event::UndecryptableMessage(

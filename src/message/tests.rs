@@ -14958,3 +14958,64 @@ async fn a_redelivery_under_the_other_namespace_is_not_a_new_message() {
         "the same participant under the other namespace is the same message"
     );
 }
+
+/// The mapping can be learned between the two deliveries, and the message is
+/// still one message.
+///
+/// This is the transition the preloaded-mapping test cannot reach: the first
+/// delivery keys under the PN because nothing maps it yet, and the resend
+/// teaches us the LID — `receive.rs` updates the cache before dispatch — so a
+/// key derived only from the resolved sender would move and dispatch twice for
+/// one message.
+#[tokio::test]
+async fn learning_the_mapping_between_deliveries_does_not_redispatch() {
+    let client = crate::test_utils::create_test_client().await;
+    let chat: Jid = "120363000000000003@g.us".parse().expect("group jid");
+    let pn: Jid = "15550009876@s.whatsapp.net".parse().expect("pn jid");
+    let lid: Jid = "555555555555555@lid".parse().expect("lid jid");
+
+    let info_for = |sender: Jid| {
+        Arc::new(MessageInfo {
+            id: "3EB0LEARNED0001".into(),
+            source: crate::types::message::MessageSource {
+                sender,
+                chat: chat.clone(),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+
+    // First delivery: nothing maps this PN yet, so it keys under the PN.
+    let first = client
+        .dispatch_undecryptable_event(
+            info_for(pn.clone()),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+    assert!(first, "the first delivery is dispatched");
+
+    // The resend teaches us the mapping before it is dispatched.
+    let entry = crate::lid_pn_cache::LidPnEntry::new(
+        lid.user.to_string(),
+        pn.user.to_string(),
+        crate::lid_pn_cache::LearningSource::PeerLidMessage,
+    );
+    client.lid_pn_cache.add(&entry).await;
+
+    let resend = client
+        .dispatch_undecryptable_event(
+            info_for(pn),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+    assert!(
+        !resend,
+        "learning the mapping must not turn a resend into a second message"
+    );
+}
