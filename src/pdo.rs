@@ -97,15 +97,10 @@ impl Client {
         };
         let cache_key = ChatMessageId::new(cache_chat, info.id.clone());
 
-        // The gate names the sender; the pending map cannot. A message id is
-        // the sending client's to pick, so two participants can share one and
-        // gating on `(chat, id)` alone would let the first of them swallow the
-        // second's request. The pending map has to match what the phone sends
-        // back, so it keeps the key the response carries.
-        //
         // Wire spelling, unresolved: this key is never compared against
         // anything the phone produces, so it has no namespace to agree with,
         // and a key that resolves would move when a LID mapping is learned.
+        // Why it names the sender at all is on `Client::pdo_requested`.
         let gate_key = wacore::types::message::SenderMessageId::new(
             info.source.chat.clone(),
             info.id.clone(),
@@ -139,6 +134,12 @@ impl Client {
         }
 
         if self.pdo_pending_requests.get(&cache_key).await.is_some() {
+            // Nothing was sent for this sender, so it must not keep the slot.
+            // The pending map is shared by `(chat, id)`, so another sender's
+            // in-flight request lands here; holding the gate would suppress
+            // this one for the gate's whole lifetime once that request is
+            // answered and the pending entry clears.
+            self.pdo_requested.remove(&gate_key).await;
             debug!(
                 "PDO request already pending for message {} from {}",
                 info.id,
@@ -919,6 +920,64 @@ mod tests {
             ungated.is_err(),
             "the second sender's message is its own, and must reach the send \
              rather than being gated by the first"
+        );
+    }
+
+    /// A sender blocked by *another* sender's in-flight request must not keep
+    /// the gate it just claimed.
+    ///
+    /// The pending map is shared by `(chat, id)`, so one sender's in-flight
+    /// request short-circuits the other's call after it has already claimed its
+    /// own gate. Nothing was sent for it, so holding the slot would suppress it
+    /// for the gate's whole lifetime once the pending entry clears.
+    #[tokio::test]
+    async fn a_sender_short_circuited_by_a_shared_pending_entry_keeps_no_gate() {
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        client
+            .offline_sync_completed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let first = make_group_message_info(
+            "120363000000000001@g.us",
+            "203040904720543@lid",
+            "PDO_PENDING_SHARED",
+        );
+        let second = make_group_message_info(
+            "120363000000000001@g.us",
+            "111222333444555@lid",
+            "PDO_PENDING_SHARED",
+        );
+        let second_gate = wacore::types::message::SenderMessageId::new(
+            second.source.chat.clone(),
+            second.id.clone(),
+            second.source.sender.clone(),
+        );
+
+        // The first sender's request is in flight, under the shared key.
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(first.source.chat.clone(), first.id.clone()),
+                crate::pdo::PendingPdoRequest {
+                    message_info: first.clone(),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.send_pdo_placeholder_resend_request(&second),
+        )
+        .await
+        .expect("the short-circuited call returns without touching the network");
+        assert!(blocked.is_ok(), "the pending branch reports success");
+        assert!(
+            client.pdo_requested.get(&second_gate).await.is_none(),
+            "a sender that sent nothing must not hold its once-per-message slot"
         );
     }
 
