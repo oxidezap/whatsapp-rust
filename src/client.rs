@@ -1590,7 +1590,12 @@ pub struct Client {
     /// request per message, no matter how many times the server redelivers
     /// the undecryptable original. Entries are dropped on send failure so a
     /// transient error does not block the next attempt.
-    pub(crate) pdo_requested: Cache<ChatMessageId, ()>,
+    ///
+    /// Keyed with the sender, unlike [`Self::pdo_pending_requests`]. This one
+    /// is a purely local gate that never has to agree with anything the phone
+    /// sends back, so it can name the message precisely; the pending map has
+    /// to match a response and keeps the key the phone answers with.
+    pub(crate) pdo_requested: Cache<wacore::types::message::SenderMessageId, ()>,
 
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.

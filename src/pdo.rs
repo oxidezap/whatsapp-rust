@@ -97,6 +97,21 @@ impl Client {
         };
         let cache_key = ChatMessageId::new(cache_chat, info.id.clone());
 
+        // The gate names the sender; the pending map cannot. A message id is
+        // the sending client's to pick, so two participants can share one and
+        // gating on `(chat, id)` alone would let the first of them swallow the
+        // second's request. The pending map has to match what the phone sends
+        // back, so it keeps the key the response carries.
+        //
+        // Wire spelling, unresolved: this key is never compared against
+        // anything the phone produces, so it has no namespace to agree with,
+        // and a key that resolves would move when a LID mapping is learned.
+        let gate_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
+
         // One request per message, like WA Web's session-lifetime set in
         // WAWebNonMessageDataRequestPlaceholderMessageResendUtils. The
         // pending cache below only covers in-flight requests; once the phone
@@ -110,7 +125,7 @@ impl Client {
         let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let claimed_clone = claimed.clone();
         self.pdo_requested
-            .get_with(cache_key.clone(), async move {
+            .get_with(gate_key.clone(), async move {
                 claimed_clone.store(true, std::sync::atomic::Ordering::Release);
             })
             .await;
@@ -187,13 +202,13 @@ impl Client {
             .await
         {
             self.pdo_pending_requests.remove(&cache_key).await;
-            self.pdo_requested.remove(&cache_key).await;
+            self.pdo_requested.remove(&gate_key).await;
             return Err(e);
         }
 
         if let Err(e) = self.send_peer_message(peer_target, &msg).await {
             self.pdo_pending_requests.remove(&cache_key).await;
-            self.pdo_requested.remove(&cache_key).await;
+            self.pdo_requested.remove(&gate_key).await;
             warn!(
                 "Failed to send PDO request for message {}: {:?}",
                 info.id, e
@@ -827,7 +842,12 @@ mod tests {
             "PDO_ONCE_1",
         );
         let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
-        client.pdo_requested.insert(key.clone(), ()).await;
+        let gate_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
+        client.pdo_requested.insert(gate_key, ()).await;
 
         let res = client.send_pdo_placeholder_resend_request(&info).await;
 
@@ -845,12 +865,17 @@ mod tests {
     /// `(chat, id)` pairs carried messages from two different participants.
     /// Gating on `(chat, id)` alone means the second one never gets a
     /// placeholder requested for it at all.
+    ///
+    /// Told apart by the return: a gated call returns early with `Ok`, while a
+    /// call that gets past the gate reaches the send and fails without a live
+    /// transport. `Err` here therefore means "was not gated".
     #[tokio::test]
     async fn the_pdo_gate_lets_a_second_sender_ask_for_its_own_message() {
-        use wacore::types::message::SenderMessageId;
-
         let client = setup_reconstruct_client().await;
         set_own_pn(&client).await;
+        client
+            .offline_sync_completed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         let first = make_group_message_info(
             "120363000000000001@g.us",
@@ -864,30 +889,36 @@ mod tests {
         );
 
         // The first sender's request is already on record.
-        let first_key = SenderMessageId::new(
-            first.source.chat.clone(),
-            first.id.clone(),
-            first.source.sender.clone(),
-        );
-        client.pdo_requested.insert(first_key, ()).await;
+        client
+            .pdo_requested
+            .insert(
+                wacore::types::message::SenderMessageId::new(
+                    first.source.chat.clone(),
+                    first.id.clone(),
+                    first.source.sender.clone(),
+                ),
+                (),
+            )
+            .await;
 
-        // The second sender's message is a different message and must not be
-        // gated by it.
-        let second_key = SenderMessageId::new(
-            second.source.chat.clone(),
-            second.id.clone(),
-            second.source.sender.clone(),
-        );
+        let gated = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.send_pdo_placeholder_resend_request(&first),
+        )
+        .await
+        .expect("the gated call returns without touching the network");
+        assert!(gated.is_ok(), "the first sender is gated by its own record");
+
+        let ungated = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.send_pdo_placeholder_resend_request(&second),
+        )
+        .await
+        .expect("send attempt must resolve fast without a live transport");
         assert!(
-            client.pdo_requested.get(&second_key).await.is_none(),
-            "the second sender starts ungated"
-        );
-
-        let _ = client.send_pdo_placeholder_resend_request(&second).await;
-
-        assert!(
-            client.pdo_requested.get(&second_key).await.is_some(),
-            "the second sender must claim its own once-per-message slot"
+            ungated.is_err(),
+            "the second sender's message is its own, and must reach the send \
+             rather than being gated by the first"
         );
     }
 
@@ -920,8 +951,13 @@ mod tests {
         .expect("send attempt must resolve fast without a live transport");
 
         assert!(res.is_err(), "no live transport, the send must fail");
+        let gate_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
         assert!(
-            client.pdo_requested.get(&key).await.is_none(),
+            client.pdo_requested.get(&gate_key).await.is_none(),
             "failed send must release the once-per-message slot"
         );
         assert!(
@@ -942,8 +978,14 @@ mod tests {
         let chat = "5511999998888@s.whatsapp.net";
         let msg_id = "PDO_ONCE_3";
         let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+        // A DM: the chat jid is the sender, which is what the gate names.
+        let gate_key = wacore::types::message::SenderMessageId::new(
+            chat.parse().expect("chat jid"),
+            msg_id.to_owned(),
+            chat.parse().expect("chat jid"),
+        );
 
-        client.pdo_requested.insert(key.clone(), ()).await;
+        client.pdo_requested.insert(gate_key.clone(), ()).await;
         client
             .pdo_pending_requests
             .insert(
@@ -977,7 +1019,7 @@ mod tests {
             "response consumes the pending slot"
         );
         assert!(
-            client.pdo_requested.get(&key).await.is_some(),
+            client.pdo_requested.get(&gate_key).await.is_some(),
             "memo must survive a content-less response"
         );
     }
