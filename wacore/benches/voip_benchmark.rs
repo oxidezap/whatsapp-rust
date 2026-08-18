@@ -28,6 +28,7 @@ fn main() {
     // bench function does before its closure, and `Stages::new` runs three real encodes: left inside,
     // it sized `entropy_encode`'s sample loop to a single iteration and put one 3.6 ms /
     // 2000-allocation outlier on a row whose real cost is 1.9 us and zero allocations.
+    #[cfg(feature = "bench-internals")]
     codec_stages::warm();
     divan::main();
 }
@@ -218,6 +219,7 @@ fn mlow_decode(bencher: Bencher) {
 // Each row's doc gives its per-frame multiplicity, which is what makes the rows sum: reading them
 // against `mlow_encode` needs `stage_time * calls_per_frame`, not `stage_time` alone. Decode has no
 // row here on purpose -- it runs none of these stages (notably, zero FFTs).
+#[cfg(feature = "bench-internals")]
 mod codec_stages {
     use super::*;
     use std::sync::{Mutex, OnceLock};

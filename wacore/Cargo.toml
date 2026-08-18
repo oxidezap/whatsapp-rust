@@ -153,7 +153,12 @@ harness = false
 [[bench]]
 name = "voip_benchmark"
 harness = false
-required-features = ["voip-mlow", "bench-internals"]
+# Only `voip-mlow` here on purpose: cargo SILENTLY SKIPS a bench target whose required features are
+# off, so listing `bench-internals` too would make the previously-working
+# `cargo bench --features voip-mlow --bench voip_benchmark` quietly run nothing -- dropping the MLow,
+# SRTP, SFrame and framing rows along with the stage rows. The `codec_stages` module is `#[cfg]`-gated
+# inside the bench instead, so it is the only part that needs the extra feature.
+required-features = ["voip-mlow"]
 
 [[example]]
 name = "voip_profile"

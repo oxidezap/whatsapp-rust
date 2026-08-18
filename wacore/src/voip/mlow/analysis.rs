@@ -1390,8 +1390,6 @@ pub mod stage_bench {
         /// inf, changing what it measures.
         fft576_out: Vec<f32>,
         fft576_scratch: FftScratch,
-        /// Threaded across the capture loop; the LSF row reads its per-frame copy from `lsf`.
-        prev_lsfq: Vec<f32>,
         prev_nlsf: Vec<f32>,
         /// Per-row cursors over the internal-frame index. Every stage that production runs once per
         /// internal frame behaves DIFFERENTLY at `intf` 0, 1 and 2 -- the LPC window length, the
@@ -1488,7 +1486,6 @@ pub mod stage_bench {
                 fft576_spec,
                 fft576_out,
                 fft576_scratch,
-                prev_lsfq,
                 prev_nlsf,
                 intf_at: [0; Self::INTF_ROWS],
                 f2,
@@ -1541,22 +1538,27 @@ pub mod stage_bench {
                 for sf in 0..SMPL_SUBFR_COUNT {
                     block_lags[sf] = [pr.lags[2 * sf], pr.lags[2 * sf + 1]];
                 }
+                // Production sets BOTH `prev_lsfq` and `prev_nlsf` to the frame's committed NLSF
+                // after every internal frame, and the LSF quantizer, the envelope reconstruction and
+                // the interpolation that builds the CELP residual all read it. Thread one value
+                // through all three rather than pinning them to the packet-start snapshot.
+                let prev_for_frame = prev_committed.clone();
                 let fe = FrontEndLsf {
                     a: a_f,
                     nlsf: nlsf_f,
-                    prev_lsfq: &s.prev_lsfq,
+                    prev_lsfq: &prev_for_frame,
                     prev_voiced: s.es.prev_voiced,
                     intf: f,
                 };
+                let (_, _, brec, _) = fe.quantize(synth_t, 1, &prev_for_frame);
+                let (predcoefs, _) =
+                    super::super::smpl_lpc::smpl_lpc_interpol(&brec, &prev_for_frame, smpl_nlsf2a);
                 s.lsf.push(LsfInputs {
                     a: a_f,
                     nlsf: nlsf_f,
-                    prev_nlsf: prev_committed.clone(),
+                    prev_nlsf: prev_for_frame,
                 });
-                let (_, _, brec, _) = fe.quantize(synth_t, 1, &prev_committed);
-                prev_committed = brec.clone();
-                let (predcoefs, _) =
-                    super::super::smpl_lpc::smpl_lpc_interpol(&brec, &s.prev_lsfq, smpl_nlsf2a);
+                prev_committed = brec;
                 // The residual window for frame `f`, with its 32-sample CELP pre-lead.
                 let nbase = res_lead + f * SMPL_INTF_LEN;
                 let win_n = s.es.xn[nbase - res_lead..nbase + SMPL_INTF_LEN].to_vec();
@@ -1717,7 +1719,7 @@ pub mod stage_bench {
             let fe = FrontEndLsf {
                 a: inp.a,
                 nlsf: inp.nlsf,
-                prev_lsfq: &self.prev_lsfq,
+                prev_lsfq: &inp.prev_nlsf,
                 prev_voiced: true,
                 intf,
             };
