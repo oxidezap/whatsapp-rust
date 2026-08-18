@@ -394,7 +394,9 @@ fn smpl_cmf_to_bits(cmf: &[u16], cmf_len: usize, bits: &mut [f32]) {
 fn smpl_get_maxi(x: &[f32], x_len: usize) -> usize {
     let mut i = 0usize;
     let mut maxtmp = x[0];
-    for (n, v) in x[1..x_len].iter().enumerate() {
+    // `x_len.max(1)` keeps the empty-range case a no-op returning 0, as the `1..x_len` loop this
+    // replaced was: slicing would panic on `x[1..0]` where the range simply did not iterate.
+    for (n, v) in x[1..x_len.max(1)].iter().enumerate() {
         if *v > maxtmp {
             maxtmp = *v;
             i = n + 1;
