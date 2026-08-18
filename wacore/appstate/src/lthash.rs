@@ -1,5 +1,5 @@
 use hkdf::Hkdf;
-use hmac::digest::KeyInit;
+use hmac::digest::{FixedOutput, KeyInit};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::LazyLock;
@@ -55,10 +55,9 @@ impl LTHash {
     }
 }
 
-/// Deliberately scalar. A hand-vectorised version of this loop lived here
-/// until it was measured: over an 812-MAC batch it moved the total by 0.28%,
-/// because HKDF above it dominates and LLVM already auto-vectorizes this loop
-/// about as well as the intrinsics did.
+/// Lane-parallel over `u64` words: four little-endian `u16` lanes per
+/// iteration, with the carry between lanes isolated by SWAR masking, then a
+/// scalar tail for a base that is not a whole number of words.
 fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool) {
     assert_eq!(base.len(), input.len(), "length mismatch");
     assert!(base.len().is_multiple_of(2), "slice lengths must be even");
@@ -66,8 +65,38 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
     // WA Web treats the accumulator as little-endian u16 lanes
     // (`new DataView(...).getUint16(off, true)` in WA/Crypto/LtHash.js).
     // Snapshot/patch MACs are HMACs over the accumulator bytes, so the lane
-    // endianness is part of the wire spec.
-    for (base_pair, input_pair) in base.chunks_exact_mut(2).zip(input.chunks_exact(2)) {
+    // endianness is part of the wire spec. Reading the word as little-endian
+    // puts those same lanes at fixed bit positions on either byte order.
+    const LOW: u64 = 0x7FFF_7FFF_7FFF_7FFF;
+    const WORD: usize = size_of::<u64>();
+
+    let words = base.len() / WORD;
+    let (base_words, base_tail) = base.split_at_mut(words * WORD);
+    let (input_words, input_tail) = input.split_at(words * WORD);
+
+    for (base_word, input_word) in base_words
+        .chunks_exact_mut(WORD)
+        .zip(input_words.chunks_exact(WORD))
+    {
+        let x = u64::from_le_bytes(base_word.try_into().expect("word-sized chunk"));
+        let y = u64::from_le_bytes(input_word.try_into().expect("word-sized chunk"));
+
+        // Add/subtract the low 15 bits of every lane in one word operation,
+        // where no carry can escape into the next lane, then restore each
+        // lane's top bit from the operands' XOR. Same answer as four
+        // independent `u16::wrapping_*`, a quarter of the iterations.
+        let result = if subtract {
+            ((x | !LOW).wrapping_sub(y & LOW)) ^ ((x ^ !y) & !LOW)
+        } else {
+            ((x & LOW).wrapping_add(y & LOW)) ^ ((x ^ y) & !LOW)
+        };
+        base_word.copy_from_slice(&result.to_le_bytes());
+    }
+
+    for (base_pair, input_pair) in base_tail
+        .chunks_exact_mut(2)
+        .zip(input_tail.chunks_exact(2))
+    {
         let x = u16::from_le_bytes([base_pair[0], base_pair[1]]);
         let y = u16::from_le_bytes([input_pair[0], input_pair[1]]);
 
@@ -80,12 +109,43 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
     }
 }
 
+/// HKDF-SHA256 over a whole-block output, expanded in place.
+///
+/// `Hkdf::expand` is generic over the digest and re-derives its bounds per
+/// call; the batch path here runs it once per mutation with the same 24-byte
+/// `info` and a 128-byte (4-block) output every time. Driving the RFC 5869
+/// T(n) chain directly lets each block be written straight into `out` and read
+/// back as T(n-1), which drops the per-block `Output<Sha256>` copy the generic
+/// loop keeps, and skips its length check and chunk bookkeeping.
+///
+/// Restricted to whole SHA-256 blocks so the "previous block is the last 32
+/// bytes written" shortcut holds; anything else falls back to the crate.
 fn hkdf_sha256_into(key: &[u8], info: &[u8], out: &mut [u8]) {
+    const BLOCK: usize = 32;
+
     let mut extract = EXTRACT_HMAC.clone();
     extract.update(key);
     let prk = extract.finalize().into_bytes();
-    let hk = Hkdf::<Sha256>::from_prk(&prk).expect("PRK is hash-sized");
-    hk.expand(info, out).expect("hkdf expand");
+
+    if !out.len().is_multiple_of(BLOCK) || out.is_empty() || out.len() > BLOCK * 255 {
+        let hk = Hkdf::<Sha256>::from_prk(&prk).expect("PRK is hash-sized");
+        hk.expand(info, out).expect("hkdf expand");
+        return;
+    }
+
+    let expand = Hmac::<Sha256>::new_from_slice(&prk).expect("PRK is a valid HMAC key");
+    for block in 0..out.len() / BLOCK {
+        let (written, rest) = out.split_at_mut(block * BLOCK);
+        let mut round = expand.clone();
+        // T(0) is empty; every later round feeds back the block just written.
+        if let Some(previous) = written.last_chunk::<BLOCK>() {
+            round.update(previous);
+        }
+        round.update(info);
+        round.update(&[block as u8 + 1]);
+        let target: &mut [u8; BLOCK] = (&mut rest[..BLOCK]).try_into().expect("whole block");
+        round.finalize_into(target.into());
+    }
 }
 
 #[cfg(test)]
