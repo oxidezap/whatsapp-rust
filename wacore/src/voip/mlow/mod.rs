@@ -42,7 +42,9 @@ mod smpl_vad;
 mod toc;
 
 /// Per-stage bench surface (see `analysis::stage_bench`). Reachable only so the in-tree benchmark
-/// can attribute codec CPU per stage; not part of the consumer API.
+/// can attribute codec CPU per stage; not part of the consumer API, and compiled out entirely
+/// without the `bench-internals` feature.
+#[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub use analysis::stage_bench;
 pub use decoder::MlowDecoder;

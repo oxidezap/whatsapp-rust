@@ -43,6 +43,10 @@ voip-mlow = ["voip"]
 # Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
 # Dev/profiling only; off by default and not pulled into normal builds.
 dhat-heap = ["dep:dhat"]
+# Per-stage MLow codec bench surface (`voip::mlow::stage_bench`), so `voip_benchmark` can attribute
+# encoder CPU to a stage. Pure bench scaffolding: `#[doc(hidden)]` would hide it from rustdoc but
+# still compile it into every consumer, so it is a feature. Dev/bench only; off by default.
+bench-internals = []
 
 [dependencies]
 aes = { workspace = true }
@@ -149,7 +153,7 @@ harness = false
 [[bench]]
 name = "voip_benchmark"
 harness = false
-required-features = ["voip-mlow"]
+required-features = ["voip-mlow", "bench-internals"]
 
 [[example]]
 name = "voip_profile"

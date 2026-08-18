@@ -1286,14 +1286,17 @@ fn smpl_voiced_candidate(
 /// These harnesses call the SAME production functions the analyzer calls, one stage per row, so a
 /// stage-local change has a stage-local number.
 ///
-/// Setup vs. body is the load-bearing distinction: [`Stages::new`] runs real frames through
+/// Setup vs. body is the load-bearing distinction: `Stages::new` runs real frames through
 /// `smpl_analyze_frame_st`, which builds every `OnceLock` table, both FFT twiddle sets and every
 /// pooled buffer, and leaves the CELP/perc/pitch/VAD state in its steady-state regime. What the
 /// `run_*` bodies then execute is per-frame work only -- what production pays every 60 ms, never what
 /// it resolves once and holds. The per-frame multiplicity of each stage is on its method.
 ///
-/// Not a consumer API: it exists so the benchmark can attribute codec CPU, and it is `#[doc(hidden)]`
-/// for the same reason the SRTP primitives are.
+/// Not a consumer API: it exists so the benchmark can attribute codec CPU. Unlike the SRTP
+/// primitives -- which are production code that merely stays `#[doc(hidden)]` -- this module is pure
+/// bench scaffolding, so it is behind the `bench-internals` feature and compiles into nothing for a
+/// normal consumer. `#[doc(hidden)]` alone would only hide it from rustdoc, not from the build.
+#[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod stage_bench {
     use super::*;
@@ -1302,10 +1305,15 @@ pub mod stage_bench {
         FftScratch, PERCW_NFFT, rfft_backward_ordered_sc, rfft_forward_ordered_sc,
     };
 
-    /// Frames pushed through the encoder before any input is captured. Two is enough to leave every
-    /// cross-frame buffer (`hist`, `lpc_hist`, `hp_pitch_hist`, `ltp_buf`, ACB state) filled with real
-    /// signal rather than the zeros a first frame sees.
+    /// Frames pushed through the encoder before any input is captured. Three leave every cross-frame
+    /// buffer (`hist`, `lpc_hist`, `hp_pitch_hist`, `ltp_buf`, ACB state) filled with real signal
+    /// rather than the zeros a first frame sees.
     const WARMUP_FRAMES: usize = 3;
+
+    /// Distinct frames the `analyze_frame` row cycles, matching `mlow_encode`'s own `STREAM`. A
+    /// single repeated frame lets the adaptive encoder settle onto a cheaper low-pulse/low-survivor
+    /// path, which would under-report the stage and make the row incomparable to `mlow_encode`.
+    const STREAM: usize = 8;
 
     /// A 60 ms voiced tone, matching the benchmark's own steady-state input.
     fn tone(phase: usize) -> Vec<f32> {
@@ -1317,7 +1325,9 @@ pub mod stage_bench {
     /// A primed encoder plus one internal frame's worth of captured stage inputs.
     pub struct Stages {
         es: SmplEncoderState,
-        pcm: Vec<f32>,
+        /// Distinct frames the `analyze_frame` row cycles through, and the cursor into them.
+        pcm: Vec<Vec<f32>>,
+        pcm_at: usize,
         /// Snapshot of the last analyzed frame's normalized HP signal (`hp_n`), which the perc model
         /// and the residual read.
         hp: Vec<f32>,
@@ -1341,6 +1351,14 @@ pub mod stage_bench {
         nlsf: [f32; SMPL_LPC_ORDER],
         prev_lsfq: Vec<f32>,
         prev_nlsf: Vec<f32>,
+        /// Per-row cursors over the internal-frame index. Every stage that production runs once per
+        /// internal frame behaves DIFFERENTLY at `intf` 0, 1 and 2 -- the LPC window length, the
+        /// perceptual model's last-subframe window, the conditional LSF quantizer and the pitch
+        /// predictor's packet-boundary reset all key off it. Pinning a row to one index and
+        /// multiplying by three would report three copies of one path instead of the frame's real
+        /// mix, so each such row cycles 0, 1, 2 and its x3 is the actual frame. One cursor per row,
+        /// because divan runs the rows independently.
+        intf_at: [usize; Self::INTF_ROWS],
         f2: [f32; SMPL_F_LEN],
         /// CELP inputs for one internal frame (4 subframes).
         predcoefs: [[f32; SMPL_LPC_ORDER + 1]; SMPL_SUBFR_COUNT],
@@ -1369,7 +1387,9 @@ pub mod stage_bench {
                 fp = Some(smpl_analyze_frame_st(&mut es, &tone(k * SMPL_INTF_LEN * 3)));
             }
             let fp = fp.expect("warmup ran at least once");
-            let pcm = tone(WARMUP_FRAMES * SMPL_INTF_LEN * 3);
+            let pcm: Vec<Vec<f32>> = (0..STREAM)
+                .map(|k| tone((WARMUP_FRAMES + k) * SMPL_INTF_LEN * 3))
+                .collect();
 
             let hp = es.hp.clone();
             let hp_pitch_hist = es.hp_pitch_hist.clone();
@@ -1423,6 +1443,7 @@ pub mod stage_bench {
             let mut s = Stages {
                 es,
                 pcm,
+                pcm_at: 0,
                 hp,
                 hp_pitch_hist,
                 lpcbuf,
@@ -1437,6 +1458,7 @@ pub mod stage_bench {
                 nlsf,
                 prev_lsfq,
                 prev_nlsf,
+                intf_at: [0; Self::INTF_ROWS],
                 f2,
                 predcoefs,
                 res_lpc,
@@ -1467,6 +1489,21 @@ pub mod stage_bench {
             // a table build a live stream pays once, reported as if it were per-frame work.
             s.entropy_encode();
             s
+        }
+
+        /// Row slots in `intf_at`.
+        const ROW_LPC: usize = 0;
+        const ROW_PERC: usize = 1;
+        const ROW_PITCH: usize = 2;
+        const ROW_LSF: usize = 3;
+        const ROW_CELP: usize = 4;
+        const INTF_ROWS: usize = 5;
+
+        /// Advance this row's cursor and return the internal-frame index to run, 0 -> 1 -> 2 -> 0.
+        fn next_intf(&mut self, row: usize) -> usize {
+            let intf = self.intf_at[row] % 3;
+            self.intf_at[row] += 1;
+            intf
         }
 
         /// Borrow the live per-stream state as the `CelpFrameCtx` the analyzer builds each internal
@@ -1520,8 +1557,13 @@ pub mod stage_bench {
 
         /// The full LPC front-end for one internal frame: window, forward FFT, power spectrum, DCT
         /// autocorrelation, Levinson, bandwidth expansion, and A->NLSF. Runs 3x per 60 ms frame.
+        ///
+        /// Cycles the internal-frame index because `smpl_analyze_frame_st` passes `f < 2` as
+        /// `use_long_win`: internal frames 0 and 1 take the long trailing window, frame 2 the short
+        /// one, and the two differ in window-generation work.
         pub fn lpc_front_end(&mut self) -> f32 {
-            let windowed = smpl_window_lpc20(&self.lpcbuf, true);
+            let intf = self.next_intf(Self::ROW_LPC);
+            let windowed = smpl_window_lpc20(&self.lpcbuf, intf < 2);
             let (a, _f2) = smpl_lpc_analyze_with_f2(&windowed, &mut self.fft_scratch);
             let nlsf = smpl_a2nlsf_16(&a);
             nlsf[0]
@@ -1531,13 +1573,26 @@ pub mod stage_bench {
         /// plus an inverse FFT at N=576 (the mixed-radix 2/3 size). Runs 1x per internal frame, so
         /// 3x per 60 ms frame -- 12 of the frame's 15 FFTs. Advances the perc history, as production
         /// does.
+        ///
+        /// Cycles the internal-frame index: `compute_perc_corrs` sets `is_last` only on frame 2's
+        /// final subframe, which switches `smpl_perc_model` to the short trailing window, so a row
+        /// pinned to frame 1 would never reach one of the frame's six invocations.
         pub fn perc_corrs_frame(&mut self) -> f32 {
-            self.with_ctx(1, |cs| compute_perc_corrs(cs)[0][0])
+            let intf = self.next_intf(Self::ROW_PERC);
+            self.with_ctx(intf, |cs| compute_perc_corrs(cs)[0][0])
         }
 
         /// The multi-stage pitch estimator for one internal frame. Runs 3x per 60 ms frame and
         /// advances the cross-frame lag predictor, as production does.
+        ///
+        /// Resets the lag predictor at each packet boundary, because `smpl_analyze_frame_st` calls
+        /// `reset_cond` after internal frame 2: a packet is one non-conditional search followed by
+        /// two conditional ones, and those take different candidate paths. Without the reset every
+        /// timed call would be conditional and the x3 would not be a frame.
         pub fn pitch_search(&mut self) -> f32 {
+            if self.next_intf(Self::ROW_PITCH) == 0 {
+                self.es.pitch_est.reset_cond();
+            }
             let pr = super::super::smpl_pitch_enc::smpl_pitch(
                 &mut self.es.pitch_est,
                 &self.es.ltp_buf,
@@ -1549,14 +1604,22 @@ pub mod stage_bench {
 
         /// The bit-exact LSF vector quantizer plus the decoder-side envelope reconstruction and
         /// NLSF->A that follow it (`FrontEndLsf::quantize`). Runs 1x per internal frame, 3x per
-        /// 60 ms frame. Stateless, so repeated runs measure the same work.
+        /// 60 ms frame.
+        ///
+        /// The row cycles `intf` 0, 1, 2 because the two paths cost differently and production runs
+        /// both every frame: the conditional quantizer needs `intf > 0`, so internal frame 0 always
+        /// takes `lsf_quant` while 1 and 2 take `lsf_quant_cond` (which carries an extra centroid and
+        /// rotated weighting matrices). Pinning the row to one path and multiplying by three would
+        /// mis-state the frame; cycling makes the x3 the real mix. Stateless, so a full cycle
+        /// measures the same work every time.
         pub fn lsf_quantize(&mut self) -> f32 {
+            let intf = self.next_intf(Self::ROW_LSF);
             let fe = FrontEndLsf {
                 a: self.a,
                 nlsf: self.nlsf,
                 prev_lsfq: &self.prev_lsfq,
                 prev_voiced: true,
-                intf: 1,
+                intf,
             };
             let (grid, _, _, predcoef) = fe.quantize(load_smpl_synth_tables(), 1, &self.prev_nlsf);
             predcoef[1] + grid as f32
@@ -1571,7 +1634,8 @@ pub mod stage_bench {
             let res_lpc = std::mem::take(&mut self.res_lpc);
             let block_lags = self.block_lags;
             let perc_corrs = std::mem::take(&mut self.perc_corrs);
-            let r = self.with_ctx(1, |cs| {
+            let intf = self.next_intf(Self::ROW_CELP);
+            let r = self.with_ctx(intf, |cs| {
                 let outs = run_celp_subframes(
                     cs,
                     &predcoefs,
@@ -1592,7 +1656,9 @@ pub mod stage_bench {
         /// and the voiced/unvoiced decision. 1x per 60 ms frame. Together with
         /// [`Self::entropy_encode`] this is all of `mlow_encode`.
         pub fn analyze_frame(&mut self) -> u8 {
-            let fp = smpl_analyze_frame_st(&mut self.es, &self.pcm);
+            let frame = &self.pcm[self.pcm_at % self.pcm.len()];
+            self.pcm_at += 1;
+            let fp = smpl_analyze_frame_st(&mut self.es, frame);
             fp.toc
         }
 
