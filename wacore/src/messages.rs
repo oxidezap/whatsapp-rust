@@ -489,10 +489,21 @@ impl MessageUtils {
         for jid in devices {
             let start = arena.len();
             jid.push_phash_form_to(&mut arena);
-            // A device set large enough to overflow a u32 offset cannot exist:
-            // the fan-out is bounded by the group size, and the arena would be
-            // gigabytes before it got there.
             ranges.push((start as u32, arena.len() as u32));
+        }
+        // The offsets above only ever grow, so one check on the finished arena
+        // covers every one of them: if the whole arena addresses in a `u32`,
+        // then so did each `start` and `end` recorded from it. A device set
+        // that large cannot come from a group -- it would need ~100M JIDs --
+        // but this is a public entry point, and a silently truncated offset
+        // would hash the wrong bytes or invert a range, so it is refused
+        // rather than trusted. Checking here instead of per JID keeps it to a
+        // single comparison, and the ranges are not read before this point.
+        if u32::try_from(arena.len()).is_err() {
+            return Err(anyhow!(
+                "participant list is too large to hash: {} bytes of rendered JIDs",
+                arena.len()
+            ));
         }
         // Compare and hash over the bytes, not the `String`: indexing a `str`
         // re-checks a UTF-8 boundary at both ends of every probe, and the sort
