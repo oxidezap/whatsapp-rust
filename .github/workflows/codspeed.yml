@@ -124,6 +124,8 @@ jobs:
           key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
 
       - name: Bound apt and pre-install libc6-dbg
+        env:
+          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
         run: |
           sudo tee /etc/apt/apt.conf.d/99-ci-bounds > /dev/null <<'EOF'
           Acquire::Retries "3";
@@ -141,7 +143,14 @@ jobs:
           save_deb() {
             sudo cp /var/cache/apt/archives/libc6-dbg_*.deb "$cache"/ 2>/dev/null || true
           }
-          if sudo timeout 120 apt-get install -y libc6-dbg; then
+          # Pinned, because libc6-dbg carries `Depends: libc6 (= <version>)`:
+          # an unpinned install of a newer build pulls a libc6 upgrade with it,
+          # swapping the C library out from under benchmarks whose malloc
+          # tunables this workflow freezes for exactly that kind of stability.
+          # It would also cache a package the key, taken before the upgrade, no
+          # longer describes.
+          pinned="libc6-dbg=$LIBC6_VERSION"
+          if sudo timeout 120 apt-get install -y "$pinned"; then
             save_deb
             exit 0
           fi
@@ -149,13 +158,22 @@ jobs:
           # lines are what identify which mirror is responsible.
           for attempt in 1 2; do
             if sudo timeout 180 apt-get update -q \
-              && sudo timeout 120 apt-get install -y libc6-dbg; then
+              && sudo timeout 120 apt-get install -y "$pinned"; then
               save_deb
               exit 0
             fi
             echo "apt attempt $attempt failed"
             sleep 15
           done
+          # The pin is gone from the pool: the archive moved past the runner
+          # image and dropped the older build. Take the newer package anyway --
+          # the runner would install exactly the same thing, only after a
+          # multi-minute apt of its own -- but leave it out of the cache, where
+          # it would sit under a key it does not match and never install again.
+          if sudo timeout 120 apt-get install -y libc6-dbg; then
+            echo "::warning::installed a libc6-dbg newer than the image's libc6; not cached"
+            exit 0
+          fi
           echo "::warning::libc6-dbg pre-install gave up; the runner installs it itself"
 
       - name: Install tools (protoc, cargo-codspeed)
@@ -279,6 +297,8 @@ jobs:
           key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
 
       - name: Bound apt and pre-install libc6-dbg
+        env:
+          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
         run: |
           sudo tee /etc/apt/apt.conf.d/99-ci-bounds > /dev/null <<'EOF'
           Acquire::Retries "3";
@@ -296,7 +316,14 @@ jobs:
           save_deb() {
             sudo cp /var/cache/apt/archives/libc6-dbg_*.deb "$cache"/ 2>/dev/null || true
           }
-          if sudo timeout 120 apt-get install -y libc6-dbg; then
+          # Pinned, because libc6-dbg carries `Depends: libc6 (= <version>)`:
+          # an unpinned install of a newer build pulls a libc6 upgrade with it,
+          # swapping the C library out from under benchmarks whose malloc
+          # tunables this workflow freezes for exactly that kind of stability.
+          # It would also cache a package the key, taken before the upgrade, no
+          # longer describes.
+          pinned="libc6-dbg=$LIBC6_VERSION"
+          if sudo timeout 120 apt-get install -y "$pinned"; then
             save_deb
             exit 0
           fi
@@ -304,13 +331,22 @@ jobs:
           # lines are what identify which mirror is responsible.
           for attempt in 1 2; do
             if sudo timeout 180 apt-get update -q \
-              && sudo timeout 120 apt-get install -y libc6-dbg; then
+              && sudo timeout 120 apt-get install -y "$pinned"; then
               save_deb
               exit 0
             fi
             echo "apt attempt $attempt failed"
             sleep 15
           done
+          # The pin is gone from the pool: the archive moved past the runner
+          # image and dropped the older build. Take the newer package anyway --
+          # the runner would install exactly the same thing, only after a
+          # multi-minute apt of its own -- but leave it out of the cache, where
+          # it would sit under a key it does not match and never install again.
+          if sudo timeout 120 apt-get install -y libc6-dbg; then
+            echo "::warning::installed a libc6-dbg newer than the image's libc6; not cached"
+            exit 0
+          fi
           echo "::warning::libc6-dbg pre-install gave up; the runner installs it itself"
 
       - name: Install tools (protoc, cargo-codspeed)
