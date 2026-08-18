@@ -519,6 +519,13 @@ fn fft_rec(
     // Past the last split level the chain terminates in its prime base: the naive O(n^2) DFT.
     let Some(lvl) = tw.levels.get(depth) else {
         let n = tw.base_n;
+        if n <= 1 {
+            // A length-1 transform is the identity. `FftTwiddles::new(1)` splits nothing and builds
+            // no base table, so this must return before indexing one -- the guard the pre-plan
+            // recursion carried as its `n == 1` arm.
+            out[0] = x[0];
+            return;
+        }
         let bt = &tw.base;
         for k in 0..n {
             let mut acc = Cpx::zero();
@@ -1044,6 +1051,18 @@ mod tests {
     // The precomputed twiddle tables MUST reproduce the inline cos/sin to the bit, or the golden
     // checksum shifts. Assert every used (n, k, q) combine entry and (n, k, j) base entry equals the
     // inline recompute for both signs (forward = -1, backward = +1) at both FFT sizes (576, 512).
+    /// A length-1 transform is the identity, and its plan has no levels and no base table. The
+    /// depth-indexed recursion must return before indexing that empty table.
+    #[test]
+    fn fft_of_length_one_is_the_identity() {
+        let mut sc = FftScratch::new(1);
+        let input = [Cpx { re: 0.25, im: -0.5 }];
+        let mut out = [Cpx::zero()];
+        cfft(&input, &mut out, -1.0, &mut sc.arena, &sc.tw_fwd);
+        assert_eq!(out[0].re.to_bits(), input[0].re.to_bits());
+        assert_eq!(out[0].im.to_bits(), input[0].im.to_bits());
+    }
+
     #[test]
     fn twiddle_table_is_bit_exact() {
         for &top in &[PERCW_NFFT, 512usize] {

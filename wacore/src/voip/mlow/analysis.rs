@@ -1322,6 +1322,15 @@ pub mod stage_bench {
             .collect()
     }
 
+    /// One internal frame's pitch-estimator inputs, captured from the live encoder state after
+    /// `build_ltp_buf` has rolled that frame's perceptually weighted speech in -- which production
+    /// does before every `smpl_pitch` call. A frozen pair would fix the estimator's data-dependent
+    /// survivor blocks, so resetting the predictor alone would still measure one workload.
+    struct PitchInputs {
+        ltp_buf: Vec<f32>,
+        f2: [f32; SMPL_F_LEN],
+    }
+
     /// One internal frame's CELP inputs, captured from the live encoder state.
     #[derive(Default)]
     struct CelpInputs {
@@ -1374,6 +1383,8 @@ pub mod stage_bench {
         /// iteration, and the fixed-codebook search inside it is data-dependent -- it would settle
         /// on one pulse/survivor path and misreport the largest stage of the encoder.
         celp: Vec<CelpInputs>,
+        /// Pitch inputs, one set per internal frame. See [`PitchInputs`].
+        pitch: Vec<PitchInputs>,
         /// Entropy-coder inputs: analyzed params for a real frame, plus the encoder's own buffers.
         /// Analyzed parameters for each of the `STREAM` frames, and the cursor over them. One set
         /// would make the row re-serialize a single frame forever, and an entropy encode's cost
@@ -1457,6 +1468,7 @@ pub mod stage_bench {
                 intf_at: [0; Self::INTF_ROWS],
                 f2,
                 celp: Vec::new(),
+                pitch: Vec::new(),
                 fps,
                 fp_at: 0,
                 range: super::super::rangecoder::RangeEncoder::new(
@@ -1469,13 +1481,30 @@ pub mod stage_bench {
             let synth_t = load_smpl_synth_tables();
             let res_lead = SMPL_ORDER + SMPL_WINNEXT_WB_LEN;
             for f in 0..3 {
+                // This frame's own LPC power spectrum: production recomputes it per internal frame,
+                // and `smpl_pitch` reads it for harmonic strength.
+                let mut lpcbuf_f = [0f32; SMPL_LPC_BUF_LEN];
+                let start = SMPL_LPC_HIST_LEN - SMPL_LPC_PRE + f * SMPL_INTF_LEN;
+                lpcbuf_f.copy_from_slice(&s.es.hp_full[start..start + SMPL_LPC_BUF_LEN]);
+                let windowed_f = smpl_window_lpc20(&lpcbuf_f, f < 2);
+                let (_, f2_f) = smpl_lpc_analyze_with_f2(&windowed_f, &mut s.fft_scratch);
+
                 let perc_corrs: Vec<Vec<f32>> = s.with_ctx(f, [[0.0; 2]; SMPL_SUBFR_COUNT], |cs| {
                     compute_perc_corrs(cs).into()
+                });
+                // Roll this frame's weighted speech into `ltp_buf`, exactly as the analyzer does
+                // before each estimator call, then snapshot the pair the row replays.
+                s.with_ctx(f, [[0.0; 2]; SMPL_SUBFR_COUNT], |cs| {
+                    build_ltp_buf(cs, &perc_corrs);
+                });
+                s.pitch.push(PitchInputs {
+                    ltp_buf: s.es.ltp_buf.clone(),
+                    f2: f2_f,
                 });
                 let pr = super::super::smpl_pitch_enc::smpl_pitch(
                     &mut s.es.pitch_est,
                     &s.es.ltp_buf,
-                    &s.f2,
+                    &f2_f,
                     true,
                 );
                 let mut block_lags = [[0.0f32; 2]; SMPL_SUBFR_COUNT];
@@ -1622,13 +1651,15 @@ pub mod stage_bench {
         /// two conditional ones, and those take different candidate paths. Without the reset every
         /// timed call would be conditional and the x3 would not be a frame.
         pub fn pitch_search(&mut self) -> f32 {
-            if self.next_intf(Self::ROW_PITCH) == 0 {
+            let intf = self.next_intf(Self::ROW_PITCH);
+            if intf == 0 {
                 self.es.pitch_est.reset_cond();
             }
+            let inp = &self.pitch[intf];
             let pr = super::super::smpl_pitch_enc::smpl_pitch(
                 &mut self.es.pitch_est,
-                &self.es.ltp_buf,
-                &self.f2,
+                &inp.ltp_buf,
+                &inp.f2,
                 true,
             );
             pr.pitchcorr
