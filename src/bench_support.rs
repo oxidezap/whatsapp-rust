@@ -391,7 +391,7 @@ async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
         Some((1u32.into(), opk.public_key)),
         1u32.into(),
         spk.public_key,
-        signature.to_vec(),
+        signature,
         *receiver.identity_key(),
     )
     .expect("prekey bundle");
@@ -458,7 +458,7 @@ async fn establish_acknowledged_session(client: &Arc<Client>, peer: &Jid) {
         None,
         peer_snapshot.signed_pre_key_id.into(),
         peer_snapshot.signed_pre_key.public_key,
-        peer_snapshot.signed_pre_key_signature.to_vec(),
+        peer_snapshot.signed_pre_key_signature,
         IdentityKey::new(peer_snapshot.identity_key.public_key),
     )
     .expect("companion prekey bundle");

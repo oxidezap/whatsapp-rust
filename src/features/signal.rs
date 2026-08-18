@@ -764,7 +764,7 @@ mod tests {
             Some((7u32.into(), prekey.public_key)),
             9u32.into(),
             signed_prekey.public_key,
-            signature.to_vec(),
+            signature,
             *identity.identity_key(),
         )
         .expect("prekey bundle")

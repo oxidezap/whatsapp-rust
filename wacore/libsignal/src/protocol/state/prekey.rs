@@ -69,11 +69,26 @@ impl PreKeyRecord {
         }
     }
 
-    pub fn deserialize(data: &[u8]) -> Result<Self> {
-        let mut pre_key = waproto::codec::pre_key_record_decode(data)
-            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+    /// Adopt a record structure the caller already owns.
+    ///
+    /// Reusing its buffers is the whole point: a store read that decodes a
+    /// structure and then rebuilds the record through [`new`](Self::new)
+    /// re-allocates both key fields and drops the originals, for two 32-byte
+    /// copies that change nothing. The stored public key is normalized to the
+    /// raw 32-byte form exactly as [`deserialize`](Self::deserialize) does, so a
+    /// row written before 0.7.0 reads back identical to a freshly built record.
+    ///
+    /// The key bytes are not parsed here. A caller that must reject a malformed
+    /// structure validates it through [`key_pair`](Self::key_pair) first.
+    pub fn from_storage(mut pre_key: PreKeyRecordStructure) -> Self {
         super::normalize_stored_public_key(&mut pre_key.public_key);
-        Ok(Self { pre_key })
+        Self { pre_key }
+    }
+
+    pub fn deserialize(data: &[u8]) -> Result<Self> {
+        let pre_key = waproto::codec::pre_key_record_decode(data)
+            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+        Ok(Self::from_storage(pre_key))
     }
 
     pub fn id(&self) -> Result<PreKeyId> {

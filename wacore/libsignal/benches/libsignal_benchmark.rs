@@ -256,7 +256,7 @@ struct User {
     signed_prekey_id: SignedPreKeyId,
     prekey_pair: KeyPair,
     signed_prekey_pair: KeyPair,
-    signed_prekey_signature: Vec<u8>,
+    signed_prekey_signature: [u8; 64],
 }
 
 impl User {
@@ -318,7 +318,7 @@ impl User {
             signed_prekey_id,
             prekey_pair,
             signed_prekey_pair,
-            signed_prekey_signature: signed_prekey_signature.to_vec(),
+            signed_prekey_signature,
         }
     }
 
@@ -329,7 +329,7 @@ impl User {
             Some((self.prekey_id, self.prekey_pair.public_key)),
             self.signed_prekey_id,
             self.signed_prekey_pair.public_key,
-            self.signed_prekey_signature.clone(),
+            self.signed_prekey_signature,
             *self.identity_store.identity_key_pair.identity_key(),
         )
         .expect("valid bundle")

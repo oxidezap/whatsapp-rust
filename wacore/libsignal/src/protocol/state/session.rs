@@ -1225,16 +1225,23 @@ impl SessionRecord {
             .map(|msg_len| 1 + varint_len(msg_len as u64) + msg_len)
             .unwrap_or(0);
 
-        let mut previous_msg_lens = Vec::with_capacity(self.previous_sessions.len());
-        let previous_len: usize = self
-            .previous_sessions
-            .iter()
-            .map(|s| {
-                let msg_len = s.compute_size(&mut cache) as usize;
-                previous_msg_lens.push(msg_len);
-                1 + varint_len(msg_len as u64) + msg_len
-            })
-            .sum();
+        // Sizing pass for the archived states. Their encoded lengths are needed
+        // twice (to reserve, then to write each length prefix), and a scratch
+        // `Vec` for them allocated on every flush. `previous_sessions` holds 0
+        // to 3 states in the common case, so the lengths land in a stack array
+        // and only a deep archive falls back to the heap.
+        const INLINE_PREVIOUS_LENS: usize = 8;
+        let mut inline_msg_lens = [0usize; INLINE_PREVIOUS_LENS];
+        let mut spilled_msg_lens: Vec<usize> = Vec::new();
+        let mut previous_len = 0usize;
+        for (i, session) in self.previous_sessions.iter().enumerate() {
+            let msg_len = session.compute_size(&mut cache) as usize;
+            previous_len += 1 + varint_len(msg_len as u64) + msg_len;
+            match inline_msg_lens.get_mut(i) {
+                Some(slot) => *slot = msg_len,
+                None => spilled_msg_lens.push(msg_len),
+            }
+        }
 
         let reserved = self.lease.ceiling();
         let incarnation = incarnation.filter(|_| reserved > 0);
@@ -1255,7 +1262,11 @@ impl SessionRecord {
         {
             write_len_delimited(1, &state.session, msg_len, &mut cache, buf);
         }
-        for (session, msg_len) in self.previous_sessions.iter().zip(previous_msg_lens) {
+        for (i, session) in self.previous_sessions.iter().enumerate() {
+            let msg_len = match inline_msg_lens.get(i) {
+                Some(msg_len) => *msg_len,
+                None => spilled_msg_lens[i - INLINE_PREVIOUS_LENS],
+            };
             write_len_delimited(2, session, msg_len, &mut cache, buf);
         }
         if reserved > 0 {

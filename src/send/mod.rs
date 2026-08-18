@@ -5896,7 +5896,7 @@ mod tests {
                     Some((1u32.into(), opk.public_key)),
                     1u32.into(),
                     spk.public_key,
-                    sig.to_vec(),
+                    sig,
                     *receiver.identity_key(),
                 )
             })
@@ -6113,7 +6113,7 @@ mod tests {
                     Some((1u32.into(), opk.public_key)),
                     1u32.into(),
                     spk.public_key,
-                    sig.to_vec(),
+                    sig,
                     *receiver.identity_key(),
                 )
             })
