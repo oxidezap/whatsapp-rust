@@ -13,7 +13,6 @@
 
 use crate::protocol::{
     KeyPair, PreKeyRecord, PrivateKey, PublicKey, SignalProtocolError, SignedPreKeyRecord,
-    Timestamp,
 };
 use chrono::Utc;
 use waproto::whatsapp as wa;
@@ -75,26 +74,28 @@ pub fn new_signed_pre_key_record(
 }
 
 pub fn prekey_structure_to_record(
-    structure: wa::PreKeyRecordStructure,
+    mut structure: wa::PreKeyRecordStructure,
 ) -> Result<PreKeyRecord, SignalProtocolError> {
-    let id = structure.id.unwrap_or(0).into();
-    let public_key = PublicKey::from_stored_public_key_bytes(
+    // The parsed keys are dropped again: they exist to reject a malformed
+    // structure, not to rebuild one. Rebuilding is what this used to do, and it
+    // re-allocated both key fields from the keys it had just parsed out of the
+    // buffers the caller already owned -- two allocations per prekey read, on
+    // the path every PreKeySignalMessage decrypt takes.
+    PublicKey::from_stored_public_key_bytes(
         structure
             .public_key
             .as_ref()
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?
             .as_slice(),
     )?;
-    let private_key = PrivateKey::deserialize(
+    PrivateKey::deserialize(
         structure
             .private_key
             .as_ref()
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?,
     )?;
-    Ok(PreKeyRecord::new(
-        id,
-        &KeyPair::new(public_key, private_key),
-    ))
+    structure.id = Some(structure.id.unwrap_or(0));
+    Ok(PreKeyRecord::from_storage(structure))
 }
 
 pub fn prekey_record_to_structure(
@@ -108,31 +109,31 @@ pub fn prekey_record_to_structure(
 }
 
 pub fn signed_prekey_structure_to_record(
-    structure: wa::SignedPreKeyRecordStructure,
+    mut structure: wa::SignedPreKeyRecordStructure,
 ) -> Result<SignedPreKeyRecord, SignalProtocolError> {
-    let id = structure.id.unwrap_or(0).into();
-    let public_key = PublicKey::from_stored_public_key_bytes(
+    // Same shape as `prekey_structure_to_record`: validate, then adopt. The
+    // rebuild it replaces copied both keys and the 64-byte signature.
+    PublicKey::from_stored_public_key_bytes(
         structure
             .public_key
             .as_ref()
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?
             .as_slice(),
     )?;
-    let private_key = PrivateKey::deserialize(
+    PrivateKey::deserialize(
         structure
             .private_key
             .as_ref()
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?,
     )?;
-    let key_pair = KeyPair::new(public_key, private_key);
-    let signature = structure
-        .signature
-        .as_ref()
-        .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
-    let timestamp = Timestamp::from_epoch_millis(structure.timestamp.unwrap_or(0));
+    if structure.signature.is_none() {
+        return Err(SignalProtocolError::InvalidProtobufEncoding);
+    }
+    structure.id = Some(structure.id.unwrap_or(0));
+    structure.timestamp = Some(structure.timestamp.unwrap_or(0));
     Ok(
-        <SignedPreKeyRecord as crate::protocol::GenericSignedPreKey>::new(
-            id, timestamp, &key_pair, signature,
+        <SignedPreKeyRecord as crate::protocol::GenericSignedPreKey>::from_stored_structure(
+            structure,
         ),
     )
 }
@@ -143,7 +144,7 @@ pub fn signed_prekey_structure_to_record(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use crate::protocol::{GenericSignedPreKey, KeyPair, PreKeyRecord};
+    use crate::protocol::{GenericSignedPreKey, KeyPair, PreKeyRecord, Timestamp};
     use rand::Rng;
 
     #[test]

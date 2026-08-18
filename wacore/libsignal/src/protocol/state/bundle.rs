@@ -8,15 +8,24 @@ use std::clone::Clone;
 use crate::protocol::state::{PreKeyId, SignedPreKeyId};
 use crate::protocol::{DeviceId, IdentityKey, PublicKey, Result, SignalProtocolError};
 
+/// Length of the XEdDSA signature over a signed pre-key. Fixed by the curve, so
+/// the bundle stores it inline: a `Vec` here cost one allocation per bundle and
+/// another per clone, for 64 bytes that can never be any other size.
+pub const SIGNED_PRE_KEY_SIGNATURE_LEN: usize = 64;
+
 #[derive(Clone)]
 struct SignedPreKey {
     id: SignedPreKeyId,
     public_key: PublicKey,
-    signature: Vec<u8>,
+    signature: [u8; SIGNED_PRE_KEY_SIGNATURE_LEN],
 }
 
 impl SignedPreKey {
-    fn new(id: SignedPreKeyId, public_key: PublicKey, signature: Vec<u8>) -> Self {
+    fn new(
+        id: SignedPreKeyId,
+        public_key: PublicKey,
+        signature: [u8; SIGNED_PRE_KEY_SIGNATURE_LEN],
+    ) -> Self {
         Self {
             id,
             public_key,
@@ -49,7 +58,7 @@ impl From<PreKeyBundle> for PreKeyBundleContent {
             pre_key_public: bundle.pre_key_public,
             ec_pre_key_id: Some(bundle.ec_signed_pre_key.id),
             ec_pre_key_public: Some(bundle.ec_signed_pre_key.public_key),
-            ec_pre_key_signature: Some(bundle.ec_signed_pre_key.signature),
+            ec_pre_key_signature: Some(bundle.ec_signed_pre_key.signature.to_vec()),
             identity_key: Some(bundle.identity_key),
         }
     }
@@ -100,15 +109,47 @@ pub struct PreKeyBundle {
 }
 
 impl PreKeyBundle {
+    /// `signed_pre_key_signature` is anything that converts into the fixed
+    /// 64-byte signature: a `[u8; 64]` straight off `calculate_signature` passes
+    /// through with no allocation, while a `Vec<u8>` from a store row is checked
+    /// and rejected if it is not exactly 64 bytes.
     pub fn new(
         registration_id: u32,
         device_id: DeviceId,
         pre_key: Option<(PreKeyId, PublicKey)>,
         signed_pre_key_id: SignedPreKeyId,
         signed_pre_key_public: PublicKey,
-        signed_pre_key_signature: Vec<u8>,
+        signed_pre_key_signature: impl TryInto<[u8; SIGNED_PRE_KEY_SIGNATURE_LEN]>,
         identity_key: IdentityKey,
     ) -> Result<Self> {
+        let signature = signed_pre_key_signature.try_into().map_err(|_| {
+            SignalProtocolError::InvalidArgument(format!(
+                "signed_pre_key_signature must be {SIGNED_PRE_KEY_SIGNATURE_LEN} bytes"
+            ))
+        })?;
+        // The conversion is the only generic part; the rest stays out of line so
+        // each argument type costs one thin wrapper rather than a second copy of
+        // the constructor.
+        Ok(Self::assemble(
+            registration_id,
+            device_id,
+            pre_key,
+            signed_pre_key_id,
+            signed_pre_key_public,
+            signature,
+            identity_key,
+        ))
+    }
+
+    fn assemble(
+        registration_id: u32,
+        device_id: DeviceId,
+        pre_key: Option<(PreKeyId, PublicKey)>,
+        signed_pre_key_id: SignedPreKeyId,
+        signed_pre_key_public: PublicKey,
+        signed_pre_key_signature: [u8; SIGNED_PRE_KEY_SIGNATURE_LEN],
+        identity_key: IdentityKey,
+    ) -> Self {
         let (pre_key_id, pre_key_public) = match pre_key {
             None => (None, None),
             Some((id, key)) => (Some(id), Some(key)),
@@ -120,14 +161,14 @@ impl PreKeyBundle {
             signed_pre_key_signature,
         );
 
-        Ok(Self {
+        Self {
             registration_id,
             device_id,
             pre_key_id,
             pre_key_public,
             ec_signed_pre_key,
             identity_key,
-        })
+        }
     }
 
     pub fn registration_id(&self) -> Result<u32> {
@@ -155,7 +196,7 @@ impl PreKeyBundle {
     }
 
     pub fn signed_pre_key_signature(&self) -> Result<&[u8]> {
-        Ok(self.ec_signed_pre_key.signature.as_ref())
+        Ok(&self.ec_signed_pre_key.signature)
     }
 
     pub fn identity_key(&self) -> Result<&IdentityKey> {

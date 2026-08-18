@@ -1480,7 +1480,7 @@ impl Client {
             prekey_data,
             signed_prekey.id.into(),
             skey_public,
-            skey_signature.into(),
+            skey_signature,
             identity_key.into(),
         )?;
 

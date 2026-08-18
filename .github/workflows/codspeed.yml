@@ -34,6 +34,12 @@ jobs:
   benchmarks:
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
+    # The slowest shard finishes in ~13min. The cap exists because the CodSpeed
+    # runner shells out to apt with no timeout of its own, so a stalled archive
+    # leaves the job producing no output until the GitHub default of 6h -- which
+    # is what happened on 2026-08-18, when shards ran for two hours without
+    # executing a single benchmark.
+    timeout-minutes: 25
     strategy:
       # One shard failing must not cancel the other: CodSpeed merges shards
       # into a single run, and a cancelled shard leaves it incomplete.
@@ -78,6 +84,46 @@ jobs:
         with:
           toolchain: nightly-2026-06-16
 
+      # The CodSpeed runner installs its patched valgrind with a bare
+      # `apt-get update && apt-get install`, and it buffers that command's
+      # output, printing it only on failure -- so a stalled mirror or a held
+      # dpkg lock reads as a step that emits nothing and never returns. Two
+      # things follow from that, and this step does both.
+      #
+      # Bound apt globally: the config file applies to the runner's own
+      # invocation too, turning an unbounded wait into a bounded failure.
+      #
+      # Pre-install libc6-dbg: the runner's instrument cache restores valgrind's
+      # *files*, but its readiness check also runs `dpkg -s libc6-dbg`, which a
+      # file-level restore never satisfies, so every job fell through to a full
+      # network install. Having the package installed for real is what lets that
+      # check pass and the cached valgrind be used without touching apt at all.
+      #
+      # The budgets nest, and the order matters: apt's own limits are meant to
+      # fire first and `timeout` is only the backstop for the case they cannot
+      # see, which is a transfer that keeps trickling bytes. Hence 180s over a
+      # 60s lock wait and a ~80s worst case per index file. A degraded-but-
+      # working archive took up to 263s here on 2026-08-18, so this step must
+      # not be the thing that fails the job -- if it gives up, the runner still
+      # installs the package itself, now bounded by the same config.
+      - name: Bound apt and pre-install libc6-dbg
+        run: |
+          sudo tee /etc/apt/apt.conf.d/99-ci-bounds > /dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          DPkg::Lock::Timeout "60";
+          EOF
+          for attempt in 1 2; do
+            if sudo timeout 180 apt-get update -qq \
+              && sudo timeout 180 apt-get install -y -qq libc6-dbg; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed"
+            sleep 15
+          done
+          echo "::warning::libc6-dbg pre-install gave up; the runner installs it itself"
+
       - name: Install tools (protoc, cargo-codspeed)
         uses: taiki-e/install-action@v2
         with:
@@ -101,8 +147,14 @@ jobs:
 
       # Both instruments run serially in a single invocation so each
       # benchmark uploads as one run carrying CPU and memory metrics.
+      #
+      # v5 weights each instruction by its estimated cycle cost rather than
+      # charging every instruction the same, so the simulation metric changes
+      # scale: expect a one-time step across every series at the first run on
+      # this action, and read the PR right after the bump against the new
+      # baseline, not the old one. `cycle-estimation: false` reverts it.
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+        uses: CodSpeedHQ/action@v5
         env:
           SHARD_PACKAGES: ${{ matrix.shard.packages }}
         with:
@@ -153,6 +205,46 @@ jobs:
         with:
           toolchain: nightly-2026-06-16
 
+      # The CodSpeed runner installs its patched valgrind with a bare
+      # `apt-get update && apt-get install`, and it buffers that command's
+      # output, printing it only on failure -- so a stalled mirror or a held
+      # dpkg lock reads as a step that emits nothing and never returns. Two
+      # things follow from that, and this step does both.
+      #
+      # Bound apt globally: the config file applies to the runner's own
+      # invocation too, turning an unbounded wait into a bounded failure.
+      #
+      # Pre-install libc6-dbg: the runner's instrument cache restores valgrind's
+      # *files*, but its readiness check also runs `dpkg -s libc6-dbg`, which a
+      # file-level restore never satisfies, so every job fell through to a full
+      # network install. Having the package installed for real is what lets that
+      # check pass and the cached valgrind be used without touching apt at all.
+      #
+      # The budgets nest, and the order matters: apt's own limits are meant to
+      # fire first and `timeout` is only the backstop for the case they cannot
+      # see, which is a transfer that keeps trickling bytes. Hence 180s over a
+      # 60s lock wait and a ~80s worst case per index file. A degraded-but-
+      # working archive took up to 263s here on 2026-08-18, so this step must
+      # not be the thing that fails the job -- if it gives up, the runner still
+      # installs the package itself, now bounded by the same config.
+      - name: Bound apt and pre-install libc6-dbg
+        run: |
+          sudo tee /etc/apt/apt.conf.d/99-ci-bounds > /dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          DPkg::Lock::Timeout "60";
+          EOF
+          for attempt in 1 2; do
+            if sudo timeout 180 apt-get update -qq \
+              && sudo timeout 180 apt-get install -y -qq libc6-dbg; then
+              exit 0
+            fi
+            echo "apt attempt $attempt failed"
+            sleep 15
+          done
+          echo "::warning::libc6-dbg pre-install gave up; the runner installs it itself"
+
       - name: Install tools (protoc, cargo-codspeed)
         uses: taiki-e/install-action@v2
         with:
@@ -192,7 +284,7 @@ jobs:
       # workspace default-member, so a bare `cargo codspeed run` discovers no
       # benchmarks for it ("No benchmarks found for the simulation mode").
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+        uses: CodSpeedHQ/action@v5
         env:
           MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
           RUST_LOG: warn

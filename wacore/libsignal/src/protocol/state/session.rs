@@ -1225,16 +1225,23 @@ impl SessionRecord {
             .map(|msg_len| 1 + varint_len(msg_len as u64) + msg_len)
             .unwrap_or(0);
 
-        let mut previous_msg_lens = Vec::with_capacity(self.previous_sessions.len());
-        let previous_len: usize = self
-            .previous_sessions
-            .iter()
-            .map(|s| {
-                let msg_len = s.compute_size(&mut cache) as usize;
-                previous_msg_lens.push(msg_len);
-                1 + varint_len(msg_len as u64) + msg_len
-            })
-            .sum();
+        // Sizing pass for the archived states. Their encoded lengths are needed
+        // twice (to reserve, then to write each length prefix), and a scratch
+        // `Vec` for them allocated on every flush. `previous_sessions` holds 0
+        // to 3 states in the common case, so the lengths land in a stack array
+        // and only a deep archive falls back to the heap.
+        const INLINE_PREVIOUS_LENS: usize = 8;
+        let mut inline_msg_lens = [0usize; INLINE_PREVIOUS_LENS];
+        let mut spilled_msg_lens: Vec<usize> = Vec::new();
+        let mut previous_len = 0usize;
+        for (i, session) in self.previous_sessions.iter().enumerate() {
+            let msg_len = session.compute_size(&mut cache) as usize;
+            previous_len += 1 + varint_len(msg_len as u64) + msg_len;
+            match inline_msg_lens.get_mut(i) {
+                Some(slot) => *slot = msg_len,
+                None => spilled_msg_lens.push(msg_len),
+            }
+        }
 
         let reserved = self.lease.ceiling();
         let incarnation = incarnation.filter(|_| reserved > 0);
@@ -1255,7 +1262,11 @@ impl SessionRecord {
         {
             write_len_delimited(1, &state.session, msg_len, &mut cache, buf);
         }
-        for (session, msg_len) in self.previous_sessions.iter().zip(previous_msg_lens) {
+        for (i, session) in self.previous_sessions.iter().enumerate() {
+            let msg_len = match inline_msg_lens.get(i) {
+                Some(msg_len) => *msg_len,
+                None => spilled_msg_lens[i - INLINE_PREVIOUS_LENS],
+            };
             write_len_delimited(2, session, msg_len, &mut cache, buf);
         }
         if reserved > 0 {
@@ -2117,6 +2128,55 @@ mod tests {
         .encode_to_vec();
 
         assert_eq!(record.serialize().unwrap(), expected);
+    }
+
+    /// `serialize_into_inner` keeps the first few archived lengths in a stack
+    /// array and puts the rest in a heap spill indexed off that capacity, so an
+    /// archive deep enough to spill can emit a length prefix belonging to a
+    /// different session. The sizes have to differ per session for that to show
+    /// up in the bytes at all: a list of equal-sized sessions encodes
+    /// identically no matter which length each prefix is taken from.
+    #[test]
+    fn test_session_record_manual_encoding_matches_generated_past_inline_lengths() {
+        let current = make_cache_shape_session(1, 3, 2);
+        let previous_sessions: Vec<SessionStructure> = (0..20u8)
+            .map(|idx| {
+                make_cache_shape_session(
+                    7u8.wrapping_mul(idx).wrapping_add(11),
+                    (idx % 4) as usize,
+                    (idx % 5) as usize,
+                )
+            })
+            .collect();
+
+        // Guard the premise: neighbouring sessions must encode to different
+        // lengths, or this test cannot fail on a mis-indexed spill.
+        let lengths: Vec<usize> = previous_sessions
+            .iter()
+            .map(|s| s.encode_to_vec().len())
+            .collect();
+        assert!(
+            lengths.windows(2).any(|w| w[0] != w[1]),
+            "sessions must vary in encoded length: {lengths:?}"
+        );
+
+        let record = SessionRecord {
+            current_session: Some(SessionState::from_session_structure(current.clone())),
+            previous_sessions: Arc::new(previous_sessions.clone()),
+            lease: CounterLease::default(),
+        };
+        let expected = waproto::whatsapp::RecordStructure {
+            current_session: MessageField::some(current),
+            previous_sessions,
+        }
+        .encode_to_vec();
+
+        assert_eq!(record.serialize().unwrap(), expected);
+
+        // Round-trip too, so a length prefix that is self-consistent but wrong
+        // still surfaces as reordered or corrupted sessions.
+        let restored = SessionRecord::deserialize(&expected).unwrap();
+        assert_eq!(restored.previous_session_count(), 20);
     }
 
     #[test]

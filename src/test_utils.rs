@@ -351,7 +351,7 @@ pub async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
             Some((1u32.into(), opk.public_key)),
             1u32.into(),
             spk.public_key,
-            signature.to_vec(),
+            signature,
             *receiver.identity_key(),
         )
     })
