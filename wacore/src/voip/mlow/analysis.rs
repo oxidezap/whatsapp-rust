@@ -1292,6 +1292,18 @@ fn smpl_voiced_candidate(
 /// `run_*` bodies then execute is per-frame work only -- what production pays every 60 ms, never what
 /// it resolves once and holds. The per-frame multiplicity of each stage is on its method.
 ///
+/// KNOWN LIMITATION, measured rather than assumed. The stateful rows advance the same cross-frame
+/// state production advances (perc history, pitch predictor, CELP ACB/ZIR, bitrate controller) while
+/// replaying a fixed three-frame input cycle, so a row's regime is its own history rather than a live
+/// call's. `stage_rows_are_three_periodic` pins the result: `pitch_search` and `perc_model_frame` are
+/// EXACTLY 3-periodic from the first iteration, so for them the question does not arise.
+/// `celp_subframes_frame` is not -- its pulse counts wander (28,19,31,... early vs 26,16,33,... after
+/// 20 iterations) because the excitation history keeps evolving against a repeating residual. Its
+/// timing spread stays inside 1%, so the cost is dominated by the fixed-size beam search rather than
+/// the exact pulse count, but that row is a steady-state estimate and not a reproduction of one
+/// production frame. `analyze_frame` has no such caveat -- it drives the real encoder over eight
+/// cycling frames -- which is why the stage rows are reported against it rather than summed alone.
+///
 /// Not a consumer API: it exists so the benchmark can attribute codec CPU. Unlike the SRTP
 /// primitives -- which are production code that merely stays `#[doc(hidden)]` -- this module is pure
 /// bench scaffolding, so it is behind the `bench-internals` feature and compiles into nothing for a
@@ -1320,6 +1332,16 @@ pub mod stage_bench {
         (0..SMPL_INTF_LEN * 3)
             .map(|i| 0.3 * (((i + phase) as f32) * 0.07).sin())
             .collect()
+    }
+
+    /// One internal frame's LSF-quantizer inputs. Production derives `a`/NLSF anew per internal
+    /// frame and threads the previous frame's committed envelope; `lsf_quant_core` has an
+    /// input-dependent early exit (`abs_qerr < 0.25`), so frozen values would fix how many
+    /// refinement iterations run.
+    struct LsfInputs {
+        a: [f32; SMPL_LPC_ORDER + 1],
+        nlsf: [f32; SMPL_LPC_ORDER],
+        prev_nlsf: Vec<f32>,
     }
 
     /// One internal frame's pitch-estimator inputs, captured from the live encoder state after
@@ -1368,9 +1390,7 @@ pub mod stage_bench {
         /// inf, changing what it measures.
         fft576_out: Vec<f32>,
         fft576_scratch: FftScratch,
-        /// LSF-quantizer inputs.
-        a: [f32; SMPL_LPC_ORDER + 1],
-        nlsf: [f32; SMPL_LPC_ORDER],
+        /// Threaded across the capture loop; the LSF row reads its per-frame copy from `lsf`.
         prev_lsfq: Vec<f32>,
         prev_nlsf: Vec<f32>,
         /// Per-row cursors over the internal-frame index. Every stage that production runs once per
@@ -1389,6 +1409,8 @@ pub mod stage_bench {
         celp: Vec<CelpInputs>,
         /// Pitch inputs, one set per internal frame. See [`PitchInputs`].
         pitch: Vec<PitchInputs>,
+        /// LSF inputs, one set per internal frame. See [`LsfInputs`].
+        lsf: Vec<LsfInputs>,
         /// Entropy-coder inputs: analyzed params for a real frame, plus the encoder's own buffers.
         /// Analyzed parameters for each of the `STREAM` frames, and the cursor over them. One set
         /// would make the row re-serialize a single frame forever, and an entropy encode's cost
@@ -1445,8 +1467,9 @@ pub mod stage_bench {
             let mut fft576_spec = vec![0.0f32; PERCW_NFFT];
             let fft576_out = vec![0.0f32; PERCW_NFFT];
             rfft_forward_ordered_sc(&fft576_time, &mut fft576_spec, &mut fft576_scratch);
-            let (a, f2) = smpl_lpc_analyze_with_f2(&windowed, &mut fft_scratch);
-            let nlsf = smpl_a2nlsf_16(&a);
+            // `f2` seeds the ctx's voicing-classifier input; the per-frame `a`/NLSF the LSF and
+            // CELP rows need are captured in the per-frame loop below.
+            let (_, f2) = smpl_lpc_analyze_with_f2(&windowed, &mut fft_scratch);
 
             let prev_lsfq = es.prev_lsfq.clone();
             let prev_nlsf = prev_lsfq.clone();
@@ -1465,14 +1488,13 @@ pub mod stage_bench {
                 fft576_spec,
                 fft576_out,
                 fft576_scratch,
-                a,
-                nlsf,
                 prev_lsfq,
                 prev_nlsf,
                 intf_at: [0; Self::INTF_ROWS],
                 f2,
                 celp: Vec::new(),
                 pitch: Vec::new(),
+                lsf: Vec::new(),
                 fps,
                 fp_at: 0,
                 range: super::super::rangecoder::RangeEncoder::new(
@@ -1484,6 +1506,8 @@ pub mod stage_bench {
             // frame's own offset, so the row's inputs vary with the index it cycles.
             let synth_t = load_smpl_synth_tables();
             let res_lead = SMPL_ORDER + SMPL_WINNEXT_WB_LEN;
+            // The committed envelope threads forward: frame f's `brec` is frame f+1's `prev_nlsf`.
+            let mut prev_committed = s.prev_nlsf.clone();
             for f in 0..3 {
                 // This frame's own LPC power spectrum: production recomputes it per internal frame,
                 // and `smpl_pitch` reads it for harmonic strength.
@@ -1524,7 +1548,13 @@ pub mod stage_bench {
                     prev_voiced: s.es.prev_voiced,
                     intf: f,
                 };
-                let (_, _, brec, _) = fe.quantize(synth_t, 1, &s.prev_nlsf);
+                s.lsf.push(LsfInputs {
+                    a: a_f,
+                    nlsf: nlsf_f,
+                    prev_nlsf: prev_committed.clone(),
+                });
+                let (_, _, brec, _) = fe.quantize(synth_t, 1, &prev_committed);
+                prev_committed = brec.clone();
                 let (predcoefs, _) =
                     super::super::smpl_lpc::smpl_lpc_interpol(&brec, &s.prev_lsfq, smpl_nlsf2a);
                 // The residual window for frame `f`, with its 32-sample CELP pre-lead.
@@ -1683,14 +1713,15 @@ pub mod stage_bench {
         /// measures the same work every time.
         pub fn lsf_quantize(&mut self) -> f32 {
             let intf = self.next_intf(Self::ROW_LSF);
+            let inp = &self.lsf[intf];
             let fe = FrontEndLsf {
-                a: self.a,
-                nlsf: self.nlsf,
+                a: inp.a,
+                nlsf: inp.nlsf,
                 prev_lsfq: &self.prev_lsfq,
                 prev_voiced: true,
                 intf,
             };
-            let (grid, _, _, predcoef) = fe.quantize(load_smpl_synth_tables(), 1, &self.prev_nlsf);
+            let (grid, _, _, predcoef) = fe.quantize(load_smpl_synth_tables(), 1, &inp.prev_nlsf);
             predcoef[1] + grid as f32
         }
 
@@ -1742,6 +1773,34 @@ pub mod stage_bench {
             super::super::encode::encode_smpl_frame_into(fp, &mut self.range, &mut self.out)
                 .expect("analyzed params encode");
             self.out.len()
+        }
+    }
+}
+
+#[cfg(all(test, feature = "bench-internals"))]
+mod stage_bench_tests {
+    use super::stage_bench::Stages;
+
+    /// The two rows whose inputs are fully captured must repeat with period 3 -- one packet -- so
+    /// their measured cost is a property of the frame index, not of how long divan happened to run.
+    /// `celp_subframes_frame` is deliberately excluded: its excitation state keeps evolving against
+    /// the replayed residual, which the module doc records as a known limitation.
+    #[test]
+    fn stage_rows_are_three_periodic() {
+        let mut s = Stages::new();
+        let pitch: Vec<u32> = (0..12).map(|_| s.pitch_search().to_bits()).collect();
+        let perc: Vec<u32> = (0..12).map(|_| s.perc_corrs_frame().to_bits()).collect();
+        for i in 3..12 {
+            assert_eq!(
+                pitch[i],
+                pitch[i - 3],
+                "pitch_search drifted at iteration {i}"
+            );
+            assert_eq!(
+                perc[i],
+                perc[i - 3],
+                "perc_model_frame drifted at iteration {i}"
+            );
         }
     }
 }
