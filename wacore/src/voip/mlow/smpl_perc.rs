@@ -475,7 +475,11 @@ pub(crate) struct FftScratch {
     tw_fwd: FftTwiddles, // sign = -1.0
     tw_bwd: FftTwiddles, // sign = +1.0
     #[cfg(any(test, feature = "mlow-fast-fft", feature = "bench-internals"))]
-    split: SplitFft,
+    /// Built on first use, not at construction: under `bench-internals` the split path is compiled
+    /// but not dispatched to, and an eagerly built plan showed up as ~57 KB of extra live memory
+    /// per encoder (two `FftScratch`, 512 and 576) on every CodSpeed Memory row that merely encodes
+    /// -- a cost the measured rows do not actually pay. Lazy keeps it on the `*_split` rows alone.
+    split: Option<SplitFft>,
 }
 
 impl FftScratch {
@@ -488,7 +492,7 @@ impl FftScratch {
             tw_fwd: FftTwiddles::new(n, -1.0),
             tw_bwd: FftTwiddles::new(n, 1.0),
             #[cfg(any(test, feature = "mlow-fast-fft", feature = "bench-internals"))]
-            split: SplitFft::new(n),
+            split: None,
         }
     }
 }
@@ -711,7 +715,7 @@ pub(crate) fn rfft_forward_ordered_split_sc(time: &[f32], f: &mut [f32], sc: &mu
     debug_assert!(f.len() == n);
     debug_assert!(n >= 2 && n.is_multiple_of(2));
     let m = n / 2;
-    let sp = &mut sc.split;
+    let sp = sc.split.get_or_insert_with(|| SplitFft::new(n));
     // z[j] = x[2j] + i*x[2j+1]: even samples into the real part, odd into the imaginary.
     for (z, pair) in sp.z.iter_mut().zip(time.chunks_exact(2)) {
         z.re = pair[0];
@@ -749,7 +753,7 @@ pub(crate) fn rfft_backward_ordered_split_sc(f: &[f32], time: &mut [f32], sc: &m
     debug_assert!(time.len() == n);
     debug_assert!(n >= 2 && n.is_multiple_of(2));
     let m = n / 2;
-    let sp = &mut sc.split;
+    let sp = sc.split.get_or_insert_with(|| SplitFft::new(n));
     // Invert the forward recombination: Z[k] = E[k] + i*O[k] with
     //   E[k] = (X[k] + conj(X[m-k])) / 2      O[k] = conj(W_n^k) * (X[k] - conj(X[m-k])) / 2
     // k = 0 pairs DC with Nyquist, which the ordered layout keeps in f[0] and f[1].
@@ -1450,6 +1454,27 @@ mod tests {
         }
     }
 
+    /// Pins the laziness of the split plan. `bench-internals` compiles the split path without
+    /// dispatching to it, so building the plan in `FftScratch::new` charged every benchmark that
+    /// merely encodes for a plan it never used -- measured on CodSpeed's Memory instrument as
+    /// +56.6 KB for one encoder and +113.2 KB for two, which is exactly the two `FftScratch`
+    /// (n=512 and n=576) each encoder holds.
+    #[test]
+    fn split_plan_is_not_built_by_the_reference_path() {
+        let mut sc = FftScratch::new(PERCW_NFFT);
+        let x = vec![0.0f32; PERCW_NFFT];
+        let mut f = vec![0.0f32; PERCW_NFFT];
+        rfft_forward_ordered_ref_sc(&x, &mut f, &mut sc);
+        let mut t = vec![0.0f32; PERCW_NFFT];
+        rfft_backward_ordered_ref_sc(&f, &mut t, &mut sc);
+        assert!(
+            sc.split.is_none(),
+            "the reference path built the split plan; the Memory rows pay for it again"
+        );
+        rfft_forward_ordered_split_sc(&x, &mut f, &mut sc);
+        assert!(sc.split.is_some(), "the split path did not build its plan");
+    }
+
     /// The split path must satisfy the same unnormalized round-trip identity as the reference:
     /// BACKWARD(FORWARD(x)) = n*x.
     #[test]
@@ -1480,7 +1505,9 @@ mod tests {
         let mut s: u32 = 12345;
         for v in x.iter_mut() {
             s = s.wrapping_mul(196314165).wrapping_add(907633515);
-            *v = ((s >> 9) as f32 / (1u32 << 23) as f32) - 1.0;
+            // `>> 8` spans 0..2^24 for a zero-mean [-1, 1); `>> 9` only reached [-1, 0), which is a
+            // DC step rather than the broadband signal this round-trip means to exercise.
+            *v = ((s >> 8) as f32 / (1u32 << 23) as f32) - 1.0;
         }
         let mut f = vec![0.0f32; n];
         rfft_forward_ordered(&x, &mut f);
