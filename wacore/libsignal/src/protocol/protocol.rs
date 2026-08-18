@@ -10,24 +10,10 @@ use hmac::{Hmac, KeyInit, Mac};
 use rand::{CryptoRng, Rng};
 use sha2::Sha256;
 use std::ops::Range;
-use std::sync::OnceLock;
 use subtle::ConstantTimeEq;
 
 use crate::protocol::state::{PreKeyId, SignedPreKeyId};
 use crate::protocol::{IdentityKey, PrivateKey, PublicKey, Result, SignalProtocolError, Timestamp};
-
-/// Get-or-init for `OnceLock<Box<[u8]>>` with a fallible initializer.
-fn get_or_try_init_bytes(
-    cache: &OnceLock<Box<[u8]>>,
-    init: impl FnOnce() -> Result<Box<[u8]>>,
-) -> Result<&[u8]> {
-    if let Some(val) = cache.get() {
-        return Ok(val);
-    }
-    let _ = cache.set(init()?);
-    // get() can't be None: even if a racing set() lost, the winner's value is stored
-    Ok(cache.get().expect("just set"))
-}
 
 fn subslice_range(parent: &[u8], child: &[u8]) -> Option<Range<usize>> {
     let start = (child.as_ptr() as usize).checked_sub(parent.as_ptr() as usize)?;
@@ -730,37 +716,22 @@ impl TryFrom<Bytes> for PreKeySignalMessage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SenderKeyMessage {
     message_version: u8,
     chain_id: u32,
     iteration: u32,
     serialized: Box<[u8]>,
-    // Ciphertext is cached after the first parse to avoid re-decoding.
-    ciphertext_cache: OnceLock<Box<[u8]>>,
-}
-
-impl Clone for SenderKeyMessage {
-    fn clone(&self) -> Self {
-        let ciphertext_cache = OnceLock::new();
-        if let Some(ciphertext) = self.ciphertext_cache.get() {
-            let _ = ciphertext_cache.set(ciphertext.clone());
-        }
-
-        Self {
-            message_version: self.message_version,
-            chain_id: self.chain_id,
-            iteration: self.iteration,
-            serialized: self.serialized.clone(),
-            ciphertext_cache,
-        }
-    }
+    /// Where the ciphertext sits inside `serialized`, as for [`SignalMessage`].
+    /// A group message is decoded once per recipient device, so pointing at the
+    /// bytes already owned here keeps the per-message copy out of the receive
+    /// path entirely rather than deferring it to first access.
+    ciphertext_range: Range<usize>,
 }
 
 impl SenderKeyMessage {
     const SIGNATURE_LEN: usize = 64;
 
-    #[allow(clippy::disallowed_methods)]
     pub fn new<R: CryptoRng + Rng>(
         message_version: u8,
         chain_id: u32,
@@ -769,20 +740,25 @@ impl SenderKeyMessage {
         csprng: &mut R,
         signature_key: &PrivateKey,
     ) -> Result<Self> {
-        let proto_message = waproto::whatsapp::SenderKeyMessage {
-            id: Some(chain_id),
-            iteration: Some(iteration),
-            ciphertext: Some(ciphertext.into_vec()),
-        };
+        use waproto::tags::sender_key_message as tags;
 
-        // Build serialized buffer directly: [version_byte || proto || signature]
-        // Sign over [version_byte || proto], then append signature
-        let shifted_version = (message_version << 4) | 3u8;
-        let mut size_cache = buffa::SizeCache::new();
-        let proto_len = proto_message.compute_size(&mut size_cache) as usize;
+        // Frame [version_byte || proto || signature] into one right-sized
+        // allocation, as `SignalMessage::new` does: the generated tags keep the
+        // schema the source of truth, while writing the fields by hand skips
+        // the intermediate protobuf struct that would have to own a copy of the
+        // ciphertext before it could be encoded.
+        let proto_len = varint_field_len(tags::ID, u64::from(chain_id))
+            + varint_field_len(tags::ITERATION, u64::from(iteration))
+            + bytes_field_len(tags::CIPHERTEXT, ciphertext.len());
         let mut serialized = Vec::with_capacity(1 + proto_len + Self::SIGNATURE_LEN);
-        serialized.push(shifted_version);
-        proto_message.write_to(&mut size_cache, &mut serialized);
+        serialized.push(encode_version_byte(
+            message_version,
+            SENDERKEY_MESSAGE_CURRENT_VERSION,
+        ));
+        push_varint_field(tags::ID, u64::from(chain_id), &mut serialized);
+        push_varint_field(tags::ITERATION, u64::from(iteration), &mut serialized);
+        let ciphertext_range = push_bytes_field(tags::CIPHERTEXT, &ciphertext, &mut serialized);
+        debug_assert_eq!(serialized.len(), 1 + proto_len);
 
         // Sign the data we've built so far (version + proto)
         let signature = signature_key
@@ -795,7 +771,7 @@ impl SenderKeyMessage {
             chain_id,
             iteration,
             serialized: serialized.into_boxed_slice(),
-            ciphertext_cache: OnceLock::new(),
+            ciphertext_range,
         })
     }
 
@@ -838,27 +814,15 @@ impl SenderKeyMessage {
         self.iteration
     }
 
-    /// Returns the ciphertext, parsing and caching it on first access.
+    /// Returns the ciphertext, borrowed straight out of `serialized`.
     ///
-    /// The ciphertext is extracted from the protobuf-encoded `serialized` bytes
-    /// and cached to avoid repeated parsing.
-    ///
-    /// # Performance Note
-    ///
-    /// Callers should avoid calling this in hot loops when possible.
+    /// The range was resolved when the message was built or parsed, so this is
+    /// an index into bytes this message already owns: no decode, no lock and no
+    /// allocation. The `Result` is kept because callers treat this as the
+    /// fallible decode step it used to be.
+    #[inline]
     pub fn ciphertext(&self) -> Result<&[u8]> {
-        get_or_try_init_bytes(&self.ciphertext_cache, || self.decode_ciphertext())
-    }
-
-    fn decode_ciphertext(&self) -> Result<Box<[u8]>> {
-        // serialized layout: [version_byte || protobuf || signature]
-        let proto_bytes = &self.serialized[1..self.serialized.len() - Self::SIGNATURE_LEN];
-        let view = waproto::whatsapp::SenderKeyMessageView::decode_view(proto_bytes)
-            .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-        match view.ciphertext {
-            Some(ciphertext) => Ok(Box::from(ciphertext)),
-            None => Err(SignalProtocolError::InvalidProtobufEncoding),
-        }
+        Ok(&self.serialized[self.ciphertext_range.clone()])
     }
 
     #[inline]
@@ -910,17 +874,17 @@ impl TryFrom<&[u8]> for SenderKeyMessage {
         let Some(ciphertext) = view.ciphertext else {
             return Err(SignalProtocolError::InvalidProtobufEncoding);
         };
-        let ciphertext: Box<[u8]> = Box::from(ciphertext);
-
-        let ciphertext_cache = OnceLock::new();
-        let _ = ciphertext_cache.set(ciphertext);
+        // The view borrows `value`, and `serialized` below is a byte-identical
+        // copy of it, so the offsets carry over unchanged.
+        let ciphertext_range = subslice_range(value, ciphertext)
+            .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
 
         Ok(SenderKeyMessage {
             message_version,
             chain_id,
             iteration,
             serialized: Box::from(value),
-            ciphertext_cache,
+            ciphertext_range,
         })
     }
 }
@@ -936,7 +900,6 @@ pub struct SenderKeyDistributionMessage {
 }
 
 impl SenderKeyDistributionMessage {
-    #[allow(clippy::disallowed_methods)]
     pub fn new(
         message_version: u8,
         chain_id: u32,
@@ -944,17 +907,27 @@ impl SenderKeyDistributionMessage {
         chain_key: [u8; 32],
         signing_key: PublicKey,
     ) -> Result<Self> {
-        let proto_message = waproto::whatsapp::SenderKeyDistributionMessage {
-            id: Some(chain_id),
-            iteration: Some(iteration),
-            chain_key: Some(chain_key.to_vec()),
-            signing_key: Some(signing_key.serialize().to_vec()),
-        };
-        let mut size_cache = buffa::SizeCache::new();
-        let message_len = proto_message.compute_size(&mut size_cache) as usize;
+        use waproto::tags::sender_key_distribution_message as tags;
+
+        // Four scalar fields, framed straight into the final allocation. The
+        // protobuf struct this replaced needed an owned `Vec` per bytes field,
+        // so a message whose whole payload is 65 bytes paid two heap
+        // allocations that existed only to be copied out again.
+        let signing_key_bytes = signing_key.serialize();
+        let message_len = varint_field_len(tags::ID, u64::from(chain_id))
+            + varint_field_len(tags::ITERATION, u64::from(iteration))
+            + bytes_field_len(tags::CHAIN_KEY, chain_key.len())
+            + bytes_field_len(tags::SIGNING_KEY, signing_key_bytes.len());
         let mut serialized = Vec::with_capacity(1 + message_len);
-        serialized.push(((message_version & 0xF) << 4) | SENDERKEY_MESSAGE_CURRENT_VERSION);
-        proto_message.write_to(&mut size_cache, &mut serialized);
+        serialized.push(encode_version_byte(
+            message_version,
+            SENDERKEY_MESSAGE_CURRENT_VERSION,
+        ));
+        push_varint_field(tags::ID, u64::from(chain_id), &mut serialized);
+        push_varint_field(tags::ITERATION, u64::from(iteration), &mut serialized);
+        push_bytes_field(tags::CHAIN_KEY, &chain_key, &mut serialized);
+        push_bytes_field(tags::SIGNING_KEY, &signing_key_bytes, &mut serialized);
+        debug_assert_eq!(serialized.len(), 1 + message_len);
 
         Ok(Self {
             message_version,
@@ -1521,6 +1494,144 @@ mod tests {
 
         assert!(signal.try_into_ciphertext_vec().is_err());
         assert!(!retained_owner.is_empty());
+    }
+
+    /// A deterministic signer, so the framed bytes below are reproducible.
+    fn test_signing_key() -> PrivateKey {
+        PrivateKey::deserialize(&[0x77; 32]).expect("test signing key")
+    }
+
+    fn generated_sender_key_wire(chain_id: u32, iteration: u32, ciphertext: &[u8]) -> Vec<u8> {
+        let proto = waproto::whatsapp::SenderKeyMessage {
+            id: Some(chain_id),
+            iteration: Some(iteration),
+            ciphertext: Some(ciphertext.to_vec()),
+        };
+        let mut wire = Vec::with_capacity(1 + proto.encoded_len() as usize);
+        wire.push(encode_version_byte(
+            SENDERKEY_MESSAGE_CURRENT_VERSION,
+            SENDERKEY_MESSAGE_CURRENT_VERSION,
+        ));
+        wire.extend_from_slice(&proto.encode_to_vec());
+        wire
+    }
+
+    /// The hand-framed encoder must agree with the generated protobuf encoder
+    /// byte for byte, over the varint boundaries and an empty payload. The
+    /// signature is excluded because it is computed over exactly these bytes:
+    /// if the framing matched, so does everything downstream of it.
+    #[test]
+    fn direct_sender_key_encoder_matches_generated_wire() {
+        let mut csprng = rand::rng();
+        let signing_key = test_signing_key();
+        let counters = [0, 127, 128, u32::MAX];
+        let ciphertexts = [Vec::new(), vec![0x5A], vec![0xC3; 300]];
+
+        for chain_id in counters {
+            for iteration in counters {
+                for ciphertext in &ciphertexts {
+                    let direct = SenderKeyMessage::new(
+                        SENDERKEY_MESSAGE_CURRENT_VERSION,
+                        chain_id,
+                        iteration,
+                        ciphertext.clone().into_boxed_slice(),
+                        &mut csprng,
+                        &signing_key,
+                    )
+                    .expect("test SenderKeyMessage");
+                    let generated = generated_sender_key_wire(chain_id, iteration, ciphertext);
+
+                    let framed = &direct.serialized()
+                        [..direct.serialized().len() - SenderKeyMessage::SIGNATURE_LEN];
+                    assert_eq!(framed, generated);
+                    assert_eq!(
+                        direct.ciphertext().expect("built ciphertext"),
+                        &ciphertext[..]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every accessor must survive the wire round-trip, and the parsed
+    /// ciphertext must point into the message's own buffer rather than a
+    /// second allocation.
+    #[test]
+    fn parsed_sender_key_ciphertext_shares_its_wire_allocation() {
+        let mut csprng = rand::rng();
+        let expected = [0x42u8; 256];
+        let built = SenderKeyMessage::new(
+            SENDERKEY_MESSAGE_CURRENT_VERSION,
+            9,
+            4,
+            Box::from(&expected[..]),
+            &mut csprng,
+            &test_signing_key(),
+        )
+        .expect("test SenderKeyMessage");
+        let wire = built.serialized().to_vec();
+
+        let parsed = SenderKeyMessage::try_from(wire.as_slice()).expect("parsed SenderKeyMessage");
+        assert_eq!(parsed.serialized(), wire);
+        assert_eq!(parsed.chain_id(), 9);
+        assert_eq!(parsed.iteration(), 4);
+        assert_eq!(parsed.message_version(), SENDERKEY_MESSAGE_CURRENT_VERSION);
+
+        let ciphertext = parsed.ciphertext().expect("parsed ciphertext");
+        assert_eq!(ciphertext, &expected[..]);
+        assert!(
+            subslice_range(parsed.serialized(), ciphertext).is_some(),
+            "the ciphertext must be a slice of the message's own buffer, not a copy"
+        );
+
+        // A clone keeps the same relationship against its own buffer.
+        let cloned = parsed.clone();
+        let cloned_ciphertext = cloned.ciphertext().expect("cloned ciphertext");
+        assert_eq!(cloned_ciphertext, &expected[..]);
+        assert!(subslice_range(cloned.serialized(), cloned_ciphertext).is_some());
+    }
+
+    /// Same contract as the SenderKeyMessage encoder test: the four scalar
+    /// fields must frame exactly as the generated encoder would, and parse back
+    /// to what went in.
+    #[test]
+    fn direct_sender_key_distribution_encoder_matches_generated_wire() {
+        let signing_key = public_key_from_seed(0x55);
+        let chain_key = [0x31u8; 32];
+
+        for chain_id in [0u32, 127, 128, u32::MAX] {
+            for iteration in [0u32, 127, 128, u32::MAX] {
+                let direct = SenderKeyDistributionMessage::new(
+                    SENDERKEY_MESSAGE_CURRENT_VERSION,
+                    chain_id,
+                    iteration,
+                    chain_key,
+                    signing_key,
+                )
+                .expect("test SenderKeyDistributionMessage");
+
+                let proto = waproto::whatsapp::SenderKeyDistributionMessage {
+                    id: Some(chain_id),
+                    iteration: Some(iteration),
+                    chain_key: Some(chain_key.to_vec()),
+                    signing_key: Some(signing_key.serialize().to_vec()),
+                };
+                let mut generated = Vec::with_capacity(1 + proto.encoded_len() as usize);
+                generated.push(encode_version_byte(
+                    SENDERKEY_MESSAGE_CURRENT_VERSION,
+                    SENDERKEY_MESSAGE_CURRENT_VERSION,
+                ));
+                generated.extend_from_slice(&proto.encode_to_vec());
+                assert_eq!(direct.serialized(), generated);
+
+                let parsed = SenderKeyDistributionMessage::try_from(direct.serialized())
+                    .expect("parsed SenderKeyDistributionMessage");
+                assert_eq!(parsed.chain_id(), chain_id);
+                assert_eq!(parsed.iteration(), iteration);
+                assert_eq!(parsed.chain_key(), &chain_key);
+                assert_eq!(parsed.signing_key().serialize(), signing_key.serialize());
+            }
+        }
     }
 
     #[test]
