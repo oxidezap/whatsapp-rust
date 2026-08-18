@@ -1,6 +1,7 @@
 //! Core incoming-message pipeline: classify, decrypt and process.
 
 use super::*;
+use smallvec::SmallVec;
 
 /// Parsed session envelope with explicit retry/ownership semantics.
 ///
@@ -137,7 +138,10 @@ impl Client {
         let own_jid = nr
             .get_optional_child("participants")
             .and_then(|_| self.pn());
-        let mut all_enc_nodes: Vec<&NodeRef<'_>> = Vec::with_capacity(4);
+        // Four inline slots: a fan-out addressed to us carries one `<enc>` per
+        // copy we can read (pkmsg/msg, plus the media-type variants), so the
+        // stanza shapes that actually reach here never spill to the heap.
+        let mut all_enc_nodes: SmallVec<[&NodeRef<'_>; 4]> = SmallVec::new();
         let mut media_type: Option<crate::types::message::EncMediaType> = None;
         for enc_node in message_enc_nodes_for_device(nr, own_jid.as_ref()) {
             // The declared media type belongs to the message, not to a device
