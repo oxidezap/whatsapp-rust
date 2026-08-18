@@ -1299,7 +1299,12 @@ mod tests {
         let mut seed: u32 = 12345;
         for v in noise.iter_mut() {
             seed = seed.wrapping_mul(196314165).wrapping_add(907633515);
-            *v = ((seed >> 9) as f32 / (1u32 << 23) as f32) - 1.0;
+            // `>> 8` spans 0..2^24, so `/ 2^23 - 1.0` gives zero-mean [-1, 1). `>> 9` -- as the
+            // older `fft_roundtrip` generator in this file does it -- only reaches [-1, 0), which
+            // puts a bin of magnitude ~n/2 at DC and inflates the spectrum RMS the bounds below
+            // normalize by. That would make this family, the one meant to stress broadband
+            // behaviour, the loosest of the four.
+            *v = ((seed >> 8) as f32 / (1u32 << 23) as f32) - 1.0;
         }
         let tone: Vec<f32> = (0..n)
             .map(|i| {
@@ -1404,7 +1409,7 @@ mod tests {
     /// with the fast path simply being wrong.
     ///
     /// Measured across these signals, error relative to the exact spectrum's RMS runs 1.3e-7..7.6e-6
-    /// for the reference and 1.5e-7..1.6e-5 for the split path, a ratio of 0.85x..5.6x. The split
+    /// for the reference and 1.5e-7..1.6e-5 for the split path, a ratio of 0.72x..5.6x. The split
     /// path is therefore slightly noisier -- it adds an f32 recombination stage the reference does
     /// not have -- but both sit at f32 rounding level, three orders of magnitude below the coarsest
     /// quantizer step in the encoder.

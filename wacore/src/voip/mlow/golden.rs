@@ -42,6 +42,12 @@ fn synth_input() -> Vec<f32> {
 /// `synth_input` with the low mantissa bit of about half the samples flipped: the smallest change
 /// an f32 signal can carry. Which samples are hit is a pure function of `(index, seed)`, so each
 /// seed is a different, reproducible one-ULP neighbour of the same signal.
+///
+/// One quarter of the corpus is exact-zero silence, so about an eighth of it goes from `0.0` to the
+/// smallest subnormal rather than taking an ordinary mantissa step. That is still one ULP, and it
+/// is not what drives the divergence the test measures: the silence frames are the ones that stay
+/// closest to the unperturbed output (70-86 dB), while the frames that move are tone and noise,
+/// where every flip is a mantissa step on a normal float.
 fn perturb_one_ulp(x: &[f32], seed: u32) -> Vec<f32> {
     x.iter()
         .enumerate()

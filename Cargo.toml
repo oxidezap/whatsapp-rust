@@ -204,6 +204,12 @@ voip-encoded = ["voip-runtime"]
 voip-mlow = ["voip-runtime", "wacore/voip-mlow"]
 # Optional PCM adapter for standard Opus, including MLOW's CELT escape. Encoded I/O needs no libopus.
 voip-libopus = ["voip-encoded", "dep:opus"]
+# Forwards `wacore/mlow-fast-fft`: the MLow encoder's opt-in half-length real FFT. Without this
+# entry the optimization is unreachable for anyone depending on this crate rather than on `wacore`
+# directly. It emits a bitstream that is NOT byte-identical to the validated reference encoder --
+# see the note on the wacore feature before turning it on, including what Cargo feature unification
+# means for who can turn it on.
+mlow-fast-fft = ["voip-mlow", "wacore/mlow-fast-fft"]
 
 [dependencies]
 anyhow = { workspace = true }
