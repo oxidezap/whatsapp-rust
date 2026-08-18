@@ -1088,15 +1088,32 @@ fn setup_with_archived_session() -> (User, User, Bytes) {
 
 /// Rejecting a PreKey envelope as a plain Signal envelope is a format-probing
 /// benchmark, not a session-decryption benchmark.
-#[divan::bench]
-fn bench_reject_prekey_as_signal(bencher: divan::Bencher) {
+///
+/// The pass count is in the benchmark name rather than a constant because it is
+/// the unit the reported number is denominated in. The reject path is only
+/// ~118 instructions, so measuring one pass measured its cache lines instead of
+/// its work: split by component, ~88% of the sample was miss penalty over a
+/// mere ~34 RAM accesses, which put a single cache line at 2.7% of the total.
+/// Any edit that shifted `protocol.rs` layout then moved the metric by more
+/// than 5% without changing one executed instruction. Repeating the parse warms
+/// those lines on the first pass, so the compulsory-miss floor amortizes and
+/// the sample tracks the parse. A different count is a different series, which
+/// is why it is a parameter and not an edit to a constant.
+#[divan::bench(args = [256])]
+fn bench_reject_prekey_as_signal(bencher: divan::Bencher, passes: usize) {
     bencher
         .with_inputs(setup_dm_with_first_message)
         .bench_refs(|data| {
             let (_, _, ciphertext) = data;
-            let parsed = wacore_libsignal::protocol::SignalMessage::try_from(ciphertext.as_slice());
-            assert!(parsed.is_err());
-            drop(black_box(parsed));
+            // The input is re-blackboxed each pass so the parse cannot be
+            // hoisted out of the loop as a repeated pure call.
+            for _ in 0..passes {
+                let parsed = wacore_libsignal::protocol::SignalMessage::try_from(black_box(
+                    ciphertext.as_slice(),
+                ));
+                assert!(parsed.is_err());
+                drop(black_box(parsed));
+            }
         });
 }
 
