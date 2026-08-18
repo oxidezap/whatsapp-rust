@@ -98,23 +98,31 @@ jobs:
       # file-level restore never satisfies, so every job fell through to a full
       # network install. Having the package installed for real is what lets that
       # check pass and the cached valgrind be used without touching apt at all.
+      #
+      # The budgets nest, and the order matters: apt's own limits are meant to
+      # fire first and `timeout` is only the backstop for the case they cannot
+      # see, which is a transfer that keeps trickling bytes. Hence 180s over a
+      # 60s lock wait and a ~80s worst case per index file. A degraded-but-
+      # working archive took up to 263s here on 2026-08-18, so this step must
+      # not be the thing that fails the job -- if it gives up, the runner still
+      # installs the package itself, now bounded by the same config.
       - name: Bound apt and pre-install libc6-dbg
         run: |
           sudo tee /etc/apt/apt.conf.d/99-ci-bounds > /dev/null <<'EOF'
-          Acquire::Retries "5";
+          Acquire::Retries "3";
           Acquire::http::Timeout "20";
           Acquire::https::Timeout "20";
-          DPkg::Lock::Timeout "120";
+          DPkg::Lock::Timeout "60";
           EOF
-          for attempt in 1 2 3; do
-            if sudo timeout 90 apt-get update -qq \
-              && sudo timeout 90 apt-get install -y -qq libc6-dbg; then
+          for attempt in 1 2; do
+            if sudo timeout 180 apt-get update -qq \
+              && sudo timeout 180 apt-get install -y -qq libc6-dbg; then
               exit 0
             fi
             echo "apt attempt $attempt failed"
-            sleep $((attempt * 10))
+            sleep 15
           done
-          exit 1
+          echo "::warning::libc6-dbg pre-install gave up; the runner installs it itself"
 
       - name: Install tools (protoc, cargo-codspeed)
         uses: taiki-e/install-action@v2
@@ -211,23 +219,31 @@ jobs:
       # file-level restore never satisfies, so every job fell through to a full
       # network install. Having the package installed for real is what lets that
       # check pass and the cached valgrind be used without touching apt at all.
+      #
+      # The budgets nest, and the order matters: apt's own limits are meant to
+      # fire first and `timeout` is only the backstop for the case they cannot
+      # see, which is a transfer that keeps trickling bytes. Hence 180s over a
+      # 60s lock wait and a ~80s worst case per index file. A degraded-but-
+      # working archive took up to 263s here on 2026-08-18, so this step must
+      # not be the thing that fails the job -- if it gives up, the runner still
+      # installs the package itself, now bounded by the same config.
       - name: Bound apt and pre-install libc6-dbg
         run: |
           sudo tee /etc/apt/apt.conf.d/99-ci-bounds > /dev/null <<'EOF'
-          Acquire::Retries "5";
+          Acquire::Retries "3";
           Acquire::http::Timeout "20";
           Acquire::https::Timeout "20";
-          DPkg::Lock::Timeout "120";
+          DPkg::Lock::Timeout "60";
           EOF
-          for attempt in 1 2 3; do
-            if sudo timeout 90 apt-get update -qq \
-              && sudo timeout 90 apt-get install -y -qq libc6-dbg; then
+          for attempt in 1 2; do
+            if sudo timeout 180 apt-get update -qq \
+              && sudo timeout 180 apt-get install -y -qq libc6-dbg; then
               exit 0
             fi
             echo "apt attempt $attempt failed"
-            sleep $((attempt * 10))
+            sleep 15
           done
-          exit 1
+          echo "::warning::libc6-dbg pre-install gave up; the runner installs it itself"
 
       - name: Install tools (protoc, cargo-codspeed)
         uses: taiki-e/install-action@v2
