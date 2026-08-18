@@ -2130,6 +2130,55 @@ mod tests {
         assert_eq!(record.serialize().unwrap(), expected);
     }
 
+    /// `serialize_into_inner` keeps the first few archived lengths in a stack
+    /// array and puts the rest in a heap spill indexed off that capacity, so an
+    /// archive deep enough to spill can emit a length prefix belonging to a
+    /// different session. The sizes have to differ per session for that to show
+    /// up in the bytes at all: a list of equal-sized sessions encodes
+    /// identically no matter which length each prefix is taken from.
+    #[test]
+    fn test_session_record_manual_encoding_matches_generated_past_inline_lengths() {
+        let current = make_cache_shape_session(1, 3, 2);
+        let previous_sessions: Vec<SessionStructure> = (0..20u8)
+            .map(|idx| {
+                make_cache_shape_session(
+                    7u8.wrapping_mul(idx).wrapping_add(11),
+                    (idx % 4) as usize,
+                    (idx % 5) as usize,
+                )
+            })
+            .collect();
+
+        // Guard the premise: neighbouring sessions must encode to different
+        // lengths, or this test cannot fail on a mis-indexed spill.
+        let lengths: Vec<usize> = previous_sessions
+            .iter()
+            .map(|s| s.encode_to_vec().len())
+            .collect();
+        assert!(
+            lengths.windows(2).any(|w| w[0] != w[1]),
+            "sessions must vary in encoded length: {lengths:?}"
+        );
+
+        let record = SessionRecord {
+            current_session: Some(SessionState::from_session_structure(current.clone())),
+            previous_sessions: Arc::new(previous_sessions.clone()),
+            lease: CounterLease::default(),
+        };
+        let expected = waproto::whatsapp::RecordStructure {
+            current_session: MessageField::some(current),
+            previous_sessions,
+        }
+        .encode_to_vec();
+
+        assert_eq!(record.serialize().unwrap(), expected);
+
+        // Round-trip too, so a length prefix that is self-consistent but wrong
+        // still surfaces as reordered or corrupted sessions.
+        let restored = SessionRecord::deserialize(&expected).unwrap();
+        assert_eq!(restored.previous_session_count(), 20);
+    }
+
     #[test]
     fn test_session_record_truncates_on_deserialize() {
         // This tests the ARCHIVED_STATES_MAX_LENGTH enforcement on load
