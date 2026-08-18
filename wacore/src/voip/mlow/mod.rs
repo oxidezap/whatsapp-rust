@@ -41,5 +41,9 @@ mod smpl_tables_blob;
 mod smpl_vad;
 mod toc;
 
+/// Per-stage bench surface (see `analysis::stage_bench`). Reachable only so the in-tree benchmark
+/// can attribute codec CPU per stage; not part of the consumer API.
+#[doc(hidden)]
+pub use analysis::stage_bench;
 pub use decoder::MlowDecoder;
 pub use encode::{MlowEncoder, MlowError};

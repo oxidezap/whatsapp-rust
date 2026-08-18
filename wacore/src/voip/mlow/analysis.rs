@@ -1279,3 +1279,328 @@ fn smpl_voiced_candidate(
         silent: false,
     }
 }
+
+/// Per-stage bench surface for `wacore/benches/voip_benchmark.rs`.
+///
+/// `mlow_encode` is one row, so a change inside the codec moves it without saying WHICH stage moved.
+/// These harnesses call the SAME production functions the analyzer calls, one stage per row, so a
+/// stage-local change has a stage-local number.
+///
+/// Setup vs. body is the load-bearing distinction: [`Stages::new`] runs real frames through
+/// `smpl_analyze_frame_st`, which builds every `OnceLock` table, both FFT twiddle sets and every
+/// pooled buffer, and leaves the CELP/perc/pitch/VAD state in its steady-state regime. What the
+/// `run_*` bodies then execute is per-frame work only -- what production pays every 60 ms, never what
+/// it resolves once and holds. The per-frame multiplicity of each stage is on its method.
+///
+/// Not a consumer API: it exists so the benchmark can attribute codec CPU, and it is `#[doc(hidden)]`
+/// for the same reason the SRTP primitives are.
+#[doc(hidden)]
+pub mod stage_bench {
+    use super::*;
+    use crate::voip::mlow::smpl_lpc::{SMPL_LPC_NFFT, new_lpc_fft_scratch};
+    use crate::voip::mlow::smpl_perc::{
+        FftScratch, PERCW_NFFT, rfft_backward_ordered_sc, rfft_forward_ordered_sc,
+    };
+
+    /// Frames pushed through the encoder before any input is captured. Two is enough to leave every
+    /// cross-frame buffer (`hist`, `lpc_hist`, `hp_pitch_hist`, `ltp_buf`, ACB state) filled with real
+    /// signal rather than the zeros a first frame sees.
+    const WARMUP_FRAMES: usize = 3;
+
+    /// A 60 ms voiced tone, matching the benchmark's own steady-state input.
+    fn tone(phase: usize) -> Vec<f32> {
+        (0..SMPL_INTF_LEN * 3)
+            .map(|i| 0.3 * (((i + phase) as f32) * 0.07).sin())
+            .collect()
+    }
+
+    /// A primed encoder plus one internal frame's worth of captured stage inputs.
+    pub struct Stages {
+        es: SmplEncoderState,
+        pcm: Vec<f32>,
+        /// Snapshot of the last analyzed frame's normalized HP signal (`hp_n`), which the perc model
+        /// and the residual read.
+        hp: Vec<f32>,
+        hp_pitch_hist: Vec<f32>,
+        /// LPC front-end inputs, captured for internal frame 0.
+        lpcbuf: [f32; SMPL_LPC_BUF_LEN],
+        /// Zero-padded windowed buffer + output, for the bare FFT row.
+        fft_in: Vec<f32>,
+        fft_out: Vec<f32>,
+        fft_scratch: FftScratch,
+        /// Same, at the perceptual model's size (N=576 = 2^6 * 3^2), for the bare mixed-radix row.
+        fft576_time: Vec<f32>,
+        fft576_spec: Vec<f32>,
+        /// Separate destination for the inverse: writing back into `fft576_time` would scale the
+        /// signal by N on every iteration (the transform pair is unnormalized) and walk the row into
+        /// inf, changing what it measures.
+        fft576_out: Vec<f32>,
+        fft576_scratch: FftScratch,
+        /// LSF-quantizer inputs.
+        a: [f32; SMPL_LPC_ORDER + 1],
+        nlsf: [f32; SMPL_LPC_ORDER],
+        prev_lsfq: Vec<f32>,
+        prev_nlsf: Vec<f32>,
+        f2: [f32; SMPL_F_LEN],
+        /// CELP inputs for one internal frame (4 subframes).
+        predcoefs: [[f32; SMPL_LPC_ORDER + 1]; SMPL_SUBFR_COUNT],
+        res_lpc: Vec<f32>,
+        block_lags: [[f32; 2]; SMPL_SUBFR_COUNT],
+        perc_corrs: Vec<Vec<f32>>,
+        /// Entropy-coder inputs: analyzed params for a real frame, plus the encoder's own buffers.
+        fp: super::super::params::SmplFrameParams,
+        range: super::super::rangecoder::RangeEncoder,
+        out: Vec<u8>,
+    }
+
+    impl Default for Stages {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Stages {
+        /// SETUP ONLY. Everything here is what production resolves once per stream and holds:
+        /// table loads, twiddle construction, scratch pools, warmed cross-frame state.
+        pub fn new() -> Self {
+            let mut es = SmplEncoderState::default();
+            let mut fp = None;
+            for k in 0..WARMUP_FRAMES {
+                fp = Some(smpl_analyze_frame_st(&mut es, &tone(k * SMPL_INTF_LEN * 3)));
+            }
+            let fp = fp.expect("warmup ran at least once");
+            let pcm = tone(WARMUP_FRAMES * SMPL_INTF_LEN * 3);
+
+            let hp = es.hp.clone();
+            let hp_pitch_hist = es.hp_pitch_hist.clone();
+
+            // LPC front-end inputs for internal frame 0, built exactly as `smpl_analyze_frame_st`
+            // builds them.
+            let mut lpcbuf = [0f32; SMPL_LPC_BUF_LEN];
+            let lpc_start = SMPL_LPC_HIST_LEN - SMPL_LPC_PRE;
+            lpcbuf.copy_from_slice(&es.hp_full[lpc_start..lpc_start + SMPL_LPC_BUF_LEN]);
+            let windowed = smpl_window_lpc20(&lpcbuf, true);
+            let mut fft_scratch = new_lpc_fft_scratch();
+            let mut fft_in = vec![0.0f32; SMPL_LPC_NFFT];
+            fft_in[..SMPL_LPC_BUF_LEN].copy_from_slice(&windowed);
+            let fft_out = vec![0.0f32; SMPL_LPC_NFFT];
+            // Seed the N=576 row from real windowed signal (zero input would still cost the same
+            // instructions, but a realistic magnitude keeps any future denormal effect honest).
+            let mut fft576_scratch = FftScratch::new(PERCW_NFFT);
+            let mut fft576_time = vec![0.0f32; PERCW_NFFT];
+            fft576_time[..SMPL_LPC_BUF_LEN].copy_from_slice(&windowed);
+            let mut fft576_spec = vec![0.0f32; PERCW_NFFT];
+            let fft576_out = vec![0.0f32; PERCW_NFFT];
+            rfft_forward_ordered_sc(&fft576_time, &mut fft576_spec, &mut fft576_scratch);
+            let (a, f2) = smpl_lpc_analyze_with_f2(&windowed, &mut fft_scratch);
+            let nlsf = smpl_a2nlsf_16(&a);
+
+            let prev_lsfq = es.prev_lsfq.clone();
+            let prev_nlsf = prev_lsfq.clone();
+
+            // CELP inputs: the committed envelope's interpolated per-subframe LPC, the residual it
+            // whitens, the perceptual autocorrelation, and the pitch contour's per-block lags.
+            let synth_t = load_smpl_synth_tables();
+            let fe = FrontEndLsf {
+                a,
+                nlsf,
+                prev_lsfq: &prev_lsfq,
+                prev_voiced: es.prev_voiced,
+                intf: 1,
+            };
+            let (_, _, brec, _) = fe.quantize(synth_t, 1, &prev_nlsf);
+            let (predcoefs, _) =
+                super::super::smpl_lpc::smpl_lpc_interpol(&brec, &prev_lsfq, smpl_nlsf2a);
+            // `win_n` for internal frame 0: the residual window with its 32-sample CELP pre-lead.
+            let res_lead = SMPL_ORDER + SMPL_WINNEXT_WB_LEN;
+            let win_n = es.xn[..res_lead + SMPL_INTF_LEN].to_vec();
+            let mut res_lpc = vec![0f32; SMPL_INTF_LEN];
+            for sf in 0..SMPL_SUBFR_COUNT {
+                let r = smpl_analysis_residual_subfr(&predcoefs[sf], &win_n, sf);
+                res_lpc[sf * SMPL_SUBFR_LEN..(sf + 1) * SMPL_SUBFR_LEN].copy_from_slice(&r);
+            }
+
+            let mut s = Stages {
+                es,
+                pcm,
+                hp,
+                hp_pitch_hist,
+                lpcbuf,
+                fft_in,
+                fft_out,
+                fft_scratch,
+                fft576_time,
+                fft576_spec,
+                fft576_out,
+                fft576_scratch,
+                a,
+                nlsf,
+                prev_lsfq,
+                prev_nlsf,
+                f2,
+                predcoefs,
+                res_lpc,
+                block_lags: [[0.0; 2]; SMPL_SUBFR_COUNT],
+                perc_corrs: Vec::new(),
+                fp,
+                range: super::super::rangecoder::RangeEncoder::new(
+                    1 + super::super::encode::SMPL_ENCODE_BUF_BYTES,
+                ),
+                out: Vec::with_capacity(512),
+            };
+            // The perceptual autocorrelation and the pitch contour come from the live state, so the
+            // CELP row runs on the weights and lags a real voiced frame would hand it.
+            s.perc_corrs = s.with_ctx(0, |cs| compute_perc_corrs(cs).into());
+            let pr = super::super::smpl_pitch_enc::smpl_pitch(
+                &mut s.es.pitch_est,
+                &s.es.ltp_buf,
+                &s.f2,
+                true,
+            );
+            for sf in 0..SMPL_SUBFR_COUNT {
+                s.block_lags[sf] = [pr.lags[2 * sf], pr.lags[2 * sf + 1]];
+            }
+            // Warm the entropy coder's own `OnceLock` tables. The analysis path above never calls
+            // `encode_smpl_frame_into`, so the range-coder CC tables are still cold here: leaving
+            // them to the first timed body charged one `entropy_encode` sample 3.5 ms and ~1000
+            // allocations for a stage whose real per-frame cost is 1.9 us and zero allocations --
+            // a table build a live stream pays once, reported as if it were per-frame work.
+            s.entropy_encode();
+            s
+        }
+
+        /// Borrow the live per-stream state as the `CelpFrameCtx` the analyzer builds each internal
+        /// frame. Pure borrows (no allocation), so calling it inside a timed body costs nothing the
+        /// analyzer does not also pay.
+        fn with_ctx<R>(&mut self, intf: usize, f: impl FnOnce(&mut CelpFrameCtx<'_>) -> R) -> R {
+            let mut cs = CelpFrameCtx {
+                celp: self.es.celp.as_mut().expect("primed by warmup"),
+                perc: self.es.perc.as_mut().expect("primed by warmup"),
+                perc_prev: &mut self.es.perc_prev,
+                bitrate: self.es.bitrate.as_mut().expect("primed by warmup"),
+                hp_n: &self.hp,
+                intf,
+                sp_act_prob: 1.0,
+                coded_as_active_voice: true,
+                f2: self.f2,
+                voicing_strength: 1.0,
+                vuv: &mut self.es.vuv,
+                hp_pitch_hist: &self.hp_pitch_hist,
+                ltp_buf: &mut self.es.ltp_buf,
+                pitch_est: &mut self.es.pitch_est,
+                perc_corrs: Vec::new(),
+                block_lags: self.block_lags,
+            };
+            f(&mut cs)
+        }
+
+        /// One forward real FFT at the LPC size (N=512, pure radix-2). Runs 3x per 60 ms frame, once
+        /// per internal frame, inside [`Self::lpc_front_end`].
+        pub fn fft512_forward(&mut self) -> f32 {
+            rfft_forward_ordered_sc(&self.fft_in, &mut self.fft_out, &mut self.fft_scratch);
+            self.fft_out[0]
+        }
+
+        /// One forward plus one inverse real FFT at the perceptual-model size (N=576 = 2^6 * 3^2,
+        /// mixed radix 2 and 3). `smpl_perc_model` runs exactly this pair, 2x per internal frame, so
+        /// 6x per 60 ms frame -- 12 of the frame's 15 FFTs.
+        pub fn fft576_roundtrip(&mut self) -> f32 {
+            rfft_forward_ordered_sc(
+                &self.fft576_time,
+                &mut self.fft576_spec,
+                &mut self.fft576_scratch,
+            );
+            rfft_backward_ordered_sc(
+                &self.fft576_spec,
+                &mut self.fft576_out,
+                &mut self.fft576_scratch,
+            );
+            self.fft576_out[0]
+        }
+
+        /// The full LPC front-end for one internal frame: window, forward FFT, power spectrum, DCT
+        /// autocorrelation, Levinson, bandwidth expansion, and A->NLSF. Runs 3x per 60 ms frame.
+        pub fn lpc_front_end(&mut self) -> f32 {
+            let windowed = smpl_window_lpc20(&self.lpcbuf, true);
+            let (a, _f2) = smpl_lpc_analyze_with_f2(&windowed, &mut self.fft_scratch);
+            let nlsf = smpl_a2nlsf_16(&a);
+            nlsf[0]
+        }
+
+        /// The perceptual model for one internal frame: two `smpl_perc_model` calls, each a forward
+        /// plus an inverse FFT at N=576 (the mixed-radix 2/3 size). Runs 1x per internal frame, so
+        /// 3x per 60 ms frame -- 12 of the frame's 15 FFTs. Advances the perc history, as production
+        /// does.
+        pub fn perc_corrs_frame(&mut self) -> f32 {
+            self.with_ctx(1, |cs| compute_perc_corrs(cs)[0][0])
+        }
+
+        /// The multi-stage pitch estimator for one internal frame. Runs 3x per 60 ms frame and
+        /// advances the cross-frame lag predictor, as production does.
+        pub fn pitch_search(&mut self) -> f32 {
+            let pr = super::super::smpl_pitch_enc::smpl_pitch(
+                &mut self.es.pitch_est,
+                &self.es.ltp_buf,
+                &self.f2,
+                true,
+            );
+            pr.pitchcorr
+        }
+
+        /// The bit-exact LSF vector quantizer plus the decoder-side envelope reconstruction and
+        /// NLSF->A that follow it (`FrontEndLsf::quantize`). Runs 1x per internal frame, 3x per
+        /// 60 ms frame. Stateless, so repeated runs measure the same work.
+        pub fn lsf_quantize(&mut self) -> f32 {
+            let fe = FrontEndLsf {
+                a: self.a,
+                nlsf: self.nlsf,
+                prev_lsfq: &self.prev_lsfq,
+                prev_voiced: true,
+                intf: 1,
+            };
+            let (grid, _, _, predcoef) = fe.quantize(load_smpl_synth_tables(), 1, &self.prev_nlsf);
+            predcoef[1] + grid as f32
+        }
+
+        /// The CELP excitation encoder for one internal frame: the perceptual weighting filters plus
+        /// four `encode_subframe` calls (ACB gain search, then the fixed-codebook pulse search that
+        /// dominates it). Runs 1x per internal frame, so `encode_subframe` runs 12x per 60 ms frame.
+        /// Advances the ACB/ZIR state, as production does.
+        pub fn celp_subframes_frame(&mut self) -> f32 {
+            let predcoefs = self.predcoefs;
+            let res_lpc = std::mem::take(&mut self.res_lpc);
+            let block_lags = self.block_lags;
+            let perc_corrs = std::mem::take(&mut self.perc_corrs);
+            let r = self.with_ctx(1, |cs| {
+                let outs = run_celp_subframes(
+                    cs,
+                    &predcoefs,
+                    &res_lpc,
+                    &block_lags,
+                    &perc_corrs,
+                    SMPL_PERC_EMPH_V,
+                    1,
+                );
+                outs.iter().map(|o| o.n_pulses[1] as i32).sum::<i32>() as f32
+            });
+            self.res_lpc = res_lpc;
+            self.perc_corrs = perc_corrs;
+            r
+        }
+
+        /// The whole analysis half of `encode`: everything above, plus the VAD, the input high-pass
+        /// and the voiced/unvoiced decision. 1x per 60 ms frame. Together with
+        /// [`Self::entropy_encode`] this is all of `mlow_encode`.
+        pub fn analyze_frame(&mut self) -> u8 {
+            let fp = smpl_analyze_frame_st(&mut self.es, &self.pcm);
+            fp.toc
+        }
+
+        /// The range coder writing the analyzed parameters to the wire. 1x per 60 ms frame.
+        pub fn entropy_encode(&mut self) -> usize {
+            super::super::encode::encode_smpl_frame_into(&self.fp, &mut self.range, &mut self.out)
+                .expect("analyzed params encode");
+            self.out.len()
+        }
+    }
+}

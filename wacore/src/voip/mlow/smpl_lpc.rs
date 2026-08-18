@@ -16,7 +16,7 @@
 use super::smpl_perc::{FftScratch, rfft_forward_ordered_sc};
 
 pub(crate) const SMPL_LPC_ORDER: usize = 16;
-const SMPL_LPC_NFFT: usize = 512;
+pub(crate) const SMPL_LPC_NFFT: usize = 512;
 // The reference uses this exact truncated literal (`SMPL_PI 3.1415926535897f`); keep it verbatim for
 // bit-faithful window/DCT generation rather than `std::f32::consts::PI`.
 #[allow(clippy::approx_constant, clippy::excessive_precision)]

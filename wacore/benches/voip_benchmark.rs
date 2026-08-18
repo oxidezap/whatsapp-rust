@@ -24,6 +24,11 @@ use wacore::voip::sframe::SframeSession;
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
 
 fn main() {
+    // Build the codec-stage harness BEFORE divan starts. Divan's calibration run times whatever the
+    // bench function does before its closure, and `Stages::new` runs three real encodes: left inside,
+    // it sized `entropy_encode`'s sample loop to a single iteration and put one 3.6 ms /
+    // 2000-allocation outlier on a row whose real cost is 1.9 us and zero allocations.
+    codec_stages::warm();
     divan::main();
 }
 
@@ -200,6 +205,107 @@ fn mlow_decode(bencher: Bencher) {
             *i += 1;
             black_box(dec.decode(black_box(p.as_slice())))
         });
+}
+
+// --- Codec stages: which part of the encoder a change actually moved ---
+//
+// `mlow_encode` is one row, so a codec-internal change moves it without saying WHICH stage moved.
+// These rows call the same production functions the analyzer calls, one stage per row, via the
+// `stage_bench` harness (`wacore::voip::mlow::stage_bench`). The harness builds its tables, twiddles
+// and pooled buffers in `Stages::new` and primes the cross-frame state with real frames, so a timed
+// body is per-frame work only -- what a call pays every 60 ms, never what the stream resolves once.
+//
+// Each row's doc gives its per-frame multiplicity, which is what makes the rows sum: reading them
+// against `mlow_encode` needs `stage_time * calls_per_frame`, not `stage_time` alone. Decode has no
+// row here on purpose -- it runs none of these stages (notably, zero FFTs).
+mod codec_stages {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use wacore::voip::mlow::stage_bench::Stages;
+
+    /// One harness for every row, built once by [`warm`] before divan starts. Divan runs rows
+    /// sequentially, so the lock is uncontended; its ~20 ns is inside every row's timed body, which
+    /// matters only for `entropy_encode` (~1% of its 1.9 us) and is why the harness is shared rather
+    /// than rebuilt.
+    ///
+    /// Sharing is also the faithful shape: the stateful stages (perc history, CELP ACB/ZIR, pitch
+    /// predictor) advance exactly as they do in a live call, and each row runs enough iterations to
+    /// settle into its own steady state, so no row depends on which ran before it.
+    static STAGES: OnceLock<Mutex<Stages>> = OnceLock::new();
+
+    /// Construct the harness outside any timed region. Called from `main` before `divan::main`.
+    pub fn warm() {
+        STAGES.get_or_init(|| Mutex::new(Stages::new()));
+    }
+
+    fn run(bencher: Bencher, mut stage: impl FnMut(&mut Stages) -> f64) {
+        let cell = STAGES.get().expect("warm() ran in main");
+        bencher.bench_local(move || black_box(stage(&mut cell.lock().expect("bench harness"))));
+    }
+
+    /// Whole analysis half of an encode (1x/frame): VAD, high-pass, and the per-internal-frame LPC /
+    /// perc / pitch / LSF / CELP chain. With `entropy_encode` this accounts for all of `mlow_encode`.
+    #[divan::bench]
+    fn analyze_frame(bencher: Bencher) {
+        run(bencher, |s| s.analyze_frame() as f64);
+    }
+
+    /// Range coder writing the analyzed parameters to the wire (1x/frame). The other half of
+    /// `mlow_encode`, and the half that does NOT dominate.
+    #[divan::bench]
+    fn entropy_encode(bencher: Bencher) {
+        run(bencher, |s| s.entropy_encode() as f64);
+    }
+
+    /// LPC front-end for one internal frame (3x/frame): window, forward FFT, power spectrum, DCT
+    /// autocorrelation, Levinson, bandwidth expansion, A->NLSF.
+    #[divan::bench]
+    fn lpc_front_end(bencher: Bencher) {
+        run(bencher, |s| s.lpc_front_end() as f64);
+    }
+
+    /// The bare forward real FFT at the LPC size (N=512, pure radix-2), 3x/frame. Isolated from
+    /// `lpc_front_end` so an FFT-local change is attributable without the DCT/Levinson around it.
+    #[divan::bench]
+    fn fft512_forward(bencher: Bencher) {
+        run(bencher, |s| s.fft512_forward() as f64);
+    }
+
+    /// Forward + inverse real FFT at the perceptual-model size (N=576 = 2^6 * 3^2, mixed radix 2/3),
+    /// 6x/frame -- 12 of the frame's 15 FFTs, and the only path that reaches the radix-3 levels and
+    /// the O(n^2) prime base case.
+    #[divan::bench]
+    fn fft576_roundtrip(bencher: Bencher) {
+        run(bencher, |s| s.fft576_roundtrip() as f64);
+    }
+
+    /// Perceptual model for one internal frame (3x/frame): two `smpl_perc_model` calls, i.e. two
+    /// `fft576_roundtrip`s plus the windowing and the masking smooth around them.
+    #[divan::bench]
+    fn perc_model_frame(bencher: Bencher) {
+        run(bencher, |s| s.perc_corrs_frame() as f64);
+    }
+
+    /// Multi-stage pitch estimator for one internal frame (3x/frame).
+    #[divan::bench]
+    fn pitch_search(bencher: Bencher) {
+        run(bencher, |s| s.pitch_search() as f64);
+    }
+
+    /// LSF vector quantizer plus the envelope reconstruction and NLSF->A after it (3x/frame). The
+    /// row that covers `get_maxi_k` and `smpl_nlsf2a`.
+    #[divan::bench]
+    fn lsf_quantize(bencher: Bencher) {
+        run(bencher, |s| s.lsf_quantize() as f64);
+    }
+
+    /// CELP excitation encoder for one internal frame (3x/frame): perceptual weighting plus four
+    /// `encode_subframe` calls, so `encode_subframe` itself runs 12x/frame. The fixed-codebook pulse
+    /// search inside it is the single largest stage of the encoder.
+    #[divan::bench]
+    fn celp_subframes_frame(bencher: Bencher) {
+        run(bencher, |s| s.celp_subframes_frame() as f64);
+    }
 }
 
 // --- Crypto + framing: the seam where avoidable per-packet allocations live ---

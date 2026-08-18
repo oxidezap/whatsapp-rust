@@ -35,7 +35,7 @@
 
 const SMPL_PI: f32 = 3.1415926535897;
 
-const PERCW_NFFT: usize = 512 + 64; // 576
+pub(crate) const PERCW_NFFT: usize = 512 + 64; // 576
 const PERCW_FS_KHZ: f32 = 16.0;
 
 const SMPL_PERC_MASK_SMTH: f32 = 0.1158;
@@ -572,7 +572,7 @@ fn rfft_forward_ordered(time: &[f32], f: &mut [f32]) {
 /// Inverse real FFT consuming the ordered REAL layout (as produced/modified above) and producing n
 /// real time samples, unnormalized (BACKWARD(FORWARD(x)) = n*x).
 /// Uses `sc.spec`/`sc.tout`/`sc.arena` as scratch (reused across calls).
-fn rfft_backward_ordered_sc(f: &[f32], time: &mut [f32], sc: &mut FftScratch) {
+pub(crate) fn rfft_backward_ordered_sc(f: &[f32], time: &mut [f32], sc: &mut FftScratch) {
     let n = f.len();
     debug_assert!(time.len() == n);
     // Rebuild the full Hermitian complex spectrum from the ordered real layout.
