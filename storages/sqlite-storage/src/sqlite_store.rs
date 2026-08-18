@@ -4183,7 +4183,10 @@ mod tests {
         .get_result(&mut conn)
         .unwrap();
 
-        // NORMAL: in WAL a commit does not fsync, only a checkpoint does.
+        // NORMAL is the chosen default because the store runs its file-backed
+        // databases in WAL, where a commit does not fsync and only a checkpoint
+        // does. `on_acquire` stamps the pragma on every connection whatever the
+        // journal mode, which is the part this in-memory database checks.
         assert_eq!(pragmas.sync, 1, "default synchronous = NORMAL");
         // MEMORY: sorters and materialized subqueries never touch the disk.
         assert_eq!(pragmas.temp_store, 2, "temp_store = MEMORY");
