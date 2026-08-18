@@ -43,6 +43,14 @@ voip-mlow = ["voip"]
 # Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
 # Dev/profiling only; off by default and not pulled into normal builds.
 dhat-heap = ["dep:dhat"]
+# Opt-in half-length ("split") real FFT for the MLow encoder's perceptual and LPC analysis. Same
+# transform, fewer butterflies, but a different operation sequence -- so it does NOT reproduce the
+# reference encoder bit for bit, and the golden checksums under it are a second, separately pinned
+# pair. Off by default: the default build stays byte-identical to the validated reference. Turning
+# it on emits a different (still well-formed) bitstream, so it should stay off until someone
+# revalidates the output against a real WhatsApp decoder. `split_rfft_matches_reference` bounds the
+# numerical difference and runs in the default `cargo test`.
+mlow-fast-fft = []
 # Per-stage MLow codec bench surface (`voip::mlow::stage_bench`), so `voip_benchmark` can attribute
 # encoder CPU to a stage. Pure bench scaffolding: `#[doc(hidden)]` would hide it from rustdoc but
 # still compile it into every consumer, so it is a feature. Dev/bench only; off by default.

@@ -185,6 +185,13 @@ jobs:
         run: |
           cargo nextest run --profile ci -p wacore --features voip --lib
           cargo nextest run --profile ci -p whatsapp-rust --features "voip tokio-native tokio-transport" --lib
+      # mlow-fast-fft is off by default and swaps the MLow encoder's real FFT for the half-length
+      # split path, which emits a different (still valid) bitstream and so carries its own pinned
+      # golden constants. Nothing else in CI exercises that dispatch: without this step the second
+      # golden pair could rot unnoticed and the differential FFT tests would only ever run against
+      # the path that is not selected.
+      - name: Test (mlow-fast-fft)
+        run: cargo nextest run --profile ci -p wacore --features voip-mlow,mlow-fast-fft --lib -E 'test(voip::mlow)'
       # legacy-session-interop is off by default, so every other test job
       # compiles its module away and never runs a single one of its tests.
       - name: Test (legacy-session-interop)

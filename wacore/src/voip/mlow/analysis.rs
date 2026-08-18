@@ -1314,7 +1314,8 @@ pub mod stage_bench {
     use super::*;
     use crate::voip::mlow::smpl_lpc::{SMPL_LPC_NFFT, new_lpc_fft_scratch};
     use crate::voip::mlow::smpl_perc::{
-        FftScratch, PERCW_NFFT, rfft_backward_ordered_sc, rfft_forward_ordered_sc,
+        FftScratch, PERCW_NFFT, rfft_backward_ordered_ref_sc, rfft_backward_ordered_split_sc,
+        rfft_forward_ordered_ref_sc, rfft_forward_ordered_split_sc,
     };
 
     /// Frames pushed through the encoder before any input is captured. Three leave every cross-frame
@@ -1464,7 +1465,7 @@ pub mod stage_bench {
             fft576_time[..SMPL_LPC_BUF_LEN].copy_from_slice(&windowed);
             let mut fft576_spec = vec![0.0f32; PERCW_NFFT];
             let fft576_out = vec![0.0f32; PERCW_NFFT];
-            rfft_forward_ordered_sc(&fft576_time, &mut fft576_spec, &mut fft576_scratch);
+            rfft_forward_ordered_ref_sc(&fft576_time, &mut fft576_spec, &mut fft576_scratch);
             // `f2` seeds the ctx's voicing-classifier input; the per-frame `a`/NLSF the LSF and
             // CELP rows need are captured in the per-frame loop below.
             let (_, f2) = smpl_lpc_analyze_with_f2(&windowed, &mut fft_scratch);
@@ -1631,7 +1632,15 @@ pub mod stage_bench {
         /// One forward real FFT at the LPC size (N=512, pure radix-2). Runs 3x per 60 ms frame, once
         /// per internal frame, inside [`Self::lpc_front_end`].
         pub fn fft512_forward(&mut self) -> f32 {
-            rfft_forward_ordered_sc(&self.fft_in, &mut self.fft_out, &mut self.fft_scratch);
+            rfft_forward_ordered_ref_sc(&self.fft_in, &mut self.fft_out, &mut self.fft_scratch);
+            self.fft_out[0]
+        }
+
+        /// The same transform through the half-length split path (`mlow-fast-fft`). Paired with the
+        /// row above rather than replacing it, so the trade is visible on every CI run even though
+        /// the default build still dispatches to the reference.
+        pub fn fft512_forward_split(&mut self) -> f32 {
+            rfft_forward_ordered_split_sc(&self.fft_in, &mut self.fft_out, &mut self.fft_scratch);
             self.fft_out[0]
         }
 
@@ -1639,12 +1648,28 @@ pub mod stage_bench {
         /// mixed radix 2 and 3). `smpl_perc_model` runs exactly this pair, 2x per internal frame, so
         /// 6x per 60 ms frame -- 12 of the frame's 15 FFTs.
         pub fn fft576_roundtrip(&mut self) -> f32 {
-            rfft_forward_ordered_sc(
+            rfft_forward_ordered_ref_sc(
                 &self.fft576_time,
                 &mut self.fft576_spec,
                 &mut self.fft576_scratch,
             );
-            rfft_backward_ordered_sc(
+            rfft_backward_ordered_ref_sc(
+                &self.fft576_spec,
+                &mut self.fft576_out,
+                &mut self.fft576_scratch,
+            );
+            self.fft576_out[0]
+        }
+
+        /// The same pair through the half-length split path (`mlow-fast-fft`), for the same reason
+        /// as `fft512_forward_split`.
+        pub fn fft576_roundtrip_split(&mut self) -> f32 {
+            rfft_forward_ordered_split_sc(
+                &self.fft576_time,
+                &mut self.fft576_spec,
+                &mut self.fft576_scratch,
+            );
+            rfft_backward_ordered_split_sc(
                 &self.fft576_spec,
                 &mut self.fft576_out,
                 &mut self.fft576_scratch,

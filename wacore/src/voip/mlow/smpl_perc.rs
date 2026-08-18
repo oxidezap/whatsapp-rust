@@ -474,6 +474,8 @@ pub(crate) struct FftScratch {
     tout: Vec<Cpx>,
     tw_fwd: FftTwiddles, // sign = -1.0
     tw_bwd: FftTwiddles, // sign = +1.0
+    #[cfg(any(test, feature = "mlow-fast-fft", feature = "bench-internals"))]
+    split: SplitFft,
 }
 
 impl FftScratch {
@@ -485,6 +487,48 @@ impl FftScratch {
             tout: vec![Cpx::zero(); n],
             tw_fwd: FftTwiddles::new(n, -1.0),
             tw_bwd: FftTwiddles::new(n, 1.0),
+            #[cfg(any(test, feature = "mlow-fast-fft", feature = "bench-internals"))]
+            split: SplitFft::new(n),
+        }
+    }
+}
+
+/// Half-length plan for the real-FFT path (`rfft_*_ordered_split_sc`). A real transform of length
+/// `n` is one complex transform of length `m = n/2` plus an O(m) recombination, so it runs a little
+/// under half the butterflies of the length-`n` complex transform the reference path runs on a
+/// zero-imaginary input.
+///
+/// Built alongside the full-length plan rather than instead of it, because
+/// `split_rfft_matches_reference` compares the two paths on the same scratch and needs both at
+/// once, and `bench-internals` measures both sides of the trade. It is `cfg`-gated so that a
+/// default library build -- the one that ships, and the one that goes to wasm and ESP32 --
+/// allocates neither the extra tables nor the extra arena.
+#[cfg(any(test, feature = "mlow-fast-fft", feature = "bench-internals"))]
+struct SplitFft {
+    /// `W_n^k = exp(-2*pi*i*k/n)` for `k` in `0..n/2`: the recombination twiddle. Built from the
+    /// same `combine_twiddle` the butterflies use, so both paths share one angle formula.
+    wn: Vec<Cpx>,
+    tw_fwd: FftTwiddles, // length n/2, sign = -1.0
+    tw_bwd: FftTwiddles, // length n/2, sign = +1.0
+    arena: Vec<Cpx>,
+    /// The packed input `z[j] = x[2j] + i*x[2j+1]` and its transform.
+    z: Vec<Cpx>,
+    zt: Vec<Cpx>,
+}
+
+#[cfg(any(test, feature = "mlow-fast-fft", feature = "bench-internals"))]
+impl SplitFft {
+    fn new(n: usize) -> Self {
+        // `n / 2` rounds an odd or zero `n` down to a plan the split path never uses: the two
+        // production lengths (512, 576) are even, and the odd case is rejected at the call.
+        let m = n / 2;
+        SplitFft {
+            wn: (0..m).map(|k| combine_twiddle(n, k, 1, -1.0)).collect(),
+            tw_fwd: FftTwiddles::new(m, -1.0),
+            tw_bwd: FftTwiddles::new(m, 1.0),
+            arena: vec![Cpx::zero(); fft_arena_len(m)],
+            z: vec![Cpx::zero(); m],
+            zt: vec![Cpx::zero(); m],
         }
     }
 }
@@ -567,8 +611,26 @@ fn cfft(input: &[Cpx], out: &mut [Cpx], sign: f32, arena: &mut [Cpx], tw: &FftTw
 
 /// Forward real FFT of `n` real samples, re-packed into the ordered REAL layout:
 /// f[0]=DC.re, f[1]=Nyquist.re, then [re,im] pairs for bins 1..n/2-1. Output length is n.
-/// Uses `sc.cin`/`sc.spec`/`sc.arena` as scratch (reused across calls).
+///
+/// Dispatches to the bit-exact reference or, under `mlow-fast-fft`, to the half-length split path.
 pub(crate) fn rfft_forward_ordered_sc(time: &[f32], f: &mut [f32], sc: &mut FftScratch) {
+    #[cfg(feature = "mlow-fast-fft")]
+    {
+        rfft_forward_ordered_split_sc(time, f, sc);
+    }
+    #[cfg(not(feature = "mlow-fast-fft"))]
+    {
+        rfft_forward_ordered_ref_sc(time, f, sc);
+    }
+}
+
+/// Reference forward real FFT: a full length-`n` complex transform of the zero-imaginary input.
+/// This is the path the golden checksums and every per-stage ground-truth vector were validated
+/// against, so it stays compiled even when it is not the one dispatched to -- the differential test
+/// is what licenses the other one.
+/// Uses `sc.cin`/`sc.spec`/`sc.arena` as scratch (reused across calls).
+#[cfg_attr(all(feature = "mlow-fast-fft", not(test)), allow(dead_code))]
+pub(crate) fn rfft_forward_ordered_ref_sc(time: &[f32], f: &mut [f32], sc: &mut FftScratch) {
     let n = time.len();
     debug_assert!(f.len() == n);
     let cin = &mut sc.cin;
@@ -597,8 +659,24 @@ fn rfft_forward_ordered(time: &[f32], f: &mut [f32]) {
 
 /// Inverse real FFT consuming the ordered REAL layout (as produced/modified above) and producing n
 /// real time samples, unnormalized (BACKWARD(FORWARD(x)) = n*x).
-/// Uses `sc.spec`/`sc.tout`/`sc.arena` as scratch (reused across calls).
+///
+/// Dispatches to the bit-exact reference or, under `mlow-fast-fft`, to the half-length split path.
 pub(crate) fn rfft_backward_ordered_sc(f: &[f32], time: &mut [f32], sc: &mut FftScratch) {
+    #[cfg(feature = "mlow-fast-fft")]
+    {
+        rfft_backward_ordered_split_sc(f, time, sc);
+    }
+    #[cfg(not(feature = "mlow-fast-fft"))]
+    {
+        rfft_backward_ordered_ref_sc(f, time, sc);
+    }
+}
+
+/// Reference inverse real FFT: rebuild the full Hermitian spectrum, then one length-`n` complex
+/// transform. Kept compiled for the same reason as its forward twin.
+/// Uses `sc.spec`/`sc.tout`/`sc.arena` as scratch (reused across calls).
+#[cfg_attr(all(feature = "mlow-fast-fft", not(test)), allow(dead_code))]
+pub(crate) fn rfft_backward_ordered_ref_sc(f: &[f32], time: &mut [f32], sc: &mut FftScratch) {
     let n = f.len();
     debug_assert!(time.len() == n);
     // Rebuild the full Hermitian complex spectrum from the ordered real layout.
@@ -615,6 +693,93 @@ pub(crate) fn rfft_backward_ordered_sc(f: &[f32], time: &mut [f32], sc: &mut Fft
     let tout = &sc.tout;
     for i in 0..n {
         time[i] = tout[i].re;
+    }
+}
+
+/// Forward real FFT via one half-length complex transform, producing the same ordered REAL layout
+/// as `rfft_forward_ordered_ref_sc`.
+///
+/// Packing `z[j] = x[2j] + i*x[2j+1]` turns the length-`n` real transform into a length-`m = n/2`
+/// complex one; the even- and odd-sample spectra are then recovered from `Z` by its Hermitian
+/// split and recombined with `W_n^k`. Mathematically identical to the reference, but the operation
+/// sequence differs, so the results differ in the last bits -- which is why this path is opt-in and
+/// carries its own golden checksums. See the `mlow-fast-fft` note in `wacore/Cargo.toml`.
+#[cfg(any(test, feature = "mlow-fast-fft", feature = "bench-internals"))]
+#[cfg_attr(all(not(feature = "mlow-fast-fft"), not(test)), allow(dead_code))]
+pub(crate) fn rfft_forward_ordered_split_sc(time: &[f32], f: &mut [f32], sc: &mut FftScratch) {
+    let n = time.len();
+    debug_assert!(f.len() == n);
+    debug_assert!(n >= 2 && n.is_multiple_of(2));
+    let m = n / 2;
+    let sp = &mut sc.split;
+    // z[j] = x[2j] + i*x[2j+1]: even samples into the real part, odd into the imaginary.
+    for (z, pair) in sp.z.iter_mut().zip(time.chunks_exact(2)) {
+        z.re = pair[0];
+        z.im = pair[1];
+    }
+    fft_rec(&sp.z, 1, 0, &mut sp.zt, &mut sp.arena, &sp.tw_fwd);
+
+    // X[k] = E[k] + W_n^k * O[k], where E and O are the DFTs of the even and the odd samples:
+    //   E[k] = (Z[k] + conj(Z[m-k])) / 2      O[k] = (Z[k] - conj(Z[m-k])) / 2i
+    // At k = 0 both collapse onto Z[0], giving X[0] = Re Z0 + Im Z0 and X[n/2] = Re Z0 - Im Z0 --
+    // the two real bins the ordered layout keeps in f[0] and f[1].
+    let z0 = sp.zt[0];
+    f[0] = z0.re + z0.im;
+    f[1] = z0.re - z0.im;
+    for k in 1..m {
+        let a = sp.zt[k];
+        let b = sp.zt[m - k];
+        let e_re = 0.5 * (a.re + b.re);
+        let e_im = 0.5 * (a.im - b.im);
+        let o_re = 0.5 * (a.im + b.im);
+        let o_im = 0.5 * (b.re - a.re);
+        let w = sp.wn[k];
+        f[2 * k] = e_re + (o_re * w.re - o_im * w.im);
+        f[2 * k + 1] = e_im + (o_re * w.im + o_im * w.re);
+    }
+}
+
+/// Inverse real FFT via one half-length complex transform, consuming the ordered REAL layout and
+/// producing n real time samples, unnormalized exactly like the reference
+/// (BACKWARD(FORWARD(x)) = n*x).
+#[cfg(any(test, feature = "mlow-fast-fft", feature = "bench-internals"))]
+#[cfg_attr(all(not(feature = "mlow-fast-fft"), not(test)), allow(dead_code))]
+pub(crate) fn rfft_backward_ordered_split_sc(f: &[f32], time: &mut [f32], sc: &mut FftScratch) {
+    let n = f.len();
+    debug_assert!(time.len() == n);
+    debug_assert!(n >= 2 && n.is_multiple_of(2));
+    let m = n / 2;
+    let sp = &mut sc.split;
+    // Invert the forward recombination: Z[k] = E[k] + i*O[k] with
+    //   E[k] = (X[k] + conj(X[m-k])) / 2      O[k] = conj(W_n^k) * (X[k] - conj(X[m-k])) / 2
+    // k = 0 pairs DC with Nyquist, which the ordered layout keeps in f[0] and f[1].
+    sp.z[0] = Cpx {
+        re: 0.5 * (f[0] + f[1]),
+        im: 0.5 * (f[0] - f[1]),
+    };
+    for k in 1..m {
+        let a_re = f[2 * k];
+        let a_im = f[2 * k + 1];
+        let c_re = f[2 * (m - k)];
+        let c_im = -f[2 * (m - k) + 1];
+        let e_re = 0.5 * (a_re + c_re);
+        let e_im = 0.5 * (a_im + c_im);
+        let d_re = 0.5 * (a_re - c_re);
+        let d_im = 0.5 * (a_im - c_im);
+        let w = sp.wn[k];
+        let o_re = d_re * w.re + d_im * w.im;
+        let o_im = d_im * w.re - d_re * w.im;
+        sp.z[k] = Cpx {
+            re: e_re - o_im,
+            im: e_im + o_re,
+        };
+    }
+    fft_rec(&sp.z, 1, 0, &mut sp.zt, &mut sp.arena, &sp.tw_bwd);
+    // The length-m inverse yields m*(x[2j] + i*x[2j+1]); the reference is unnormalized at length
+    // n = 2m, so the factor 2 restores its scale.
+    for (pair, z) in time.chunks_exact_mut(2).zip(&sp.zt[..m]) {
+        pair[0] = 2.0 * z.re;
+        pair[1] = 2.0 * z.im;
     }
 }
 
@@ -1126,6 +1291,182 @@ mod tests {
     }
 
     // FFT -> IFFT round-trips to n*x within float tolerance.
+    /// Deterministic input families covering the shapes the analysis front end actually feeds the
+    /// FFT: a windowed tone, broadband noise, an impulse (flat spectrum, worst case for relative
+    /// error) and a DC step.
+    fn split_test_signals(n: usize) -> Vec<(&'static str, Vec<f32>)> {
+        let mut noise = vec![0.0f32; n];
+        let mut seed: u32 = 12345;
+        for v in noise.iter_mut() {
+            seed = seed.wrapping_mul(196314165).wrapping_add(907633515);
+            *v = ((seed >> 9) as f32 / (1u32 << 23) as f32) - 1.0;
+        }
+        let tone: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / n as f32;
+                (2.0 * SMPL_PI * 13.0 * t).sin() * (0.5 - 0.5 * (2.0 * SMPL_PI * t).cos())
+            })
+            .collect();
+        let mut impulse = vec![0.0f32; n];
+        impulse[n / 3] = 1.0;
+        let step: Vec<f32> = (0..n).map(|i| if i < n / 2 { 1.0 } else { -1.0 }).collect();
+        vec![
+            ("tone", tone),
+            ("noise", noise),
+            ("impulse", impulse),
+            ("step", step),
+        ]
+    }
+
+    /// The `mlow-fast-fft` path is a different operation sequence for the same transform, so it can
+    /// never be compared bit for bit -- this bounds how far it may drift instead, and is what
+    /// licenses shipping it as an option. The bound is on the error relative to the reference
+    /// spectrum's own RMS, which is the scale the perceptual model reads it at. The two paths
+    /// actually differ by 2e-7 to 1.6e-5 relative across these signals and lengths, so 1e-4 is
+    /// about six times the worst observed case -- loose enough not to be a flake, tight enough that
+    /// a real defect (a wrong twiddle, a dropped bin, a scale error) is orders of magnitude out.
+    ///
+    /// `split_rfft_error_is_at_reference_level` is the companion that says what that difference
+    /// means: both paths sit at the same distance from the exact transform.
+    ///
+    /// Runs unconditionally: a mitigation you have to opt into is not one.
+    #[test]
+    fn split_rfft_matches_reference() {
+        const TOL: f32 = 1e-4;
+        for &n in &[512usize, PERCW_NFFT] {
+            let mut sc = FftScratch::new(n);
+            for (name, x) in split_test_signals(n) {
+                let mut want = vec![0.0f32; n];
+                rfft_forward_ordered_ref_sc(&x, &mut want, &mut sc);
+                let mut got = vec![0.0f32; n];
+                rfft_forward_ordered_split_sc(&x, &mut got, &mut sc);
+                let rms =
+                    (want.iter().map(|v| (v * v) as f64).sum::<f64>() / n as f64).sqrt() as f32;
+                let err = want
+                    .iter()
+                    .zip(&got)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    err <= TOL * rms,
+                    "forward n={n} {name}: max abs error {err:e} exceeds {TOL:e} * rms {rms:e}"
+                );
+
+                // Backward from the same (reference) spectrum, so the inverse is compared on its own
+                // rather than inheriting the forward's difference.
+                let mut want_t = vec![0.0f32; n];
+                rfft_backward_ordered_ref_sc(&want, &mut want_t, &mut sc);
+                let mut got_t = vec![0.0f32; n];
+                rfft_backward_ordered_split_sc(&want, &mut got_t, &mut sc);
+                let trms =
+                    (want_t.iter().map(|v| (v * v) as f64).sum::<f64>() / n as f64).sqrt() as f32;
+                let terr = want_t
+                    .iter()
+                    .zip(&got_t)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    terr <= TOL * trms,
+                    "backward n={n} {name}: max abs error {terr:e} exceeds {TOL:e} * rms {trms:e}"
+                );
+            }
+        }
+    }
+
+    /// Naive O(n^2) DFT in f64, as an oracle neither FFT path can be graded against by the other.
+    /// Returns the ordered REAL layout so it lines up with both.
+    fn exact_rfft_ordered(x: &[f32]) -> Vec<f64> {
+        let n = x.len();
+        let mut out = vec![0.0f64; n];
+        let bin = |k: usize| -> (f64, f64) {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (j, v) in x.iter().enumerate() {
+                let ang = -2.0 * std::f64::consts::PI * (k as f64) * (j as f64) / (n as f64);
+                re += (*v as f64) * ang.cos();
+                im += (*v as f64) * ang.sin();
+            }
+            (re, im)
+        };
+        out[0] = bin(0).0;
+        out[1] = bin(n / 2).0;
+        for k in 1..n / 2 {
+            let (re, im) = bin(k);
+            out[2 * k] = re;
+            out[2 * k + 1] = im;
+        }
+        out
+    }
+
+    /// The bound in `split_rfft_matches_reference` says the two paths are close; this says whether
+    /// either is right. Both are graded against an exact f64 DFT, on two axes: each must stay within
+    /// f32 precision of the exact transform, and the split path must not be more than a small factor
+    /// noisier than the reference. Without this, "they differ by 1.6e-5" would be equally consistent
+    /// with the fast path simply being wrong.
+    ///
+    /// Measured across these signals, error relative to the exact spectrum's RMS runs 1.3e-7..7.6e-6
+    /// for the reference and 1.5e-7..1.6e-5 for the split path, a ratio of 0.85x..5.6x. The split
+    /// path is therefore slightly noisier -- it adds an f32 recombination stage the reference does
+    /// not have -- but both sit at f32 rounding level, three orders of magnitude below the coarsest
+    /// quantizer step in the encoder.
+    #[test]
+    fn split_rfft_error_is_at_reference_level() {
+        // Each path's own distance to the exact transform, relative to the spectrum RMS.
+        const MAX_REL: f64 = 1e-4;
+        // ... and how much noisier the split path may be than the reference.
+        const MAX_RATIO: f64 = 8.0;
+        for &n in &[512usize, PERCW_NFFT] {
+            let mut sc = FftScratch::new(n);
+            for (name, x) in split_test_signals(n) {
+                let exact = exact_rfft_ordered(&x);
+                let mut r = vec![0.0f32; n];
+                rfft_forward_ordered_ref_sc(&x, &mut r, &mut sc);
+                let mut sp = vec![0.0f32; n];
+                rfft_forward_ordered_split_sc(&x, &mut sp, &mut sc);
+                let dist = |got: &[f32]| -> f64 {
+                    got.iter()
+                        .zip(&exact)
+                        .map(|(a, b)| ((*a as f64) - b).abs())
+                        .fold(0.0f64, f64::max)
+                };
+                let (dr, ds) = (dist(&r), dist(&sp));
+                let rms = (exact.iter().map(|v| v * v).sum::<f64>() / n as f64).sqrt();
+                assert!(
+                    dr <= MAX_REL * rms && ds <= MAX_REL * rms,
+                    "n={n} {name}: distance to the exact DFT exceeds {MAX_REL:e} * rms {rms:e} \
+                     (reference {dr:e}, split {ds:e})"
+                );
+                assert!(
+                    ds <= MAX_RATIO * dr.max(f64::MIN_POSITIVE),
+                    "n={n} {name}: split path is {:.2}x further from the exact DFT than the \
+                     reference ({ds:e} vs {dr:e})",
+                    ds / dr
+                );
+            }
+        }
+    }
+
+    /// The split path must satisfy the same unnormalized round-trip identity as the reference:
+    /// BACKWARD(FORWARD(x)) = n*x.
+    #[test]
+    fn split_rfft_roundtrip_is_unnormalized_identity() {
+        for &n in &[512usize, PERCW_NFFT] {
+            let mut sc = FftScratch::new(n);
+            for (name, x) in split_test_signals(n) {
+                let mut f = vec![0.0f32; n];
+                rfft_forward_ordered_split_sc(&x, &mut f, &mut sc);
+                let mut back = vec![0.0f32; n];
+                rfft_backward_ordered_split_sc(&f, &mut back, &mut sc);
+                for (i, (b, want)) in back.iter().zip(&x).enumerate() {
+                    let expected = want * n as f32;
+                    assert!(
+                        (b - expected).abs() < 1e-1 * (1.0 + expected.abs()),
+                        "n={n} {name} idx {i}: got {b}, want {expected}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn fft_roundtrip() {
         let n = PERCW_NFFT;
