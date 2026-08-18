@@ -4154,6 +4154,42 @@ mod tests {
         assert_eq!(busy.timeout, 7000, "busy_timeout = 7s");
     }
 
+    /// The performance-relevant pragmas a default store runs on. The custom-config
+    /// test above pins the tunables when they are overridden; these are the values
+    /// every consumer that never touches `SqliteStoreConfig` actually gets, and
+    /// they are the ones a "why is this slow" investigation starts from.
+    #[tokio::test]
+    async fn default_pragmas_are_normal_sync_and_memory_temp_store() {
+        let db_name = format!(
+            "file:memdb_default_pragmas_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let store = SqliteStore::new(&db_name).await.expect("default store");
+
+        #[derive(diesel::QueryableByName)]
+        struct Pragmas {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            sync: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            temp_store: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cache: i64,
+        }
+        let mut conn = store.pool.get().unwrap();
+        let pragmas: Pragmas = diesel::sql_query(
+            "SELECT sy.synchronous AS sync, ts.temp_store AS temp_store, cs.cache_size AS cache \
+             FROM pragma_synchronous sy, pragma_temp_store ts, pragma_cache_size cs",
+        )
+        .get_result(&mut conn)
+        .unwrap();
+
+        // NORMAL: in WAL a commit does not fsync, only a checkpoint does.
+        assert_eq!(pragmas.sync, 1, "default synchronous = NORMAL");
+        // MEMORY: sorters and materialized subqueries never touch the disk.
+        assert_eq!(pragmas.temp_store, 2, "temp_store = MEMORY");
+        assert_eq!(pragmas.cache, -512, "default cache_size = 512 KiB");
+    }
+
     #[tokio::test]
     async fn connection_init_runs_before_pragmas_and_migrations() {
         use portable_atomic::AtomicU64;
