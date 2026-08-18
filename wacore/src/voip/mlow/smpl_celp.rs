@@ -308,6 +308,13 @@ fn smpl_filt_ar16(x: &[f32], n: usize, coef: &[f32], y_base: usize, y: &mut [f32
 
 /// MA filter: the `(coef_len-1)` history samples sit before `x[0]` (caller passes an offset). `x != y`.
 fn smpl_filt_ma(x: &[f32], x_base: usize, n: usize, coef: &[f32], coef_len: usize, y: &mut [f32]) {
+    // The caller's contract, spelled out because the tap windows below depend on it: `coef_len - 1`
+    // history samples sit before `x[0]`, so every `x[x_base - i ..]` starts in bounds; and the
+    // `coef[0] == 1.0` branch needs a `coef[1]` to read. Both hold at the only call site
+    // (`perc_filt_ma`, where n == coef_len == perc_resp_len, which is 32 whenever it routes here --
+    // perc_resp_len == 10 goes to `smpl_filt_ma9`).
+    debug_assert!(x_base + 1 >= coef_len);
+    debug_assert!(coef[0] != 1.0 || coef.len() >= 2);
     // Each tap reads a fixed-offset window of `x`, so one slice per tap replaces the per-element
     // `x_base + k - i` bounds check. Taps are still applied in ascending order into the same
     // accumulator, so the sum order -- and the output bits -- are unchanged.
@@ -1289,7 +1296,9 @@ impl CelpEncoder {
             write_st.pulse_signs[np] = fcb_sign_new;
         }
 
-        // fcb->n_pulses++, fcb->fcb_state_idx = idx (mutate the read copy)
+        // The upstream C bumped `fcb->n_pulses` and set `fcb->fcb_state_idx` in place. Here the
+        // read-side `sc.fcbs[fcb_idx_in]` is left alone: both values go straight into each candidate
+        // emitted below, and the caller rebuilds `sc.fcbs` from the candidates after `swap_rw`.
         let new_n_pulses = fcb_n_pulses + 1;
 
         // Q = num^2/den; top-numsurv -> candidates with unique-signature dedup.
