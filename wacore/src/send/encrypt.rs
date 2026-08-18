@@ -964,7 +964,9 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
             includes_prekey_message: raw.includes_prekey_message,
             encrypted_devices,
             had_unregistered_device: raw.had_unregistered_device,
-            rejected_devices: raw.rejected_devices.clone(),
+            // The raw result is consumed here, so its rejection list can be
+            // handed over rather than duplicated.
+            rejected_devices: raw.rejected_devices,
         },
         first_error,
         unkeyed_at_encrypt,
@@ -1147,6 +1149,39 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         },
         first_error,
     })
+}
+
+#[cfg(test)]
+mod participant_node_tests {
+    use super::{EncryptedDevice, encrypted_device_to_participant_node};
+    use wacore_binary::Jid;
+    use wacore_binary::node::NodeContent;
+
+    /// The per-device ciphertext is the largest buffer the fan-out touches, and
+    /// it is handed straight to the `<enc>` node. `NodeBuilder::bytes` takes an
+    /// `impl Into<Vec<u8>>`, which is a no-op for the `Vec<u8>` it is given.
+    /// Pass a slice instead and every device silently pays a full copy, so
+    /// pointer identity is the only thing that catches the regression.
+    #[test]
+    fn the_ciphertext_reaches_the_enc_node_without_being_copied() {
+        let ciphertext = vec![0xAB; 4096];
+        let expected_ptr = ciphertext.as_ptr();
+        let one = EncryptedDevice {
+            device_jid: Jid::lid_device("100000000000001".to_owned(), 3),
+            enc_type: "msg",
+            is_prekey: false,
+            ciphertext,
+        };
+
+        let to_node = encrypted_device_to_participant_node(one, None, false);
+        let Some(NodeContent::Nodes(children)) = to_node.content else {
+            panic!("a `<to>` node carries its `<enc>` child");
+        };
+        let Some(NodeContent::Bytes(bytes)) = &children[0].content else {
+            panic!("an `<enc>` node carries the ciphertext as bytes");
+        };
+        assert_eq!(bytes.as_ptr(), expected_ptr, "the ciphertext was copied");
+    }
 }
 
 #[cfg(test)]
