@@ -1366,7 +1366,11 @@ pub mod stage_bench {
         block_lags: [[f32; 2]; SMPL_SUBFR_COUNT],
         perc_corrs: Vec<Vec<f32>>,
         /// Entropy-coder inputs: analyzed params for a real frame, plus the encoder's own buffers.
-        fp: super::super::params::SmplFrameParams,
+        /// Analyzed parameters for each of the `STREAM` frames, and the cursor over them. One set
+        /// would make the row re-serialize a single frame forever, and an entropy encode's cost
+        /// tracks the parameters it writes (pulse counts, voiced vs. unvoiced block).
+        fps: Vec<super::super::params::SmplFrameParams>,
+        fp_at: usize,
         range: super::super::rangecoder::RangeEncoder,
         out: Vec<u8>,
     }
@@ -1382,13 +1386,18 @@ pub mod stage_bench {
         /// table loads, twiddle construction, scratch pools, warmed cross-frame state.
         pub fn new() -> Self {
             let mut es = SmplEncoderState::default();
-            let mut fp = None;
             for k in 0..WARMUP_FRAMES {
-                fp = Some(smpl_analyze_frame_st(&mut es, &tone(k * SMPL_INTF_LEN * 3)));
+                let _ = smpl_analyze_frame_st(&mut es, &tone(k * SMPL_INTF_LEN * 3));
             }
-            let fp = fp.expect("warmup ran at least once");
             let pcm: Vec<Vec<f32>> = (0..STREAM)
                 .map(|k| tone((WARMUP_FRAMES + k) * SMPL_INTF_LEN * 3))
+                .collect();
+            // Analyze the whole stream up front so `entropy_encode` has one parameter set per frame
+            // to cycle. This runs before the buffer snapshots below so those stay consistent with
+            // the state `es` is left in.
+            let fps: Vec<_> = pcm
+                .iter()
+                .map(|f| smpl_analyze_frame_st(&mut es, f))
                 .collect();
 
             let hp = es.hp.clone();
@@ -1464,7 +1473,8 @@ pub mod stage_bench {
                 res_lpc,
                 block_lags: [[0.0; 2]; SMPL_SUBFR_COUNT],
                 perc_corrs: Vec::new(),
-                fp,
+                fps,
+                fp_at: 0,
                 range: super::super::rangecoder::RangeEncoder::new(
                     1 + super::super::encode::SMPL_ENCODE_BUF_BYTES,
                 ),
@@ -1664,7 +1674,9 @@ pub mod stage_bench {
 
         /// The range coder writing the analyzed parameters to the wire. 1x per 60 ms frame.
         pub fn entropy_encode(&mut self) -> usize {
-            super::super::encode::encode_smpl_frame_into(&self.fp, &mut self.range, &mut self.out)
+            let fp = &self.fps[self.fp_at % self.fps.len()];
+            self.fp_at += 1;
+            super::super::encode::encode_smpl_frame_into(fp, &mut self.range, &mut self.out)
                 .expect("analyzed params encode");
             self.out.len()
         }

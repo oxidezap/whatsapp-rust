@@ -43,8 +43,15 @@ jobs:
       # (codspeed.io/docs -> sharded-benchmarks).
       matrix:
         shard:
+          # `features` is required here, not optional: `voip_benchmark` and
+          # `sframe_varint_benchmark` carry `required-features`, and a bench
+          # target whose required features are off is SILENTLY SKIPPED by cargo
+          # rather than erroring. Without this the entire VoIP media plane --
+          # MLow encode/decode, E2E-SRTP, SFrame, the codec stage rows -- built
+          # nowhere and uploaded nothing, so none of it was regression-gated.
           - name: core
             packages: -p wacore -p wacore-noise
+            features: --features voip-mlow,bench-internals
           - name: proto-signal
             packages: -p wacore-binary -p wacore-libsignal -p wacore-appstate
           # The client crate's own benchmarks. Its fixture needs crate-private
