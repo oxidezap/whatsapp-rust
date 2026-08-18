@@ -353,15 +353,36 @@ fn smallest_factor(n: usize) -> usize {
     n
 }
 
-/// Precomputed twiddle factors for one `(top-N, sign)` FFT. The butterfly cos/sin depend only on
-/// `(n, index)`, never on the input, so they are computed once at init and read in the hot loop.
+/// One level of the factorization chain: at length `n` the recursion splits into `p` sub-DFTs of
+/// length `m = n/p`. Every node at a given recursion depth sees the same `n`, so the chain is a flat
+/// list indexed by depth.
+struct FftLevel {
+    n: usize,
+    p: usize,
+    m: usize,
+    /// Combine-step twiddles for this level, indexed `k * p + q` (length `n * p`).
+    tw: Vec<Cpx>,
+}
+
+/// Precomputed factorization plan and twiddle factors for one `(top-N, sign)` FFT. Both depend only
+/// on `(n, index)`, never on the input, so they are computed once at init and read in the hot loop.
+///
+/// The plan is why the levels are a flat `Vec` indexed by depth rather than an `(n, table)`
+/// association list: `n` is fixed per stream (512 for LPC analysis, 576 for the perceptual model), so
+/// the whole chain of `(n, p, m)` is known at init. Re-deriving `p` with `smallest_factor` and
+/// re-finding the twiddle table by scanning for `n` at every node cost 5361 trial divisions and 5361
+/// linear scans per encoded frame -- the recursion visits 511 nodes per 512-point transform and 319
+/// per 576-point one, at 15 transforms per frame. Indexing by depth removes both without touching a
+/// single arithmetic operation, so the output stays bit-identical.
+///
 /// Each table reproduces the EXACT inline angle arithmetic (same f32 op order, same std cos/sin), so
 /// reading from it is bit-identical to the inline recompute; proven by `twiddle_table_is_bit_exact`.
 struct FftTwiddles {
-    /// Per visited length `n`, the combine-step twiddles indexed `k * p + q` (length `n * p`).
-    combine: Vec<(usize, Vec<Cpx>)>,
-    /// Per prime base length `n`, the base-DFT twiddles indexed `k * n + j` (length `n * n`).
-    base: Vec<(usize, Vec<Cpx>)>,
+    /// The chain from the top length down to (but excluding) the prime base, indexed by depth.
+    levels: Vec<FftLevel>,
+    /// The prime length the chain terminates in, and its base-DFT twiddles indexed `k * n + j`.
+    base_n: usize,
+    base: Vec<Cpx>,
 }
 
 /// Compute the combine twiddle for `(n, k, q, sign)` exactly as the inline butterfly does.
@@ -387,54 +408,56 @@ fn base_twiddle(n: usize, k: usize, j: usize, sign: f32) -> Cpx {
 }
 
 impl FftTwiddles {
-    /// Build the twiddle tables for the chain of `n` values the recursion visits from `top` down,
-    /// for the given `sign`.
+    /// Build the plan and twiddle tables for the chain of `n` values the recursion visits from `top`
+    /// down, for the given `sign`.
     fn new(top: usize, sign: f32) -> Self {
-        let mut combine = Vec::new();
-        let mut base = Vec::new();
+        let mut levels = Vec::new();
         let mut n = top;
+        let (mut base_n, mut base) = (1usize, Vec::new());
         while n > 1 {
             let p = smallest_factor(n);
             if p == n {
-                let mut tab = Vec::with_capacity(n * n);
+                base_n = n;
+                base = Vec::with_capacity(n * n);
                 for k in 0..n {
                     for j in 0..n {
-                        tab.push(base_twiddle(n, k, j, sign));
+                        base.push(base_twiddle(n, k, j, sign));
                     }
                 }
-                base.push((n, tab));
                 break;
             }
-            let mut tab = Vec::with_capacity(n * p);
+            let mut tw = Vec::with_capacity(n * p);
             for k in 0..n {
                 for q in 0..p {
-                    tab.push(combine_twiddle(n, k, q, sign));
+                    tw.push(combine_twiddle(n, k, q, sign));
                 }
             }
-            combine.push((n, tab));
+            levels.push(FftLevel { n, p, m: n / p, tw });
             n /= p;
         }
-        FftTwiddles { combine, base }
+        FftTwiddles {
+            levels,
+            base_n,
+            base,
+        }
     }
 
-    #[inline]
+    /// Test-only lookups by length, kept so `twiddle_table_is_bit_exact` can walk the chain the way
+    /// it always has. The hot path indexes `levels` by depth instead.
+    #[cfg(test)]
     fn combine_for(&self, n: usize) -> &[Cpx] {
-        for (m, tab) in &self.combine {
-            if *m == n {
-                return tab;
+        for lvl in &self.levels {
+            if lvl.n == n {
+                return &lvl.tw;
             }
         }
         unreachable!("combine twiddle table missing for n={n}");
     }
 
-    #[inline]
+    #[cfg(test)]
     fn base_for(&self, n: usize) -> &[Cpx] {
-        for (m, tab) in &self.base {
-            if *m == n {
-                return tab;
-            }
-        }
-        unreachable!("base twiddle table missing for n={n}");
+        assert_eq!(self.base_n, n, "base twiddle table missing for n={n}");
+        &self.base
     }
 }
 
@@ -488,19 +511,15 @@ fn fft_arena_len(n: usize) -> usize {
 fn fft_rec(
     x: &[Cpx],
     stride: usize,
-    n: usize,
+    depth: usize,
     out: &mut [Cpx],
     scratch: &mut [Cpx],
     tw: &FftTwiddles,
 ) {
-    if n == 1 {
-        out[0] = x[0];
-        return;
-    }
-    let p = smallest_factor(n);
-    if p == n {
-        // Prime (or n with no small factor): naive O(n^2) DFT base case.
-        let bt = tw.base_for(n);
+    // Past the last split level the chain terminates in its prime base: the naive O(n^2) DFT.
+    let Some(lvl) = tw.levels.get(depth) else {
+        let n = tw.base_n;
+        let bt = &tw.base;
         for k in 0..n {
             let mut acc = Cpx::zero();
             let row = k * n;
@@ -510,16 +529,16 @@ fn fft_rec(
             out[k] = acc;
         }
         return;
-    }
-    let m = n / p;
+    };
+    let (n, p, m) = (lvl.n, lvl.p, lvl.m);
     // Carve this level's `sub` (size n) from the arena; the remainder feeds the child sub-DFTs.
     let (sub, rest) = scratch.split_at_mut(n);
     // Compute p sub-DFTs of length m over the decimated inputs (sub[q*m .. (q+1)*m]).
     for (q, dst) in sub.chunks_mut(m).enumerate() {
-        fft_rec(&x[q * stride..], stride * p, m, dst, rest, tw);
+        fft_rec(&x[q * stride..], stride * p, depth + 1, dst, rest, tw);
     }
     // Combine: out[k] = sum_q twiddle(q,k) * sub_q[k mod m], with the radix-p butterfly.
-    let ct = tw.combine_for(n);
+    let ct = &lvl.tw;
     for k in 0..n {
         let kmod = k % m;
         let mut acc = Cpx::zero();
@@ -536,7 +555,7 @@ fn cfft(input: &[Cpx], out: &mut [Cpx], sign: f32, arena: &mut [Cpx], tw: &FftTw
     let n = input.len();
     debug_assert!(out.len() == n);
     debug_assert!(sign == -1.0 || sign == 1.0);
-    fft_rec(input, 1, n, out, arena, tw);
+    fft_rec(input, 1, 0, out, arena, tw);
 }
 
 /// Forward real FFT of `n` real samples, re-packed into the ordered REAL layout:

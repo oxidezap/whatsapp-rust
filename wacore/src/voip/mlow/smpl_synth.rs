@@ -220,15 +220,31 @@ fn smpl_stabilize_nlsf(nlsf: &mut [f32], min_spacing: &[f32]) {
     }
 }
 
+/// Stack-scratch bound for [`smpl_nlsf2a`]: the codec's LPC order is 16 and never varies, so this is
+/// a headroom constant, not a limit anyone is expected to reach.
+const SMPL_NLSF2A_MAX_ORDER: usize = 16;
+
 /// func 3513 (silk_NLSF2A): order-16 NLSF (radians) -> LPC coefficients a[0..16], a[0]=1.0.
 pub(crate) fn smpl_nlsf2a(nlsf: &[f32]) -> Vec<f32> {
     let order = nlsf.len();
     let half = order / 2;
-    let cosv: Vec<f64> = nlsf.iter().map(|&x| (x as f64).cos()).collect();
-    let mut p = vec![0f64; half + 1];
-    let mut q = vec![0f64; half + 1];
-    smpl_nlsf_poly(&mut p, &cosv, half, 0);
-    smpl_nlsf_poly(&mut q, &cosv, half, 1);
+    // The LPC order is a fixed 16 and the working polynomials are `order/2 + 1` long, so they fit on
+    // the stack. Only the returned `a` needs the heap (the callers, including the `nlsf2a` closure
+    // `smpl_lpc_interpol` takes, are typed on `Vec<f32>`). This runs 4x per internal frame via the
+    // LSF quantizer and the per-subframe LPC interpolation.
+    debug_assert!(
+        order <= SMPL_NLSF2A_MAX_ORDER,
+        "LPC order {order} exceeds the stack scratch"
+    );
+    let mut cosv = [0f64; SMPL_NLSF2A_MAX_ORDER];
+    for (c, &x) in cosv.iter_mut().zip(nlsf) {
+        *c = (x as f64).cos();
+    }
+    let cosv = &cosv[..order];
+    let mut p = [0f64; SMPL_NLSF2A_MAX_ORDER / 2 + 1];
+    let mut q = [0f64; SMPL_NLSF2A_MAX_ORDER / 2 + 1];
+    smpl_nlsf_poly(&mut p, cosv, half, 0);
+    smpl_nlsf_poly(&mut q, cosv, half, 1);
 
     let mut a = vec![0f32; order + 1];
     a[0] = 1.0;

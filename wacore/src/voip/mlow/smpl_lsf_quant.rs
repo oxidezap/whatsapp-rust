@@ -164,7 +164,15 @@ fn matrix_mult_transp_16(c: &[Vec<f32>], x: &[f32], y: &mut [f32], len_x: usize)
 /// is the load-bearing output.
 fn get_maxi_k(x: &[f32], idx: &mut [i32], k: usize) {
     let n = x.len();
-    let mut used = vec![false; n];
+    // Stack-scratch the mask, as `smpl_celp::smpl_get_maxi_k` already does for its own copy of this
+    // selection. `n` is either the stage-1 centroid count (16, or 17 with the conditional centroid)
+    // or the LPC order (16), both bounded by the codebook geometry.
+    debug_assert!(
+        n <= LSF_CB_CENTROIDS + 1,
+        "get_maxi_k scratch too small for n={n}"
+    );
+    let mut used_buf = [false; LSF_CB_CENTROIDS + 1];
+    let used = &mut used_buf[..n];
     for slot in idx.iter_mut().take(k) {
         let mut best_i = -1i32;
         let mut best_v = f32::NEG_INFINITY;

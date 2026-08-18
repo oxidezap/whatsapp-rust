@@ -2090,14 +2090,12 @@ impl CelpEncoder {
         let mut exc_fcb = SubframeScratch::zeroed(&mut self.sf.exc_fcb, SMPL_MAX_SF_LEN);
         let tbl = celp_tables();
         for r in 0..SMPL_CELP_MAX_RATES {
-            let mut exc_fcb_raw = vec![0.0f32; SMPL_MAX_SF_LEN];
-            fcb_synthesize(
-                fcb_subfrlen,
-                &pulses[r],
-                n_pulses[r] as usize,
-                &mut exc_fcb_raw,
-            );
-            exc_fcb[..fcb_subfrlen].copy_from_slice(&exc_fcb_raw[..fcb_subfrlen]);
+            // Synthesize straight into the pooled `exc_fcb`. `fcb_synthesize` zeroes `[..fcb_subfrlen]`
+            // itself before adding pulses (whose positions are all inside that range), so it fully
+            // defines exactly the region the previous rate left dirty, and the tail past
+            // `fcb_subfrlen` is untouched either way -- the scratch buffer and its copy were
+            // redundant, not protective. Same values, one fewer 640-byte allocation per rate.
+            fcb_synthesize(fcb_subfrlen, &pulses[r], n_pulses[r] as usize, &mut exc_fcb);
             if n_pulses[r] > 0 {
                 if voiced {
                     if self.low_rate {
