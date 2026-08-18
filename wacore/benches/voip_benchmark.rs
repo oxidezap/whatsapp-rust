@@ -244,7 +244,9 @@ mod codec_stages {
     }
 
     /// Whole analysis half of an encode (1x/frame): VAD, high-pass, and the per-internal-frame LPC /
-    /// perc / pitch / LSF / CELP chain. With `entropy_encode` this accounts for all of `mlow_encode`.
+    /// perc / pitch / LSF / CELP chain. With `entropy_encode` this is the codec work -- `mlow_encode`
+    /// additionally sanitizes its 960 input samples and allocates a fresh output buffer, which the
+    /// `mlow_encode` vs `mlow_encode_reused_output` pair isolates.
     #[divan::bench]
     fn analyze_frame(bencher: Bencher) {
         run(bencher, |s| s.analyze_frame() as f64);
