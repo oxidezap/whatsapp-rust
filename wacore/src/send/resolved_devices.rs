@@ -70,7 +70,7 @@ impl ResolvedGroupDevices {
     fn compute(devices: &[Jid], own_sending_jid: &Jid) -> Option<CompactString> {
         let set = super::group::build_group_phash_set(devices, own_sending_jid);
         match MessageUtils::participant_list_hash(&set) {
-            Ok(phash) => Some(CompactString::from(phash)),
+            Ok(phash) => Some(phash),
             Err(e) => {
                 log::warn!("Failed to compute group phash: {e:?}");
                 None
@@ -130,7 +130,7 @@ impl ResolvedDmDevices {
             return Some(hash.clone());
         }
         let hash = match MessageUtils::participant_list_hash(self.devices()) {
-            Ok(phash) => CompactString::from(phash),
+            Ok(phash) => phash,
             Err(e) => {
                 log::warn!("Failed to compute DM phash: {e:?}");
                 return None;

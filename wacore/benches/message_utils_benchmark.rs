@@ -37,6 +37,19 @@ fn bench_participant_list_hash_1600(bencher: divan::Bencher) {
         });
 }
 
+/// 4 members x 2 devices: the phash input of a DM or a small group, which is
+/// the shape most sends actually have and the one the 1600-device arm above
+/// says nothing about -- there every buffer spills, so only this arm shows
+/// what the inline range storage is worth.
+#[divan::bench]
+fn bench_participant_list_hash_8(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| setup_device_list(4, 2))
+        .bench_refs(|devices| {
+            black_box(MessageUtils::participant_list_hash(black_box(&**devices)).unwrap())
+        });
+}
+
 fn text_message() -> wa::Message {
     wa::Message {
         extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {

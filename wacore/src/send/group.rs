@@ -304,7 +304,7 @@ pub async fn prepare_group_stanza(
         } else if let Some(src) = distribution_list.as_deref() {
             let phash_set = build_group_phash_set(src, &own_sending_jid);
             match MessageUtils::participant_list_hash(&phash_set) {
-                Ok(phash) => phash_for_stanza = Some(CompactString::new(&phash)),
+                Ok(phash) => phash_for_stanza = Some(phash),
                 Err(e) => {
                     log::warn!(
                         "Failed to compute group phash for {}: {:?}",

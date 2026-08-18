@@ -783,7 +783,9 @@ impl<'a> Groups<'a> {
                     (persisted, Some(metadata))
                 };
                 let phash = cached.as_deref().or(persisted.as_ref()).and_then(|info| {
-                    wacore::messages::MessageUtils::participant_list_hash(&info.participants).ok()
+                    wacore::messages::MessageUtils::participant_list_hash(&info.participants)
+                        .ok()
+                        .map(|h| h.into_string())
                 });
 
                 let group = match self
