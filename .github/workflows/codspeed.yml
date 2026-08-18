@@ -88,7 +88,7 @@ jobs:
       # `apt-get update && apt-get install`, and it buffers that command's
       # output, printing it only on failure -- so a stalled mirror or a held
       # dpkg lock reads as a step that emits nothing and never returns. Two
-      # things follow from that, and this step does both.
+      # things follow from that, and the steps below do both.
       #
       # Bound apt globally: the config file applies to the runner's own
       # invocation too, turning an unbounded wait into a bounded failure.
@@ -101,11 +101,28 @@ jobs:
       #
       # The budgets nest, and the order matters: apt's own limits are meant to
       # fire first and `timeout` is only the backstop for the case they cannot
-      # see, which is a transfer that keeps trickling bytes. Hence 180s over a
-      # 60s lock wait and a ~80s worst case per index file. A degraded-but-
-      # working archive took up to 263s here on 2026-08-18, so this step must
-      # not be the thing that fails the job -- if it gives up, the runner still
-      # installs the package itself, now bounded by the same config.
+      # see, which is a transfer that keeps trickling bytes. The step is not
+      # fatal -- if it gives up, the runner installs the package itself, now
+      # bounded by the same config, which is slow but still runs the benchmarks.
+      #
+      # `apt-get update` is the part that actually stalls: it fetches every
+      # index of every source, and on 2026-08-18 it repeatedly blew a 180s
+      # budget while the install that followed took 15s. So it is the last
+      # resort here, not the first move. The cached .deb comes first, then the
+      # image's own package lists, and only a miss on both refreshes them.
+      - name: Key the libc6-dbg cache on the installed libc6
+        id: libc6
+        run: echo "version=$(dpkg-query -W -f='${Version}' libc6)" >> "$GITHUB_OUTPUT"
+
+      # libc6-dbg must match libc6 exactly, so the installed libc6 version is
+      # the cache key: it hits while the package is valid and misses the moment
+      # the runner image bumps glibc.
+      - name: Cache the libc6-dbg package
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/libc6-dbg
+          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
+
       - name: Bound apt and pre-install libc6-dbg
         run: |
           sudo tee /etc/apt/apt.conf.d/99-ci-bounds > /dev/null <<'EOF'
@@ -113,10 +130,27 @@ jobs:
           Acquire::http::Timeout "20";
           Acquire::https::Timeout "20";
           DPkg::Lock::Timeout "60";
+          APT::Keep-Downloaded-Packages "true";
           EOF
+          cache="$HOME/.cache/libc6-dbg"
+          mkdir -p "$cache"
+          if sudo dpkg -i "$cache"/*.deb 2>/dev/null; then
+            echo "installed from the cached package, no network"
+            exit 0
+          fi
+          save_deb() {
+            sudo cp /var/cache/apt/archives/libc6-dbg_*.deb "$cache"/ 2>/dev/null || true
+          }
+          if sudo timeout 120 apt-get install -y libc6-dbg; then
+            save_deb
+            exit 0
+          fi
+          # `-q` and not `-qq`: if this ever stalls again, the per-source Get:
+          # lines are what identify which mirror is responsible.
           for attempt in 1 2; do
-            if sudo timeout 180 apt-get update -qq \
-              && sudo timeout 180 apt-get install -y -qq libc6-dbg; then
+            if sudo timeout 180 apt-get update -q \
+              && sudo timeout 120 apt-get install -y libc6-dbg; then
+              save_deb
               exit 0
             fi
             echo "apt attempt $attempt failed"
@@ -209,7 +243,7 @@ jobs:
       # `apt-get update && apt-get install`, and it buffers that command's
       # output, printing it only on failure -- so a stalled mirror or a held
       # dpkg lock reads as a step that emits nothing and never returns. Two
-      # things follow from that, and this step does both.
+      # things follow from that, and the steps below do both.
       #
       # Bound apt globally: the config file applies to the runner's own
       # invocation too, turning an unbounded wait into a bounded failure.
@@ -222,11 +256,28 @@ jobs:
       #
       # The budgets nest, and the order matters: apt's own limits are meant to
       # fire first and `timeout` is only the backstop for the case they cannot
-      # see, which is a transfer that keeps trickling bytes. Hence 180s over a
-      # 60s lock wait and a ~80s worst case per index file. A degraded-but-
-      # working archive took up to 263s here on 2026-08-18, so this step must
-      # not be the thing that fails the job -- if it gives up, the runner still
-      # installs the package itself, now bounded by the same config.
+      # see, which is a transfer that keeps trickling bytes. The step is not
+      # fatal -- if it gives up, the runner installs the package itself, now
+      # bounded by the same config, which is slow but still runs the benchmarks.
+      #
+      # `apt-get update` is the part that actually stalls: it fetches every
+      # index of every source, and on 2026-08-18 it repeatedly blew a 180s
+      # budget while the install that followed took 15s. So it is the last
+      # resort here, not the first move. The cached .deb comes first, then the
+      # image's own package lists, and only a miss on both refreshes them.
+      - name: Key the libc6-dbg cache on the installed libc6
+        id: libc6
+        run: echo "version=$(dpkg-query -W -f='${Version}' libc6)" >> "$GITHUB_OUTPUT"
+
+      # libc6-dbg must match libc6 exactly, so the installed libc6 version is
+      # the cache key: it hits while the package is valid and misses the moment
+      # the runner image bumps glibc.
+      - name: Cache the libc6-dbg package
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/libc6-dbg
+          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
+
       - name: Bound apt and pre-install libc6-dbg
         run: |
           sudo tee /etc/apt/apt.conf.d/99-ci-bounds > /dev/null <<'EOF'
@@ -234,10 +285,27 @@ jobs:
           Acquire::http::Timeout "20";
           Acquire::https::Timeout "20";
           DPkg::Lock::Timeout "60";
+          APT::Keep-Downloaded-Packages "true";
           EOF
+          cache="$HOME/.cache/libc6-dbg"
+          mkdir -p "$cache"
+          if sudo dpkg -i "$cache"/*.deb 2>/dev/null; then
+            echo "installed from the cached package, no network"
+            exit 0
+          fi
+          save_deb() {
+            sudo cp /var/cache/apt/archives/libc6-dbg_*.deb "$cache"/ 2>/dev/null || true
+          }
+          if sudo timeout 120 apt-get install -y libc6-dbg; then
+            save_deb
+            exit 0
+          fi
+          # `-q` and not `-qq`: if this ever stalls again, the per-source Get:
+          # lines are what identify which mirror is responsible.
           for attempt in 1 2; do
-            if sudo timeout 180 apt-get update -qq \
-              && sudo timeout 180 apt-get install -y -qq libc6-dbg; then
+            if sudo timeout 180 apt-get update -q \
+              && sudo timeout 120 apt-get install -y libc6-dbg; then
+              save_deb
               exit 0
             fi
             echo "apt attempt $attempt failed"
