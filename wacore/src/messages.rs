@@ -3,7 +3,6 @@ use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use buffa::MessageView;
 use compact_str::CompactString;
-use smallvec::SmallVec;
 // Encode/decode of proto trees is routed through `waproto::codec` so the tree is
 // instantiated once in waproto; tests still call the trait methods directly.
 #[cfg(test)]
@@ -458,6 +457,11 @@ impl MessageUtils {
         }
     }
 
+    /// The participant hash: `2:` plus the eight base64 characters of six hash
+    /// bytes, so ten bytes in total, which is why it is a `CompactString` and
+    /// not a `String` -- that width lives inline, and every holder of a phash
+    /// (the group and DM memos, the stanza attribute, the group query) carries
+    /// it as one, so the value never needs the heap on its way to the wire.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.send.participant_hash", level = "debug", skip_all)
@@ -471,13 +475,16 @@ impl MessageUtils {
         // order as sorting the individual ad_strings, so the hashed
         // concatenation is byte-identical.
         //
-        // The ranges are `u32` pairs held inline: a DM or a small group keeps
-        // them off the heap entirely, and a large fan-out spills half as many
-        // bytes into the sort as `usize` pairs would.
+        // The ranges are `u32` pairs, so the sort moves half the bytes per
+        // element that `usize` pairs would. They stay a plain `Vec`: an inline
+        // `SmallVec` would spare the small shape its one allocation, but this
+        // hash is memoised per resolved device set rather than run per message,
+        // and instantiating `SmallVec` for a new element type stamps its whole
+        // used surface into the binary -- measured at ~11 KiB of `.text` for no
+        // measurable time, on a crate that also builds for ESP32.
         let devices = devices.into_iter();
         let hint = devices.size_hint().0;
-        let mut ranges: SmallVec<[(u32, u32); 16]> = SmallVec::new();
-        ranges.reserve(hint);
+        let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(hint);
         let mut arena = String::with_capacity(hint * 36);
         for jid in devices {
             let start = arena.len();

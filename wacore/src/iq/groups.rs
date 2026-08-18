@@ -1453,7 +1453,12 @@ pub enum GroupInfoOutcome {
 #[derive(Debug, Clone)]
 pub struct GroupQueryIq {
     pub group_jid: Jid,
-    pub phash: Option<String>,
+    /// A `CompactString` because that is what a phash is everywhere else:
+    /// `MessageUtils::participant_list_hash` produces one, the send memos hold
+    /// one, and a ten-byte value lives inside it with nothing on the heap. A
+    /// `String` here would allocate once to be built and again on the clone
+    /// into the node attribute below.
+    pub phash: Option<CompactString>,
 }
 
 impl GroupQueryIq {
@@ -1466,7 +1471,7 @@ impl GroupQueryIq {
 
     /// Query carrying the cached participant `phash` so the server can answer
     /// "not-modified" by omitting `<group>`.
-    pub fn with_phash(group_jid: &Jid, phash: Option<String>) -> Self {
+    pub fn with_phash(group_jid: &Jid, phash: Option<CompactString>) -> Self {
         Self {
             group_jid: group_jid.clone(),
             phash,
@@ -3906,7 +3911,7 @@ mod tests {
     #[test]
     fn group_query_iq_with_phash_emits_attr() {
         let jid: Jid = "120363000000000001@g.us".parse().unwrap();
-        let iq = GroupQueryIq::with_phash(&jid, Some("2:abc123".to_string())).build_iq();
+        let iq = GroupQueryIq::with_phash(&jid, Some(CompactString::from("2:abc123"))).build_iq();
         let Some(NodeContent::Nodes(nodes)) = &iq.content else {
             panic!("expected NodeContent::Nodes");
         };
