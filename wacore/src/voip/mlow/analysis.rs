@@ -1351,7 +1351,11 @@ pub mod stage_bench {
         hp: Vec<f32>,
         hp_pitch_hist: Vec<f32>,
         /// LPC front-end inputs, captured for internal frame 0.
-        lpcbuf: [f32; SMPL_LPC_BUF_LEN],
+        /// The `lpcbuf` window each internal frame analyzes. Production advances the start by
+        /// `f * SMPL_INTF_LEN`, and the coefficients that fall out drive the data-dependent root
+        /// search in `smpl_a2nlsf_16`, so cycling only the long/short window flag would still be
+        /// three passes over one signal.
+        lpcbufs: Vec<[f32; SMPL_LPC_BUF_LEN]>,
         /// Zero-padded windowed buffer + output, for the bare FFT row.
         fft_in: Vec<f32>,
         fft_out: Vec<f32>,
@@ -1453,7 +1457,7 @@ pub mod stage_bench {
                 pcm_at: 0,
                 hp,
                 hp_pitch_hist,
-                lpcbuf,
+                lpcbufs: Vec::new(),
                 fft_in,
                 fft_out,
                 fft_scratch,
@@ -1487,7 +1491,9 @@ pub mod stage_bench {
                 let start = SMPL_LPC_HIST_LEN - SMPL_LPC_PRE + f * SMPL_INTF_LEN;
                 lpcbuf_f.copy_from_slice(&s.es.hp_full[start..start + SMPL_LPC_BUF_LEN]);
                 let windowed_f = smpl_window_lpc20(&lpcbuf_f, f < 2);
-                let (_, f2_f) = smpl_lpc_analyze_with_f2(&windowed_f, &mut s.fft_scratch);
+                let (a_f, f2_f) = smpl_lpc_analyze_with_f2(&windowed_f, &mut s.fft_scratch);
+                let nlsf_f = smpl_a2nlsf_16(&a_f);
+                s.lpcbufs.push(lpcbuf_f);
 
                 let perc_corrs: Vec<Vec<f32>> = s.with_ctx(f, [[0.0; 2]; SMPL_SUBFR_COUNT], |cs| {
                     compute_perc_corrs(cs).into()
@@ -1512,8 +1518,8 @@ pub mod stage_bench {
                     block_lags[sf] = [pr.lags[2 * sf], pr.lags[2 * sf + 1]];
                 }
                 let fe = FrontEndLsf {
-                    a: s.a,
-                    nlsf: s.nlsf,
+                    a: a_f,
+                    nlsf: nlsf_f,
                     prev_lsfq: &s.prev_lsfq,
                     prev_voiced: s.es.prev_voiced,
                     intf: f,
@@ -1622,7 +1628,7 @@ pub mod stage_bench {
         /// one, and the two differ in window-generation work.
         pub fn lpc_front_end(&mut self) -> f32 {
             let intf = self.next_intf(Self::ROW_LPC);
-            let windowed = smpl_window_lpc20(&self.lpcbuf, intf < 2);
+            let windowed = smpl_window_lpc20(&self.lpcbufs[intf], intf < 2);
             let (a, _f2) = smpl_lpc_analyze_with_f2(&windowed, &mut self.fft_scratch);
             let nlsf = smpl_a2nlsf_16(&a);
             nlsf[0]
