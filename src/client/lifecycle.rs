@@ -587,18 +587,6 @@ impl Client {
             stanza_interceptors: std::sync::RwLock::new(Arc::new(Vec::new())),
             stanza_interceptor_count: AtomicUsize::new(0),
             next_interceptor_id: AtomicU64::new(0),
-            #[cfg(feature = "voip-runtime")]
-            call_registry: Arc::new(wacore::voip::CallRegistry::new()),
-            #[cfg(feature = "voip-runtime")]
-            pending_call_link_joins: Arc::new(std::sync::Mutex::new(
-                voip::PendingCallLinkJoins::default(),
-            )),
-            #[cfg(feature = "voip-runtime")]
-            pending_call_link_join_lane: Arc::new(Mutex::new(())),
-            #[cfg(feature = "voip-runtime")]
-            answer_transition_locks: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
-            #[cfg(feature = "voip-runtime")]
-            pending_outgoing_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let arc = Arc::new(this);
@@ -1746,15 +1734,8 @@ impl Client {
         // in this window must see `!is_connected()` and bail instead of registering/connecting a call
         // after this sweep.
         self.is_connected.store(false, Ordering::Release);
-        // Tear down every in-flight VoIP call: the relay socket and signaling are connection-scoped,
-        // so a call can't survive a disconnect/reconnect. Aborts each media task and clears the map.
-        #[cfg(feature = "voip-runtime")]
-        {
-            self.call_registry.abort_all();
-            // Dormant outgoing calls (relay never arrived) live in pending_outgoing_calls, not the
-            // registry, so abort_all misses them. Drain them and notify `ended` so any waiter wakes.
-            crate::voip::facade::drain_pending_outgoing_on_disconnect(self);
-        }
+        // Let each attached subsystem release what this connection owned.
+        subsystem::on_connection_cleanup(self).await;
         // Close the socket as part of cleanup so this path is authoritative
         // even when reached via the run loop's graceful-exit flow (not just
         // `Client::disconnect()`). Transport impls make `disconnect()`

@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use wacore::runtime::BoxFuture;
 use wacore::stanza::wire_tags::NotificationType;
-use wacore_binary::OwnedNodeRef;
+use wacore::stats::CollectionStats;
+use wacore_binary::{NodeRef, OwnedNodeRef};
 
 use super::Client;
 
@@ -29,7 +30,14 @@ pub(crate) type SubsystemState = Arc<dyn Any + Send + Sync>;
 #[cfg(target_arch = "wasm32")]
 pub(crate) type SubsystemState = Arc<dyn Any>;
 
+/// What a subsystem reports as retained, named as `MemoryReport` prints it.
+pub(crate) type RetainedCollections = Vec<(&'static str, CollectionStats)>;
+
 /// One optional subsystem attached to the core.
+///
+/// Every hook is optional and every one is a plain function pointer, so an
+/// unattached build folds the whole table away instead of paying for an empty
+/// vtable.
 pub(crate) struct Subsystem {
     /// Builds this subsystem's per-client state, once, during client assembly.
     pub state: fn() -> SubsystemState,
@@ -38,12 +46,24 @@ pub(crate) struct Subsystem {
     pub notifications: &'static [NotificationType],
     pub handle_notification:
         for<'a> fn(&'a Arc<Client>, NotificationType, Arc<OwnedNodeRef>) -> BoxFuture<'a, ()>,
+    /// Runs while a connection's state is torn down, before the socket closes.
+    pub on_connection_cleanup: Option<for<'a> fn(&'a Client) -> BoxFuture<'a, ()>>,
+    /// Sees a response before the waiter it belongs to is woken. On the ack
+    /// path and synchronous, so an implementation has to stay cheap; the point
+    /// of running here rather than on the waiter's side is that the waking is
+    /// what a subsystem would otherwise race.
+    pub on_response: Option<fn(&Client, &NodeRef<'_>)>,
+    /// Retained collections for `Client::memory_report`, named as the report
+    /// prints them.
+    pub memory: Option<fn(&Client) -> RetainedCollections>,
 }
 
 /// Every optional subsystem attached to this build.
 pub(crate) const SUBSYSTEMS: &[Subsystem] = &[
     #[cfg(feature = "passkey")]
     crate::passkey::SUBSYSTEM,
+    #[cfg(feature = "voip-runtime")]
+    crate::voip::SUBSYSTEM,
 ];
 
 /// The state of every attached subsystem, in [`SUBSYSTEMS`] order. Empty, and
@@ -100,6 +120,35 @@ pub(crate) async fn dispatch_notification(
         }
     }
     false
+}
+
+/// Lets every attached subsystem release what one connection owned.
+pub(crate) async fn on_connection_cleanup(client: &Client) {
+    for subsystem in SUBSYSTEMS {
+        if let Some(hook) = subsystem.on_connection_cleanup {
+            hook(client).await;
+        }
+    }
+}
+
+/// Offers a response to every attached subsystem before its waiter is woken.
+pub(crate) fn on_response(client: &Client, node: &NodeRef<'_>) {
+    for subsystem in SUBSYSTEMS {
+        if let Some(hook) = subsystem.on_response {
+            hook(client, node);
+        }
+    }
+}
+
+/// Collects what the attached subsystems retain, for the memory report.
+pub(crate) fn memory(client: &Client) -> RetainedCollections {
+    let mut collected = Vec::new();
+    for subsystem in SUBSYSTEMS {
+        if let Some(hook) = subsystem.memory {
+            collected.extend(hook(client));
+        }
+    }
+    collected
 }
 
 #[cfg(test)]

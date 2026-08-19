@@ -22,8 +22,11 @@ pub mod driver;
 pub mod facade;
 pub mod registry;
 pub mod session;
+mod state;
 pub mod transport;
 pub mod video;
+
+pub(crate) use state::SUBSYSTEM;
 
 pub use audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 pub use facade::{

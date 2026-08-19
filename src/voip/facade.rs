@@ -1581,6 +1581,7 @@ async fn publish_group_epoch_ciphertexts(
 pub(crate) fn drain_pending_outgoing_on_disconnect(client: &Client) {
     let drained: Vec<PendingOutgoing> = {
         let mut map = client
+            .voip_state()
             .pending_outgoing_calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1798,6 +1799,7 @@ async fn place_call(
 
     // Park the material needed to spawn the engine once the relay arrives. Keyed by call-id.
     client
+        .voip_state()
         .pending_outgoing_calls
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1822,7 +1824,11 @@ async fn place_call(
     // registry generation, drop the dangling ack-waiter, and wake any wait_ended() waiter, then
     // propagate. Guarded so a same-call-id replacement that already superseded us isn't evicted.
     if let Err(e) = client.send_node(offer).await {
-        let removed = take_pending_if_current(&client.pending_outgoing_calls, &call_id, generation);
+        let removed = take_pending_if_current(
+            &client.voip_state().pending_outgoing_calls,
+            &call_id,
+            generation,
+        );
         registry.remove_if_current(&call_id, generation);
         // No ack will ever arrive for the failed offer; drop the waiter so it can't leak.
         client.response_waiters_guard().remove(&offer_stanza_id);
@@ -1846,7 +1852,7 @@ async fn place_call(
         peer_jid: peer.clone(),
         call_creator: call_creator.clone(),
         client_registry: registry,
-        pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+        pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
         client: client_weak(client),
         muted,
         video: video_shared,
@@ -1973,7 +1979,11 @@ fn take_pending_if_current(
 }
 
 fn fail_pending_outgoing(client: &Client, call_id: &str, generation: u64) {
-    let pending = take_pending_if_current(&client.pending_outgoing_calls, call_id, generation);
+    let pending = take_pending_if_current(
+        &client.voip_state().pending_outgoing_calls,
+        call_id,
+        generation,
+    );
     client
         .call_registry()
         .remove_if_current(call_id, generation);
@@ -2046,6 +2056,7 @@ pub(crate) async fn attach_outgoing_relay(
     // Remove-on-match: a second relay for the same call-id is ignored (the engine is already up).
     let pending = {
         let mut map = client
+            .voip_state()
             .pending_outgoing_calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2281,7 +2292,11 @@ impl GroupRekeyTeardown {
 
 fn claim_group_rekey_generation(client: &Client, call_id: &str, generation: Option<u64>) -> bool {
     generation.is_none_or(|generation| {
-        let pending = take_pending_if_current(&client.pending_outgoing_calls, call_id, generation);
+        let pending = take_pending_if_current(
+            &client.voip_state().pending_outgoing_calls,
+            call_id,
+            generation,
+        );
         let removed = client
             .call_registry()
             .remove_if_current(call_id, generation);
@@ -2549,7 +2564,7 @@ async fn spawn_registered_call(
         peer_jid: registration.peer_jid.clone(),
         call_creator: registration.call_creator.clone(),
         client_registry: client.call_registry(),
-        pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+        pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
         client: client_weak(client),
         muted,
         video: video_shared,
@@ -5224,7 +5239,7 @@ mod tests {
             peer_jid: caller(),
             call_creator: caller(),
             client_registry: client.call_registry(),
-            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: std::sync::Weak::new(),
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
@@ -5803,6 +5818,7 @@ mod tests {
         );
         assert!(
             client
+                .voip_state()
                 .pending_outgoing_calls
                 .lock()
                 .unwrap()
@@ -6533,7 +6549,12 @@ mod tests {
             "an unsendable offer must not register the call"
         );
         assert!(
-            client.pending_outgoing_calls.lock().unwrap().is_empty(),
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
             "an unsendable offer must not park a pending entry"
         );
     }
@@ -6580,6 +6601,7 @@ mod tests {
         let (handle, call_id) = place_dormant_outgoing(&client).await;
         assert!(
             client
+                .voip_state()
                 .pending_outgoing_calls
                 .lock()
                 .unwrap()
@@ -6590,7 +6612,12 @@ mod tests {
         handle.hangup().await;
 
         assert!(
-            client.pending_outgoing_calls.lock().unwrap().is_empty(),
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
             "hangup must drop the dormant pending entry"
         );
         assert_eq!(
@@ -6613,7 +6640,12 @@ mod tests {
         drain_pending_outgoing_on_disconnect(&client);
 
         assert!(
-            client.pending_outgoing_calls.lock().unwrap().is_empty(),
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
             "disconnect must drain dormant outgoing calls"
         );
         tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
@@ -6783,7 +6815,7 @@ mod tests {
             peer_jid: caller(),
             call_creator: caller(),
             client_registry: client.call_registry(),
-            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: std::sync::Weak::new(),
             muted: muted.clone(),
             video: Arc::new(VideoShared::new()),
@@ -7876,7 +7908,12 @@ mod tests {
             "a send failure must surface as a Send error"
         );
         assert!(
-            client.pending_outgoing_calls.lock().unwrap().is_empty(),
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
             "a send failure must drop the parked pending entry"
         );
         assert_eq!(
@@ -8047,7 +8084,12 @@ mod tests {
             "a refused offer must not register the call"
         );
         assert!(
-            client.pending_outgoing_calls.lock().unwrap().is_empty(),
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
             "a refused offer must not park a pending entry"
         );
     }
@@ -8695,7 +8737,7 @@ mod tests {
             peer_jid: caller(),
             call_creator: caller(),
             client_registry: registry.clone(),
-            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video_shared.clone(),
@@ -8775,7 +8817,7 @@ mod tests {
             peer_jid: caller(),
             call_creator: caller(),
             client_registry: registry.clone(),
-            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
@@ -8865,7 +8907,7 @@ mod tests {
             peer_jid: caller(),
             call_creator: caller(),
             client_registry: registry.clone(),
-            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
@@ -8975,6 +9017,7 @@ mod tests {
                 .await;
         assert!(
             client
+                .voip_state()
                 .pending_outgoing_calls
                 .lock()
                 .unwrap()
@@ -8985,6 +9028,7 @@ mod tests {
         handle.stop_video().await.expect("dormant downgrade");
         assert!(
             client
+                .voip_state()
                 .pending_outgoing_calls
                 .lock()
                 .unwrap()

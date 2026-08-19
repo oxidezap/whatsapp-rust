@@ -51,6 +51,9 @@ pub(crate) const SUBSYSTEM: Subsystem = Subsystem {
         NotificationType::CrscContinuation,
     ],
     handle_notification: flow::handle_notification,
+    on_connection_cleanup: None,
+    on_response: None,
+    memory: None,
 };
 
 /// WebAuthn user-verification requirement from the server's request options.

@@ -158,7 +158,7 @@ impl PendingCallLinkTransition {
 
 #[cfg(feature = "voip-runtime")]
 #[derive(Default)]
-pub(super) struct PendingCallLinkJoins {
+pub(crate) struct PendingCallLinkJoins {
     active: usize,
     bound_call_id: Option<String>,
     transitions: std::collections::HashMap<String, Vec<PendingCallLinkTransition>>,
@@ -267,7 +267,7 @@ impl PendingCallLinkJoins {
         }
     }
 
-    pub(super) fn memory_stats(&self) -> wacore::stats::CollectionStats {
+    pub(crate) fn memory_stats(&self) -> wacore::stats::CollectionStats {
         use wacore::stats::HeapSize;
 
         let transition_bytes = self
@@ -398,12 +398,13 @@ impl Client {
     /// facade and the connection-cleanup teardown share one instance.
     #[cfg(feature = "voip-runtime")]
     pub(crate) fn call_registry(&self) -> Arc<wacore::voip::CallRegistry> {
-        self.call_registry.clone()
+        self.voip_state().call_registry.clone()
     }
 
     #[cfg(feature = "voip-runtime")]
     fn begin_call_link_join(&self) -> PendingCallLinkJoinGuard {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -416,7 +417,7 @@ impl Client {
         state.active = state.active.saturating_add(1);
         drop(state);
         PendingCallLinkJoinGuard {
-            state: self.pending_call_link_joins.clone(),
+            state: self.voip_state().pending_call_link_joins.clone(),
         }
     }
 
@@ -428,6 +429,7 @@ impl Client {
         sender: &Jid,
     ) -> bool {
         let state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -435,7 +437,11 @@ impl Client {
             && !call_id.is_empty()
             && state.accepts(call_id)
             && sender.to_non_ad() == call_creator.to_non_ad()
-            && self.call_registry.generation_of(call_id).is_none()
+            && self
+                .voip_state()
+                .call_registry
+                .generation_of(call_id)
+                .is_none()
     }
 
     /// Bind the one serialized pending link join to the ACK's exact call id before the read loop
@@ -447,6 +453,7 @@ impl Client {
             return;
         };
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -458,6 +465,7 @@ impl Client {
     #[cfg(feature = "voip-runtime")]
     fn prepare_pending_call_link_join_retry(&self, call_id: &str) -> bool {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -474,6 +482,7 @@ impl Client {
         sender: &Jid,
     ) -> PendingCallLinkBuffer {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -481,7 +490,11 @@ impl Client {
             || update.call_id.is_empty()
             || !state.accepts(&update.call_id)
             || sender.to_non_ad() != update.call_creator.to_non_ad()
-            || self.call_registry.generation_of(&update.call_id).is_some()
+            || self
+                .voip_state()
+                .call_registry
+                .generation_of(&update.call_id)
+                .is_some()
         {
             return PendingCallLinkBuffer::NotPending;
         }
@@ -531,6 +544,7 @@ impl Client {
         raw_epoch: &[u8],
     ) -> PendingCallLinkBuffer {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -538,7 +552,11 @@ impl Client {
             || call_id.is_empty()
             || !state.accepts(call_id)
             || sender.to_non_ad() != call_creator.to_non_ad()
-            || self.call_registry.generation_of(call_id).is_some()
+            || self
+                .voip_state()
+                .call_registry
+                .generation_of(call_id)
+                .is_some()
         {
             return PendingCallLinkBuffer::NotPending;
         }
@@ -592,6 +610,7 @@ impl Client {
         sender: &Jid,
     ) -> PendingCallLinkBuffer {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -599,7 +618,11 @@ impl Client {
             || call_id.is_empty()
             || !state.accepts(call_id)
             || sender.to_non_ad() != call_creator.to_non_ad()
-            || self.call_registry.generation_of(call_id).is_some()
+            || self
+                .voip_state()
+                .call_registry
+                .generation_of(call_id)
+                .is_some()
         {
             return PendingCallLinkBuffer::NotPending;
         }
@@ -651,18 +674,19 @@ impl Client {
         if buffered.suppresses_dispatch() {
             return true;
         }
-        let Some(generation) = self.call_registry.generation_of(call_id) else {
+        let Some(generation) = self.voip_state().call_registry.generation_of(call_id) else {
             return false;
         };
-        if !self.call_registry.group_creator_authorized_if_current(
-            call_id,
-            generation,
-            call_creator,
-            sender,
-        ) {
+        if !self
+            .voip_state()
+            .call_registry
+            .group_creator_authorized_if_current(call_id, generation, call_creator, sender)
+        {
             return false;
         }
-        self.call_registry.remove_if_current(call_id, generation)
+        self.voip_state()
+            .call_registry
+            .remove_if_current(call_id, generation)
     }
 
     /// Buffer a creator-authenticated waiting-room snapshot in the same ordered call-link
@@ -674,10 +698,15 @@ impl Client {
         sender: &Jid,
     ) -> PendingCallLinkBuffer {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.call_registry.generation_of(&room.call_id).is_some()
+        if self
+            .voip_state()
+            .call_registry
+            .generation_of(&room.call_id)
+            .is_some()
             || state.active == 0
             || room.call_id.is_empty()
             || !state.accepts(&room.call_id)
@@ -723,6 +752,7 @@ impl Client {
         // either committed to that generation or caused registration to fail.
         let _answer_transition = self.lock_answer_transition(&call_id).await;
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -732,13 +762,19 @@ impl Client {
         if saturated {
             return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
         }
-        let generation = self.call_registry.insert_call_link_checked(session)?;
+        let generation = self
+            .voip_state()
+            .call_registry
+            .insert_call_link_checked(session)?;
         if let Some(room) = waiting_room {
             let applied = self
+                .voip_state()
                 .call_registry
                 .apply_waiting_room_if_current(room, generation);
             if applied != wacore::voip::GroupStateApply::Applied {
-                self.call_registry.remove_if_current(&call_id, generation);
+                self.voip_state()
+                    .call_registry
+                    .remove_if_current(&call_id, generation);
                 return Err(applied);
             }
         }
@@ -757,7 +793,9 @@ impl Client {
                         }
                         wacore::voip::GroupStateApply::Stale => {}
                         rejected => {
-                            self.call_registry.remove_if_current(&call_id, generation);
+                            self.voip_state()
+                                .call_registry
+                                .remove_if_current(&call_id, generation);
                             return Err(rejected);
                         }
                     }
@@ -768,6 +806,7 @@ impl Client {
                         && room.link_token == expected_token =>
                 {
                     let applied = self
+                        .voip_state()
                         .call_registry
                         .apply_waiting_room_if_current(room, generation);
                     if !matches!(
@@ -775,7 +814,9 @@ impl Client {
                         wacore::voip::GroupStateApply::Applied
                             | wacore::voip::GroupStateApply::Stale
                     ) {
-                        self.call_registry.remove_if_current(&call_id, generation);
+                        self.voip_state()
+                            .call_registry
+                            .remove_if_current(&call_id, generation);
                         return Err(applied);
                     }
                 }
@@ -785,21 +826,27 @@ impl Client {
                     transaction_id,
                     raw_epoch,
                 } => {
-                    if !self.call_registry.group_sender_authorized_if_current(
-                        &call_id,
-                        generation,
-                        &staged_creator,
-                        &sender,
-                    ) {
+                    if !self
+                        .voip_state()
+                        .call_registry
+                        .group_sender_authorized_if_current(
+                            &call_id,
+                            generation,
+                            &staged_creator,
+                            &sender,
+                        )
+                    {
                         continue;
                     }
-                    if !self.call_registry.send_group_epoch_if_current(
+                    if !self.voip_state().call_registry.send_group_epoch_if_current(
                         &call_id,
                         generation,
                         transaction_id,
                         raw_epoch.to_vec(),
                     ) {
-                        self.call_registry.remove_if_current(&call_id, generation);
+                        self.voip_state()
+                            .call_registry
+                            .remove_if_current(&call_id, generation);
                         return Err(wacore::voip::GroupStateApply::UnknownCall);
                     }
                 }
@@ -807,19 +854,27 @@ impl Client {
                     call_creator: staged_creator,
                     sender,
                 } => {
-                    if !self.call_registry.group_creator_authorized_if_current(
-                        &call_id,
-                        generation,
-                        &staged_creator,
-                        &sender,
-                    ) {
+                    if !self
+                        .voip_state()
+                        .call_registry
+                        .group_creator_authorized_if_current(
+                            &call_id,
+                            generation,
+                            &staged_creator,
+                            &sender,
+                        )
+                    {
                         continue;
                     }
-                    self.call_registry.remove_if_current(&call_id, generation);
+                    self.voip_state()
+                        .call_registry
+                        .remove_if_current(&call_id, generation);
                     return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
                 }
                 PendingCallLinkTransition::Saturated => {
-                    self.call_registry.remove_if_current(&call_id, generation);
+                    self.voip_state()
+                        .call_registry
+                        .remove_if_current(&call_id, generation);
                     return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
                 }
                 _ => {}
@@ -834,7 +889,8 @@ impl Client {
         update: GroupCallUpdate,
         generation: u64,
     ) -> wacore::voip::GroupStateApply {
-        self.call_registry
+        self.voip_state()
+            .call_registry
             .apply_group_update_if_current(update, generation)
     }
 
@@ -847,8 +903,8 @@ impl Client {
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         call_id.hash(&mut hasher);
-        let lane = hasher.finish() as usize % self.answer_transition_locks.len();
-        self.answer_transition_locks[lane].clone()
+        let lane = hasher.finish() as usize % self.voip_state().answer_transition_locks.len();
+        self.voip_state().answer_transition_locks[lane].clone()
     }
 
     #[cfg(feature = "voip-runtime")]
@@ -1198,7 +1254,12 @@ impl Voip<'_> {
         // to associate with this request. Keep one such request active at a time so bounded-buffer
         // saturation can fail only its owning join; other joins wait here and start with clean
         // staging state.
-        let pending_join_lane = self.client.pending_call_link_join_lane.lock().await;
+        let pending_join_lane = self
+            .client
+            .voip_state()
+            .pending_call_link_join_lane
+            .lock()
+            .await;
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let token = normalize_call_link_token(token_or_url, media)?;
         let capability =
@@ -1923,6 +1984,16 @@ async fn execute_call_service_request<T>(
 
 #[cfg(test)]
 mod tests {
+    /// The admission snapshots the report attributes to this subsystem.
+    #[cfg(feature = "voip-runtime")]
+    async fn pending_link_updates(client: &Client) -> wacore::stats::CollectionStats {
+        client
+            .memory_report()
+            .await
+            .subsystem("voip pending_link_updates:")
+            .expect("the voip subsystem is attached in this build")
+    }
+
     #[cfg(feature = "voip-runtime")]
     use super::PendingCallLinkBuffer;
     use std::sync::Arc;
@@ -3253,7 +3324,7 @@ mod tests {
             PendingCallLinkBuffer::NotPending,
             "an unrelated sender cannot populate the pre-registration buffer"
         );
-        let pending_memory = client.memory_report().await.pending_call_link_updates;
+        let pending_memory = pending_link_updates(&client).await;
         assert_eq!(pending_memory.entries, 1);
         assert!(pending_memory.bytes > 0);
 
@@ -3282,14 +3353,7 @@ mod tests {
                 .and_then(|state| { state.snapshot().map(|snapshot| snapshot.transaction_id) }),
             Some(8)
         );
-        assert_eq!(
-            client
-                .memory_report()
-                .await
-                .pending_call_link_updates
-                .entries,
-            0
-        );
+        assert_eq!(pending_link_updates(&client).await.entries, 0);
         let mut later = update;
         later.transaction_id = 9;
         assert_eq!(
@@ -3697,7 +3761,7 @@ mod tests {
                     == PendingCallLinkBuffer::Buffered,
             );
         }
-        let stats = client.memory_report().await.pending_call_link_updates;
+        let stats = pending_link_updates(&client).await;
         assert!(
             accepted < 4,
             "the aggregate byte budget must reject excess staged snapshots"
@@ -3892,11 +3956,7 @@ mod tests {
             "exhausted pre-ACK identity metadata requires one exact-call refresh"
         );
         assert_eq!(
-            client
-                .memory_report()
-                .await
-                .pending_call_link_updates
-                .entries,
+            pending_link_updates(&client).await.entries,
             0,
             "binding the ACK must discard every unrelated candidate bucket"
         );
@@ -4134,11 +4194,7 @@ mod tests {
             };
             assert!(handled, "the ACK must resolve its registered waiter");
             assert_eq!(
-                client
-                    .memory_report()
-                    .await
-                    .pending_call_link_updates
-                    .entries,
+                pending_link_updates(&client).await.entries,
                 0,
                 "the ACK call id must be bound before the waiter can observe the response"
             );
@@ -4252,14 +4308,7 @@ mod tests {
             client.buffer_pending_call_link_update(&second, &sender),
             PendingCallLinkBuffer::Buffered
         );
-        assert_eq!(
-            client
-                .memory_report()
-                .await
-                .pending_call_link_updates
-                .entries,
-            3
-        );
+        assert_eq!(pending_link_updates(&client).await.entries, 3);
 
         let mut session =
             CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
@@ -4313,14 +4362,7 @@ mod tests {
             client.call_registry().phase_if_current(call_id, generation),
             Some(CallPhase::Connecting)
         );
-        assert_eq!(
-            client
-                .memory_report()
-                .await
-                .pending_call_link_updates
-                .entries,
-            0
-        );
+        assert_eq!(pending_link_updates(&client).await.entries, 0);
 
         drop(pending);
         client
