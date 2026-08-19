@@ -139,10 +139,11 @@ Stripped `demo`, release profile, the build `binary_size_ci.md` gates on. Sizes
 are deterministic for a pinned toolchain; the baseline reproduced byte for byte
 across two runs.
 
-Two questions, so two tables. What this batch changed, each row against the
-same build before it:
+Two questions, so two tables. What this batch changed, each row measured on
+`main` and on the branch from the same working tree so no other commit can drift
+into the delta:
 
-| build | before | after | delta |
+| build | main | branch | delta |
 | --- | ---: | ---: | ---: |
 | default | 10,806,752 | 10,757,216 | -48.4 KiB |
 | default + `voip` | 11,373,952 | 11,330,656 | -42.3 KiB |
