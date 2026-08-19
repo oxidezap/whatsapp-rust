@@ -139,12 +139,26 @@ Stripped `demo`, release profile, the build `binary_size_ci.md` gates on. Sizes
 are deterministic for a pinned toolchain; the baseline reproduced byte for byte
 across two runs.
 
+Two questions, so two tables. What this batch changed, each row against the
+same build before it:
+
 | build | before | after | delta |
 | --- | ---: | ---: | ---: |
 | default | 10,806,752 | 10,757,216 | -48.4 KiB |
-| default + `passkey` | n/a, always compiled in | 10,810,016 | +51.8 KiB over default |
 | default + `voip` | 11,373,952 | 11,330,656 | -42.3 KiB |
-| default + `plugins`, host on and no plugin installed | 10,960,960 | | +150.6 KiB over default |
+
+And what a subsystem costs to turn on, each row against the default build beside
+it:
+
+| build | bin size | vs default |
+| --- | ---: | ---: |
+| default | 10,757,216 | |
+| default + `passkey` | 10,810,016 | +51.6 KiB |
+| default + `plugins`, host on and no plugin installed | 10,960,960 | +150.6 KiB |
+
+`passkey` has no before column: it used to be compiled in unconditionally, so
+there was no build without it to compare against. The `plugins` figure is
+measured on the pre-batch tree, which this batch does not touch.
 
 Turning the smallest cuttable subsystem off is worth ~48 KiB. The `voip` row is
 the one to read twice: moving five `Client` fields and their construction and
@@ -186,7 +200,7 @@ after this batch:
 - `pair_code` needs a decision about the ADV-rotation interlock before it can be
   anything but coupled, and that is a protocol-correctness question, not a
   refactor.
-- The plugin host's runtime cost with no plugin installed is measured below by
+- The plugin host's runtime cost with no plugin installed is measured above by
   hand rather than gated in CI, because a CodSpeed series is keyed by benchmark
   name and cannot hold two configurations of the same benchmark.
 

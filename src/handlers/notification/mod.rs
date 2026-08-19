@@ -195,13 +195,12 @@ mod tests {
     #[tokio::test]
     async fn a_claimed_notification_type_is_not_shadowed_by_a_core_arm() {
         use crate::client::subsystem::{DISPATCHED, SUBSYSTEMS};
-        use std::sync::atomic::Ordering;
 
         let client = create_test_client().await;
 
         for subsystem in SUBSYSTEMS {
             for notification_type in subsystem.notifications {
-                let before = DISPATCHED.load(Ordering::Relaxed);
+                let before = DISPATCHED.with(|dispatched| dispatched.get());
                 let notif = NodeBuilder::new("notification")
                     .attr("type", notification_type.as_str())
                     .attr("from", "12025550111@s.whatsapp.net")
@@ -210,7 +209,7 @@ mod tests {
                 handle_notification_impl(&client, node_to_arc(notif)).await;
 
                 assert!(
-                    DISPATCHED.load(Ordering::Relaxed) > before,
+                    DISPATCHED.with(|dispatched| dispatched.get()) > before,
                     "{notification_type:?} never reached the attachment table, so a core arm took it"
                 );
             }

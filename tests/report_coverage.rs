@@ -300,6 +300,37 @@ fn mentions(text: &str, name: &str) -> bool {
     })
 }
 
+/// The body of the function whose signature starts with `signature`,
+/// brace-matched with line comments stripped first, or `None` when the file has
+/// no such function.
+fn fn_body(text: &str, signature: &str) -> Option<String> {
+    let stripped: String = text
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(at) => &line[..at],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let at = stripped.find(signature)?;
+    let open = at + stripped[at..].find('{')?;
+    let mut depth = 0usize;
+    for (offset, ch) in stripped[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(stripped[open..=open + offset].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The body of `memory_report()`, brace-matched from its signature with line
 /// comments stripped first. Searching all of `accessors.rs` would let an
 /// unrelated getter, or a field named in a comment, stand in for the report
@@ -377,6 +408,75 @@ fn every_growable_client_field_reaches_the_memory_report() {
         "these `Client` fields can grow but never reach `memory_report()`:\n{}\n\n\
          Add them to the report (see agent_docs/observability.md), or to EXEMPT in \
          this file with the reason they are not a per-session memory question.",
+        missing.join("\n"),
+    );
+}
+
+/// Per-client state a subsystem parks on the attachment table, with the file
+/// whose `memory` hook has to account for it.
+///
+/// The `Client` walk above cannot see these: the table stores state as
+/// `Arc<dyn Any>`, so the traversal bottoms out at the erased pointer and every
+/// collection behind it reads as absent. Without this list, moving a growable
+/// field into a subsystem is how it would leave the report unnoticed.
+const SUBSYSTEM_STATES: &[(&str, &str)] = &[
+    ("VoipState", "src/voip/state.rs"),
+    ("PasskeyState", "src/passkey/flow.rs"),
+];
+
+fn struct_named(text: &str, name: &str) -> Option<syn::ItemStruct> {
+    fn find(items: Vec<syn::Item>, name: &str) -> Option<syn::ItemStruct> {
+        for item in items {
+            match item {
+                syn::Item::Struct(item) if item.ident == name => return Some(item),
+                syn::Item::Mod(item) => {
+                    if let Some((_, inner)) = item.content
+                        && let Some(found) = find(inner, name)
+                    {
+                        return Some(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    find(syn::parse_file(text).ok()?.items, name)
+}
+
+#[test]
+fn every_growable_subsystem_field_reaches_the_memory_report() {
+    let (defs, aliases) = crate_type_fields();
+    let mut missing = Vec::new();
+
+    for (state, file) in SUBSYSTEM_STATES {
+        let text = read(file);
+        let Some(item) = struct_named(&text, state) else {
+            // The subsystem is not compiled into this configuration.
+            continue;
+        };
+        let hook = fn_body(&text, "fn memory(").unwrap_or_default();
+        for field in &item.fields {
+            let Some(name) = field.ident.as_ref().map(ToString::to_string) else {
+                continue;
+            };
+            let mut idents = Vec::new();
+            type_idents(&field.ty, &mut idents);
+            let idents = resolve_aliases(&idents, &aliases);
+            let Some(via) = growable_path(&idents, &defs) else {
+                continue;
+            };
+            if !mentions(&hook, &name) {
+                missing.push(format!("  {state}::{name} in {file} (via {via})"));
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "these subsystem fields can grow but their `memory` hook never walks them:\n{}\n\n\
+         The `Client` scan cannot reach them through the attachment table's type \
+         erasure, so this list is the only thing that would notice.",
         missing.join("\n"),
     );
 }

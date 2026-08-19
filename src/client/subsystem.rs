@@ -100,9 +100,14 @@ impl Subsystems {
 
 /// Counts stanzas handed to a subsystem, so a test can tell routing through the
 /// table apart from a core arm that quietly took the stanza instead.
+///
+/// Thread-local rather than a process-wide counter: a sibling test dispatching
+/// the same type concurrently would otherwise satisfy the assertion on its own,
+/// which is the failure the counter exists to catch.
 #[cfg(test)]
-pub(crate) static DISPATCHED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    pub(crate) static DISPATCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Hands a notification to the subsystem that models its type. `false` means no
 /// attached subsystem claims it, leaving the core's own fallback in charge.
@@ -114,7 +119,7 @@ pub(crate) async fn dispatch_notification(
     for subsystem in SUBSYSTEMS {
         if subsystem.notifications.contains(&notification_type) {
             #[cfg(test)]
-            DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DISPATCHED.with(|dispatched| dispatched.set(dispatched.get() + 1));
             (subsystem.handle_notification)(client, notification_type, Arc::clone(node)).await;
             return true;
         }

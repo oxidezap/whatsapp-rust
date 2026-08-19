@@ -15,7 +15,11 @@ package="${1:?usage: test_features.sh <package>}"
 # dhat-heap      installs a global allocator, colliding with the counting one
 #                the allocation guards install.
 # js, getrandom  wasm32 backend selection, with no native build to join.
-excluded='default|danger-skip-.*|dhat-heap|js|getrandom'
+# tracing-pii    renders raw numbers, which compiles out the assertion that
+#                `record_identity_on_span` redacts them. Joining the shared run
+#                would leave that assertion executing nowhere, so the shared run
+#                is the one that keeps `tracing` without it.
+excluded='default|danger-skip-.*|dhat-heap|js|getrandom|tracing-pii'
 
 cargo metadata --no-deps --format-version 1 \
   | jq -r --arg package "$package" \
