@@ -275,27 +275,12 @@ mod codec_stages {
         run(bencher, |s| s.fft512_forward() as f64);
     }
 
-    /// The same transform through the half-length split path that `mlow-fast-fft` dispatches to.
-    /// Measured next to the reference on every run, so the cost side of that opt-in is visible in CI
-    /// even though the default build still ships the reference.
-    #[divan::bench]
-    fn fft512_forward_split(bencher: Bencher) {
-        run(bencher, |s| s.fft512_forward_split() as f64);
-    }
-
     /// Forward + inverse real FFT at the perceptual-model size (N=576 = 2^6 * 3^2, mixed radix 2/3),
     /// 6x/frame -- 12 of the frame's 15 FFTs, and the only path that reaches the radix-3 levels and
     /// the O(n^2) prime base case.
     #[divan::bench]
     fn fft576_roundtrip(bencher: Bencher) {
         run(bencher, |s| s.fft576_roundtrip() as f64);
-    }
-
-    /// The `fft576_roundtrip` pair through the half-length split path, for the same reason as
-    /// `fft512_forward_split`.
-    #[divan::bench]
-    fn fft576_roundtrip_split(bencher: Bencher) {
-        run(bencher, |s| s.fft576_roundtrip_split() as f64);
     }
 
     /// Perceptual model for one internal frame (3x/frame): two `smpl_perc_model` calls, i.e. two

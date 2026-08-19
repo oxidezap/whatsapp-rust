@@ -85,8 +85,7 @@ a subsystem.
 `client-lifecycle` is the generation-scoped seam; `plugins` is the generic host,
 and its gate count is the price of the seam existing. `sqlite-storage`,
 `tokio-transport`, `tokio-runtime`, `ureq-client`, `signal` and `tokio-native`
-are platform adapter selection. `voip-mlow`, `voip-libopus`, `voip-encoded` and
-`mlow-fast-fft` are codec profiles inside `voip`. `bench-harness`,
+are platform adapter selection. `voip-mlow`, `voip-libopus` and `voip-encoded` are codec profiles inside `voip`. `bench-harness`,
 `debug-snapshots`, `legacy-session-interop` and `danger-skip-*` are build-time
 switches.
 

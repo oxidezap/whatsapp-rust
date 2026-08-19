@@ -181,6 +181,10 @@ jobs:
       # share a build with the rest. `scripts/ci/test_features.sh` derives the
       # set that can from cargo metadata and carries the exclusions with their
       # reasons, so a feature added tomorrow is tested without editing CI.
+      # Compiling a test is not running it: the two `--all-features` steps above
+      # build the codec suite, its golden checksums and every C/Go ground-truth
+      # vector among them, but nothing executed them until a step actually
+      # enabled `voip-mlow` and ran it. That is what this loop does.
       - name: Test (every shareable feature)
         run: |
           for package in wacore wacore-libsignal whatsapp-rust; do
@@ -189,16 +193,6 @@ jobs:
             cargo nextest run --profile ci -p "$package" --features "$features" --lib --tests
             echo "::endgroup::"
           done
-      # The one exclusion that still needs running: `mlow-fast-fft` selects a
-      # different FFT, so the golden checksums under it are a second, separately
-      # pinned pair. That covers which implementation the feature selects, not
-      # interoperability -- no job here decodes with a real WhatsApp client, so a
-      # bitstream passing this is well-formed by our own decoder and nothing
-      # more. The FFTs are compared against each other and against an exact f64
-      # DFT by the differential tests in `smpl_perc.rs`, which run in both
-      # configurations.
-      - name: Test (mlow-fast-fft)
-        run: cargo nextest run --profile ci -p wacore --features voip-mlow,mlow-fast-fft --lib -E 'test(voip::mlow)'
 
   rustdoc:
     name: Rustdoc
