@@ -627,17 +627,25 @@ fn rfft_forward_ordered(time: &[f32], f: &mut [f32]) {
 /// this path as marginally closer to that oracle than the full-length one it replaced.
 pub(crate) fn rfft_forward_ordered_sc(time: &[f32], f: &mut [f32], sc: &mut FftScratch) {
     let n = time.len();
-    debug_assert!(f.len() == n);
-    debug_assert!(n >= 2 && n.is_multiple_of(2));
-    let m = n / 2;
-    // A scratch built for one length and then used at another would truncate at the `zip` below
-    // and return a wrong spectrum without complaining; the two production lengths are separate
-    // instances (512 in the LPC front end, 576 in the perc model), so this only ever fires on a
-    // wiring mistake.
-    debug_assert!(
-        sp_len_matches(sc, m),
-        "FftScratch built for a different length"
+    // Checked in release, not just under `debug_assert!`: every way these can disagree fails
+    // SILENTLY rather than loudly. A mismatched scratch truncates at the `zip` below, an odd `n`
+    // leaves `f[n - 1]` untouched, and a short `f` drops the top bins -- each yielding a
+    // plausible-looking spectrum the encoder would happily quantize. Measured at +0.26% on a
+    // 486 s encode, i.e. inside this machine's run-to-run noise, so the check is free.
+    assert!(
+        f.len() == n,
+        "rfft forward: output len {} != input len {n}",
+        f.len()
     );
+    assert!(
+        n >= 2 && n.is_multiple_of(2),
+        "rfft forward: length {n} must be even and >= 2"
+    );
+    assert!(
+        sp_len_matches(sc, n / 2),
+        "rfft forward: FftScratch built for a different length than {n}"
+    );
+    let m = n / 2;
     let sp = sc;
     // z[j] = x[2j] + i*x[2j+1]: even samples into the real part, odd into the imaginary.
     for (z, pair) in sp.z.iter_mut().zip(time.chunks_exact(2)) {
@@ -670,13 +678,22 @@ pub(crate) fn rfft_forward_ordered_sc(time: &[f32], f: &mut [f32], sc: &mut FftS
 /// producing n real time samples, unnormalized (BACKWARD(FORWARD(x)) = n*x).
 pub(crate) fn rfft_backward_ordered_sc(f: &[f32], time: &mut [f32], sc: &mut FftScratch) {
     let n = f.len();
-    debug_assert!(time.len() == n);
-    debug_assert!(n >= 2 && n.is_multiple_of(2));
-    let m = n / 2;
-    debug_assert!(
-        sp_len_matches(sc, m),
-        "FftScratch built for a different length"
+    // Release-checked for the same reason as the forward twin: a short `time` is only partially
+    // written and the caller reads stale samples as signal.
+    assert!(
+        time.len() == n,
+        "rfft backward: output len {} != input len {n}",
+        time.len()
     );
+    assert!(
+        n >= 2 && n.is_multiple_of(2),
+        "rfft backward: length {n} must be even and >= 2"
+    );
+    assert!(
+        sp_len_matches(sc, n / 2),
+        "rfft backward: FftScratch built for a different length than {n}"
+    );
+    let m = n / 2;
     let sp = sc;
     // Invert the forward recombination: Z[k] = E[k] + i*O[k] with
     //   E[k] = (X[k] + conj(X[m-k])) / 2      O[k] = conj(W_n^k) * (X[k] - conj(X[m-k])) / 2

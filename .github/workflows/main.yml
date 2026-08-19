@@ -185,9 +185,11 @@ jobs:
         run: |
           cargo nextest run --profile ci -p wacore --features voip --lib
           cargo nextest run --profile ci -p whatsapp-rust --features "voip tokio-native tokio-transport" --lib
-      # `voip` does NOT imply `voip-mlow`, and wacore has no default features, so `voip::mlow` is
-      # compiled away in every job above -- the codec's tests, the golden checksums and every C/Go
-      # ground-truth vector among them, ran nowhere in CI before this step.
+      # `voip` does NOT imply `voip-mlow`, and wacore has no default features, so the `Test (voip)`
+      # step above compiles `voip::mlow` away entirely. The two `--all-features` steps at the top of
+      # this job do compile it, tests and all, but compiling a test is not running it: the codec's
+      # tests, the golden checksums and every C/Go ground-truth vector among them, executed nowhere
+      # in CI before this step.
       - name: Test (voip-mlow)
         run: cargo nextest run --profile ci -p wacore --features voip-mlow --lib -E 'test(voip::mlow)'
       # legacy-session-interop is off by default, so every other test job
