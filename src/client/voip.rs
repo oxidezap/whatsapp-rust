@@ -741,6 +741,7 @@ impl Client {
         expected_media: CallLinkMedia,
         expected_token: &str,
     ) -> Result<u64, wacore::voip::GroupStateApply> {
+        let voip = self.voip_state();
         let call_id = session.call_id.clone();
         let call_creator = session.call_creator.clone();
         let mut rekey_pending = session
@@ -772,9 +773,7 @@ impl Client {
                 .call_registry
                 .apply_waiting_room_if_current(room, generation);
             if applied != wacore::voip::GroupStateApply::Applied {
-                self.voip_state()
-                    .call_registry
-                    .remove_if_current(&call_id, generation);
+                voip.call_registry.remove_if_current(&call_id, generation);
                 return Err(applied);
             }
         }
@@ -793,9 +792,7 @@ impl Client {
                         }
                         wacore::voip::GroupStateApply::Stale => {}
                         rejected => {
-                            self.voip_state()
-                                .call_registry
-                                .remove_if_current(&call_id, generation);
+                            voip.call_registry.remove_if_current(&call_id, generation);
                             return Err(rejected);
                         }
                     }
@@ -814,9 +811,7 @@ impl Client {
                         wacore::voip::GroupStateApply::Applied
                             | wacore::voip::GroupStateApply::Stale
                     ) {
-                        self.voip_state()
-                            .call_registry
-                            .remove_if_current(&call_id, generation);
+                        voip.call_registry.remove_if_current(&call_id, generation);
                         return Err(applied);
                     }
                 }
@@ -838,15 +833,13 @@ impl Client {
                     {
                         continue;
                     }
-                    if !self.voip_state().call_registry.send_group_epoch_if_current(
+                    if !voip.call_registry.send_group_epoch_if_current(
                         &call_id,
                         generation,
                         transaction_id,
                         raw_epoch.to_vec(),
                     ) {
-                        self.voip_state()
-                            .call_registry
-                            .remove_if_current(&call_id, generation);
+                        voip.call_registry.remove_if_current(&call_id, generation);
                         return Err(wacore::voip::GroupStateApply::UnknownCall);
                     }
                 }
@@ -866,15 +859,11 @@ impl Client {
                     {
                         continue;
                     }
-                    self.voip_state()
-                        .call_registry
-                        .remove_if_current(&call_id, generation);
+                    voip.call_registry.remove_if_current(&call_id, generation);
                     return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
                 }
                 PendingCallLinkTransition::Saturated => {
-                    self.voip_state()
-                        .call_registry
-                        .remove_if_current(&call_id, generation);
+                    voip.call_registry.remove_if_current(&call_id, generation);
                     return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
                 }
                 _ => {}
