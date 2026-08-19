@@ -1726,8 +1726,12 @@ impl Client {
         server_phash: &str,
         invalidate_group_cache: bool,
     ) {
+        // The one signal a bot gets that its participant device set disagrees
+        // with the server's, whatever the cause. What follows repairs a
+        // participant-level divergence; a device-level one only gets logged
+        // here, so keep the line saying what happened and not what was fixed.
         log::warn!(
-            "Phash mismatch for {}: ours={our_phash}, server={server_phash}. Invalidating caches.",
+            "Phash mismatch for {}: ours={our_phash}, server={server_phash}",
             jid.observe()
         );
         // DM phash covers both recipient + own devices
