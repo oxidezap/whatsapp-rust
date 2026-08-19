@@ -327,11 +327,13 @@ pub struct IncomingCall {
     /// offer with no `<enc>` for us. Boxed so the large `RelayData` doesn't bloat every `Event`
     /// (the no-media common case stays one pointer).
     ///
-    /// Reached through [`Self::media`] rather than as a public field: the field only exists under
-    /// `voip`, and a public payload whose fields come and go with a feature is one type with two
-    /// shapes. A gated accessor is not, which is what `agent_docs/subsystem_boundary.md` test 4
-    /// asks for. Unconditional is not the alternative -- the type carries a parsed `RelayData`,
-    /// so making it always present would link the relay parser into every build.
+    /// Reached through [`Self::media`] rather than as a public field. The gate does not go away:
+    /// the accessor is gated too. What changes is where it lands. A field that comes and goes with
+    /// a feature changes how the type is built and matched; a method that does cannot, so code
+    /// that constructs or destructures an `IncomingCall` compiles the same either way. That is the
+    /// half `agent_docs/subsystem_boundary.md` test 4 is about. Unconditional is not the
+    /// alternative -- the type carries a parsed `RelayData`, so making it always present would
+    /// link the relay parser into every build.
     #[cfg(feature = "voip")]
     #[serde(skip)]
     #[builder(skip)]
@@ -435,11 +437,13 @@ impl IncomingCall {
         self.ringing_generation
     }
 
-    /// Attach the media material the parser captured from an `<offer>`.
+    /// Attach the media material the parser captured from an `<offer>`. Not
+    /// `pub`: the parser below is the only caller, unlike the sibling setters
+    /// this crate exposes for `whatsapp-rust` to call.
     #[cfg(feature = "voip")]
-    #[doc(hidden)]
-    pub fn set_media(&mut self, media: Option<Box<MediaOffer>>) {
+    pub(crate) fn with_media(mut self, media: Option<Box<MediaOffer>>) -> Self {
         self.media = media;
+        self
     }
 
     /// The offer's media material, when this is an `<offer>` that carried an `<enc>` for us.

@@ -373,8 +373,6 @@ impl Client {
     /// out of its ack. A phash check does not, which is why that path uses
     /// [`Self::register_phash_waiter`] and pays no channel per message. Gated on
     /// the only consumer's feature, or it is dead code in a default build.
-    /// Park a waiter for the ack of one outgoing stanza. Gated because the VoIP
-    /// facade is its only caller; see `agent_docs/subsystem_boundary.md`.
     #[cfg(feature = "voip-runtime")]
     pub(crate) fn register_ack_waiter(
         &self,

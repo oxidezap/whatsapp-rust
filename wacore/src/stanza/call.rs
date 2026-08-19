@@ -84,12 +84,11 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .offline(offline)
         .action(action)
         .maybe_group(group);
+    let call = call.build();
     // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
     // capture it only on an <offer> and only when `voip` is on (RelayData lives there).
-    #[cfg_attr(not(feature = "voip"), expect(unused_mut))]
-    let mut call = call.build();
     #[cfg(feature = "voip")]
-    call.set_media(media);
+    let call = call.with_media(media);
 
     Ok(Some(call))
 }

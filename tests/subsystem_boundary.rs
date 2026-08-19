@@ -30,6 +30,25 @@ struct Cuttable {
     budget: &'static [(&'static str, usize)],
 }
 
+/// Whether a line that names a cuttable subsystem is one of the shapes the
+/// budget is for: a feature gate, the `mod` declaration that brings the files
+/// in, or the entry in the `subsystems!` list.
+///
+/// The count alone would not catch the cheapest way through: spending one of
+/// the allowed lines on a `pub use crate::<name>::Thing` re-export keeps the
+/// total the same and puts the subsystem back in the core's surface.
+fn is_declaration(line: &str, name: &str) -> bool {
+    let line = line.trim();
+    // An attribute and nothing else. The `)]` matters: without it
+    // `#[cfg(feature = "x")] pub use crate::x::Thing;` is one line that opens
+    // like a gate and ends as a re-export.
+    let is_attribute =
+        (line.starts_with("#[cfg(") || line.starts_with("#[cfg_attr(")) && line.ends_with(")]");
+    let is_mod = line == format!("pub mod {name};") || line == format!("mod {name};");
+    let is_entry = line.starts_with(&format!("{name}: crate::{name}::")) && line.ends_with(',');
+    is_attribute || is_mod || is_entry
+}
+
 const CUTTABLE: &[Cuttable] = &[Cuttable {
     name: "passkey",
     owns: "src/passkey",
@@ -85,12 +104,28 @@ fn the_core_does_not_name_a_cuttable_subsystem() {
 
             let source =
                 std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {relative}: {e}"));
-            let hits: Vec<usize> = source
+            let named: Vec<(usize, &str)> = source
                 .lines()
                 .enumerate()
                 .filter(|(_, line)| line.to_lowercase().contains(subsystem.name))
-                .map(|(index, _)| index + 1)
+                .map(|(index, line)| (index + 1, line))
                 .collect();
+            let hits: Vec<usize> = named.iter().map(|(number, _)| *number).collect();
+
+            if budget.is_some() {
+                let shapes: Vec<usize> = named
+                    .iter()
+                    .filter(|(_, line)| !is_declaration(line, subsystem.name))
+                    .map(|(number, _)| *number)
+                    .collect();
+                if !shapes.is_empty() {
+                    violations.push(format!(
+                        "{relative} names `{}` at {shapes:?} in something other than a feature \
+                         gate, its `mod` declaration or its `subsystems!` entry",
+                        subsystem.name
+                    ));
+                }
+            }
 
             match budget {
                 None if !hits.is_empty() => violations.push(format!(
@@ -113,4 +148,42 @@ fn the_core_does_not_name_a_cuttable_subsystem() {
         "subsystem boundary violated:\n  {}",
         violations.join("\n  ")
     );
+}
+
+#[cfg(test)]
+mod shape {
+    use super::is_declaration;
+
+    /// The three shapes the budget exists for.
+    #[test]
+    fn a_declaration_is_recognized() {
+        for line in [
+            "#[cfg(feature = \"passkey\")]",
+            "    #[cfg_attr(docsrs, doc(cfg(feature = \"passkey\")))]",
+            "pub mod passkey;",
+            "    passkey: crate::passkey::Passkey,",
+        ] {
+            assert!(
+                is_declaration(line, "passkey"),
+                "{line:?} is one of the shapes the core is allowed"
+            );
+        }
+    }
+
+    /// What counting alone would let through: the same number of lines, spent
+    /// on putting the subsystem back into the core's surface.
+    #[test]
+    fn anything_else_is_not() {
+        for line in [
+            "pub use crate::passkey::PasskeyError;",
+            "#[cfg(feature = \"passkey\")] pub use crate::passkey::PasskeyError;",
+            "    let state = self.subsystem::<crate::passkey::Passkey>();",
+            "// passkey needs the event bus here",
+        ] {
+            assert!(
+                !is_declaration(line, "passkey"),
+                "{line:?} is coupling, not a declaration"
+            );
+        }
+    }
 }

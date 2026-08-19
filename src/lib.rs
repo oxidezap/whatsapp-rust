@@ -130,7 +130,8 @@ pub use client::NodeFilter;
 pub use client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
 pub use client::{
     AllocSnapshot, CollectionStats, HttpResourceReport, MemoryReport, ResourceReport,
-    StatsSnapshot, StorageResourceReport, TransportResourceReport,
+    StatsSnapshot, StorageResourceReport, SubsystemCollection, SubsystemMemory,
+    TransportResourceReport,
 };
 pub use client::{CallError, Voip};
 pub use client::{

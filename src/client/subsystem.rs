@@ -8,11 +8,11 @@
 //! anywhere else; `tests/subsystem_boundary.rs` fails on a mention outside that
 //! budget.
 //!
-//! Everything here is written for a reader the core does not have: the trait,
-//! the state it stores and the lookup that finds it again all belong to the
-//! attached subsystems, so a build with none attached has no user for any of
-//! it. That is the seam working, not rot, hence the module-wide allow.
-#![allow(dead_code)]
+//! Three items here have no user in a build with no subsystem attached: the two
+//! traits and the lookup. That is the seam working rather than rot, so each
+//! carries its own `allow` and the module carries none. `expect` would be the
+//! better tool and does not fit: the items are live as soon as one subsystem is
+//! attached, so the expectation would go unfulfilled in every other build.
 
 use std::sync::Arc;
 
@@ -30,6 +30,10 @@ use super::{Client, SubsystemMemory};
 /// the way a record of function pointers lets them. Nothing here is `dyn`, so a
 /// hook a subsystem does not fill costs no branch and no vtable.
 #[allow(async_fn_in_trait)] // never used through `dyn`: every call names a concrete impl, so auto traits still flow
+#[allow(
+    dead_code,
+    reason = "no implementor in a build with no subsystem attached"
+)]
 pub(crate) trait Subsystem: 'static {
     /// What one client retains for this subsystem. Stored inline in `Client`
     /// under its real type, so reaching it back is a field access and not a
@@ -91,6 +95,7 @@ macro_rules! subsystems {
         /// makes [`Client::subsystem`] infallible: asking for a detached
         /// subsystem's state is a compile error, not a `None` or a panic every
         /// caller has to carry a story for.
+        #[allow(dead_code, reason = "no implementor in a build with no subsystem attached")]
         pub(crate) trait Attached: Subsystem {
             fn state(subsystems: &Subsystems) -> &Self::State;
         }
@@ -221,6 +226,7 @@ impl Client {
     ///
     /// Infallible by construction: [`Attached`] is implemented only for a
     /// subsystem this build carries, so naming a detached one does not compile.
+    #[allow(dead_code, reason = "no caller in a build with no subsystem attached")]
     pub(crate) fn subsystem<S: Attached>(&self) -> &S::State {
         S::state(&self.subsystems)
     }

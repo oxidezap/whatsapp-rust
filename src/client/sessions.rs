@@ -959,9 +959,6 @@ impl Client {
     /// session with an un-acked pre-key still pending). Reuses the send path's
     /// pre-flight so the voip offer treats a session-present-but-unacked device as
     /// pkmsg too, not as plain msg.
-    /// Whether encrypting for `jid` right now would emit a `pkmsg` rather than a
-    /// `msg`. Gated because the VoIP facade is its only caller, so an ordinary
-    /// build would carry it dead; see `agent_docs/subsystem_boundary.md`.
     #[cfg(feature = "voip-runtime")]
     pub(crate) async fn would_emit_pkmsg(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
         let device_store = self.persistence_manager.clone();

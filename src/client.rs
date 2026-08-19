@@ -552,6 +552,27 @@ pub struct MemoryReport {
     pub stanza_interceptors: usize,
 }
 
+/// Names one collection an attached subsystem reports.
+///
+/// A subsystem exports these as constants (see `voip::collections`), so looking
+/// a figure up in [`MemoryReport`] is a name the compiler checks rather than two
+/// string literals a caller has to spell the way the report happens to print
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubsystemCollection {
+    pub subsystem: &'static str,
+    pub collection: &'static str,
+}
+
+impl SubsystemCollection {
+    pub const fn new(subsystem: &'static str, collection: &'static str) -> Self {
+        Self {
+            subsystem,
+            collection,
+        }
+    }
+}
+
 /// One collection an attached subsystem retains, as `MemoryReport` carries it.
 ///
 /// The subsystem and the collection stay separate fields rather than one fused
@@ -590,10 +611,12 @@ impl MemoryReport {
 
     /// One collection of one attached subsystem. `None` when that subsystem is
     /// not attached to this build, or does not report that collection.
-    pub fn subsystem(&self, subsystem: &str, collection: &str) -> Option<CollectionStats> {
+    pub fn subsystem(&self, which: SubsystemCollection) -> Option<CollectionStats> {
         self.subsystems
             .iter()
-            .find(|retained| retained.subsystem == subsystem && retained.collection == collection)
+            .find(|retained| {
+                retained.subsystem == which.subsystem && retained.collection == which.collection
+            })
             .map(|retained| retained.stats)
     }
 
@@ -1563,7 +1586,6 @@ pub struct Client {
     /// each under its own type, in one field rather than one field per
     /// subsystem. Empty, and zero-sized, in a build with none attached; see
     /// `agent_docs/subsystem_boundary.md`.
-    #[allow(dead_code)]
     pub(crate) subsystems: subsystem::Subsystems,
 
     /// Custom handlers for encrypted message types. Set once at `Bot::build` and

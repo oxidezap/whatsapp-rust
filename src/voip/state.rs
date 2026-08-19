@@ -16,6 +16,25 @@ use wacore_binary::NodeRef;
 use crate::client::Client;
 use crate::client::subsystem::Subsystem;
 
+/// What this subsystem reports to `Client::memory_report`, named once so a
+/// lookup and the hook below cannot drift apart, and so a caller spells a
+/// constant instead of a string.
+pub mod collections {
+    use super::Voip;
+    use crate::client::SubsystemCollection;
+    use crate::client::subsystem::Subsystem;
+
+    /// Admission snapshots retained while a call-link join ACK is in flight.
+    pub const PENDING_LINK_UPDATES: SubsystemCollection =
+        SubsystemCollection::new(Voip::NAME, "pending_link_updates");
+    /// Active and ringing calls, with their bounded pre-offer group controls.
+    pub const ACTIVE_CALLS: SubsystemCollection =
+        SubsystemCollection::new(Voip::NAME, "active_calls");
+    /// Outgoing calls parked until the server sends the relay that owns them.
+    pub const PENDING_OUTGOING: SubsystemCollection =
+        SubsystemCollection::new(Voip::NAME, "pending_outgoing");
+}
+
 /// How many lanes stripe [`VoipState::answer_transition_locks`].
 const ANSWER_TRANSITION_LANES: usize = 16;
 
@@ -54,12 +73,18 @@ impl Subsystem for Voip {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len() as u64;
         vec![
-            ("pending_link_updates", pending_link_updates),
-            ("active_calls", state.call_registry.memory_stats()),
+            (
+                collections::PENDING_LINK_UPDATES.collection,
+                pending_link_updates,
+            ),
+            (
+                collections::ACTIVE_CALLS.collection,
+                state.call_registry.memory_stats(),
+            ),
             // Entry count only: each parked call retains engine material this
             // side cannot size without walking it.
             (
-                "pending_outgoing",
+                collections::PENDING_OUTGOING.collection,
                 CollectionStats::new(pending_outgoing, 0),
             ),
         ]
@@ -75,8 +100,10 @@ pub(crate) struct VoipState {
     pub(crate) pending_call_link_joins:
         Arc<std::sync::Mutex<crate::client::voip::PendingCallLinkJoins>>,
     /// Serializes call-link joins until the ACK reveals which call id owns any admission state
-    /// buffered during the request, so a bounded overflow stays tied to one join.
-    pub(crate) pending_call_link_join_lane: Arc<Mutex<()>>,
+    /// buffered during the request, so a bounded overflow stays tied to one join. Not shared: the
+    /// one caller locks it through `&Client`, unlike the striped answer lanes, which hand out an
+    /// owned guard via `lock_arc` and so have to be `Arc`.
+    pub(crate) pending_call_link_join_lane: Mutex<()>,
     /// Serializes incoming-answer registration with generation-aware teardown. A failed answer
     /// holds its call-id lane until `<terminate>` has been written, so a same-call-id re-offer
     /// cannot become current in the removal-before-send window.
@@ -93,7 +120,7 @@ impl Default for VoipState {
         Self {
             call_registry: Arc::new(wacore::voip::CallRegistry::new()),
             pending_call_link_joins: Arc::new(std::sync::Mutex::new(Default::default())),
-            pending_call_link_join_lane: Arc::new(Mutex::new(())),
+            pending_call_link_join_lane: Mutex::new(()),
             answer_transition_locks: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
             pending_outgoing_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }

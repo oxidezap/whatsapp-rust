@@ -35,12 +35,20 @@ A subsystem is **cuttable** when all four tests pass.
 2. **State.** Its per-client state is read only by itself.
 3. **Return.** Everything it needs from the core is already `pub` or
    `pub(crate)` for some other caller.
-4. **Contract.** Nothing it owns changes shape with the feature. `Event` is
-   exempt from removal but not from mutation: `EventKind` discriminants are
-   `EventInterest` bit indices consumers persist, so a cut subsystem keeps its
-   variants and payload types compiled unconditionally. What fails this test is
-   a payload *field* behind a `cfg`, because then one public type has two
-   shapes.
+4. **Contract.** Nothing it owns changes the *construction surface* of a public
+   type with the feature: no `cfg` on a field, a builder setter, or a variant.
+   `Event` is exempt from removal but not from mutation: `EventKind`
+   discriminants are `EventInterest` bit indices consumers persist, so a cut
+   subsystem keeps its variants and payload types compiled unconditionally.
+
+   The test is deliberately narrower than "no gated API at all", because that
+   is not achievable: `IncomingCall::media` is reached through an accessor that
+   is itself gated, so the type does still have two shapes. What the accessor
+   buys is that the two shapes differ only in a method. Code that builds,
+   matches or destructures the payload compiles the same with the feature on or
+   off, and only code that asks for the optional half stops compiling. A gated
+   field takes that choice away from every consumer, which is why it fails and
+   a gated method does not.
 
 Verdicts:
 
@@ -144,11 +152,37 @@ The list is a macro rather than runtime registration because static
 registration through a linker-section crate would trade the core's last gate for
 a new dependency. The guard test is what keeps "one gate" enforceable instead.
 
+### Adding a fifth hook
+
+Four hooks is not a budget, it is what two subsystems happened to need. The
+failure mode from here is obvious and slow: `pdo` wants a point that does not
+exist, a defaulted method is the shortest path, and three batches later the
+trait is a god object with eight defaults that no single subsystem fills. That
+is the coupling this document is about, moved into one file rather than removed.
+
+So a fifth hook has to clear two bars:
+
+1. **Two askers.** Two subsystems want the same point, or the one that wants it
+   gets its own seam instead. One subsystem's need is not a core extension
+   point; it is that subsystem's problem.
+2. **A measured floor.** The hook costs nothing in a build that does not fill
+   it. That is a claim about codegen, so it is measured the way the rest of this
+   document is, not asserted: build with and without and put the number here.
+
+A hook that cannot clear both is a sign the subsystem is coupled (rule test 1),
+and the honest answer is the inventory row, not the trait.
+
 Besides state, a subsystem can fill three hooks: connection cleanup, a response
 about to reach its waiter, and the collections it retains for
 `Client::memory_report`. `memory` takes `&Self::State` rather than the client,
 so reporting cannot quietly become a second way for a subsystem to read the
 core.
+
+The report does not undo that with strings. A subsystem exports its collections
+as `SubsystemCollection` constants (`voip::collections`) and its hook names them
+from those same constants, so a caller writes
+`report.subsystem(voip::collections::ACTIVE_CALLS)` and a typo is a compile
+error rather than a silent `None`.
 
 The core's own match arms win: the seam is consulted only for a notification
 type the core does not model itself, so a claim on a type the core later starts
