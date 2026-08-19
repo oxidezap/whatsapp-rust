@@ -3826,7 +3826,7 @@ mod tests {
             .map(|user| Jid::from_str(&format!("{user}@s.whatsapp.net")).unwrap())
             .collect();
         // Only the first member has a session; establishing the second one's
-        // needs a pre-key fetch, and this client has no socket to fetch over —
+        // needs a pre-key fetch, and this client has no socket to fetch over:
         // the transient failure a real cold send hits on a bad connection.
         crate::test_utils::seed_peer_session(&client, &participants[0]).await;
 
@@ -3948,7 +3948,7 @@ mod tests {
             .expect("device resolution is cache-backed here")
             .1;
         assert!(
-            needs.iter().any(|device| *device == member),
+            needs.contains(&member),
             "the member that spoke must be back on the distribution list"
         );
     }
@@ -3995,6 +3995,199 @@ mod tests {
                 );
             }
             _ => panic!("a group send registers a phash waiter, not an IQ waiter"),
+        }
+    }
+
+    /// The protected path, broken on purpose: the server answers with a phash
+    /// that disagrees with ours. That means our participant device set is not
+    /// what the group actually holds, so the group's sender-key tracking and its
+    /// metadata snapshot both have to go, and the next send redistributes
+    /// against a fresh participant list. WA Web's answer to the same ack is
+    /// `sendQueryGroup` plus a resend to the devices it had missed.
+    #[tokio::test]
+    async fn a_disagreeing_ack_phash_clears_the_group_sender_key_tracking() {
+        let fixture = GroupSendFixture::new().await;
+        let group_str = fixture.group.to_string();
+        let message_id = "GROUPPHASHMISMATCH1";
+        fixture
+            .client
+            .send_message_with_options(
+                fixture.group.clone(),
+                wa::Message::text("hi"),
+                SendOptions::default().with_message_id(message_id),
+            )
+            .await
+            .expect("group text send should reach the wire");
+
+        let group_info = fixture
+            .client
+            .get_group_cache()
+            .get(&fixture.group)
+            .await
+            .expect("group metadata");
+        assert!(
+            fixture
+                .client
+                .resolve_skdm_targets_memoized(
+                    &fixture.group,
+                    &group_str,
+                    &group_info,
+                    &fixture.own_sending,
+                )
+                .await
+                .expect("device resolution is cache-backed here")
+                .1
+                .is_empty(),
+            "the cold send keyed every member"
+        );
+
+        let ack = wacore_binary::marshal::marshal_ref(
+            &NodeBuilder::new("ack")
+                .attr("id", message_id)
+                .attr("from", "s.whatsapp.net")
+                .attr("phash", "2:notwhatwesent")
+                .build()
+                .as_node_ref(),
+        )
+        .expect("valid node");
+        let ack = wacore_binary::OwnedNodeRef::new(
+            wacore_binary::util::unpack(&ack)
+                .expect("packed payload")
+                .into_owned(),
+        )
+        .expect("valid node");
+        assert!(
+            fixture.client.handle_ack_response_arc(&Arc::new(ack)),
+            "the group send's waiter must claim its own ack"
+        );
+
+        // handle_phash_mismatch runs detached off the read loop.
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let needs = fixture
+                    .client
+                    .resolve_skdm_targets_memoized(
+                        &fixture.group,
+                        &group_str,
+                        &group_info,
+                        &fixture.own_sending,
+                    )
+                    .await
+                    .expect("device resolution is cache-backed here")
+                    .1;
+                if !needs.is_empty() {
+                    return needs;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a disagreeing phash must put the group back on the distribution path");
+        assert_eq!(
+            cleared.len(),
+            fixture.recipient_devices,
+            "every member is targeted again after the server disagreed"
+        );
+    }
+
+    /// An ack that agrees is the ordinary case and must cost nothing: no reset,
+    /// no re-query, no redistribution.
+    #[tokio::test]
+    async fn an_agreeing_ack_phash_leaves_the_group_warm() {
+        let fixture = GroupSendFixture::new().await;
+        let group_str = fixture.group.to_string();
+        let message_id = "GROUPPHASHMATCH1";
+        fixture
+            .client
+            .send_message_with_options(
+                fixture.group.clone(),
+                wa::Message::text("hi"),
+                SendOptions::default().with_message_id(message_id),
+            )
+            .await
+            .expect("group text send should reach the wire");
+        let sent = fixture.stanza(0).await;
+        let on_wire = attr_value(&sent, "phash").expect("groups carry a phash");
+
+        let ack = wacore_binary::marshal::marshal_ref(
+            &NodeBuilder::new("ack")
+                .attr("id", message_id)
+                .attr("from", "s.whatsapp.net")
+                .attr("phash", on_wire.as_str())
+                .build()
+                .as_node_ref(),
+        )
+        .expect("valid node");
+        let ack = wacore_binary::OwnedNodeRef::new(
+            wacore_binary::util::unpack(&ack)
+                .expect("packed payload")
+                .into_owned(),
+        )
+        .expect("valid node");
+        fixture.client.handle_ack_response_arc(&Arc::new(ack));
+
+        let group_info = fixture
+            .client
+            .get_group_cache()
+            .get(&fixture.group)
+            .await
+            .expect("group metadata");
+        assert!(
+            fixture
+                .client
+                .resolve_skdm_targets_memoized(
+                    &fixture.group,
+                    &group_str,
+                    &group_info,
+                    &fixture.own_sending,
+                )
+                .await
+                .expect("device resolution is cache-backed here")
+                .1
+                .is_empty(),
+            "an agreeing server must not cost a redistribution"
+        );
+    }
+
+    /// Non-regression for the group whose members all resolve: the cold send
+    /// hands the key to every device and marks every device, the warm send that
+    /// follows distributes nothing, and both carry a phash.
+    #[tokio::test]
+    async fn a_group_whose_members_all_resolve_sends_and_marks_exactly_as_before() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("cold send").await;
+        fixture.send_text("warm send").await;
+
+        let cold = fixture.stanza(0).await;
+        let warm = fixture.stanza(1).await;
+        assert_eq!(
+            skdm_targets(&cold),
+            Some(fixture.recipient_devices),
+            "a cold send hands the key to every resolvable device"
+        );
+        assert_eq!(
+            skdm_targets(&warm),
+            None,
+            "the warm send distributes nothing"
+        );
+        for stanza in [&cold, &warm] {
+            assert!(
+                attr_value(stanza, "phash").is_some_and(|phash| !phash.is_empty()),
+                "groups carry a phash on every send"
+            );
+        }
+
+        let map = fixture
+            .client
+            .skdm_device_map(&fixture.group.to_string())
+            .await;
+        for index in 0..fixture.recipient_devices {
+            let user = format!("55110000{:05}", 10 + index);
+            assert_eq!(
+                map.device_has_key(&user, 0),
+                Some(true),
+                "{user} received its distribution and stays marked"
+            );
         }
     }
 
