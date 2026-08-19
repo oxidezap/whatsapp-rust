@@ -3410,6 +3410,32 @@ mod mark_full_distribution_list {
         (ss, is)
     }
 
+    /// `established_stores` for more than one peer: every listed device gets a
+    /// session, anything else has to go through the resolver's prekey fetch.
+    async fn established_stores_for(peers: &[&Jid]) -> (MemSessionStore, MemIdentityStore) {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let sender = IdentityKeyPair::generate(&mut rng);
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: sender,
+            reg_id: 42,
+            known: Default::default(),
+        };
+        for peer in peers {
+            process_prekey_bundle(
+                &peer.to_protocol_address(),
+                &mut ss,
+                &mut is,
+                &signed_prekey_bundle(),
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .unwrap();
+        }
+        (ss, is)
+    }
+
     #[tokio::test]
     async fn targeted_status_retry_sends_only_the_requesting_device() {
         let status = Jid::status_broadcast();
@@ -3584,17 +3610,23 @@ mod mark_full_distribution_list {
         );
     }
 
+    /// `markHasSenderKey(x, M)` marks the whole target set, not the encrypted
+    /// subset, so a companion whose SKDM encryption failed still counts as keyed
+    /// and no re-fanout storm follows. `getKeyDistributionMsg` swallows a
+    /// companion's encryption failure (`isPrimaryDevice(e)` is false), which is
+    /// what lets that marking be reached at all.
     #[tokio::test]
-    async fn failed_device_is_still_marked_has_key() {
+    async fn failed_companion_is_still_marked_has_key() {
         let group: Jid = "120363000000000001@g.us".parse().unwrap();
         let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
         let own_lid: Jid = "100000000000000@lid".parse().unwrap();
-        // A has a session (encrypts ok); B has neither session nor bundle,
-        // mimicking a device that 406'd / has no key material.
+        // A has a session (encrypts ok); B is a COMPANION with neither session
+        // nor bundle, mimicking a device that 406'd / has no key material.
         let a: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
-        let b: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+        let b: Jid = "559933334444:12@s.whatsapp.net".parse().unwrap();
+        let b_primary: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
 
-        let (mut ss, mut is) = established_stores(&a).await;
+        let (mut ss, mut is) = established_stores_for(&[&a, &b_primary]).await;
         let mut sks = MemSenderKeyStore::default();
         let mut pks = UnusedPreKeyStore;
         let spks = UnusedSignedPreKeyStore;
@@ -3633,7 +3665,7 @@ mod mark_full_distribution_list {
                 message: &msg,
                 message_id: "TESTREQID",
                 force_distribution: false,
-                distribution_targets: Some(vec![a.clone(), b.clone()]),
+                distribution_targets: Some(vec![a.clone(), b_primary.clone(), b.clone()]),
                 distribution_policy: SenderKeyDistributionPolicy::BestEffort,
                 phash_devices: None,
                 edit: None,
@@ -3656,19 +3688,110 @@ mod mark_full_distribution_list {
         );
         assert!(
             marked.contains(&b.to_string()),
-            "device whose SKDM encryption FAILED must still be marked has_key \
+            "COMPANION whose SKDM encryption FAILED must still be marked has_key \
                  (WA Web markHasSenderKey(x, M) marks the full target set → no re-fanout storm)"
         );
         assert_eq!(
             prepared.skdm_devices.len(),
-            2,
-            "exactly the full distribution list (A + B), not just the encrypted subset"
+            3,
+            "exactly the full distribution list, not just the encrypted subset"
         );
 
         // A key-distributing send must carry a phash (computed over the list).
         assert!(
             prepared.node.attrs().optional_string("phash").is_some(),
             "a key-distributing group send must carry a phash"
+        );
+    }
+
+    /// The operator's report, at the layer that creates it: in a closed group
+    /// one participant sits on "waiting for this message" forever while every
+    /// other member reads normally.
+    ///
+    /// A primary that never received its SKDM must not be reported as keyed.
+    /// `markHasSenderKey(x, M)` marks the whole target set, but WA Web can never
+    /// reach it with a failed primary in `M`: `getKeyDistributionMsg` rejects
+    /// the entire send on `isPrimaryDevice(e)` and only swallows companions. Our
+    /// marking is the same; the guarantee that no primary is marked without its
+    /// SKDM is what was missing, and a primary marked warm is filtered out of
+    /// every later send by the `device_and_primary_warm` gate, permanently:
+    /// nothing but that member's own traffic ever unmarks it.
+    #[tokio::test]
+    async fn a_primary_that_got_no_skdm_is_not_reported_as_keyed() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000000@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000000@lid".parse().unwrap();
+        // A encrypts; B is a whole user whose primary has no key material, plus
+        // a companion that is equally unreachable.
+        let a: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let b_primary: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+        let b_companion: Jid = "559933334444:12@s.whatsapp.net".parse().unwrap();
+
+        let (mut ss, mut is) = established_stores(&a).await;
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        let resolver = MockSendContextResolver::new();
+        let group_info = GroupInfo::new(
+            vec![own_jid.to_non_ad(), a.to_non_ad(), b_primary.to_non_ad()],
+            AddressingMode::Pn,
+        );
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &resolver,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "UNKEYEDPRIMARY",
+                force_distribution: false,
+                distribution_targets: Some(vec![a.clone(), b_primary.clone(), b_companion.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await
+        .expect("a best-effort send survives a member it cannot encrypt for");
+
+        let marked: HashSet<String> = prepared
+            .skdm_devices
+            .iter()
+            .map(|j| j.to_string())
+            .collect();
+
+        assert!(
+            marked.contains(&a.to_string()),
+            "the device that received its SKDM stays marked"
+        );
+        assert!(
+            !marked.contains(&b_primary.to_string()),
+            "a PRIMARY that received no SKDM must not be reported as keyed: marking \
+             it hides the whole user from every later send's target filter"
+        );
+        assert!(
+            marked.contains(&b_companion.to_string()),
+            "the companion keeps the markHasSenderKey(x, M) rule; only the primary \
+             is held back, mirroring getKeyDistributionMsg's isPrimaryDevice gate"
         );
     }
 

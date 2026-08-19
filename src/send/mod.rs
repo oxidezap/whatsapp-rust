@@ -3767,6 +3767,226 @@ mod tests {
         );
     }
 
+    /// The operator's report, end to end over the client's own tracker: the bot
+    /// sends into a closed group, a member sits on "waiting for this message",
+    /// and it never clears because nobody in that group ever sends anything.
+    ///
+    /// A cold group send whose pre-key fetch fails distributes no sender key at
+    /// all, yet reports its whole target set as keyed. Every later send then
+    /// filters those devices out (`device_and_primary_warm`) and distributes to
+    /// nobody. The only thing that undoes it is the member's own retry receipt,
+    /// which is what "she sent a message, or even just a reaction" produces.
+    #[tokio::test]
+    async fn a_send_that_distributed_nothing_reports_nobody_as_keyed() {
+        use wacore::client::context::GroupInfo;
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        let client = crate::test_utils::create_test_client_with_name("unkeyed_group").await;
+        let own = Jid::from_str("5511000000001@s.whatsapp.net").unwrap();
+        let own_lid = Jid::from_str("100000000000001@lid").unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(own.clone())))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(own_lid)))
+            .await;
+        client.enter_live_mode_for_tests();
+
+        let members = ["5511000000010", "5511000000011"];
+        for user in [own.user.as_str()].into_iter().chain(members) {
+            client
+                .device_registry_cache
+                .raw_insert_for_tests(
+                    user.to_string(),
+                    Arc::new(DeviceListRecord {
+                        user: user.into(),
+                        devices: vec![DeviceInfo::new(0, None)],
+                        timestamp: wacore::time::now_secs(),
+                        phash: None,
+                        raw_id: None,
+                    }),
+                )
+                .await;
+        }
+        let participants: Vec<Jid> = members
+            .iter()
+            .map(|user| Jid::from_str(&format!("{user}@s.whatsapp.net")).unwrap())
+            .collect();
+        // Only the first member has a session; establishing the second one's
+        // needs a pre-key fetch, and this client has no socket to fetch over —
+        // the transient failure a real cold send hits on a bad connection.
+        crate::test_utils::seed_peer_session(&client, &participants[0]).await;
+
+        let group = Jid::from_str("120363000000000077@g.us").unwrap();
+        let group_str = group.to_string();
+        let group_info = Arc::new(GroupInfo::new(participants.clone(), AddressingMode::Pn));
+        client
+            .get_group_cache()
+            .insert(group.clone(), Arc::clone(&group_info))
+            .await;
+
+        let prepared = {
+            let device_snapshot = client.persistence_manager.get_device_snapshot();
+            let mut adapter = client.signal_adapter();
+            let mut stores = adapter.as_signal_stores();
+            wacore::send::prepare_group_stanza(
+                &*client.runtime,
+                &mut stores,
+                &*client,
+                wacore::send::GroupStanzaRequest {
+                    group: &group_info,
+                    own_jid: device_snapshot.pn.as_ref().expect("own pn"),
+                    own_lid: device_snapshot.lid.as_ref().expect("own lid"),
+                    account: None,
+                    to: &group,
+                    message: &wa::Message::text("hi"),
+                    message_id: "COLDGROUPSEND1",
+                    force_distribution: true,
+                    distribution_targets: None,
+                    distribution_policy: wacore::send::SenderKeyDistributionPolicy::BestEffort,
+                    phash_devices: None,
+                    edit: None,
+                    extra_nodes: &[],
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .expect("a best-effort group send survives a failed pre-key fetch")
+        };
+
+        assert!(
+            prepared.node.get_optional_child("participants").is_none(),
+            "the fixture's point: this send handed out no sender key at all"
+        );
+        assert!(
+            prepared.skdm_devices.is_empty(),
+            "a send that distributed nothing must report nobody as keyed; it reported {:?}",
+            prepared.skdm_devices
+        );
+
+        // The client half of the loop: what the send reports is what gets
+        // persisted, and what is persisted decides the next send's targets.
+        client
+            .update_sender_key_devices(&group_str, &prepared.skdm_devices)
+            .await;
+        let (_all, needs) = client
+            .resolve_skdm_targets_memoized(&group, &group_str, &group_info, &own)
+            .await
+            .expect("device resolution is cache-backed here");
+        let targeted: std::collections::HashSet<String> =
+            needs.iter().map(Jid::to_string).collect();
+        for participant in &participants {
+            assert!(
+                targeted.contains(&participant.to_string()),
+                "{participant} got no sender key, so the next send must still target it"
+            );
+        }
+    }
+
+    /// The repair the report describes: the member sends anything at all, her
+    /// retry receipt marks her cold again, and the next send hands her the key.
+    /// It is the only repair a closed group ever gets, which is why the group
+    /// stays dark until someone speaks.
+    #[tokio::test]
+    async fn a_retry_receipt_puts_a_keyed_member_back_on_the_distribution_list() {
+        let fixture = GroupSendFixture::new().await;
+        let group_str = fixture.group.to_string();
+        fixture.send_text("cold send").await;
+
+        let group_info = fixture
+            .client
+            .get_group_cache()
+            .get(&fixture.group)
+            .await
+            .expect("group metadata");
+        let warm = fixture
+            .client
+            .resolve_skdm_targets_memoized(
+                &fixture.group,
+                &group_str,
+                &group_info,
+                &fixture.own_sending,
+            )
+            .await
+            .expect("device resolution is cache-backed here")
+            .1;
+        assert!(
+            warm.is_empty(),
+            "after a cold send every member holds the key"
+        );
+
+        // What handle_retry_receipt does for a member that could not decrypt.
+        let member = fixture.member.clone();
+        fixture
+            .client
+            .mark_forget_sender_key(&group_str, std::slice::from_ref(&member))
+            .await
+            .expect("marking a member cold must succeed");
+
+        let needs = fixture
+            .client
+            .resolve_skdm_targets_memoized(
+                &fixture.group,
+                &group_str,
+                &group_info,
+                &fixture.own_sending,
+            )
+            .await
+            .expect("device resolution is cache-backed here")
+            .1;
+        assert!(
+            needs.iter().any(|device| *device == member),
+            "the member that spoke must be back on the distribution list"
+        );
+    }
+
+    /// The server answers a group send with its own view of the participant
+    /// device set, and disagreement is the only signal a bot gets that its
+    /// member list is stale without anyone in the group speaking first.
+    /// `WAWebSendGroupSkmsgJob` reads `phash` off the ack and, on a mismatch,
+    /// re-queries the group and resends to the devices it had missed; the group
+    /// branch here dropped the ack's phash on the floor, so
+    /// `handle_phash_mismatch`'s group half could never run.
+    #[tokio::test]
+    async fn a_group_send_registers_its_phash_ack_waiter() {
+        let fixture = GroupSendFixture::new().await;
+        let message_id = "GROUPPHASHWAITER1";
+        fixture
+            .client
+            .send_message_with_options(
+                fixture.group.clone(),
+                wa::Message::text("hi"),
+                SendOptions::default().with_message_id(message_id),
+            )
+            .await
+            .expect("group text send should reach the wire");
+
+        let stanza = fixture.stanza(0).await;
+        let on_wire = attr_value(&stanza, "phash").expect("groups carry a phash on every send");
+
+        let mut waiters = fixture.client.response_waiters_guard();
+        let waiter = waiters
+            .remove(message_id)
+            .expect("a group send must wait on the ack's phash");
+        match waiter {
+            crate::client::ResponseWaiter::Phash(waiter) => {
+                assert_eq!(
+                    waiter.expected.as_str(),
+                    on_wire,
+                    "the waiter must expect exactly what went on the wire"
+                );
+                assert_eq!(waiter.jid, fixture.group);
+                assert!(
+                    waiter.invalidate_group_cache,
+                    "a disagreeing server also means our participant list is stale"
+                );
+            }
+            _ => panic!("a group send registers a phash waiter, not an IQ waiter"),
+        }
+    }
+
     /// `edit`, `phash` and the `skmsg` payload are built by the group path
     /// itself, with or without a distribution list, so a revoke that hands out
     /// no sender key still carries the whole structure.
