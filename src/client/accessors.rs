@@ -371,7 +371,7 @@ impl Client {
             history_sync_activity.tasks as u64,
             history_sync_activity.payload_bytes as u64,
         );
-        let subsystems = subsystem::memory(self);
+        let subsystems = subsystem::memory(&self.subsystems);
         #[cfg(feature = "plugins")]
         let plugin_stats = self.plugin_stats();
         #[cfg(feature = "plugins")]

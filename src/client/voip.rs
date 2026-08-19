@@ -1979,7 +1979,7 @@ mod tests {
         client
             .memory_report()
             .await
-            .subsystem("voip pending_link_updates:")
+            .subsystem("voip", "pending_link_updates")
             .expect("the voip subsystem is attached in this build")
     }
 

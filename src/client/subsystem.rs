@@ -1,105 +1,233 @@
 //! The core's single attachment point for an optional subsystem.
 //!
-//! [`SUBSYSTEMS`] is the one place the core is allowed to name one. A subsystem
-//! that passes the cut rule in `agent_docs/subsystem_boundary.md` parks its
-//! per-client state here and lists the notification types it models, so turning
-//! it on adds no `Client` field and no `cfg` anywhere else;
-//! `tests/subsystem_boundary.rs` fails on a mention outside that budget.
+//! The [`subsystems!`] list below is the one place the core is allowed to name
+//! one. A subsystem that passes the cut rule in
+//! `agent_docs/subsystem_boundary.md` implements [`Subsystem`], parks its
+//! per-client state through the associated type and lists the notification
+//! types it models, so turning it on adds no `Client` field and no `cfg`
+//! anywhere else; `tests/subsystem_boundary.rs` fails on a mention outside that
+//! budget.
 //!
-//! Everything here is written for a reader the core does not have: the table's
-//! entries, the state it builds and the lookup that finds it again all belong
-//! to the attached subsystems, so a build with none attached has no user for
-//! any of it. That is the seam working, not rot, hence the module-wide allow.
+//! Everything here is written for a reader the core does not have: the trait,
+//! the state it stores and the lookup that finds it again all belong to the
+//! attached subsystems, so a build with none attached has no user for any of
+//! it. That is the seam working, not rot, hence the module-wide allow.
 #![allow(dead_code)]
 
-use std::any::Any;
 use std::sync::Arc;
 
-use wacore::runtime::BoxFuture;
 use wacore::stanza::wire_tags::NotificationType;
 use wacore::stats::CollectionStats;
+use wacore::sync_marker::MaybeSendSync;
 use wacore_binary::{NodeRef, OwnedNodeRef};
 
-use super::Client;
+use super::{Client, SubsystemMemory};
 
-/// Per-client state a subsystem parks on the core. `Send + Sync` only where the
-/// client itself is: wasm32 is single-threaded and its handles may be `!Send`,
-/// the same split `wacore::sync_marker` makes for trait objects.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) type SubsystemState = Arc<dyn Any + Send + Sync>;
-#[cfg(target_arch = "wasm32")]
-pub(crate) type SubsystemState = Arc<dyn Any>;
-
-/// What a subsystem reports as retained, named as `MemoryReport` prints it.
-pub(crate) type RetainedCollections = Vec<(&'static str, CollectionStats)>;
-
-/// One optional subsystem attached to the core.
+/// One optional subsystem the core can carry.
 ///
-/// Every hook is optional and every one is a plain function pointer, so an
-/// unattached build folds the whole table away instead of paying for an empty
-/// vtable.
-pub(crate) struct Subsystem {
-    /// Builds this subsystem's per-client state, once, during client assembly.
-    pub state: fn() -> SubsystemState,
+/// The implementing type is the whole handle: its state, the notification types
+/// it claims and the hooks it fills all hang off it, so they cannot drift apart
+/// the way a record of function pointers lets them. Nothing here is `dyn`, so a
+/// hook a subsystem does not fill costs no branch and no vtable.
+#[allow(async_fn_in_trait)] // never used through `dyn`: every call names a concrete impl, so auto traits still flow
+pub(crate) trait Subsystem: 'static {
+    /// What one client retains for this subsystem. Stored inline in `Client`
+    /// under its real type, so reaching it back is a field access and not a
+    /// downcast that has to answer for failing. `MaybeSendSync` is the bound
+    /// the client itself carries: `Send + Sync` on native, dropped on wasm32.
+    type State: Default + MaybeSendSync;
+
+    /// How `Client::memory_report` names this subsystem's collections.
+    const NAME: &'static str;
+
     /// The notification types this subsystem models. The core routes on the
-    /// type alone and never looks inside the stanza.
-    pub notifications: &'static [NotificationType],
-    pub handle_notification:
-        for<'a> fn(&'a Arc<Client>, NotificationType, Arc<OwnedNodeRef>) -> BoxFuture<'a, ()>,
+    /// type alone and never looks inside the stanza. Two subsystems claiming
+    /// one type fails the build; see the assertion below.
+    const NOTIFICATIONS: &'static [NotificationType] = &[];
+
+    /// Handles one of [`Self::NOTIFICATIONS`]. Never called for a type this
+    /// subsystem did not claim, which is why claiming none needs no handler.
+    async fn handle_notification(
+        _client: &Arc<Client>,
+        _notification_type: NotificationType,
+        _node: Arc<OwnedNodeRef>,
+    ) {
+    }
+
     /// Runs while a connection's state is torn down, before the socket closes.
-    pub on_connection_cleanup: Option<for<'a> fn(&'a Client) -> BoxFuture<'a, ()>>,
+    async fn on_connection_cleanup(_client: &Client) {}
+
     /// Sees a response before the waiter it belongs to is woken. On the ack
     /// path and synchronous, so an implementation has to stay cheap; the point
     /// of running here rather than on the waiter's side is that the waking is
     /// what a subsystem would otherwise race.
-    pub on_response: Option<fn(&Client, &NodeRef<'_>)>,
-    /// Retained collections for `Client::memory_report`, named as the report
-    /// prints them.
-    pub memory: Option<fn(&Client) -> RetainedCollections>,
+    fn on_response(_client: &Client, _node: &NodeRef<'_>) {}
+
+    /// Retained collections, named as `MemoryReport` prints them under
+    /// [`Self::NAME`]. Takes the state rather than the client, so reporting
+    /// cannot quietly become a second way for a subsystem to read the core.
+    fn memory(_state: &Self::State) -> Vec<(&'static str, CollectionStats)> {
+        Vec::new()
+    }
 }
 
-/// Every optional subsystem attached to this build.
-pub(crate) const SUBSYSTEMS: &[Subsystem] = &[
-    #[cfg(feature = "passkey")]
-    crate::passkey::SUBSYSTEM,
-    #[cfg(feature = "voip-runtime")]
-    crate::voip::SUBSYSTEM,
-];
-
-/// The state of every attached subsystem, in [`SUBSYSTEMS`] order. Empty, and
-/// allocation-free, in a build with none attached.
-pub(crate) struct Subsystems {
-    state: Box<[SubsystemState]>,
-}
-
-impl Default for Subsystems {
-    fn default() -> Self {
-        Self {
-            state: SUBSYSTEMS
-                .iter()
-                .map(|subsystem| (subsystem.state)())
-                .collect(),
+/// Generates the core's whole side of the seam from one list of subsystems:
+/// where their state lives, which of them a build can ask for, and the four
+/// points the core calls out from.
+///
+/// The generated functions carry `unused_variables` because a build with no
+/// subsystem attached expands every one of them to a body that reads none of
+/// its arguments.
+macro_rules! subsystems {
+    ($($(#[$attr:meta])* $field:ident: $subsystem:ty),* $(,)?) => {
+        /// The state of every subsystem attached to this build, each under its
+        /// own type. No fields, and nothing to construct, when none is.
+        #[derive(Default)]
+        pub(crate) struct Subsystems {
+            $($(#[$attr])* $field: <$subsystem as Subsystem>::State,)*
         }
-    }
+
+        /// Implemented only for a subsystem this build attached. That is what
+        /// makes [`Client::subsystem`] infallible: asking for a detached
+        /// subsystem's state is a compile error, not a `None` or a panic every
+        /// caller has to carry a story for.
+        pub(crate) trait Attached: Subsystem {
+            fn state(subsystems: &Subsystems) -> &Self::State;
+        }
+
+        $(
+            $(#[$attr])*
+            impl Attached for $subsystem {
+                fn state(subsystems: &Subsystems) -> &Self::State {
+                    &subsystems.$field
+                }
+            }
+        )*
+
+        /// What each attached subsystem claims, in list order.
+        pub(crate) const CLAIMS: &[&[NotificationType]] = &[
+            $($(#[$attr])* <$subsystem as Subsystem>::NOTIFICATIONS,)*
+        ];
+
+        /// Hands a notification to the subsystem that models its type. `false`
+        /// means no attached subsystem claims it, leaving the core's own
+        /// fallback in charge.
+        #[allow(unused_variables)]
+        pub(crate) async fn dispatch_notification(
+            client: &Arc<Client>,
+            notification_type: NotificationType,
+            node: &Arc<OwnedNodeRef>,
+        ) -> bool {
+            $(
+                $(#[$attr])*
+                if <$subsystem as Subsystem>::NOTIFICATIONS.contains(&notification_type) {
+                    #[cfg(test)]
+                    DISPATCHED.with(|dispatched| dispatched.set(dispatched.get() + 1));
+                    <$subsystem as Subsystem>::handle_notification(
+                        client,
+                        notification_type,
+                        Arc::clone(node),
+                    )
+                    .await;
+                    return true;
+                }
+            )*
+            false
+        }
+
+        /// Lets every attached subsystem release what one connection owned.
+        #[allow(unused_variables)]
+        pub(crate) async fn on_connection_cleanup(client: &Client) {
+            $(
+                $(#[$attr])*
+                <$subsystem as Subsystem>::on_connection_cleanup(client).await;
+            )*
+        }
+
+        /// Offers a response to every attached subsystem before its waiter is woken.
+        #[allow(unused_variables)]
+        pub(crate) fn on_response(client: &Client, node: &NodeRef<'_>) {
+            $(
+                $(#[$attr])*
+                <$subsystem as Subsystem>::on_response(client, node);
+            )*
+        }
+
+        /// Collects what the attached subsystems retain, for the memory report.
+        #[allow(unused_variables, unused_mut)]
+        pub(crate) fn memory(subsystems: &Subsystems) -> Vec<SubsystemMemory> {
+            let mut retained = Vec::new();
+            $(
+                $(#[$attr])*
+                retained.extend(
+                    <$subsystem as Subsystem>::memory(&subsystems.$field)
+                        .into_iter()
+                        .map(|(collection, stats)| SubsystemMemory {
+                            subsystem: <$subsystem as Subsystem>::NAME,
+                            collection,
+                            stats,
+                        }),
+                );
+            )*
+            retained
+        }
+    };
 }
 
-impl Subsystems {
-    /// The state parked by the subsystem that owns `T`, or `None` when it is
-    /// not attached to this build.
-    pub(crate) fn state<T: Any>(&self) -> Option<&T> {
-        self.state
-            .iter()
-            .find_map(|state| state.downcast_ref::<T>())
-    }
+subsystems! {
+    #[cfg(feature = "passkey")]
+    passkey: crate::passkey::Passkey,
+    #[cfg(feature = "voip-runtime")]
+    voip: crate::voip::Voip,
+}
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.state.len()
+/// Dispatch picks the first subsystem whose claim matches, so two of them
+/// claiming one notification type would make routing depend on list order and
+/// silently starve the loser. Checked here rather than in a test because the
+/// list is a `const`: there is no configuration where this is a runtime
+/// question.
+const _: () = assert!(
+    !claims_overlap(CLAIMS),
+    "two subsystems claim the same notification type"
+);
+
+/// Whether any two of `claims` name one notification type. `const` and hence
+/// written as index loops: iterators are not available here.
+const fn claims_overlap(claims: &[&[NotificationType]]) -> bool {
+    let mut left = 0;
+    while left < claims.len() {
+        let mut right = left + 1;
+        while right < claims.len() {
+            let mut this = 0;
+            while this < claims[left].len() {
+                let mut other = 0;
+                while other < claims[right].len() {
+                    if claims[left][this] as usize == claims[right][other] as usize {
+                        return true;
+                    }
+                    other += 1;
+                }
+                this += 1;
+            }
+            right += 1;
+        }
+        left += 1;
+    }
+    false
+}
+
+impl Client {
+    /// The state `S` parked during client assembly.
+    ///
+    /// Infallible by construction: [`Attached`] is implemented only for a
+    /// subsystem this build carries, so naming a detached one does not compile.
+    pub(crate) fn subsystem<S: Attached>(&self) -> &S::State {
+        S::state(&self.subsystems)
     }
 }
 
 // Counts stanzas handed to a subsystem, so a test can tell routing through the
-// table apart from a core arm that quietly took the stanza instead. Thread-local
+// seam apart from a core arm that quietly took the stanza instead. Thread-local
 // rather than process-wide: a sibling test dispatching the same type would
 // otherwise satisfy the assertion on its own, which is the failure it exists to
 // catch. A `///` here would be an unused doc comment, since rustdoc does not
@@ -109,91 +237,30 @@ thread_local! {
     pub(crate) static DISPATCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Hands a notification to the subsystem that models its type. `false` means no
-/// attached subsystem claims it, leaving the core's own fallback in charge.
-pub(crate) async fn dispatch_notification(
-    client: &Arc<Client>,
-    notification_type: NotificationType,
-    node: &Arc<OwnedNodeRef>,
-) -> bool {
-    for subsystem in SUBSYSTEMS {
-        if subsystem.notifications.contains(&notification_type) {
-            #[cfg(test)]
-            DISPATCHED.with(|dispatched| dispatched.set(dispatched.get() + 1));
-            (subsystem.handle_notification)(client, notification_type, Arc::clone(node)).await;
-            return true;
-        }
-    }
-    false
-}
-
-/// Lets every attached subsystem release what one connection owned.
-pub(crate) async fn on_connection_cleanup(client: &Client) {
-    for subsystem in SUBSYSTEMS {
-        if let Some(hook) = subsystem.on_connection_cleanup {
-            hook(client).await;
-        }
-    }
-}
-
-/// Offers a response to every attached subsystem before its waiter is woken.
-pub(crate) fn on_response(client: &Client, node: &NodeRef<'_>) {
-    for subsystem in SUBSYSTEMS {
-        if let Some(hook) = subsystem.on_response {
-            hook(client, node);
-        }
-    }
-}
-
-/// Collects what the attached subsystems retain, for the memory report.
-pub(crate) fn memory(client: &Client) -> RetainedCollections {
-    let mut collected = Vec::new();
-    for subsystem in SUBSYSTEMS {
-        if let Some(hook) = subsystem.memory {
-            collected.extend(hook(client));
-        }
-    }
-    collected
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct Absent;
-
+    /// The `const` assertion above only fires when two subsystems really do
+    /// collide, which no shipping configuration does. This proves the check
+    /// that guards them is not vacuously true.
     #[test]
-    fn detached_table_hands_out_no_state() {
-        let subsystems = Subsystems {
-            state: Box::new([]),
-        };
+    fn overlapping_claims_are_detected() {
+        const A: &[NotificationType] = &[NotificationType::Devices, NotificationType::Picture];
+        const B: &[NotificationType] = &[NotificationType::Picture];
+        const C: &[NotificationType] = &[NotificationType::Contacts];
 
         assert!(
-            subsystems.state::<Absent>().is_none(),
-            "a subsystem that is not attached must not resolve its state"
+            claims_overlap(&[A, B]),
+            "two lists sharing a type must be reported as overlapping"
         );
-    }
-
-    #[test]
-    fn every_attached_subsystem_gets_its_state_built() {
-        assert_eq!(
-            Subsystems::default().len(),
-            SUBSYSTEMS.len(),
-            "client assembly must build one state per attached subsystem"
+        assert!(
+            !claims_overlap(&[A, C]),
+            "disjoint lists must not be reported as overlapping"
         );
-    }
-
-    #[test]
-    fn no_two_subsystems_claim_the_same_notification_type() {
-        let mut claimed: Vec<NotificationType> = Vec::new();
-        for subsystem in SUBSYSTEMS {
-            for notification_type in subsystem.notifications {
-                assert!(
-                    !claimed.contains(notification_type),
-                    "{notification_type:?} is claimed by two subsystems; dispatch would pick by table order"
-                );
-                claimed.push(*notification_type);
-            }
-        }
+        assert!(
+            !claims_overlap(CLAIMS),
+            "the shipping list must stay free of overlap"
+        );
     }
 }

@@ -3,7 +3,7 @@
 //! `agent_docs/subsystem_boundary.md` classifies a subsystem as cuttable when
 //! the core neither holds its state nor runs its code inline, and gives the core
 //! a budget of two mentions for it: the `mod` declaration that brings the files
-//! in, and the entry in the attachment table that routes to them. The failure
+//! in, and the entry in the subsystem list that routes to them. The failure
 //! this guards is the cheap one: a third mention, added because a `Client` field
 //! or an inline branch was the shortest path, and nothing objected. That is how
 //! the subsystems the same document classifies as coupled got to 314 `cfg`
@@ -36,7 +36,7 @@ const CUTTABLE: &[Cuttable] = &[Cuttable {
     budget: &[
         // `pub mod passkey;` with its feature gate and its docs.rs attribute.
         ("src/lib.rs", 3),
-        // The attachment-table entry with its feature gate.
+        // The entry in the subsystem list, with its feature gate.
         ("src/client/subsystem.rs", 2),
     ],
 }];
@@ -95,7 +95,7 @@ fn the_core_does_not_name_a_cuttable_subsystem() {
             match budget {
                 None if !hits.is_empty() => violations.push(format!(
                     "{relative} names `{}` at {hits:?}; the core may name a cuttable subsystem \
-                     only in its `mod` declaration and its attachment-table entry",
+                     only in its `mod` declaration and its subsystem-list entry",
                     subsystem.name
                 )),
                 Some(allowed) if hits.len() > allowed => violations.push(format!(

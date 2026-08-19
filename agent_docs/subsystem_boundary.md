@@ -45,8 +45,8 @@ A subsystem is **cuttable** when all four tests pass.
 Verdicts:
 
 - **Cuttable.** All four pass. The core may name it in exactly two places: its
-  `mod` declaration and its entry in `SUBSYSTEMS` (`src/client/subsystem.rs`).
-  `tests/subsystem_boundary.rs` fails on a third.
+  `mod` declaration and its entry in the `subsystems!` list
+  (`src/client/subsystem.rs`). `tests/subsystem_boundary.rs` fails on a third.
 - **Coupled.** Fails 1 or 2. It can be *disciplined* (interleaved statements
   hoisted into files it owns, one call per seam) but not cut, because the seam
   it needs does not exist yet.
@@ -103,32 +103,54 @@ hot path and the core's own work. They fail tests 1 and 2 by construction.
 
 ## The seam
 
-`src/client/subsystem.rs` holds one `const` table:
+A subsystem implements one trait and the core names it once:
 
 ```rust
-pub(crate) const SUBSYSTEMS: &[Subsystem] = &[
+pub(crate) trait Subsystem: 'static {
+    type State: Default + MaybeSendSync;
+    const NAME: &'static str;
+    const NOTIFICATIONS: &'static [NotificationType] = &[];
+    // handle_notification, on_connection_cleanup, on_response, memory
+}
+
+subsystems! {
     #[cfg(feature = "passkey")]
-    crate::passkey::SUBSYSTEM,
-];
+    passkey: crate::passkey::Passkey,
+}
 ```
 
-`Client` gains one field, `subsystems`, not one per subsystem. A subsystem parks
-its per-client state there and lists the notification types it models. With none
-attached the table is a zero-length slice, so every loop over it folds away.
+`Client` gains one field, `subsystems`, not one per subsystem. The list
+generates a struct holding each attached subsystem's `State` under its real
+type, so with none attached the struct has no fields and every generated loop
+folds away.
 
-The table is a `const` rather than runtime registration because static
+The implementing type is the whole handle: its state, its claims and its hooks
+hang off one `impl`, so they cannot drift apart the way a record of function
+pointers lets them. Three things that were runtime questions are answered by the
+compiler instead:
+
+- **Reaching the state back.** `client.subsystem::<Voip>()` returns `&VoipState`
+  directly. There is no `Any`, no downcast and no `Option`: the generated
+  `Attached` trait is implemented only for a subsystem this build carries, so
+  naming a detached one does not compile. That replaced an `expect` on one side
+  and an unreachable `Err` arm on the other.
+- **Two subsystems claiming one notification type.** Dispatch takes the first
+  match, so a collision would make routing depend on list order. `CLAIMS` is a
+  `const`, so a `const` assertion rejects the build.
+- **A hook a subsystem does not fill.** It is a defaulted trait method, not a
+  `None` in a table, so it costs no branch rather than a checked one.
+
+The list is a macro rather than runtime registration because static
 registration through a linker-section crate would trade the core's last gate for
 a new dependency. The guard test is what keeps "one gate" enforceable instead.
 
-Besides state, a subsystem can fill three optional hooks: connection cleanup,
-a response about to reach its waiter, and the collections it retains for
-`Client::memory_report`. Each is a plain function pointer, so an unattached
-build folds the table away rather than paying for an empty vtable. A subsystem
-whose state is reached from many of its own call sites takes it with
-`expect`, which is infallible by construction: the table entry and the callers
-sit behind one gate.
+Besides state, a subsystem can fill three hooks: connection cleanup, a response
+about to reach its waiter, and the collections it retains for
+`Client::memory_report`. `memory` takes `&Self::State` rather than the client,
+so reporting cannot quietly become a second way for a subsystem to read the
+core.
 
-The core's own match arms win: the table is consulted only for a notification
+The core's own match arms win: the seam is consulted only for a notification
 type the core does not model itself, so a claim on a type the core later starts
 handling would silently stop arriving.
 `a_claimed_notification_type_is_not_shadowed_by_a_core_arm` fails when that happens.
@@ -145,16 +167,16 @@ into the delta:
 
 | build | main | branch | delta |
 | --- | ---: | ---: | ---: |
-| default | 10,806,752 | 10,757,216 | -48.4 KiB |
-| default + `voip` | 11,373,952 | 11,330,656 | -42.3 KiB |
+| default | 10,806,752 | 10,756,792 | -48.8 KiB |
+| default + `voip` | 11,373,952 | 11,319,160 | -53.5 KiB |
 
 And what a subsystem costs to turn on, each row against the default build beside
 it:
 
 | build | bin size | vs default |
 | --- | ---: | ---: |
-| default | 10,757,216 | |
-| default + `passkey` | 10,810,016 | +51.6 KiB |
+| default | 10,756,792 | |
+| default + `passkey` | 10,807,352 | +49.4 KiB |
 | default + `plugins`, host on and no plugin installed | 10,960,960 | +150.6 KiB |
 
 `passkey` has no before column: it used to be compiled in unconditionally, so
@@ -163,8 +185,21 @@ measured on the pre-batch tree, which this batch does not touch.
 
 Turning the smallest cuttable subsystem off is worth ~48 KiB. The `voip` row is
 the one to read twice: moving five `Client` fields and their construction and
-teardown branches onto the table made the VoIP build 42 KiB *smaller*, so the
-seam did not cost that subsystem anything to attach through. The `plugins` row
+teardown branches onto the seam made the VoIP build 53 KiB *smaller*, so
+attaching through it did not cost that subsystem anything.
+
+Of that `voip` figure, 11.2 KiB came from making the seam static rather than
+erased, measured on its own by building both designs back to back:
+
+| build | erased seam | typed seam | delta |
+| --- | ---: | ---: | ---: |
+| default | 10,757,208 | 10,756,792 | -0.4 KiB |
+| default + `voip` | 11,330,648 | 11,319,160 | -11.2 KiB |
+
+An `Arc<dyn Any>` per subsystem, the vtables behind it, the boxed futures the
+hook signatures forced and the scan that found the state again were all real
+bytes. Storing each state under its own type spends none of them, which is why
+the type-safe version is also the smaller one. The `plugins` row
 is the enabled-with-no-plugin number `plugin_architecture.md`'s checklist asks
 for and that nothing in the repo had produced.
 

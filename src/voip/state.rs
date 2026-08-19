@@ -1,36 +1,70 @@
 //! What the VoIP runtime parks on the core, and the hooks it fills.
 //!
 //! Every one of these used to be a `Client` field: five of them, each with its
-//! own `cfg`, plus the branches that built and tore them down. The core now
-//! holds one attachment table (`src/client/subsystem.rs`) and this is VoIP's
-//! entry in it, which is why nothing outside `src/voip/`, `src/client/voip.rs`
-//! and `src/handlers/call.rs` names VoIP any more.
+//! own `cfg`, plus the branches that built and tore them down. They are now one
+//! `Subsystem` impl (`src/client/subsystem.rs`), which is why nothing outside
+//! `src/voip/`, `src/client/voip.rs` and `src/handlers/call.rs` names VoIP any
+//! more.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_lock::Mutex;
-use wacore::runtime::BoxFuture;
 use wacore::stats::CollectionStats;
 use wacore_binary::NodeRef;
 
 use crate::client::Client;
-use crate::client::subsystem::{RetainedCollections, Subsystem, SubsystemState};
+use crate::client::subsystem::Subsystem;
 
 /// How many lanes stripe [`VoipState::answer_transition_locks`].
 const ANSWER_TRANSITION_LANES: usize = 16;
 
-/// VoIP's entry in the core's attachment table. It claims no notification type:
-/// calls arrive as `<call>` stanzas, which the stanza router already dispatches
-/// to `CallHandler`.
-pub(crate) const SUBSYSTEM: Subsystem = Subsystem {
-    state: new_state,
-    notifications: &[],
-    handle_notification: never_dispatched,
-    on_connection_cleanup: Some(on_connection_cleanup),
-    on_response: Some(on_response),
-    memory: Some(memory),
-};
+/// VoIP's attachment to the core. It claims no notification type: calls arrive
+/// as `<call>` stanzas, which the stanza router already dispatches to
+/// `CallHandler`, so the two hooks below are all it takes from the core.
+pub(crate) struct Voip;
+
+impl Subsystem for Voip {
+    type State = VoipState;
+
+    const NAME: &'static str = "voip";
+
+    /// The relay socket and signaling are connection-scoped, so no call
+    /// survives a disconnect or reconnect.
+    async fn on_connection_cleanup(client: &Client) {
+        client.voip_state().call_registry.abort_all();
+        // Dormant outgoing calls (the relay never arrived) live in pending_outgoing_calls, not the
+        // registry, so abort_all misses them. Drain them and notify `ended` so any waiter wakes.
+        super::facade::drain_pending_outgoing_on_disconnect(client);
+    }
+
+    fn on_response(client: &Client, node: &NodeRef<'_>) {
+        client.bind_pending_call_link_join_ack(node);
+    }
+
+    fn memory(state: &VoipState) -> Vec<(&'static str, CollectionStats)> {
+        let pending_link_updates = state
+            .pending_call_link_joins
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .memory_stats();
+        let pending_outgoing = state
+            .pending_outgoing_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len() as u64;
+        vec![
+            ("pending_link_updates", pending_link_updates),
+            ("active_calls", state.call_registry.memory_stats()),
+            // Entry count only: each parked call retains engine material this
+            // side cannot size without walking it.
+            (
+                "pending_outgoing",
+                CollectionStats::new(pending_outgoing, 0),
+            ),
+        ]
+    }
+}
 
 /// Everything one client retains for VoIP.
 pub(crate) struct VoipState {
@@ -66,67 +100,10 @@ impl Default for VoipState {
     }
 }
 
-fn new_state() -> SubsystemState {
-    Arc::new(VoipState::default())
-}
-
-/// Unreachable: `notifications` is empty, so the core never routes one here.
-fn never_dispatched<'a>(
-    _client: &'a Arc<Client>,
-    _notification_type: wacore::stanza::wire_tags::NotificationType,
-    _node: Arc<wacore_binary::OwnedNodeRef>,
-) -> BoxFuture<'a, ()> {
-    Box::pin(async {})
-}
-
-/// The relay socket and signaling are connection-scoped, so no call survives a
-/// disconnect or reconnect.
-fn on_connection_cleanup(client: &Client) -> BoxFuture<'_, ()> {
-    Box::pin(async move {
-        client.voip_state().call_registry.abort_all();
-        // Dormant outgoing calls (the relay never arrived) live in pending_outgoing_calls, not the
-        // registry, so abort_all misses them. Drain them and notify `ended` so any waiter wakes.
-        super::facade::drain_pending_outgoing_on_disconnect(client);
-    })
-}
-
-fn on_response(client: &Client, node: &NodeRef<'_>) {
-    client.bind_pending_call_link_join_ack(node);
-}
-
-fn memory(client: &Client) -> RetainedCollections {
-    let voip = client.voip_state();
-    let pending_link_updates = voip
-        .pending_call_link_joins
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .memory_stats();
-    let pending_outgoing = voip
-        .pending_outgoing_calls
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .len() as u64;
-    vec![
-        ("voip pending_link_updates:", pending_link_updates),
-        ("voip active_calls:", voip.call_registry.memory_stats()),
-        // Entry count only: each parked call retains engine material this side
-        // cannot size without walking it.
-        (
-            "voip pending_outgoing:",
-            CollectionStats::new(pending_outgoing, 0),
-        ),
-    ]
-}
-
 impl Client {
-    /// The VoIP state parked during client assembly.
-    ///
-    /// Infallible by construction: the table entry above and every caller of
-    /// this are behind the same `voip-runtime` gate, so a build that can reach
-    /// it always attached it.
+    /// The VoIP state parked during client assembly. Named `voip_state` because
+    /// `Client::voip()` is already the public facade accessor.
     pub(crate) fn voip_state(&self) -> &VoipState {
-        self.subsystems
-            .state::<VoipState>()
-            .expect("the voip subsystem is attached whenever this code compiles")
+        self.subsystem::<Voip>()
     }
 }

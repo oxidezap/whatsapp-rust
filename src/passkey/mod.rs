@@ -33,28 +33,13 @@
 
 pub mod flow;
 
-use crate::client::subsystem::Subsystem;
+pub(crate) use flow::Passkey;
+
 use async_trait::async_trait;
 use base64::prelude::*;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use wacore::stanza::wire_tags::NotificationType;
-
-/// This subsystem's entry in the core's attachment table
-/// (`src/client/subsystem.rs`). Listing a notification type here is what routes
-/// it; the core holds no passkey state and runs no passkey branch.
-pub(crate) const SUBSYSTEM: Subsystem = Subsystem {
-    state: flow::new_state,
-    notifications: &[
-        NotificationType::PasskeyPrologueRequest,
-        NotificationType::CrscContinuation,
-    ],
-    handle_notification: flow::handle_notification,
-    on_connection_cleanup: None,
-    on_response: None,
-    memory: None,
-};
 
 /// WebAuthn user-verification requirement from the server's request options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

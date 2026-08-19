@@ -26,7 +26,7 @@ mod state;
 pub mod transport;
 pub mod video;
 
-pub(crate) use state::SUBSYSTEM;
+pub(crate) use state::Voip;
 
 pub use audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
 pub use facade::{

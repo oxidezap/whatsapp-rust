@@ -517,11 +517,11 @@ pub struct MemoryReport {
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
-    /// What the optional subsystems attached to this build retain, each named as
-    /// the report prints it. Empty when none is attached. One field rather than
-    /// a `cfg`'d field per subsystem, so the report has one shape whatever was
-    /// compiled; see `agent_docs/subsystem_boundary.md`.
-    pub subsystems: Vec<(&'static str, CollectionStats)>,
+    /// What the optional subsystems attached to this build retain. Empty when
+    /// none is attached. One field rather than a `cfg`'d field per subsystem,
+    /// so the report has one shape whatever was compiled; see
+    /// `agent_docs/subsystem_boundary.md`.
+    pub subsystems: Vec<SubsystemMemory>,
     #[cfg(feature = "plugins")]
     pub plugins: u64,
     #[cfg(feature = "plugins")]
@@ -552,6 +552,21 @@ pub struct MemoryReport {
     pub stanza_interceptors: usize,
 }
 
+/// One collection an attached subsystem retains, as `MemoryReport` carries it.
+///
+/// The subsystem and the collection stay separate fields rather than one fused
+/// display string, so a caller looks a figure up by what it is instead of by
+/// how the report happens to print it.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct SubsystemMemory {
+    /// The subsystem that reported it, e.g. `"voip"`.
+    pub subsystem: &'static str,
+    /// The collection within that subsystem, e.g. `"active_calls"`.
+    pub collection: &'static str,
+    pub stats: CollectionStats,
+}
+
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
@@ -573,23 +588,21 @@ impl MemoryReport {
         ]
     }
 
-    /// The retained collection an attached subsystem reports under `name`, as
-    /// [`Display`](std::fmt::Display) prints it. `None` when that subsystem is
-    /// not attached to this build.
-    pub fn subsystem(&self, name: &str) -> Option<CollectionStats> {
+    /// One collection of one attached subsystem. `None` when that subsystem is
+    /// not attached to this build, or does not report that collection.
+    pub fn subsystem(&self, subsystem: &str, collection: &str) -> Option<CollectionStats> {
         self.subsystems
             .iter()
-            .find(|(reported, _)| *reported == name)
-            .map(|(_, stats)| *stats)
+            .find(|retained| retained.subsystem == subsystem && retained.collection == collection)
+            .map(|retained| retained.stats)
     }
 
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
-        let total = self
-            .subsystems
-            .iter()
-            .fold(total, |sum, (_, stats)| sum.saturating_add(stats.bytes));
+        let total = self.subsystems.iter().fold(total, |sum, retained| {
+            sum.saturating_add(retained.stats.bytes)
+        });
         #[cfg(feature = "plugins")]
         let total = total.saturating_add(self.plugin_event_queue.bytes);
         total
@@ -689,8 +702,9 @@ impl std::fmt::Display for MemoryReport {
         }
         if !self.subsystems.is_empty() {
             writeln!(f, "--- Optional subsystems ---")?;
-            for (name, stats) in &self.subsystems {
-                line(f, name, stats)?;
+            for retained in &self.subsystems {
+                let name = format!("{} {}:", retained.subsystem, retained.collection);
+                line(f, &name, &retained.stats)?;
             }
         }
         writeln!(f, "--- In-flight history sync ---")?;
@@ -1546,9 +1560,9 @@ pub struct Client {
     pub(crate) pair_code_state: Arc<Mutex<wacore::pair_code::PairCodeState>>,
 
     /// Per-client state of every optional subsystem attached to this build,
-    /// in one field rather than one field per subsystem. The core does not
-    /// know what is in it, and in a build with none attached nothing reads it;
-    /// see `agent_docs/subsystem_boundary.md`.
+    /// each under its own type, in one field rather than one field per
+    /// subsystem. Empty, and zero-sized, in a build with none attached; see
+    /// `agent_docs/subsystem_boundary.md`.
     #[allow(dead_code)]
     pub(crate) subsystems: subsystem::Subsystems,
 

@@ -412,7 +412,7 @@ fn every_growable_client_field_reaches_the_memory_report() {
     );
 }
 
-/// Per-client state a subsystem parks on the attachment table, with the file
+/// Per-client state a subsystem parks on the core, with the file
 /// whose `memory` hook has to account for it.
 ///
 /// The `Client` walk above cannot see these: the table stores state as
@@ -475,8 +475,8 @@ fn every_growable_subsystem_field_reaches_the_memory_report() {
     assert!(
         missing.is_empty(),
         "these subsystem fields can grow but their `memory` hook never walks them:\n{}\n\n\
-         The `Client` scan cannot reach them through the attachment table's type \
-         erasure, so this list is the only thing that would notice.",
+         The `Client` scan stops one level in, at `Subsystems` itself, so this \
+         list is the only thing that would notice.",
         missing.join("\n"),
     );
 }

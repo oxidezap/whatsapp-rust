@@ -154,7 +154,7 @@ mod tests {
             .adv_secret_key
     }
 
-    /// The failure path of the attachment table: a type the core does not
+    /// The failure path of the seam: a type the core does not
     /// model and no attached subsystem claims reaches the consumer whole
     /// instead of being dropped. That is what an operation belonging to a
     /// subsystem this build left out looks like from outside.
@@ -184,7 +184,7 @@ mod tests {
         );
     }
 
-    /// A type a subsystem claims must not be shadowed by a core arm. The table
+    /// A type a subsystem claims must not be shadowed by a core arm. The seam
     /// is consulted only in the fallthrough, so an arm added here later would
     /// take the stanza and the subsystem would silently stop seeing it. The
     /// counter is what separates the two: suppressing the raw event alone
@@ -194,12 +194,12 @@ mod tests {
     /// the all-features job is where it has teeth.
     #[tokio::test]
     async fn a_claimed_notification_type_is_not_shadowed_by_a_core_arm() {
-        use crate::client::subsystem::{DISPATCHED, SUBSYSTEMS};
+        use crate::client::subsystem::{CLAIMS, DISPATCHED};
 
         let client = create_test_client().await;
 
-        for subsystem in SUBSYSTEMS {
-            for notification_type in subsystem.notifications {
+        for claimed in CLAIMS {
+            for notification_type in *claimed {
                 let before = DISPATCHED.with(|dispatched| dispatched.get());
                 let notif = NodeBuilder::new("notification")
                     .attr("type", notification_type.as_str())
@@ -210,7 +210,7 @@ mod tests {
 
                 assert!(
                     DISPATCHED.with(|dispatched| dispatched.get()) > before,
-                    "{notification_type:?} never reached the attachment table, so a core arm took it"
+                    "{notification_type:?} never reached its subsystem, so a core arm took it"
                 );
             }
         }
