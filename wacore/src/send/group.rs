@@ -37,6 +37,9 @@ pub struct PreparedGroupStanza {
     /// so msmsg bot replies referencing this msg_id hit the same row that
     /// `<meta target_sender_jid>` echoes back at lookup time.
     pub sender_identity: Jid,
+    /// The phash on the stanza, so the caller can compare it against the one the
+    /// server echoes on the ack without re-reading the built node.
+    pub phash: Option<CompactString>,
 }
 
 /// A required sender-key distribution that could not reach every target.
@@ -578,8 +581,8 @@ pub async fn prepare_group_stanza(
     }
 
     // Groups carry a phash on every send, distribution or not (see above).
-    if let Some(phash) = phash_for_stanza {
-        stanza_builder = stanza_builder.attr("phash", phash);
+    if let Some(phash) = phash_for_stanza.as_ref() {
+        stanza_builder = stanza_builder.attr("phash", phash.as_str());
     }
 
     // Add any extra stanza nodes provided by the caller
@@ -604,6 +607,7 @@ pub async fn prepare_group_stanza(
         stale_device_users: stale_users,
         message_secret: reporting_result.map(|r| r.message_secret),
         sender_identity: own_sending_jid,
+        phash: phash_for_stanza,
     })
 }
 

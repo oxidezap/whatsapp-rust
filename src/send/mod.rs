@@ -216,7 +216,10 @@ struct SendBranchOutput {
     /// cold send re-resolves against the winner's warm marking.
     distribution_guard: Option<async_lock::MutexGuardArc<()>>,
     issue_tc_token_after_send: bool,
-    dm_phash: Option<wacore_binary::CompactString>,
+    /// The phash this stanza carries, when it carries one. The server echoes
+    /// its own on the ack and a disagreement is the only signal a send gets
+    /// that its participant device set is stale.
+    ack_phash: Option<wacore_binary::CompactString>,
 }
 
 struct GroupBranchRequest<'a> {
@@ -314,7 +317,7 @@ impl SendBranchOutput {
             skdm_update: None,
             distribution_guard: None,
             issue_tc_token_after_send: false,
-            dm_phash: None,
+            ack_phash: None,
         }
     }
 }
@@ -1874,7 +1877,7 @@ impl Client {
             skdm_update,
             distribution_guard,
             issue_tc_token_after_send: should_issue_tc_token_after_send,
-            dm_phash,
+            ack_phash,
         } = if peer && !to.is_group() {
             box_send_branch(self.send_peer_branch(to, message, request_id)).await?
         } else if to.is_group() {
@@ -1928,7 +1931,7 @@ impl Client {
             Some(request_id),
             "branch stanza must carry the id this send was named with"
         );
-        let ack_message_id = if !borrowed_message_id && let Some(phash) = dm_phash {
+        let ack_message_id = if !borrowed_message_id && let Some(phash) = ack_phash {
             // Group sends also invalidate group cache on mismatch: the server's
             // participant set diverged, so the next send needs a fresh query.
             let invalidate_group = tc_issue_target.is_group();
@@ -2060,10 +2063,16 @@ impl Client {
             device_freshness,
             borrowed_message_id,
         } = request;
-        // Every arm of the prepare match below assigns these three.
+        // Every arm of the prepare match below assigns these four.
         let outbound_msg_secret: Option<[u8; 32]>;
         let outbound_group_sender_identity: Option<Jid>;
         let skdm_update: Option<SkdmUpdate>;
+        // A group stanza carries a phash on every send, and the server answers
+        // with its own. `WAWebSendGroupSkmsgJob` compares them and, on a
+        // mismatch, re-queries the group and resends to the devices it missed;
+        // this is the only signal a bot gets that its participant device set is
+        // stale without a member sending something first.
+        let group_ack_phash: Option<wacore_binary::CompactString>;
         let mut distribution_guard: Option<async_lock::MutexGuardArc<()>> = None;
         let node = {
             // No send-level lock: encrypt_group_message serializes the
@@ -2323,6 +2332,7 @@ impl Client {
                     });
                     outbound_msg_secret = prepared.message_secret;
                     outbound_group_sender_identity = Some(prepared.sender_identity);
+                    group_ack_phash = prepared.phash;
                     prepared.node
                 }
                 Err(e) => {
@@ -2403,6 +2413,7 @@ impl Client {
                         });
                         outbound_msg_secret = retry_prepared.message_secret;
                         outbound_group_sender_identity = Some(retry_prepared.sender_identity);
+                        group_ack_phash = retry_prepared.phash;
                         retry_prepared.node
                     } else {
                         return Err(e);
@@ -2417,7 +2428,7 @@ impl Client {
             skdm_update,
             distribution_guard,
             issue_tc_token_after_send: false,
-            dm_phash: None,
+            ack_phash: group_ack_phash,
         })
     }
 
@@ -2573,7 +2584,7 @@ impl Client {
             skdm_update: None,
             distribution_guard: None,
             issue_tc_token_after_send: should_issue_tc_token_after_send,
-            dm_phash: prepared.phash,
+            ack_phash: prepared.phash,
         })
     }
 
