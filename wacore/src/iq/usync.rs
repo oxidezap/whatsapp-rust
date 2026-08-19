@@ -715,7 +715,7 @@ pub(crate) fn project_device_list_response(
             .key_index
             .and_then(|key_index| key_index.signed_key_index_bytes)
             .filter(|bytes| !bytes.is_empty());
-        let parsed_devices = device_list
+        let mut parsed_devices = device_list
             .devices
             .into_iter()
             .map(|device| {
@@ -724,19 +724,38 @@ pub(crate) fn project_device_list_response(
             })
             .collect::<Vec<_>>();
 
+        // Companions we cannot validate are dropped; the identity is not. WA
+        // Web's `handleOmittedResult` collapses such a record to the primary
+        // (`devices = [{id: DEFAULT_DEVICE_ID, keyIndex: 0}]`) and its fan-out
+        // falls back to the bare user for any wid it has no list for. Losing
+        // the primary here takes the user out of every group send's sender-key
+        // targets and out of the phash, where nothing downstream can see it.
+        let mut phash = device_list.hash.map(|hash| hash.to_string());
         let has_companion = parsed_devices.iter().any(|device| device.device != 0);
         if has_companion && key_index_bytes.is_none() {
+            parsed_devices.retain(|device| device.device == 0);
+            if parsed_devices.is_empty() {
+                warn!(
+                    target: "usync",
+                    "User {user_jid} has no signedKeyIndexBytes and no primary device, skipping"
+                );
+                continue;
+            }
             warn!(
                 target: "usync",
-                "User {user_jid} has companion devices but no signedKeyIndexBytes, skipping"
+                "User {user_jid} has companion devices but no signedKeyIndexBytes; keeping only the primary"
             );
-            continue;
+            // The server's hash covers the devices it sent, not the ones kept.
+            // Storing it would make the next query claim this truncated list is
+            // current and let the server omit the user, stranding the dropped
+            // companions.
+            phash = None;
         }
 
         device_lists.push(UserDeviceList {
             user: user_jid,
             devices: parsed_devices,
-            phash: device_list.hash.map(|hash| hash.to_string()),
+            phash,
             key_index_bytes,
         });
     }
