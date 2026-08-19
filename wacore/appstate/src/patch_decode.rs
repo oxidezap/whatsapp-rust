@@ -26,6 +26,21 @@ impl WAPatchName {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Rank in the order batched syncs reserve collections in, which is also the
+    /// order the collections reach the wire. The ranks reproduce [`Self::as_str`]
+    /// order, and the match is exhaustive so a new variant has to be given a
+    /// rank rather than silently landing anywhere.
+    pub const fn reservation_rank(self) -> u8 {
+        match self {
+            Self::CriticalBlock => 0,
+            Self::CriticalUnblockLow => 1,
+            Self::Regular => 2,
+            Self::RegularHigh => 3,
+            Self::RegularLow => 4,
+            Self::Unknown => 5,
+        }
+    }
 }
 
 impl FromStr for WAPatchName {
@@ -213,6 +228,80 @@ mod tests {
     use super::*;
     use buffa::Message;
     use wacore_binary::builder::NodeBuilder;
+
+    /// Every collection, in an order no caller uses, so the ranks and not the
+    /// input decide the result.
+    const SHUFFLED: [WAPatchName; 6] = [
+        WAPatchName::RegularLow,
+        WAPatchName::Unknown,
+        WAPatchName::Regular,
+        WAPatchName::CriticalBlock,
+        WAPatchName::RegularHigh,
+        WAPatchName::CriticalUnblockLow,
+    ];
+
+    /// The reservation order used to be "sorted by `as_str`", and the batched
+    /// sync puts the collections on the wire in it, so it is pinned rather than
+    /// left to whatever the ranks happen to say.
+    #[test]
+    fn reservation_rank_reproduces_as_str_order() {
+        let mut ordered = SHUFFLED;
+        ordered.sort_unstable_by_key(|name| name.reservation_rank());
+        let names: Vec<&str> = ordered.iter().map(|name| name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            [
+                "critical_block",
+                "critical_unblock_low",
+                "regular",
+                "regular_high",
+                "regular_low",
+                "unknown",
+            ]
+        );
+
+        let mut by_name: Vec<&str> = SHUFFLED.iter().map(|name| name.as_str()).collect();
+        by_name.sort_unstable();
+        assert_eq!(names, by_name, "the ranks are the `as_str` order");
+    }
+
+    /// Exhaustive on purpose: a seventh collection stops this compiling, which
+    /// is what puts whoever adds it in front of the pinned order above. The
+    /// rank itself cannot be forgotten, because `reservation_rank` is a match
+    /// over the enum.
+    #[test]
+    fn the_pinned_order_covers_every_collection() {
+        for name in SHUFFLED {
+            match name {
+                WAPatchName::CriticalBlock
+                | WAPatchName::CriticalUnblockLow
+                | WAPatchName::Regular
+                | WAPatchName::RegularHigh
+                | WAPatchName::RegularLow
+                | WAPatchName::Unknown => {}
+            }
+        }
+    }
+
+    /// Two collections sharing a rank would leave their relative order up to the
+    /// caller, which is the cycle the shared order exists to rule out.
+    #[test]
+    fn every_collection_has_its_own_rank() {
+        let mut ranks: Vec<u8> = SHUFFLED
+            .iter()
+            .map(|name| name.reservation_rank())
+            .collect();
+        ranks.sort_unstable();
+        ranks.dedup();
+
+        assert_eq!(ranks.len(), SHUFFLED.len(), "ranks collide");
+        assert_eq!(
+            ranks.last().copied(),
+            Some(SHUFFLED.len() as u8 - 1),
+            "the ranks are contiguous from zero, so a new one is visibly appended"
+        );
+    }
 
     /// Length-delimited field 1 announcing 5 bytes but carrying 1, so every
     /// protobuf decoder in the tests below fails deterministically.

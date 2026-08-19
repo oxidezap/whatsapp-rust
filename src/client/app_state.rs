@@ -1810,7 +1810,7 @@ impl Client {
         // collection under both `synced` and `skipped`, making `all_synced()`
         // false and publishing a failure that blames a writer who never existed.
         let mut seen = HashSet::with_capacity(collections.len());
-        let mut collections: Vec<WAPatchName> = collections
+        let collections: Vec<WAPatchName> = collections
             .into_iter()
             .filter(|name| seen.insert(*name))
             .collect();
@@ -1821,9 +1821,20 @@ impl Client {
         // opposite orders would otherwise each hold the other's next collection
         // and make no progress until both waits time out, minutes later, for
         // work neither was slow at. A single order over a shared set is what
-        // makes that cycle unconstructible. The name is the only ordering both
-        // callers can agree on without coordinating.
-        collections.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        // makes that cycle unconstructible, and `reservation_rank` is where that
+        // order lives, as a property of the collection rather than a list a new
+        // variant can be left out of. Placed one by one rather than sorted,
+        // because the set is at most six elements and a generic sort over them
+        // monomorphizes to kilobytes of code.
+        let mut ordered: Vec<WAPatchName> = Vec::with_capacity(collections.len());
+        for name in collections {
+            let at = ordered
+                .iter()
+                .position(|placed| placed.reservation_rank() > name.reservation_rank())
+                .unwrap_or(ordered.len());
+            ordered.insert(at, name);
+        }
+        let collections = ordered;
 
         // The bootstrap cannot skip: it has to know the collection is synced
         // before it dispatches Connected, and an equivalent sync in flight only
@@ -4297,6 +4308,139 @@ mod retry_gate_tests {
             APP_STATE_RETRY_BACKOFF_MAX,
             "an absurd round must clamp, not overflow"
         );
+    }
+}
+
+#[cfg(test)]
+mod collection_order_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::batch_result;
+
+    /// The order the batch reserves in is the order the `<collection>` children
+    /// go out in, so it is pinned on the wire rather than on the vector: a
+    /// change here is a change the server sees.
+    #[tokio::test]
+    async fn a_shuffled_batch_reaches_the_wire_in_reservation_order() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let scope = client.sync_scope(None);
+                client
+                    .sync_collections_batched(
+                        vec![
+                            WAPatchName::RegularLow,
+                            WAPatchName::Regular,
+                            WAPatchName::CriticalUnblockLow,
+                            WAPatchName::RegularHigh,
+                            WAPatchName::CriticalBlock,
+                        ],
+                        scope,
+                    )
+                    .await
+            })
+        };
+
+        let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request = request.get().to_owned();
+        let sync_node = request
+            .get_optional_child("sync")
+            .expect("the batch is a `<sync>` IQ");
+        let asked: Vec<String> = sync_node
+            .get_children_by_tag("collection")
+            .map(|collection| {
+                collection
+                    .attrs()
+                    .optional_string("name")
+                    .expect("every `<collection>` is named")
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(
+            asked,
+            [
+                "critical_block",
+                "critical_unblock_low",
+                "regular",
+                "regular_high",
+                "regular_low",
+            ]
+        );
+
+        let id = request
+            .attrs()
+            .optional_string("id")
+            .expect("every IQ carries an id")
+            .into_owned();
+        let response = batch_result(
+            &id,
+            &[
+                ("critical_block", None),
+                ("critical_unblock_low", None),
+                ("regular", None),
+                ("regular_high", None),
+                ("regular_low", None),
+            ],
+        );
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let outcome = sync
+            .await
+            .expect("the sync task should not panic")
+            .expect("a clean batch is not a transport failure");
+
+        assert_eq!(
+            outcome.synced,
+            vec![
+                WAPatchName::CriticalBlock,
+                WAPatchName::CriticalUnblockLow,
+                WAPatchName::Regular,
+                WAPatchName::RegularHigh,
+                WAPatchName::RegularLow,
+            ]
+        );
+    }
+
+    /// The dedup runs before the ordering, so a repeated collection must not
+    /// reach the wire twice or push the rest out of order.
+    #[tokio::test]
+    async fn a_repeated_collection_is_asked_for_once_and_still_in_order() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let scope = client.sync_scope(None);
+                client
+                    .sync_collections_batched(
+                        vec![
+                            WAPatchName::Regular,
+                            WAPatchName::CriticalBlock,
+                            WAPatchName::Regular,
+                        ],
+                        scope,
+                    )
+                    .await
+            })
+        };
+
+        let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request = request.get().to_owned();
+        let asked: Vec<String> = request
+            .get_optional_child("sync")
+            .expect("the batch is a `<sync>` IQ")
+            .get_children_by_tag("collection")
+            .map(|collection| {
+                collection
+                    .attrs()
+                    .optional_string("name")
+                    .expect("every `<collection>` is named")
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(asked, ["critical_block", "regular"]);
+
+        sync.abort();
     }
 }
 
