@@ -184,6 +184,43 @@ mod tests {
         );
     }
 
+    /// A type a subsystem claims must not be shadowed by a core arm. The table
+    /// is consulted only in the fallthrough, so an arm added here later would
+    /// take the stanza and the subsystem would silently stop seeing it. `from`
+    /// is not the server, which the handlers reject, so this observes routing
+    /// without running the subsystem's work. Vacuous when no subsystem is
+    /// attached, so the all-features job is where it has teeth.
+    #[tokio::test]
+    async fn a_claimed_notification_type_is_not_shadowed_by_a_core_arm() {
+        use crate::client::subsystem::SUBSYSTEMS;
+        use crate::types::events::EventHandler;
+
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+
+        for subsystem in SUBSYSTEMS {
+            for notification_type in subsystem.notifications {
+                let notif = NodeBuilder::new("notification")
+                    .attr("type", notification_type.as_str())
+                    .attr("from", "15550001111@s.whatsapp.net")
+                    .attr("id", "claimed-1")
+                    .build();
+                handle_notification_impl(&client, node_to_arc(notif)).await;
+            }
+        }
+
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::Notification(_))),
+            "a claimed notification type reached the raw fallthrough, so the table never saw it"
+        );
+    }
+
     #[tokio::test]
     async fn companion_reg_refresh_rotates_the_adv_secret() {
         let client = create_test_client().await;

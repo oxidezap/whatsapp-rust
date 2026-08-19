@@ -946,6 +946,9 @@ mod identity_span_tests {
             Some(pn.observe().to_string().as_str()),
             "pn field must render through the redacting wrapper, not raw"
         );
+        // `tracing-pii` exists to render the number raw, so this is the one
+        // claim it invalidates; same split as `observe_redacts_phone_but_not_lid_or_group`.
+        #[cfg(not(feature = "tracing-pii"))]
         assert!(
             !recorded(&captured, "pn")
                 .expect("pn recorded")

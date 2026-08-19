@@ -177,40 +177,28 @@ jobs:
         run: cargo build --workspace --exclude e2e-tests --all-features --all-targets --verbose
       - name: Clippy (all features)
         run: cargo clippy --workspace --exclude e2e-tests --all-features --all-targets -- -D warnings
-      # No `cargo test --all-features`: it enables the `danger-skip-*-verify` flags, which disable
-      # security verification (the cert-chain negative test is even cfg'd out), so the suite would
-      # change behavior rather than catch rot; build + clippy cover that. The voip suite runs under
-      # the explicit `voip` feature set instead, never `--all-features`.
-      - name: Test (voip)
+      # There is no `cargo test --all-features` because a few features cannot
+      # share a build with the rest. `scripts/ci/test_features.sh` derives the
+      # set that can from cargo metadata and carries the exclusions with their
+      # reasons, so a feature added tomorrow is tested without editing CI.
+      - name: Test (every shareable feature)
         run: |
-          cargo nextest run --profile ci -p wacore --features voip --lib
-          cargo nextest run --profile ci -p whatsapp-rust --features "voip tokio-native tokio-transport" --lib
-      # `voip` does NOT imply `voip-mlow`, and wacore has no default features, so `voip::mlow` is
-      # compiled away in every job above -- the codec's 87 tests, both golden checksums and every
-      # C/Go ground-truth vector among them, ran nowhere in CI before this step. It is the shipping
-      # configuration, so it comes first.
-      - name: Test (voip-mlow)
-        run: cargo nextest run --profile ci -p wacore --features voip-mlow --lib -E 'test(voip::mlow)'
-      # The same suite through the opt-in split-FFT dispatch. This covers which implementation the
-      # feature selects and the second golden pair pinned for it -- not interoperability: no CI job
-      # here decodes with a real WhatsApp client, so a bitstream passing this step is well-formed by
-      # our own decoder and nothing more. The FFTs themselves are compared against each other and
-      # against an exact f64 DFT by the differential tests in `smpl_perc.rs`, which run in both
-      # configurations; this step is what keeps the feature-selected path from rotting.
+          for package in wacore wacore-libsignal whatsapp-rust; do
+            features="$(./scripts/ci/test_features.sh "$package")"
+            echo "::group::$package [$features]"
+            cargo nextest run --profile ci -p "$package" --features "$features" --lib --tests
+            echo "::endgroup::"
+          done
+      # The one exclusion that still needs running: `mlow-fast-fft` selects a
+      # different FFT, so the golden checksums under it are a second, separately
+      # pinned pair. That covers which implementation the feature selects, not
+      # interoperability -- no job here decodes with a real WhatsApp client, so a
+      # bitstream passing this is well-formed by our own decoder and nothing
+      # more. The FFTs are compared against each other and against an exact f64
+      # DFT by the differential tests in `smpl_perc.rs`, which run in both
+      # configurations.
       - name: Test (mlow-fast-fft)
         run: cargo nextest run --profile ci -p wacore --features voip-mlow,mlow-fast-fft --lib -E 'test(voip::mlow)'
-      # legacy-session-interop is off by default, so every other test job
-      # compiles its module away and never runs a single one of its tests.
-      - name: Test (legacy-session-interop)
-        run: cargo nextest run --profile ci -p wacore-libsignal --features legacy-session-interop
-      # `tracing` is off by default, so span-scope assertions compile to nothing
-      # everywhere else. They are the only gate on which work a span owns.
-      - name: Test (tracing)
-        run: cargo nextest run --profile ci -p whatsapp-rust --features tracing --test handshake_span_scope
-      # `passkey` is off by default, so the linking flow's tests compile away in
-      # every other job.
-      - name: Test (passkey)
-        run: cargo nextest run --profile ci -p whatsapp-rust --features passkey --lib
 
   rustdoc:
     name: Rustdoc
