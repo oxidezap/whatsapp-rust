@@ -74,21 +74,21 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
             handle_newsletter_notification(client, Arc::clone(&node))
         }
         Some(NotificationType::Mex) => handle_mex_notification(client, nr),
-        Some(NotificationType::PasskeyPrologueRequest) => {
-            crate::passkey::flow::handle_passkey_notification(client, Arc::clone(&node)).await;
-        }
-        Some(NotificationType::CrscContinuation) => {
-            crate::passkey::flow::handle_passkey_continuation(client, Arc::clone(&node)).await;
-        }
         Some(NotificationType::MediaRetry) => {
             debug!(
                 "Received mediaretry notification for msg {}",
                 nr.attrs().optional_string("id").unwrap_or_default()
             );
         }
-        // A type the protocol carries that this client does not act on, or one
-        // it does not model at all. Both reach the consumer as a raw event.
+        // A type the core does not model itself. An attached subsystem may
+        // claim it; otherwise it is one this client does not act on, or does
+        // not model at all, and both reach the consumer as a raw event.
         _ => {
+            if let Some(parsed) = parsed
+                && crate::client::subsystem::dispatch_notification(client, parsed, &node).await
+            {
+                return;
+            }
             let other = notification_type.as_deref().unwrap_or_default();
             debug!("Unhandled notification type '{other}', dispatching raw event");
             client
@@ -152,6 +152,36 @@ mod tests {
             .persistence_manager
             .get_device_snapshot()
             .adv_secret_key
+    }
+
+    /// The failure path of the attachment table: a type the core does not
+    /// model and no attached subsystem claims reaches the consumer whole
+    /// instead of being dropped. That is what an operation belonging to a
+    /// subsystem this build left out looks like from outside.
+    #[tokio::test]
+    async fn an_unclaimed_notification_type_reaches_the_consumer_raw() {
+        use crate::types::events::EventHandler;
+
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+
+        let notif = NodeBuilder::new("notification")
+            .attr("type", NotificationType::Psa.as_str())
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "psa-1")
+            .build();
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert!(
+            collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::Notification(_))),
+            "an unclaimed notification type must reach the consumer as a raw event"
+        );
     }
 
     #[tokio::test]

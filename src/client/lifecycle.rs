@@ -523,8 +523,7 @@ impl Client {
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pairing_qr_refresh_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
-            passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
-            passkey_opening: AtomicBool::new(false),
+            subsystems: subsystem::Subsystems::default(),
             signal_flush_state: AtomicU64::new(0),
             signal_flush_lifecycle: Mutex::new(()),
             #[cfg(test)]

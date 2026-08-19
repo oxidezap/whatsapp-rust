@@ -15,7 +15,7 @@ description = "Rust client for WhatsApp Web"
 autobenches = false
 
 [package.metadata.docs.rs]
-features = ["plugins"]
+features = ["passkey", "plugins"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [workspace]
@@ -152,6 +152,10 @@ client-lifecycle = []
 # Build-time native plugin host. Kept opt-in so clients that do not use plugins
 # retain the pre-host binary footprint.
 plugins = ["client-lifecycle", "dep:bon"]
+# SHORTCAKE_PASSKEY linking flow. Opt-in so a client that links by QR or pair
+# code carries neither the flow nor any state for it; the core keeps no field
+# and no branch either way. See agent_docs/subsystem_boundary.md.
+passkey = []
 # Optional observability. Off by default: no `tracing` dep, zero overhead.
 # Emits tracing spans/events only; the application installs the subscriber
 # (and any OpenTelemetry bridge). See examples/observability.rs.

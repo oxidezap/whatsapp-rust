@@ -20,6 +20,7 @@ mod node_io;
 pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;
+pub(crate) mod subsystem;
 mod voip;
 use builder::{ClientAssembly, ClientExtensions};
 pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
@@ -1544,14 +1545,12 @@ pub struct Client {
     /// Tracks the pending pair code request and ephemeral keys.
     pub(crate) pair_code_state: Arc<Mutex<wacore::pair_code::PairCodeState>>,
 
-    /// SHORTCAKE_PASSKEY linking flow state: the pending handoff key, the
-    /// per-attempt ephemeral linking cache, and the optional host authenticator.
-    pub(crate) passkey_state: Arc<Mutex<crate::passkey::flow::PasskeyFlowState>>,
-
-    /// Wait-free "an open is in flight" reservation for the passkey flow. Kept
-    /// outside `passkey_state` so it can be released synchronously on drop (a
-    /// cancelled open can't leave it stuck), unlike a flag behind the async lock.
-    pub(crate) passkey_opening: AtomicBool,
+    /// Per-client state of every optional subsystem attached to this build,
+    /// in one field rather than one field per subsystem. The core does not
+    /// know what is in it, and in a build with none attached nothing reads it;
+    /// see `agent_docs/subsystem_boundary.md`.
+    #[allow(dead_code)]
+    pub(crate) subsystems: subsystem::Subsystems,
 
     /// Custom handlers for encrypted message types. Set once at `Bot::build` and
     /// immutable afterward, so the receive hot path reads it with a plain

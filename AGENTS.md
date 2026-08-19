@@ -56,6 +56,7 @@ Read the one that covers what you are touching:
 | `agent_docs/protocol_architecture.md` | Building or parsing stanzas: `ProtocolNode`, `IqSpec`, derive macros, node helpers |
 | `agent_docs/noise_handshake.md` | Connection setup: XX/IK/fallback selection, server cert cache, failure classification |
 | `agent_docs/feature_implementation.md` | Starting a feature and needing its wire format from captured WA Web JS |
+| `agent_docs/subsystem_boundary.md` | Adding a feature gate, adding a `Client` field only one subsystem reads, or proposing that a subsystem leave the core |
 | `agent_docs/signal_durability.md` | Any code that reads, mutates, persists, or sends Signal state |
 | `agent_docs/e2e_testing.md` | Writing or fixing tests under `tests/e2e/` |
 | `agent_docs/observability.md` | Adding a cache, counter, or anything reported by `memory_report()` / `stats()` |

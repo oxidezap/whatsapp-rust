@@ -156,6 +156,8 @@ pub mod message;
 pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
+#[cfg(feature = "passkey")]
+#[cfg_attr(docsrs, doc(cfg(feature = "passkey")))]
 pub mod passkey;
 #[cfg(feature = "plugins")]
 #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]

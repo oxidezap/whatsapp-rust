@@ -207,6 +207,10 @@ jobs:
       # everywhere else. They are the only gate on which work a span owns.
       - name: Test (tracing)
         run: cargo nextest run --profile ci -p whatsapp-rust --features tracing --test handshake_span_scope
+      # `passkey` is off by default, so the linking flow's tests compile away in
+      # every other job.
+      - name: Test (passkey)
+        run: cargo nextest run --profile ci -p whatsapp-rust --features passkey --lib
 
   rustdoc:
     name: Rustdoc
