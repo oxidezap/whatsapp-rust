@@ -206,8 +206,7 @@ impl<'a> AcceptCall<'a> {
         let video = self.video.take();
         let peer_invite_device = self
             .incoming
-            .media
-            .as_ref()
+            .media()
             .and_then(|media| media.peer_device.clone());
         let has_video = video.is_some();
         if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
@@ -246,7 +245,7 @@ impl<'a> AcceptCall<'a> {
             None => None,
         };
         if self.incoming.group.is_some()
-            && self.incoming.media.is_none()
+            && self.incoming.media().is_none()
             && group
                 .as_ref()
                 .and_then(|update| update.relay.as_ref())
@@ -275,7 +274,7 @@ impl<'a> AcceptCall<'a> {
             ));
         }
         let is_group = group.is_some();
-        if self.incoming.media.is_none()
+        if self.incoming.media().is_none()
             && group
                 .as_ref()
                 .and_then(|group| group.relay.as_ref())
@@ -418,8 +417,7 @@ impl<'a> AcceptCall<'a> {
 
         let media = self
             .incoming
-            .media
-            .as_ref()
+            .media()
             .ok_or(CallError::Media("offer carried no media block"))?;
         let enc = media
             .enc_for(Some(&own_lid))
@@ -1261,11 +1259,7 @@ fn build_answer_signaling(
         video,
     );
     // Captured video accepts mirror the offer's peer experiment metadata; audio accepts omit it.
-    let metadata = if video {
-        incoming.media.as_deref()
-    } else {
-        None
-    };
+    let metadata = if video { incoming.media() } else { None };
     let accept = build_accept(&AcceptParams {
         call_id,
         to: &target,

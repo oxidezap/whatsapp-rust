@@ -325,10 +325,17 @@ pub struct IncomingCall {
     /// Media material from an `<offer>` (the encrypted callKey + parsed relay), captured by the
     /// parser so the `voip` media facade can drive the call. `None` for non-offer actions or an
     /// offer with no `<enc>` for us. Boxed so the large `RelayData` doesn't bloat every `Event`
-    /// (the no-media common case stays one pointer). Skipped on the `serde` shape (binary-only).
+    /// (the no-media common case stays one pointer).
+    ///
+    /// Reached through [`Self::media`] rather than as a public field: the field only exists under
+    /// `voip`, and a public payload whose fields come and go with a feature is one type with two
+    /// shapes. A gated accessor is not, which is what `agent_docs/subsystem_boundary.md` test 4
+    /// asks for. Unconditional is not the alternative -- the type carries a parsed `RelayData`,
+    /// so making it always present would link the relay parser into every build.
     #[cfg(feature = "voip")]
     #[serde(skip)]
-    pub media: Option<Box<MediaOffer>>,
+    #[builder(skip)]
+    pub(crate) media: Option<Box<MediaOffer>>,
 }
 
 /// A call that must NOT ring: surfaced instead of [`IncomingCall`] so a consumer cannot auto-accept
@@ -426,6 +433,19 @@ impl IncomingCall {
     #[doc(hidden)]
     pub fn ringing_generation(&self) -> Option<u64> {
         self.ringing_generation
+    }
+
+    /// Attach the media material the parser captured from an `<offer>`.
+    #[cfg(feature = "voip")]
+    #[doc(hidden)]
+    pub fn set_media(&mut self, media: Option<Box<MediaOffer>>) {
+        self.media = media;
+    }
+
+    /// The offer's media material, when this is an `<offer>` that carried an `<enc>` for us.
+    #[cfg(feature = "voip")]
+    pub fn media(&self) -> Option<&MediaOffer> {
+        self.media.as_deref()
     }
 
     /// Minimal constructor for in-tree tests in dependent crates; `#[non_exhaustive]` blocks the
