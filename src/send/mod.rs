@@ -1716,9 +1716,8 @@ impl Client {
     }
 
     /// Cold path of the phash check: the server's phash disagreed with ours, so
-    /// invalidate the relevant device/group caches and (for groups) force
-    /// sender-key redistribution. Spawned only on a mismatch, which is why the
-    /// common path costs a string comparison on the read loop.
+    /// re-resolve whatever produced it. Spawned only on a mismatch, which is why
+    /// the common path costs a string comparison on the read loop.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.phash_mismatch", level = "debug", skip_all, fields(jid = %jid.observe())))]
     pub(crate) async fn handle_phash_mismatch(
         &self,
@@ -1740,13 +1739,13 @@ impl Client {
             }
         }
         let jid_str = jid.to_string();
-        // Cache-only invalidation re-reads the same stale rows on the next send.
-        // Drop the persisted state too so the next send takes the full-
-        // distribution path. If the clear fails, fall back to deleting the bot's
-        // own sender key for the chat — the next send will see `!key_exists` and
-        // force_skdm without depending on the tracker.
+        // A group takes neither arm: `resendGroupMsg` answers a mismatch with
+        // `sendQueryGroup` alone, which is the metadata invalidation below.
+        // Forgetting its sender keys, or its device rows, would cost a full
+        // fan-out or a full re-resolve on every message while the divergence
+        // lasts.
         let mut flush_fallback = false;
-        if jid.is_group() || jid.is_status_broadcast() {
+        if jid.is_status_broadcast() {
             let distribution_guard = self.group_distribution_lock(jid).await;
             if let Err(e) = self.reset_sender_key_device_tracking(&jid_str).await {
                 log::warn!(
@@ -1764,7 +1763,7 @@ impl Client {
                 flush_fallback = true;
             }
             drop(distribution_guard);
-        } else {
+        } else if !jid.is_group() {
             self.sender_key_device_cache.invalidate(&jid_str).await;
         }
         if flush_fallback {
@@ -3292,6 +3291,39 @@ mod tests {
             companion
         }
 
+        /// `send_text` under a caller-chosen id, so a test can address the ack
+        /// the send registers its phash waiter under.
+        async fn send_with_id(&self, message_id: &str) {
+            self.client
+                .send_message_with_options(
+                    self.group.clone(),
+                    wa::Message::text("hi"),
+                    SendOptions::default().with_message_id(message_id),
+                )
+                .await
+                .expect("group text send should reach the wire");
+        }
+
+        /// Feed the server's `<ack>` back through the read loop's own entry
+        /// point. Returns whether a waiter claimed it.
+        async fn deliver_ack(&self, message_id: &str, phash: Option<&str>) -> bool {
+            let mut builder = NodeBuilder::new("ack")
+                .attr("id", message_id)
+                .attr("from", "s.whatsapp.net");
+            if let Some(phash) = phash {
+                builder = builder.attr("phash", phash);
+            }
+            let marshaled = wacore_binary::marshal::marshal_ref(&builder.build().as_node_ref())
+                .expect("valid node");
+            let node = wacore_binary::OwnedNodeRef::new(
+                wacore_binary::util::unpack(&marshaled)
+                    .expect("packed payload")
+                    .into_owned(),
+            )
+            .expect("valid node");
+            self.client.handle_ack_response_arc(&Arc::new(node))
+        }
+
         async fn send_text(&self, text: &str) {
             self.client
                 .send_message(self.group.clone(), wa::Message::text(text))
@@ -3964,15 +3996,7 @@ mod tests {
     async fn a_group_send_registers_its_phash_ack_waiter() {
         let fixture = GroupSendFixture::new().await;
         let message_id = "GROUPPHASHWAITER1";
-        fixture
-            .client
-            .send_message_with_options(
-                fixture.group.clone(),
-                wa::Message::text("hi"),
-                SendOptions::default().with_message_id(message_id),
-            )
-            .await
-            .expect("group text send should reach the wire");
+        fixture.send_with_id(message_id).await;
 
         let stanza = fixture.stanza(0).await;
         let on_wire = attr_value(&stanza, "phash").expect("groups carry a phash on every send");
@@ -3999,133 +4023,121 @@ mod tests {
     }
 
     /// The protected path, broken on purpose: the server answers with a phash
-    /// that disagrees with ours. That means our participant device set is not
-    /// what the group actually holds, so the group's sender-key tracking and its
-    /// metadata snapshot both have to go, and the next send redistributes
-    /// against a fresh participant list. WA Web's answer to the same ack is
-    /// `sendQueryGroup` plus a resend to the devices it had missed.
+    /// that disagrees with ours. `resendGroupMsg` answers that with
+    /// `sendQueryGroup`, so the group's metadata snapshot has to go and the next
+    /// send resolves its participants from the server.
     #[tokio::test]
-    async fn a_disagreeing_ack_phash_clears_the_group_sender_key_tracking() {
+    async fn a_disagreeing_ack_phash_re_queries_the_group() {
         let fixture = GroupSendFixture::new().await;
-        let group_str = fixture.group.to_string();
         let message_id = "GROUPPHASHMISMATCH1";
-        fixture
-            .client
-            .send_message_with_options(
-                fixture.group.clone(),
-                wa::Message::text("hi"),
-                SendOptions::default().with_message_id(message_id),
-            )
-            .await
-            .expect("group text send should reach the wire");
-
-        let group_info = fixture
-            .client
-            .get_group_cache()
-            .get(&fixture.group)
-            .await
-            .expect("group metadata");
+        fixture.send_with_id(message_id).await;
         assert!(
             fixture
                 .client
-                .resolve_skdm_targets_memoized(
-                    &fixture.group,
-                    &group_str,
-                    &group_info,
-                    &fixture.own_sending,
-                )
+                .get_group_cache()
+                .get(&fixture.group)
                 .await
-                .expect("device resolution is cache-backed here")
-                .1
-                .is_empty(),
-            "the cold send keyed every member"
+                .is_some(),
+            "the send warmed the group snapshot"
         );
 
-        let ack = wacore_binary::marshal::marshal_ref(
-            &NodeBuilder::new("ack")
-                .attr("id", message_id)
-                .attr("from", "s.whatsapp.net")
-                .attr("phash", "2:notwhatwesent")
-                .build()
-                .as_node_ref(),
-        )
-        .expect("valid node");
-        let ack = wacore_binary::OwnedNodeRef::new(
-            wacore_binary::util::unpack(&ack)
-                .expect("packed payload")
-                .into_owned(),
-        )
-        .expect("valid node");
         assert!(
-            fixture.client.handle_ack_response_arc(&Arc::new(ack)),
-            "the group send's waiter must claim its own ack"
+            fixture
+                .deliver_ack(message_id, Some("2:notwhatwesent"))
+                .await,
+            "the send's waiter must claim its own ack"
         );
 
         // handle_phash_mismatch runs detached off the read loop.
-        let cleared = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let needs = fixture
-                    .client
-                    .resolve_skdm_targets_memoized(
-                        &fixture.group,
-                        &group_str,
-                        &group_info,
-                        &fixture.own_sending,
-                    )
-                    .await
-                    .expect("device resolution is cache-backed here")
-                    .1;
-                if !needs.is_empty() {
-                    return needs;
-                }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fixture
+                .client
+                .get_group_cache()
+                .get(&fixture.group)
+                .await
+                .is_some()
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("a disagreeing phash must put the group back on the distribution path");
+        .expect("a disagreeing phash must drop the group snapshot that produced it");
+    }
+
+    /// The other half, and the reason the repair cannot storm: the members that
+    /// already hold the key keep holding it, and their device rows stay put.
+    /// `resendGroupMsg` sends only to the devices a refreshed fan-out newly
+    /// reveals; it never calls `markForgetSenderKey`, and it never touches the
+    /// device table (`<notification type="devices">` is what keeps that fresh).
+    /// Doing either here would cost a full fan-out, or a full re-resolve, on
+    /// every message for as long as the divergence lasts.
+    ///
+    /// Drives `handle_phash_mismatch` directly rather than through the ack: the
+    /// ack path spawns it detached, and polling for one of its effects would
+    /// read the tracker before a later step could touch it.
+    #[tokio::test]
+    async fn a_group_phash_mismatch_forgets_no_sender_key_and_no_device_row() {
+        let fixture = GroupSendFixture::new().await;
+        let group_str = fixture.group.to_string();
+        fixture.send_text("cold send").await;
+
+        let before = fixture.client.skdm_device_map(&group_str).await;
         assert_eq!(
-            cleared.len(),
-            fixture.recipient_devices,
-            "every member is targeted again after the server disagreed"
+            before.device_has_key(&fixture.member.user, 0),
+            Some(true),
+            "the cold send keyed this member"
+        );
+
+        fixture
+            .client
+            .handle_phash_mismatch(&fixture.group, "2:ours", "2:theirs", true)
+            .await;
+
+        let after = fixture.client.skdm_device_map(&group_str).await;
+        assert_eq!(
+            after.device_has_key(&fixture.member.user, 0),
+            Some(true),
+            "a mismatch must not forget a member that already holds the key: \
+             clearing the tracker costs a full fan-out per message while the \
+             divergence lasts"
+        );
+        assert!(
+            fixture
+                .client
+                .get_devices_from_registry(&fixture.member)
+                .await
+                .is_some(),
+            "nor may it drop device rows: a device notification owns that, and \
+             dropping them costs a full re-resolve per message instead"
         );
     }
 
-    /// An ack that agrees is the ordinary case and must cost nothing: no reset,
-    /// no re-query, no redistribution.
+    /// An ack that agrees is the ordinary case and must cost nothing: no device
+    /// rows dropped, no re-query, no redistribution.
     #[tokio::test]
     async fn an_agreeing_ack_phash_leaves_the_group_warm() {
         let fixture = GroupSendFixture::new().await;
         let group_str = fixture.group.to_string();
         let message_id = "GROUPPHASHMATCH1";
-        fixture
-            .client
-            .send_message_with_options(
-                fixture.group.clone(),
-                wa::Message::text("hi"),
-                SendOptions::default().with_message_id(message_id),
-            )
-            .await
-            .expect("group text send should reach the wire");
+        fixture.send_with_id(message_id).await;
         let sent = fixture.stanza(0).await;
         let on_wire = attr_value(&sent, "phash").expect("groups carry a phash");
 
-        let ack = wacore_binary::marshal::marshal_ref(
-            &NodeBuilder::new("ack")
-                .attr("id", message_id)
-                .attr("from", "s.whatsapp.net")
-                .attr("phash", on_wire.as_str())
-                .build()
-                .as_node_ref(),
-        )
-        .expect("valid node");
-        let ack = wacore_binary::OwnedNodeRef::new(
-            wacore_binary::util::unpack(&ack)
-                .expect("packed payload")
-                .into_owned(),
-        )
-        .expect("valid node");
-        fixture.client.handle_ack_response_arc(&Arc::new(ack));
+        assert!(
+            fixture
+                .deliver_ack(message_id, Some(on_wire.as_str()))
+                .await,
+            "the send's waiter must claim its own ack"
+        );
 
+        assert!(
+            fixture
+                .client
+                .get_devices_from_registry(&fixture.member)
+                .await
+                .is_some(),
+            "an agreeing server must not cost a device re-resolve"
+        );
         let group_info = fixture
             .client
             .get_group_cache()
