@@ -98,12 +98,12 @@ impl Subsystems {
     }
 }
 
-/// Counts stanzas handed to a subsystem, so a test can tell routing through the
-/// table apart from a core arm that quietly took the stanza instead.
-///
-/// Thread-local rather than a process-wide counter: a sibling test dispatching
-/// the same type concurrently would otherwise satisfy the assertion on its own,
-/// which is the failure the counter exists to catch.
+// Counts stanzas handed to a subsystem, so a test can tell routing through the
+// table apart from a core arm that quietly took the stanza instead. Thread-local
+// rather than process-wide: a sibling test dispatching the same type would
+// otherwise satisfy the assertion on its own, which is the failure it exists to
+// catch. A `///` here would be an unused doc comment, since rustdoc does not
+// document a macro invocation.
 #[cfg(test)]
 thread_local! {
     pub(crate) static DISPATCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
