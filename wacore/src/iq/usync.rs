@@ -1677,6 +1677,11 @@ mod tests {
             user.key_index_bytes.is_none(),
             "no key index was returned, so none is invented"
         );
+        assert!(
+            user.phash.is_none(),
+            "the server's hash describes the devices it sent, not the ones kept: \
+             persisting it would let a later query call this truncated list current"
+        );
     }
 
     /// The degradation above has a floor: a device list that does not even carry
