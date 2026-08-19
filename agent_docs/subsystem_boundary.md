@@ -85,6 +85,28 @@ a subsystem.
 | `pair_code` (`src/pair_code.rs`) | `pair-success` takes this subsystem's lock on the shared pairing path, QR included, so that a pair-code flow being retired cannot re-mint the ADV secret between verification and completion (`src/pair.rs`). Cutting it would either drop that interlock or leave the core reaching into an optional subsystem | 2 |
 | `features/groups`, `features/newsletter`, `features/business`, `features/mex` | outbound IQ in `src/features/`, inbound handling in `src/handlers/notification/`, so neither half owns the subsystem; `group_cache` is also read from `src/voip/facade.rs` | 1, 2 |
 
+### `voip-runtime` is a runtime, not the subsystem
+
+Asked often enough to write down: the runtime-free VoIP core already exists, and
+it is not what `voip-runtime` gates.
+
+`wacore::voip` is sans-IO. Its feature is `["dep:aes-gcm", "dep:zerocopy"]`,
+`tokio` appears only under wacore's `[dev-dependencies]`, and the four mentions
+of tokio or webrtc under `wacore/src/voip/` are doc comments describing what the
+native side injects. The executor is the `wacore::runtime::Runtime` trait, with
+a `Send` native shape and a non-`Send` wasm one; the socket is the
+`RelayTransport` seam. CI builds it for `wasm32-unknown-unknown` with
+`--no-default-features --features "voip,js"` on every PR, which is what keeps
+that true.
+
+What `voip-runtime` gates in this crate is the native media plane: the webrtc-rs
+DTLS/SCTP DataChannel, the libopus FFI and the task orchestration around them.
+That is runtime-bound by construction, and `src/voip/mod.rs` has a
+`compile_error!` pointing wasm32 and espidf builds at `wacore/voip` instead.
+Making it runtime-agnostic would not be a refactor of this code, it would be
+replacing webrtc-rs, and there is no consumer waiting for it: the one a split
+was supposed to free is already served by `wacore::voip`.
+
 `voip-runtime` is one test away from cuttable, and the three sites that keep it
 coupled are all the same shape: a `pub(crate)` helper whose only caller is VoIP.
 Moving them under `src/voip/` would pass test 3 by separating each from the
@@ -247,15 +269,22 @@ cargo bench --bench client_group_send --features bench-harness,plugins -- warm_g
 
 | group size | host off | host on, no plugin installed |
 | ---: | ---: | ---: |
-| 8 | 52.99 | 53.20 |
-| 32 | 53.71 | 53.30 |
-| 128 | 53.80 | 53.39 |
-| 512 | 54.62 | 54.24 |
+| 8 | 62.90 | 62.36 |
+| 32 | 63.08 | 61.49 |
+| 128 | 61.80 | 61.70 |
+| 512 | 63.66 | 63.82 |
 
 Inside the noise floor of an ordinary machine, which is what a null check on
-`Option<Arc<PluginHost>>` should read as. Run it rather than trust it: CodSpeed
-keys a series by benchmark name, so it cannot hold both configurations of the
-same benchmark, which is why this is a command here and not a CI gate.
+`Option<Arc<PluginHost>>` should read as: the host-on column is faster in three
+rows of four, which is not a speedup, it is the spread.
+
+Both columns have to come from one session on one machine, and only the two
+columns may be compared. The absolute figures move with the box, so a number
+here is not comparable to one from another run, and this table is worth nothing
+as a record of whether the client got faster over time. Re-run it rather than
+trust it. CodSpeed is the instrument for the across-time question, and the
+reason this is a command here instead of a CI gate is that CodSpeed keys a
+series by benchmark name and cannot hold two configurations of the same one.
 
 ## When to stop
 
