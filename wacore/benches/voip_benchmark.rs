@@ -566,11 +566,42 @@ mod framing {
         p
     }
 
+    /// How many packets one sample of the alloc-free parse rows decodes.
+    ///
+    /// `parse_rtcp_sender_ssrc` is a length check and a four-byte load, and
+    /// `parse_rtp_header` is not much more: 6.6 ns and 10 ns here, against a
+    /// per-sample harness cost the CodSpeed runner measures at hundreds of
+    /// nanoseconds. A single packet per sample makes those rows report the
+    /// harness, and an unrelated change to code layout then moves them by tens
+    /// of percent -- `parse_rtcp` swung 23% on a PR that touched no VoIP code.
+    /// A fixed batch puts the decode back above that floor: 512 packets is
+    /// ~320 ns of RTCP parsing and ~2.4 us of RTP parsing here, against ~0.6 ns
+    /// and ~4.7 ns for one. Both working sets (14 KiB and 8 KiB) stay L1
+    /// resident, so the rows remain parse benchmarks rather than cache ones.
+    /// The encode and STUN rows keep one packet per sample: they allocate, and
+    /// the allocation count per sample is their signal.
+    const PARSE_BATCH: usize = 512;
+
     #[divan::bench]
     fn parse_rtp(bencher: Bencher) {
-        bencher
-            .with_inputs(|| encode_rtp_header(&sample_rtp_header()))
-            .bench_refs(|pkt| black_box(parse_rtp_header(black_box(pkt))));
+        // Built once, outside the measured closure: encoding a header costs
+        // more than parsing one, and per-iteration input generation is the
+        // other half of what buried this row's signal.
+        let packets: Vec<Vec<u8>> = (0..PARSE_BATCH)
+            .map(|i| {
+                let mut header = sample_rtp_header();
+                // Distinct sequence numbers so no load folds across the batch.
+                header.sequence_number = header.sequence_number.wrapping_add(i as u16);
+                encode_rtp_header(&header)
+            })
+            .collect();
+        bencher.bench(|| {
+            let mut acc = 0u32;
+            for packet in black_box(&packets) {
+                acc ^= parse_rtp_header(packet).map_or(0, |header| header.ssrc);
+            }
+            black_box(acc)
+        });
     }
 
     #[divan::bench]
@@ -596,10 +627,11 @@ mod framing {
 
     #[divan::bench]
     fn parse_rtcp(bencher: Bencher) {
-        bencher
-            .with_inputs(|| {
+        // See `PARSE_BATCH`: built once, distinct SSRCs, one batch per sample.
+        let reports: Vec<[u8; 28]> = (0..PARSE_BATCH)
+            .map(|i| {
                 build_sender_report(
-                    0xDEAD_BEEF,
+                    0xDEAD_BEEF ^ i as u32,
                     &RtcpSenderStats {
                         packets_sent: 1000,
                         octets_sent: 40_000,
@@ -608,6 +640,13 @@ mod framing {
                     1_700_000_000_000,
                 )
             })
-            .bench_refs(|sr| black_box(parse_rtcp_sender_ssrc(black_box(sr))));
+            .collect();
+        bencher.bench(|| {
+            let mut acc = 0u32;
+            for report in black_box(&reports) {
+                acc ^= parse_rtcp_sender_ssrc(report).unwrap_or(0);
+            }
+            black_box(acc)
+        });
     }
 }
