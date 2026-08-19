@@ -598,7 +598,10 @@ mod framing {
         bencher.bench(|| {
             let mut acc = 0u32;
             for packet in black_box(&packets) {
-                acc ^= parse_rtp_header(packet).map_or(0, |header| header.ssrc);
+                // The sequence number is the field that varies across the
+                // batch, so it is the one the result has to depend on.
+                acc ^= parse_rtp_header(packet)
+                    .map_or(0, |header| header.ssrc ^ u32::from(header.sequence_number));
             }
             black_box(acc)
         });
