@@ -186,19 +186,10 @@ jobs:
           cargo nextest run --profile ci -p wacore --features voip --lib
           cargo nextest run --profile ci -p whatsapp-rust --features "voip tokio-native tokio-transport" --lib
       # `voip` does NOT imply `voip-mlow`, and wacore has no default features, so `voip::mlow` is
-      # compiled away in every job above -- the codec's 87 tests, both golden checksums and every
-      # C/Go ground-truth vector among them, ran nowhere in CI before this step. It is the shipping
-      # configuration, so it comes first.
+      # compiled away in every job above -- the codec's tests, the golden checksums and every C/Go
+      # ground-truth vector among them, ran nowhere in CI before this step.
       - name: Test (voip-mlow)
         run: cargo nextest run --profile ci -p wacore --features voip-mlow --lib -E 'test(voip::mlow)'
-      # The same suite through the opt-in split-FFT dispatch. This covers which implementation the
-      # feature selects and the second golden pair pinned for it -- not interoperability: no CI job
-      # here decodes with a real WhatsApp client, so a bitstream passing this step is well-formed by
-      # our own decoder and nothing more. The FFTs themselves are compared against each other and
-      # against an exact f64 DFT by the differential tests in `smpl_perc.rs`, which run in both
-      # configurations; this step is what keeps the feature-selected path from rotting.
-      - name: Test (mlow-fast-fft)
-        run: cargo nextest run --profile ci -p wacore --features voip-mlow,mlow-fast-fft --lib -E 'test(voip::mlow)'
       # legacy-session-interop is off by default, so every other test job
       # compiles its module away and never runs a single one of its tests.
       - name: Test (legacy-session-interop)

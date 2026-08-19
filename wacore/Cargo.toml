@@ -43,24 +43,6 @@ voip-mlow = ["voip"]
 # Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
 # Dev/profiling only; off by default and not pulled into normal builds.
 dhat-heap = ["dep:dhat"]
-# Opt-in half-length ("split") real FFT for the MLow encoder's perceptual and LPC analysis. Same
-# transform, fewer butterflies, but a different operation sequence -- so it does NOT reproduce the
-# reference encoder bit for bit, and the golden checksums under it are a second, separately pinned
-# pair. Off by default: the default build stays byte-identical to the validated reference. Turning
-# it on emits a different (still well-formed) bitstream, so it should stay off until someone
-# revalidates the output against a real WhatsApp decoder. `split_rfft_matches_reference` bounds the
-# numerical difference and runs in the default `cargo test`.
-#
-# Who can turn it on is not only you: Cargo unifies features across the whole dependency graph, so
-# any crate in a build that enables `wacore/mlow-fast-fft` switches the encoder for every consumer
-# of that build, with no warning and no way for this crate to notice. For an interop-critical codec
-# that is the failure mode that actually happens. A `--cfg mlow_fast_fft` flag would not be
-# reachable that way; it stays a feature for consistency with the rest of this table and so
-# `cargo hack --each-feature` keeps checking it, which makes the hazard worth stating here.
-#
-# Implies `voip-mlow`: on its own it would gate an encoder that is not compiled, i.e. silently do
-# nothing.
-mlow-fast-fft = ["voip-mlow"]
 # Per-stage MLow codec bench surface (`voip::mlow::stage_bench`), so `voip_benchmark` can attribute
 # encoder CPU to a stage. Pure bench scaffolding: `#[doc(hidden)]` would hide it from rustdoc but
 # still compile it into every consumer, so it is a feature. Dev/bench only; off by default.

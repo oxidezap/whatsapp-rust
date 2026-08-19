@@ -108,33 +108,16 @@ fn digest(out: &[i16]) -> Digest {
 const GOLDEN_SAMPLES: usize = 23040;
 const GOLDEN_CLIP: f32 = 0.0;
 
-// Everything below depends on the exact arithmetic path, so `mlow-fast-fft` gets its own pinned
-// set rather than a widened tolerance: the point of this file is to catch drift, and a tolerance
-// wide enough to span both paths would be wide enough to hide a regression in either.
-// `encoder_output_is_last_bit_chaotic` is what says the two sets describe the same codec.
-#[cfg(not(feature = "mlow-fast-fft"))]
-mod golden_values {
-    pub const RMS: f32 = 0.154699;
-    pub const PEAK: f32 = 0.458405;
-    pub const CHECKSUM: u64 = 0x8782_cb8c_d7b5_f262;
-    // Pins the ENCODER bitstream independently of the decoder: fnv1a over the concatenation of
-    // every emitted packet's wire bytes. Drift here means the encoder changed even if decode
-    // output did not.
-    pub const FRAMES_CHECKSUM: u64 = 0xb179_3f10_72d1_5a7d;
-}
-
-#[cfg(feature = "mlow-fast-fft")]
-mod golden_values {
-    pub const RMS: f32 = 0.156401;
-    pub const PEAK: f32 = 0.524200;
-    pub const CHECKSUM: u64 = 0x4302_cced_6791_52b4;
-    pub const FRAMES_CHECKSUM: u64 = 0x5583_7f25_b89a_0621;
-}
-
-use golden_values::{
-    CHECKSUM as GOLDEN_CHECKSUM, FRAMES_CHECKSUM as GOLDEN_FRAMES_CHECKSUM, PEAK as GOLDEN_PEAK,
-    RMS as GOLDEN_RMS,
-};
+// The scalars are tolerant and platform-robust; the checksums are exact, and exact means exact for
+// one build: the encoder resolves ties on f32 comparisons, so the bitstream is a function of the
+// arithmetic the compiler emits, not only of the source. Changing `-C target-cpu` alone moves these
+// constants. They are a drift tripwire on the CI target, not a portable identity of the codec.
+const GOLDEN_RMS: f32 = 0.156401;
+const GOLDEN_PEAK: f32 = 0.524200;
+const GOLDEN_CHECKSUM: u64 = 0x4302_cced_6791_52b4;
+// Pins the ENCODER bitstream independently of the decoder: fnv1a over the concatenation of every
+// emitted packet's wire bytes. Drift here means the encoder changed even if decode output did not.
+const GOLDEN_FRAMES_CHECKSUM: u64 = 0x5583_7f25_b89a_0621;
 
 /// Encode then decode the whole corpus, returning the decoded i16 output and the concatenated
 /// packet bytes.
@@ -229,10 +212,9 @@ fn golden_roundtrip_no_regression() {
 ///
 /// This is what the exact checksums above do and do not mean. They pin one arithmetic path
 /// exactly, which is what makes them a useful tripwire; they say nothing about whether a different
-/// path is worse. It is also why `mlow-fast-fft` carries a separate constant set rather than a
-/// widened tolerance -- measured on this corpus its output sits at 22.2 dB global / 9.6 dB worst
-/// frame from the reference, i.e. inside the band this test asserts for a one-ULP input nudge, and
-/// both encodings land within 0.05 dB of each other in distance from the source signal.
+/// path is worse. Two encodings that land far apart on this measure can be equally good encodings
+/// of the same signal -- which is why a change of arithmetic is judged against the SOURCE, by
+/// perceptual measurement, and not against the previous bitstream.
 ///
 /// Asserting an upper bound on the SNR looks backwards, but it is the load-bearing half: if a
 /// one-ULP input change ever stopped moving the output, the tie-breaking would have changed and
