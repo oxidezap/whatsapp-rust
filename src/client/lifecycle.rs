@@ -2026,6 +2026,41 @@ impl Client {
         Reachability::Reconnecting
     }
 
+    /// Wait until this client can reach the server again, or until waiting
+    /// stops being the answer.
+    ///
+    /// Returns the state that ended the wait: [`Reachability::Reachable`] when
+    /// one arrived, and otherwise the reason none will without the caller doing
+    /// something about it. [`Reachability::Reconnecting`] is never returned,
+    /// because it is the one state this waits out.
+    ///
+    /// Bounded by the client's own lifetime rather than by a duration: the
+    /// reconnect backoff is jittered, capped at 900s, and followed by a
+    /// handshake, so any constant here would be wrong in one direction or the
+    /// other. Cancellation belongs to the caller, who is the one that knows how
+    /// long the operation behind the wait is worth: drop the future, or wrap it
+    /// in a timeout of your own.
+    ///
+    /// Waiting restores the ability to ask, never the request that was refused.
+    /// Nothing is re-sent, so a caller that wants its call to happen issues it
+    /// again after this returns — and issues it knowing the answer can be stale
+    /// the moment it is given, since a connection can be lost again between
+    /// this returning and the next call reaching the socket.
+    ///
+    /// Not from an event handler: the bus dispatches on the read loop, so a
+    /// handler that waits here blocks the connection it is waiting for.
+    ///
+    /// A [`pause`](Self::pause) ends the wait rather than being waited out: the
+    /// client does come back, but on [`resume`](Self::resume) rather than on
+    /// its own, and the caller is the side that knows when that is. Sitting
+    /// through it would mean parking for as long as the application cared to
+    /// stay offline, and a caller holding this client is also holding the drop
+    /// that would otherwise have been the only other way out.
+    #[must_use = "the return value says whether a connection arrived or why none will"]
+    pub async fn wait_until_reachable(&self) -> Reachability {
+        self.wait_for_reachability(false).await
+    }
+
     /// Park until [`Self::reachability`] settles, per
     /// [`Reachability::settles`].
     ///
