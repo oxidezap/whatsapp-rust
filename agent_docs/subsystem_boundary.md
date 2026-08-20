@@ -217,6 +217,13 @@ Stripped `demo`, release profile, the build `binary_size_ci.md` gates on. Sizes
 are deterministic for a pinned toolchain; the baseline reproduced byte for byte
 across two runs.
 
+Read the file size as a shipping proxy and nothing more. It is quantized by
+section alignment, so two builds can land on the same byte count while their
+codegen differs, and an unchanged number is therefore not evidence that a change
+was free. `binary_size_ci.md` names the sensitive measures for that question,
+`.text` and llvm-lines, and they are what a "this cost nothing" claim has to
+rest on.
+
 Two questions, so two tables. What this batch changed, each row measured on
 `main` and on the branch from the same working tree so no other commit can drift
 into the delta:
@@ -305,12 +312,37 @@ after this batch:
 
 ## What the guard proves, and what it does not
 
-`tests/subsystem_boundary.rs` fails when a cuttable subsystem is named outside
-the files it owns and its two allowed core mentions. It scans text, so it sees a
-mention in a comment too, which is deliberate: a comment in the core explaining
-what a subsystem needs is the same coupling one commit early.
+`tests/subsystem_boundary.rs` holds two guards, one per verdict.
 
-It does not reach test 3 (the subsystem calling core internals that exist only
-for it), and it does not claim the disabled build carries zero bytes of the
-subsystem: `Event` variants and payload types stay in `wacore` by test 4. "Zero
-cost" here means zero code, state and branches of the subsystem's own.
+**Cuttable.** The core may not name the subsystem outside the files it owns and
+its two allowed mentions. It scans text, so it sees a mention in a comment too,
+which is deliberate: a comment in the core explaining what a subsystem needs is
+the same coupling one commit early. It also checks the *shape* of each allowed
+line rather than only counting them, because a budget of three lines is
+otherwise satisfied by spending one on a `pub use crate::<name>::Thing`, which
+keeps the count and puts the subsystem back in the core's surface. An allowed
+line has to be a feature gate, the `mod` declaration or the `subsystems!` entry,
+and the gate arm requires the line to *end* as an attribute, or a one-line
+`#[cfg(feature = "x")] pub use crate::x::Thing;` would open like a gate and pass.
+
+**Coupled but disciplined.** A subsystem that cannot leave still has gates in the
+core, so the guard caps how many. VoIP's is 9 outside the files it owns, and
+raising it is meant to be a decision with a line in this document behind it. The
+cap counts production and test gates together, because telling them apart needs
+a parser the guard does not have and a new gate is worth a look either way.
+Without this, the 29-to-5 result above had nothing holding it: the next change
+could spend it back one `Client` field at a time, and human review is exactly
+what let the original 314 accumulate.
+
+What neither reaches: test 3, the subsystem calling core internals that exist
+only for it. Neither claims the disabled build carries zero bytes of the
+subsystem either, since `Event` variants and payload types stay in `wacore` by
+test 4. "Zero cost" here means zero code, state and branches of the subsystem's
+own.
+
+One narrow hole is left in the cuttable guard, recorded rather than fixed
+because closing it costs more code than it saves: only lines that *contain* the
+subsystem's name are examined, so an item gated by `#[cfg(feature = "passkey")]`
+whose own line never says "passkey" is invisible to it. The gate line itself is
+still counted against the budget, so this cannot be done silently at scale, but
+one such item fits inside a budget that has room.

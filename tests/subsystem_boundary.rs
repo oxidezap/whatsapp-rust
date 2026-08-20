@@ -60,6 +60,32 @@ const CUTTABLE: &[Cuttable] = &[Cuttable {
     ],
 }];
 
+/// A subsystem the cut rule calls *coupled but disciplined*: it cannot leave the
+/// core, so it keeps gates there, and the only thing worth guarding is that the
+/// count does not creep back up. Weaker than [`Cuttable`] on purpose, and the
+/// batch that wrote `agent_docs/subsystem_boundary.md` needed it: it took VoIP
+/// from 29 gates outside its own files to 5, and nothing but this stops the
+/// next change from spending that back one field at a time.
+struct Disciplined {
+    /// The feature whose gates are counted.
+    feature: &'static str,
+    /// The paths that own the subsystem. Gates inside them are its own business.
+    owns: &'static [&'static str],
+    /// How many gates may appear anywhere else, production and test alike.
+    /// Counting both is deliberate: telling them apart needs a parser this
+    /// guard does not have, and a gate that appears is worth a look either way.
+    budget: usize,
+}
+
+const DISCIPLINED: &[Disciplined] = &[Disciplined {
+    feature: "voip-runtime",
+    owns: &["src/voip", "src/client/voip.rs", "src/handlers/call.rs"],
+    // 5 in production: the `mod` declaration, the `subsystems!` entry, and the
+    // three `pub(crate)` helpers whose only caller is VoIP, which the document
+    // records as a deliberate keep. The other 4 are test scaffolding.
+    budget: 9,
+}];
+
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -73,6 +99,55 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
+    }
+}
+
+#[test]
+fn a_disciplined_subsystem_does_not_creep_back_into_the_core() {
+    let root = crate_root();
+    let mut sources = Vec::new();
+    rust_sources(&root.join("src"), &mut sources);
+    sources.sort();
+
+    for subsystem in DISCIPLINED {
+        let needle = format!("cfg(feature = \"{}\")", subsystem.feature);
+        let mut gates = Vec::new();
+
+        for path in &sources {
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if subsystem
+                .owns
+                .iter()
+                .any(|owned| relative == *owned || relative.starts_with(&format!("{owned}/")))
+            {
+                continue;
+            }
+
+            let source =
+                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {relative}: {e}"));
+            for (index, line) in source.lines().enumerate() {
+                if line.contains(&needle) {
+                    gates.push(format!("  {relative}:{}", index + 1));
+                }
+            }
+        }
+
+        assert!(
+            gates.len() <= subsystem.budget,
+            "`{}` now has {} gates outside the files it owns, budget is {}:\n{}\n\n\
+             Raising the budget is a decision, not a formality: the point of the \
+             number is that a subsystem that cannot be cut still does not spread. \
+             If the new gate belongs, say why in agent_docs/subsystem_boundary.md \
+             and move the budget with it.",
+            subsystem.feature,
+            gates.len(),
+            subsystem.budget,
+            gates.join("\n"),
+        );
     }
 }
 
