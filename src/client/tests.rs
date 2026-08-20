@@ -6831,44 +6831,47 @@ async fn the_wait_ends_when_the_replacement_connection_authenticates() {
 /// Terminal beats reachability. Every one of these sets its terminal flags
 /// before it clears the session and closes the transport, so a wait that asked
 /// about the socket first would be handed a connection that is already ending.
+///
+/// The ordering is asserted on a client that is still connected and still
+/// authenticated, because that is the window it exists for. The release is
+/// asserted from a wait that is already parked, so what ends it is the terminal
+/// transition and not the state the waiter happened to start in.
 #[tokio::test]
 async fn a_terminal_session_ends_the_wait_however_it_became_terminal() {
     for code in ["401", "409", "516"] {
         let client = create_reachable_wait_test_client(&format!("terminal-{code}")).await;
-
-        let waiter = {
-            let client = Arc::clone(&client);
-            tokio::spawn(async move { client.wait_until_reachable().await })
-        };
-
         let error = NodeBuilder::new("stream:error").attr("code", code).build();
         client.handle_stream_error(&error.as_node_ref()).await;
 
         assert!(client.is_terminal(), "{code} ends the session for good");
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), waiter)
-                .await
-                .unwrap_or_else(|_| panic!("{code} must release the wait"))
-                .expect("the waiter should not panic"),
+            client.reachability(),
             Reachability::Finished,
-            "and say so, rather than reporting a connection that is not coming"
+            "and that outranks whatever the socket still says"
         );
     }
 
-    // A shutdown is terminal without any stream error, and reaches the parked
-    // wait through the same notifier.
-    let client = create_reachable_wait_test_client("terminal-shutdown").await;
+    // Parked first, on a client that is merely between connections, so the only
+    // thing that can end this wait is the transition under test.
+    let client = crate::test_utils::create_test_client_with_name("terminal-parked").await;
+    client.is_running.store(true, Ordering::Relaxed);
     let waiter = {
         let client = Arc::clone(&client);
         tokio::spawn(async move { client.wait_until_reachable().await })
     };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+    assert!(!waiter.is_finished(), "parked, with no verdict yet");
+
+    // A shutdown is terminal without any stream error, and reaches the parked
+    // wait through the same notifier.
     client.signal_shutdown_sync();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
             .expect("a shutdown must release the wait")
             .expect("the waiter should not panic"),
-        Reachability::Finished
+        Reachability::Finished,
+        "reporting that no connection is coming, rather than that none arrived yet"
     );
 }
 
@@ -6934,11 +6937,16 @@ async fn a_client_with_no_reader_is_told_rather_than_parked() {
 async fn a_pause_ends_the_public_wait_and_not_the_internal_one() {
     let client = create_reachable_wait_test_client("paused").await;
 
+    // Paused before the internal waiter starts, so it parks on the pause rather
+    // than racing the connection this call tears down.
+    client.pause().await;
+    assert_eq!(client.reachability(), Reachability::Paused);
+
     let internal = {
         let client = Arc::clone(&client);
         tokio::spawn(async move { client.await_connection().await })
     };
-    client.pause().await;
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
 
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), client.wait_until_reachable())

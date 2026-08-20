@@ -2120,9 +2120,15 @@ pub enum Reachability {
     /// Nothing is reading this client, so no answer would be decoded and no
     /// reconnect will be attempted. Not terminal — the application may still
     /// drive it — but waiting cannot be what fixes it.
+    ///
+    /// Outranks [`Self::Paused`] where both hold: a paused client with no
+    /// reader has nothing to reconnect it either way, and reporting the pause
+    /// would park a wait on a resume that cannot end it. [`Client::run`] parks
+    /// on a pause rather than refusing it, so starting a reader is safe here.
     Unsupervised,
     /// The session is over for good: shut down, logged out, replaced, or
-    /// refused in a way no reconnect recovers. Build a new client.
+    /// refused in a way no reconnect recovers. Nothing brings one back on its
+    /// own.
     Finished,
 }
 
