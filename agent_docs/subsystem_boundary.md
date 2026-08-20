@@ -330,6 +330,14 @@ core, so the guard caps how many. VoIP's is 9 outside the files it owns, and
 raising it is meant to be a decision with a line in this document behind it. The
 cap counts production and test gates together, because telling them apart needs
 a parser the guard does not have and a new gate is worth a look either way.
+
+It counts the `feature = "..."` term rather than a whole `cfg(feature = "...")`,
+so a composite gate counts as well. That matters because the budget sits at
+exactly the current count, so the next gate fails the test, and the cheapest way
+out of that failure is to write the gate as `all(...)`. rustfmt already splits
+such a gate across lines and leaves the term on one of its own, which the
+narrower spelling would not have seen at all. Matching the term also counts
+`not(feature = "...")`, which is still core code conditioned on the subsystem.
 Without this, the 29-to-5 result above had nothing holding it: the next change
 could spend it back one `Client` field at a time, and human review is exactly
 what let the original 314 accumulate.

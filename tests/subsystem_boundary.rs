@@ -77,6 +77,19 @@ struct Disciplined {
     budget: usize,
 }
 
+/// Whether `line` conditions something on `feature`.
+///
+/// Matches the `feature = "..."` term rather than a whole `cfg(feature = "...")`,
+/// so a composite gate counts too. That is not hypothetical: rustfmt splits
+/// `#[cfg(all(feature = "voip-runtime", any(...)))]` across lines and leaves the
+/// term on one of its own, and the budget below sits at exactly the current
+/// count, so the cheapest way out of a failure is to write the new gate as
+/// `all(...)`. Matching the term also counts `not(feature = "...")`, which is
+/// still core code conditioned on the subsystem.
+fn names_feature(line: &str, feature: &str) -> bool {
+    line.contains(&format!("feature = \"{feature}\""))
+}
+
 const DISCIPLINED: &[Disciplined] = &[Disciplined {
     feature: "voip-runtime",
     owns: &["src/voip", "src/client/voip.rs", "src/handlers/call.rs"],
@@ -110,7 +123,6 @@ fn a_disciplined_subsystem_does_not_creep_back_into_the_core() {
     sources.sort();
 
     for subsystem in DISCIPLINED {
-        let needle = format!("cfg(feature = \"{}\")", subsystem.feature);
         let mut gates = Vec::new();
 
         for path in &sources {
@@ -130,7 +142,7 @@ fn a_disciplined_subsystem_does_not_creep_back_into_the_core() {
             let source =
                 std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {relative}: {e}"));
             for (index, line) in source.lines().enumerate() {
-                if line.contains(&needle) {
+                if names_feature(line, subsystem.feature) {
                     gates.push(format!("  {relative}:{}", index + 1));
                 }
             }
@@ -223,6 +235,42 @@ fn the_core_does_not_name_a_cuttable_subsystem() {
         "subsystem boundary violated:\n  {}",
         violations.join("\n  ")
     );
+}
+
+#[cfg(test)]
+mod gate {
+    use super::names_feature;
+
+    /// Every form a gate takes in this tree, including the one rustfmt produces.
+    #[test]
+    fn a_gate_is_counted_however_it_is_written() {
+        for line in [
+            "#[cfg(feature = \"voip-runtime\")]",
+            "#[cfg(all(feature = \"voip-runtime\", not(target_arch = \"wasm32\")))]",
+            "    feature = \"voip-runtime\",",
+            "#[cfg(not(feature = \"voip-runtime\"))]",
+            "#[cfg_attr(feature = \"voip-runtime\", allow(dead_code))]",
+        ] {
+            assert!(
+                names_feature(line, "voip-runtime"),
+                "{line:?} conditions on the feature and has to count"
+            );
+        }
+    }
+
+    #[test]
+    fn another_feature_is_not() {
+        for line in [
+            "#[cfg(feature = \"voip\")]",
+            "#[cfg(feature = \"voip-encoded\")]",
+            "// voip-runtime is the native media plane",
+        ] {
+            assert!(
+                !names_feature(line, "voip-runtime"),
+                "{line:?} does not condition on the feature"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
