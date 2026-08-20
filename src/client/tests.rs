@@ -6730,3 +6730,49 @@ mod ensure_sessions_concurrency {
         assert_eq!(client.ensure_inflight.len(), 0);
     }
 }
+
+/// Reproduction: a client between connections and a client that is finished
+/// refuse the same public call with the same error, so nothing in what the
+/// caller gets back separates "this comes back on its own" from "stop trying".
+///
+/// The two clients differ only in the state the reconnect loop reads, which is
+/// exactly what [`Client::reachability`] reports and the error does not.
+#[tokio::test]
+async fn a_reconnecting_client_and_a_finished_one_refuse_a_call_identically() {
+    let reconnecting = crate::test_utils::create_test_client().await;
+    reconnecting.is_running.store(true, Ordering::Relaxed);
+
+    let finished = crate::test_utils::create_test_client().await;
+    finished.is_running.store(true, Ordering::Relaxed);
+    finished.enable_auto_reconnect.store(false, Ordering::Relaxed);
+    finished.expected_disconnect.store(true, Ordering::Relaxed);
+
+    let jid = wacore_binary::Jid::pn("12025550111");
+    let transient = reconnecting
+        .contacts()
+        .get_user_info(std::slice::from_ref(&jid))
+        .await
+        .expect_err("a client with no socket cannot answer a usync");
+    let terminal = finished
+        .contacts()
+        .get_user_info(std::slice::from_ref(&jid))
+        .await
+        .expect_err("nor can one that is finished");
+
+    assert_eq!(
+        transient.to_string(),
+        terminal.to_string(),
+        "the error is the same on both, which is the gap being closed"
+    );
+
+    assert_eq!(
+        reconnecting.reachability(),
+        Reachability::Reconnecting,
+        "a client whose loop is still trying is worth waiting for"
+    );
+    assert_eq!(
+        finished.reachability(),
+        Reachability::Finished,
+        "a finished one never is"
+    );
+}
