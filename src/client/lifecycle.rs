@@ -1992,6 +1992,138 @@ impl Client {
             // same verdict.
             && !self.is_paused()
     }
+
+    /// What the client's connection state means for work handed to it now.
+    ///
+    /// The one place the connection state is turned into an answer, so a
+    /// caller never has to assemble one from the individual flags — and so a
+    /// condition added later is classified once rather than once per reader.
+    ///
+    /// Terminal is asked first. The two are not mutually exclusive during a
+    /// teardown: the stream-error paths set the terminal flags before they
+    /// clear `is_logged_in` and close the transport, so asking about
+    /// reachability first hands out a connection that is already ending.
+    ///
+    /// Reads flags and nothing else, so it costs the same whether the answer
+    /// is acted on or discarded.
+    pub fn reachability(&self) -> Reachability {
+        if self.is_terminal() {
+            return Reachability::Finished;
+        }
+        if self.can_reach_server() {
+            return Reachability::Reachable;
+        }
+        // A client with no supervision loop has no reader, so nothing will ever
+        // answer an IQ and no `<success>` will ever arrive. Not terminal — the
+        // connection is fine and the application may still use it — but nothing
+        // is going to change it either.
+        if !self.is_running.load(Ordering::Relaxed) {
+            return Reachability::Unsupervised;
+        }
+        if self.is_paused() {
+            return Reachability::Paused;
+        }
+        Reachability::Reconnecting
+    }
+
+    /// Park until [`Self::reachability`] settles, per
+    /// [`Reachability::settles`].
+    ///
+    /// Both notifiers are registered before the re-check, so a transition
+    /// landing in the gap is not missed. Socket readiness alone is not enough
+    /// to wait on: it fires before login, and nothing fires at all when the
+    /// client stops without a replacement socket. A notification that does not
+    /// settle the question simply loops — the wait ends on the state, never on
+    /// one event, which is also what keeps a wait won just before a teardown
+    /// from being handed a connection that is already going.
+    pub(crate) async fn wait_for_reachability(&self, park_through_pause: bool) -> Reachability {
+        loop {
+            let verdict = self.reachability();
+            if verdict.settles(park_through_pause) {
+                return verdict;
+            }
+            let ready = self.socket_ready_notifier.listen();
+            let session = self.session_state_notifier.listen();
+            let verdict = self.reachability();
+            if verdict.settles(park_through_pause) {
+                return verdict;
+            }
+            futures::pin_mut!(ready);
+            futures::pin_mut!(session);
+            futures::future::select(ready, session).await;
+        }
+    }
+}
+
+/// Whether work handed to the client right now can reach the server, and when
+/// it cannot, what a caller should do about it.
+///
+/// Reported by [`Client::reachability`] and settled by
+/// [`Client::wait_until_reachable`]. The error a refused call returns says what
+/// happened to that attempt; this says what the client is, which is the only
+/// thing that answers "is it worth asking again".
+///
+/// Deliberately a state and not a property of the error. A refusal is a fact
+/// about one instant, and by the time a caller reads it the client may already
+/// have moved on — the connection lost right after a call was admitted, or
+/// restored right after one was refused. Anything derived from the error would
+/// be a snapshot that is stale on arrival; this is re-read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Reachability {
+    /// A request sent now has a socket, an authenticated session and a reader
+    /// to decode the answer.
+    Reachable,
+    /// Between connections, with something driving the client back to one.
+    /// Nothing is re-sent by that: recovery restores the ability to ask, not
+    /// the request that was refused.
+    Reconnecting,
+    /// [`Client::pause`] is in effect. Like [`Self::Reconnecting`] the client
+    /// is not finished, but the thing that ends it is [`Client::resume`], and
+    /// only the application knows when that comes.
+    Paused,
+    /// Nothing is reading this client, so no answer would be decoded and no
+    /// reconnect will be attempted. Not terminal — the application may still
+    /// drive it — but waiting cannot be what fixes it.
+    Unsupervised,
+    /// The session is over for good: shut down, logged out, replaced, or
+    /// refused in a way no reconnect recovers. Build a new client.
+    Finished,
+}
+
+impl Reachability {
+    /// Whether a request sent now can be answered.
+    pub fn is_reachable(self) -> bool {
+        matches!(self, Self::Reachable)
+    }
+
+    /// Whether the client is expected to become [`Self::Reachable`] again with
+    /// no further action from the caller, which is what makes waiting the right
+    /// response rather than giving up.
+    ///
+    /// False for [`Self::Paused`]: the client does come back, but on the
+    /// application's word rather than on its own.
+    pub fn recovers_on_its_own(self) -> bool {
+        matches!(self, Self::Reconnecting)
+    }
+
+    /// Whether this is an answer a wait can stop on.
+    ///
+    /// `park_through_pause` is the one policy the two waits differ by. Work
+    /// the client re-issues for itself has nothing to hand a caller and nobody
+    /// to re-issue it later, so it sits through a pause the same way it sits
+    /// through a 900s backoff. A caller waiting on its own behalf is the side
+    /// that decides to resume, so it is told instead.
+    ///
+    /// Matched exhaustively so a state added later has to be classified here
+    /// rather than defaulting to "keep waiting" unnoticed.
+    fn settles(self, park_through_pause: bool) -> bool {
+        match self {
+            Self::Reachable | Self::Finished | Self::Unsupervised => true,
+            Self::Paused => !park_through_pause,
+            Self::Reconnecting => false,
+        }
+    }
 }
 
 /// An established connection that nothing is reading yet.

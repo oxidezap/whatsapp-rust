@@ -141,7 +141,7 @@ pub use client::{
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
-pub use client::{ConnectError, ConnectStage, SignalMaintenanceError};
+pub use client::{ConnectError, ConnectStage, Reachability, SignalMaintenanceError};
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
 pub mod download;

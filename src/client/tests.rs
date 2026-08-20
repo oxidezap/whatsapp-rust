@@ -6744,10 +6744,12 @@ async fn a_reconnecting_client_and_a_finished_one_refuse_a_call_identically() {
 
     let finished = crate::test_utils::create_test_client().await;
     finished.is_running.store(true, Ordering::Relaxed);
-    finished.enable_auto_reconnect.store(false, Ordering::Relaxed);
+    finished
+        .enable_auto_reconnect
+        .store(false, Ordering::Relaxed);
     finished.expected_disconnect.store(true, Ordering::Relaxed);
 
-    let jid = wacore_binary::Jid::pn("12025550111");
+    let jid = Jid::pn("12025550111");
     let transient = reconnecting
         .contacts()
         .get_user_info(std::slice::from_ref(&jid))

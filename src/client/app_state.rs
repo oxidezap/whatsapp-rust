@@ -1148,69 +1148,19 @@ impl Client {
 
     /// Wait until there is a connection to work on, or the client is finished.
     ///
-    /// Returns whether one arrived. Bounded by the client's own lifetime rather
-    /// than by a duration: every number tried here was wrong in one direction or
-    /// the other, because the reconnect backoff is jittered, capped at 900s, and
-    /// followed by a handshake — there is no honest constant. Terminal is the
-    /// condition that actually means "stop waiting", and it is already tracked.
+    /// Returns whether one arrived. The internal half of
+    /// [`Client::wait_until_reachable`], differing only in sitting through a
+    /// pause: nothing on the next connection re-issues a consumer's task, so
+    /// giving up there would drop a full-sync request outright rather than
+    /// defer it, and a pause is the same shape as the backoff this already
+    /// waits out — offline now, connected later.
     ///
-    /// Waits for [`Self::can_reach_server`], not for `Connected`: the caller's
-    /// question is whether its IQ can be sent and answered, and the `Connected`
-    /// notifier additionally waits for the critical sync, so a retry would sit
-    /// through a bootstrap it may itself be part of.
+    /// Waits for `can_reach_server`, not for `Connected`: the caller's question
+    /// is whether its IQ can be sent and answered, and the `Connected` notifier
+    /// additionally waits for the critical sync, so a retry would sit through a
+    /// bootstrap it may itself be part of.
     pub(crate) async fn await_connection(&self) -> bool {
-        loop {
-            if let Some(verdict) = self.connection_wait_verdict() {
-                return verdict;
-            }
-            // Both registered before the re-check, so a transition landing in the
-            // gap is not missed. Socket readiness alone is not enough to wait on:
-            // it fires before login, and nothing fires at all when the client
-            // stops without a replacement socket — a wait on it alone parks
-            // forever, holding the `Arc<Client>` whose drop is the only other
-            // way this task ends.
-            let ready = self.socket_ready_notifier.listen();
-            let session = self.session_state_notifier.listen();
-            if let Some(verdict) = self.connection_wait_verdict() {
-                return verdict;
-            }
-            futures::pin_mut!(ready);
-            futures::pin_mut!(session);
-            // A notification that does not settle the question simply loops: the
-            // wait ends on the state, never on one event.
-            futures::future::select(ready, session).await;
-        }
-    }
-
-    /// Whether [`Self::await_connection`] can stop, and with what answer.
-    fn connection_wait_verdict(&self) -> Option<bool> {
-        // Terminal first. The two are not mutually exclusive during a teardown:
-        // the stream-error paths set the terminal flags before they clear
-        // `is_logged_in` and close the transport, so asking about reachability
-        // first hands out a connection that is already ending.
-        if self.is_terminal() {
-            return Some(false);
-        }
-        if self.can_reach_server() {
-            return Some(true);
-        }
-        // A client with no supervision loop has no reader, so nothing will ever
-        // answer an IQ and no `<success>` will ever arrive. That is not terminal
-        // — the connection is fine and the application may still use it — but it
-        // is unwaitable, and the alternative is parking until the process ends.
-        if !self.is_running.load(Ordering::Relaxed) {
-            return Some(false);
-        }
-        // A pause deliberately gets no branch of its own. It is not terminal —
-        // the application means to come back — and nothing on the next
-        // connection re-issues a consumer's task, so giving up here would drop
-        // a full-sync request outright rather than defer it. Waiting is already
-        // what this does for a 900s backoff, and a pause is the same shape:
-        // offline now, connected later, bounded by the client's lifetime. The
-        // window where the pause is still tearing down is handled where it
-        // belongs, in `can_reach_server`, so a paused client never reads as
-        // reachable while it waits.
-        None
+        self.wait_for_reachability(true).await.is_reachable()
     }
 
     /// Open a scope for work starting now on the live connection.
@@ -5233,7 +5183,7 @@ mod sync_outcome_tests {
         client.expected_disconnect.store(true, Ordering::Relaxed);
 
         assert!(client.is_terminal());
-        assert_eq!(client.connection_wait_verdict(), Some(false));
+        assert_eq!(client.reachability(), Reachability::Finished);
 
         // The window is now closed at the source rather than ordered around:
         // `can_reach_server()` rejects a socket marked for retirement, and every
@@ -5281,8 +5231,8 @@ mod sync_outcome_tests {
         let current = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
         assert!(!client.can_reach_server());
         assert_eq!(
-            client.connection_wait_verdict(),
-            None,
+            client.reachability(),
+            Reachability::Reconnecting,
             "the wait carries on"
         );
 
@@ -5290,7 +5240,7 @@ mod sync_outcome_tests {
         client
             .authenticated_generation
             .store(current, Ordering::SeqCst);
-        assert_eq!(client.connection_wait_verdict(), Some(true));
+        assert_eq!(client.reachability(), Reachability::Reachable);
     }
 }
 
@@ -5459,8 +5409,8 @@ mod retiring_socket_tests {
             "which is not the same as the client being finished"
         );
         assert_eq!(
-            client.connection_wait_verdict(),
-            None,
+            client.reachability(),
+            Reachability::Reconnecting,
             "so the wait carries on to the replacement"
         );
     }
