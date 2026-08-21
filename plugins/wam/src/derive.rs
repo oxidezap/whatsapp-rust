@@ -210,10 +210,17 @@ pub fn message_receive(info: &MessageInfo) -> events::MessageReceive {
 /// is allowed to hold one.
 fn receipt_item_count(node: &NodeRef<'_>, is_view: bool) -> usize {
     // The aggregated shape names one peer per `<user>` and carries no `<list>`.
+    // A `<user>` whose `jid` does not parse is not counted, because the client's
+    // own parser drops it (`parse_participants` reads the jid with `?`) and the
+    // receipt pipeline emits nothing for it. Counting it would report an
+    // acknowledgement this client never identified, let alone processed.
     if let Some(participants) = node.get_optional_child("participants") {
-        return participants
-            .children()
-            .map_or(0, |users| users.iter().filter(|c| c.tag == "user").count());
+        return participants.children().map_or(0, |users| {
+            users
+                .iter()
+                .filter(|c| c.tag == "user" && c.attrs().optional_jid("jid").is_some())
+                .count()
+        });
     }
     // A view receipt names its ids as `server_id` and does not acknowledge the
     // stanza's own `id`; every other type does both. This is the rule the
@@ -231,6 +238,38 @@ fn receipt_item_count(node: &NodeRef<'_>, is_view: bool) -> usize {
                 .count()
         });
     listed + usize::from(!is_view)
+}
+
+/// What one aggregated receipt's `<user>` entries agree on, if anything.
+///
+/// `None` when the stanza is not the aggregated shape. Only entries the client
+/// itself would keep are consulted, for the same reason the count skips the
+/// rest: an entry it drops is not part of what the stanza did to this client.
+enum AggregatedType {
+    Agreed(String),
+    Mixed,
+}
+
+fn aggregated_receipt_type(node: &NodeRef<'_>) -> Option<AggregatedType> {
+    let participants = node.get_optional_child("participants")?;
+    let mut agreed: Option<String> = None;
+    for user in participants.children()?.iter().filter(|c| c.tag == "user") {
+        let mut attrs = user.attrs();
+        if attrs.optional_jid("jid").is_none() {
+            continue;
+        }
+        // A `<user>` with no type of its own is a delivery entry, the same
+        // default the stanza attribute carries.
+        let named = attrs
+            .optional_string("type")
+            .map_or_else(|| "delivery".to_string(), |t| t.into_owned());
+        match &agreed {
+            Some(seen) if *seen != named => return Some(AggregatedType::Mixed),
+            Some(_) => {}
+            None => agreed = Some(named),
+        }
+    }
+    Some(agreed.map_or(AggregatedType::Mixed, AggregatedType::Agreed))
 }
 
 /// `ReceiptStanzaReceive` for one inbound `<receipt>` stanza.
@@ -253,21 +292,48 @@ fn receipt_item_count(node: &NodeRef<'_>, is_view: bool) -> usize {
 pub fn receipt_stanza_receive(node: &NodeRef<'_>) -> Option<events::ReceiptStanzaReceive> {
     let raw_type = node.attrs().optional_string("type");
     // A `<receipt>` with no `type` is a delivery receipt, which is why the
-    // official client sends that one as a dropped attribute.
-    let raw_type = raw_type.as_deref().unwrap_or("delivery");
-    let named = match ReceiptType::parse(raw_type) {
+    // official client sends that one as a dropped attribute. The
+    // aggregated-by-message shape is the exception and it is not one stanza's
+    // worth of one type: the attribute is absent because each `<user>` carries
+    // its own, and the client fans out one event per user with that user's
+    // type. Reading the absence as `delivery` would put a type on the wire that
+    // a stanza carrying read and inactive entries never had, so the type comes
+    // from the children when they agree and is left absent when they do not.
+    let aggregated_type = aggregated_receipt_type(node);
+    let raw_type = match (&raw_type, &aggregated_type) {
+        (Some(named), _) => Some(named.as_ref()),
+        (None, Some(AggregatedType::Agreed(named))) => Some(named.as_str()),
+        (None, Some(AggregatedType::Mixed)) => None,
+        (None, None) => Some("delivery"),
+    };
+    let named = match raw_type.map(ReceiptType::parse) {
+        // A mixed aggregate has no one type to report, and the field is
+        // optional, so it goes out without one rather than with a wrong one.
+        None => {
+            return Some(events::ReceiptStanzaReceive {
+                receipt_stanza_total_count: i64::try_from(receipt_item_count(node, false)).ok(),
+                receipt_stanza_stage: Some(enums::ReceiptStanzaStage::Overall),
+                ..Default::default()
+            });
+        }
+        Some(parsed) => parsed,
+    };
+    let named = match named {
         // `view` has no variant of its own because the client branches on the
         // string rather than on a parsed type, but it is a type this client
         // names: that same branch is what decides which attribute the ids below
         // are read from.
-        ReceiptType::Other(_) if raw_type == "view" => "view".to_string(),
+        ReceiptType::Other(_) if raw_type == Some("view") => "view".to_string(),
         ReceiptType::Other(_) => return None,
         known => known.as_wire_str().to_string(),
     };
     Some(events::ReceiptStanzaReceive {
         receipt_stanza_type: Some(named),
-        receipt_stanza_total_count: i64::try_from(receipt_item_count(node, raw_type == "view"))
-            .ok(),
+        receipt_stanza_total_count: i64::try_from(receipt_item_count(
+            node,
+            raw_type == Some("view"),
+        ))
+        .ok(),
         receipt_stanza_stage: Some(enums::ReceiptStanzaStage::Overall),
         ..Default::default()
     })
@@ -519,6 +585,66 @@ mod tests {
         let node = receipt(&[("type", "delivery")], Some(users));
         let event = derive_receipt(&node).expect("delivery is a type this client names");
         assert_eq!(event.receipt_stanza_total_count, Some(3));
+    }
+
+    #[test]
+    fn an_aggregated_user_the_client_cannot_identify_is_not_counted() {
+        // `parse_participants` reads the jid with `?`, so an entry without a
+        // parseable one is dropped and the receipt pipeline emits nothing for
+        // it. Counting it would report an acknowledgement this client never
+        // identified.
+        let users = NodeBuilder::new("participants")
+            .attr("id", "AGG")
+            .children([
+                NodeBuilder::new("user")
+                    .attr("jid", "15550000001@s.whatsapp.net")
+                    .build(),
+                NodeBuilder::new("user").attr("t", "1700000000").build(),
+            ])
+            .build();
+        let node = receipt(&[("type", "delivery")], Some(users));
+        let event = derive_receipt(&node).expect("delivery is a type this client names");
+        assert_eq!(event.receipt_stanza_total_count, Some(1));
+    }
+
+    #[test]
+    fn a_mixed_aggregate_is_reported_without_a_type_rather_than_as_delivery() {
+        // The aggregated-by-message shape carries no top-level `type`, because
+        // each `<user>` has its own. Reading the absence as `delivery` puts a
+        // type on the wire the stanza never had.
+        let users = NodeBuilder::new("participants")
+            .attr("message_id", "REAL-MSG-ID")
+            .children([
+                NodeBuilder::new("user")
+                    .attr("jid", "15550000001@lid")
+                    .attr("type", "delivery")
+                    .build(),
+                NodeBuilder::new("user")
+                    .attr("jid", "15550000002@lid")
+                    .attr("type", "read")
+                    .build(),
+            ])
+            .build();
+        let node = receipt(&[], Some(users));
+        let event = derive_receipt(&node).expect("a mixed aggregate is still one stanza");
+        assert_eq!(event.receipt_stanza_type, None);
+        assert_eq!(event.receipt_stanza_total_count, Some(2));
+    }
+
+    #[test]
+    fn an_aggregate_whose_users_agree_reports_the_type_they_agree_on() {
+        let users = NodeBuilder::new("participants")
+            .attr("message_id", "REAL-MSG-ID")
+            .children((0..2).map(|i| {
+                NodeBuilder::new("user")
+                    .attr("jid", format!("1555000000{i}@lid"))
+                    .attr("type", "read")
+                    .build()
+            }))
+            .build();
+        let node = receipt(&[], Some(users));
+        let event = derive_receipt(&node).expect("read is a type this client names");
+        assert_eq!(event.receipt_stanza_type, Some("read".to_string()));
     }
 
     #[test]

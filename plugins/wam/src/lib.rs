@@ -358,7 +358,14 @@ fn spawn_flush_loop(
     parked_writer: Arc<Mutex<Option<WamWriter>>>,
 ) -> Result<()> {
     let worker = tasks.clone();
-    tasks.spawn(async move {
+    // Cooperative, not the default abort mode. An aborted task's future is
+    // dropped where it is suspended, which for this loop is inside `sleep`,
+    // before it reaches the parking step below. The shutdown flush would then
+    // find no writer and start a fresh one, which saves the queue and loses the
+    // buffer already being filled: exactly what the flush exists to persist.
+    // Cooperative shutdown makes `sleep` return an error instead, so the loop
+    // leaves through its own bottom and hands the buffer over.
+    tasks.spawn_cooperative(async move {
         let mut writer = WamWriter::default();
         while worker.sleep(BUFFERING_INTERVAL).await.is_ok() {
             let now = whatsapp_rust::wacore::time::now_utc().timestamp();

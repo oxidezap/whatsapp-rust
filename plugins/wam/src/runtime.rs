@@ -398,6 +398,21 @@ impl WamRuntime {
         }));
     }
 
+    /// Report a loss the store caused, the way the official client does.
+    ///
+    /// Its own field rather than the drop counter, because the two name
+    /// different faults: a drop is this runtime abandoning a buffer it could
+    /// have kept, and this is the store refusing to hold one or to hand out the
+    /// sequence number it needs. Queued rather than only counted locally, so the
+    /// telemetry that eventually uploads says why the gap in it is there; the
+    /// report rides a later buffer, which is the only kind that can carry it.
+    fn report_store_error(&self) {
+        self.observe(PendingEvent::WamClientErrors(events::WamClientErrors {
+            wam_client_buffer_store_error_count: Some(1),
+            ..Default::default()
+        }));
+    }
+
     /// Write the queued events into a buffer and upload it when it is due.
     ///
     /// `now_secs` and `roll` are parameters rather than reads of a global clock
@@ -452,6 +467,7 @@ impl WamRuntime {
                     Some(buffer) => writer.current = Some(buffer),
                     None => {
                         self.lock().stats.unbuffered += 1;
+                        self.report_store_error();
                         continue;
                     }
                 }
@@ -641,7 +657,7 @@ impl WamRuntime {
             Err(err) => {
                 warn!("wam: cannot retain a buffer without reading the retained set: {err}");
                 self.lock().stats.discarded += 1;
-                self.report_buffer_drop();
+                self.report_store_error();
                 return;
             }
         };
@@ -659,7 +675,12 @@ impl WamRuntime {
             self.report_buffer_drop();
             return;
         }
-        let key = next_key(&pending);
+        let Some(key) = next_key(&pending) else {
+            warn!("wam: no free key is left in the retained set, dropping a buffer");
+            self.lock().stats.discarded += 1;
+            self.report_store_error();
+            return;
+        };
         if let Err(err) = self
             .store
             .put_pending(PendingBuffer {
@@ -671,6 +692,7 @@ impl WamRuntime {
         {
             warn!("wam: could not retain a buffer: {err}");
             self.lock().stats.discarded += 1;
+            self.report_store_error();
         }
     }
 
@@ -780,13 +802,19 @@ enum Delivery {
 /// not know about them would hand out a key one of them already holds, which the
 /// store's insert semantics turn into an undelivered buffer being overwritten.
 /// The caller already has the list, since the retention cap is computed from it.
-fn next_key(pending: &[PendingBuffer]) -> u64 {
+///
+/// `None` when the highest key in use is already the largest a key can be.
+/// Saturating there would hand back that same occupied key and let the store's
+/// insert semantics overwrite the buffer holding it, which is the loss this
+/// function exists to prevent; a store keyed by something like a timestamp can
+/// reach the top without ever having retained many buffers.
+fn next_key(pending: &[PendingBuffer]) -> Option<u64> {
     pending
         .iter()
         .map(|b| b.key)
         .max()
         .unwrap_or(0)
-        .saturating_add(1)
+        .checked_add(1)
 }
 
 /// How long to wait before the next upload attempt, in seconds, after
@@ -1536,6 +1564,43 @@ mod tests {
         );
     }
 
+    /// A loss the store caused is not a loss this runtime chose. The catalog
+    /// has a field for each, and only the local counter used to move, so the
+    /// telemetry that eventually uploaded never said why it had a gap.
+    #[tokio::test]
+    async fn a_store_that_loses_a_buffer_says_so_in_the_telemetry() {
+        let store = Arc::new(BlindStore::new());
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([Err(UploadFailure::retryable("503"))]);
+
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Final,
+            )
+            .await;
+
+        assert_eq!(runtime.stats().discarded, 1);
+        let reported = runtime.queued();
+        assert_eq!(reported.len(), 1, "the loss is queued for a later buffer");
+        let PendingEvent::WamClientErrors(report) = &reported[0] else {
+            panic!(
+                "a store loss is reported as a client error, got {:?}",
+                reported[0]
+            );
+        };
+        assert_eq!(report.wam_client_buffer_store_error_count, Some(1));
+        assert_eq!(
+            report.wam_client_buffer_drop_error_count, None,
+            "the store refusing to hold a buffer is not this runtime dropping one"
+        );
+    }
+
     #[tokio::test]
     async fn a_store_that_cannot_be_read_does_not_get_a_guessed_key() {
         // A failed read is not an empty store. Retaining under a guessed key
@@ -1780,13 +1845,16 @@ mod tests {
 
     #[test]
     fn next_key_clears_every_key_already_in_use() {
-        assert_eq!(next_key(&[]), 1);
+        assert_eq!(next_key(&[]), Some(1));
         let held = |key| PendingBuffer {
             key,
             channel: Channel::Regular,
             bytes: Vec::new(),
         };
-        assert_eq!(next_key(&[held(1), held(7), held(3)]), 8);
+        assert_eq!(next_key(&[held(1), held(7), held(3)]), Some(8));
+        // The top of the range is not a key to hand out again: saturating there
+        // would return the one the buffer at `u64::MAX` already holds.
+        assert_eq!(next_key(&[held(u64::MAX)]), None);
     }
 
     #[test]

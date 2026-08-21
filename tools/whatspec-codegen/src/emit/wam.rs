@@ -275,6 +275,19 @@ fn globals_module(ir: &WamIr, enums: &BTreeMap<String, String>) -> Result<String
                 .trim_start_matches("ValueKind::")
                 .to_lowercase(),
         };
+        // Same two-byte ceiling the event fields are held to, and for the same
+        // reason: a descriptor spells a wide id in two bytes, so a global past
+        // that would be written under a truncated one. Checked here rather than
+        // trusted, because a global is the one descriptor whose id comes from a
+        // separate bundle module and could grow on its own.
+        if g.id > u32::from(u16::MAX) {
+            bail!(
+                "WAM global {:?} has id {}, which does not fit the buffer \
+                 format's two-byte descriptor id",
+                g.name,
+                g.id,
+            );
+        }
         out.push_str(&format!(
             "    /// `{}` (id {}, {}).\n    pub const {}: GlobalDef = GlobalDef {{\n        name: {},\n        id: {},\n        kind: {},\n        channels: {},\n    }};\n\n",
             g.name,
