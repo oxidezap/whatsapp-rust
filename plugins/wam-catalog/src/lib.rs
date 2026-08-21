@@ -255,6 +255,19 @@ const CLASS_STR32: u8 = 160;
 /// no `defineGlobal` declares it, because the runtime writes it directly, so
 /// there is no upstream record for the extractor to read and this constant is
 /// this repository's own reading of the writer.
+/// The protocol version as the header byte carries it.
+///
+/// Narrowed once, in a const block, so a catalog that starts declaring a version
+/// past a byte fails the build instead of stamping a truncated one on every
+/// buffer this client sends.
+const PROTOCOL_VERSION_BYTE: u8 = {
+    assert!(
+        constants::WAM_PROTOCOL_VERSION >= 0 && constants::WAM_PROTOCOL_VERSION <= u8::MAX as i64,
+        "the WAM protocol version no longer fits the one byte the header gives it"
+    );
+    constants::WAM_PROTOCOL_VERSION as u8
+};
+
 pub const TIMESTAMP_FIELD: u32 = 47;
 
 /// The wire id of the beaconing event sequence number.
@@ -318,7 +331,7 @@ impl WamBuffer {
     pub fn new(channel: Channel, stream_id: u8, sequence: u16) -> Self {
         let mut bytes = Vec::with_capacity(256);
         bytes.extend_from_slice(b"WAM");
-        bytes.push(constants::WAM_PROTOCOL_VERSION as u8);
+        bytes.push(PROTOCOL_VERSION_BYTE);
         bytes.push(stream_id);
         bytes.extend_from_slice(&sequence.to_le_bytes());
         bytes.push(channel.wire());
@@ -478,6 +491,15 @@ impl WamBuffer {
     /// the flag byte landed, so the group-end bit can be set on whichever record
     /// turns out to be the last one written.
     fn write_descriptor(&mut self, id: u32, flags: u8) -> usize {
+        // The wide form is two bytes, so the format itself cannot carry a larger
+        // id and a catalog declaring one would be unencodable rather than merely
+        // unusual. The generator refuses to emit such an id, which is where this
+        // is really enforced; the assertion is here so a hand-written id in a
+        // test cannot pass silently.
+        debug_assert!(
+            id <= u32::from(u16::MAX),
+            "field id {id} does not fit the buffer format's two-byte id"
+        );
         let at = self.bytes.len();
         if id < 256 {
             self.bytes.push(flags);

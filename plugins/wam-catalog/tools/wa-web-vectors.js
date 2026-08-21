@@ -78,9 +78,9 @@ function emit(name, channel, seq, build) {
 // order (the object holding them is keyed by id, and JS iterates integer-like
 // keys numerically), then the event record and its fields. That is what reaches
 // the wire, so it is what the Rust encoder is compared against.
-const TS = 47;
+const TIMESTAMP_FIELD_ID = 47;
 function withEvent(b, globals, ts, code, weight, fields) {
-  const all = globals.concat([[TS, ts]]).sort((x, y) => x[0] - y[0]);
+  const all = globals.concat([[TIMESTAMP_FIELD_ID, ts]]).sort((x, y) => x[0] - y[0]);
   for (const [id, v] of all) proto.writeGlobalAttribute(b, id, v);
   proto.writeEvent(b, code, -weight, fields.length > 0);
   fields.forEach(([id, v], i) => proto.writeField(b, id, v, i < fields.length - 1));

@@ -118,7 +118,10 @@ fn every_string_length_class_matches_wa_web() {
     }
 
     // The long cases are asserted by prefix plus body, since a 64 KiB hex
-    // literal in a test file is unreadable and proves nothing extra.
+    // literal in a test file is unreadable and proves nothing extra. The space
+    // in the last prefix separates the descriptor from the four-byte length that
+    // class carries, which is the one place the split is not obvious; it is
+    // stripped before the comparison.
     let long: &[(usize, &str)] = &[
         (255, "57414d0501010000502fc02c9b6839780dff8601ff"),
         (256, "57414d0501010000502fc02c9b6839780dff96010001"),
@@ -427,4 +430,38 @@ fn the_catalog_covers_the_whole_declared_surface() {
     assert_eq!(constants::WAM_PROTOCOL_VERSION, 5);
     assert_eq!(constants::WAM_MAX_BUFFER_SIZE, 50_000);
     assert_eq!(constants::WAM_MAX_BUFFER_SIZE_FOR_UPLOAD, 64_000);
+}
+
+/// How many bytes a second event costs when `def` is set to the same value
+/// again between the two, on a `private` buffer.
+///
+/// The comparison this feeds is the point: a global the writer deduplicates
+/// costs the second event nothing, and one it rewrites costs it a record.
+fn private_repeat_cost(def: GlobalDef, value: GlobalValue<'_>) -> usize {
+    let mut buf = WamBuffer::new(Channel::Private, 1, 1);
+    buf.set_global(def, value.clone())
+        .expect("a private global on a private buffer");
+    buf.write_event(&events::TestAnonymousDaily {}, TS, 1)
+        .expect("a private event on a private buffer");
+    let after_first = buf.as_bytes().len();
+    buf.set_global(def, value)
+        .expect("a private global on a private buffer");
+    buf.write_event(&events::TestAnonymousDaily {}, TS, 1)
+        .expect("a private event on a private buffer");
+    buf.as_bytes().len() - after_first
+}
+
+#[test]
+fn the_private_stats_id_is_rewritten_before_every_event_and_another_global_is_not() {
+    // Not a WA Web vector: the harness produced no private-channel bytes, so
+    // this locks the exemption's behaviour rather than an exact encoding. The
+    // two globals are the same kind and the same length, so the whole difference
+    // between the two costs is the psId record the second event carries.
+    let ps_id = private_repeat_cost(globals::PS_ID, GlobalValue::Str("aaaa"));
+    let country = private_repeat_cost(globals::PS_COUNTRY_CODE, GlobalValue::Str("aaaa"));
+    assert!(
+        ps_id > country,
+        "psId must be rewritten before every event on a private buffer \
+         (psId cost {ps_id}, an ordinary private global cost {country})"
+    );
 }

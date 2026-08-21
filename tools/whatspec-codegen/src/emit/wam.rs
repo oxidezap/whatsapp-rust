@@ -117,7 +117,7 @@ fn catalog(ir: &WamIr, wa_version: &str, enums: &BTreeMap<String, String>) -> Re
          \n"
     ));
 
-    out.push_str(&constants(ir));
+    out.push_str(&constants(ir)?);
     out.push_str(&private_stats_ids(ir));
     out.push_str(&enum_module(ir, enums));
     out.push_str(&globals_module(ir, enums)?);
@@ -125,7 +125,7 @@ fn catalog(ir: &WamIr, wa_version: &str, enums: &BTreeMap<String, String>) -> Re
     Ok(out)
 }
 
-fn constants(ir: &WamIr) -> String {
+fn constants(ir: &WamIr) -> Result<String> {
     let mut out = String::new();
     out.push_str(
         "/// The literals `WAWebWamConstants` exports: the buffer's protocol version\n\
@@ -133,13 +133,47 @@ fn constants(ir: &WamIr) -> String {
          pub mod constants {\n",
     );
     for c in &ir.constants {
+        // The name is written out as an item name and inside a doc comment, so
+        // anything that is not a plain constant identifier would emit Rust this
+        // emitter did not intend. Failing is the only safe answer: the fix is a
+        // naming rule here, not a file that happens to compile.
+        if !is_screaming_snake(&c.name) {
+            bail!(
+                "WAM constant {:?} in {:?} is not a SCREAMING_SNAKE_CASE identifier, \
+                 so it cannot be emitted as one",
+                c.name,
+                c.module,
+            );
+        }
         out.push_str(&format!(
             "    /// `{}::{}`.\n    pub const {}: i64 = {};\n",
             c.module, c.name, c.name, c.value
         ));
     }
     out.push_str("}\n\n");
-    out
+    Ok(out)
+}
+
+/// Whether a bundle name is already a constant identifier: ASCII letters,
+/// digits and underscores, not starting with a digit, with no lowercase.
+fn is_screaming_snake(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The Rust type for an enum module the catalog declares.
+///
+/// A miss is a bundle that names an enum module in a field or a global without
+/// declaring it. Indexing would panic with the module name and no explanation;
+/// this says which one and where it was expected.
+fn enum_type<'a>(enums: &'a BTreeMap<String, String>, module: &str) -> Result<&'a str> {
+    match enums.get(module) {
+        Some(rust) => Ok(rust.as_str()),
+        None => bail!("WAM uses the enum module {module:?}, which the catalog does not declare"),
+    }
 }
 
 fn private_stats_ids(ir: &WamIr) -> String {
@@ -236,7 +270,7 @@ fn globals_module(ir: &WamIr, enums: &BTreeMap<String, String>) -> Result<String
     );
     for g in &ir.globals {
         let doc_type = match &g.kind {
-            WamValueKind::Enum { module } => format!("enum `{}`", enums[module]),
+            WamValueKind::Enum { module } => format!("enum `{}`", enum_type(enums, module)?),
             other => kind_expr(other)
                 .trim_start_matches("ValueKind::")
                 .to_lowercase(),
@@ -295,13 +329,25 @@ fn event_struct(e: &WamEventDef, enums: &BTreeMap<String, String>) -> Result<Str
     ));
     let mut fields = Vec::with_capacity(e.fields.len());
     for f in &e.fields {
+        // The buffer format spells a wide field id in two bytes, so an id past
+        // that is not encodable at all. Emitting it would produce a catalog
+        // whose events silently go out under a truncated id.
+        if f.id > u32::from(u16::MAX) {
+            bail!(
+                "WAM field {:?} on event {:?} has id {}, which does not fit the \
+                 buffer format's two-byte field id",
+                f.name,
+                e.name,
+                f.id,
+            );
+        }
         let ident = rust_ident(&f.name);
         let ty = match &f.kind {
             WamValueKind::Boolean => "bool".to_string(),
             WamValueKind::Integer | WamValueKind::Timer => "i64".to_string(),
             WamValueKind::Number => "f64".to_string(),
             WamValueKind::String => "String".to_string(),
-            WamValueKind::Enum { module } => format!("enums::{}", enums[module]),
+            WamValueKind::Enum { module } => format!("enums::{}", enum_type(enums, module)?),
         };
         let note = match &f.kind {
             WamValueKind::Timer => " A duration in milliseconds.",
@@ -315,13 +361,23 @@ fn event_struct(e: &WamEventDef, enums: &BTreeMap<String, String>) -> Result<Str
     }
     out.push_str("    }\n\n");
 
+    // Three, one per sampling cohort, and the catalog's own `WEIGHTS: [u32; 3]`
+    // depends on it. A bundle that starts declaring a different number has
+    // changed the sampling model, which is a thing to read before regenerating.
+    let [alpha, beta, release] = e.weights[..] else {
+        bail!(
+            "WAM event {:?} declares {} sampling weights, not the three the cohorts need",
+            e.name,
+            e.weights.len(),
+        );
+    };
     out.push_str(&format!(
         "    impl WamEvent for {rust} {{\n        const NAME: &'static str = {};\n        const CODE: u32 = {};\n        const CHANNEL: Channel = Channel::{channel};\n        const WEIGHTS: [u32; 3] = [{}, {}, {}];\n        const PRIVATE_STATS_ID: Option<i64> = {};\n\n        fn encode(&self, fields: &mut EventFields<'_>) {{\n",
         rust_lit(&e.name),
         e.code,
-        e.weights[0],
-        e.weights[1],
-        e.weights[2],
+        alpha,
+        beta,
+        release,
         match e.private_stats_id {
             Some(id) => format!("Some({id})"),
             None => "None".to_string(),
@@ -505,5 +561,43 @@ mod tests {
         ir.events[0].channel = "quantum".to_string();
         let err = generate(&ir, "2.3000.1").expect_err("an unencodable channel must fail");
         assert!(err.to_string().contains("unknown WAM channel"), "{err}");
+    }
+
+    #[test]
+    fn an_enum_module_no_enum_declares_fails_generation() {
+        let mut ir = ir();
+        ir.events[0].fields[1].kind = WamValueKind::Enum {
+            module: "WAWebWamEnumNobodyDeclares".to_string(),
+        };
+        let err = generate(&ir, "2.3000.1").expect_err("an undeclared enum module must fail");
+        assert!(
+            err.to_string().contains("WAWebWamEnumNobodyDeclares"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_weight_list_that_is_not_three_long_fails_generation() {
+        let mut ir = ir();
+        ir.events[0].weights = vec![1, 20];
+        let err = generate(&ir, "2.3000.1").expect_err("the three cohorts must hold");
+        assert!(err.to_string().contains("sampling weights"), "{err}");
+    }
+
+    #[test]
+    fn a_field_id_past_the_wire_format_fails_generation() {
+        let mut ir = ir();
+        ir.events[0].fields[0].id = 70_000;
+        let err = generate(&ir, "2.3000.1").expect_err("an unencodable field id must fail");
+        assert!(err.to_string().contains("two-byte field id"), "{err}");
+    }
+
+    #[test]
+    fn a_constant_name_that_is_not_an_identifier_fails_generation() {
+        let mut ir = ir();
+        ir.constants[0].name = "WAM VERSION: i64 = 0; //".to_string();
+        let err =
+            generate(&ir, "2.3000.1").expect_err("a name that is not an identifier must fail");
+        assert!(err.to_string().contains("SCREAMING_SNAKE_CASE"), "{err}");
     }
 }
