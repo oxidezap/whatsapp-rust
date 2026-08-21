@@ -1,4 +1,4 @@
-//! Auto-generated A/B-props registry (WhatsApp 2.3000.1044659339). DO NOT EDIT.
+//! Auto-generated A/B-props registry (WhatsApp 2.3000.1045368834). DO NOT EDIT.
 //!
 //! One `pub mod` per WA Web registry, one `pub const` per flag (screaming-snake of
 //! its key) with the numeric `code` sent in the `<props>` IQ, value type, and default;
@@ -31,7 +31,7 @@ pub struct AbProp {
     pub default: AbDefault,
 }
 
-/// `WAWebABPropsConfigs` — 2193 flags.
+/// `WAWebABPropsConfigs` — 2298 flags.
 pub mod web {
     use super::{AbDefault, AbProp, AbPropType};
 
@@ -146,6 +146,12 @@ pub mod web {
     pub const AI_3P_BOT_PRODUCT_CHAT_RENDERING_ENABLED: AbProp = AbProp {
         name: "ai_3p_bot_product_chat_rendering_enabled",
         code: 34186,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const AI_3P_BOT_PRODUCT_ENABLED: AbProp = AbProp {
+        name: "ai_3p_bot_product_enabled",
+        code: 33090,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -299,6 +305,12 @@ pub mod web {
         value_type: AbPropType::Int,
         default: AbDefault::Int(3),
     };
+    pub const AI_CHAT_THREADS_V1_DEPRECATION_BANNER_MAX_IMPRESSIONS: AbProp = AbProp {
+        name: "ai_chat_threads_v1_deprecation_banner_max_impressions",
+        code: 35038,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(1),
+    };
     pub const AI_CHAT_THREADS_WEB_ENABLED: AbProp = AbProp {
         name: "ai_chat_threads_web_enabled",
         code: 23169,
@@ -316,6 +328,12 @@ pub mod web {
         code: 23694,
         value_type: AbPropType::Int,
         default: AbDefault::Int(50),
+    };
+    pub const AI_COMMENTARY_STANDALONE_MESSAGES_ENABLED: AbProp = AbProp {
+        name: "ai_commentary_standalone_messages_enabled",
+        code: 34670,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
     };
     pub const AI_CONTEXTUAL_WRITING_HELP_ENABLED: AbProp = AbProp {
         name: "ai_contextual_writing_help_enabled",
@@ -569,6 +587,18 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const AI_HATCH_MANAGE_SUBSCRIPTION_ENABLED: AbProp = AbProp {
+        name: "ai_hatch_manage_subscription_enabled",
+        code: 34521,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const AI_HATCH_MANAGE_SUBSCRIPTION_URL: AbProp = AbProp {
+        name: "ai_hatch_manage_subscription_url",
+        code: 34840,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str("https://www.whatsapp.com/"),
+    };
     pub const AI_HATCH_MEDIA_UPLOAD_COUNT_LIMIT: AbProp = AbProp {
         name: "ai_hatch_media_upload_count_limit",
         code: 27897,
@@ -626,6 +656,12 @@ pub mod web {
     pub const AI_META_AI_PREKEY_CLEANUP_ENABLED: AbProp = AbProp {
         name: "ai_meta_ai_prekey_cleanup_enabled",
         code: 31941,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const AI_META_AI_THREAD_CREATION_ENABLED: AbProp = AbProp {
+        name: "ai_meta_ai_thread_creation_enabled",
+        code: 34964,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -742,6 +778,12 @@ pub mod web {
         code: 22025,
         value_type: AbPropType::Int,
         default: AbDefault::Int(10),
+    };
+    pub const AI_RETRIGGER_NULL_STATE_MAIN_GATE_V2_ENABLED: AbProp = AbProp {
+        name: "ai_retrigger_null_state_main_gate_v2_enabled",
+        code: 14925,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
     };
     pub const AI_REWRITE_ENABLED: AbProp = AbProp {
         name: "ai_rewrite_enabled",
@@ -1007,6 +1049,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const AI_SUBSCRIPTION_MEDIA_EDITOR_ENABLED: AbProp = AbProp {
+        name: "ai_subscription_media_editor_enabled",
+        code: 34784,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const AI_SUBSCRIPTION_METERING_ENABLED: AbProp = AbProp {
         name: "ai_subscription_metering_enabled",
         code: 30960,
@@ -1112,6 +1160,12 @@ pub mod web {
     pub const AI_WEB_ASK_META_AI_ENABLED: AbProp = AbProp {
         name: "ai_web_ask_meta_ai_enabled",
         code: 23725,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const AI_WEB_ASK_META_AI_IMPROVEMENT_ENABLED: AbProp = AbProp {
+        name: "ai_web_ask_meta_ai_improvement_enabled",
+        code: 34586,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -1667,6 +1721,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const BIZ_AI_META_ONE_INTEGRATION: AbProp = AbProp {
+        name: "biz_ai_meta_one_integration",
+        code: 31231,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const BIZ_AI_PRIORITY_LIST_ENABLED: AbProp = AbProp {
         name: "biz_ai_priority_list_enabled",
         code: 16420,
@@ -2123,6 +2183,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const CALL_INFO_OPTIMIZATIONS_1ON1_CONTEXT_MENU: AbProp = AbProp {
+        name: "call_info_optimizations_1on1_context_menu",
+        code: 34450,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const CALL_INFO_OPTIMIZATIONS_AHGC_CALL_LINK: AbProp = AbProp {
         name: "call_info_optimizations_ahgc_call_link",
         code: 31096,
@@ -2200,6 +2266,12 @@ pub mod web {
         code: 33548,
         value_type: AbPropType::Int,
         default: AbDefault::Int(5800),
+    };
+    pub const CALLING_ENABLE_DUAL_STREAM_RECEIVER: AbProp = AbProp {
+        name: "calling_enable_dual_stream_receiver",
+        code: 34740,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(true),
     };
     pub const CALLING_LID_VERSION: AbProp = AbProp {
         name: "calling_lid_version",
@@ -2546,6 +2618,12 @@ pub mod web {
     pub const CHANNELS_ADMIN_PROFILES_FORWARDING_TO_CHATS_ENABLED: AbProp = AbProp {
         name: "channels_admin_profiles_forwarding_to_chats_enabled",
         code: 23170,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const CHANNELS_ADMIN_PROFILES_ID_ONLY_RESOLUTION_ENABLED: AbProp = AbProp {
+        name: "channels_admin_profiles_id_only_resolution_enabled",
+        code: 34768,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -3558,6 +3636,18 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const CTWA_AE_SIGNAL_3PD_ENABLED: AbProp = AbProp {
+        name: "ctwa_ae_signal_3pd_enabled",
+        code: 34663,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const CTWA_AE_SIGNAL_3PD_FIELD_POLICY: AbProp = AbProp {
+        name: "ctwa_ae_signal_3pd_field_policy",
+        code: 34665,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
     pub const CTWA_BLOCK_IB_AR_FOR_WABAI: AbProp = AbProp {
         name: "ctwa_block_ib_ar_for_wabai",
         code: 26302,
@@ -4396,6 +4486,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const ENABLE_LANCZOS_UPSCALER_FOR_VOD_BITMAP: AbProp = AbProp {
+        name: "enable_lanczos_upscaler_for_vod_bitmap",
+        code: 34626,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
     pub const ENABLE_LAZY_LOADING_OF_CALL_VIEW_ELEMENTS: AbProp = AbProp {
         name: "enable_lazy_loading_of_call_view_elements",
         code: 5053,
@@ -4773,6 +4869,12 @@ pub mod web {
         code: 33539,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(true),
+    };
+    pub const ENABLE_WEB_VOIP_WEBTRANSPORT_GROUP_CALLS: AbProp = AbProp {
+        name: "enable_web_voip_webtransport_group_calls",
+        code: 34645,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
     };
     pub const ENABLE_WEB_VOIP_WORKER_POOL_RECLAIM_ON_REJOIN: AbProp = AbProp {
         name: "enable_web_voip_worker_pool_reclaim_on_rejoin",
@@ -5170,11 +5272,35 @@ pub mod web {
         value_type: AbPropType::Int,
         default: AbDefault::Int(2048),
     };
+    pub const GROUP_ENC_KEY_ENABLED: AbProp = AbProp {
+        name: "group_enc_key_enabled",
+        code: 29673,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const GROUP_FROM_GROUP: AbProp = AbProp {
         name: "group_from_group",
         code: 24024,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
+    };
+    pub const GROUP_FROM_GROUP_ADMIN_MAX_SIZE: AbProp = AbProp {
+        name: "group_from_group_admin_max_size",
+        code: 34956,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(128),
+    };
+    pub const GROUP_FROM_GROUP_BAN_RISK_MITIGATION_ENABLED: AbProp = AbProp {
+        name: "group_from_group_ban_risk_mitigation_enabled",
+        code: 34955,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const GROUP_FROM_GROUP_MAX_MISSING_PRIVACY_TOKENS: AbProp = AbProp {
+        name: "group_from_group_max_missing_privacy_tokens",
+        code: 34957,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(32),
     };
     pub const GROUP_HISTORY_AFTER_JOIN_PREREQUISITES: AbProp = AbProp {
         name: "group_history_after_join_prerequisites",
@@ -5569,6 +5695,12 @@ pub mod web {
     pub const HYBRID_NUX_BETA_50_ENABLED: AbProp = AbProp {
         name: "hybrid_nux_beta_50_enabled",
         code: 17717,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const HYBRID_SAVE_AS_SHARED_BUFFER_ENABLED: AbProp = AbProp {
+        name: "hybrid_save_as_shared_buffer_enabled",
+        code: 34993,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -6082,6 +6214,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const MAIBA_META_AI_FAB_NULLSTATE_IS_DEPRECATED: AbProp = AbProp {
+        name: "maiba_meta_ai_fab_nullstate_is_deprecated",
+        code: 32490,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const MARK_AS_VERIFIED_ENABLED: AbProp = AbProp {
         name: "mark_as_verified_enabled",
         code: 29343,
@@ -6135,6 +6273,12 @@ pub mod web {
         code: 1517,
         value_type: AbPropType::Int,
         default: AbDefault::Int(10),
+    };
+    pub const MD_STANZAS_LID: AbProp = AbProp {
+        name: "md_stanzas_lid",
+        code: 34764,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
     };
     pub const MD_SYNCD_BUNDLE_LOGGING: AbProp = AbProp {
         name: "md_syncd_bundle_logging",
@@ -6267,6 +6411,18 @@ pub mod web {
         code: 22815,
         value_type: AbPropType::Int,
         default: AbDefault::Int(50),
+    };
+    pub const MESSAGE_PARTIAL_SELECTION_DISCOVERABILITY: AbProp = AbProp {
+        name: "message_partial_selection_discoverability",
+        code: 34826,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const MESSAGE_PARTIAL_SELECTION_IN_BUBBLE: AbProp = AbProp {
+        name: "message_partial_selection_in_bubble",
+        code: 34585,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
     };
     pub const MESSAGE_PARTIAL_SELECTION_M2: AbProp = AbProp {
         name: "message_partial_selection_m2",
@@ -6506,6 +6662,12 @@ pub mod web {
     pub const MM_USER_CONTROLS_EXPOSURE: AbProp = AbProp {
         name: "mm_user_controls_exposure",
         code: 13510,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const MM_USER_CONTROLS_UNIFIED_STOP_ENABLED: AbProp = AbProp {
+        name: "mm_user_controls_unified_stop_enabled",
+        code: 34622,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -7203,9 +7365,33 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const PAYMENTS_UPR_ALGERIA_ENABLED: AbProp = AbProp {
+        name: "payments_upr_algeria_enabled",
+        code: 35026,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const PAYMENTS_UPR_ANGOLA_ENABLED: AbProp = AbProp {
+        name: "payments_upr_angola_enabled",
+        code: 35054,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const PAYMENTS_UPR_ARGENTINA_ENABLED: AbProp = AbProp {
         name: "payments_upr_argentina_enabled",
         code: 33887,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const PAYMENTS_UPR_BAHRAIN_ENABLED: AbProp = AbProp {
+        name: "payments_upr_bahrain_enabled",
+        code: 35055,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const PAYMENTS_UPR_BENIN_ENABLED: AbProp = AbProp {
+        name: "payments_upr_benin_enabled",
+        code: 35056,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -7214,6 +7400,18 @@ pub mod web {
         code: 29342,
         value_type: AbPropType::Str,
         default: AbDefault::Str("MX, ID, HK, TW, AE, EG, TR"),
+    };
+    pub const PAYMENTS_UPR_BURKINA_FASO_ENABLED: AbProp = AbProp {
+        name: "payments_upr_burkina_faso_enabled",
+        code: 35057,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const PAYMENTS_UPR_CAMEROON_ENABLED: AbProp = AbProp {
+        name: "payments_upr_cameroon_enabled",
+        code: 34981,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
     };
     pub const PAYMENTS_UPR_CANADA_ENABLED: AbProp = AbProp {
         name: "payments_upr_canada_enabled",
@@ -7224,6 +7422,12 @@ pub mod web {
     pub const PAYMENTS_UPR_COLOMBIA_ENABLED: AbProp = AbProp {
         name: "payments_upr_colombia_enabled",
         code: 33889,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const PAYMENTS_UPR_COSTA_RICA_ENABLED: AbProp = AbProp {
+        name: "payments_upr_costa_rica_enabled",
+        code: 35058,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -7239,9 +7443,27 @@ pub mod web {
         value_type: AbPropType::Str,
         default: AbDefault::Str(""),
     };
+    pub const PAYMENTS_UPR_DJIBOUTI_ENABLED: AbProp = AbProp {
+        name: "payments_upr_djibouti_enabled",
+        code: 35060,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const PAYMENTS_UPR_DR_CONGO_ENABLED: AbProp = AbProp {
+        name: "payments_upr_dr_congo_enabled",
+        code: 35059,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const PAYMENTS_UPR_EGYPT_ENABLED: AbProp = AbProp {
         name: "payments_upr_egypt_enabled",
         code: 31870,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const PAYMENTS_UPR_EL_SALVADOR_ENABLED: AbProp = AbProp {
+        name: "payments_upr_el_salvador_enabled",
+        code: 35061,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -7266,6 +7488,18 @@ pub mod web {
     pub const PAYMENTS_UPR_ID_ENABLED: AbProp = AbProp {
         name: "payments_upr_id_enabled",
         code: 32170,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const PAYMENTS_UPR_JORDAN_ENABLED: AbProp = AbProp {
+        name: "payments_upr_jordan_enabled",
+        code: 34982,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const PAYMENTS_UPR_KUWAIT_ENABLED: AbProp = AbProp {
+        name: "payments_upr_kuwait_enabled",
+        code: 35062,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -7587,11 +7821,23 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const PQ_BATCH_UPLOAD_SIZE: AbProp = AbProp {
+        name: "pq_batch_upload_size",
+        code: 21201,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(10),
+    };
     pub const PQ_KEYS_UPLOAD: AbProp = AbProp {
         name: "pq_keys_upload",
         code: 21198,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
+    };
+    pub const PQ_MAX_KEYS_ON_SERVER: AbProp = AbProp {
+        name: "pq_max_keys_on_server",
+        code: 21200,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(200),
     };
     pub const PREMIUM_BLUE_ENABLED: AbProp = AbProp {
         name: "premium_blue_enabled",
@@ -8048,6 +8294,18 @@ pub mod web {
         code: 16254,
         value_type: AbPropType::Int,
         default: AbDefault::Int(1440),
+    };
+    pub const SCHEDULED_COMPANION_CONTACT_REFRESH_DAYS: AbProp = AbProp {
+        name: "scheduled_companion_contact_refresh_days",
+        code: 34960,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const SCHEDULED_COMPANION_CONTACT_REFRESH_HOURS: AbProp = AbProp {
+        name: "scheduled_companion_contact_refresh_hours",
+        code: 35018,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
     };
     pub const SCHEDULED_MESSAGES_PHOTO_VIDEO_SENDER_ENABLED: AbProp = AbProp {
         name: "scheduled_messages_photo_video_sender_enabled",
@@ -8561,6 +8819,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const SMB_META_AI_TOS_NOTICE_ID: AbProp = AbProp {
+        name: "smb_meta_ai_tos_notice_id",
+        code: 14628,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
     pub const SMB_META_VERIFIED_CONTEXT_CARD: AbProp = AbProp {
         name: "smb_meta_verified_context_card",
         code: 8313,
@@ -8699,6 +8963,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const SMB_WEB_AI_TOS_MASTER_NOTICE_ID: AbProp = AbProp {
+        name: "smb_web_ai_tos_master_notice_id",
+        code: 34831,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
     pub const SMB_WEB_BB_HOME_QP_SURFACE_ENABLED: AbProp = AbProp {
         name: "smb_web_bb_home_qp_surface_enabled",
         code: 32613,
@@ -8752,6 +9022,18 @@ pub mod web {
         code: 30112,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
+    };
+    pub const SMB_WEB_META_AI_ASSISTANT_ENABLED: AbProp = AbProp {
+        name: "smb_web_meta_ai_assistant_enabled",
+        code: 34828,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const SMB_WEB_META_AI_IMAGE_INPUT_LANGUAGES: AbProp = AbProp {
+        name: "smb_web_meta_ai_image_input_languages",
+        code: 34829,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(" "),
     };
     pub const SMB_WEB_SHOW_QUICK_REPLY_OPTION_IN_COMPOSER: AbProp = AbProp {
         name: "smb_web_show_quick_reply_option_in_composer",
@@ -8836,12 +9118,6 @@ pub mod web {
         code: 17942,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(true),
-    };
-    pub const SMOOTHIE_PERFORMANCE_RESIZE_FOLLOWUP: AbProp = AbProp {
-        name: "smoothie_performance_resize_followup",
-        code: 18992,
-        value_type: AbPropType::Bool,
-        default: AbDefault::Bool(false),
     };
     pub const SNAPL_NEWSLETTER_LOGGING_ENCRYPTED_RID_ENABLED: AbProp = AbProp {
         name: "snapl_newsletter_logging_encrypted_rid_enabled",
@@ -8972,6 +9248,12 @@ pub mod web {
     pub const STATUS_VIDEO_MAX_DURATION: AbProp = AbProp {
         name: "status_video_max_duration",
         code: 175,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(30),
+    };
+    pub const STATUS_VIDEO_PLAYBACK_MAX_DURATION_SECOND: AbProp = AbProp {
+        name: "status_video_playback_max_duration_second",
+        code: 7902,
         value_type: AbPropType::Int,
         default: AbDefault::Int(30),
     };
@@ -9381,12 +9663,6 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
-    pub const USE_PER_CHAT_WALLPAPER: AbProp = AbProp {
-        name: "use_per_chat_wallpaper",
-        code: 9756,
-        value_type: AbPropType::Bool,
-        default: AbDefault::Bool(false),
-    };
     pub const USE_SIGNED_SHIMMED_URL_LINK: AbProp = AbProp {
         name: "use_signed_shimmed_url_link",
         code: 11977,
@@ -9445,7 +9721,7 @@ pub mod web {
         name: "username_contact_display",
         code: 4746,
         value_type: AbPropType::Bool,
-        default: AbDefault::Bool(false),
+        default: AbDefault::Bool(true),
     };
     pub const USERNAME_CONTACT_PRIVACY_SETTING_ALLOW_UNCONTACT_SET_ENABLE: AbProp = AbProp {
         name: "username_contact_privacy_setting_allow_uncontact_set_enable",
@@ -9507,6 +9783,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const USERNAME_KEY_ALPHANUMERIC_CHARSET: AbProp = AbProp {
+        name: "username_key_alphanumeric_charset",
+        code: 34791,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str("0123456789ABCDEFGHJKLMNPQRSTVWXYZ"),
+    };
     pub const USERNAME_KEY_ENTRY_UI_V2: AbProp = AbProp {
         name: "username_key_entry_ui_v2",
         code: 34226,
@@ -9530,6 +9812,12 @@ pub mod web {
         code: 29026,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
+    };
+    pub const USERNAME_KEY_REGEX: AbProp = AbProp {
+        name: "username_key_regex",
+        code: 34350,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str("^([0-9]{4}|[A-Z0-9]{6})$"),
     };
     pub const USERNAME_KEY_UPSELL_MAX_CHARACTERS: AbProp = AbProp {
         name: "username_key_upsell_max_characters",
@@ -9795,6 +10083,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const WA_BIZ_URL_CTA_CLICK_SIGNALS: AbProp = AbProp {
+        name: "wa_biz_url_cta_click_signals",
+        code: 34726,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const WA_CAPPING_LOCAL_DATA_LOGIC_UPDATE: AbProp = AbProp {
         name: "wa_capping_local_data_logic_update",
         code: 21348,
@@ -9933,11 +10227,179 @@ pub mod web {
         value_type: AbPropType::Int,
         default: AbDefault::Int(0),
     };
+    pub const WA_MEDIA_CHANNEL_DOCUMENT_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_channel_document_experience_id",
+        code: 34915,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHANNEL_OTHER_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_channel_other_experience_id",
+        code: 34950,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHANNEL_PHOTO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_channel_photo_experience_id",
+        code: 34911,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHANNEL_PTT_AUDIO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_channel_ptt_audio_experience_id",
+        code: 34916,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHANNEL_STICKER_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_channel_sticker_experience_id",
+        code: 34913,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHANNEL_TEXT_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_channel_text_experience_id",
+        code: 34946,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHANNEL_VIDEO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_channel_video_experience_id",
+        code: 34912,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHAT_DOCUMENT_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_chat_document_experience_id",
+        code: 34903,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHAT_OTHER_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_chat_other_experience_id",
+        code: 34948,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHAT_PHOTO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_chat_photo_experience_id",
+        code: 34899,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHAT_PTT_AUDIO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_chat_ptt_audio_experience_id",
+        code: 34904,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHAT_STICKER_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_chat_sticker_experience_id",
+        code: 34901,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHAT_TEXT_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_chat_text_experience_id",
+        code: 34944,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_CHAT_VIDEO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_chat_video_experience_id",
+        code: 34900,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_DOCUMENT_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_document_experience_id",
+        code: 34897,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
     pub const WA_MEDIA_IMAGE_UPLOAD_CACHE: AbProp = AbProp {
         name: "wa_media_image_upload_cache",
         code: 22784,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
+    };
+    pub const WA_MEDIA_OTHER_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_other_experience_id",
+        code: 34947,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_PHOTO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_photo_experience_id",
+        code: 34893,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_PTT_AUDIO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_ptt_audio_experience_id",
+        code: 34898,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_STATUS_DOCUMENT_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_status_document_experience_id",
+        code: 34909,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_STATUS_OTHER_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_status_other_experience_id",
+        code: 34949,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_STATUS_PHOTO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_status_photo_experience_id",
+        code: 34905,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_STATUS_PTT_AUDIO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_status_ptt_audio_experience_id",
+        code: 34910,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_STATUS_STICKER_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_status_sticker_experience_id",
+        code: 34907,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_STATUS_TEXT_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_status_text_experience_id",
+        code: 34945,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_STATUS_VIDEO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_status_video_experience_id",
+        code: 34906,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_STICKER_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_sticker_experience_id",
+        code: 34895,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_TEXT_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_text_experience_id",
+        code: 34943,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WA_MEDIA_VIDEO_EXPERIENCE_ID: AbProp = AbProp {
+        name: "wa_media_video_experience_id",
+        code: 34894,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
     };
     pub const WA_META_ONE_ELIGIBILITY_SUBSCRIPTION_STATUS_CHECK_ENABLED: AbProp = AbProp {
         name: "wa_meta_one_eligibility_subscription_status_check_enabled",
@@ -9996,6 +10458,12 @@ pub mod web {
     pub const WA_NATIVE_ADS_XPLAT_DRAFT_ADS_MS1A_ENABLED: AbProp = AbProp {
         name: "wa_native_ads_xplat_draft_ads_ms1a_enabled",
         code: 33372,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const WA_NCT_CAPPING_KILL_SWITCH_ENABLED: AbProp = AbProp {
+        name: "wa_nct_capping_kill_switch_enabled",
+        code: 34795,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -10227,11 +10695,23 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const WA_WEB_CALLING_CHATLIST_ACTIVATION_BANNER_ENABLED: AbProp = AbProp {
+        name: "wa_web_calling_chatlist_activation_banner_enabled",
+        code: 34762,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const WA_WEB_CALLING_DEEP_LINK_ERROR: AbProp = AbProp {
         name: "wa_web_calling_deep_link_error",
         code: 10051,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(true),
+    };
+    pub const WA_WEB_CALLING_PUSH_NOTIFICATION_ON_CALL_END_ENABLED: AbProp = AbProp {
+        name: "wa_web_calling_push_notification_on_call_end_enabled",
+        code: 34763,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
     };
     pub const WA_WEB_CALLING_SIDENAV_CALLS_TAB_NUX_ENABLED: AbProp = AbProp {
         name: "wa_web_calling_sidenav_calls_tab_nux_enabled",
@@ -10966,6 +11446,18 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const WA_WEB_VOIP_MIC_HEALTH_EXPERIENCE: AbProp = AbProp {
+        name: "wa_web_voip_mic_health_experience",
+        code: 34761,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const WA_WEB_VOIP_MIC_INPUT_LEVEL: AbProp = AbProp {
+        name: "wa_web_voip_mic_input_level",
+        code: 34765,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const WA_WEB_VOIP_STACK_LOG_LEVEL: AbProp = AbProp {
         name: "wa_web_voip_stack_log_level",
         code: 30261,
@@ -11212,6 +11704,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const WAVOIP_LARGE_VSR_MODEL_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_large_vsr_model_download_versions_v2",
+        code: 34857,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
     pub const WAVOIP_LEGACY_ML_QPL_EXP_TAG: AbProp = AbProp {
         name: "wavoip_legacy_ml_qpl_exp_tag",
         code: 30561,
@@ -11284,9 +11782,21 @@ pub mod web {
         value_type: AbPropType::Str,
         default: AbDefault::Str(""),
     };
+    pub const WAVOIP_ML_BWE_QUICKHD_MODEL_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_bwe_quickhd_model_download_versions_v2",
+        code: 28012,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
     pub const WAVOIP_ML_BWE_RL_MODEL_DOWNLOAD_VERSIONS: AbProp = AbProp {
         name: "wavoip_ml_bwe_rl_model_download_versions",
         code: 21733,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
+    pub const WAVOIP_ML_BWE_RL_MODEL_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_bwe_rl_model_download_versions_v2",
+        code: 27994,
         value_type: AbPropType::Str,
         default: AbDefault::Str(""),
     };
@@ -11308,9 +11818,27 @@ pub mod web {
         value_type: AbPropType::Str,
         default: AbDefault::Str(""),
     };
+    pub const WAVOIP_ML_BWE_UNDERSHOOT_MODEL_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_bwe_undershoot_model_download_versions_v2",
+        code: 27916,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
     pub const WAVOIP_ML_MEDIA_AUTOMOS_MODEL_DOWNLOAD_VERSIONS: AbProp = AbProp {
         name: "wavoip_ml_media_automos_model_download_versions",
         code: 21731,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
+    pub const WAVOIP_ML_MEDIA_AUTOMOS_MODEL_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_media_automos_model_download_versions_v2",
+        code: 27997,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
+    pub const WAVOIP_ML_MEDIA_MLOW_COMPANION_MODEL_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_media_mlow_companion_model_download_versions_v2",
+        code: 31947,
         value_type: AbPropType::Str,
         default: AbDefault::Str(""),
     };
@@ -11320,15 +11848,33 @@ pub mod web {
         value_type: AbPropType::Str,
         default: AbDefault::Str(""),
     };
+    pub const WAVOIP_ML_MEDIA_NS_MODEL_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_media_ns_model_download_versions_v2",
+        code: 27992,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
     pub const WAVOIP_ML_MEDIA_VMOS_MODEL_DOWNLOAD_VERSIONS: AbProp = AbProp {
         name: "wavoip_ml_media_vmos_model_download_versions",
         code: 21736,
         value_type: AbPropType::Str,
         default: AbDefault::Str(""),
     };
+    pub const WAVOIP_ML_MEDIA_VMOS_MODEL_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_media_vmos_model_download_versions_v2",
+        code: 27993,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
     pub const WAVOIP_ML_MEDIA_VSR_MODEL_DOWNLOAD_VERSIONS: AbProp = AbProp {
         name: "wavoip_ml_media_vsr_model_download_versions",
         code: 21735,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
+    pub const WAVOIP_ML_MEDIA_VSR_MODEL_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_media_vsr_model_download_versions_v2",
+        code: 27995,
         value_type: AbPropType::Str,
         default: AbDefault::Str(""),
     };
@@ -11356,9 +11902,27 @@ pub mod web {
         value_type: AbPropType::Str,
         default: AbDefault::Str(""),
     };
+    pub const WAVOIP_ML_TEMP_MODEL_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_temp_model_download_versions_v2",
+        code: 28014,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
     pub const WAVOIP_ML_TRANSPORT_DOWNLOAD_VERSIONS: AbProp = AbProp {
         name: "wavoip_ml_transport_download_versions",
         code: 24173,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
+    pub const WAVOIP_ML_TRANSPORT_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_transport_download_versions_v2",
+        code: 28020,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str(""),
+    };
+    pub const WAVOIP_ML_UVQ_DOWNLOAD_VERSIONS_V2: AbProp = AbProp {
+        name: "wavoip_ml_uvq_download_versions_v2",
+        code: 28013,
         value_type: AbPropType::Str,
         default: AbDefault::Str(""),
     };
@@ -11835,6 +12399,12 @@ pub mod web {
         code: 22186,
         value_type: AbPropType::Int,
         default: AbDefault::Int(1),
+    };
+    pub const WEB_CALLING_SELF_PREVIEW_ENLARGE: AbProp = AbProp {
+        name: "web_calling_self_preview_enlarge",
+        code: 34817,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
     };
     pub const WEB_CALLING_SMOOTH_CALL_LINK_LOBBY: AbProp = AbProp {
         name: "web_calling_smooth_call_link_lobby",
@@ -12325,6 +12895,12 @@ pub mod web {
     pub const WEB_MEMLAB_FIXES_2: AbProp = AbProp {
         name: "web_memlab_fixes_2",
         code: 34305,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const WEB_MEMORIES_SUBDOMAIN_ENABLED: AbProp = AbProp {
+        name: "web_memories_subdomain_enabled",
+        code: 34935,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -12868,6 +13444,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const WEB_VALIDATE_MEDIA_URL_ALLOWLIST_ENABLED: AbProp = AbProp {
+        name: "web_validate_media_url_allowlist_enabled",
+        code: 34890,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(true),
+    };
     pub const WEB_VOIP_ADAPTIVE_SCTP_PREWARM: AbProp = AbProp {
         name: "web_voip_adaptive_sctp_prewarm",
         code: 32804,
@@ -12898,9 +13480,33 @@ pub mod web {
         value_type: AbPropType::Int,
         default: AbDefault::Int(0),
     };
+    pub const WEB_VOIP_DEFERRED_BOOT_EARLY_MODULE_PREFETCH: AbProp = AbProp {
+        name: "web_voip_deferred_boot_early_module_prefetch",
+        code: 35091,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const WEB_VOIP_DEFERRED_BOOT_INIT: AbProp = AbProp {
+        name: "web_voip_deferred_boot_init",
+        code: 34923,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const WEB_VOIP_DEFERRED_BOOT_INIT_MAX_DELAY_MS: AbProp = AbProp {
+        name: "web_voip_deferred_boot_init_max_delay_ms",
+        code: 34924,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(120000),
+    };
     pub const WEB_VOIP_DYNAMIC_THREAD_PREALLOCATE_COUNT: AbProp = AbProp {
         name: "web_voip_dynamic_thread_preallocate_count",
         code: 23789,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
+    };
+    pub const WEB_VOIP_INCOMING_OFFER_INIT_FRESHNESS_MS: AbProp = AbProp {
+        name: "web_voip_incoming_offer_init_freshness_ms",
+        code: 34925,
         value_type: AbPropType::Int,
         default: AbDefault::Int(0),
     };
@@ -12921,6 +13527,12 @@ pub mod web {
         code: 33122,
         value_type: AbPropType::Int,
         default: AbDefault::Int(0),
+    };
+    pub const WEB_VOIP_PRE_INIT_WORKER_BOOTSTRAP: AbProp = AbProp {
+        name: "web_voip_pre_init_worker_bootstrap",
+        code: 34685,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
     };
     pub const WEB_VOIP_RUNTIME_STACK_SELECTION_ENABLED: AbProp = AbProp {
         name: "web_voip_runtime_stack_selection_enabled",
@@ -13180,6 +13792,12 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const WMI_ASYNC_AWAIT_PREP_DECRYPT: AbProp = AbProp {
+        name: "wmi_async_await_prep_decrypt",
+        code: 35094,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const WMI_JM_TO_TS_M1: AbProp = AbProp {
         name: "wmi_jm_to_ts_m1",
         code: 32880,
@@ -13204,6 +13822,18 @@ pub mod web {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const XB_PAYMENTS_SEND_AGAIN_FETCH_ENABLED: AbProp = AbProp {
+        name: "xb_payments_send_again_fetch_enabled",
+        code: 35074,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const XB_PAYMENTS_SEND_MONEY_V2_ENABLED: AbProp = AbProp {
+        name: "xb_payments_send_money_v2_enabled",
+        code: 35073,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const XPLAT_ATTACHMENT_FORMAT_CHECK_V2: AbProp = AbProp {
         name: "xplat_attachment_format_check_v2",
         code: 8082,
@@ -13217,7 +13847,7 @@ pub mod web {
         default: AbDefault::Bool(false),
     };
 
-    /// All 2193 flags in this registry, sorted by name.
+    /// All 2298 flags in this registry, sorted by name.
     pub const ALL: &[AbProp] = &[
         A2UI_SUPPORTED_ELEMENTS,
         ACP_REMOVAL,
@@ -13238,6 +13868,7 @@ pub mod web {
         AI_3P_AGENT_LINK_ENABLED,
         AI_3P_AGENT_MEDIA_SUPPORT_MODE,
         AI_3P_BOT_PRODUCT_CHAT_RENDERING_ENABLED,
+        AI_3P_BOT_PRODUCT_ENABLED,
         AI_3P_BOT_PRODUCT_NUX_NOTICE_ID,
         AI_ACCOUNT_LINKING_ENABLED,
         AI_ALL_LANGUAGES_ENABLED,
@@ -13263,9 +13894,11 @@ pub mod web {
         AI_CHAT_THREADS_INFRA_WEB_ENABLED,
         AI_CHAT_THREADS_PIN_ENABLED,
         AI_CHAT_THREADS_PIN_MAX_COUNT,
+        AI_CHAT_THREADS_V1_DEPRECATION_BANNER_MAX_IMPRESSIONS,
         AI_CHAT_THREADS_WEB_ENABLED,
         AI_CHAT_THREADS_WEB_KILLSWITCH_ENABLED,
         AI_CHAT_THREADS_WEB_MSGS_LOAD_LIMIT,
+        AI_COMMENTARY_STANDALONE_MESSAGES_ENABLED,
         AI_CONTEXTUAL_WRITING_HELP_ENABLED,
         AI_CONTEXTUAL_WRITING_HELP_LANGUAGES_AND_TONES_CONFIG,
         AI_CONTEXTUAL_WRITING_HELP_NUM_SUGGESTIONS,
@@ -13308,6 +13941,8 @@ pub mod web {
         AI_HATCH_INTEGRATION_HISTORY_SYNC_ENABLED,
         AI_HATCH_INTEGRATION_HISTORY_SYNC_PRE_CHATD_ENABLED,
         AI_HATCH_INTEGRATION_TAB_ENABLED,
+        AI_HATCH_MANAGE_SUBSCRIPTION_ENABLED,
+        AI_HATCH_MANAGE_SUBSCRIPTION_URL,
         AI_HATCH_MEDIA_UPLOAD_COUNT_LIMIT,
         AI_HATCH_SECRET_ENCRYPTED_MESSAGE_ENABLED,
         AI_HATCH_VIDEO_AVATARS_ENABLED,
@@ -13318,6 +13953,7 @@ pub mod web {
         AI_MAIBA_WASS_MIGRATION_RECEIVING,
         AI_MAIBA_WASS_MIGRATION_SENDING,
         AI_META_AI_PREKEY_CLEANUP_ENABLED,
+        AI_META_AI_THREAD_CREATION_ENABLED,
         AI_METABOT_DOCUMENT_OCR_IMAGE_CONVERSION_ENABLED,
         AI_METABOT_DOCUMENT_UPLOAD_ENABLED,
         AI_METABOT_DOCUMENT_UPLOAD_PAGE_COUNT_LIMIT,
@@ -13337,6 +13973,7 @@ pub mod web {
         AI_PTT_MAIN_GATE_SUPPORTED_LANGUAGES,
         AI_REPLY_MESSAGE_CONTEXT_MAX_COUNT,
         AI_REPLY_MESSAGE_CONTEXT_TRIGGER_MIN_COUNT,
+        AI_RETRIGGER_NULL_STATE_MAIN_GATE_V2_ENABLED,
         AI_REWRITE_ENABLED,
         AI_REWRITE_ENTRY_POINT_MIN_WORDS,
         AI_REWRITE_IN_EXPRESSION_TRAY_ENABLED,
@@ -13381,6 +14018,7 @@ pub mod web {
         AI_SUBSCRIPTION_ENABLED,
         AI_SUBSCRIPTION_IMAGINE_INTENT_ENABLED,
         AI_SUBSCRIPTION_IMAGINE_INTENT_METERING_ENABLED,
+        AI_SUBSCRIPTION_MEDIA_EDITOR_ENABLED,
         AI_SUBSCRIPTION_METERING_ENABLED,
         AI_TAB_UNREAD_BADGE_RECENCY_WINDOW_HOURS,
         AI_UGC_HIDE_ENABLED,
@@ -13399,6 +14037,7 @@ pub mod web {
         AI_VOICE_ENTRY_POINT_LOGGING_ENABLED,
         AI_VOICE_MULTIMODAL_COMPOSER_ENABLED,
         AI_WEB_ASK_META_AI_ENABLED,
+        AI_WEB_ASK_META_AI_IMPROVEMENT_ENABLED,
         AI_WEB_ASK_META_AI_MEDIA_FORWARD_ENABLED,
         AI_WEB_FORWARD_FLOW_ENABLED,
         AI_WEB_META_AI_IMAGE_INPUT_ENABLED,
@@ -13491,6 +14130,7 @@ pub mod web {
         BIZ_AI_HANDOFF_TIMING_SYNC_ENABLED,
         BIZ_AI_IN_THREAD_UNMUTE_V2,
         BIZ_AI_LARGE_SCREENS_GATE_FETCH_ENABLED,
+        BIZ_AI_META_ONE_INTEGRATION,
         BIZ_AI_PRIORITY_LIST_ENABLED,
         BIZ_AI_PRIORITY_LIST_ITEM_EXPIRE_DAYS,
         BIZ_AI_RESPONDING_LIST_ENABLED,
@@ -13567,6 +14207,7 @@ pub mod web {
         BUYER_INITIATED_ORDER_REQUEST_VARIANT_ENABLED,
         CALL_ADMIN_VERSION,
         CALL_INFO_OPTIMIZATIONS_1ON1,
+        CALL_INFO_OPTIMIZATIONS_1ON1_CONTEXT_MENU,
         CALL_INFO_OPTIMIZATIONS_AHGC_CALL_LINK,
         CALL_INFO_OPTIMIZATIONS_LGC,
         CALL_INFO_OPTIMIZATIONS_VERSION,
@@ -13580,6 +14221,7 @@ pub mod web {
         CALLING_DUAL_STREAM_CAMERA_AUTO_OFF_ENABLED,
         CALLING_DUAL_STREAM_CAMERA_AUTO_OFF_INCLUDE_LOW_DATA_USAGE,
         CALLING_DUAL_STREAM_CAMERA_AUTO_OFF_POOR_NETWORK_TIME_MS,
+        CALLING_ENABLE_DUAL_STREAM_RECEIVER,
         CALLING_LID_VERSION,
         CALLING_RUST_MIGRATION_BITMAP,
         CALLING_RUST_MIGRATION_INCOMING_ACK_STANZA_BITMAP,
@@ -13638,6 +14280,7 @@ pub mod web {
         CHANNELS_ADMIN_NOTIFICATIONS_FORWARDS_ENABLED,
         CHANNELS_ADMIN_PROFILES_BANNER_ENABLED,
         CHANNELS_ADMIN_PROFILES_FORWARDING_TO_CHATS_ENABLED,
+        CHANNELS_ADMIN_PROFILES_ID_ONLY_RESOLUTION_ENABLED,
         CHANNELS_ADMIN_PROFILES_LIST_ENABLED,
         CHANNELS_ADMIN_PROFILES_RECEIVER_ENABLED,
         CHANNELS_ADMIN_PROFILES_SENDER_ENABLED,
@@ -13806,6 +14449,8 @@ pub mod web {
         CTWA_AD_CREATION_ENTRY_POINT_CATALOG_WEB,
         CTWA_AE_MODEL_META_DATA_ENABLED,
         CTWA_AE_MODEL_META_DATA_SIGNAL_ENABLED,
+        CTWA_AE_SIGNAL_3PD_ENABLED,
+        CTWA_AE_SIGNAL_3PD_FIELD_POLICY,
         CTWA_BLOCK_IB_AR_FOR_WABAI,
         CTWA_CONVERSION_CREATION_FROM_DELAY_ENABLED,
         CTWA_CUSTOM_LABEL_ALGORITHM,
@@ -13945,6 +14590,7 @@ pub mod web {
         ENABLE_INIT_BWE_FOR_GROUP_CALL,
         ENABLE_JOIN_GROUP_CONTEXT_NON_AUTO_EXPOSE,
         ENABLE_JOIN_ONGOING_CALL_REFACTOR,
+        ENABLE_LANCZOS_UPSCALER_FOR_VOD_BITMAP,
         ENABLE_LAZY_LOADING_OF_CALL_VIEW_ELEMENTS,
         ENABLE_LID_CALL_LINK,
         ENABLE_LOGGING_QBM_INCOMING_MESSAGE,
@@ -14008,6 +14654,7 @@ pub mod web {
         ENABLE_WEB_VOIP_VIRTUAL_VIDEO_CAPTURE_DRIVER,
         ENABLE_WEB_VOIP_WEBTRANSPORT,
         ENABLE_WEB_VOIP_WEBTRANSPORT_FALLBACK,
+        ENABLE_WEB_VOIP_WEBTRANSPORT_GROUP_CALLS,
         ENABLE_WEB_VOIP_WORKER_POOL_RECLAIM_ON_REJOIN,
         ENABLE_WEBCODEC_REQUIRE_KEYFRAME,
         ENABLE_WEBCODEC_VIDEO_ENCODE,
@@ -14074,7 +14721,11 @@ pub mod web {
         GROUP_CALLING_WAVE_SENDING_ENABLED,
         GROUP_CREATE_ADD_USING_LID_JIDS,
         GROUP_DESCRIPTION_LENGTH,
+        GROUP_ENC_KEY_ENABLED,
         GROUP_FROM_GROUP,
+        GROUP_FROM_GROUP_ADMIN_MAX_SIZE,
+        GROUP_FROM_GROUP_BAN_RISK_MITIGATION_ENABLED,
+        GROUP_FROM_GROUP_MAX_MISSING_PRIVACY_TOKENS,
         GROUP_HISTORY_AFTER_JOIN_PREREQUISITES,
         GROUP_HISTORY_BUMP_MESSAGE_ID,
         GROUP_HISTORY_BUNDLE_TIME_LIMIT_RECEIVER_ENFORCEMENT_SECS,
@@ -14141,6 +14792,7 @@ pub mod web {
         HYBRID_FONT_SIZE_DROPDOWN,
         HYBRID_INCREMENTAL_ZOOMING_SIMPLE_ENABLED,
         HYBRID_NUX_BETA_50_ENABLED,
+        HYBRID_SAVE_AS_SHARED_BUFFER_ENABLED,
         IGNORE_JOINABLE_TERMINATE_ON_EXPIRED_OFFER,
         IGNORE_ONE_TO_ONE_TERMINATE_IN_GROUP_CALL,
         IM_A2UI_REQUIRE_BOT_ATTRIBUTION,
@@ -14226,6 +14878,7 @@ pub mod web {
         LOW_CACHE_HIT_RATE_MEDIA_TYPES,
         LTHASH_CHECK_HOURS,
         M2_AUDIENCE_DYNAMIC_RULES,
+        MAIBA_META_AI_FAB_NULLSTATE_IS_DEPRECATED,
         MARK_AS_VERIFIED_ENABLED,
         MAX_GROUP_SIZE_FOR_LONG_RINGTONE,
         MAX_NUM_PARTICIPANTS_FOR_SS,
@@ -14235,6 +14888,7 @@ pub mod web {
         MD_APP_STATE_GATE_D34336913,
         MD_ICDC_HASH_LENGTH,
         MD_OFFLINE_V2_M2_ENABLED,
+        MD_STANZAS_LID,
         MD_SYNCD_BUNDLE_LOGGING,
         MD_SYNCD_MUTATION_LOGGING,
         MD_SYNCD_MUTATION_SUMMARY_LOGGING,
@@ -14257,6 +14911,8 @@ pub mod web {
         MESSAGE_EDIT_TO_MESSAGE_SECRET_SENDER_ENABLED,
         MESSAGE_EDIT_WINDOW_DURATION_SECONDS,
         MESSAGE_KEYS_ASYNC_CHUNK_SIZE,
+        MESSAGE_PARTIAL_SELECTION_DISCOVERABILITY,
+        MESSAGE_PARTIAL_SELECTION_IN_BUBBLE,
         MESSAGE_PARTIAL_SELECTION_M2,
         META_AI_IN_APP_SURVEY_ENABLED,
         META_CATALOG_LINKING_M2_ENABLED,
@@ -14297,6 +14953,7 @@ pub mod web {
         MM_USER_CONTROLS_ENTRY_POINTS_UPDATE_M1_MENU,
         MM_USER_CONTROLS_EXCEPTION_NUMBER_PREFIXES,
         MM_USER_CONTROLS_EXPOSURE,
+        MM_USER_CONTROLS_UNIFIED_STOP_ENABLED,
         MMS_VCACHE_AGGREGATION_ENABLED,
         MUSIC_OHAI_PROXY_URL,
         NATIVE_CONTACT_COMPANION_CHANGE_ENABLED,
@@ -14411,17 +15068,29 @@ pub mod web {
         PAYMENTS_BR_PIX_WEB_ATTACHMENT_TRAY,
         PAYMENTS_LINK_TO_LITE_CONSUMER_ENABLED,
         PAYMENTS_MERCHANT_GLOBAL_ORDERS_VALUE_PROPS_BANNER_ENABLED,
+        PAYMENTS_UPR_ALGERIA_ENABLED,
+        PAYMENTS_UPR_ANGOLA_ENABLED,
         PAYMENTS_UPR_ARGENTINA_ENABLED,
+        PAYMENTS_UPR_BAHRAIN_ENABLED,
+        PAYMENTS_UPR_BENIN_ENABLED,
         PAYMENTS_UPR_BUBBLE_COUNTRIES,
+        PAYMENTS_UPR_BURKINA_FASO_ENABLED,
+        PAYMENTS_UPR_CAMEROON_ENABLED,
         PAYMENTS_UPR_CANADA_ENABLED,
         PAYMENTS_UPR_COLOMBIA_ENABLED,
+        PAYMENTS_UPR_COSTA_RICA_ENABLED,
         PAYMENTS_UPR_COTE_DIVOIRE_ENABLED,
         PAYMENTS_UPR_CUSTOM_PAYMENT_METHODS_SYNC_COUNTRIES,
+        PAYMENTS_UPR_DJIBOUTI_ENABLED,
+        PAYMENTS_UPR_DR_CONGO_ENABLED,
         PAYMENTS_UPR_EGYPT_ENABLED,
+        PAYMENTS_UPR_EL_SALVADOR_ENABLED,
         PAYMENTS_UPR_ETHIOPIA_ENABLED,
         PAYMENTS_UPR_GHANA_ENABLED,
         PAYMENTS_UPR_HONGKONG_ENABLED,
         PAYMENTS_UPR_ID_ENABLED,
+        PAYMENTS_UPR_JORDAN_ENABLED,
+        PAYMENTS_UPR_KUWAIT_ENABLED,
         PAYMENTS_UPR_MEXICO_WALLET_ENABLED,
         PAYMENTS_UPR_MULTIPLE_KEY_COPY_ENABLED,
         PAYMENTS_UPR_MX_ENABLED,
@@ -14475,7 +15144,9 @@ pub mod web {
         POLL_TC_RECEIVING_ENABLED,
         POLL_TC_SENDING_ENABLED,
         PQ_1ON1_MESSAGE_ENABLED,
+        PQ_BATCH_UPLOAD_SIZE,
         PQ_KEYS_UPLOAD,
+        PQ_MAX_KEYS_ON_SERVER,
         PREMIUM_BLUE_ENABLED,
         PREMIUM_BROADCAST_SMB_CAPPING_ENABLED,
         PREMIUM_MSG_BB_CAMPAIGN_SYNC_ENABLED,
@@ -14552,6 +15223,8 @@ pub mod web {
         SAGA_V1_REENGAGEMENT_ENABLED,
         SCHEDULE_CALL_SHOW_JOIN_BUTTON_TIME_INTERVAL_MINS,
         SCHEDULE_CALL_SHOW_UPCOMING_BANNER_TIME_INTERVAL_MINS,
+        SCHEDULED_COMPANION_CONTACT_REFRESH_DAYS,
+        SCHEDULED_COMPANION_CONTACT_REFRESH_HOURS,
         SCHEDULED_MESSAGES_PHOTO_VIDEO_SENDER_ENABLED,
         SCHEDULED_MESSAGES_RECEIVER_ENABLED,
         SCHEDULED_MESSAGES_SENDER_ENABLED,
@@ -14637,6 +15310,7 @@ pub mod web {
         SMB_MD_AGENT_CHAT_ASSIGNMENT_NOTIFICATIONS_ENABLED,
         SMB_MD_AGENT_CHAT_ASSIGNMENT_NUX_IMPRESSIONS,
         SMB_MD_AGENT_CHAT_ASSIGNMENT_SYSTEM_MESSAGES_LOGGING_V2_ENABLED,
+        SMB_META_AI_TOS_NOTICE_ID,
         SMB_META_VERIFIED_CONTEXT_CARD,
         SMB_MULTI_DEVICE_AGENTS_LOGGING_V2_ENABLED,
         SMB_MULTI_DEVICE_MESSAGE_ATTRIBUTION_ENABLED,
@@ -14660,6 +15334,7 @@ pub mod web {
         SMB_TEMP_COVER_PHOTO_PRIVACY_MESSAGING,
         SMB_TOS_QP_CHATLIST_BANNER,
         SMB_WALDO_SERVICE_OFFERINGS_SELECTION_ENABLED,
+        SMB_WEB_AI_TOS_MASTER_NOTICE_ID,
         SMB_WEB_BB_HOME_QP_SURFACE_ENABLED,
         SMB_WEB_CATEGORY_SEARCH_VIA_GRAPH_ENABLED,
         SMB_WEB_CUSTOMER_MANAGEMENT_ENABLED,
@@ -14669,6 +15344,8 @@ pub mod web {
         SMB_WEB_CUSTOMER_MANAGER_EXPORT_ENABLED,
         SMB_WEB_CUSTOMER_MANAGER_HEADER_MENU_ENABLED,
         SMB_WEB_ENABLE_FB_LINKING,
+        SMB_WEB_META_AI_ASSISTANT_ENABLED,
+        SMB_WEB_META_AI_IMAGE_INPUT_LANGUAGES,
         SMB_WEB_SHOW_QUICK_REPLY_OPTION_IN_COMPOSER,
         SMBA_BB_GENAI_COMPOSER_MIN_WORDS,
         SMBA_BUSINESS_BROADCAST_GENAI_CUSTOM_USER_PROMPT_ENABLED,
@@ -14683,7 +15360,6 @@ pub mod web {
         SMBW_BUSINESS_BROADCAST_DUPLICATE_ENABLED,
         SMBW_BUSINESS_BROADCAST_SMART_COLUMN_DETECTION_ENABLED,
         SMOOTHIE_PERFORMANCE_MSG_SEND,
-        SMOOTHIE_PERFORMANCE_RESIZE_FOLLOWUP,
         SNAPL_NEWSLETTER_LOGGING_ENCRYPTED_RID_ENABLED,
         SNAPL_NEWSLETTER_LOGGING_MEDIA_ID_PLACEHOLDER_STRING,
         SNAPSHOT_RECOVERY_MAX_MUTATIONS_COUNT_ALLOWED,
@@ -14706,6 +15382,7 @@ pub mod web {
         STATUS_REACTION_EMOJIS,
         STATUS_SAVE_TO_CAMERA_ROLL_ENABLED,
         STATUS_VIDEO_MAX_DURATION,
+        STATUS_VIDEO_PLAYBACK_MAX_DURATION_SECOND,
         STATUS_VIEWER_ACTION_PSA_LINK_CLICK_LOGGING_ENABLED,
         STATUS_WEB_RANKING,
         STICKER_STORE_TESTING_ENABLED,
@@ -14773,7 +15450,6 @@ pub mod web {
         UPLOAD_DOCUMENT_THUMB_MMS_ENABLED,
         USE_CACHED_APP_SETTINGS_FROM_GLOBAL_CTX,
         USE_CUSTOM_SOCCER_BALL_FOR_REACTION_ENABLED,
-        USE_PER_CHAT_WALLPAPER,
         USE_SIGNED_SHIMMED_URL_LINK,
         USERNAME_1ON1_SYS_MSG_CREATION_UPSELL_ENABLED,
         USERNAME_ACTIVATION_QP,
@@ -14794,10 +15470,12 @@ pub mod web {
         USERNAME_EXPOSED_LOGGING_ENABLED,
         USERNAME_GLOBAL_SEARCH_ENABLED,
         USERNAME_GROUP_MUTATION_ENABLED,
+        USERNAME_KEY_ALPHANUMERIC_CHARSET,
         USERNAME_KEY_ENTRY_UI_V2,
         USERNAME_KEY_MAX_LENGTH,
         USERNAME_KEY_MIN_LENGTH,
         USERNAME_KEY_REDESIGN_ENABLED,
+        USERNAME_KEY_REGEX,
         USERNAME_KEY_UPSELL_MAX_CHARACTERS,
         USERNAME_KEY_UPSELL_MAX_NUMBERS,
         USERNAME_KEY_UPSELL_MODE,
@@ -14842,6 +15520,7 @@ pub mod web {
         WA_AUTH_AGENT_OFFBOARDING_ENABLED,
         WA_BIZ_GAP_ENFORCEMENT_RULES_SYNC_TO_META_ENABLED_AC_LINKED_USER,
         WA_BIZ_PAYMENT_TEMPLATE_CLICK_SIGNALS,
+        WA_BIZ_URL_CTA_CLICK_SIGNALS,
         WA_CAPPING_LOCAL_DATA_LOGIC_UPDATE,
         WA_CATALOG_GRAPHQL_USE_LID_ENABLED,
         WA_COEX_BIZ_AI_CAPPING_ELIGIBLE,
@@ -14865,7 +15544,35 @@ pub mod web {
         WA_INDIVIDUAL_NEW_CHAT_MSG_FCI_STALENESS_TTL_IN_SECONDS,
         WA_INDIVIDUAL_NEW_CHAT_MSG_LATEST_RAMPUP_DATE,
         WA_INDIVIDUAL_NEW_CHAT_THREAD_CAPPING_LIMIT,
+        WA_MEDIA_CHANNEL_DOCUMENT_EXPERIENCE_ID,
+        WA_MEDIA_CHANNEL_OTHER_EXPERIENCE_ID,
+        WA_MEDIA_CHANNEL_PHOTO_EXPERIENCE_ID,
+        WA_MEDIA_CHANNEL_PTT_AUDIO_EXPERIENCE_ID,
+        WA_MEDIA_CHANNEL_STICKER_EXPERIENCE_ID,
+        WA_MEDIA_CHANNEL_TEXT_EXPERIENCE_ID,
+        WA_MEDIA_CHANNEL_VIDEO_EXPERIENCE_ID,
+        WA_MEDIA_CHAT_DOCUMENT_EXPERIENCE_ID,
+        WA_MEDIA_CHAT_OTHER_EXPERIENCE_ID,
+        WA_MEDIA_CHAT_PHOTO_EXPERIENCE_ID,
+        WA_MEDIA_CHAT_PTT_AUDIO_EXPERIENCE_ID,
+        WA_MEDIA_CHAT_STICKER_EXPERIENCE_ID,
+        WA_MEDIA_CHAT_TEXT_EXPERIENCE_ID,
+        WA_MEDIA_CHAT_VIDEO_EXPERIENCE_ID,
+        WA_MEDIA_DOCUMENT_EXPERIENCE_ID,
         WA_MEDIA_IMAGE_UPLOAD_CACHE,
+        WA_MEDIA_OTHER_EXPERIENCE_ID,
+        WA_MEDIA_PHOTO_EXPERIENCE_ID,
+        WA_MEDIA_PTT_AUDIO_EXPERIENCE_ID,
+        WA_MEDIA_STATUS_DOCUMENT_EXPERIENCE_ID,
+        WA_MEDIA_STATUS_OTHER_EXPERIENCE_ID,
+        WA_MEDIA_STATUS_PHOTO_EXPERIENCE_ID,
+        WA_MEDIA_STATUS_PTT_AUDIO_EXPERIENCE_ID,
+        WA_MEDIA_STATUS_STICKER_EXPERIENCE_ID,
+        WA_MEDIA_STATUS_TEXT_EXPERIENCE_ID,
+        WA_MEDIA_STATUS_VIDEO_EXPERIENCE_ID,
+        WA_MEDIA_STICKER_EXPERIENCE_ID,
+        WA_MEDIA_TEXT_EXPERIENCE_ID,
+        WA_MEDIA_VIDEO_EXPERIENCE_ID,
         WA_META_ONE_ELIGIBILITY_SUBSCRIPTION_STATUS_CHECK_ENABLED,
         WA_META_ONE_ENABLED,
         WA_META_ONE_LAUNCH_FREE_TRIAL_ENABLED,
@@ -14876,6 +15583,7 @@ pub mod web {
         WA_NATIVE_ADS_WEB_CREATION_ROLLOUT_NO_EXPOSURE,
         WA_NATIVE_ADS_XPLAT_DRAFT_ADS_MS1A_DUMMY_ENABLED,
         WA_NATIVE_ADS_XPLAT_DRAFT_ADS_MS1A_ENABLED,
+        WA_NCT_CAPPING_KILL_SWITCH_ENABLED,
         WA_NCT_TOKEN_HISTORY_SYNC_ENABLED,
         WA_NCT_TOKEN_SALT_CREATION_ENABLED,
         WA_NCT_TOKEN_SEND_ENABLED,
@@ -14914,7 +15622,9 @@ pub mod web {
         WA_WEB_BUTTONS_RESPONSE_PROP_REMOVAL_KILLSWITCH,
         WA_WEB_CALLING_CALLS_TAB_EMPTY_STATE_UPDATE_ENABLED,
         WA_WEB_CALLING_CHAT_EMPTY_STATE_UPDATE_ENABLED,
+        WA_WEB_CALLING_CHATLIST_ACTIVATION_BANNER_ENABLED,
         WA_WEB_CALLING_DEEP_LINK_ERROR,
+        WA_WEB_CALLING_PUSH_NOTIFICATION_ON_CALL_END_ENABLED,
         WA_WEB_CALLING_SIDENAV_CALLS_TAB_NUX_ENABLED,
         WA_WEB_CALLING_WHATS_NEW_MODAL_UPDATE_ENABLED,
         WA_WEB_CANONICAL_REG_RELOAD_ENABLED,
@@ -15037,6 +15747,8 @@ pub mod web {
         WA_WEB_VELOCITY_ANIMATE_MIGRATION_ENABLED,
         WA_WEB_VIDEO_COMET_VIDEO_PLAYER_ENABLED,
         WA_WEB_VOIP_ADAPTIVE_GRID_PAGE_SIZE,
+        WA_WEB_VOIP_MIC_HEALTH_EXPERIENCE,
+        WA_WEB_VOIP_MIC_INPUT_LEVEL,
         WA_WEB_VOIP_STACK_LOG_LEVEL,
         WA_WEB_WAE_QPL_ENABLED,
         WA_WEB_WAM_FALCO_CRITICAL_EVENT_IDS,
@@ -15078,6 +15790,7 @@ pub mod web {
         WAMO_SUB_MESSAGES_SUPPORTED,
         WAMO_SUB_PROCESS_MESSAGE_KILL_SWITCH,
         WAVOIP_ENABLE_ML_NAMESPACE_V2,
+        WAVOIP_LARGE_VSR_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_LEGACY_ML_QPL_EXP_TAG,
         WAVOIP_ML_BWE_CONG_MODEL_DOWNLOAD_VERSIONS,
         WAVOIP_ML_BWE_CONG_MODEL_DOWNLOAD_VERSIONS_V2,
@@ -15090,19 +15803,30 @@ pub mod web {
         WAVOIP_ML_BWE_PLC_MODEL_DOWNLOAD_VERSIONS,
         WAVOIP_ML_BWE_PLC_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_BWE_QUICKHD_MODEL_DOWNLOAD_VERSIONS,
+        WAVOIP_ML_BWE_QUICKHD_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_BWE_RL_MODEL_DOWNLOAD_VERSIONS,
+        WAVOIP_ML_BWE_RL_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_BWE_TR_MODEL_DOWNLOAD_VERSIONS,
         WAVOIP_ML_BWE_TR_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_BWE_UNDERSHOOT_MODEL_DOWNLOAD_VERSIONS,
+        WAVOIP_ML_BWE_UNDERSHOOT_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_MEDIA_AUTOMOS_MODEL_DOWNLOAD_VERSIONS,
+        WAVOIP_ML_MEDIA_AUTOMOS_MODEL_DOWNLOAD_VERSIONS_V2,
+        WAVOIP_ML_MEDIA_MLOW_COMPANION_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_MEDIA_NS_MODEL_DOWNLOAD_VERSIONS,
+        WAVOIP_ML_MEDIA_NS_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_MEDIA_VMOS_MODEL_DOWNLOAD_VERSIONS,
+        WAVOIP_ML_MEDIA_VMOS_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_MEDIA_VSR_MODEL_DOWNLOAD_VERSIONS,
+        WAVOIP_ML_MEDIA_VSR_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_NADL_MODEL_DOWNLOAD_VERSIONS,
         WAVOIP_ML_NADL_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_QPL_EXP_TAG,
         WAVOIP_ML_TEMP_MODEL_DOWNLOAD_VERSIONS,
+        WAVOIP_ML_TEMP_MODEL_DOWNLOAD_VERSIONS_V2,
         WAVOIP_ML_TRANSPORT_DOWNLOAD_VERSIONS,
+        WAVOIP_ML_TRANSPORT_DOWNLOAD_VERSIONS_V2,
+        WAVOIP_ML_UVQ_DOWNLOAD_VERSIONS_V2,
         WAWEB_CHATINFO_REFRESH,
         WAWEB_CROSSPOSTING_ATTRIBUTIONS,
         WAWEB_ENABLE_LEGACY_IMAGE_ZOOM,
@@ -15182,6 +15906,7 @@ pub mod web {
         WEB_CALLING_OFFLINE_RESUME_ORDERING,
         WEB_CALLING_PAUSE_BG_DURING_CALL_MODE,
         WEB_CALLING_PERF_OPTIMIZATIONS_BITMASK,
+        WEB_CALLING_SELF_PREVIEW_ENLARGE,
         WEB_CALLING_SMOOTH_CALL_LINK_LOBBY,
         WEB_CALLING_SPEAKER_STRIP_RESIZE_ENABLED,
         WEB_CALLS_TAB_EMPTY_STATE_BUTTONS,
@@ -15264,6 +15989,7 @@ pub mod web {
         WEB_MEDIA_WORKER_SPLIT_ENABLED,
         WEB_MEMLAB_FIXES,
         WEB_MEMLAB_FIXES_2,
+        WEB_MEMORIES_SUBDOMAIN_ENABLED,
         WEB_MEMORY_REDUCTION,
         WEB_MENU_SHARE_GROUP,
         WEB_MESSAGE_CUSTOM_ARIA_LABEL,
@@ -15354,15 +16080,21 @@ pub mod web {
         WEB_TOP_LEVEL_MESSAGE_SECRET_ENFORCEMENT_ENABLED,
         WEB_UI_REFRESH_M1,
         WEB_USE_KALEIDOSCOPE_MEDIA_CHECK_ENABLED,
+        WEB_VALIDATE_MEDIA_URL_ALLOWLIST_ENABLED,
         WEB_VOIP_ADAPTIVE_SCTP_PREWARM,
         WEB_VOIP_AUDIO_CAPTURE_IMPL,
         WEB_VOIP_AUDIO_PLAYBACK_IMPL,
         WEB_VOIP_AV_SYNC_DEBUG_OVERLAY,
         WEB_VOIP_CAPTURE_VIDEO_ROTATION_TYPE,
+        WEB_VOIP_DEFERRED_BOOT_EARLY_MODULE_PREFETCH,
+        WEB_VOIP_DEFERRED_BOOT_INIT,
+        WEB_VOIP_DEFERRED_BOOT_INIT_MAX_DELAY_MS,
         WEB_VOIP_DYNAMIC_THREAD_PREALLOCATE_COUNT,
+        WEB_VOIP_INCOMING_OFFER_INIT_FRESHNESS_MS,
         WEB_VOIP_LOAD_WASM_VARIANT,
         WEB_VOIP_LOW_RESOURCE_DEVICE,
         WEB_VOIP_OUTGOING_CALL_SETUP_LATENCY_MODE,
+        WEB_VOIP_PRE_INIT_WORKER_BOOTSTRAP,
         WEB_VOIP_RUNTIME_STACK_SELECTION_ENABLED,
         WEB_VOIP_SCTP_WORKER_SAFARI_EXP,
         WEB_VOIP_SKIP_OFFLINE_WAIT_ON_CALL_INTENT,
@@ -15406,10 +16138,13 @@ pub mod web {
         WINDOWS_SS_CAPTURE_DRIVER_TYPE,
         WINRT_RENDERER,
         WMI_ASYNC_AWAIT_PREP,
+        WMI_ASYNC_AWAIT_PREP_DECRYPT,
         WMI_JM_TO_TS_M1,
         WMI_JM_TO_TS_SERVICED,
         WMI_TASK_SCHEDULER_SECOND_STEP,
         WMI_WORKER_SCHEDULER_WEB,
+        XB_PAYMENTS_SEND_AGAIN_FETCH_ENABLED,
+        XB_PAYMENTS_SEND_MONEY_V2_ENABLED,
         XPLAT_ATTACHMENT_FORMAT_CHECK_V2,
         YOUTUBE_INLINE_PLAYBACK_KILLSWITCH,
     ];
@@ -15523,7 +16258,7 @@ pub mod group {
     ];
 }
 
-/// `WAWebHybridABPropsConfigs` — 339 flags.
+/// `WAWebHybridABPropsConfigs` — 348 flags.
 pub mod hybrid {
     use super::{AbDefault, AbProp, AbPropType};
 
@@ -15538,6 +16273,12 @@ pub mod hybrid {
         code: 34393,
         value_type: AbPropType::Int,
         default: AbDefault::Int(0),
+    };
+    pub const AI_3P_BOT_PRODUCT_ENABLED: AbProp = AbProp {
+        name: "ai_3p_bot_product_enabled",
+        code: 33090,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
     };
     pub const AI_ASSET_REPLACEMENT_ENABLED: AbProp = AbProp {
         name: "ai_asset_replacement_enabled",
@@ -15694,6 +16435,18 @@ pub mod hybrid {
         code: 27356,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
+    };
+    pub const AI_HATCH_MANAGE_SUBSCRIPTION_ENABLED: AbProp = AbProp {
+        name: "ai_hatch_manage_subscription_enabled",
+        code: 34521,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const AI_HATCH_MANAGE_SUBSCRIPTION_URL: AbProp = AbProp {
+        name: "ai_hatch_manage_subscription_url",
+        code: 34840,
+        value_type: AbPropType::Str,
+        default: AbDefault::Str("https://www.whatsapp.com/"),
     };
     pub const AI_MAIBA_WASS_MIGRATION_RECEIVING: AbProp = AbProp {
         name: "ai_maiba_wass_migration_receiving",
@@ -15857,6 +16610,12 @@ pub mod hybrid {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const CALL_INFO_OPTIMIZATIONS_1ON1_CONTEXT_MENU: AbProp = AbProp {
+        name: "call_info_optimizations_1on1_context_menu",
+        code: 34450,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const CALL_INFO_OPTIMIZATIONS_AHGC_CALL_LINK: AbProp = AbProp {
         name: "call_info_optimizations_ahgc_call_link",
         code: 31096,
@@ -15934,6 +16693,12 @@ pub mod hybrid {
         code: 33548,
         value_type: AbPropType::Int,
         default: AbDefault::Int(5800),
+    };
+    pub const CALLING_ENABLE_DUAL_STREAM_RECEIVER: AbProp = AbProp {
+        name: "calling_enable_dual_stream_receiver",
+        code: 34740,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(true),
     };
     pub const CALLING_LID_VERSION: AbProp = AbProp {
         name: "calling_lid_version",
@@ -16282,6 +17047,12 @@ pub mod hybrid {
         code: 34093,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
+    };
+    pub const ENABLE_LANCZOS_UPSCALER_FOR_VOD_BITMAP: AbProp = AbProp {
+        name: "enable_lanczos_upscaler_for_vod_bitmap",
+        code: 34626,
+        value_type: AbPropType::Int,
+        default: AbDefault::Int(0),
     };
     pub const ENABLE_LAZY_LOADING_OF_CALL_VIEW_ELEMENTS: AbProp = AbProp {
         name: "enable_lazy_loading_of_call_view_elements",
@@ -16718,6 +17489,12 @@ pub mod hybrid {
     pub const HYBRID_EDUCATIONAL_DIALOGS_ENABLED: AbProp = AbProp {
         name: "hybrid_educational_dialogs_enabled",
         code: 14674,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const HYBRID_SAVE_AS_SHARED_BUFFER_ENABLED: AbProp = AbProp {
+        name: "hybrid_save_as_shared_buffer_enabled",
+        code: 34993,
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
@@ -17246,12 +18023,6 @@ pub mod hybrid {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
-    pub const SMOOTHIE_PERFORMANCE_RESIZE_FOLLOWUP: AbProp = AbProp {
-        name: "smoothie_performance_resize_followup",
-        code: 18992,
-        value_type: AbPropType::Bool,
-        default: AbDefault::Bool(false),
-    };
     pub const STICKERS_EMOJI_TAGGING_ENABLED: AbProp = AbProp {
         name: "stickers_emoji_tagging_enabled",
         code: 26465,
@@ -17286,7 +18057,7 @@ pub mod hybrid {
         name: "username_contact_display",
         code: 4746,
         value_type: AbPropType::Bool,
-        default: AbDefault::Bool(false),
+        default: AbDefault::Bool(true),
     };
     pub const USERNAME_ENABLED_ON_COMPANION: AbProp = AbProp {
         name: "username_enabled_on_companion",
@@ -17462,6 +18233,24 @@ pub mod hybrid {
         value_type: AbPropType::Bool,
         default: AbDefault::Bool(false),
     };
+    pub const WEB_GUEST_CALLING_REPRESENTATION_ENABLED: AbProp = AbProp {
+        name: "web_guest_calling_representation_enabled",
+        code: 31533,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const WEB_GUEST_CALLING_WAITING_ROOM_ADMIN_XP_ENABLED: AbProp = AbProp {
+        name: "web_guest_calling_waiting_room_admin_xp_enabled",
+        code: 33384,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
+    pub const WEB_GUEST_CALLING_WAITING_ROOM_APPROVAL_NOTE_ENABLED: AbProp = AbProp {
+        name: "web_guest_calling_waiting_room_approval_note_enabled",
+        code: 33385,
+        value_type: AbPropType::Bool,
+        default: AbDefault::Bool(false),
+    };
     pub const WEB_IP_TOKEN_ENABLED: AbProp = AbProp {
         name: "web_ip_token_enabled",
         code: 20043,
@@ -17571,10 +18360,11 @@ pub mod hybrid {
         default: AbDefault::Bool(true),
     };
 
-    /// All 339 flags in this registry, sorted by name.
+    /// All 348 flags in this registry, sorted by name.
     pub const ALL: &[AbProp] = &[
         ADV_ACCEPT_HOSTED_DEVICES,
         AI_3P_AGENT_MEDIA_SUPPORT_MODE,
+        AI_3P_BOT_PRODUCT_ENABLED,
         AI_ASSET_REPLACEMENT_ENABLED,
         AI_BIZAI_2WAY_INTEGRATION_ENABLED,
         AI_BIZAI_2WAY_INTEGRATION_HISTORY_SYNC_PRE_CHATD_ENABLED,
@@ -17601,6 +18391,8 @@ pub mod hybrid {
         AI_HATCH_INTEGRATION_HISTORY_SYNC_ENABLED,
         AI_HATCH_INTEGRATION_HISTORY_SYNC_PRE_CHATD_ENABLED,
         AI_HATCH_INTEGRATION_TAB_ENABLED,
+        AI_HATCH_MANAGE_SUBSCRIPTION_ENABLED,
+        AI_HATCH_MANAGE_SUBSCRIPTION_URL,
         AI_MAIBA_WASS_MIGRATION_RECEIVING,
         AI_MAIBA_WASS_MIGRATION_SENDING,
         AI_SEARCH_EXPERIENCE_ENABLED,
@@ -17628,6 +18420,7 @@ pub mod hybrid {
         BUG_REPORTING_PRE_UPLOADED_ATTACHMENTS_ON_BUG_CREATION_ENABLED,
         BUG_REPORTING_RID_IN_FLYTRAP,
         CALL_INFO_OPTIMIZATIONS_1ON1,
+        CALL_INFO_OPTIMIZATIONS_1ON1_CONTEXT_MENU,
         CALL_INFO_OPTIMIZATIONS_AHGC_CALL_LINK,
         CALL_INFO_OPTIMIZATIONS_LGC,
         CALL_INFO_OPTIMIZATIONS_VERSION,
@@ -17641,6 +18434,7 @@ pub mod hybrid {
         CALLING_DUAL_STREAM_CAMERA_AUTO_OFF_ENABLED,
         CALLING_DUAL_STREAM_CAMERA_AUTO_OFF_INCLUDE_LOW_DATA_USAGE,
         CALLING_DUAL_STREAM_CAMERA_AUTO_OFF_POOR_NETWORK_TIME_MS,
+        CALLING_ENABLE_DUAL_STREAM_RECEIVER,
         CALLING_LID_VERSION,
         CALLING_RUST_MIGRATION_BITMAP,
         CALLING_RUST_MIGRATION_INCOMING_ACK_STANZA_BITMAP,
@@ -17699,6 +18493,7 @@ pub mod hybrid {
         ENABLE_HYBRID_VIDEO_TRANSCODING,
         ENABLE_HYBRID_VIDEO_TRANSCODING_FOR_VALID_MP4,
         ENABLE_JOIN_ONGOING_CALL_REFACTOR,
+        ENABLE_LANCZOS_UPSCALER_FOR_VOD_BITMAP,
         ENABLE_LAZY_LOADING_OF_CALL_VIEW_ELEMENTS,
         ENABLE_LID_CALL_LINK,
         ENABLE_NEW_CALL_LINK_REPRESENTATION,
@@ -17772,6 +18567,7 @@ pub mod hybrid {
         HSM_TAG_IN_HISTORY_SYNC_DESERIALIZATION_ENABLED,
         HYBRID_EDUCATIONAL_DIALOG_START_AT,
         HYBRID_EDUCATIONAL_DIALOGS_ENABLED,
+        HYBRID_SAVE_AS_SHARED_BUFFER_ENABLED,
         IGNORE_JOINABLE_TERMINATE_ON_EXPIRED_OFFER,
         IGNORE_ONE_TO_ONE_TERMINATE_IN_GROUP_CALL,
         IN_APP_BUG_REPORTING_DESCRIPTION_GOOD_QUALITY_CHARS,
@@ -17858,7 +18654,6 @@ pub mod hybrid {
         SHOW_INTEGRITY_SCREENSHARING_FRICTION_UI,
         SHOW_INTEGRITY_SCREENSHARING_FRICTION_UI_LOGGING_ENABLED,
         SILENT_GROUP_USERNAME_ACTIVITIES_ENABLED,
-        SMOOTHIE_PERFORMANCE_RESIZE_FOLLOWUP,
         STICKERS_EMOJI_TAGGING_ENABLED,
         SUPPORT_CONTACT_FORM_USING_GRAPHQL,
         UNIFIED_SESSION_LOG_CALL_EVENT,
@@ -17894,6 +18689,9 @@ pub mod hybrid {
         WEB_CHANNEL_VIDEO_SERVER_TRANSCODE_UPLOAD,
         WEB_CHAT_INFO_ACTION_BUTTONS_REFRESH,
         WEB_GROUP_BULK_ADD_CONTACT,
+        WEB_GUEST_CALLING_REPRESENTATION_ENABLED,
+        WEB_GUEST_CALLING_WAITING_ROOM_ADMIN_XP_ENABLED,
+        WEB_GUEST_CALLING_WAITING_ROOM_APPROVAL_NOTE_ENABLED,
         WEB_IP_TOKEN_ENABLED,
         WEB_WINDOWS_CALLING_32P_VERSION,
         WEBVIEW2_DISABLE_GPU_ACCELERATION,

@@ -1,4 +1,4 @@
-//! Auto-generated stanza and notification vocabulary (WhatsApp 2.3000.1044659339). DO NOT EDIT.
+//! Auto-generated stanza and notification vocabulary (WhatsApp 2.3000.1045368834). DO NOT EDIT.
 //!
 //! The tag a stanza arrives under, and the type of a `<notification>`.
 //!

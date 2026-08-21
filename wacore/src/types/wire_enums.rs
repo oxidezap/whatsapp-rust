@@ -1,4 +1,4 @@
-//! Auto-generated protocol enums (WhatsApp 2.3000.1044659339). DO NOT EDIT.
+//! Auto-generated protocol enums (WhatsApp 2.3000.1045368834). DO NOT EDIT.
 //!
 //! Protocol enums generated from the whatspec enum catalog.
 //!

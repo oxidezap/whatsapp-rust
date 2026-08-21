@@ -483,7 +483,10 @@ mod tests {
             request.doc.name,
             "WAWebMexFetchNewChatMessageCappingInfoJobQuery"
         );
-        assert_eq!(request.doc.id, "24503548349331633");
+        // Pinned as a literal on purpose: a persisted-query id is WhatsApp's to
+        // rotate, and this is the tripwire that makes a rotation visible in a
+        // spec bump instead of silent. It moved once, at 12dbeeb.
+        assert_eq!(request.doc.id, "27910975521856601");
         assert_eq!(
             serde_json::to_value(&request.variables).expect("variables serialize"),
             json!({ "input": { "type": "INDIVIDUAL_NEW_CHAT_THREAD" } })
