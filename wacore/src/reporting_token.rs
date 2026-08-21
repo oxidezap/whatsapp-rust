@@ -855,9 +855,14 @@ pub fn build_reporting_node(result: &ReportingTokenResult) -> Node {
     // The integer goes in as an integer: `NodeValue`'s numeric conversion
     // formats through `itoa` into an inline `CompactString`, while a
     // `to_string()` first would heap-allocate a one-byte String per message.
+    //
+    // The token goes in as the fixed-size array it is. `NodeContent::Bytes`
+    // owns a `Vec`, so one allocation is unavoidable, but `Vec::from([u8; N])`
+    // sizes and copies it with the length known at compile time, where the
+    // `to_vec()` on a slice first went through a runtime-length reserve.
     let token_node = NodeBuilder::new("reporting_token")
         .attr("v", result.version)
-        .bytes(result.reporting_token.to_vec())
+        .bytes(result.reporting_token)
         .build();
 
     NodeBuilder::new("reporting").children([token_node]).build()

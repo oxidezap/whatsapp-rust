@@ -3,6 +3,8 @@
 use super::*;
 use crate::stats::UnkeyableDevice;
 use anyhow::Context;
+use std::borrow::Cow;
+use wacore_binary::node::{Attrs, AttrsVec, NodeContent};
 
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
 /// across the surrounding SKDM creation + this encrypt, so a concurrent send
@@ -361,22 +363,40 @@ fn encrypted_device_to_participant_node(
     mediatype: Option<&str>,
     hide_decrypt_fail: bool,
 ) -> Node {
-    let mut enc_builder = NodeBuilder::new("enc")
-        .attr("v", stanza::ENC_VERSION)
-        .attr("type", one.enc_type);
+    // Built without `NodeBuilder` because the keys here are four distinct
+    // literals fixed at compile time, and `attr` cannot know that: every
+    // insert string-compares each key already present to reject a duplicate,
+    // which for `<enc>` is six comparisons per device. `<enc>` also carries one
+    // attr more than `AttrsVec` holds inline whenever a media send hides
+    // decrypt failures, so the builder's empty default spilled to the heap
+    // mid-insert; the count is known here, so the one allocation that case
+    // still needs is made once, at the right size.
+    let mut enc_attrs = AttrsVec::with_capacity(
+        2 + usize::from(mediatype.is_some()) + usize::from(hide_decrypt_fail),
+    );
+    enc_attrs.push((Cow::Borrowed("v"), stanza::ENC_VERSION.into()));
+    enc_attrs.push((Cow::Borrowed("type"), one.enc_type.into()));
     // `mediatype` is batch-level (same for every device) and originates as
     // a `&'static str`, so it's threaded here instead of cloned per result.
     if let Some(mt) = mediatype {
-        enc_builder = enc_builder.attr("mediatype", mt);
+        enc_attrs.push((Cow::Borrowed("mediatype"), mt.into()));
     }
     if hide_decrypt_fail {
-        enc_builder = enc_builder.attr("decrypt-fail", "hide");
+        enc_attrs.push((Cow::Borrowed("decrypt-fail"), "hide".into()));
     }
-    let enc_node = enc_builder.bytes(one.ciphertext).build();
-    NodeBuilder::new("to")
-        .attr("jid", one.device_jid)
-        .children([enc_node])
-        .build()
+    let enc_node = Node {
+        tag: Cow::Borrowed("enc"),
+        attrs: Attrs(enc_attrs),
+        content: Some(NodeContent::Bytes(one.ciphertext)),
+    };
+
+    let mut to_attrs = AttrsVec::with_capacity(1);
+    to_attrs.push((Cow::Borrowed("jid"), one.device_jid.into()));
+    Node {
+        tag: Cow::Borrowed("to"),
+        attrs: Attrs(to_attrs),
+        content: Some(NodeContent::Nodes(vec![enc_node])),
+    }
 }
 
 /// Per-device Signal sessions are independent (different ratchet state per
@@ -950,6 +970,10 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
     let mut participant_nodes = Vec::with_capacity(raw.devices.len());
     let mut encrypted_devices = Vec::with_capacity(raw.devices.len());
     for one in raw.devices {
+        // Both lists need the JID by value (`NodeValue::Jid` owns one), so one
+        // copy is the floor. It is a `CompactString` that holds every phone and
+        // LID user inline, so the copy is a move of the struct, not a heap
+        // round trip.
         encrypted_devices.push(one.device_jid.clone());
         participant_nodes.push(encrypted_device_to_participant_node(
             one,
