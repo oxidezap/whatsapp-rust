@@ -95,48 +95,6 @@ impl ByteWriter for VecByteWriter<'_> {
     }
 }
 
-pub(crate) struct SliceByteWriter<'a> {
-    buffer: &'a mut [u8],
-    position: usize,
-}
-
-impl<'a> SliceByteWriter<'a> {
-    fn new(buffer: &'a mut [u8]) -> Self {
-        Self {
-            buffer,
-            position: 0,
-        }
-    }
-
-    #[inline]
-    fn bytes_written(&self) -> usize {
-        self.position
-    }
-}
-
-impl ByteWriter for SliceByteWriter<'_> {
-    #[inline]
-    fn write_u8(&mut self, value: u8) -> Result<()> {
-        if self.position >= self.buffer.len() {
-            return Err(BinaryError::UnexpectedEof);
-        }
-        self.buffer[self.position] = value;
-        self.position += 1;
-        Ok(())
-    }
-
-    #[inline]
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let end = self.position + bytes.len();
-        if end > self.buffer.len() {
-            return Err(BinaryError::UnexpectedEof);
-        }
-        self.buffer[self.position..end].copy_from_slice(bytes);
-        self.position = end;
-        Ok(())
-    }
-}
-
 /// Trait for encoding node structures (both owned Node and borrowed NodeRef).
 /// All encoding logic lives in the trait implementation, keeping
 /// the Encoder simple and focused on low-level byte writing.
@@ -672,32 +630,30 @@ impl<W: Write> Encoder<'static, IoByteWriter<W>> {
 
 impl<'v> Encoder<'static, VecByteWriter<'v>> {
     pub fn new_vec(buffer: &'v mut Vec<u8>) -> Result<Self> {
-        buffer.clear();
-        let mut enc = Self {
-            writer: VecByteWriter::new(buffer),
-            string_hints: None,
-        };
-        enc.write_u8(crate::util::FORMAT_PLAIN)?;
-        Ok(enc)
+        Self::new_vec_with_hints(buffer, None)
     }
 }
 
-impl<'a> Encoder<'a, SliceByteWriter<'a>> {
-    pub(crate) fn new_slice(
-        buffer: &'a mut [u8],
+impl<'a, 'v> Encoder<'a, VecByteWriter<'v>> {
+    /// Append into `buffer`, replaying a plan's string hints.
+    ///
+    /// The exact-size marshallers reach for this rather than [`Self::new_slice`]
+    /// so their output buffer can be reserved instead of zero-filled: a `Vec`
+    /// only ever grown by writes needs no initial value for bytes the encoder
+    /// is about to overwrite, while a `&mut [u8]` has to exist before the
+    /// encoder can borrow it. The exact-size invariant is enforced the same
+    /// way either side, by comparing the written length against the plan.
+    pub(crate) fn new_vec_with_hints(
+        buffer: &'v mut Vec<u8>,
         string_hints: Option<&'a StringHintCache>,
     ) -> Result<Self> {
+        buffer.clear();
         let mut enc = Self {
-            writer: SliceByteWriter::new(buffer),
+            writer: VecByteWriter::new(buffer),
             string_hints,
         };
         enc.write_u8(crate::util::FORMAT_PLAIN)?;
         Ok(enc)
-    }
-
-    #[inline]
-    pub(crate) fn bytes_written(&self) -> usize {
-        self.writer.bytes_written()
     }
 }
 

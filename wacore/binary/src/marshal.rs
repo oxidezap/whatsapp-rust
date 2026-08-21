@@ -81,14 +81,22 @@ pub fn marshal_auto(node: &Node) -> Result<Vec<u8>> {
 /// This avoids output buffer growth/copies and can be beneficial for large/variable payloads.
 pub fn marshal_exact(node: &Node) -> Result<Vec<u8>> {
     let plan = build_marshaled_node_plan(node);
-    let mut payload = vec![0; plan.size];
-    let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
-    encoder.write_node(node)?;
-    let written = encoder.bytes_written();
+    // Reserved, not zero-filled. `vec![0; plan.size]` memset every byte the
+    // encoder is about to overwrite, which for the large payloads this path
+    // exists for is a second full pass over the output. Appending into a `Vec`
+    // reserved to the exact plan size writes each byte once; the plan is still
+    // what decides the buffer's size, so a plan that undershoots grows the
+    // `Vec` and is caught by the length check below rather than silently
+    // truncating.
+    let mut payload = Vec::with_capacity(plan.size);
+    {
+        let mut encoder = Encoder::new_vec_with_hints(&mut payload, Some(&plan.hints))?;
+        encoder.write_node(node)?;
+    }
     // Real checks, not debug_asserts: replayed hints are trusted in release,
     // so a plan/encode traversal divergence must fail the marshal instead of
     // shipping corrupt bytes. Two integer compares per stanza.
-    if written != payload.len() || !plan.hints.fully_consumed() {
+    if payload.len() != plan.size || !plan.hints.fully_consumed() {
         return Err(BinaryError::PlanMismatch);
     }
     Ok(payload)
@@ -131,12 +139,14 @@ pub fn marshal_ref_auto(node: &NodeRef<'_>) -> Result<Vec<u8>> {
 /// This avoids output buffer growth/copies and preserves zero-copy input semantics.
 pub fn marshal_ref_exact(node: &NodeRef<'_>) -> Result<Vec<u8>> {
     let plan = build_marshaled_node_ref_plan(node);
-    let mut payload = vec![0; plan.size];
-    let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
-    encoder.write_node(node)?;
-    let written = encoder.bytes_written();
+    // Reserved rather than zero-filled, for the reason marshal_exact gives.
+    let mut payload = Vec::with_capacity(plan.size);
+    {
+        let mut encoder = Encoder::new_vec_with_hints(&mut payload, Some(&plan.hints))?;
+        encoder.write_node(node)?;
+    }
     // Same invariant enforcement as marshal_exact.
-    if written != payload.len() || !plan.hints.fully_consumed() {
+    if payload.len() != plan.size || !plan.hints.fully_consumed() {
         return Err(BinaryError::PlanMismatch);
     }
     Ok(payload)
@@ -290,8 +300,8 @@ mod tests {
     /// here — the two directions of this token genuinely differ.
     ///
     /// Every encoder path is covered because `marshal_exact` sizes its output
-    /// slice from the size estimator before writing into it: an estimator that
-    /// disagrees with the writer surfaces as `UnexpectedEof`, not as wrong bytes,
+    /// buffer from the size estimator before writing into it: an estimator that
+    /// disagrees with the writer surfaces as `PlanMismatch`, not as wrong bytes,
     /// and `marshal_exact` is what production sends through.
     #[test]
     fn interop_jid_carries_its_integrator_onto_the_wire() -> TestResult {
@@ -598,6 +608,48 @@ mod tests {
         marshal_to(&node, &mut payload_writer)?;
 
         assert_eq!(payload_exact, payload_writer);
+        Ok(())
+    }
+
+    /// The exact-size paths reserve their output instead of zero-filling it, so
+    /// nothing initializes the bytes the encoder does not reach: a plan that
+    /// overshoots can no longer leave a tail of zeros that happens to look like
+    /// a valid encoding, and one that undershoots grows the buffer instead of
+    /// erroring inside the writer. Both now surface only through the length
+    /// check, which the other exact tests exercise on a small fixture; this one
+    /// runs a payload past every growth step a `Vec` would take on the way to
+    /// it, where a divergence has room to show up as wrong bytes.
+    #[test]
+    fn exact_paths_match_the_streaming_writer_on_a_large_payload() -> TestResult {
+        let mut attrs = Attrs::with_capacity(2);
+        attrs.push("id".to_string(), "ABC123");
+        attrs.push(
+            "to".to_string(),
+            NodeValue::Jid("15551234567@s.whatsapp.net".parse::<Jid>().unwrap()),
+        );
+        let children: Vec<Node> = (0..512)
+            .map(|i| {
+                let mut child_attrs = Attrs::with_capacity(1);
+                child_attrs.push("i".to_string(), i.to_string());
+                Node::new(
+                    "item",
+                    child_attrs,
+                    Some(NodeContent::Bytes(vec![(i % 251) as u8; 64])),
+                )
+            })
+            .collect();
+        let node = Node::new("message", attrs, Some(NodeContent::Nodes(children)));
+        let node_ref = node.as_node_ref();
+
+        let mut streamed = Vec::new();
+        marshal_to(&node, &mut streamed)?;
+        assert!(
+            streamed.len() > 32 * 1024,
+            "fixture must outgrow the small-payload paths"
+        );
+
+        assert_eq!(marshal_exact(&node)?, streamed, "marshal_exact");
+        assert_eq!(marshal_ref_exact(&node_ref)?, streamed, "marshal_ref_exact");
         Ok(())
     }
 
