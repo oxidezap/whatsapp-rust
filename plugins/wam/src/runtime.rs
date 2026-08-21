@@ -23,7 +23,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use log::{debug, warn};
-use portable_atomic::{AtomicU64, Ordering};
 use whatsapp_rust::async_trait;
 use whatsapp_rust_wam_catalog::{Channel, WamBuffer, WamEvent, constants, events, sampling};
 
@@ -194,9 +193,6 @@ pub struct WamRuntime {
     store: Arc<dyn WamStore>,
     max_queued_events: usize,
     shared: Mutex<Shared>,
-    /// Distinguishes retained buffers. Monotonic within a run and never a wire
-    /// value, so a restart repeating it is harmless.
-    next_key: AtomicU64,
 }
 
 impl std::fmt::Debug for WamRuntime {
@@ -241,7 +237,6 @@ impl WamRuntime {
                     ..WamStats::default()
                 },
             }),
-            next_key: AtomicU64::new(1),
         }
     }
 
@@ -490,7 +485,7 @@ impl WamRuntime {
             self.report_buffer_drop();
             return;
         }
-        let key = self.next_key.fetch_add(1, Ordering::Relaxed);
+        let key = next_key(&pending);
         if let Err(err) = self
             .store
             .put_pending(PendingBuffer {
@@ -556,6 +551,22 @@ enum Delivery {
     Failed,
     /// Not sent at all, and not worth keeping.
     TooLarge,
+}
+
+/// A key no retained buffer is using.
+///
+/// Read off the retained buffers rather than a counter that starts at 1. A
+/// durable store hands back the previous run's buffers, and a counter that does
+/// not know about them would hand out a key one of them already holds, which the
+/// store's insert semantics turn into an undelivered buffer being overwritten.
+/// The caller already has the list, since the retention cap is computed from it.
+fn next_key(pending: &[PendingBuffer]) -> u64 {
+    pending
+        .iter()
+        .map(|b| b.key)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 /// How long to wait before the next upload attempt, in seconds, after
@@ -908,6 +919,57 @@ mod tests {
             .tick(&mut writer, &uploader, 1_755_000_000, &mut keep_all(), true)
             .await;
         assert!(uploader.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_retained_buffer_never_overwrites_one_a_previous_run_left() {
+        // A durable store hands back the last run's buffers, so a key counter
+        // starting at 1 would reuse one of theirs and lose it.
+        let store = Arc::new(InMemoryWamStore::new());
+        store
+            .put_pending(PendingBuffer {
+                key: 1,
+                channel: Channel::Regular,
+                bytes: b"WAM-from-a-previous-run".to_vec(),
+            })
+            .await
+            .expect("seed");
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([
+            Err(UploadFailure::Retryable("503".into())),
+            Err(UploadFailure::Retryable("503".into())),
+        ]);
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                false,
+            )
+            .await;
+
+        let pending = store.pending().await.expect("pending");
+        assert_eq!(pending.len(), 2, "both buffers are retained");
+        assert!(
+            pending
+                .iter()
+                .any(|b| b.bytes == b"WAM-from-a-previous-run"),
+            "the previous run's buffer survived"
+        );
+    }
+
+    #[test]
+    fn next_key_clears_every_key_already_in_use() {
+        assert_eq!(next_key(&[]), 1);
+        let held = |key| PendingBuffer {
+            key,
+            channel: Channel::Regular,
+            bytes: Vec::new(),
+        };
+        assert_eq!(next_key(&[held(1), held(7), held(3)]), 8);
     }
 
     #[test]
