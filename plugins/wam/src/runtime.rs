@@ -224,6 +224,30 @@ impl std::fmt::Debug for WamRuntime {
     }
 }
 
+/// Why a tick is running, which decides what it is allowed to ignore.
+///
+/// The two differ only in how they treat the cooldown a failed upload sets.
+/// Everything else a tick does is the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickKind {
+    /// The recurring flush. Uploads a buffer that is due and skips one inside a
+    /// cooldown, so a failing server is asked at the backoff's pace.
+    Scheduled,
+    /// The last tick before the client goes away. Uploads whatever it holds and
+    /// makes one attempt even inside a cooldown: a cooldown defers to the next
+    /// tick, and there is no next tick, so honouring it here is not patience but
+    /// a discard, silent against the default store, which keeps nothing. The
+    /// attempt is bounded by the shutdown deadline the host already applies.
+    Final,
+}
+
+impl TickKind {
+    /// Whether a cooldown still stops an upload.
+    fn honours_cooldown(self) -> bool {
+        matches!(self, Self::Scheduled)
+    }
+}
+
 /// The buffers, owned by whichever task drives [`WamRuntime::tick`].
 #[derive(Debug, Default)]
 pub struct WamWriter {
@@ -357,11 +381,11 @@ impl WamRuntime {
         uploader: &dyn WamUploader,
         now_secs: i64,
         roll: &mut (dyn FnMut() -> f64 + Send),
-        force: bool,
+        kind: TickKind,
     ) {
         // Before anything else, so a buffer retained by this tick waits for the
         // next one and older buffers keep their place in line.
-        self.drain_pending(writer, uploader, now_secs).await;
+        self.drain_pending(writer, uploader, now_secs, kind).await;
 
         let queued: Vec<PendingEvent> = {
             let mut shared = self.lock();
@@ -382,7 +406,7 @@ impl WamRuntime {
                 .as_ref()
                 .is_some_and(|b| b.len() > MAX_BUFFER_SIZE)
             {
-                self.upload_current(writer, uploader, now_secs).await;
+                self.upload_current(writer, uploader, now_secs, kind).await;
             }
             if writer.current.is_none() {
                 match self.start_buffer().await {
@@ -403,14 +427,14 @@ impl WamRuntime {
 
         let due = writer.current.as_ref().is_some_and(|buffer| {
             buffer.has_events()
-                && (force
+                && (kind == TickKind::Final
                     || buffer.len() > MAX_BUFFER_SIZE
                     || writer
                         .last_upload_secs
                         .is_none_or(|last| now_secs >= last.saturating_add(ROTATE_INTERVAL_SECS)))
         });
         if due {
-            self.upload_current(writer, uploader, now_secs).await;
+            self.upload_current(writer, uploader, now_secs, kind).await;
         }
     }
 
@@ -443,6 +467,7 @@ impl WamRuntime {
         writer: &mut WamWriter,
         uploader: &dyn WamUploader,
         now_secs: i64,
+        kind: TickKind,
     ) {
         let Some(buffer) = writer.current.take() else {
             return;
@@ -453,8 +478,10 @@ impl WamRuntime {
         let bytes = buffer.into_bytes();
         // Inside a cooldown the buffer is retained without an attempt: the
         // cooldown exists so a failing server is asked at the backoff's pace,
-        // and a buffer finished mid-drain must not get around it.
-        if writer.retry_after_secs.is_some_and(|at| now_secs < at) {
+        // and a buffer finished mid-drain must not get around it. A final tick
+        // is the exception, because retaining is only deferral while there is a
+        // later tick to defer to.
+        if kind.honours_cooldown() && writer.retry_after_secs.is_some_and(|at| now_secs < at) {
             self.retain(bytes).await;
             return;
         }
@@ -568,8 +595,9 @@ impl WamRuntime {
         writer: &mut WamWriter,
         uploader: &dyn WamUploader,
         now_secs: i64,
+        kind: TickKind,
     ) {
-        if writer.retry_after_secs.is_some_and(|at| now_secs < at) {
+        if kind.honours_cooldown() && writer.retry_after_secs.is_some_and(|at| now_secs < at) {
             return;
         }
         let pending = match self.store.pending().await {
@@ -740,7 +768,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         let seen = uploader.seen();
@@ -760,11 +788,23 @@ mod tests {
         let start = 1_755_000_000;
         runtime.observe(receipt());
         runtime
-            .tick(&mut writer, &uploader, start, &mut keep_all(), false)
+            .tick(
+                &mut writer,
+                &uploader,
+                start,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
             .await;
         runtime.observe(receipt());
         runtime
-            .tick(&mut writer, &uploader, start + 5, &mut keep_all(), false)
+            .tick(
+                &mut writer,
+                &uploader,
+                start + 5,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
             .await;
         assert_eq!(uploader.seen().len(), 1, "too soon to upload again");
         runtime.observe(receipt());
@@ -774,7 +814,7 @@ mod tests {
                 &uploader,
                 start + ROTATE_INTERVAL_SECS,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         assert_eq!(uploader.seen().len(), 2, "the interval elapsed");
@@ -795,7 +835,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         assert_eq!(runtime.stats().upload_failures, 1);
@@ -809,7 +849,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         assert_eq!(uploader.seen().len(), 1);
@@ -821,10 +861,52 @@ mod tests {
                 &uploader,
                 1_755_000_000 + backoff(0),
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         assert_eq!(runtime.stats().uploaded, 1);
+        assert!(store.pending().await.expect("pending").is_empty());
+    }
+
+    /// The cooldown defers to the next tick, and a final tick is the one with
+    /// none. Honouring it there retains into a store the default implementation
+    /// throws away, so the shutdown flush would do nothing in exactly the case
+    /// it exists for: a client that had been failing to upload.
+    #[tokio::test]
+    async fn a_final_tick_attempts_an_upload_the_cooldown_would_have_deferred() {
+        let store = Arc::new(InMemoryWamStore::new());
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([Err(UploadFailure::Retryable("503".into()))]);
+
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
+            .await;
+        assert_eq!(uploader.seen().len(), 1);
+        assert_eq!(store.pending().await.expect("pending").len(), 1);
+
+        // Same second, so the cooldown the failure started is still running.
+        // A scheduled tick would not ask again; this one does, and takes both
+        // the buffer left behind and the one the queue just produced.
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Final,
+            )
+            .await;
+        assert_eq!(uploader.seen().len(), 3);
+        assert_eq!(runtime.stats().uploaded, 2);
         assert!(store.pending().await.expect("pending").is_empty());
     }
 
@@ -843,7 +925,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         assert_eq!(uploader.seen().len(), 1);
@@ -873,7 +955,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         assert_eq!(runtime.stats().uploaded, 0);
@@ -890,7 +972,7 @@ mod tests {
                 &uploader,
                 1_755_000_000 + backoff(0),
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         // The refused buffer is gone rather than queued for another refusal.
@@ -939,7 +1021,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         // Two events written: the one that survived, and one report carrying
@@ -957,7 +1039,13 @@ mod tests {
         // 0.5 is far past 1/2000 and the event is discarded.
         let mut roll = || 0.5;
         runtime
-            .tick(&mut writer, &uploader, 1_755_000_000, &mut roll, false)
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut roll,
+                TickKind::Scheduled,
+            )
             .await;
         let stats = runtime.stats();
         assert_eq!(stats.sampled_out, 1);
@@ -988,7 +1076,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         let seen = uploader.seen();
@@ -1017,7 +1105,13 @@ mod tests {
             },
         ));
         runtime
-            .tick(&mut writer, &uploader, 1_755_000_000, &mut keep_all(), true)
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Final,
+            )
             .await;
         assert!(
             uploader.seen().is_empty(),
@@ -1030,7 +1124,13 @@ mod tests {
         // And the drop is reported the way the official client reports it.
         let mut roll = || 0.0;
         runtime
-            .tick(&mut writer, &uploader, 1_755_000_001, &mut roll, true)
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_001,
+                &mut roll,
+                TickKind::Final,
+            )
             .await;
         let seen = uploader.seen();
         assert_eq!(seen.len(), 1, "the report itself is a small buffer");
@@ -1043,7 +1143,13 @@ mod tests {
         let mut writer = WamWriter::default();
         let uploader = ScriptedUploader::with([Ok(())]);
         runtime
-            .tick(&mut writer, &uploader, 1_755_000_000, &mut keep_all(), true)
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Final,
+            )
             .await;
         assert!(uploader.seen().is_empty());
     }
@@ -1074,7 +1180,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
 
@@ -1157,7 +1263,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
 
@@ -1206,7 +1312,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         let stats = runtime.stats();
@@ -1277,7 +1383,7 @@ mod tests {
                 &refusing,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         assert_eq!(
@@ -1298,7 +1404,7 @@ mod tests {
                 &accepting,
                 1_755_000_600,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         assert_eq!(store.removals(), vec![1], "an accepted buffer is forgotten");
@@ -1357,7 +1463,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                false,
+                TickKind::Scheduled,
             )
             .await;
         assert_eq!(

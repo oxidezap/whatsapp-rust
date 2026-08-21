@@ -82,7 +82,7 @@ use whatsapp_rust::{
 use whatsapp_rust_wam_catalog::events;
 
 pub use identity::WamIdentity;
-pub use runtime::{PendingEvent, UploadFailure, WamStats, WamUploader};
+pub use runtime::{PendingEvent, TickKind, UploadFailure, WamStats, WamUploader};
 pub use store::{InMemoryWamStore, PendingBuffer, WamStore, WamStoreError};
 
 use runtime::{BUFFERING_INTERVAL, WamRuntime, WamWriter};
@@ -212,8 +212,10 @@ impl EventHandler for WamEventHandler {
             }
             Event::RawNode(node) => {
                 let node = node.get();
-                if node.tag.as_ref() == StanzaTag::Receipt.as_str()
-                    && let Some(event) = derive::receipt_stanza_receive(node)
+                if matches!(
+                    StanzaTag::try_from(node.tag.as_ref()),
+                    Ok(StanzaTag::Receipt)
+                ) && let Some(event) = derive::receipt_stanza_receive(node)
                 {
                     self.0.observe(PendingEvent::ReceiptStanzaReceive(event));
                 }
@@ -330,7 +332,13 @@ impl ClientPlugin for WamPlugin {
             let now = whatsapp_rust::wacore::time::now_utc().timestamp();
             let mut roll = rand::random::<f64>;
             runtime
-                .tick(&mut writer, uploader.as_ref(), now, &mut roll, true)
+                .tick(
+                    &mut writer,
+                    uploader.as_ref(),
+                    now,
+                    &mut roll,
+                    TickKind::Final,
+                )
                 .await;
             Ok(())
         })
@@ -356,7 +364,13 @@ fn spawn_flush_loop(
             let now = whatsapp_rust::wacore::time::now_utc().timestamp();
             let mut roll = rand::random::<f64>;
             runtime
-                .tick(&mut writer, uploader.as_ref(), now, &mut roll, false)
+                .tick(
+                    &mut writer,
+                    uploader.as_ref(),
+                    now,
+                    &mut roll,
+                    TickKind::Scheduled,
+                )
                 .await;
         }
         // Parked for the shutdown flush, which is the only thing that runs after

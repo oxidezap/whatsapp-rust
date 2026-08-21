@@ -14,7 +14,7 @@ use whatsapp_rust::wacore::request::RequestUtils;
 use whatsapp_rust::wacore_binary::marshal::{marshal, unmarshal_packed_ref};
 use whatsapp_rust::wacore_binary::{NodeContent, NodeContentRef};
 use whatsapp_rust_plugin_wam::iq::SendBufferSpec;
-use whatsapp_rust_plugin_wam::runtime::{PendingEvent, WamRuntime, WamWriter};
+use whatsapp_rust_plugin_wam::runtime::{PendingEvent, TickKind, WamRuntime, WamWriter};
 use whatsapp_rust_plugin_wam::{InMemoryWamStore, UploadFailure, WamIdentity, WamUploader};
 use whatsapp_rust_wam_catalog::{WamEvent, events, globals};
 
@@ -136,7 +136,13 @@ async fn one_observation_reaches_the_wire_as_a_stats_stanza() {
     // A roll of zero keeps everything, so the test is about the encoding rather
     // than about the sampler.
     runtime
-        .tick(&mut writer, &uploader, 1_755_000_000, &mut || 0.0, true)
+        .tick(
+            &mut writer,
+            &uploader,
+            1_755_000_000,
+            &mut || 0.0,
+            TickKind::Final,
+        )
         .await;
 
     let buffers = uploader.0.lock().expect("capture lock").clone();
