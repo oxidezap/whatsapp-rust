@@ -321,10 +321,12 @@ fn reports_a_decryption_outcome(reason: &EncDecryptFailureReason) -> bool {
 
 /// The `E2eMessageRecv` one failed `<enc>` produces, when it produces one.
 ///
-/// `None` for a reason that does not describe this `<enc>`'s decryption; see
-/// [`reports_a_decryption_outcome`] for which those are and why. The `<enc>`
-/// goes unreported rather than misreported, which is the side of the choice
-/// that keeps the number meaning what it says.
+/// `None` for a reason that does not describe this `<enc>`'s decryption: one
+/// the client set aside before reading any ciphertext, or one where the
+/// decryption succeeded and something after it could not use the bytes. Such an
+/// `<enc>` goes unreported rather than misreported, which is the side of the
+/// choice that keeps the number meaning what it says. The exact line, and the
+/// one reason that crosses it, are in `reports_a_decryption_outcome` below.
 pub fn from_enc_failure(failed: &EncDecryptFailed) -> Option<events::E2eMessageRecv> {
     if !reports_a_decryption_outcome(&failed.reason) {
         return None;
