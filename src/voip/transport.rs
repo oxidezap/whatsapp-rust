@@ -1482,10 +1482,13 @@ mod relay_failures {
     /// connected UDP socket the vanished peer surfaces as an ICMP-driven socket error, which the
     /// driver reports as `Disconnected` instead of leaving the call waiting on silence.
     ///
-    /// This covers the socket-error path specifically, and so depends on the platform delivering
-    /// ICMP port-unreachable on loopback (Linux does; CI runs there). The relay hanging up properly
-    /// is the portable path and has its own test over the in-memory link, so a platform without
-    /// that ICMP behaviour still has the close path covered.
+    /// This covers the socket-error path specifically, which is the only signal a relay that stops
+    /// answering without saying so ever produces. It is gated to Linux because it is the platform
+    /// whose loopback delivers ICMP port-unreachable to a connected UDP socket; elsewhere the test
+    /// would run out its bound and fail on correct code. The two ways a relay ends a call politely
+    /// are the portable paths and have their own tests over the in-memory link, so a platform
+    /// without that ICMP behaviour still has the close paths covered.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_relay_that_disappears_disconnects_the_channel() {
         let body = async {
