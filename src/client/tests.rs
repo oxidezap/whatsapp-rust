@@ -7100,3 +7100,58 @@ async fn a_first_connection_and_a_restored_one_report_the_same_state() {
         );
     }
 }
+
+/// A client that has never connected is the state every healthy start passes
+/// through, so it is waited out like any other and ends on the connection
+/// rather than on a verdict about the past. A state that reported "no
+/// connection has ever landed" and settled the wait would hand that verdict to
+/// every caller that waits right after starting the loop.
+#[tokio::test]
+async fn a_first_connection_is_waited_out_like_any_other() {
+    let client = crate::test_utils::create_test_client_with_name("first-connect-wait").await;
+    client.is_running.store(true, Ordering::Relaxed);
+    assert_eq!(
+        client.connection_generation.load(Ordering::SeqCst),
+        0,
+        "no connection of this client was ever driven or torn down"
+    );
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+    assert!(
+        !waiter.is_finished(),
+        "having never connected is not a reason to stop waiting"
+    );
+
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    client.notify_session_state();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the first connection must end the wait")
+            .expect("the waiter should not panic"),
+        Reachability::Reachable
+    );
+}
+
+/// The gate an embedder reads before every call stays flag loads and a match,
+/// on the path that is taken most: no store read, and nothing to allocate.
+#[tokio::test]
+async fn reading_reachability_costs_nothing_on_the_reachable_path() {
+    let client = create_reachable_wait_test_client("reachability-cost").await;
+
+    let allocations = crate::test_alloc::min_allocs(0, || {
+        assert_eq!(client.reachability(), Reachability::Reachable);
+        assert!(!client.reachability().recovers_on_its_own());
+    });
+    assert_eq!(allocations, 0);
+}

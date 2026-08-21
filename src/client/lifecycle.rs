@@ -2115,6 +2115,21 @@ pub enum Reachability {
     ///
     /// The one state [`Client::wait_until_reachable`] waits out, so it is the
     /// one that call never returns; only [`Client::reachability`] reports it.
+    ///
+    /// Covers a first connection that has not landed yet as well as a session
+    /// being restored, and does not separate them. What a client holds about
+    /// its past does not answer the question a caller is asking about its
+    /// future: a device that authenticated yesterday and has been revoked
+    /// since will never connect again, and one whose first attempt lands
+    /// during a brief outage connects on the next. It is also the state every
+    /// healthy client sits in for the whole of a normal start.
+    ///
+    /// So this says an attempt is being made, never that one will land. Causes
+    /// the client cannot attribute are retried indefinitely by design, a
+    /// handshake torn down before `<success>` reading the same as a server
+    /// that is momentarily unreachable, and a wait on this can outlive the
+    /// process. The bound belongs to the caller: see
+    /// [`Client::wait_until_reachable`].
     Reconnecting,
     /// [`Client::pause`] is in effect. Like [`Self::Reconnecting`] the client
     /// is not finished, but the thing that ends it is [`Client::resume`], and
@@ -2147,8 +2162,20 @@ impl Reachability {
     ///
     /// False for [`Self::Paused`]: the client does come back, but on the
     /// application's word rather than on its own.
+    ///
+    /// An expectation and not a promise, for the reason given on
+    /// [`Self::Reconnecting`]: true says something is driving the client back,
+    /// and the client cannot tell a cause a retry fixes from one it never
+    /// will.
+    ///
+    /// Matched exhaustively for the same reason [`Self::settles`] is: a state
+    /// added later has to be classified here rather than taking an answer by
+    /// omission.
     pub fn recovers_on_its_own(self) -> bool {
-        matches!(self, Self::Reconnecting)
+        match self {
+            Self::Reconnecting => true,
+            Self::Reachable | Self::Paused | Self::Unsupervised | Self::Finished => false,
+        }
     }
 
     /// Whether this is an answer a wait can stop on.
