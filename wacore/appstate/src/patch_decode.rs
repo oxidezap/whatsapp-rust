@@ -251,7 +251,7 @@ fn parse_collection_error(
 /// rather than generic over the two node types: the owned and borrowed trees
 /// expose different attribute parsers and content enums, and the shared shape is
 /// three field reads.
-pub fn parse_single_collection_ref(collection: &NodeRef<'_>) -> Result<PatchList> {
+fn parse_single_collection_ref(collection: &NodeRef<'_>) -> Result<PatchList> {
     let mut ag = collection.attrs();
     let name_str = ag
         .optional_string("name")
