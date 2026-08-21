@@ -7040,3 +7040,63 @@ async fn a_reachable_client_completes_the_wait_without_parking() {
         "and must not register a listener on the way through"
     );
 }
+
+/// Reproduction: the two clients [`Reachability`] does not separate are one
+/// whose first connection has not landed and one restoring a session it lost.
+/// Every marker that could tell them apart is set on the second and not the
+/// first, and both report the same state, so a caller holding work until the
+/// client is reachable holds both the same way.
+#[tokio::test]
+async fn a_first_connection_and_a_restored_one_report_the_same_state() {
+    let first = crate::test_utils::create_test_client_with_name("never-connected").await;
+    first.is_running.store(true, Ordering::Relaxed);
+
+    let restoring = crate::test_utils::create_test_client_with_name("lost-session").await;
+    restoring.is_running.store(true, Ordering::Relaxed);
+    // What one authenticated-then-lost cycle leaves standing: the persistent
+    // record of a login, and the generations `<success>` and the teardown bump.
+    restoring
+        .persistence_manager
+        .process_command(DeviceCommand::IncrementLoginCounter)
+        .await;
+    restoring
+        .connection_generation
+        .fetch_add(2, Ordering::SeqCst);
+
+    assert_eq!(first.connection_generation.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        first
+            .persistence_manager
+            .get_device_snapshot()
+            .login_counter,
+        0,
+        "the first client has never authenticated, in this process or any other"
+    );
+    assert!(restoring.connection_generation.load(Ordering::SeqCst) > 0);
+    assert!(
+        restoring
+            .persistence_manager
+            .get_device_snapshot()
+            .login_counter
+            > 0,
+        "and the second has, which is the whole of the difference between them"
+    );
+
+    assert_eq!(
+        first.reachability(),
+        restoring.reachability(),
+        "yet nothing reachability reads separates them"
+    );
+    assert_eq!(first.reachability(), Reachability::Reconnecting);
+    assert!(first.reachability().recovers_on_its_own());
+    assert!(restoring.reachability().recovers_on_its_own());
+
+    for client in [&first, &restoring] {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), client.wait_until_reachable())
+                .await
+                .is_err(),
+            "so a wait sits through both alike"
+        );
+    }
+}
