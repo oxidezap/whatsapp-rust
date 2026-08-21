@@ -330,6 +330,16 @@ mod tests {
         assert!(decoder.decode_frame().is_none());
     }
 
+    /// Payload size for the four tests below that need the buffer to go past
+    /// [`MAX_IDLE_CAPACITY`], which is the only property of it that matters.
+    ///
+    /// Cut under Miri because interpretation is ~100x native and `payload`
+    /// builds its bytes one at a time. It must stay *above* 64 KiB: below that
+    /// `grew_oversized` never latches, the release path is never entered, and
+    /// all four assertions hold without testing anything. Each of them asserts
+    /// the latch, so shrinking this too far fails loudly instead.
+    const OVERSIZED_PAYLOAD: usize = if cfg!(miri) { 80 * 1024 } else { 200 * 1024 };
+
     /// Deterministic stand-in for a payload of `len` bytes.
     fn payload(len: usize, seed: u8) -> Vec<u8> {
         (0..len)
@@ -501,7 +511,7 @@ mod tests {
     #[test]
     fn an_exactly_consumed_oversized_buffer_is_still_released() {
         let mut decoder = FrameDecoder::new();
-        let payload_len = 200 * 1024;
+        let payload_len = OVERSIZED_PAYLOAD;
 
         let mut wire = Vec::with_capacity(FRAME_LENGTH_SIZE + payload_len);
         wire.push((payload_len >> 16) as u8);
@@ -510,6 +520,10 @@ mod tests {
         wire.extend(std::iter::repeat_n(0xAB, payload_len));
 
         decoder.feed(&wire);
+        assert!(
+            decoder.grew_oversized,
+            "fixture never crossed MAX_IDLE_CAPACITY, so the release path below is not reached"
+        );
         let frame = decoder.decode_frame().expect("the whole frame arrived");
         assert_eq!(frame.len(), payload_len);
         drop(frame);
@@ -530,7 +544,7 @@ mod tests {
     /// frame never arrives.
     #[test]
     fn an_oversized_buffer_is_released_when_a_short_tail_remains() {
-        let big = payload(200 * 1024, 0x55);
+        let big = payload(OVERSIZED_PAYLOAD, 0x55);
         let mut decoder = FrameDecoder::new();
 
         let mut wire = encode_frame(&big, None).expect("encode");
@@ -538,6 +552,10 @@ mod tests {
         // the decoder parks holding them.
         wire.extend_from_slice(&[0x00, 0x00]);
         decoder.feed(&wire);
+        assert!(
+            decoder.grew_oversized,
+            "fixture never crossed MAX_IDLE_CAPACITY, so the release path below is not reached"
+        );
 
         let frame = decoder.decode_frame().expect("big frame");
         assert_eq!(&frame[..], &big[..]);
@@ -574,12 +592,16 @@ mod tests {
     /// the buffer it was copied out of would have to be grown straight back.
     #[test]
     fn a_long_residue_is_not_copied_out_of_its_buffer() {
-        let big = payload(200 * 1024, 0x66);
+        let big = payload(OVERSIZED_PAYLOAD, 0x66);
         let mut decoder = FrameDecoder::new();
 
         let mut wire = encode_frame(&big, None).expect("encode");
         wire.extend_from_slice(&encode_frame(&payload(8 * 1024, 0x77), None).expect("encode")[..]);
         decoder.feed(&wire);
+        assert!(
+            decoder.grew_oversized,
+            "fixture never crossed MAX_IDLE_CAPACITY, so there is no release decision to skip"
+        );
 
         let frame = decoder.decode_frame().expect("big frame");
         assert_eq!(
@@ -591,9 +613,13 @@ mod tests {
 
     #[test]
     fn an_oversized_buffer_is_released_once_drained() {
-        let big = payload(200 * 1024, 0x33);
+        let big = payload(OVERSIZED_PAYLOAD, 0x33);
         let mut decoder = FrameDecoder::new();
         decoder.feed(&encode_frame(&big, None).expect("encode"));
+        assert!(
+            decoder.grew_oversized,
+            "fixture never crossed MAX_IDLE_CAPACITY, so the release path below is not reached"
+        );
 
         let frame = decoder.decode_frame().expect("big frame");
         assert_eq!(&frame[..], &big[..]);
