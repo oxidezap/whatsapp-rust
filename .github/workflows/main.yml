@@ -10,11 +10,19 @@ on:
   workflow_call:
 
 concurrency:
-  # Cancelling is scoped to `pull_request`: a push to main and a release's
-  # `workflow_call` run must both finish. The event name is in the group for the
-  # same reason docker.yml puts it there: without it a release validating main
-  # would land in the same group as a run of this workflow on main and be
-  # cancelled by it.
+  # The decision point for every `workflow_call`-able workflow here; the others
+  # carry a one-line pointer rather than a copy of this.
+  #
+  # Cancelling is scoped to `pull_request`. A push to main and a run started by
+  # `release.yml` calling this workflow must both finish, so neither may cancel
+  # the other. `github.event_name` is in the group for exactly that: it is what
+  # keeps a release validating main out of the same group as a `push` run on
+  # main, which would otherwise cancel it. docker.yml already grouped on the
+  # event name for this reason before any of these did.
+  #
+  # `release.yml` calls main.yml, e2e.yml and docker.yml today; miri.yml,
+  # supply-chain.yml and wasm.yml expose `workflow_call` without a caller yet,
+  # and are grouped the same way so adding one is not a silent cancellation bug.
   group: rust-ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 

@@ -10,11 +10,8 @@ on:
   workflow_call:
 
 concurrency:
-  # Cancelling is scoped to `pull_request`: a push to main and a release's
-  # `workflow_call` run must both finish. The event name is in the group for the
-  # same reason docker.yml puts it there: without it a release validating main
-  # would land in the same group as a run of this workflow on main and be
-  # cancelled by it.
+  # Grouped and scoped exactly as main.yml's concurrency block, for the reasons
+  # given there.
   group: miri-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
