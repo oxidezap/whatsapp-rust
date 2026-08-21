@@ -1179,7 +1179,7 @@ pub fn parse_message_info(
 ) -> Result<crate::types::message::MessageInfo> {
     use crate::types::message::{
         AddressingMode, EditAttribute, MessageCategory, MessageInfo, MessageSource, PollType,
-        StanzaMessageType,
+        ReportingBytes, StanzaMessageType,
     };
     use wacore_binary::{JidExt as _, STATUS_BROADCAST_USER, Server};
 
@@ -1342,14 +1342,14 @@ pub fn parse_message_info(
     let mut meta_info = crate::types::message::MsgMetaInfo::default();
     if let Some(meta) = node.get_optional_child("meta") {
         let mut ma = meta.attrs();
-        meta_info.content_type = ma.optional_string("content_type").map(|s| s.into_owned());
-        meta_info.appdata = ma.optional_string("appdata").map(|s| s.into_owned());
+        meta_info.content_type = ma.optional_string("content_type").map(CompactString::from);
+        meta_info.appdata = ma.optional_string("appdata").map(CompactString::from);
         // msmsg addon path needs the trio (target_id, target_sender_jid,
         // target_chat_jid) to look up the parent messageSecret.
-        meta_info.target_id = ma.optional_string("target_id").map(|s| s.into_owned());
+        meta_info.target_id = ma.optional_string("target_id").map(CompactString::from);
         meta_info.target_sender = ma.optional_jid("target_sender_jid");
         meta_info.target_chat = ma.optional_jid("target_chat_jid");
-        meta_info.thread_message_id = ma.optional_string("thread_msg_id").map(|s| s.into_owned());
+        meta_info.thread_message_id = ma.optional_string("thread_msg_id").map(CompactString::from);
         meta_info.thread_message_sender_jid = ma.optional_jid("thread_msg_sender_jid");
         // WA Web scopes `polltype` to poll envelopes, so a value on any other
         // type is not the poll stage and is not recorded as one. Unknown
@@ -1363,12 +1363,12 @@ pub fn parse_message_info(
     if let Some(reporting) = node.get_optional_child("reporting")
         && let Some(tag) = reporting.get_optional_child("reporting_tag")
     {
-        meta_info.reporting_tag = tag.content_bytes().map(|b| b.to_vec());
+        meta_info.reporting_tag = tag.content_bytes().map(ReportingBytes::from_slice);
     }
     if let Some(reporting) = node.get_optional_child("reporting")
         && let Some(token) = reporting.get_optional_child("reporting_token")
     {
-        meta_info.reporting_token = token.content_bytes().map(|b| b.to_vec());
+        meta_info.reporting_token = token.content_bytes().map(ReportingBytes::from_slice);
         // WA Web `I()`: `c.maybeAttrInt("v")!=null?_:1`. Missing `v` is
         // not a parse failure — token format version defaults to 1.
         meta_info.reporting_token_version = Some(

@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wacore_binary::{Jid, JidExt, MessageId, MessageServerId};
+use wacore_binary::{CompactString, Jid, JidExt, MessageId, MessageServerId};
 use waproto::whatsapp as wa;
 
 use crate::WireEnum;
+use smallvec::SmallVec;
 
 /// Identifies a specific message within a chat.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -332,10 +333,19 @@ pub struct MsgBotInfo {
     pub edit_sender_timestamp_ms: Option<DateTime<Utc>>,
 }
 
+/// The `<reporting>` payloads: a 16 or 20 byte tag, a 16 byte token. Both fit
+/// inline, so a message that carries reporting data does not pay a heap
+/// allocation per payload for bytes this client only stores and hands back.
+pub type ReportingBytes = SmallVec<[u8; 20]>;
+
+/// The short `<meta>` attributes are `CompactString`: a message id is 22 wire
+/// characters and the rest are short keywords ("add_on", "default"), so all of
+/// them live in the 24 inline bytes and parsing a `<meta>` child allocates
+/// nothing for them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MsgMetaInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_id: Option<MessageId>,
+    pub target_id: Option<CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_sender: Option<Jid>,
     /// `<meta target_chat_jid="…">` — present when the bot reply addresses a
@@ -346,7 +356,7 @@ pub struct MsgMetaInfo {
     /// `<meta thread_msg_id="…">`: the message this one threads under, for a
     /// stanza the server routes into an existing thread.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread_message_id: Option<MessageId>,
+    pub thread_message_id: Option<CompactString>,
     /// `<meta thread_msg_sender_jid="…">`: who authored
     /// [`thread_message_id`](Self::thread_message_id). Absent whenever that is.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,18 +373,18 @@ pub struct MsgMetaInfo {
     /// `<meta content_type=...>` attr. Server marks reactions/edits as
     /// `"add_on"`; mirrors `WAWebHandleMsgParser` b()'s metadata read.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
+    pub content_type: Option<CompactString>,
     /// `<meta appdata=...>` attr. `"default"` is the only observed value.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub appdata: Option<String>,
+    pub appdata: Option<CompactString>,
     /// `<reporting><reporting_tag>` content bytes (16 or 20). Pre-requisite
     /// for the server-side report-abuse flow.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reporting_tag: Option<Vec<u8>>,
+    pub reporting_tag: Option<ReportingBytes>,
     /// `<reporting><reporting_token>` content bytes (16). Pre-requisite
     /// for the server-side report-abuse flow.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reporting_token: Option<Vec<u8>>,
+    pub reporting_token: Option<ReportingBytes>,
     /// `v` attr on `<reporting_token>`. WA Web defaults to 1 when missing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reporting_token_version: Option<i64>,
@@ -504,7 +514,7 @@ mod tests {
     fn message_info_serde_omits_only_absent_optional_fields() {
         let mut info = MessageInfo::default();
         info.source.sender_alt = Some("15550000001@lid".parse().unwrap());
-        info.meta_info.target_id = Some("TARGET".to_owned());
+        info.meta_info.target_id = Some("TARGET".into());
         info.unavailable_request_id = Some("REQUEST".to_owned());
 
         let serialized = serde_json::to_value(info).expect("serialize message info");

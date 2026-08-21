@@ -81,7 +81,9 @@ serde-big-array = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-smallvec = { workspace = true }
+# `serde` for the inline reporting-token buffers on `MsgMetaInfo`, which the
+# `Serialize` derive on `MessageInfo` reaches through.
+smallvec = { workspace = true, features = ["serde"] }
 smoothutf8 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
