@@ -10,6 +10,10 @@
 //! - LID sessions survive reconnect (DB reload)
 //! - No UndecryptableMessage events during normal messaging
 //! - Multiple sequential sends don't regress to PN sessions
+//!
+//! The undecryptable checks are barriers rather than windows: every peer here
+//! is a 1:1 chat, so one lane orders the message each check drains to against
+//! anything that failed to decrypt before it. See `assert_no_event_before`.
 
 use e2e_tests::{TestClient, peer_session_addr, scan_sessions, send_and_expect_text, text_msg};
 use log::info;
@@ -266,9 +270,6 @@ async fn test_stale_pn_session_does_not_break_lid_messaging() -> anyhow::Result<
     );
 
     // No undecryptable events on either side
-    // A barrier, not a window: both an undecryptable and this message come out
-    // of the same chat's lane, and the event channel is FIFO, so anything that
-    // failed to decrypt above is already in the channel when this arrives.
     client_b
         .client
         .send_message(jid_a.clone(), text_msg("stale-pn-barrier-b2a"))
@@ -464,9 +465,6 @@ async fn test_no_undecryptable_events_during_messaging() -> anyhow::Result<()> {
     info!("6 messages exchanged successfully");
 
     // Neither side should have any undecryptable messages
-    // A barrier, not a window: both an undecryptable and this message come out
-    // of the same chat's lane, and the event channel is FIFO, so anything that
-    // failed to decrypt above is already in the channel when this arrives.
     client_b
         .client
         .send_message(jid_a.clone(), text_msg("exchange-barrier-b2a"))
@@ -601,9 +599,6 @@ async fn test_pn_only_session_causes_undecryptable_on_lid_lookup() -> anyhow::Re
     // after crossing the same persistence boundary used by production shutdown.
     client_a.client.flush_pending_signal_state().await?;
 
-    // A barrier, not a window: both an undecryptable and this message come out
-    // of the same chat's lane, and the event channel is FIFO, so anything that
-    // failed to decrypt above is already in the channel when this arrives.
     client_b
         .client
         .send_message(jid_a.clone(), text_msg("migration-barrier-b2a"))
@@ -723,9 +718,6 @@ async fn test_pn_migration_is_durable_across_followup_messages() -> anyhow::Resu
         backend_a.get_session(&pn_addr).await?.is_none(),
         "stale PN copy stays gone after migration"
     );
-    // A barrier, not a window: both an undecryptable and this message come out
-    // of the same chat's lane, and the event channel is FIFO, so anything that
-    // failed to decrypt above is already in the channel when this arrives.
     client_b
         .client
         .send_message(jid_a.clone(), text_msg("followup-barrier-b2a"))

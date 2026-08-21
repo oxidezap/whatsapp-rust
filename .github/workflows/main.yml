@@ -189,10 +189,25 @@ jobs:
           cache-targets: "true"
       # No doctest counterpart: the features only swap derives on generated
       # code, whose doc comments `Build & Test` already builds.
-      - name: Test waproto serde (enum repr)
-        run: cargo nextest run --profile ci -p waproto --features serde-enum-repr
-      - name: Test waproto serde (snake_case)
-        run: cargo nextest run --profile ci -p waproto --features serde-snake-case
+      - name: Test waproto serde representations
+        run: |
+          mkdir -p "$RUNNER_TEMP/test-timings"
+          status=0
+          for feature in serde-enum-repr serde-snake-case; do
+            echo "::group::$feature"
+            cargo nextest run --profile ci -p waproto --features "$feature" || status=$?
+            mv target/nextest/ci/junit.xml "$RUNNER_TEMP/test-timings/$feature.xml"
+            echo "::endgroup::"
+          done
+          exit "$status"
+      - name: Publish test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-waproto-serde
+          path: ${{ runner.temp }}/test-timings
+          retention-days: 14
+          if-no-files-found: warn
 
   test-all-features:
     name: Build & Lint (all features)
@@ -243,14 +258,21 @@ jobs:
       - name: Test (every shareable feature)
         run: |
           mkdir -p "$RUNNER_TEMP/test-timings"
+          status=0
           for package in wacore wacore-libsignal whatsapp-rust; do
             features="$(./scripts/ci/test_features.sh "$package")"
             echo "::group::$package [$features]"
-            cargo nextest run --profile ci -p "$package" --features "$features" --lib --tests
-            # One path per profile, so each pass would otherwise overwrite the last.
+            # `|| status=$?` rather than letting `bash -e` end the loop: nextest
+            # writes the report whether the run passed or failed, and a failing
+            # package is exactly when its timings are worth having. Every package
+            # still runs, and the first failure is still the job's verdict.
+            cargo nextest run --profile ci -p "$package" --features "$features" --lib --tests \
+              || status=$?
+            # One report path per profile, so each pass overwrites the last.
             mv target/nextest/ci/junit.xml "$RUNNER_TEMP/test-timings/$package.xml"
             echo "::endgroup::"
           done
+          exit "$status"
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v4
@@ -299,31 +321,36 @@ jobs:
       - name: Build docs
         run: cargo doc --workspace --no-deps --all-features
 
+  feature-matrix-crates:
+    name: Feature Matrix (crates)
+    runs-on: ubuntu-latest
+    # `cargo metadata` reads manifests; it runs no build script, so this needs
+    # neither protoc nor a compiled workspace and costs about as long as the
+    # checkout.
+    outputs:
+      crates: ${{ steps.crates.outputs.crates }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: crates
+        run: echo "crates=$(scripts/ci/feature_matrix_crates.sh)" >> "$GITHUB_OUTPUT"
+
   feature-matrix:
     name: Feature Matrix (${{ matrix.crate }})
     runs-on: ubuntu-latest
+    needs: feature-matrix-crates
     # Individual features are only ever exercised in the combinations the other
     # jobs happen to build (default / --all-features), so a feature whose gates
     # are wrong compiles fine there and breaks for a downstream consumer that
-    # picks it alone. Restricted to the published library crates; bin/test
-    # members carry no feature surface worth enumerating.
+    # picks it alone.
     strategy:
       # One crate per runner. `cargo hack` walks a crate's features serially, so
-      # a single job spent its time on seven walks that share nothing but the
-      # dependency build: whatsapp-rust alone is most of it, and everything
-      # behind it was waiting on a machine that had already checked its own
-      # crate. Each leg is also an independent question, so one failing must not
-      # withdraw the verdict on the other six.
+      # a single job spent its whole time on seven walks that shared nothing but
+      # the dependency build, with whatsapp-rust alone most of it. Each leg is
+      # also an independent question, so one failing must not withdraw the
+      # verdict on the others.
       fail-fast: false
       matrix:
-        crate:
-          - whatsapp-rust
-          - wacore
-          - wacore-binary
-          - wacore-appstate
-          - wacore-libsignal
-          - wacore-noise
-          - waproto
+        crate: ${{ fromJSON(needs.feature-matrix-crates.outputs.crates) }}
     steps:
       - uses: actions/checkout@v6
       - name: Reclaim unused Android SDK space
