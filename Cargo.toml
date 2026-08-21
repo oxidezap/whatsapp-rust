@@ -195,12 +195,10 @@ voip-runtime = [
     "wacore/voip",
     "tokio-runtime",
     "tokio/net",
-    "dep:webrtc-dtls",
-    "dep:webrtc-sctp",
-    "dep:webrtc-data",
-    "dep:webrtc-util",
-    "dep:webrtc-util-011",
-    "dep:rustls",
+    "dep:rtc-dtls",
+    "dep:rtc-sctp",
+    "dep:rtc-datachannel",
+    "dep:rtc-shared",
 ]
 # Backwards-compatible full profile: preserves both codec adapters from the former single feature.
 voip = ["voip-mlow", "voip-libopus"]
@@ -233,10 +231,21 @@ log = { workspace = true }
 opus = { version = "0.3", optional = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
-# Only with `voip`: lets us install the `ring` rustls CryptoProvider before the DTLS handshake.
-# webrtc-dtls picks rustls' process-default provider, and the tree carries both ring and aws-lc-rs,
-# so without an explicit default the first real handshake panics.
-rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+# The sans-IO media stack for `voip`. Pinned exactly: 0.21 is a pre-1.0 beta, so a minor bump
+# may be breaking, and a `cargo update` that silently moved it would break a call at runtime rather
+# than at compile time. Revisit the pin when 0.21.0 goes stable. `crypto-ring` (the default) rather
+# than aws-lc-rs because `ring` is already compiled here for rustls, via the websocket transport and
+# the HTTP client, so the media stack costs no new crypto crate.
+rtc-datachannel = { version = "=0.21.0-beta.1", optional = true }
+rtc-dtls = { version = "=0.21.0-beta.1", optional = true, default-features = false, features = [
+    "crypto-ring",
+] }
+rtc-sctp = { version = "=0.21.0-beta.1", optional = true }
+# The vocabulary crate of the three above: they take and return its `TransportProtocol` and `Error`
+# in public signatures and none of them re-exports it, so a caller that has to name a transport
+# protocol or tell a peer close apart from a corrupt datagram needs it directly. Adds no crate to
+# the tree; it is already there under the other three.
+rtc-shared = { version = "=0.21.0-beta.1", optional = true, default-features = false }
 scopeguard = "1.2"
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
@@ -247,11 +256,6 @@ wacore = { workspace = true }
 wacore-binary = { workspace = true }
 waproto = { workspace = true }
 zeroize = { workspace = true }
-webrtc-data = { version = "0.17", optional = true }
-webrtc-dtls = { version = "0.12", optional = true }
-webrtc-sctp = { version = "0.17", optional = true }
-webrtc-util = { version = "0.17", optional = true }
-webrtc-util-011 = { package = "webrtc-util", version = "0.11", optional = true }
 whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.7.0", optional = true }
 whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.7.0", optional = true }
 whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.7.0", optional = true }

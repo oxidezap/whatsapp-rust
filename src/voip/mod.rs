@@ -2,19 +2,19 @@
 //! over the WhatsApp relay, encoded audio, the call state machine, and the media pipeline.
 //! Pure protocol/crypto lives in `wacore::voip`.
 //!
-//! This module pulls webrtc-rs, which does not build on wasm32 or espidf. The wasm/esp32-safe
-//! subset is `wacore`'s `voip` feature (pure-Rust crypto and encoded transport); add
-//! `wacore/voip-mlow` for its pure-Rust MLOW codec.
+//! This module drives the media stack over a Tokio UDP socket, which does not exist on wasm32 or
+//! espidf. The wasm/esp32-safe subset is `wacore`'s `voip` feature (pure-Rust crypto and encoded
+//! transport); add `wacore/voip-mlow` for its pure-Rust MLOW codec.
 
-// Fail fast with an actionable message instead of a confusing webrtc link error.
+// Fail fast with an actionable message instead of a confusing link error further down.
 #[cfg(all(
     feature = "voip-runtime",
     any(target_arch = "wasm32", target_os = "espidf")
 ))]
 compile_error!(
-    "the native VoIP features of `whatsapp-rust` pull webrtc-rs and do not build on \
-     wasm32/espidf. For those targets use `wacore/voip` for crypto/encoded transport and \
-     optionally `wacore/voip-mlow` for the pure-Rust MLOW codec."
+    "the native VoIP features of `whatsapp-rust` drive the relay media stack over a Tokio UDP \
+     socket and do not build on wasm32/espidf. For those targets use `wacore/voip` for \
+     crypto/encoded transport and optionally `wacore/voip-mlow` for the pure-Rust MLOW codec."
 );
 
 pub mod audio;
