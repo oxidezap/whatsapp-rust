@@ -85,6 +85,14 @@ skip = [
     { name = "thiserror-impl", version = "=1.0.69" },
     { name = "winnow", version = "=0.7.15" },
 
+    # base64 0.22 behind buffa, metrics-exporter-prometheus, tokio-websockets
+    # and the pem that rcgen brings into the DTLS stack. ureq 3.4 requires
+    # 0.23, so the split arrived with a dependency bump rather than a choice of
+    # ours, and no version of the workspace's own base64 can close it: whatever
+    # we pick, one of the two lines is left with a consumer. Collapses once
+    # those four migrate.
+    { name = "base64", version = "=0.22.1" },
+
     # Assorted transitive lag: no workspace crate depends on any of these
     # directly, so the version is whatever our deps agreed on.
     { name = "bitflags", version = "=1.3.2" },
