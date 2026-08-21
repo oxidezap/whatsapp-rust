@@ -25,19 +25,20 @@ use whatsapp_rust_wam_catalog::{enums, events};
 /// The WAM device type for the sender of an inbound stanza.
 ///
 /// Three axes, all on the envelope: whose account it is (`fromMe`), whether the
-/// JID names the primary device or a companion, and whether that companion is a
-/// hosted one. The coex members are not produced, because nothing on the
-/// envelope tells a coex device from an ordinary companion, so choosing between
-/// them would be an invention.
+/// JID is a hosted endpoint, and whether it names the primary device or a
+/// companion. The coex members are not produced, because nothing on the envelope
+/// tells a coex device from an ordinary companion, so choosing between them
+/// would be an invention.
 fn sender_type(sender: &Jid, is_from_me: bool) -> enums::E2eDeviceType {
-    // A hosted device is never the primary: `is_hosted` recognises it by a
-    // reserved device number or a hosted server, and both name a companion the
-    // account did not pair itself.
-    match (is_from_me, sender.device == 0, sender.is_hosted()) {
-        (true, true, _) => enums::E2eDeviceType::MyPrimary,
-        (false, true, _) => enums::E2eDeviceType::OtherPrimary,
-        (true, false, true) => enums::E2eDeviceType::MyHostedCompanion,
-        (false, false, true) => enums::E2eDeviceType::OtherHostedCompanion,
+    // Hosted first, and not device number first: a hosted server carries a
+    // device 0 of its own, and WAM has no hosted primary to report it as. Being
+    // hosted is the stronger fact anyway, since it names an endpoint the account
+    // did not pair for itself rather than a position in a device list.
+    match (is_from_me, sender.is_hosted(), sender.device == 0) {
+        (true, true, _) => enums::E2eDeviceType::MyHostedCompanion,
+        (false, true, _) => enums::E2eDeviceType::OtherHostedCompanion,
+        (true, false, true) => enums::E2eDeviceType::MyPrimary,
+        (false, false, true) => enums::E2eDeviceType::OtherPrimary,
         (true, false, false) => enums::E2eDeviceType::MyCompanion,
         (false, false, false) => enums::E2eDeviceType::OtherCompanion,
     }
@@ -619,6 +620,17 @@ mod tests {
         assert_eq!(
             sender_type(&jid("15550000008", Server::Pn, 4), false),
             enums::E2eDeviceType::OtherCompanion
+        );
+
+        // A hosted server carries a device 0 of its own, and WAM has no hosted
+        // primary, so being hosted has to win over the device number.
+        assert_eq!(
+            sender_type(&jid("15550000011", Server::Hosted, 0), false),
+            enums::E2eDeviceType::OtherHostedCompanion
+        );
+        assert_eq!(
+            sender_type(&jid("15550000011", Server::HostedLid, 0), true),
+            enums::E2eDeviceType::MyHostedCompanion
         );
     }
 

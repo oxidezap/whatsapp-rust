@@ -47,8 +47,18 @@ type Result<T> = std::result::Result<T, WamStoreError>;
 ///   returns 0: the official client starts at 1 and wraps back to 1 past
 ///   65535, and a server that has seen a sequence twice cannot order the
 ///   buffers between them.
+/// - [`put_pending`](Self::put_pending) stores a buffer under its `key` without
+///   displacing one already held under a different key. The runtime picks a key
+///   no retained buffer is using, reading the set it gets back from
+///   [`pending`](Self::pending) rather than a counter, so a durable store that
+///   survives a restart keeps the buffers it restored. An implementation that
+///   would rather own identity may key its rows however it likes, as long as
+///   [`pending`](Self::pending) reports back the `key` it was given and
+///   [`remove_pending`](Self::remove_pending) accepts it.
 /// - Nothing else. Every other method may fail; the runtime treats a failure as
-///   "this buffer is lost" and carries on.
+///   "this buffer is lost" and carries on. A [`pending`](Self::pending) that
+///   fails is not read as an empty store: the runtime drops the buffer it was
+///   about to retain rather than guessing at a key.
 ///
 /// # What it must not do
 ///
