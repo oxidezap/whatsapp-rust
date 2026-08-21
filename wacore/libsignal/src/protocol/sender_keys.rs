@@ -153,9 +153,18 @@ impl SenderChainKey {
         SenderMessageKey::new(self.iteration, self.get_derivative(Self::MESSAGE_KEY_SEED))
     }
 
-    /// Compute both sender message key and next chain key in one call, reusing HMAC key setup.
+    /// Advance one step, yielding this iteration's message-key *seed* and the
+    /// next chain key, without expanding the seed into a [`SenderMessageKey`].
+    ///
+    /// The seed is everything the backlog stores, and everything the full key is
+    /// re-derived from on removal, so a skipped iteration never needs its IV or
+    /// cipher key: expanding one costs an HKDF extract+expand to 48 bytes that is
+    /// thrown away on the next loop turn. A receiver catching up over a jump
+    /// pays that per skipped message, which is where the whole cost of a
+    /// forward jump lives. [`Self::step_with_message_key`] is this plus the
+    /// expansion, for the one iteration whose key is actually used.
     #[inline]
-    pub fn step_with_message_key(&self) -> Result<(SenderMessageKey, Self), SignalProtocolError> {
+    pub fn step_seed_only(&self) -> Result<([u8; 32], Self), SignalProtocolError> {
         let new_iteration = self.iteration.checked_add(1).ok_or_else(|| {
             SignalProtocolError::InvalidState(
                 "sender_chain_key_step",
@@ -172,13 +181,23 @@ impl SenderChainKey {
         hmac.update(&[Self::CHAIN_KEY_SEED]);
         let next_chain_key: [u8; 32] = hmac.finalize().into_bytes().into();
 
-        let message_key = SenderMessageKey::new(self.iteration, message_key_seed);
-        let next_chain = Self {
-            iteration: new_iteration,
-            chain_key: next_chain_key,
-        };
+        Ok((
+            message_key_seed,
+            Self {
+                iteration: new_iteration,
+                chain_key: next_chain_key,
+            },
+        ))
+    }
 
-        Ok((message_key, next_chain))
+    /// Compute both sender message key and next chain key in one call, reusing HMAC key setup.
+    #[inline]
+    pub fn step_with_message_key(&self) -> Result<(SenderMessageKey, Self), SignalProtocolError> {
+        let (message_key_seed, next_chain) = self.step_seed_only()?;
+        Ok((
+            SenderMessageKey::new(self.iteration, message_key_seed),
+            next_chain,
+        ))
     }
 
     #[inline]
@@ -556,11 +575,17 @@ impl SenderKeyState {
     }
 
     pub fn add_sender_message_key(&mut self, sender_message_key: &SenderMessageKey) {
+        self.add_skipped_message_key(sender_message_key.iteration, sender_message_key.seed);
+    }
+
+    /// Buffer a skipped key from the `(iteration, seed)` pair the backlog
+    /// actually stores. Callers that hold a full [`SenderMessageKey`] go through
+    /// [`Self::add_sender_message_key`]; the catch-up loop in `get_sender_key`
+    /// never builds one, so it would only be paying the HKDF expansion to
+    /// discard both halves of it here.
+    pub(crate) fn add_skipped_message_key(&mut self, iteration: u32, seed: [u8; 32]) {
         let keys = std::sync::Arc::make_mut(&mut self.message_keys);
-        keys.push(StoredMessageKey {
-            iteration: sender_message_key.iteration,
-            seed: sender_message_key.seed,
-        });
+        keys.push(StoredMessageKey { iteration, seed });
         // AMORTIZED EVICTION: Only prune when exceeding MAX + threshold.
         // This reduces O(n) drain() calls from every insert to once every PRUNE_THRESHOLD inserts.
         let len = keys.len();

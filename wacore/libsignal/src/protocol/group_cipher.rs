@@ -187,9 +187,14 @@ fn get_sender_key(state: &mut SenderKeyState, iteration: u32) -> Result<SenderMe
 
     let mut sender_chain_key = sender_chain_key;
 
+    // Only the seed is buffered, and only the seed is what a later out-of-order
+    // message re-derives its key from, so the skipped iterations skip the HKDF
+    // expansion entirely: a catch-up over `jump` messages ran `jump` expansions
+    // whose IV and cipher key were dropped on the next turn of this loop.
     while sender_chain_key.iteration() < iteration {
-        let (message_key, next_chain) = sender_chain_key.step_with_message_key()?;
-        state.add_sender_message_key(&message_key);
+        let skipped_iteration = sender_chain_key.iteration();
+        let (seed, next_chain) = sender_chain_key.step_seed_only()?;
+        state.add_skipped_message_key(skipped_iteration, seed);
         sender_chain_key = next_chain;
     }
 
@@ -486,6 +491,79 @@ mod tests {
 
     use crate::protocol::consts::SENDER_CHAIN_RESERVATION_BATCH;
     use futures::executor::block_on;
+
+    /// Repeated forward jumps, then every skipped message delivered late.
+    ///
+    /// The catch-up loop buffers a skipped iteration from its chain seed alone
+    /// and only expands the seed into a full key when the late message arrives,
+    /// so a wrong seed (or a seed filed under the wrong iteration) would show up
+    /// here as a decrypt failure or a swapped plaintext, not as a chain that
+    /// merely ends up at the wrong index.
+    #[test]
+    fn forward_jumps_buffer_keys_that_still_decrypt_in_any_order() {
+        let mut rng = rand::rng();
+        let name = SenderKeyName::new("group@g.us".to_string(), "alice.0".to_string());
+        let mut alice = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        let skdm = block_on(create_sender_key_distribution_message(
+            &name, &mut alice, &mut rng,
+        ))
+        .expect("alice creates her distribution message");
+        let mut bob = InMemorySenderKeyStore {
+            keys: HashMap::new(),
+        };
+        block_on(process_sender_key_distribution_message(
+            &name, &skdm, &mut bob,
+        ))
+        .expect("bob processes alice's distribution message");
+
+        const TOTAL: usize = 40;
+        let ciphertexts: Vec<Vec<u8>> = (0..TOTAL)
+            .map(|i| {
+                block_on(group_encrypt(
+                    &mut alice,
+                    &name,
+                    format!("msg {i}").as_bytes(),
+                    &mut rng,
+                ))
+                .expect("alice encrypts")
+                .serialized()
+                .to_vec()
+            })
+            .collect();
+
+        // Three jumps of different sizes, so the loop runs with 12, 14 and 11
+        // skipped iterations rather than one uniform gap.
+        let jump_targets = [12usize, 27, 39];
+        for &target in &jump_targets {
+            let plaintext = block_on(group_decrypt(&ciphertexts[target], &mut bob, &name))
+                .expect("bob decrypts the message he jumped to");
+            assert_eq!(plaintext, format!("msg {target}").as_bytes());
+        }
+
+        // Now every message the jumps skipped, oldest first, then re-checked in
+        // reverse to cover both ends of the backlog scan.
+        let mut skipped: Vec<usize> = (0..TOTAL).filter(|i| !jump_targets.contains(i)).collect();
+        for &i in &skipped {
+            let plaintext = block_on(group_decrypt(&ciphertexts[i], &mut bob, &name))
+                .unwrap_or_else(|e| panic!("skipped message {i} must still decrypt: {e:?}"));
+            assert_eq!(plaintext, format!("msg {i}").as_bytes());
+        }
+
+        // Every buffered key is consumed exactly once: a replay is a duplicate,
+        // never a second successful decrypt.
+        skipped.reverse();
+        for &i in &skipped {
+            assert!(
+                matches!(
+                    block_on(group_decrypt(&ciphertexts[i], &mut bob, &name)),
+                    Err(SignalProtocolError::DuplicatedMessage(..))
+                ),
+                "replay of message {i} must be reported as a duplicate"
+            );
+        }
+    }
 
     /// THE crash-safety invariant: a reload mid-lease must never re-derive an
     /// iteration that a lost send may already have put on the wire, and a peer
