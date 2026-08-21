@@ -1143,28 +1143,39 @@ mod tests {
 
     /// A partial triple beside a seed is still cross-checked, which is what
     /// keeps "carries the seed alone" from widening into "carries a seed and
-    /// some derived material". The guard enters on *any* derived field being
-    /// present and then requires all three to match; weakening it to *all
-    /// three present* would let a record pair a seed with one mismatched
-    /// derived field and pass.
+    /// some derived material".
+    ///
+    /// Both seeds matter, and they fail the record for different reasons. The
+    /// disagreeing seed is rejected on the fields that *are* present, so it
+    /// would still fail a check that only compared those. The matching seed is
+    /// the one that isolates incompleteness: every present field agrees with
+    /// it, so the only thing left to reject is the missing one. A guard that
+    /// entered only when all three fields are present, or that skipped absent
+    /// fields, would accept that record and hand a consumer two thirds of a
+    /// key.
     #[test]
     fn a_seed_beside_a_partial_derived_triple_is_rejected() {
-        for drop_field in 0..3 {
-            let mut persisted = legacy_persisted_key([9; SYMMETRIC_KEY_BYTES], 3);
-            match drop_field {
-                0 => persisted.cipher_key = None,
-                1 => persisted.mac_key = None,
-                _ => persisted.iv = None,
-            }
-            // The seed disagrees with what is left of the triple, too.
-            persisted.seed = Some(Bytes::copy_from_slice(&[10; SYMMETRIC_KEY_BYTES]));
+        const DERIVES_THE_TRIPLE: [u8; SYMMETRIC_KEY_BYTES] = [9; SYMMETRIC_KEY_BYTES];
+        const DERIVES_SOMETHING_ELSE: [u8; SYMMETRIC_KEY_BYTES] = [10; SYMMETRIC_KEY_BYTES];
 
-            let error = SessionMessageKeyComponents::from_structure(persisted)
-                .expect_err("a seed beside a partial triple must fail");
-            assert!(
-                matches!(error, SignalProtocolError::InvalidArgument(_)),
-                "dropped field {drop_field}: {error}"
-            );
+        for seed in [DERIVES_THE_TRIPLE, DERIVES_SOMETHING_ELSE] {
+            for drop_field in 0..3 {
+                let mut persisted = legacy_persisted_key(DERIVES_THE_TRIPLE, 3);
+                match drop_field {
+                    0 => persisted.cipher_key = None,
+                    1 => persisted.mac_key = None,
+                    _ => persisted.iv = None,
+                }
+                persisted.seed = Some(Bytes::copy_from_slice(&seed));
+
+                let error = SessionMessageKeyComponents::from_structure(persisted)
+                    .expect_err("a seed beside a partial triple must fail");
+                assert!(
+                    matches!(error, SignalProtocolError::InvalidArgument(_)),
+                    "seed {}, dropped field {drop_field}: {error}",
+                    seed[0]
+                );
+            }
         }
     }
 
