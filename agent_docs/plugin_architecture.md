@@ -143,6 +143,13 @@ backend or Signal stores.
 The workspace crate `plugins/metrics` is the public-API conformance example. It
 must remain buildable without private access to the main crate.
 
+`plugins/wam` is the second in-tree plugin and a different kind of example: a
+real subsystem that failed `subsystem_boundary.md`'s reach test and attached
+here instead. It is worth reading for what a plugin does when a capability it
+wants does not exist: it defines its own storage trait rather than asking for a
+capability, and it names the events it cannot emit rather than approximating
+them. See `wam_telemetry.md`.
+
 ## Capabilities and trust
 
 A native plugin is trusted in-process Rust code. Its manifest requests

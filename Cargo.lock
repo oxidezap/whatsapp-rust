@@ -4307,6 +4307,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "whatsapp-rust-plugin-wam"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "portable-atomic",
+ "rand 0.10.2",
+ "thiserror 2.0.19",
+ "tokio",
+ "whatsapp-rust",
+ "whatsapp-rust-wam-catalog",
+]
+
+[[package]]
 name = "whatsapp-rust-sqlite-storage"
 version = "0.7.0"
 dependencies = [

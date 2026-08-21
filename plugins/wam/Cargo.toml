@@ -1,0 +1,27 @@
+[package]
+name = "whatsapp-rust-plugin-wam"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+description = "WhatsApp Metrics (WAM) telemetry plugin for whatsapp-rust"
+
+[dependencies]
+anyhow = { workspace = true }
+log = { workspace = true }
+portable-atomic = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+whatsapp-rust = { path = "../..", default-features = false, features = ["plugins"] }
+whatsapp-rust-wam-catalog = { path = "../wam-catalog" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# Default features on, so the size-probe examples link the same platform
+# adapters the `demo` example does and the pair measures the plugin rather than
+# a different client.
+whatsapp-rust = { path = "../..", features = ["plugins"] }
+whatsapp-rust-wam-catalog = { path = "../wam-catalog", features = ["parity"] }
+
+[lints]
+workspace = true
