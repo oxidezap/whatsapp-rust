@@ -318,12 +318,24 @@ impl ClientPlugin for WamPlugin {
             // in-progress buffer with it is survivable; losing the queue is
             // not, and a fresh writer flushes the queue either way. There is
             // nothing to race: the host has already drained the task.
-            let mut writer = self
+            // Only the writer the loop handed over, never a fresh one. A
+            // cooperative task is not forcibly cancelled, so the host proceeds
+            // here once its drain deadline passes even if the loop is still
+            // inside a slow store call. Starting a second writer then would put
+            // two of them against one store, both reading the retained set and
+            // both picking the same next key, which is the overwrite `next_key`
+            // exists to avoid. An empty slot means the loop is still working and
+            // will park on its own; leaving it to do that loses nothing that a
+            // race would not have lost worse.
+            let Some(mut writer) = self
                 .parked_writer
                 .lock()
                 .map_err(|_| anyhow::anyhow!("the wam writer lock was poisoned"))?
                 .take()
-                .unwrap_or_default();
+            else {
+                warn!("wam: the flush loop had not parked its writer, leaving the flush to it");
+                return Ok(());
+            };
             // The official client's own answer to this instant. Observed before
             // the flush so it rides the buffer it describes.
             runtime.observe(PendingEvent::WebWamForceFlush(

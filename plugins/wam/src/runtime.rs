@@ -261,6 +261,17 @@ pub enum TickKind {
     Final,
 }
 
+/// Why no buffer could be started.
+///
+/// The two are different faults with different owners: a store that will not
+/// issue a sequence number, and a catalog whose global no longer belongs on the
+/// channel this buffer is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoBuffer {
+    Store,
+    Catalog,
+}
+
 /// How draining the retained buffers ended.
 ///
 /// [`TickKind::Final`] ignores a cooldown an earlier tick set, because there is
@@ -464,10 +475,17 @@ impl WamRuntime {
             }
             if writer.current.is_none() {
                 match self.start_buffer().await {
-                    Some(buffer) => writer.current = Some(buffer),
-                    None => {
+                    Ok(buffer) => writer.current = Some(buffer),
+                    Err(reason) => {
                         self.lock().stats.unbuffered += 1;
-                        self.report_store_error();
+                        // Only one of the two is the store's doing. A global the
+                        // catalog no longer allows on this channel is this build
+                        // disagreeing with itself, and reporting it as a storage
+                        // failure would point whoever reads the counter at the
+                        // wrong thing.
+                        if reason == NoBuffer::Store {
+                            self.report_store_error();
+                        }
                         continue;
                     }
                 }
@@ -508,12 +526,12 @@ impl WamRuntime {
     }
 
     /// A fresh buffer, carrying the identity's globals.
-    async fn start_buffer(&self) -> Option<WamBuffer> {
+    async fn start_buffer(&self) -> Result<WamBuffer, NoBuffer> {
         let sequence = match self.store.next_sequence(Channel::Regular).await {
             Ok(sequence) => sequence,
             Err(err) => {
                 warn!("wam: no sequence number, dropping the event: {err}");
-                return None;
+                return Err(NoBuffer::Store);
             }
         };
         let mut buffer = WamBuffer::new(Channel::Regular, STREAM_ID, sequence);
@@ -524,10 +542,10 @@ impl WamRuntime {
                 // channel. Refusing is right: the alternative is uploading a
                 // buffer no official client would send.
                 warn!("wam: cannot start a buffer: {err}");
-                return None;
+                return Err(NoBuffer::Catalog);
             }
         }
-        Some(buffer)
+        Ok(buffer)
     }
 
     /// Take the current buffer and try to deliver it.
@@ -803,18 +821,31 @@ enum Delivery {
 /// store's insert semantics turn into an undelivered buffer being overwritten.
 /// The caller already has the list, since the retention cap is computed from it.
 ///
-/// `None` when the highest key in use is already the largest a key can be.
+/// One past the highest, except when the highest is the largest a key can be.
 /// Saturating there would hand back that same occupied key and let the store's
 /// insert semantics overwrite the buffer holding it, which is the loss this
-/// function exists to prevent; a store keyed by something like a timestamp can
-/// reach the top without ever having retained many buffers.
+/// function exists to prevent. A key at the top says nothing about the space
+/// below it, though, and a store that picks its keys by hash puts one there
+/// while holding almost nothing, so the fallback takes the lowest key nobody
+/// holds. `None` only when every key is taken, which nothing this retention cap
+/// allows can reach.
 fn next_key(pending: &[PendingBuffer]) -> Option<u64> {
-    pending
-        .iter()
-        .map(|b| b.key)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
+    let mut used: Vec<u64> = pending.iter().map(|b| b.key).collect();
+    used.sort_unstable();
+    used.dedup();
+    if let Some(next) = used.last().copied().unwrap_or(0).checked_add(1) {
+        return Some(next);
+    }
+    // Keys start at 1, so the walk does too.
+    let mut candidate = 1u64;
+    for key in used {
+        match key.cmp(&candidate) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Greater => return Some(candidate),
+            std::cmp::Ordering::Equal => candidate = candidate.checked_add(1)?,
+        }
+    }
+    Some(candidate)
 }
 
 /// How long to wait before the next upload attempt, in seconds, after
@@ -1853,8 +1884,11 @@ mod tests {
         };
         assert_eq!(next_key(&[held(1), held(7), held(3)]), Some(8));
         // The top of the range is not a key to hand out again: saturating there
-        // would return the one the buffer at `u64::MAX` already holds.
-        assert_eq!(next_key(&[held(u64::MAX)]), None);
+        // would return the one the buffer at `u64::MAX` already holds. The space
+        // below it is untouched, so that is where the next key comes from rather
+        // than nowhere.
+        assert_eq!(next_key(&[held(u64::MAX)]), Some(1));
+        assert_eq!(next_key(&[held(1), held(2), held(u64::MAX)]), Some(3));
     }
 
     #[test]

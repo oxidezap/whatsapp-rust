@@ -306,15 +306,24 @@ pub fn receipt_stanza_receive(node: &NodeRef<'_>) -> Option<events::ReceiptStanz
         (None, Some(AggregatedType::Mixed)) => None,
         (None, None) => Some("delivery"),
     };
+    // An aggregate reports its count with the type left out rather than not at
+    // all, and that holds however the type became unreportable: because the
+    // entries disagree, or because they agree on one this client cannot name.
+    // The two are the same fact about the stanza, and suppressing the whole
+    // metric for the second would lose the count and the stage as well.
+    let untyped_aggregate = || {
+        Some(events::ReceiptStanzaReceive {
+            receipt_stanza_total_count: i64::try_from(receipt_item_count(node, false)).ok(),
+            receipt_stanza_stage: Some(enums::ReceiptStanzaStage::Overall),
+            ..Default::default()
+        })
+    };
     let named = match raw_type.map(ReceiptType::parse) {
-        // A mixed aggregate has no one type to report, and the field is
-        // optional, so it goes out without one rather than with a wrong one.
-        None => {
-            return Some(events::ReceiptStanzaReceive {
-                receipt_stanza_total_count: i64::try_from(receipt_item_count(node, false)).ok(),
-                receipt_stanza_stage: Some(enums::ReceiptStanzaStage::Overall),
-                ..Default::default()
-            });
+        None => return untyped_aggregate(),
+        Some(ReceiptType::Other(_))
+            if aggregated_type.is_some() && node.attrs().optional_string("type").is_none() =>
+        {
+            return untyped_aggregate();
         }
         Some(parsed) => parsed,
     };
@@ -599,7 +608,13 @@ mod tests {
                 NodeBuilder::new("user")
                     .attr("jid", "15550000001@s.whatsapp.net")
                     .build(),
+                // No `jid` at all, and a `jid` that decodes but does not parse
+                // as one: the client drops both, so neither is an
+                // acknowledgement it can attribute. The second has no server
+                // rather than an unknown one, because an unknown server fails
+                // in the binary decode and never reaches a derivation.
                 NodeBuilder::new("user").attr("t", "1700000000").build(),
+                NodeBuilder::new("user").attr("jid", "notajid").build(),
             ])
             .build();
         let node = receipt(&[("type", "delivery")], Some(users));
@@ -645,6 +660,27 @@ mod tests {
         let node = receipt(&[], Some(users));
         let event = derive_receipt(&node).expect("read is a type this client names");
         assert_eq!(event.receipt_stanza_type, Some("read".to_string()));
+    }
+
+    #[test]
+    fn an_aggregate_agreeing_on_a_type_this_client_cannot_name_keeps_its_count() {
+        // A mixed aggregate already goes out with the type left off, so an
+        // aggregate whose entries agree on a type this client cannot name has
+        // to as well. Suppressing it would lose the count and the stage over a
+        // field the two other cases are allowed to omit.
+        let users = NodeBuilder::new("participants")
+            .attr("message_id", "REAL-MSG-ID")
+            .children((0..2).map(|i| {
+                NodeBuilder::new("user")
+                    .attr("jid", format!("1555000000{i}@lid"))
+                    .attr("type", "something-the-server-invented")
+                    .build()
+            }))
+            .build();
+        let node = receipt(&[], Some(users));
+        let event = derive_receipt(&node).expect("the stanza still arrived");
+        assert_eq!(event.receipt_stanza_type, None);
+        assert_eq!(event.receipt_stanza_total_count, Some(2));
     }
 
     #[test]
