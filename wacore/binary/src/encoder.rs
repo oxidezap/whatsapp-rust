@@ -637,12 +637,13 @@ impl<'v> Encoder<'static, VecByteWriter<'v>> {
 impl<'a, 'v> Encoder<'a, VecByteWriter<'v>> {
     /// Append into `buffer`, replaying a plan's string hints.
     ///
-    /// The exact-size marshallers reach for this rather than [`Self::new_slice`]
-    /// so their output buffer can be reserved instead of zero-filled: a `Vec`
-    /// only ever grown by writes needs no initial value for bytes the encoder
-    /// is about to overwrite, while a `&mut [u8]` has to exist before the
-    /// encoder can borrow it. The exact-size invariant is enforced the same
-    /// way either side, by comparing the written length against the plan.
+    /// The exact-size marshallers reach for this rather than writing into a
+    /// pre-sized `&mut [u8]` so their output buffer can be reserved instead of
+    /// zero-filled: a `Vec` only ever grown by writes needs no initial value
+    /// for the bytes the encoder is about to overwrite, while a slice has to
+    /// be fully initialized before the encoder can borrow it. The exact-size
+    /// invariant is enforced the same way either side, by comparing the
+    /// written length against the plan.
     pub(crate) fn new_vec_with_hints(
         buffer: &'v mut Vec<u8>,
         string_hints: Option<&'a StringHintCache>,
