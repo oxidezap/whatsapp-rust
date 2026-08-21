@@ -2112,6 +2112,9 @@ pub enum Reachability {
     /// Between connections, with something driving the client back to one.
     /// Nothing is re-sent by that: recovery restores the ability to ask, not
     /// the request that was refused.
+    ///
+    /// The one state [`Client::wait_until_reachable`] waits out, so it is the
+    /// one that call never returns; only [`Client::reachability`] reports it.
     Reconnecting,
     /// [`Client::pause`] is in effect. Like [`Self::Reconnecting`] the client
     /// is not finished, but the thing that ends it is [`Client::resume`], and
