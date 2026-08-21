@@ -305,6 +305,143 @@ pub struct TokensIr {
     pub double_byte: Vec<Vec<String>>,
 }
 
+/// Whether a WAM value is a boolean, an integer, a float, a string, a timer or
+/// a member of one of the catalog's enums.
+///
+/// `timer` is the one kind whose name is not its representation: it is a
+/// millisecond duration written on the wire as an integer, which is why the
+/// codec treats it as one and only the generated field type keeps the
+/// distinction visible.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WamValueKind {
+    Boolean,
+    Integer,
+    Number,
+    String,
+    Timer,
+    /// `module` is the defining `WAWebWamEnum…` module, the key into
+    /// [`WamIr::enums`].
+    Enum {
+        module: String,
+    },
+}
+
+/// One member of a WAM enum. WAM enum values are always integers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WamEnumVariant {
+    pub key: String,
+    pub value: i64,
+}
+
+/// A WAM enum referenced as a field or global type.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WamEnum {
+    pub name: String,
+    /// Defining module; the catalog's key, since names repeat.
+    pub module: String,
+    pub variants: Vec<WamEnumVariant>,
+}
+
+/// One field of a WAM event: its camelCase name, its numeric wire id and its
+/// type.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WamField {
+    pub name: String,
+    pub id: u32,
+    #[serde(flatten)]
+    pub kind: WamValueKind,
+}
+
+/// One buffer-level global. Same id space and type vocabulary as a field, plus
+/// the channels on which writing it is legal.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WamGlobal {
+    pub name: String,
+    pub id: u32,
+    #[serde(flatten)]
+    pub kind: WamValueKind,
+    pub channels: Vec<String>,
+}
+
+/// How a call site writes one field: as a key of the constructor's argument
+/// object, or as a later assignment on the constructed value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WamFieldWrite {
+    Constructor,
+    Assigned,
+}
+
+/// One field a call site writes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WamCallSiteField {
+    pub name: String,
+    pub write: WamFieldWrite,
+}
+
+/// One place in WA Web that constructs an event, and the fields it is seen
+/// writing there.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WamCallSite {
+    pub module: String,
+    #[serde(default)]
+    pub fields: Vec<WamCallSiteField>,
+    /// `true` when the site also writes fields the scan could not read, which
+    /// makes `fields` a lower bound rather than the site's full set.
+    #[serde(default)]
+    pub partial: bool,
+}
+
+/// One WAM event definition.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WamEventDef {
+    pub name: String,
+    pub code: u32,
+    pub module: String,
+    pub channel: String,
+    /// The catalog's declared weights, in `defineEvents` source order
+    /// (`[alpha, beta, release]`). Never the weight a given buffer carries: a
+    /// runtime lookup may override it.
+    pub weights: Vec<u32>,
+    pub fields: Vec<WamField>,
+    #[serde(default)]
+    pub private_stats_id: Option<i64>,
+    #[serde(default)]
+    pub call_sites: Vec<WamCallSite>,
+}
+
+/// One literal `WAWebWamConstants` exports.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WamConstant {
+    pub name: String,
+    pub value: i64,
+    pub module: String,
+}
+
+/// One private-stats rotation group.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WamPrivateStatsId {
+    pub key: String,
+    pub id: i64,
+    pub rotation_period_days: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WamIr {
+    pub events: Vec<WamEventDef>,
+    pub enums: Vec<WamEnum>,
+    #[serde(default)]
+    pub globals: Vec<WamGlobal>,
+    #[serde(default)]
+    pub constants: Vec<WamConstant>,
+    #[serde(default)]
+    pub private_stats_ids: Vec<WamPrivateStatsId>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

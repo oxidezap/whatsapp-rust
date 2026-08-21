@@ -21,6 +21,8 @@ This repo vendors parts of it. whatspec commits only the IR now (`generated/**/*
 | `wacore/binary/src/tokens.json` | `tokens` |
 | `waproto/src/whatsapp.proto` | `proto` |
 | `wacore/src/version/generated.rs` | `manifest.json`'s `waVersion` |
+| `plugins/wam-catalog/src/generated.rs` | `wam`: the whole telemetry catalog |
+| `plugins/wam-catalog/src/call_sites.rs` | `wam`: where WA Web constructs each event (behind the crate's `parity` feature) |
 
 ```sh
 cargo run -p whatspec-codegen                    # regenerate from the pinned commit
@@ -57,7 +59,7 @@ cargo run --release -p whatspec -- diff old-generated/ generated/   # what a WA 
 | `abprops` | ~2400 A/B feature flags: name, code, type, default. Where protocol limits actually live |
 | `enums` | Wire-enum catalog — nack codes, chat and receipt types |
 | `tokens` | Binary-protocol token dictionaries (single-byte + double-byte) |
-| `wam` | Client telemetry event schemas |
+| `wam` | Client telemetry event schemas, their globals, constants and call sites. See `wam_telemetry.md` |
 
 Each has a JSON Schema under `generated/schema/`.
 

@@ -4376,6 +4376,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "whatsapp-rust-wam-catalog"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "whatspec-codegen"
 version = "0.0.0"
 dependencies = [

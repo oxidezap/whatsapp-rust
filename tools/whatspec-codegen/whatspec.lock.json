@@ -13,6 +13,7 @@
     "proto/WAProto.proto": "sha256:f3da4ba028402ea225747dc40247a5d55473012da9c4ef0c4b9de5c443117e2f",
     "srvreq/index.json": "sha256:d8eff4e11cdbb4d1f98daccde3bc90756ff0606853d2d547cde4d90742c0d544",
     "stanza/index.json": "sha256:71bf4cf68551b9a70a9eca21e78ac33f02c13925a039769780f8da3bc6c016ab",
-    "tokens/index.json": "sha256:2c21ee752449f0d12d6ea3b10897597416013eb14e36e12bad815f266985c3c7"
+    "tokens/index.json": "sha256:2c21ee752449f0d12d6ea3b10897597416013eb14e36e12bad815f266985c3c7",
+    "wam/index.json": "sha256:39e3ffcac131264d99b368a951a94c1fc3ff44091f837250d70fa445c2948736"
   }
 }

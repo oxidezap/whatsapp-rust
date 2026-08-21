@@ -27,6 +27,7 @@ pub const IR_FILES: &[&str] = &[
     "stanza/index.json",
     "mex/index.json",
     "tokens/index.json",
+    "wam/index.json",
     "proto/WAProto.proto",
 ];
 

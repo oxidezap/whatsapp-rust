@@ -12,6 +12,7 @@ pub mod notif;
 pub mod proto;
 pub mod tokens;
 pub mod version;
+pub mod wam;
 
 /// The two-line preamble every generated Rust file opens with. The version is
 /// part of it so a partially refreshed tree is visible in a diff.

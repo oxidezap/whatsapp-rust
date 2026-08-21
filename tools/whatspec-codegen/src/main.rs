@@ -264,6 +264,9 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
         serde_json::from_str(&ir.text("mex/index.json")?).context("parsing the mex IR")?;
     let tokens: ir::TokensIr =
         serde_json::from_str(&ir.text("tokens/index.json")?).context("parsing the tokens IR")?;
+    let wam: ir::WamIr =
+        serde_json::from_str(&ir.text("wam/index.json")?).context("parsing the WAM IR")?;
+    let wam = emit::wam::generate(&wam, wa_version)?;
 
     Ok(vec![
         Artifact {
@@ -305,6 +308,16 @@ fn build(ir: &Ir, wa_version: &str) -> Result<Vec<Artifact>> {
             path: "wacore/binary/src/tokens.json",
             content: emit::tokens::generate(&tokens)?,
             rust: false,
+        },
+        Artifact {
+            path: "plugins/wam-catalog/src/generated.rs",
+            content: wam.catalog,
+            rust: true,
+        },
+        Artifact {
+            path: "plugins/wam-catalog/src/call_sites.rs",
+            content: wam.call_sites,
+            rust: true,
         },
         Artifact {
             path: PROTO_ARTIFACT,
