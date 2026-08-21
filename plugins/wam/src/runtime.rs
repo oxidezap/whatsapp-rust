@@ -248,6 +248,18 @@ impl TickKind {
     }
 }
 
+/// How draining the retained buffers ended.
+///
+/// [`TickKind::Final`] ignores a cooldown an earlier tick set, because there is
+/// no later tick for it to defer to. It must not ignore one *this* tick set: a
+/// refusal seconds old is the server's current answer, not stale policy, and
+/// asking again in the same instant is the hammering the backoff exists to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drained {
+    WithoutFailing,
+    AfterAFailure,
+}
+
 /// The buffers, owned by whichever task drives [`WamRuntime::tick`].
 #[derive(Debug, Default)]
 pub struct WamWriter {
@@ -385,7 +397,17 @@ impl WamRuntime {
     ) {
         // Before anything else, so a buffer retained by this tick waits for the
         // next one and older buffers keep their place in line.
-        self.drain_pending(writer, uploader, now_secs, kind).await;
+        let drained = self.drain_pending(writer, uploader, now_secs, kind).await;
+        // Whether the buffer built below may still be *attempted*, which is a
+        // different question from whether it is finished: a final tick always
+        // finishes its buffer, because there is no later tick to finish it. A
+        // refusal in the drain is the server's answer from a moment ago, so that
+        // buffer waits for the cooldown it set even here. What a final tick may
+        // ignore is a cooldown it did not set.
+        let upload_kind = match drained {
+            Drained::WithoutFailing => kind,
+            Drained::AfterAFailure => TickKind::Scheduled,
+        };
 
         let queued: Vec<PendingEvent> = {
             let mut shared = self.lock();
@@ -406,7 +428,8 @@ impl WamRuntime {
                 .as_ref()
                 .is_some_and(|b| b.len() > MAX_BUFFER_SIZE)
             {
-                self.upload_current(writer, uploader, now_secs, kind).await;
+                self.upload_current(writer, uploader, now_secs, upload_kind)
+                    .await;
             }
             if writer.current.is_none() {
                 match self.start_buffer().await {
@@ -434,7 +457,8 @@ impl WamRuntime {
                         .is_none_or(|last| now_secs >= last.saturating_add(ROTATE_INTERVAL_SECS)))
         });
         if due {
-            self.upload_current(writer, uploader, now_secs, kind).await;
+            self.upload_current(writer, uploader, now_secs, upload_kind)
+                .await;
         }
     }
 
@@ -590,21 +614,24 @@ impl WamRuntime {
     }
 
     /// Try the buffers a previous run or a previous failure left behind.
+    ///
+    /// Returns whether the server refused one of them, which the caller needs
+    /// because a refusal here is this instant's answer rather than an old one.
     async fn drain_pending(
         &self,
         writer: &mut WamWriter,
         uploader: &dyn WamUploader,
         now_secs: i64,
         kind: TickKind,
-    ) {
+    ) -> Drained {
         if kind.honours_cooldown() && writer.retry_after_secs.is_some_and(|at| now_secs < at) {
-            return;
+            return Drained::WithoutFailing;
         }
         let pending = match self.store.pending().await {
             Ok(pending) => pending,
             Err(err) => {
                 warn!("wam: could not read the retained buffers: {err}");
-                return;
+                return Drained::WithoutFailing;
             }
         };
         for buffer in pending {
@@ -621,22 +648,23 @@ impl WamRuntime {
                 Delivery::Accepted => {
                     writer.last_upload_secs = Some(now_secs);
                     if !self.forget(buffer.key).await {
-                        return;
+                        return Drained::WithoutFailing;
                     }
                 }
                 Delivery::Retryable => {
                     // One failing buffer means the server or the link is
                     // unhappy; marching through the rest would just fail as
                     // many times.
-                    return;
+                    return Drained::AfterAFailure;
                 }
                 Delivery::Unsendable => {
                     if !self.forget(buffer.key).await {
-                        return;
+                        return Drained::WithoutFailing;
                     }
                 }
             }
         }
+        Drained::WithoutFailing
     }
 
     /// Drop a retained buffer that has been dealt with, reporting whether the
@@ -908,6 +936,48 @@ mod tests {
         assert_eq!(uploader.seen().len(), 3);
         assert_eq!(runtime.stats().uploaded, 2);
         assert!(store.pending().await.expect("pending").is_empty());
+    }
+
+    /// The other half of the same rule. Ignoring a cooldown an earlier tick set
+    /// is the fix; ignoring one this tick set would be asking a server that just
+    /// refused, in the same instant, which is the hammering the backoff is for.
+    #[tokio::test]
+    async fn a_final_tick_still_waits_for_a_cooldown_it_set_itself() {
+        let store = Arc::new(InMemoryWamStore::new());
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([
+            Err(UploadFailure::Retryable("503".into())),
+            Err(UploadFailure::Retryable("503".into())),
+        ]);
+
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
+            .await;
+        assert_eq!(uploader.seen().len(), 1);
+
+        // The final tick's drain retries the retained buffer and is refused
+        // again. The buffer it builds from the queue behind that refusal is
+        // retained rather than offered: one attempt per instant, not two.
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000 + backoff(0),
+                &mut keep_all(),
+                TickKind::Final,
+            )
+            .await;
+        assert_eq!(uploader.seen().len(), 2);
+        assert_eq!(store.pending().await.expect("pending").len(), 2);
     }
 
     #[tokio::test]
