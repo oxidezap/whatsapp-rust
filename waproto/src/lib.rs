@@ -108,6 +108,57 @@ pub mod codec {
     use crate::whatsapp;
     use buffa::Message as _;
 
+    /// Protobuf packs the field number above the 3-bit wire type in the tag.
+    const PROTOBUF_WIRE_TYPE_BITS: u32 = 3;
+
+    /// `SyncActionData` field numbers, read off `whatsapp.proto`.
+    const SYNC_ACTION_DATA_INDEX: u32 = 1;
+    const SYNC_ACTION_DATA_VALUE: u32 = 2;
+    const SYNC_ACTION_DATA_PADDING: u32 = 3;
+    const SYNC_ACTION_DATA_VERSION: u32 = 4;
+
+    #[inline]
+    fn push_varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+
+    #[inline]
+    fn wire_tag_value(field: u32, wire_type: buffa::encoding::WireType) -> u64 {
+        (u64::from(field) << PROTOBUF_WIRE_TYPE_BITS) | wire_type as u64
+    }
+
+    #[inline]
+    fn push_wire_tag(field: u32, wire_type: buffa::encoding::WireType, out: &mut Vec<u8>) {
+        push_varint(wire_tag_value(field, wire_type), out);
+    }
+
+    /// Bytes a base-128 varint occupies.
+    #[inline]
+    fn varint_len(mut v: u64) -> usize {
+        let mut n = 1;
+        while v >= 0x80 {
+            v >>= 7;
+            n += 1;
+        }
+        n
+    }
+
+    /// Encoded size of the length-delimited field `field` carrying `payload_len`
+    /// bytes (key + length varint + payload), so a nested field's length can be
+    /// pre-computed without a temp buffer.
+    #[inline]
+    fn len_delimited_len(field: u32, payload_len: usize) -> usize {
+        varint_len(wire_tag_value(
+            field,
+            buffa::encoding::WireType::LengthDelimited,
+        )) + varint_len(payload_len as u64)
+            + payload_len
+    }
+
     #[inline(never)]
     pub fn message_encoded_len(msg: &whatsapp::Message) -> usize {
         msg.encoded_len() as usize
@@ -291,9 +342,59 @@ pub mod codec {
         whatsapp::SyncActionData::decode_from_slice(bytes)
     }
 
+    /// Encode a `SyncActionData` wrapping a borrowed action value, returning the
+    /// wire bytes in one exactly-sized allocation.
+    ///
+    /// The app-state encode path holds the value behind a reference and fills the
+    /// other three fields from scalars, so building an owned `SyncActionData`
+    /// first deep-cloned the whole `SyncActionValue` subtree once per outgoing
+    /// mutation purely to hand it to the generated encoder. Writing the four
+    /// fields directly keeps that clone, the index copy and the empty padding
+    /// vector out of the path. Field numbers are `SyncActionData`'s (index = 1,
+    /// value = 2, padding = 3, version = 4); the app-state encode/decode
+    /// roundtrip test is what holds them to the schema.
+    ///
+    /// `padding` is written as the empty byte string the previous owned form
+    /// produced, so the bytes are identical to `SyncActionData::encode_to_vec`.
     #[inline(never)]
-    pub fn sync_action_data_to_vec(data: &whatsapp::SyncActionData) -> Vec<u8> {
-        data.encode_to_vec()
+    pub fn sync_action_data_to_vec(
+        index: &[u8],
+        value: &whatsapp::SyncActionValue,
+        version: i32,
+    ) -> Vec<u8> {
+        use buffa::encoding::WireType;
+
+        // Size the value once; the same cache feeds `write_to` below.
+        let mut cache = buffa::SizeCache::new();
+        let value_len = value.compute_size(&mut cache) as usize;
+
+        let total = len_delimited_len(SYNC_ACTION_DATA_INDEX, index.len())
+            + len_delimited_len(SYNC_ACTION_DATA_VALUE, value_len)
+            + len_delimited_len(SYNC_ACTION_DATA_PADDING, 0)
+            + varint_len(wire_tag_value(SYNC_ACTION_DATA_VERSION, WireType::Varint))
+            + buffa::types::int32_encoded_len(version);
+        let mut out = Vec::with_capacity(total);
+
+        push_wire_tag(SYNC_ACTION_DATA_INDEX, WireType::LengthDelimited, &mut out);
+        push_varint(index.len() as u64, &mut out);
+        out.extend_from_slice(index);
+
+        push_wire_tag(SYNC_ACTION_DATA_VALUE, WireType::LengthDelimited, &mut out);
+        push_varint(value_len as u64, &mut out);
+        value.write_to(&mut cache, &mut out);
+
+        push_wire_tag(
+            SYNC_ACTION_DATA_PADDING,
+            WireType::LengthDelimited,
+            &mut out,
+        );
+        push_varint(0, &mut out);
+
+        push_wire_tag(SYNC_ACTION_DATA_VERSION, WireType::Varint, &mut out);
+        buffa::types::encode_int32(version, &mut out);
+
+        debug_assert_eq!(out.len(), total, "two-pass size mismatch");
+        out
     }
 
     /// Signal storage records. Decoded/encoded from wacore-libsignal and the
