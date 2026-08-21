@@ -157,6 +157,36 @@ pub enum GlobalValue<'a> {
 }
 
 impl GlobalValue<'_> {
+    /// The kind this value would be read back as, for reporting a mismatch.
+    fn kind(&self) -> ValueKind {
+        match self {
+            Self::Bool(_) => ValueKind::Boolean,
+            Self::Int(_) => ValueKind::Integer,
+            Self::Float(_) => ValueKind::Number,
+            Self::Str(_) => ValueKind::String,
+        }
+    }
+
+    /// Whether this value is one the catalog's declared kind accepts.
+    ///
+    /// Three kinds share the integer shape and are not interchangeable in the
+    /// catalog, only on the wire: a timer and an enum are both written as an
+    /// integer, and an enum member reaches here already resolved to its wire
+    /// value. `Number` takes either, because the official numeric encoder sends
+    /// an integral double as an integer anyway.
+    fn fits(&self, kind: ValueKind) -> bool {
+        matches!(
+            (kind, self),
+            (ValueKind::Boolean, Self::Bool(_))
+                | (
+                    ValueKind::Integer | ValueKind::Timer | ValueKind::Enum,
+                    Self::Int(_)
+                )
+                | (ValueKind::Number, Self::Int(_) | Self::Float(_))
+                | (ValueKind::String, Self::Str(_))
+        )
+    }
+
     fn to_owned_value(&self) -> OwnedGlobalValue {
         match self {
             // A boolean reaches the wire as 0 or 1, and the official writer
@@ -302,6 +332,18 @@ pub enum BufferError {
         event_channel: Channel,
         buffer_channel: Channel,
     },
+    /// A global handed a value of a type the catalog does not declare for it.
+    ///
+    /// An event's fields are typed by its generated struct, so this cannot
+    /// happen there. A global is the one untyped way into a buffer, and the
+    /// declared kind is what the server reads the bytes back as: a string id
+    /// carrying an integer is a record no client sends.
+    #[error("global `{name}` is {expected:?}, not {actual:?}")]
+    GlobalValueKind {
+        name: &'static str,
+        expected: ValueKind,
+        actual: ValueKind,
+    },
 }
 
 /// One WAM buffer, built record by record.
@@ -396,6 +438,13 @@ impl WamBuffer {
             return Err(BufferError::GlobalNotOnChannel {
                 name: def.name,
                 channel: self.channel,
+            });
+        }
+        if !value.fits(def.kind) {
+            return Err(BufferError::GlobalValueKind {
+                name: def.name,
+                expected: def.kind,
+                actual: value.kind(),
             });
         }
         self.pending.insert(def.id, value.to_owned_value());

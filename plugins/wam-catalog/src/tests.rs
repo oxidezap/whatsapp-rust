@@ -339,6 +339,35 @@ fn a_global_the_channel_does_not_allow_is_refused() {
 }
 
 #[test]
+fn a_global_given_the_wrong_kind_of_value_is_refused() {
+    // An event's fields are typed by its generated struct. A global is the one
+    // untyped way into a buffer, so the catalog's declared kind is the only
+    // thing standing between a caller's slip and a record the server reads back
+    // as the wrong type.
+    let mut buf = buffer(1);
+    let err = buf
+        .set_global(globals::APP_VERSION, GlobalValue::Int(1))
+        .expect_err("appVersion is a string");
+    assert_eq!(
+        err,
+        BufferError::GlobalValueKind {
+            name: "appVersion",
+            expected: ValueKind::String,
+            actual: ValueKind::Integer,
+        }
+    );
+    assert_eq!(buf.len(), 8, "and nothing reached the bytes");
+
+    // An enum global takes the integer its member resolves to, which is the
+    // shape the identity writes and must keep working.
+    buf.set_global(
+        globals::PLATFORM,
+        GlobalValue::Int(enums::PlatformType::Webclient.wire()),
+    )
+    .expect("an enum global takes its wire value");
+}
+
+#[test]
 fn a_realtime_buffer_accepts_the_regular_globals() {
     // The official writer maps `realtime` onto `regular` before consulting a
     // global's channel list, so a regular-only global is legal here.

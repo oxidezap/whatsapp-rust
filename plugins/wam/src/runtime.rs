@@ -258,6 +258,9 @@ impl TickKind {
 enum Drained {
     WithoutFailing,
     AfterAFailure,
+    /// The retained set could not be read, so whether an older buffer is
+    /// waiting is unknown. Not a failure: the server was never asked.
+    WithoutReadingTheSet,
 }
 
 /// The buffers, owned by whichever task drives [`WamRuntime::tick`].
@@ -405,7 +408,7 @@ impl WamRuntime {
         // buffer waits for the cooldown it set even here. What a final tick may
         // ignore is a cooldown it did not set.
         let upload_kind = match drained {
-            Drained::WithoutFailing => kind,
+            Drained::WithoutFailing | Drained::WithoutReadingTheSet => kind,
             Drained::AfterAFailure => TickKind::Scheduled,
         };
 
@@ -456,7 +459,20 @@ impl WamRuntime {
                         .last_upload_secs
                         .is_none_or(|last| now_secs >= last.saturating_add(ROTATE_INTERVAL_SECS)))
         });
-        if due {
+        // An unreadable retained set may be hiding an older buffer, and sending
+        // this one would put it on the wire ahead of that one. Holding it in the
+        // writer for the next tick keeps the order and costs nothing; retaining
+        // it instead would discard it, because `retain` needs the same read that
+        // just failed. Two cases send anyway: a final tick has no next tick to
+        // hold for, and a buffer already past the size threshold would only grow
+        // while it waited.
+        let holds_its_place = drained == Drained::WithoutReadingTheSet
+            && kind != TickKind::Final
+            && writer
+                .current
+                .as_ref()
+                .is_some_and(|buffer| buffer.len() <= MAX_BUFFER_SIZE);
+        if due && !holds_its_place {
             self.upload_current(writer, uploader, now_secs, upload_kind)
                 .await;
         }
@@ -631,7 +647,7 @@ impl WamRuntime {
             Ok(pending) => pending,
             Err(err) => {
                 warn!("wam: could not read the retained buffers: {err}");
-                return Drained::WithoutFailing;
+                return Drained::WithoutReadingTheSet;
             }
         };
         for buffer in pending {
@@ -1308,11 +1324,74 @@ mod tests {
         }
     }
 
+    /// A read that fails may be hiding an older retained buffer. Sending the
+    /// fresh one anyway puts it on the wire ahead of that one; retaining it
+    /// discards it, since `retain` needs the same read. Holding it costs
+    /// nothing and keeps both the order and the data.
+    #[tokio::test]
+    async fn a_buffer_waits_rather_than_jumping_a_retained_set_that_cannot_be_read() {
+        let store = Arc::new(BlindStore::new());
+        store
+            .inner
+            .put_pending(PendingBuffer {
+                key: 1,
+                channel: Channel::Regular,
+                bytes: vec![b'W', b'A', b'M', 5, 1, 0, 0, 0],
+            })
+            .await
+            .expect("seed the retained set");
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([]);
+
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
+            .await;
+        assert!(
+            uploader.seen().is_empty(),
+            "nothing goes out ahead of a set that could not be read"
+        );
+        assert_eq!(runtime.stats().discarded, 0, "and nothing is discarded");
+
+        // Once the store answers, the retained buffer goes first and the held
+        // one follows it, still carrying the event observed before the failure.
+        store.see_again();
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Final,
+            )
+            .await;
+        let seen = uploader.seen();
+        assert_eq!(seen.len(), 2, "both go out, and neither was lost");
+        assert_eq!(
+            seen[0],
+            vec![b'W', b'A', b'M', 5, 1, 0, 0, 0],
+            "oldest first"
+        );
+    }
+
     #[tokio::test]
     async fn a_store_that_cannot_be_read_does_not_get_a_guessed_key() {
         // A failed read is not an empty store. Retaining under a guessed key
         // would overwrite whichever undelivered buffer already holds it, so the
         // new buffer is dropped and counted instead.
+        //
+        // Driven by a final tick, because a scheduled one no longer reaches
+        // `retain` here: it holds the buffer for the next tick rather than
+        // sending it ahead of a set it could not read. A final tick has no next
+        // tick, so it still sends, still fails, and still lands on the guard
+        // this test is about.
         let store = Arc::new(BlindStore::new());
         store
             .inner
@@ -1333,7 +1412,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                TickKind::Scheduled,
+                TickKind::Final,
             )
             .await;
 
