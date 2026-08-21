@@ -2127,8 +2127,8 @@ pub enum Reachability {
     /// So this says an attempt is being made, never that one will land. Causes
     /// the client cannot attribute are retried indefinitely by design, a
     /// handshake torn down before `<success>` reading the same as a server
-    /// that is momentarily unreachable, and a wait on this can outlive the
-    /// process. The bound belongs to the caller: see
+    /// that is momentarily unreachable, and a wait on this can go on for as
+    /// long as the process does. The bound belongs to the caller: see
     /// [`Client::wait_until_reachable`].
     Reconnecting,
     /// [`Client::pause`] is in effect. Like [`Self::Reconnecting`] the client
