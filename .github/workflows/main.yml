@@ -9,6 +9,15 @@ on:
     branches: [main]
   workflow_call:
 
+concurrency:
+  # Cancelling is scoped to `pull_request`: a push to main and a release's
+  # `workflow_call` run must both finish. The event name is in the group for the
+  # same reason docker.yml puts it there: without it a release validating main
+  # would land in the same group as a run of this workflow on main and be
+  # cancelled by it.
+  group: rust-ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   PROTOC_VERSION: '3.25.3'
@@ -141,10 +150,33 @@ jobs:
       # examples whose compilation is asserted nowhere else.
       - name: Run doctests
         run: cargo test --workspace --exclude e2e-tests --doc --verbose
-      # waproto serde tests are feature-gated and produce zero tests under the
-      # default feature set, so exercise each representation explicitly. No
-      # doctest counterpart: the features only swap derives on generated code,
-      # whose doc comments the step above already builds.
+
+  waproto-serde:
+    name: waproto serde representations
+    runs-on: ubuntu-latest
+    # waproto serde tests are feature-gated and produce zero tests under the
+    # default feature set, so each representation has to be built on its own.
+    # Its own job rather than two more steps on `Build & Test`: 11 tests that
+    # run in 20ms cost ~104s of recompiling waproto with a different feature
+    # set, and paying that on the workflow's most-read job put it on the
+    # critical path for nothing. Here it runs beside everything else.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Install protoc and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Cache Rust build (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+      # No doctest counterpart: the features only swap derives on generated
+      # code, whose doc comments `Build & Test` already builds.
       - name: Test waproto serde (enum repr)
         run: cargo nextest run --profile ci -p waproto --features serde-enum-repr
       - name: Test waproto serde (snake_case)
@@ -256,13 +288,30 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features
 
   feature-matrix:
-    name: Feature Matrix (each feature)
+    name: Feature Matrix (${{ matrix.crate }})
     runs-on: ubuntu-latest
     # Individual features are only ever exercised in the combinations the other
     # jobs happen to build (default / --all-features), so a feature whose gates
     # are wrong compiles fine there and breaks for a downstream consumer that
     # picks it alone. Restricted to the published library crates; bin/test
     # members carry no feature surface worth enumerating.
+    strategy:
+      # One crate per runner. `cargo hack` walks a crate's features serially, so
+      # a single job spent its time on seven walks that share nothing but the
+      # dependency build: whatsapp-rust alone is most of it, and everything
+      # behind it was waiting on a machine that had already checked its own
+      # crate. Each leg is also an independent question, so one failing must not
+      # withdraw the verdict on the other six.
+      fail-fast: false
+      matrix:
+        crate:
+          - whatsapp-rust
+          - wacore
+          - wacore-binary
+          - wacore-appstate
+          - wacore-libsignal
+          - wacore-noise
+          - waproto
     steps:
       - uses: actions/checkout@v6
       - name: Reclaim unused Android SDK space
@@ -292,14 +341,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
+          # Each leg builds a different feature set into the same target dir;
+          # without this they would all write one cache entry and race for it.
+          key: ${{ matrix.crate }}
       # --no-dev-deps: dev-dependencies enable features on the crate under test
       # (wacore/test-util, for one), which would mask exactly the gaps this
       # job looks for.
       - name: Check each feature
-        run: >
-          cargo hack check --each-feature --no-dev-deps
-          -p whatsapp-rust -p wacore -p wacore-binary -p wacore-appstate
-          -p wacore-libsignal -p wacore-noise -p waproto
+        run: cargo hack check --each-feature --no-dev-deps -p ${{ matrix.crate }}
 
   test-stable:
     name: Test Stable (MSRV)
