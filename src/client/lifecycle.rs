@@ -2168,9 +2168,9 @@ impl Reachability {
     /// and the client cannot tell a cause a retry fixes from one it never
     /// will.
     ///
-    /// Matched exhaustively for the same reason [`Self::settles`] is: a state
-    /// added later has to be classified here rather than taking an answer by
-    /// omission.
+    /// Matched exhaustively for the same reason the wait's own `settles`
+    /// classifier is: a state added later has to be classified here rather
+    /// than taking an answer by omission.
     pub fn recovers_on_its_own(self) -> bool {
         match self {
             Self::Reconnecting => true,
