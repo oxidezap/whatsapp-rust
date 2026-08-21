@@ -26,12 +26,24 @@ slow-timeout = { period = "60s" }
 # is the last thing in the log rather than something to scroll back for.
 fail-fast = false
 failure-output = "immediate-final"
-# A PASS line per test is thousands of lines of nothing; the trailing summary
-# carries the count. `slow` rather than `fail` because the levels nest: this is
-# what makes the slow-timeout above visible — at `fail` the run reports "1 slow"
-# in the summary and never says which test it was.
+# 20s names an outlier while it is still one test's problem; the inherited 60s
+# left a 120s test reported as one SLOW line. The ceiling is 6 periods: enough
+# headroom that the slowest test here has ~3x of it under a loaded runner, low
+# enough that a hang costs one test's wall clock instead of the job's.
+slow-timeout = { period = "20s", terminate-after = 6 }
+# A PASS line per test is thousands of lines of nothing; the summary carries the
+# count and the report below carries the times. `slow` rather than `fail` because
+# the levels nest: this is what names the tests that trip the slow-timeout, where
+# `fail` reports "1 slow" and never says which one.
 status-level = "slow"
 final-status-level = "flaky"
+
+# What every test cost, every run. `status-level` only names what crosses its
+# threshold, so on its own it cannot say whether the suite is 5000 cheap tests or
+# 4999 cheap ones and a fuzz, which is the question asked whenever a job slows
+# down. Written to target/nextest/ci/junit.xml, which CI publishes.
+[profile.ci.junit]
+path = "junit.xml"
 
 [profile.e2e]
 # The e2e suite talks to the bartender mock server, so its failure mode is a wait
@@ -43,3 +55,9 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 fail-fast = false
 failure-output = "immediate-final"
 final-status-level = "flaky"
+
+# Same report as `ci`. This profile does print a PASS line per test, but adding
+# 166 of them up by hand is how this suite was last audited; the report makes the
+# same numbers something a script can read.
+[profile.e2e.junit]
+path = "junit.xml"

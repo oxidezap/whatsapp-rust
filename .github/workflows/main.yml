@@ -125,6 +125,17 @@ jobs:
         run: cargo build --workspace --exclude e2e-tests --all-targets --verbose
       - name: Run tests
         run: cargo nextest run --profile ci --workspace --exclude e2e-tests
+      # Immediately after the run that produced it: the waproto steps below
+      # write the same path, and the workspace suite is the one whose cost this
+      # job exists to report.
+      - name: Publish test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-build-and-test
+          path: target/nextest/ci/junit.xml
+          retention-days: 14
+          if-no-files-found: warn
       # nextest cannot run doctests (nextest-rs/nextest#16) and silently reports
       # none, so they need their own libtest step — the workspace has ~200 doc
       # examples whose compilation is asserted nowhere else.
@@ -187,12 +198,23 @@ jobs:
       # enabled `voip-mlow` and ran it. That is what this loop does.
       - name: Test (every shareable feature)
         run: |
+          mkdir -p "$RUNNER_TEMP/test-timings"
           for package in wacore wacore-libsignal whatsapp-rust; do
             features="$(./scripts/ci/test_features.sh "$package")"
             echo "::group::$package [$features]"
             cargo nextest run --profile ci -p "$package" --features "$features" --lib --tests
+            # One path per profile, so each pass would otherwise overwrite the last.
+            mv target/nextest/ci/junit.xml "$RUNNER_TEMP/test-timings/$package.xml"
             echo "::endgroup::"
           done
+      - name: Publish test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-all-features
+          path: ${{ runner.temp }}/test-timings
+          retention-days: 14
+          if-no-files-found: warn
 
   rustdoc:
     name: Rustdoc
