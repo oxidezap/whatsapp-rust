@@ -592,7 +592,9 @@ impl WamRuntime {
             {
                 Delivery::Accepted => {
                     writer.last_upload_secs = Some(now_secs);
-                    self.forget(buffer.key).await;
+                    if !self.forget(buffer.key).await {
+                        return;
+                    }
                 }
                 Delivery::Retryable => {
                     // One failing buffer means the server or the link is
@@ -600,20 +602,32 @@ impl WamRuntime {
                     // many times.
                     return;
                 }
-                Delivery::Unsendable => self.forget(buffer.key).await,
+                Delivery::Unsendable => {
+                    if !self.forget(buffer.key).await {
+                        return;
+                    }
+                }
             }
         }
     }
 
-    /// Drop a retained buffer that has been dealt with.
+    /// Drop a retained buffer that has been dealt with, reporting whether the
+    /// store agreed.
     ///
     /// A removal that fails leaves the buffer retained, so the next drain offers
-    /// it again. For one the server accepted that is a duplicate upload, which is
-    /// the direction to fail in: the server sees a buffer twice instead of this
-    /// client losing one, and the log says which happened.
-    async fn forget(&self, key: u64) {
-        if let Err(err) = self.store.remove_pending(key).await {
-            warn!("wam: a delivered buffer stayed retained and may be sent again: {err}");
+    /// it again. For one the server accepted that is a duplicate upload, which
+    /// is the direction to fail in: the server sees a buffer twice instead of
+    /// this client losing one. The caller stops draining on `false`, because a
+    /// store that cannot delete will not delete the next one either, and
+    /// marching on would upload the whole retained set again on every tick for
+    /// as long as the failure lasts.
+    async fn forget(&self, key: u64) -> bool {
+        match self.store.remove_pending(key).await {
+            Ok(()) => true,
+            Err(err) => {
+                warn!("wam: a delivered buffer stayed retained and may be sent again: {err}");
+                false
+            }
         }
     }
 }
@@ -1290,6 +1304,68 @@ mod tests {
         assert_eq!(store.removals(), vec![1], "an accepted buffer is forgotten");
         assert!(store.pending().await.expect("pending").is_empty());
         assert_eq!(accepting.seen().len(), 1);
+    }
+
+    /// A store that accepts everything but refuses to delete.
+    #[derive(Debug, Default)]
+    struct UndeletableStore {
+        inner: InMemoryWamStore,
+    }
+
+    #[async_trait]
+    impl WamStore for UndeletableStore {
+        async fn next_sequence(&self, channel: Channel) -> Result<u16, WamStoreError> {
+            self.inner.next_sequence(channel).await
+        }
+
+        async fn put_pending(&self, buffer: PendingBuffer) -> Result<(), WamStoreError> {
+            self.inner.put_pending(buffer).await
+        }
+
+        async fn pending(&self) -> Result<Vec<PendingBuffer>, WamStoreError> {
+            self.inner.pending().await
+        }
+
+        async fn remove_pending(&self, _key: u64) -> Result<(), WamStoreError> {
+            Err(WamStoreError::new("this store cannot delete"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_delete_stops_the_drain_instead_of_resending_it_all() {
+        // A buffer that stays retained after being accepted comes back on the
+        // next tick. Marching through the rest would upload the whole set again
+        // every tick for as long as the store stays broken, so the drain stops
+        // after the first one that would not go away.
+        let store = Arc::new(UndeletableStore::default());
+        for key in 1..=3 {
+            store
+                .put_pending(PendingBuffer {
+                    key,
+                    channel: Channel::Regular,
+                    bytes: format!("WAM-{key}").into_bytes(),
+                })
+                .await
+                .expect("seed");
+        }
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([Ok(()), Ok(()), Ok(())]);
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                false,
+            )
+            .await;
+        assert_eq!(
+            uploader.seen().len(),
+            1,
+            "the drain stopped at the buffer that would not go away"
+        );
+        assert_eq!(store.pending().await.expect("pending").len(), 3);
     }
 
     #[test]

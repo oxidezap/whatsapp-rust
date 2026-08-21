@@ -302,21 +302,26 @@ impl ClientPlugin for WamPlugin {
     /// store that means the last buffer is lost, which is what an in-memory
     /// store is; with a durable one the next run sends it.
     ///
-    /// The host drains a plugin's tasks before it calls this, so the flush loop
-    /// has already parked its buffers and nothing races for them.
+    /// The host drains a plugin's tasks before it calls this, so nothing races
+    /// for the flush loop's buffers. It may have been cancelled before parking
+    /// them, in which case this starts a fresh writer and flushes the queue,
+    /// which is the state worth saving.
     fn shutdown(&self) -> PluginFuture<'_, Result<()>> {
         Box::pin(async move {
             let (Some(runtime), Some(uploader)) = (self.runtime.get(), self.uploader.get()) else {
                 return Ok(());
             };
-            let parked = self
+            // A cancelled task drops its future, so the flush loop may never
+            // reach its parking step even on a clean shutdown. Losing the
+            // in-progress buffer with it is survivable; losing the queue is
+            // not, and a fresh writer flushes the queue either way. There is
+            // nothing to race: the host has already drained the task.
+            let mut writer = self
                 .parked_writer
                 .lock()
                 .map_err(|_| anyhow::anyhow!("the wam writer lock was poisoned"))?
-                .take();
-            let Some(mut writer) = parked else {
-                return Ok(());
-            };
+                .take()
+                .unwrap_or_default();
             // The official client's own answer to this instant. Observed before
             // the flush so it rides the buffer it describes.
             runtime.observe(PendingEvent::WebWamForceFlush(
@@ -364,6 +369,33 @@ fn spawn_flush_loop(
     Ok(())
 }
 
+/// Whether an upload error is the server refusing this buffer for good, as
+/// opposed to refusing it for now.
+///
+/// Anything that is not the server answering at all is worth another try: a
+/// disconnected client reconnects, a timeout may not repeat. When the server
+/// does answer, the XMPP error class is the signal rather than the code, since
+/// `wait` is the server's own word for "ask again"; a stanza the server will
+/// never accept comes back `cancel` or a 4xx. The two codes that mean "not now"
+/// by definition are retried whatever class they carry, because a server that
+/// omits the class still means them: 429 is the one this repository already
+/// classifies as transient beside 5xx in `wacore::stats`, and 408 is the same
+/// statement about a request that never landed.
+fn refuses_this_buffer(err: &whatsapp_rust::PluginIqError) -> bool {
+    let whatsapp_rust::PluginIqError::Iq(whatsapp_rust::IqError::ServerError {
+        code,
+        error_type,
+        ..
+    }) = err
+    else {
+        return false;
+    };
+    if matches!(code, 408 | 429) || error_type.as_deref() == Some("wait") {
+        return false;
+    }
+    (400..500).contains(code)
+}
+
 /// Uploads through the plugin's IQ capability.
 struct IqUploader(PluginIq);
 
@@ -374,23 +406,59 @@ impl WamUploader for IqUploader {
             Ok(()) => Ok(()),
             Err(err) => {
                 let message = err.to_string();
-                // Anything that is not the server saying no is worth one more
-                // try: a disconnected client reconnects, a timeout may not
-                // repeat. A 4xx from the server will repeat.
-                let permanent = matches!(
-                    &err,
-                    whatsapp_rust::PluginIqError::Iq(whatsapp_rust::IqError::ServerError {
-                        code,
-                        ..
-                    }) if (400..500).contains(code)
-                );
                 warn!("wam: buffer upload failed: {message}");
-                Err(if permanent {
+                Err(if refuses_this_buffer(&err) {
                     UploadFailure::Permanent(message)
                 } else {
                     UploadFailure::Retryable(message)
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use whatsapp_rust::wacore_binary::OwnedNodeRef;
+    use whatsapp_rust::wacore_binary::builder::NodeBuilder;
+    use whatsapp_rust::wacore_binary::marshal::marshal;
+    use whatsapp_rust::wacore_binary::util::unpack;
+    use whatsapp_rust::{IqError, PluginIqError};
+
+    fn server_error(code: u16, error_type: Option<&str>) -> PluginIqError {
+        let node = NodeBuilder::new("iq").attr("type", "error").build();
+        let packed = marshal(&node).expect("an iq marshals");
+        let bytes = unpack(&packed).expect("a marshalled iq unpacks");
+        let response = Arc::new(OwnedNodeRef::new(bytes.into_owned()).expect("an iq decodes"));
+        PluginIqError::Iq(IqError::ServerError {
+            code,
+            text: String::new(),
+            error_type: error_type.map(str::to_owned),
+            backoff: None,
+            response: response.into(),
+        })
+    }
+
+    #[test]
+    fn a_throttled_upload_is_retried_and_a_rejected_one_is_not() {
+        // "not now", both by code and by the server's own error class.
+        assert!(!refuses_this_buffer(&server_error(429, Some("cancel"))));
+        assert!(!refuses_this_buffer(&server_error(408, None)));
+        assert!(!refuses_this_buffer(&server_error(503, Some("wait"))));
+        assert!(!refuses_this_buffer(&server_error(400, Some("wait"))));
+
+        // "not this buffer": retrying buys the same answer forever.
+        assert!(refuses_this_buffer(&server_error(400, Some("modify"))));
+        assert!(refuses_this_buffer(&server_error(401, None)));
+        assert!(refuses_this_buffer(&server_error(404, Some("cancel"))));
+
+        // A server that never answered has said nothing about the buffer.
+        assert!(!refuses_this_buffer(&server_error(500, None)));
+        assert!(!refuses_this_buffer(&PluginIqError::Iq(IqError::Timeout)));
+        assert!(!refuses_this_buffer(&PluginIqError::Iq(
+            IqError::NotConnected
+        )));
     }
 }

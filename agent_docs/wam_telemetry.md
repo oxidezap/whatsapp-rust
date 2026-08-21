@@ -149,8 +149,17 @@ Shutdown gets one best-effort flush, inside the deadline the plugin host already
 applies to every shutdown callback rather than a new one of its own. The host
 drains the plugin's tasks first, so the flush loop has parked its buffers and
 nothing races for them; an upload that does not finish inside the bound leaves
-the buffer retained rather than delaying the teardown. It is the moment the
+the buffer retained rather than delaying the teardown. A cancelled task drops its
+future, so the loop may never reach its parking step; the flush then starts a
+fresh writer, which loses the in-progress buffer and saves the queue, and the
+queue is the larger of the two. It is the moment the
 official client writes `WebWamForceFlush`, so this writes it too.
+
+A refusal is classified by the XMPP error class rather than by the code alone,
+since `wait` is the server's own word for "ask again": a `wait` of any code is
+retried, and so are 408 and 429, which mean "not now" whether or not the server
+attaches a class. Everything else in the 4xx range is this buffer being refused
+and is dropped.
 
 A retained buffer is removed from the store only once the server has answered.
 Removing it first would lose it to a crash between the delete and the answer,
@@ -184,7 +193,7 @@ chosen to match that unit rather than to be convenient:
 
 | event | derived from | the unit it counts |
 | --- | --- | --- |
-| `E2eMessageRecv` | `DecryptedPayload`, `EncDecryptFailed` | one `<enc>` |
+| `E2eMessageRecv` | `DecryptedPayload`, some `EncDecryptFailed` | one `<enc>` this client tried to decrypt |
 | `MessageReceive` | `Messages` | one decrypted message |
 | `ReceiptStanzaReceive` | `RawNode`, filtered to `<receipt>` | one inbound receipt stanza |
 | `WebcSocketConnect` | `Connected` | one authenticated socket |
@@ -202,13 +211,23 @@ several stanzas where one arrived and none where one did. `RawNode` is one event
 per decoded stanza, which is the unit the metric's name claims. The cost is that
 every inbound stanza crosses the plugin bus for a tag comparison.
 
-**`EncDecryptFailed(PlaintextUnusable)` produces nothing.** It is the one reason
-that does not describe a decryption failure: the Signal layer handed back bytes
-and something after it could not use them. When the bytes were unpadded first,
+**Not every `EncDecryptFailed` is an E2E failure.** `e2eSuccessful: false` claims
+this client read this `<enc>`'s ciphertext and could not turn it into plaintext,
+and two groups of reasons make that claim false in opposite directions.
+
+Below the line is `EncDecryptFailureReason::decryption_was_attempted`, the core's
+own name for it: those nodes were set aside before any ciphertext was read, and
+the last of them is not even about the stanza, only about when it arrived.
+Counting them moves a success rate with something that was never a decryption.
+`UnsupportedEncType` crosses back the other way, because unlike the rest of that
+group it is a fact about this `<enc>`'s own `type` attribute and WAM names
+exactly it.
+
+Above the line is `PlaintextUnusable`, where the decryption succeeded and
+something after it could not use the bytes. When the padding was the usable part,
 the same `<enc>` already produced a `DecryptedPayload` and was already counted as
-a success, so reporting it again as a failure would double-count one `<enc>` with
-two contradicting answers. WAM has no member for "decrypted but undecodable", so
-the honest report is none.
+a success, so a second metric would contradict the first. WAM has no member for
+"decrypted but undecodable", so the honest report is none.
 
 ## What is not emitted, and why
 

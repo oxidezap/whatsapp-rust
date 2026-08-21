@@ -288,18 +288,44 @@ pub fn from_batch(batch: &MessageBatch) -> Vec<crate::runtime::PendingEvent> {
     out
 }
 
+/// Whether a failure reason says anything about this `<enc>`'s decryption.
+///
+/// `e2eSuccessful: false` is a claim that this client read this `<enc>`'s
+/// ciphertext and could not turn it into plaintext. Two groups of reasons make
+/// that claim false, in opposite directions.
+///
+/// Below the line is `EncDecryptFailureReason::decryption_was_attempted`, the
+/// core's own name for it: those nodes were set aside before any ciphertext was
+/// read, and the last of them is not even about the stanza, only about when it
+/// arrived. Counting them as failures moves a success rate with something that
+/// was never a decryption.
+///
+/// Above it is `PlaintextUnusable`, where the decryption succeeded and
+/// something after it could not use the bytes. When the padding was the usable
+/// part, the same `<enc>` already produced a `DecryptedPayload` and was already
+/// counted as a success, so a second metric would contradict the first. WAM has
+/// no member for "decrypted but undecodable", so the honest report is none.
+///
+/// One reason crosses back the other way. `UnsupportedEncType` is not attempted
+/// either, but unlike the rest of that group it is a fact about this `<enc>`'s
+/// own `type` attribute, and WAM names exactly it, so it is reported with that
+/// reason rather than dropped.
+fn reports_a_decryption_outcome(reason: &EncDecryptFailureReason) -> bool {
+    match reason {
+        EncDecryptFailureReason::PlaintextUnusable => false,
+        EncDecryptFailureReason::UnsupportedEncType => true,
+        other => other.decryption_was_attempted(),
+    }
+}
+
 /// The `E2eMessageRecv` one failed `<enc>` produces, when it produces one.
 ///
-/// `PlaintextUnusable` produces none. It is the one reason that does not
-/// describe a decryption failure: the Signal layer handed back bytes and
-/// something after it could not use them, so reporting `e2eSuccessful: false`
-/// would be wrong on its own terms. For the `<enc>` that already produced a
-/// `DecryptedPayload` it would also be a second, contradicting metric for the
-/// same `<enc>`. The one whose padding was the unusable part goes unreported
-/// instead, which is the honest side of the choice: WAM has no member for
-/// "decrypted but undecodable", so there is nothing to say about it.
+/// `None` for a reason that does not describe this `<enc>`'s decryption; see
+/// [`reports_a_decryption_outcome`] for which those are and why. The `<enc>`
+/// goes unreported rather than misreported, which is the side of the choice
+/// that keeps the number meaning what it says.
 pub fn from_enc_failure(failed: &EncDecryptFailed) -> Option<events::E2eMessageRecv> {
-    if matches!(failed.reason, EncDecryptFailureReason::PlaintextUnusable) {
+    if !reports_a_decryption_outcome(&failed.reason) {
         return None;
     }
     Some(e2e_message_recv(
@@ -535,6 +561,25 @@ mod tests {
 
     fn derive_receipt(node: &OwnedNodeRef) -> Option<events::ReceiptStanzaReceive> {
         receipt_stanza_receive(node.get())
+    }
+
+    #[test]
+    fn an_enc_the_client_never_tried_produces_no_metric() {
+        // The contract on `NotAttempted` says the ciphertext was never read,
+        // and the torn-down-connection case is not even about this stanza.
+        // Counting it as a decryption failure moves the success rate with
+        // something that was never a decryption.
+        assert!(from_enc_failure(&failure(EncDecryptFailureReason::NotAttempted)).is_none());
+        assert!(from_enc_failure(&failure(EncDecryptFailureReason::MalformedNode)).is_none());
+
+        // The one that is not attempted and is still reported: it names this
+        // `<enc>`'s own `type` attribute, and WAM has a member for exactly that.
+        let unsupported = from_enc_failure(&failure(EncDecryptFailureReason::UnsupportedEncType))
+            .expect("an unusable enc type is a fact about this enc");
+        assert_eq!(
+            unsupported.e2e_failure_reason,
+            Some(enums::E2eFailureReason::UnknownCiphertextType)
+        );
     }
 
     #[test]
