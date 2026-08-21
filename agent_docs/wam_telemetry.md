@@ -133,6 +133,13 @@ waiting between two attempts; here that wait would sit on the task that also
 drains the queue, so a slow server would stop events being *written* as well as
 sent. The spacing is the same curve without occupying anything.
 
+A buffer the server *refused* is dropped rather than kept, which is the one
+place this diverges from the official client deliberately. A 4xx is a refusal of
+that buffer, so retaining it buys a retry that fails the same way every two
+minutes until unrelated traffic pushes it past the retention cap. It is counted
+the way a buffer past the upload ceiling is counted. A timeout or a lost
+connection is not a refusal and is retained.
+
 Nothing on this path can reach the client. Telemetry that cannot be encoded,
 stored or uploaded is dropped and counted, and the count is reported as the
 `WamClientErrors` and `WamDroppedEvent` events the official client uses for the

@@ -422,8 +422,8 @@ impl WamRuntime {
         }
         match self.deliver(writer, uploader, now_secs, &bytes).await {
             Delivery::Accepted => writer.last_upload_secs = Some(now_secs),
-            Delivery::Failed => self.retain(bytes).await,
-            Delivery::TooLarge => {}
+            Delivery::Retryable => self.retain(bytes).await,
+            Delivery::Unsendable => {}
         }
     }
 
@@ -447,7 +447,7 @@ impl WamRuntime {
             );
             self.lock().stats.discarded += 1;
             self.report_buffer_drop();
-            return Delivery::TooLarge;
+            return Delivery::Unsendable;
         }
         match uploader.upload(now_secs, bytes).await {
             Ok(()) => {
@@ -462,7 +462,17 @@ impl WamRuntime {
                 writer.consecutive_failures = writer.consecutive_failures.saturating_add(1);
                 writer.retry_after_secs = Some(now_secs.saturating_add(wait));
                 debug!("wam: upload failed, waiting {wait}s: {failure}");
-                Delivery::Failed
+                // A permanent refusal is a refusal of this buffer, so keeping it
+                // buys a retry that fails the same way forever, at the backoff's
+                // pace, until unrelated traffic evicts it. The official client
+                // re-stores it anyway; this drops it and counts it, which is the
+                // same accounting a buffer past the upload ceiling gets.
+                if matches!(failure, UploadFailure::Permanent(_)) {
+                    self.lock().stats.discarded += 1;
+                    self.report_buffer_drop();
+                    return Delivery::Unsendable;
+                }
+                Delivery::Retryable
             }
         }
     }
@@ -530,14 +540,14 @@ impl WamRuntime {
                 Delivery::Accepted => {
                     writer.last_upload_secs = Some(now_secs);
                 }
-                Delivery::Failed => {
+                Delivery::Retryable => {
                     self.retain(buffer.bytes).await;
                     // One failing buffer means the server or the link is
                     // unhappy; marching through the rest would just fail as
                     // many times.
                     return;
                 }
-                Delivery::TooLarge => {}
+                Delivery::Unsendable => {}
             }
         }
     }
@@ -547,10 +557,11 @@ impl WamRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delivery {
     Accepted,
-    /// Not accepted, and worth keeping.
-    Failed,
-    /// Not sent at all, and not worth keeping.
-    TooLarge,
+    /// Refused for a reason that may not repeat, so the buffer is kept.
+    Retryable,
+    /// Not worth keeping: the server refused this buffer and will refuse it
+    /// again, or it was never sendable in the first place.
+    Unsendable,
 }
 
 /// A key no retained buffer is using.
@@ -739,15 +750,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_permanently_refused_buffer_is_dropped_rather_than_retried_forever() {
+        // Keeping it would buy a retry that fails the same way every two
+        // minutes until unrelated traffic evicts it.
+        let store = Arc::new(InMemoryWamStore::new());
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([Err(UploadFailure::Permanent("400".into()))]);
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                false,
+            )
+            .await;
+        assert_eq!(uploader.seen().len(), 1);
+        assert!(
+            store.pending().await.expect("pending").is_empty(),
+            "a buffer the server will refuse again is not kept"
+        );
+        assert_eq!(runtime.stats().discarded, 1);
+    }
+
+    #[tokio::test]
     async fn a_failing_upload_never_reaches_the_client() {
-        // The one thing telemetry may not do. Every failure path is exercised
-        // and none of them returns anything a caller could propagate.
+        // The one thing telemetry may not do. Both failure classes are
+        // exercised and neither returns anything a caller could propagate, nor
+        // stops the next event being written.
         let store = Arc::new(InMemoryWamStore::new());
         let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
         let mut writer = WamWriter::default();
         let uploader = ScriptedUploader::with([
-            Err(UploadFailure::Permanent("400".into())),
             Err(UploadFailure::Retryable("timeout".into())),
+            Err(UploadFailure::Permanent("400".into())),
         ]);
         runtime.observe(receipt());
         runtime
@@ -760,12 +798,12 @@ mod tests {
             )
             .await;
         assert_eq!(runtime.stats().uploaded, 0);
-        // Retained rather than lost: the retention cap is what bounds memory,
-        // not the error class, which is the same choice the official client
-        // makes.
+        // Retained, because a timeout is not a refusal. The retention cap is
+        // what bounds the memory.
         assert_eq!(store.pending().await.expect("pending").len(), 1);
 
-        // A second observation still gets written and queued behind it.
+        // The retry is refused outright, so that buffer is dropped, and a new
+        // observation is still written.
         runtime.observe(receipt());
         runtime
             .tick(
@@ -776,7 +814,13 @@ mod tests {
                 false,
             )
             .await;
-        assert_eq!(runtime.stats().written, 2);
+        // The refused buffer is gone rather than queued for another refusal.
+        // What is retained now is the buffer this tick built, held back by the
+        // cooldown the refusal started.
+        let stats = runtime.stats();
+        assert_eq!(stats.uploaded, 0);
+        assert_eq!(stats.discarded, 1);
+        assert!(stats.written >= 2);
     }
 
     #[tokio::test]
