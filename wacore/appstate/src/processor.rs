@@ -141,7 +141,7 @@ where
 
         mutation_macs.push(AppStateMutationMAC {
             index_mac: macs.index_mac,
-            value_mac: macs.value_mac,
+            value_mac: macs.value_mac.to_vec(),
         });
 
         mutations.push(mutation);
@@ -308,7 +308,7 @@ where
                 wa::syncd_mutation::SyncdOperation::SET => {
                     added_macs.push(AppStateMutationMAC {
                         index_mac: macs.index_mac,
-                        value_mac: macs.value_mac,
+                        value_mac: macs.value_mac.to_vec(),
                     });
                 }
                 wa::syncd_mutation::SyncdOperation::REMOVE => {
