@@ -424,7 +424,6 @@ jobs:
     env:
       RUSTFLAGS: ""
       NEXTEST_PROFILE: ci
-      TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
     steps:
       - uses: actions/checkout@v6
       # Pinned rather than `@stable`: this version is the workspace MSRV
@@ -446,6 +445,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
+      # `TEST_TIMINGS_DIR` cannot join `NEXTEST_PROFILE` in the job's `env:`
+      # above: it needs `runner.temp`, the `runner` context is not available to
+      # a job-level `env:`, and that is a whole-workflow startup failure rather
+      # than a failure of this job. Exported once here instead of repeated on
+      # each of the three steps below.
+      - name: Point the timing wrapper at this job's report directory
+        run: echo "TEST_TIMINGS_DIR=$RUNNER_TEMP/test-timings" >> "$GITHUB_ENV"
       # These three used to be reachable here only with `--no-default-features`,
       # because their default `simd` feature pulled in `portable_simd` and so
       # needed nightly. There is no SIMD in the tree any more and no feature
