@@ -130,20 +130,20 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
-      # nextest's own build, so `Run tests` below only runs. `cargo build
-      # --all-targets` shared nothing with it: cargo's unit hash carries the
-      # profile name, `dev` for one and `test` for the other, and `--all-targets`
-      # additionally pulls bench-integration and through it e2e-tests into the
-      # graph. This job compiled the workspace twice for that, ~220s of the ~350s
-      # that `Run tests` used to spend before its first test.
+      # No separate build step. There used to be one, and it was pure waste: in
+      # three different spellings, `cargo build --all-targets`, `cargo test
+      # --all-targets --no-run`, and finally nextest's own `--no-run` build, the
+      # step below went on to recompile the same thirteen crates anyway. Measured
+      # on the runner with the last of those, which differs from the step below
+      # only by `--no-run`: 223s to build, then 189s recompiling before the first
+      # test ran. Whatever cargo is keying on there, nothing the build step
+      # produced was reusable, so the workspace is compiled once, here.
       #
-      # What this no longer asserts is that every target links under the default
-      # feature set: benches and examples are not test targets, so nextest does
-      # not build them. `Clippy Linter` still compiles them on this same push, and
-      # `Build & Lint (all features)` still links them, with all features on
-      # rather than the default set. That is the one seam left, and it is narrow.
-      - name: Build project
-        run: cargo nextest run --profile ci --workspace --exclude e2e-tests --no-run
+      # What that gives up is a job whose default-feature targets all link:
+      # benches and examples are not test targets, so nextest does not build
+      # them. `Clippy Linter` still compiles them on this same push, and `Build &
+      # Lint (all features)` still links them with all features on. The seam left
+      # is a target that links with all features and not with the default set.
       - name: Run tests
         env:
           NEXTEST_PROFILE: ci
