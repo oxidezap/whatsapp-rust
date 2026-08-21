@@ -299,7 +299,7 @@ impl RelayTransport for RelayMediaChannel {
 const RELAY_EVENT_CAP: usize = 256;
 /// One DataChannel message fits in a UDP MTU; 1500 covers any STUN/RTP/RTCP packet WA sends. Used by
 /// the in-test loopback relay, whose messages are single small packets.
-#[cfg(all(test, feature = "voip-mlow"))]
+#[cfg(test)]
 const RELAY_READ_BUF: usize = 1500;
 /// SCTP read buffer for the inbound pump. webrtc-sctp reassembles inbound messages up to its default
 /// `max_message_size` (65536) regardless of MTU, and a buffer smaller than the delivered message
@@ -634,54 +634,19 @@ mod tests {
     }
 }
 
-/// End-to-end over a REAL localhost UDP socket: the production `RelayMediaChannelFactory` dials the
-/// full DTLS+SCTP+DataChannel stack to an in-test relay server, and the sans-IO `CallEngine` driven
-/// by `run_call_tokio` exchanges packets with it. This is the one place CI exercises the native
-/// transport's I/O (the rest of the suite mocks the socket), closing the `connect_relay_media is not
-/// exercised in CI` gap in the module header.
-#[cfg(all(test, feature = "voip-mlow"))]
-mod udp_relay_e2e {
+/// The relay half of the loopback tests: the server side of the same DTLS+SCTP+DataChannel stack
+/// the production factory dials, plus the socket plumbing to put a test in the middle of the wire.
+#[cfg(test)]
+mod loopback_relay {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-
-    use wacore::voip::engine::{CallConfig, CallEvent, SequentialTxIds};
-    use wacore::voip::session::{CallDirection, MediaPipeline, MediaPipelineParams};
-    use wacore::voip::{CallChannels, CallEngine, video_control_channel};
-    use webrtc_dtls::config::Config as DtlsConfig;
-    use webrtc_sctp::association::{Association, Config as SctpConfig};
-
-    use crate::voip::driver::run_call_tokio;
-
-    const SELF_LID: &str = "111111111111111:0@lid";
-    const PEER_LID: &str = "222222222222222:0@lid";
-    const SSRC: u32 = 0x5741_0001;
-    const SAMPLES: u32 = 960;
-
-    fn config(relay_addr: SocketAddr) -> CallConfig {
-        CallConfig {
-            call_id: "CID".into(),
-            direction: CallDirection::Incoming,
-            self_lid: SELF_LID.into(),
-            peer_lid: PEER_LID.into(),
-            call_key: (0u8..32).collect(),
-            ssrc: SSRC,
-            audio: wacore::voip::AudioConfig::MLOW_PCM,
-            relay_token: vec![0xAB; 16],
-            relay_ip: relay_addr.ip().to_string(),
-            relay_port: relay_addr.port(),
-            integrity_key: b"relay-key".to_vec(),
-            warp_mi_tag_len: 4,
-            enable_media: true,
-            enable_video: false,
-            enable_sframe: false,
-        }
-    }
 
     /// The relay server half of the DataChannel: the DTLS server handshake (mirroring the client's
     /// skip-verify self-signed setup), the SCTP server association, and the same pre-negotiated id=0
     /// stream the client dials. Returns once the channel is open. Bridges DTLS's util-0.11 `Conn` to
     /// SCTP's util-0.17 `Conn` via the same `DtlsToSctpConn` the client uses.
-    async fn accept_relay(udp: UdpSocket) -> Arc<DataChannel> {
+    pub(super) async fn accept_relay(udp: UdpSocket) -> Arc<DataChannel> {
         let udp: Arc<dyn Conn011 + Send + Sync> = Arc::new(udp);
         let cert = Certificate::generate_self_signed(vec!["wa-relay".to_owned()]).unwrap();
         let dtls = DTLSConn::new(
@@ -715,6 +680,225 @@ mod udp_relay_e2e {
             .await
             .expect("relay datachannel");
         Arc::new(dc)
+    }
+
+    /// Control surface of [`run_reordering_proxy`], shared with the test that arms it.
+    #[derive(Default)]
+    pub(super) struct ReorderControl {
+        /// How many client-to-relay datagrams to capture before releasing them in reverse arrival
+        /// order. Zero means pass everything straight through. The test arms this only after the
+        /// handshake has completed, so nothing but application data is ever reordered.
+        pub(super) hold_target: AtomicUsize,
+        /// How many datagrams are captured so far, so a test can send one message, wait for its
+        /// datagram to land here, and thereby know each message got a datagram of its own.
+        pub(super) held: AtomicUsize,
+    }
+
+    /// Forward datagrams between the client and the relay, optionally reversing a run of them.
+    ///
+    /// Whether the media channel is ordered is not observable from either endpoint's API: it shows
+    /// up only in what SCTP does to out-of-order arrivals. Putting the reordering on the wire is
+    /// what makes it observable -- an ordered stream restores send order before delivering, an
+    /// unordered one delivers each message the moment it arrives.
+    pub(super) async fn run_reordering_proxy(
+        front: UdpSocket,
+        relay_addr: SocketAddr,
+        ctl: Arc<ReorderControl>,
+    ) {
+        let back = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("proxy back socket");
+        back.connect(relay_addr).await.expect("proxy dial relay");
+        let mut client_addr: Option<SocketAddr> = None;
+        let mut captured: Vec<Vec<u8>> = Vec::new();
+        let mut from_client = vec![0u8; RELAY_READ_BUF];
+        let mut from_relay = vec![0u8; RELAY_READ_BUF];
+        loop {
+            tokio::select! {
+                r = front.recv_from(&mut from_client) => {
+                    let Ok((n, peer)) = r else { break };
+                    client_addr = Some(peer);
+                    if ctl.hold_target.load(Ordering::SeqCst) == 0 {
+                        let _ = back.send(&from_client[..n]).await;
+                        continue;
+                    }
+                    captured.push(from_client[..n].to_vec());
+                    ctl.held.store(captured.len(), Ordering::SeqCst);
+                    if captured.len() >= ctl.hold_target.load(Ordering::SeqCst) {
+                        ctl.hold_target.store(0, Ordering::SeqCst);
+                        for datagram in captured.drain(..).rev() {
+                            let _ = back.send(&datagram).await;
+                        }
+                    }
+                }
+                r = back.recv(&mut from_relay) => {
+                    let Ok(n) = r else { break };
+                    if let Some(peer) = client_addr {
+                        let _ = front.send_to(&from_relay[..n], peer).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Poll `cond` until it holds, failing at the deadline. Tests carry a bound, never a fixed
+    /// wait: a condition already met returns on the first poll, and a condition that never comes
+    /// names itself in the panic instead of hanging the suite.
+    pub(super) async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+/// The media channel must stay UNORDERED and UNRELIABLE (`maxRetransmits = 0`), the shape WA Web
+/// opens it with. A reliable, ordered stream head-of-line-blocks real-time RTP, which the peer hears
+/// as choppy audio -- the regression this pins down, and the one the loopback e2e above cannot see
+/// because a loopback socket never reorders on its own.
+#[cfg(test)]
+mod media_channel_reliability {
+    use super::loopback_relay::{ReorderControl, accept_relay, run_reordering_proxy, wait_for};
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// How many messages to write, hold on the wire, and release reversed. Four is enough for the
+    /// delivered order to be unambiguous while keeping the hold far below SCTP's retransmit timer,
+    /// which would otherwise abandon a held chunk (`Rexmit 0` never retransmits).
+    const MESSAGES: usize = 4;
+
+    /// Reversing the client's datagrams on the wire must reverse what the relay reads. That only
+    /// happens on an unordered stream: were the channel ordered, SCTP would hold each arrival until
+    /// its predecessor came and hand the relay 0,1,2,3 no matter what the network did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn media_channel_delivers_out_of_order_arrivals_immediately() {
+        install_default_crypto_provider();
+        let body = async {
+            // Relay, proxy, client: the client dials the proxy, which forwards to the relay.
+            let relay_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let relay_addr = relay_udp.local_addr().unwrap();
+            let front = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let proxy_addr = front.local_addr().unwrap();
+
+            let (order_tx, order_rx) = async_channel::unbounded::<u8>();
+            let relay_task = tokio::spawn(async move {
+                let mut peek = [0u8; RELAY_READ_BUF];
+                let (_, proxy_back) = relay_udp.peek_from(&mut peek).await.unwrap();
+                relay_udp.connect(proxy_back).await.unwrap();
+                let dc = accept_relay(relay_udp).await;
+                let mut buf = vec![0u8; RELAY_READ_BUF];
+                loop {
+                    match dc.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) if n > 0 => {
+                            if order_tx.send(buf[0]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            });
+
+            let ctl = Arc::new(ReorderControl::default());
+            let proxy_task = tokio::spawn(run_reordering_proxy(front, relay_addr, ctl.clone()));
+
+            // The production media channel, dialled through the proxy. `connect_relay_media` rather
+            // than the factory: the factory also races the web-client port, and a second dial would
+            // put datagrams the proxy never sees on the wire.
+            let chan = connect_relay_media(proxy_addr, Arc::new(crate::runtime_impl::TokioRuntime))
+                .await
+                .expect("relay media connect through the proxy");
+
+            // Arm only now: everything before this is handshake traffic, which must arrive in order
+            // for the stack to come up at all.
+            ctl.hold_target.store(MESSAGES, Ordering::SeqCst);
+            for i in 0..MESSAGES {
+                chan.send(Bytes::from(vec![i as u8; 8])).await.unwrap();
+                // Step one datagram at a time so each message is provably its own datagram; a batch
+                // SCTP bundled into one packet would survive reversal and prove nothing.
+                wait_for(
+                    || ctl.held.load(Ordering::SeqCst) > i,
+                    "the proxy to capture the datagram just written",
+                )
+                .await;
+            }
+
+            let mut delivered = Vec::with_capacity(MESSAGES);
+            for _ in 0..MESSAGES {
+                let id = tokio::time::timeout(Duration::from_secs(5), order_rx.recv())
+                    .await
+                    .expect("the relay must receive every released message")
+                    .expect("relay read channel stayed open");
+                delivered.push(id);
+            }
+
+            let expected: Vec<u8> = (0..MESSAGES as u8).rev().collect();
+            assert_eq!(
+                delivered,
+                expected,
+                "the relay must read the messages in arrival order; an ordered stream would have \
+                 re-sorted them back to {:?}",
+                (0..MESSAGES as u8).collect::<Vec<_>>()
+            );
+
+            chan.disconnect().await;
+            drop(chan);
+            let _ = tokio::time::timeout(Duration::from_secs(5), relay_task).await;
+            proxy_task.abort();
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), body)
+            .await
+            .expect("the reordering round-trip must complete within the bound");
+    }
+}
+
+/// End-to-end over a REAL localhost UDP socket: the production `RelayMediaChannelFactory` dials the
+/// full DTLS+SCTP+DataChannel stack to an in-test relay server, and the sans-IO `CallEngine` driven
+/// by `run_call_tokio` exchanges packets with it. This is the one place CI exercises the native
+/// transport's I/O (the rest of the suite mocks the socket), closing the `connect_relay_media is not
+/// exercised in CI` gap in the module header.
+#[cfg(all(test, feature = "voip-mlow"))]
+mod udp_relay_e2e {
+    use super::*;
+    use std::time::Duration;
+
+    use wacore::voip::engine::{CallConfig, CallEvent, SequentialTxIds};
+    use wacore::voip::session::{CallDirection, MediaPipeline, MediaPipelineParams};
+    use wacore::voip::{CallChannels, CallEngine, video_control_channel};
+
+    use super::loopback_relay::accept_relay;
+    use crate::voip::driver::run_call_tokio;
+
+    const SELF_LID: &str = "111111111111111:0@lid";
+    const PEER_LID: &str = "222222222222222:0@lid";
+    const SSRC: u32 = 0x5741_0001;
+    const SAMPLES: u32 = 960;
+
+    fn config(relay_addr: SocketAddr) -> CallConfig {
+        CallConfig {
+            call_id: "CID".into(),
+            direction: CallDirection::Incoming,
+            self_lid: SELF_LID.into(),
+            peer_lid: PEER_LID.into(),
+            call_key: (0u8..32).collect(),
+            ssrc: SSRC,
+            audio: wacore::voip::AudioConfig::MLOW_PCM,
+            relay_token: vec![0xAB; 16],
+            relay_ip: relay_addr.ip().to_string(),
+            relay_port: relay_addr.port(),
+            integrity_key: b"relay-key".to_vec(),
+            warp_mi_tag_len: 4,
+            enable_media: true,
+            enable_video: false,
+            enable_sframe: false,
+        }
     }
 
     /// One mirrored-peer MLow tone frame, SRTP-protected so the engine's `unprotect_audio` (its recv
