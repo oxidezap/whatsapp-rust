@@ -358,11 +358,14 @@ jobs:
         crate: ${{ fromJSON(needs.feature-matrix-crates.outputs.crates) }}
     steps:
       - uses: actions/checkout@v6
-      - name: Reclaim unused Android SDK space
-        run: |
-          df -h /
-          sudo rm -rf --one-file-system /usr/local/lib/android
-          df -h /
+      # No Android SDK reclaim here, unlike the three jobs that build the whole
+      # workspace. A runner starts this leg with 87G free and one crate's
+      # `check` comes nowhere near it, so the `rm -rf` bought 10G nothing asked
+      # for at a price that ran from 18s to 188s per leg: on wacore-binary it
+      # was 188s of deleting against 13s of actual checking. That was one step
+      # when this was a single job, and splitting it per crate multiplied it by
+      # the number of published crates. The `df` closing the check step below is
+      # what keeps this claim answerable rather than asserted.
       # Pinned toolchain: .cargo/config.toml carries nightly-only rustflags
       # (-Zshare-generics) for this target, and this job does not clear them.
       - uses: dtolnay/rust-toolchain@master
@@ -392,7 +395,9 @@ jobs:
       # (wacore/test-util, for one), which would mask exactly the gaps this
       # job looks for.
       - name: Check each feature
-        run: cargo hack check --each-feature --no-dev-deps -p ${{ matrix.crate }}
+        run: |
+          cargo hack check --each-feature --no-dev-deps -p ${{ matrix.crate }}
+          df -h /
 
   test-stable:
     name: Test Stable (MSRV)
