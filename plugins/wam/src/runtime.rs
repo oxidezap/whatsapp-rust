@@ -226,6 +226,8 @@ pub struct WamStats {
 struct Shared {
     queue: VecDeque<PendingEvent>,
     stats: WamStats,
+    /// Losses the store caused that no buffer has carried a report for yet.
+    store_losses: u64,
 }
 
 /// The plugin's telemetry runtime.
@@ -319,6 +321,7 @@ impl WamRuntime {
                     store_is_durable: durable,
                     ..WamStats::default()
                 },
+                store_losses: 0,
             }),
         }
     }
@@ -409,7 +412,7 @@ impl WamRuntime {
         }));
     }
 
-    /// Report a loss the store caused, the way the official client does.
+    /// Note a loss the store caused, to be reported once a buffer can carry it.
     ///
     /// Its own field rather than the drop counter, because the two name
     /// different faults: a drop is this runtime abandoning a buffer it could
@@ -417,11 +420,24 @@ impl WamRuntime {
     /// sequence number it needs. Queued rather than only counted locally, so the
     /// telemetry that eventually uploads says why the gap in it is there; the
     /// report rides a later buffer, which is the only kind that can carry it.
-    fn report_store_error(&self) {
-        self.observe(PendingEvent::WamClientErrors(events::WamClientErrors {
-            wam_client_buffer_store_error_count: Some(1),
-            ..Default::default()
-        }));
+    fn note_store_loss(&self) {
+        let mut shared = self.lock();
+        shared.store_losses = shared.store_losses.saturating_add(1);
+    }
+
+    /// The losses noted since the last report, as the event that carries them.
+    ///
+    /// `None` when there are none. Counted rather than queued so a store that
+    /// keeps failing reports what it lost once it can, instead of one report per
+    /// tick describing the attempt to report the last one.
+    fn take_store_losses(&self) -> Option<PendingEvent> {
+        let count = std::mem::take(&mut self.lock().store_losses);
+        i64::try_from(count).ok().filter(|n| *n > 0).map(|count| {
+            PendingEvent::WamClientErrors(events::WamClientErrors {
+                wam_client_buffer_store_error_count: Some(count),
+                ..Default::default()
+            })
+        })
     }
 
     /// Write the queued events into a buffer and upload it when it is due.
@@ -484,7 +500,7 @@ impl WamRuntime {
                         // failure would point whoever reads the counter at the
                         // wrong thing.
                         if reason == NoBuffer::Store {
-                            self.report_store_error();
+                            self.note_store_loss();
                         }
                         continue;
                     }
@@ -493,6 +509,17 @@ impl WamRuntime {
             let Some(buffer) = writer.current.as_mut() else {
                 continue;
             };
+            // A buffer exists, so the losses noted while none could be started
+            // have somewhere to go. Written here rather than queued when they
+            // happen: a queued report is itself an event that needs a buffer,
+            // so a store that keeps failing would drop each report and note a
+            // fresh loss for it, reporting its own retries as losses forever.
+            if let Some(report) = self.take_store_losses() {
+                let weight = report.weight();
+                if report.write_into(buffer, now_secs, weight) {
+                    self.lock().stats.written += 1;
+                }
+            }
             if event.write_into(buffer, now_secs, weight) {
                 self.lock().stats.written += 1;
             }
@@ -675,7 +702,7 @@ impl WamRuntime {
             Err(err) => {
                 warn!("wam: cannot retain a buffer without reading the retained set: {err}");
                 self.lock().stats.discarded += 1;
-                self.report_store_error();
+                self.note_store_loss();
                 return;
             }
         };
@@ -696,7 +723,7 @@ impl WamRuntime {
         let Some(key) = next_key(&pending) else {
             warn!("wam: no free key is left in the retained set, dropping a buffer");
             self.lock().stats.discarded += 1;
-            self.report_store_error();
+            self.note_store_loss();
             return;
         };
         if let Err(err) = self
@@ -710,7 +737,7 @@ impl WamRuntime {
         {
             warn!("wam: could not retain a buffer: {err}");
             self.lock().stats.discarded += 1;
-            self.report_store_error();
+            self.note_store_loss();
         }
     }
 
@@ -1598,8 +1625,13 @@ mod tests {
     /// A loss the store caused is not a loss this runtime chose. The catalog
     /// has a field for each, and only the local counter used to move, so the
     /// telemetry that eventually uploaded never said why it had a gap.
+    ///
+    /// Counted while it cannot be reported and written once it can: queueing
+    /// the report instead would make it an event that itself needs a buffer,
+    /// and a store that keeps failing would drop each one and note a fresh loss
+    /// for it, reporting its own retries forever.
     #[tokio::test]
-    async fn a_store_that_loses_a_buffer_says_so_in_the_telemetry() {
+    async fn a_store_that_loses_a_buffer_reports_it_once_a_buffer_can_carry_it() {
         let store = Arc::new(BlindStore::new());
         let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
         let mut writer = WamWriter::default();
@@ -1615,21 +1647,59 @@ mod tests {
                 TickKind::Final,
             )
             .await;
-
         assert_eq!(runtime.stats().discarded, 1);
-        let reported = runtime.queued();
-        assert_eq!(reported.len(), 1, "the loss is queued for a later buffer");
-        let PendingEvent::WamClientErrors(report) = &reported[0] else {
-            panic!(
-                "a store loss is reported as a client error, got {:?}",
-                reported[0]
-            );
-        };
-        assert_eq!(report.wam_client_buffer_store_error_count, Some(1));
-        assert_eq!(
-            report.wam_client_buffer_drop_error_count, None,
-            "the store refusing to hold a buffer is not this runtime dropping one"
+        assert!(
+            runtime.queued().is_empty(),
+            "the report is not itself an event waiting for a buffer"
         );
+
+        // Once the store answers, the next buffer carries the report.
+        store.see_again();
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000 + ROTATE_INTERVAL_SECS,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
+            .await;
+        assert_eq!(
+            runtime.stats().written,
+            3,
+            "the receipt from each tick, plus one report for the loss"
+        );
+    }
+
+    /// A store that will not issue a sequence number costs every event it is
+    /// handed. What it must not cost is a report per tick describing the last
+    /// failed report: nothing is queued, so an idle tick notes nothing.
+    #[tokio::test]
+    async fn a_sequence_outage_does_not_report_its_own_retries() {
+        let runtime = WamRuntime::new(WamIdentity::web(), Arc::new(SequencelessStore), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([]);
+
+        runtime.observe(receipt());
+        for tick in 0..4 {
+            runtime
+                .tick(
+                    &mut writer,
+                    &uploader,
+                    1_755_000_000 + tick,
+                    &mut keep_all(),
+                    TickKind::Scheduled,
+                )
+                .await;
+        }
+
+        assert_eq!(
+            runtime.stats().unbuffered,
+            1,
+            "one event was lost, and the three idle ticks after it lost nothing"
+        );
+        assert!(runtime.queued().is_empty());
     }
 
     #[tokio::test]

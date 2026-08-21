@@ -69,7 +69,7 @@ pub mod store;
 #[cfg(test)]
 mod parity;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use log::warn;
@@ -147,15 +147,9 @@ impl WamApi {
 pub struct WamPlugin {
     config: WamConfig,
     runtime: OnceLock<Arc<WamRuntime>>,
-    /// Kept so the shutdown flush can send through the same capability the flush
-    /// loop uses, rather than opening a second path to the server.
+    /// Held so the API can be built before the loop that uses it, and so both
+    /// go through one path to the server rather than two.
     uploader: OnceLock<Arc<IqUploader>>,
-    /// Where the flush loop leaves its buffers when it stops.
-    ///
-    /// `None` until the loop parks them, and `None` again once the shutdown
-    /// flush has taken them, so neither can run a second writer against the same
-    /// store no matter how the two are ordered.
-    parked_writer: Arc<Mutex<Option<WamWriter>>>,
 }
 
 impl WamPlugin {
@@ -164,7 +158,6 @@ impl WamPlugin {
             config,
             runtime: OnceLock::new(),
             uploader: OnceLock::new(),
-            parked_writer: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -287,7 +280,7 @@ impl ClientPlugin for WamPlugin {
 
             let subscription =
                 core_events.subscribe(WAM_INTEREST, Arc::new(WamEventHandler(runtime.clone())))?;
-            spawn_flush_loop(tasks, uploader, runtime.clone(), self.parked_writer.clone())?;
+            spawn_flush_loop(tasks, uploader, runtime.clone())?;
             Ok(Arc::new(WamApi {
                 runtime,
                 _core_events: subscription,
@@ -295,65 +288,16 @@ impl ClientPlugin for WamPlugin {
         })
     }
 
-    /// Flush what is still queued, best effort, inside the deadline the host
-    /// already applies to this callback.
+    /// Nothing, and that is the whole of it.
     ///
-    /// Not a new deadline and not a guarantee: the host bounds every shutdown
-    /// callback, and an upload that does not finish inside that bound leaves the
-    /// buffer retained rather than delaying the teardown. With the in-memory
-    /// store that means the last buffer is lost, which is what an in-memory
-    /// store is; with a durable one the next run sends it.
-    ///
-    /// The host drains a plugin's tasks before it calls this, so nothing races
-    /// for the flush loop's buffers. It may have been cancelled before parking
-    /// them, in which case this starts a fresh writer and flushes the queue,
-    /// which is the state worth saving.
+    /// The last flush belongs to the flush loop, which makes it when its own
+    /// cancellation ends the loop, before this runs. Doing it here as well would
+    /// need a second `WamWriter` against the same store, and a cooperative task
+    /// may outlive the host's drain, so the two could be alive at once: both
+    /// would read the retained set and both would pick the same next key, which
+    /// is the overwrite `next_key` exists to prevent.
     fn shutdown(&self) -> PluginFuture<'_, Result<()>> {
-        Box::pin(async move {
-            let (Some(runtime), Some(uploader)) = (self.runtime.get(), self.uploader.get()) else {
-                return Ok(());
-            };
-            // A cancelled task drops its future, so the flush loop may never
-            // reach its parking step even on a clean shutdown. Losing the
-            // in-progress buffer with it is survivable; losing the queue is
-            // not, and a fresh writer flushes the queue either way. There is
-            // nothing to race: the host has already drained the task.
-            // Only the writer the loop handed over, never a fresh one. A
-            // cooperative task is not forcibly cancelled, so the host proceeds
-            // here once its drain deadline passes even if the loop is still
-            // inside a slow store call. Starting a second writer then would put
-            // two of them against one store, both reading the retained set and
-            // both picking the same next key, which is the overwrite `next_key`
-            // exists to avoid. An empty slot means the loop is still working and
-            // will park on its own; leaving it to do that loses nothing that a
-            // race would not have lost worse.
-            let Some(mut writer) = self
-                .parked_writer
-                .lock()
-                .map_err(|_| anyhow::anyhow!("the wam writer lock was poisoned"))?
-                .take()
-            else {
-                warn!("wam: the flush loop had not parked its writer, leaving the flush to it");
-                return Ok(());
-            };
-            // The official client's own answer to this instant. Observed before
-            // the flush so it rides the buffer it describes.
-            runtime.observe(PendingEvent::WebWamForceFlush(
-                events::WebWamForceFlush::default(),
-            ));
-            let now = whatsapp_rust::wacore::time::now_utc().timestamp();
-            let mut roll = rand::random::<f64>;
-            runtime
-                .tick(
-                    &mut writer,
-                    uploader.as_ref(),
-                    now,
-                    &mut roll,
-                    TickKind::Final,
-                )
-                .await;
-            Ok(())
-        })
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -367,16 +311,14 @@ fn spawn_flush_loop(
     tasks: PluginTasks,
     uploader: Arc<IqUploader>,
     runtime: Arc<WamRuntime>,
-    parked_writer: Arc<Mutex<Option<WamWriter>>>,
 ) -> Result<()> {
     let worker = tasks.clone();
     // Cooperative, not the default abort mode. An aborted task's future is
     // dropped where it is suspended, which for this loop is inside `sleep`,
-    // before it reaches the parking step below. The shutdown flush would then
-    // find no writer and start a fresh one, which saves the queue and loses the
-    // buffer already being filled: exactly what the flush exists to persist.
-    // Cooperative shutdown makes `sleep` return an error instead, so the loop
-    // leaves through its own bottom and hands the buffer over.
+    // before it reaches the final pass below, losing the buffer already being
+    // filled: exactly what that pass exists to persist. Cooperative shutdown
+    // makes `sleep` return an error instead, so the loop leaves through its own
+    // bottom.
     tasks.spawn_cooperative(async move {
         let mut writer = WamWriter::default();
         while worker.sleep(BUFFERING_INTERVAL).await.is_ok() {
@@ -392,12 +334,31 @@ fn spawn_flush_loop(
                 )
                 .await;
         }
-        // Parked for the shutdown flush, which is the only thing that runs after
-        // this loop. A poisoned lock means a panic already lost the buffers, so
-        // there is nothing left to hand over.
-        if let Ok(mut slot) = parked_writer.lock() {
-            *slot = Some(writer);
-        }
+        // The loop only ends when shutdown is signalled, so this is the last
+        // pass, and the worker makes it itself rather than handing the writer to
+        // the shutdown callback. Two reasons, and either alone would decide it:
+        // the callback runs after the host's task drain, which a cooperative
+        // task is allowed to outlive, so a writer handed over then has no
+        // consumer left; and one owner means there is never a second writer
+        // reading the same retained set and picking the same next key.
+        //
+        // Nothing new can arrive to be missed. The host closes a plugin's
+        // resources, subscriptions included, before it signals cancellation, so
+        // the queue this drains is the whole of what was observed.
+        runtime.observe(PendingEvent::WebWamForceFlush(
+            events::WebWamForceFlush::default(),
+        ));
+        let now = whatsapp_rust::wacore::time::now_utc().timestamp();
+        let mut roll = rand::random::<f64>;
+        runtime
+            .tick(
+                &mut writer,
+                uploader.as_ref(),
+                now,
+                &mut roll,
+                TickKind::Final,
+            )
+            .await;
     })?;
     Ok(())
 }
