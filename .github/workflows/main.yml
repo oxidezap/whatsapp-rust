@@ -145,16 +145,16 @@ jobs:
       - name: Build project
         run: cargo nextest run --profile ci --workspace --exclude e2e-tests --no-run
       - name: Run tests
-        run: cargo nextest run --profile ci --workspace --exclude e2e-tests
-      # Immediately after the run that produced it: the waproto steps below
-      # write the same path, and the workspace suite is the one whose cost this
-      # job exists to report.
+        env:
+          NEXTEST_PROFILE: ci
+          TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
+        run: scripts/ci/nextest_timed.sh workspace --workspace --exclude e2e-tests
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-timings-build-and-test
-          path: target/nextest/ci/junit.xml
+          path: ${{ runner.temp }}/test-timings
           retention-days: 14
           if-no-files-found: warn
       # nextest cannot run doctests (nextest-rs/nextest#16) and silently reports
@@ -190,13 +190,18 @@ jobs:
       # No doctest counterpart: the features only swap derives on generated
       # code, whose doc comments `Build & Test` already builds.
       - name: Test waproto serde representations
+        env:
+          NEXTEST_PROFILE: ci
+          TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
         run: |
-          mkdir -p "$RUNNER_TEMP/test-timings"
+          # Both representations run whichever one fails, and the job exits with
+          # the first failure rather than the last.
           status=0
           for feature in serde-enum-repr serde-snake-case; do
             echo "::group::$feature"
-            cargo nextest run --profile ci -p waproto --features "$feature" || status=$?
-            mv target/nextest/ci/junit.xml "$RUNNER_TEMP/test-timings/$feature.xml"
+            rc=0
+            scripts/ci/nextest_timed.sh "$feature" -p waproto --features "$feature" || rc=$?
+            if [ "$status" -eq 0 ]; then status="$rc"; fi
             echo "::endgroup::"
           done
           exit "$status"
@@ -256,20 +261,20 @@ jobs:
       # vector among them, but nothing executed them until a step actually
       # enabled `voip-mlow` and ran it. That is what this loop does.
       - name: Test (every shareable feature)
+        env:
+          NEXTEST_PROFILE: ci
+          TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
         run: |
-          mkdir -p "$RUNNER_TEMP/test-timings"
+          # Every package runs whichever one fails, and the job exits with the
+          # first failure rather than the last.
           status=0
           for package in wacore wacore-libsignal whatsapp-rust; do
             features="$(./scripts/ci/test_features.sh "$package")"
             echo "::group::$package [$features]"
-            # `|| status=$?` rather than letting `bash -e` end the loop: nextest
-            # writes the report whether the run passed or failed, and a failing
-            # package is exactly when its timings are worth having. Every package
-            # still runs, and the first failure is still the job's verdict.
-            cargo nextest run --profile ci -p "$package" --features "$features" --lib --tests \
-              || status=$?
-            # One report path per profile, so each pass overwrites the last.
-            mv target/nextest/ci/junit.xml "$RUNNER_TEMP/test-timings/$package.xml"
+            rc=0
+            scripts/ci/nextest_timed.sh "$package" \
+              -p "$package" --features "$features" --lib --tests || rc=$?
+            if [ "$status" -eq 0 ]; then status="$rc"; fi
             echo "::endgroup::"
           done
           exit "$status"
