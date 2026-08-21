@@ -3,9 +3,13 @@
 //! Provides type-safe message stanzas with JID-aware attributes.
 
 use crate::ProtocolNode;
-use wacore_binary::Jid;
+use wacore_binary::{CompactString, Jid};
 
 /// Typed 1-to-1 or generic message stanza with JID-safe attributes.
+///
+/// The text attributes are `CompactString`: a message id, a unix timestamp, a
+/// type and an addressing mode all fit in the 24 inline bytes, so parsing a
+/// stanza takes no heap allocation for them.
 ///
 /// Wire format:
 /// ```xml
@@ -24,15 +28,15 @@ pub struct MessageStanza {
 
     /// Message ID (required)
     #[attr(name = "id")]
-    pub id: String,
+    pub id: CompactString,
 
     /// Timestamp (required, seconds since epoch)
     #[attr(name = "t")]
-    pub timestamp: String,
+    pub timestamp: CompactString,
 
     /// Message type (default: "text")
     #[attr(name = "type", default = "text")]
-    pub msg_type: String,
+    pub msg_type: CompactString,
 
     /// Optional sender LID (JID)
     #[attr(name = "sender_lid", jid, optional)]
@@ -48,9 +52,9 @@ pub struct MessageStanza {
 
     /// Optional addressing mode (e.g., "lid")
     #[attr(name = "addressing_mode", optional)]
-    pub addressing_mode: Option<String>,
+    pub addressing_mode: Option<CompactString>,
 
     /// Optional push name of sender (server-injected on forwarded messages)
     #[attr(name = "notify", optional)]
-    pub notify: Option<String>,
+    pub notify: Option<CompactString>,
 }

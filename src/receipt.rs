@@ -600,9 +600,12 @@ impl Client {
         if let Some(part_node) = nr.get_optional_child("participants") {
             let (agg_msg_id, agg_key, users) =
                 wacore::stanza::receipt::parse_participants(part_node);
-            let fan_out_id = agg_msg_id
-                .clone()
-                .or_else(|| agg_key.clone())
+            // The event's `message_ids` are `String`, so the borrowed compact id
+            // is widened once here instead of cloning both candidates first.
+            let fan_out_id: String = agg_msg_id
+                .as_deref()
+                .or(agg_key.as_deref())
+                .map(String::from)
                 .unwrap_or_else(|| stanza_id.clone());
             debug!(
                 "Aggregated receipt from {}: stanza={stanza_id} \

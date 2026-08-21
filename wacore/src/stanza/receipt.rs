@@ -6,7 +6,7 @@
 use crate::types::message::{MessageCategory, MessageInfo};
 use crate::types::presence::ReceiptType;
 use wacore_binary::NodeRef;
-use wacore_binary::{Jid, JidExt as _, STATUS_BROADCAST_USER};
+use wacore_binary::{CompactString, Jid, JidExt as _, STATUS_BROADCAST_USER};
 
 /// Parsed `<user>` entry inside `<receipt><participants>`.
 ///
@@ -16,14 +16,18 @@ use wacore_binary::{Jid, JidExt as _, STATUS_BROADCAST_USER};
 ///
 /// `timestamp` is `None` when the `<user t>` attr is missing (malformed
 /// stanza). The handler falls back to the stanza-level `t` in that case.
+///
+/// The text fields are `CompactString`: a receipt type ("delivery", "read") and
+/// a username both fit in the 24 inline bytes, and a group receipt builds one
+/// of these per participant.
 #[derive(Debug, Clone)]
 pub struct ReceiptUser {
     pub jid: Jid,
     pub timestamp: Option<u64>,
     /// Per-user `type` attr (only on aggregated_by_message shape).
-    pub r#type: Option<String>,
+    pub r#type: Option<CompactString>,
     pub participant_pn: Option<Jid>,
-    pub participant_username: Option<String>,
+    pub participant_username: Option<CompactString>,
 }
 
 /// Parses `<participants>` child of `<receipt>`. Returns `(message_id, key, users)`.
@@ -31,10 +35,14 @@ pub struct ReceiptUser {
 /// (aggregated_by_message); `key` is the legacy aggregated_by_type identifier.
 pub fn parse_participants(
     node: &NodeRef<'_>,
-) -> (Option<String>, Option<String>, Vec<ReceiptUser>) {
+) -> (
+    Option<CompactString>,
+    Option<CompactString>,
+    Vec<ReceiptUser>,
+) {
     let mut attrs = node.attrs();
-    let message_id = attrs.optional_string("message_id").map(|s| s.into_owned());
-    let key = attrs.optional_string("key").map(|s| s.into_owned());
+    let message_id = attrs.optional_string("message_id").map(CompactString::from);
+    let key = attrs.optional_string("key").map(CompactString::from);
 
     let users = node
         .children()
@@ -46,11 +54,11 @@ pub fn parse_participants(
                     let mut a = c.attrs();
                     let jid = a.optional_jid("jid")?;
                     let timestamp = a.optional_u64("t");
-                    let r#type = a.optional_string("type").map(|s| s.into_owned());
+                    let r#type = a.optional_string("type").map(CompactString::from);
                     let participant_pn = a.optional_jid("participant_pn");
                     let participant_username = a
                         .optional_string("participant_username")
-                        .map(|s| s.into_owned());
+                        .map(CompactString::from);
                     Some(ReceiptUser {
                         jid,
                         timestamp,
