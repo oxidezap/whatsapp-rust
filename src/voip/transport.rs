@@ -376,6 +376,21 @@ impl RelayStack {
         self.pump(now)
     }
 
+    /// Reset the media stream the way a peer closing its DataChannel does, leaving the association
+    /// itself up. Test-only, because production hangs up by tearing the whole channel down -- but
+    /// the relay does exactly this at the end of a call, which is what the old stack saw as a read
+    /// of `Ok(0)`.
+    #[cfg(test)]
+    fn close_media_stream(&mut self, now: Instant) -> Result<(), StackError> {
+        if let Some((_, assoc)) = self.assoc.as_mut() {
+            assoc
+                .stream(MEDIA_STREAM_ID)
+                .and_then(|mut s| s.close())
+                .map_err(|e| StackError::Failed(format!("close media stream: {e}")))?;
+        }
+        self.pump(now)
+    }
+
     /// Tear the channel down politely: SHUTDOWN the association, then `close_notify` the DTLS
     /// channel. One flush, without waiting for the relay's SHUTDOWN-ACK -- the relay drops the flow
     /// on its own consent-freshness timer, and a teardown that waits on a peer that may already be
@@ -645,6 +660,10 @@ const RELAY_SCTP_MAX_MESSAGE: u32 = 65536;
 /// any one step: the driver reports the channel open only once every layer is up, so one deadline
 /// covers what is now several round trips.
 const RELAY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+/// How long one inbound STUN packet may hold the driver while the call is behind. Well under both
+/// retransmission timers this same task drives (DTLS re-flights at 1s, SCTP's RTO floor is 1s), so a
+/// consumer that stalls loses a STUN packet rather than the association.
+const RELAY_STUN_HOLD: std::time::Duration = std::time::Duration::from_millis(100);
 /// How long `disconnect` waits for the driver's polite close before abandoning it.
 const RELAY_DISCONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -851,10 +870,20 @@ async fn deliver(events: &async_channel::Sender<RelayTransportEvent>, packet: By
         // Media is loss tolerant, but STUN control is NOT: dropping a Binding Request means the
         // engine never replies Binding Success, so the relay's consent-freshness check fails and it
         // tears the call down (~4s) -- even though only media should be lossy. Under backpressure
-        // drop media, but preserve STUN with a blocking send (the call is draining, so it unblocks
-        // promptly; a closed channel means the call is gone).
+        // drop media, but wait for a slot for STUN.
+        //
+        // Bounded, and that bound is the whole reason this is not a plain `send().await`: the same
+        // task owns the DTLS and SCTP retransmission timers, so a call that stops draining would
+        // otherwise stall them here and take the association down -- turning a slow consumer into a
+        // dead one. Past the bound the STUN goes the way of the media.
         Err(async_channel::TrySendError::Full(event)) => {
-            kind != RelayPacketKind::Stun || events.send(event).await.is_ok()
+            if kind != RelayPacketKind::Stun {
+                return true;
+            }
+            match tokio::time::timeout(RELAY_STUN_HOLD, events.send(event)).await {
+                Ok(sent) => sent.is_ok(),
+                Err(_) => true,
+            }
         }
         Err(async_channel::TrySendError::Closed(_)) => false,
     }
@@ -944,6 +973,32 @@ mod tests {
         );
     }
 
+    // The STUN hold is bounded, and that bound is what keeps a stalled call from taking the
+    // association with it: the driver owns the DTLS and SCTP retransmission timers, so an unbounded
+    // wait here would stop them. Nobody ever drains this channel, so the send can only end by
+    // timing out -- and `deliver` must come back saying the driver should keep running.
+    #[tokio::test(start_paused = true)]
+    async fn deliver_bounds_how_long_stun_can_hold_the_driver() {
+        let (tx, _rx) = async_channel::bounded(1);
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2])).await);
+        let held = tokio::time::Instant::now();
+        // The outer bound is what makes an unbounded hold fail here rather than hang the suite.
+        let kept_going = tokio::time::timeout(
+            RELAY_STUN_HOLD * 50,
+            deliver(&tx, Bytes::from_static(&[0x00, 0x01, 5, 6])),
+        )
+        .await
+        .expect("the STUN hold must give up, or the driver's timers never run again");
+        assert!(
+            kept_going,
+            "a STUN packet that cannot be delivered is dropped, not a reason to stop the driver"
+        );
+        assert!(
+            held.elapsed() >= RELAY_STUN_HOLD,
+            "the STUN must be held for the bound before being given up on"
+        );
+    }
+
     // Under backpressure (a full event channel because the call is behind on media), delivery must
     // drop media but PRESERVE STUN control: a dropped Binding Request never gets a Binding Success,
     // so the relay's consent-freshness check fails and tears the call down. A cap-1 channel is
@@ -972,6 +1027,179 @@ mod tests {
             "the STUN must be preserved while the media behind the first was dropped, got {second:?}"
         );
         feed.await.unwrap();
+    }
+}
+
+/// The stack on its own, with no socket and no clock: two [`RelayStack`]s wired to each other in
+/// memory, datagrams handed across by the test. This is what sans-IO buys -- the handshakes, the
+/// media stream and its teardown are all reachable without a port, a timer or a task, so the paths
+/// a live relay only takes at the end of a call can be tested directly.
+#[cfg(test)]
+mod stack {
+    use super::*;
+
+    const CLIENT: &str = "127.0.0.1:5001";
+    const RELAY: &str = "127.0.0.1:5002";
+
+    /// What each half made of the datagrams it was handed. A test that only cares about one side
+    /// can read that field and drop the rest.
+    struct Exchanged {
+        at_relay: Result<(), StackError>,
+        at_client: Result<(), StackError>,
+    }
+
+    /// A pair mid-handshake, plus the instant they were built at.
+    struct Pair {
+        client: RelayStack,
+        relay: RelayStack,
+        now: Instant,
+    }
+
+    impl Pair {
+        fn new() -> Self {
+            let client_addr: SocketAddr = CLIENT.parse().unwrap();
+            let relay_addr: SocketAddr = RELAY.parse().unwrap();
+            let now = now();
+            Pair {
+                client: RelayStack::connect(client_addr, relay_addr, now).expect("client stack"),
+                relay: RelayStack::accept(relay_addr, client_addr).expect("relay stack"),
+                now,
+            }
+        }
+
+        /// Carry every queued datagram across, both ways, until neither side has anything to send.
+        /// The link is lossless and in order, so no timer ever has to fire for this to converge.
+        fn exchange(&mut self) -> Exchanged {
+            let mut out = Exchanged {
+                at_relay: Ok(()),
+                at_client: Ok(()),
+            };
+            for _ in 0..64 {
+                let mut moved = false;
+                while let Some(d) = self.client.poll_transmit() {
+                    moved = true;
+                    if out.at_relay.is_ok() {
+                        out.at_relay = self.relay.handle_datagram(self.now, &d);
+                    }
+                }
+                while let Some(d) = self.relay.poll_transmit() {
+                    moved = true;
+                    if out.at_client.is_ok() {
+                        out.at_client = self.client.handle_datagram(self.now, &d);
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+            out
+        }
+
+        /// Both halves open, which is the state a call starts from.
+        fn connected() -> Self {
+            let mut pair = Pair::new();
+            let exchanged = pair.exchange();
+            exchanged.at_relay.expect("relay accepted the handshake");
+            exchanged.at_client.expect("client completed the handshake");
+            assert!(pair.client.is_open() && pair.relay.is_open());
+            pair
+        }
+    }
+
+    /// DTLS, the SCTP association and the media stream all come up over a plain in-memory link, with
+    /// the dialling and accepting halves of the same type on either end.
+    #[test]
+    fn both_halves_reach_an_open_media_channel() {
+        let pair = Pair::connected();
+        assert!(pair.client.is_open(), "the dialling half must open");
+        assert!(pair.relay.is_open(), "the accepting half must open");
+    }
+
+    /// A message written on one side comes out the other, which is the whole job.
+    #[test]
+    fn media_crosses_the_open_channel() {
+        let mut pair = Pair::connected();
+        pair.client
+            .write_media(pair.now, &Bytes::from_static(b"hello relay"))
+            .expect("client write");
+        pair.exchange();
+        assert_eq!(
+            pair.relay.poll_inbound().as_deref(),
+            Some(&b"hello relay"[..])
+        );
+    }
+
+    /// The relay ends a call by resetting the media stream while the association stays up. The old
+    /// DataChannel read pump saw that as `Ok(0)` and reported `Closed`; this asserts the sans-IO
+    /// stack still ends the channel rather than parking on a live association nothing arrives on.
+    #[test]
+    fn a_peer_stream_reset_closes_the_channel() {
+        let mut pair = Pair::connected();
+        pair.relay
+            .close_media_stream(pair.now)
+            .expect("relay resets its media stream");
+        let Err(e) = pair.exchange().at_client else {
+            panic!("the client must not keep the channel open after the peer reset the stream");
+        };
+        assert!(
+            matches!(
+                RelayDisconnectReason::from(e),
+                RelayDisconnectReason::Closed
+            ),
+            "a peer reset is the peer hanging up, not a transport error"
+        );
+        assert!(!pair.client.is_open());
+    }
+
+    /// A relay that hangs up properly (SCTP SHUTDOWN, then DTLS close_notify) is reported as a clean
+    /// close, not as a read error the call would surface as a failure.
+    #[test]
+    fn a_peer_close_is_reported_as_closed() {
+        let mut pair = Pair::connected();
+        pair.relay.close(pair.now);
+        let Err(e) = pair.exchange().at_client else {
+            panic!("the client must notice the relay closing the channel");
+        };
+        assert!(matches!(
+            RelayDisconnectReason::from(e),
+            RelayDisconnectReason::Closed
+        ));
+    }
+
+    /// Garbage on the wire is one lost datagram, not a lost call: the socket is connected to the
+    /// relay, so a record that fails to authenticate means corruption on the path. Once the
+    /// association exists the stack drops it and keeps going.
+    #[test]
+    fn a_corrupt_datagram_after_the_handshake_is_dropped_not_fatal() {
+        let mut pair = Pair::connected();
+        pair.client
+            .handle_datagram(pair.now, &[0xFFu8; 48])
+            .expect("a corrupt record must not end the channel");
+        assert!(pair.client.is_open());
+
+        // ... and the channel still carries media afterwards.
+        pair.relay
+            .write_media(pair.now, &Bytes::from_static(b"still here"))
+            .expect("relay write");
+        pair.exchange();
+        assert_eq!(
+            pair.client.poll_inbound().as_deref(),
+            Some(&b"still here"[..])
+        );
+    }
+
+    /// The same garbage before the handshake finishes is the handshake failing. There is nothing
+    /// else those datagrams could have been, so the caller finds out now instead of waiting out
+    /// `RELAY_CONNECT_TIMEOUT`.
+    #[test]
+    fn a_corrupt_datagram_during_the_handshake_is_fatal() {
+        let mut pair = Pair::new();
+        assert!(
+            pair.client
+                .handle_datagram(pair.now, &[0xFFu8; 48])
+                .is_err(),
+            "a handshake that cannot proceed must fail rather than wait"
+        );
     }
 }
 
@@ -1253,6 +1481,11 @@ mod relay_failures {
     /// A relay that goes away after the channel opened must take the channel down with it. On a
     /// connected UDP socket the vanished peer surfaces as an ICMP-driven socket error, which the
     /// driver reports as `Disconnected` instead of leaving the call waiting on silence.
+    ///
+    /// This covers the socket-error path specifically, and so depends on the platform delivering
+    /// ICMP port-unreachable on loopback (Linux does; CI runs there). The relay hanging up properly
+    /// is the portable path and has its own test over the in-memory link, so a platform without
+    /// that ICMP behaviour still has the close path covered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_relay_that_disappears_disconnects_the_channel() {
         let body = async {
