@@ -430,8 +430,52 @@ impl TestClient {
         .await
     }
 
+    /// Assert that no event matching `forbidden` arrives before one matching
+    /// `barrier` does.
+    ///
+    /// The event channel is FIFO per client, so anything the client dispatched
+    /// before the barrier is already in it when the barrier is read: draining to
+    /// the barrier settles the absence as a fact. [`assert_no_event`](Self::assert_no_event) can only
+    /// report that a clock ran out first, which is the weaker claim, and the
+    /// forbidden event arriving just after the window makes it pass.
+    ///
+    /// Sound only where the two share an ordering: same chat (one lane serialises
+    /// it), or a forbidden event dispatched inline off the read loop ahead of a
+    /// barrier that goes through a lane. Across two chats the lanes run
+    /// concurrently and this proves nothing, so use [`assert_no_event`](Self::assert_no_event) there.
+    pub async fn assert_no_event_before<F, B>(
+        &mut self,
+        timeout_secs: u64,
+        mut forbidden: F,
+        mut barrier: B,
+        context: &str,
+    ) -> anyhow::Result<Arc<Event>>
+    where
+        F: FnMut(&Event) -> bool,
+        B: FnMut(&Event) -> bool,
+    {
+        let timeout = tokio::time::Duration::from_secs(timeout_secs);
+        tokio::time::timeout(timeout, async {
+            loop {
+                match self.event_rx.recv().await {
+                    Ok(event) if forbidden(&event) => {
+                        panic!("{context}: expected no event but got: {event:?}")
+                    }
+                    Ok(event) if barrier(&event) => return Ok(event),
+                    Ok(_) => continue,
+                    Err(e) => return Err(anyhow::anyhow!("Event channel closed: {e}")),
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("{context}: barrier never arrived in {timeout_secs}s"))?
+    }
+
     /// Assert that NO event matching the predicate arrives within the timeout.
     /// Returns Ok(()) if the wait times out (expected), panics if an event arrives.
+    ///
+    /// Prefer [`assert_no_event_before`](Self::assert_no_event_before) wherever the channel orders the two:
+    /// this one is only as strong as the window is generous.
     pub async fn assert_no_event<F>(
         &mut self,
         timeout_secs: u64,
@@ -512,6 +556,24 @@ impl TestClient {
 
             tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
         }
+    }
+
+    /// Take the client offline and keep it there until [`come_back_online`](Self::come_back_online).
+    ///
+    /// `reconnect()` opens the offline window on the library's own backoff
+    /// schedule, so a test that only needs to get a send in while the client is
+    /// down waits five seconds for a window that is still only probably long
+    /// enough. `pause()` makes the window a fact the test closes itself: nothing
+    /// reconnects until it says so, and it says so as soon as it is ready.
+    pub async fn go_offline(&mut self) -> anyhow::Result<()> {
+        self.client.pause().await;
+        self.wait_for_disconnected(5).await
+    }
+
+    /// Release [`go_offline`](Self::go_offline). The run loop owes no backoff for a window the
+    /// caller chose, so the offline drain starts as soon as the socket is back.
+    pub fn come_back_online(&self) {
+        self.client.resume();
     }
 
     /// Reconnect and wait for the Connected event.

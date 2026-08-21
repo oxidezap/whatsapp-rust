@@ -105,9 +105,8 @@ async fn test_delivery_receipt_offline_reconnect() -> anyhow::Result<()> {
 
     let jid_b = client_b.jid().await;
 
-    client_b.client.reconnect().await;
-    info!("B disconnected (will auto-reconnect)");
-    client_b.wait_for_disconnected(5).await?;
+    client_b.go_offline().await?;
+    info!("B is offline");
 
     let msg_id = client_a
         .client
@@ -133,6 +132,7 @@ async fn test_delivery_receipt_offline_reconnect() -> anyhow::Result<()> {
         .await?;
     info!("Confirmed: no early delivery receipt");
 
+    client_b.come_back_online();
     client_b.wait_for_text("Offline delivery test", 30).await?;
     info!("B received offline message after reconnect");
 
@@ -185,9 +185,8 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
         })
         .await;
 
-    client_a.client.reconnect().await;
-    info!("A disconnected (will auto-reconnect)");
-    client_a.wait_for_disconnected(5).await?;
+    client_a.go_offline().await?;
+    info!("A is offline");
 
     client_b
         .client
@@ -196,6 +195,7 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
     info!("B marked message as read (A is offline)");
 
     // A reconnects and gets the queued read receipt
+    client_a.come_back_online();
     client_a
         .wait_for_event(30, |e| {
             matches!(
@@ -224,8 +224,7 @@ async fn test_delivery_receipt_bidirectional_offline() -> anyhow::Result<()> {
 
     let jid_b = client_b.jid().await;
 
-    client_b.client.reconnect().await;
-    client_b.wait_for_disconnected(5).await?;
+    client_b.go_offline().await?;
     info!("B offline");
 
     let msg_id = client_a
@@ -235,15 +234,17 @@ async fn test_delivery_receipt_bidirectional_offline() -> anyhow::Result<()> {
         .message_id;
     info!("A sent to offline B: {msg_id}");
 
-    client_a.client.reconnect().await;
-    client_a.wait_for_disconnected(5).await?;
+    client_a.go_offline().await?;
     info!("A offline");
 
-    // B reconnects, receives message, sends delivery receipt (queued since A is offline)
+    // B comes back first, on purpose: the receipt A is owed is only queued once
+    // B has taken delivery, which the backoff schedule left to chance.
+    client_b.come_back_online();
     client_b.wait_for_text("Bidirectional test", 30).await?;
     info!("B received offline message");
 
     // A reconnects and gets queued delivery receipt
+    client_a.come_back_online();
     client_a
         .wait_for_event(30, |e| {
             matches!(

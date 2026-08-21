@@ -57,9 +57,8 @@ async fn test_bidirectional_offline_receipt() -> anyhow::Result<()> {
 
     info!("B={jid_b}");
 
-    client_b.client.reconnect().await;
-    info!("B disconnected");
-    client_b.wait_for_disconnected(5).await?;
+    client_b.go_offline().await?;
+    info!("B is offline");
 
     let text = "Bidirectional offline test";
     let msg_id = client_a
@@ -69,15 +68,16 @@ async fn test_bidirectional_offline_receipt() -> anyhow::Result<()> {
         .message_id;
     info!("A sent message to offline B: {msg_id}");
 
-    client_a.client.reconnect().await;
-    info!("A disconnected");
-    client_a.wait_for_disconnected(5).await?;
+    client_a.go_offline().await?;
+    info!("A is offline");
 
-    // B reconnects and receives the message
+    // B comes back first, on purpose: the receipt A is owed can only be queued
+    // once B has taken delivery, which the backoff schedule left to chance.
+    client_b.come_back_online();
     client_b.wait_for_text(text, 30).await?;
     info!("B received offline message");
 
-    // A reconnects and receives the deferred delivery receipt
+    client_a.come_back_online();
     client_a
         .wait_for_event(30, |e| {
             matches!(
@@ -108,9 +108,8 @@ async fn test_deferred_delivery_receipt_on_reconnect() -> anyhow::Result<()> {
 
     info!("B={jid_b}");
 
-    client_b.client.reconnect().await;
-    info!("B disconnected (will auto-reconnect)");
-    client_b.wait_for_disconnected(5).await?;
+    client_b.go_offline().await?;
+    info!("B is offline");
 
     let text = "Waiting for delivery receipt";
     let msg_id = client_a
@@ -120,7 +119,8 @@ async fn test_deferred_delivery_receipt_on_reconnect() -> anyhow::Result<()> {
         .message_id;
     info!("A sent message to offline B: {msg_id}");
 
-    // Timeout shorter than reconnect backoff so B is still offline during this window.
+    // B stays down for the whole window now, so this is a negative about a
+    // recipient that is provably offline rather than one that probably still is.
     client_a
         .assert_no_event(
             3,
@@ -138,6 +138,7 @@ async fn test_deferred_delivery_receipt_on_reconnect() -> anyhow::Result<()> {
     info!("Confirmed: no early delivery receipt");
 
     // B reconnects and receives the message
+    client_b.come_back_online();
     client_b.wait_for_text(text, 30).await?;
     info!("B received the offline message after reconnect");
 
@@ -181,9 +182,8 @@ async fn test_offline_presence_coalescing() -> anyhow::Result<()> {
         .await?;
     info!("B received initial presence");
 
-    client_b.client.reconnect().await;
-    info!("B disconnected (will auto-reconnect)");
-    client_b.wait_for_disconnected(5).await?;
+    client_b.go_offline().await?;
+    info!("B is offline");
 
     // A changes presence multiple times while B is offline. Both stanzas go out
     // over A's single socket, so the server already sees them in send order —
@@ -195,6 +195,7 @@ async fn test_offline_presence_coalescing() -> anyhow::Result<()> {
     info!("A set available again");
 
     // B reconnects — coalescing means only the latest state arrives, not all 3
+    client_b.come_back_online();
     let presence_event = client_b
         .wait_for_event(30, |e| matches!(e, Event::Presence(_)))
         .await?;

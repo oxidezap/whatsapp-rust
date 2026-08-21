@@ -11,10 +11,8 @@ async fn test_offline_message_delivery_on_reconnect() -> anyhow::Result<()> {
     let jid_b = client_b.jid().await;
     info!("Client B JID: {jid_b}");
 
-    // Triggers auto-reconnect
-    client_b.client.reconnect().await;
-    info!("Client B connection dropped, will auto-reconnect");
-    client_b.wait_for_disconnected(5).await?;
+    client_b.go_offline().await?;
+    info!("Client B is offline until this test says otherwise");
 
     let text = "Hello from offline queue!";
     let msg_id = client_a
@@ -22,9 +20,10 @@ async fn test_offline_message_delivery_on_reconnect() -> anyhow::Result<()> {
         .send_message(jid_b.clone(), text_msg(text))
         .await?
         .message_id;
-    info!("Client A sent message to reconnecting B: {msg_id}");
+    info!("Client A sent message to offline B: {msg_id}");
 
     // Message should arrive from the offline queue after reconnect
+    client_b.come_back_online();
     client_b.wait_for_text(text, 30).await?;
     info!("Client B received offline message after reconnect");
 
@@ -43,8 +42,7 @@ async fn test_offline_message_ordering() -> anyhow::Result<()> {
 
     let jid_b = client_b.jid().await;
 
-    client_b.client.reconnect().await;
-    client_b.wait_for_disconnected(5).await?;
+    client_b.go_offline().await?;
 
     let messages = vec!["first", "second", "third"];
     for text in &messages {
@@ -54,6 +52,7 @@ async fn test_offline_message_ordering() -> anyhow::Result<()> {
             .await?;
         info!("Sent: {text}");
     }
+    client_b.come_back_online();
 
     // Verify messages arrive in send order. During offline drain a single
     // event can carry several messages, so iterate each batch.

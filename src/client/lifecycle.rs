@@ -1306,7 +1306,14 @@ impl Client {
     ///
     /// `fibonacci_backoff(RECONNECT_BACKOFF_STEP)` determines the delay before
     /// the run loop re-connects.  This must be longer than the mock server's
-    /// chatstate TTL (`CHATSTATE_TTL_SECS=3`) so TTL-expiry tests pass.
+    /// chatstate TTL (`CHATSTATE_TTL_SECS=3`) so the TTL-expiry test passes.
+    ///
+    /// Only that one test needs a *timed* window. Everything else that wants the
+    /// client offline while it does something uses [`pause`](Self::pause) and
+    /// [`resume`](Self::resume), which make the window a fact the caller closes
+    /// rather than a delay it hopes is long enough. That is also the answer for
+    /// an embedder that wants a different offline window: this constant is not
+    /// it, and nothing here takes one per call.
     ///
     /// Sequence: fib(0)=1s, fib(1)=1s, fib(2)=2s, fib(3)=3s, **fib(4)=5s**.
     pub const RECONNECT_BACKOFF_STEP: u32 = 4;
