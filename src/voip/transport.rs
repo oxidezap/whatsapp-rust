@@ -816,11 +816,15 @@ async fn relay_driver(
             let _ = events.try_send(RelayTransportEvent::Connected);
         }
         if hung_up {
-            let _ = events
-                .send(RelayTransportEvent::Disconnected(
-                    RelayDisconnectReason::Closed,
-                ))
-                .await;
+            // `try_send`, unlike the terminal send in `finish`, because this close was asked for
+            // locally: the call already knows, and by the time `disconnect` runs it has left its
+            // receive loop, so nothing is draining this channel. Awaiting a slot that only the
+            // departed reader could free would hang the driver until `disconnect` gave up on it --
+            // a two-second teardown stall, and only when the call was already behind enough to fill
+            // the queue.
+            let _ = events.try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ));
             return;
         }
 
@@ -1476,6 +1480,58 @@ mod relay_failures {
             "an endpoint that never completes the DTLS handshake must not yield a channel"
         );
         junk.abort();
+    }
+
+    /// Hanging up must not wait on a call that has stopped listening. `run_call` leaves its receive
+    /// loop before it calls `disconnect`, so once the event channel is full nothing will ever drain
+    /// it again -- and a driver that blocked delivering its goodbye there would sit until
+    /// `RELAY_DISCONNECT_TIMEOUT` gave up on it. That stall would land exactly when the call was
+    /// already behind, which is the worst time to add two seconds to teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hanging_up_does_not_wait_on_a_backed_up_event_queue() {
+        let body = async {
+            let relay_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let relay_addr = relay_udp.local_addr().unwrap();
+            let relay_task = tokio::spawn(async move {
+                let mut peek = [0u8; RELAY_DATAGRAM_BUF];
+                let (_, client) = relay_udp.peek_from(&mut peek).await.unwrap();
+                relay_udp.connect(client).await.unwrap();
+                accept_relay(relay_udp).await
+            });
+
+            let (chan, events) =
+                connect_relay_media(relay_addr, Arc::new(crate::runtime_impl::TokioRuntime))
+                    .await
+                    .expect("relay media connect");
+            let relay = relay_task.await.unwrap();
+
+            // Back the call up without reading a single event: media past the cap is dropped, so the
+            // queue fills to exactly `RELAY_EVENT_CAP` and stays there. Non-STUN payloads, so
+            // delivery never takes the STUN hold.
+            while events.len() < RELAY_EVENT_CAP {
+                relay
+                    .outbound
+                    .send(Bytes::from_static(&[0x90, 0x78, 7, 7]))
+                    .await
+                    .expect("relay writes into the open channel");
+                tokio::task::yield_now().await;
+            }
+
+            let hang_up = tokio::time::Instant::now();
+            chan.disconnect().await;
+            let took = hang_up.elapsed();
+            assert!(
+                took < RELAY_DISCONNECT_TIMEOUT / 2,
+                "hanging up took {took:?}, so the driver blocked on the full event queue instead of \
+                 ending; the bound is {RELAY_DISCONNECT_TIMEOUT:?}"
+            );
+
+            relay.driver.abort();
+        };
+
+        tokio::time::timeout(Duration::from_secs(30), body)
+            .await
+            .expect("the hang-up round-trip must complete within the bound");
     }
 
     /// A relay that goes away after the channel opened must take the channel down with it. On a
