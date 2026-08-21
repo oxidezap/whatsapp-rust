@@ -410,6 +410,20 @@ fn refuses_this_buffer(err: &whatsapp_rust::PluginIqError) -> bool {
     (400..500).contains(code)
 }
 
+/// The delay the server asked for, when its error stanza named one.
+///
+/// The core parses the `backoff` attribute and hands it over; dropping it here
+/// would leave the local curve guessing at a number the server had already
+/// given, and its first step is one second.
+fn server_directed_backoff(err: &whatsapp_rust::PluginIqError) -> Option<u32> {
+    match err {
+        whatsapp_rust::PluginIqError::Iq(whatsapp_rust::IqError::ServerError {
+            backoff, ..
+        }) => *backoff,
+        _ => None,
+    }
+}
+
 /// Uploads through the plugin's IQ capability.
 struct IqUploader(PluginIq);
 
@@ -424,7 +438,10 @@ impl WamUploader for IqUploader {
                 Err(if refuses_this_buffer(&err) {
                     UploadFailure::Permanent(message)
                 } else {
-                    UploadFailure::Retryable(message)
+                    UploadFailure::Retryable {
+                        message,
+                        retry_after_secs: server_directed_backoff(&err),
+                    }
                 })
             }
         }

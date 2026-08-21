@@ -147,15 +147,36 @@ impl PendingEvent {
 pub enum UploadFailure {
     /// The server or the transport may succeed on a retry: a timeout, a lost
     /// connection, a 5xx.
-    Retryable(String),
+    Retryable {
+        message: String,
+        /// Seconds the server itself asked us to wait, from the `backoff`
+        /// attribute of its error stanza, when it named one.
+        ///
+        /// Carried rather than folded into the message because it is the one
+        /// part of a rejection that is an instruction. The local backoff is a
+        /// guess about a server that stopped answering; this is that server
+        /// telling us when to come back, and coming back earlier is how a
+        /// throttle turns into a longer throttle.
+        retry_after_secs: Option<u32>,
+    },
     /// The server refused this buffer and will refuse it again.
     Permanent(String),
+}
+
+impl UploadFailure {
+    /// A retryable failure carrying no server-directed delay.
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self::Retryable {
+            message: message.into(),
+            retry_after_secs: None,
+        }
+    }
 }
 
 impl std::fmt::Display for UploadFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Retryable(m) | Self::Permanent(m) => f.write_str(m),
+            Self::Retryable { message: m, .. } | Self::Permanent(m) => f.write_str(m),
         }
     }
 }
@@ -563,7 +584,19 @@ impl WamRuntime {
             }
             Err(failure) => {
                 self.lock().stats.upload_failures += 1;
-                let wait = backoff(writer.consecutive_failures);
+                // The longer of the two, never the shorter. The local curve
+                // protects a server that stopped answering; a `backoff` the
+                // server named is that server saying when to come back, and
+                // asking before it said is how a throttle gets extended. Where
+                // our own curve has already grown past it, it stays: the server
+                // asked for a floor, not a ceiling.
+                let directed = match &failure {
+                    UploadFailure::Retryable {
+                        retry_after_secs, ..
+                    } => retry_after_secs.map(i64::from).unwrap_or(0),
+                    UploadFailure::Permanent(_) => 0,
+                };
+                let wait = backoff(writer.consecutive_failures).max(directed);
                 writer.consecutive_failures = writer.consecutive_failures.saturating_add(1);
                 writer.retry_after_secs = Some(now_secs.saturating_add(wait));
                 debug!("wam: upload failed, waiting {wait}s: {failure}");
@@ -607,9 +640,14 @@ impl WamRuntime {
         };
         let retained: usize = pending.iter().map(|b| b.bytes.len()).sum();
         if retained.saturating_add(bytes.len()) > MAX_BUFFER_SIZE {
-            for buffer in pending {
-                let _ = self.store.remove_pending(buffer.key).await;
-            }
+            // The newest buffer is the one that goes, and the set it did not fit
+            // into stays whole. Clearing the set instead would drop this buffer
+            // anyway and take the older ones with it, and it cannot be done
+            // safely from here: `remove_pending` is allowed to fail per key, so
+            // a delete that stopped halfway would leave an arbitrary subset for
+            // the next drain to upload with holes where the rest had been. The
+            // set is not stale either, since a buffer the server refuses for
+            // good is dropped at the point of refusal and never reaches it.
             self.lock().stats.discarded += 1;
             self.report_buffer_drop();
             return;
@@ -650,7 +688,15 @@ impl WamRuntime {
                 return Drained::WithoutReadingTheSet;
             }
         };
-        for buffer in pending {
+        // This uploader speaks the regular channel's `w:stats` path and nothing
+        // else. A store shared with a future private-channel writer, or carried
+        // across a version that had one, hands back buffers this cannot send:
+        // a private buffer needs its own token and its own endpoint. The field
+        // exists to be read, so read it and leave the rest to their owner.
+        for buffer in pending
+            .into_iter()
+            .filter(|buffer| buffer.channel == Channel::Regular)
+        {
             // Removed once the outcome is known, never before it. Removing first
             // would lose the buffer to a crash or a cancelled flush between the
             // delete and the answer, which is the one window a durable store
@@ -870,8 +916,7 @@ mod tests {
         let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
         let mut writer = WamWriter::default();
         // Two attempts fail, so the buffer is retained; the next tick delivers it.
-        let uploader =
-            ScriptedUploader::with([Err(UploadFailure::Retryable("503".into())), Ok(())]);
+        let uploader = ScriptedUploader::with([Err(UploadFailure::retryable("503")), Ok(())]);
         runtime.observe(receipt());
         runtime
             .tick(
@@ -921,7 +966,7 @@ mod tests {
         let store = Arc::new(InMemoryWamStore::new());
         let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
         let mut writer = WamWriter::default();
-        let uploader = ScriptedUploader::with([Err(UploadFailure::Retryable("503".into()))]);
+        let uploader = ScriptedUploader::with([Err(UploadFailure::retryable("503"))]);
 
         runtime.observe(receipt());
         runtime
@@ -963,8 +1008,8 @@ mod tests {
         let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
         let mut writer = WamWriter::default();
         let uploader = ScriptedUploader::with([
-            Err(UploadFailure::Retryable("503".into())),
-            Err(UploadFailure::Retryable("503".into())),
+            Err(UploadFailure::retryable("503")),
+            Err(UploadFailure::retryable("503")),
         ]);
 
         runtime.observe(receipt());
@@ -994,6 +1039,135 @@ mod tests {
             .await;
         assert_eq!(uploader.seen().len(), 2);
         assert_eq!(store.pending().await.expect("pending").len(), 2);
+    }
+
+    /// The local curve is a guess about a server that stopped answering. A
+    /// `backoff` the server named is that server saying when to come back, and
+    /// its first local step is one second, so dropping it asks again 29 seconds
+    /// early and extends the throttle that produced it.
+    #[tokio::test]
+    async fn a_server_directed_backoff_outlasts_the_local_one() {
+        let store = Arc::new(InMemoryWamStore::new());
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([
+            Err(UploadFailure::Retryable {
+                message: "rate-overlimit".into(),
+                retry_after_secs: Some(30),
+            }),
+            Ok(()),
+        ]);
+
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
+            .await;
+        assert_eq!(uploader.seen().len(), 1);
+
+        // A tick past the local step and short of what the server asked for
+        // does not ask again.
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000 + backoff(0) + 1,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
+            .await;
+        assert_eq!(uploader.seen().len(), 1, "the server named 30s, not 1s");
+
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000 + 30,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
+            .await;
+        assert_eq!(uploader.seen().len(), 2);
+        assert!(store.pending().await.expect("pending").is_empty());
+    }
+
+    /// The set the newest buffer did not fit into is not stale and is not this
+    /// function's to clear: `remove_pending` may fail per key, so a delete that
+    /// stopped halfway would leave a subset for the next drain to send with
+    /// holes where the rest had been.
+    #[tokio::test]
+    async fn a_buffer_past_the_retention_cap_does_not_take_the_set_with_it() {
+        let store = Arc::new(InMemoryWamStore::new());
+        store
+            .put_pending(PendingBuffer {
+                key: 1,
+                channel: Channel::Regular,
+                bytes: vec![b'x'; MAX_BUFFER_SIZE],
+            })
+            .await
+            .expect("seed a set already at the cap");
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([Err(UploadFailure::retryable("503"))]);
+
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Final,
+            )
+            .await;
+
+        let pending = store.pending().await.expect("pending");
+        assert_eq!(pending.len(), 1, "the older buffer is still there");
+        assert_eq!(pending[0].key, 1);
+        assert_eq!(runtime.stats().discarded, 1, "only the newest was dropped");
+    }
+
+    /// The store hands back every retained buffer and this uploader speaks one
+    /// channel. A private buffer needs its own token and endpoint, so sending
+    /// its bytes down `w:stats` would put it on the wrong path entirely.
+    #[tokio::test]
+    async fn a_retained_buffer_from_another_channel_is_left_for_its_owner() {
+        let store = Arc::new(InMemoryWamStore::new());
+        for (key, channel) in [(1, Channel::Private), (2, Channel::Regular)] {
+            store
+                .put_pending(PendingBuffer {
+                    key,
+                    channel,
+                    bytes: vec![b'W', b'A', b'M', 5, 1, 0, 0, key as u8],
+                })
+                .await
+                .expect("seed");
+        }
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([]);
+
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
+            .await;
+
+        let seen = uploader.seen();
+        assert_eq!(seen.len(), 1, "only the regular buffer was sent");
+        assert_eq!(seen[0][7], 2);
+        let pending = store.pending().await.expect("pending");
+        assert_eq!(pending.len(), 1, "the private one is still retained");
+        assert_eq!(pending[0].channel, Channel::Private);
     }
 
     #[tokio::test]
@@ -1031,7 +1205,7 @@ mod tests {
         let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
         let mut writer = WamWriter::default();
         let uploader = ScriptedUploader::with([
-            Err(UploadFailure::Retryable("timeout".into())),
+            Err(UploadFailure::retryable("timeout")),
             Err(UploadFailure::Permanent("400".into())),
         ]);
         runtime.observe(receipt());
@@ -1256,8 +1430,8 @@ mod tests {
         let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
         let mut writer = WamWriter::default();
         let uploader = ScriptedUploader::with([
-            Err(UploadFailure::Retryable("503".into())),
-            Err(UploadFailure::Retryable("503".into())),
+            Err(UploadFailure::retryable("503")),
+            Err(UploadFailure::retryable("503")),
         ]);
         runtime.observe(receipt());
         runtime
@@ -1404,7 +1578,7 @@ mod tests {
             .expect("seed");
         let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
         let mut writer = WamWriter::default();
-        let uploader = ScriptedUploader::with([Err(UploadFailure::Retryable("503".into()))]);
+        let uploader = ScriptedUploader::with([Err(UploadFailure::retryable("503"))]);
         runtime.observe(receipt());
         runtime
             .tick(
@@ -1525,7 +1699,7 @@ mod tests {
 
         // First tick: the server refuses. Nothing is removed, and the buffer
         // stays under the key it already had.
-        let refusing = ScriptedUploader::with([Err(UploadFailure::Retryable("503".into()))]);
+        let refusing = ScriptedUploader::with([Err(UploadFailure::retryable("503"))]);
         runtime
             .tick(
                 &mut writer,
