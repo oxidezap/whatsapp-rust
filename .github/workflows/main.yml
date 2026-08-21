@@ -130,8 +130,20 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
+      # nextest's own build, so `Run tests` below only runs. `cargo build
+      # --all-targets` shared nothing with it: cargo's unit hash carries the
+      # profile name, `dev` for one and `test` for the other, and `--all-targets`
+      # additionally pulls bench-integration and through it e2e-tests into the
+      # graph. This job compiled the workspace twice for that, ~220s of the ~350s
+      # that `Run tests` used to spend before its first test.
+      #
+      # What this no longer asserts is that every target links under the default
+      # feature set: benches and examples are not test targets, so nextest does
+      # not build them. `Clippy Linter` still compiles them on this same push, and
+      # `Build & Lint (all features)` still links them, with all features on
+      # rather than the default set. That is the one seam left, and it is narrow.
       - name: Build project
-        run: cargo build --workspace --exclude e2e-tests --all-targets --verbose
+        run: cargo nextest run --profile ci --workspace --exclude e2e-tests --no-run
       - name: Run tests
         run: cargo nextest run --profile ci --workspace --exclude e2e-tests
       # Immediately after the run that produced it: the waproto steps below
