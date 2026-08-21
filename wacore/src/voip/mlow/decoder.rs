@@ -1,5 +1,5 @@
-//! MLow top-level decoder: RED strip -> TOC routing -> active-frame decode (3 chained 20 ms internal
-//! frames: LSF -> pulses -> pitch/gains -> CELP synthesis) -> 60 ms PCM. The synthesis
+//! MLow top-level decoder: RED strip -> TOC routing -> active-frame decode (chained 20 ms internal
+//! frames: LSF -> pulses -> pitch/gains -> CELP synthesis) -> PCM. The synthesis
 //! (`smpl_celpdec`) runs the excitation in the codec's float domain (gen_noise + LPC synthesis). The
 //! cross-frame predictor and synthesis history persist across calls because the stream is
 //! continuous.
@@ -20,8 +20,33 @@ use super::toc::parse_mlow_toc;
 
 const OPUS_FRAME_SAMPS: usize = 960; // 60 ms @ 16 kHz
 
+/// Internal 20 ms frames chained inside one packet, or `None` for a duration this decoder cannot
+/// run. A packet is not a single unit of decode: the reference derives the loop count from the
+/// declared duration while the geometry inside each iteration stays fixed, so 20/60/120 ms differ
+/// only in how many times the same decode repeats.
+///
+/// 10 ms is the exception and stays unsupported: it halves the internal frame length and the
+/// subframe count, which the synthesis does not implement, and decoding it under the wrong geometry
+/// would consume the payload with the wrong symbol count and desync the range coder.
+fn internal_frames(frame_ms: i32) -> Option<usize> {
+    (frame_ms > 10).then(|| ((frame_ms + 10) / 20) as usize)
+}
+
+/// Does a decode that ended after `consumed` bytes of a `storage`-byte body land where a valid
+/// stream can end? Under-running is always malformed; the upper slack absorbs the range coder's
+/// final carry bytes, which the encoder does not emit.
+///
+/// The bound is four, taken from the shipped decoder rather than from the C fork: `WhatsAppNative.dll`
+/// @ `0x180337e30` does `add r8d, 0x4` before its second compare, while the fork's
+/// `smpl_check_end_result` allows only `+2`. Two is the stricter of the pair, so it would conceal
+/// frames the official client plays — a false report of corruption, silencing audio that is fine.
+fn endpoint_is_valid(storage: u32, consumed: u32) -> bool {
+    storage <= consumed && consumed <= storage + 4
+}
+
 /// Stateful pure-Rust MLow decoder. Decodes one RTP payload (a bare MLow frame, or a SplitRed
-/// packet when redundancy was negotiated) into a 60 ms / 960-sample PCM frame at 16 kHz.
+/// packet when redundancy was negotiated) into a PCM frame at 16 kHz, one 20 ms internal frame
+/// per chained frame in the packet.
 pub struct MlowDecoder {
     state: SmplDecoderState,
     redundancy: i32,
@@ -31,11 +56,18 @@ pub struct MlowDecoder {
     /// never gates output.
     had_error: bool,
     /// Count of inbound frames dropped because they fall outside this decoder's single operating point
-    /// (16kHz wideband, low_rate=0, 60ms). Such a frame would desync the range coder if decoded, so it
-    /// is dropped (treated as a lost frame). The count drives a once + every-100th `warn` (which names
-    /// the offending dimension) so a live capture reveals whether real peers emit these (decides the
-    /// follow-ups).
+    /// (16kHz wideband, low_rate=0, and a duration whose internal geometry it implements). Such a
+    /// frame would desync the range coder if decoded, so it is dropped (treated as a lost frame). The
+    /// count drives a once + every-100th `warn` naming the offending dimension.
     dropped_unsupported: u32,
+    /// Frames concealed because the decode did not end where the body said it should. Drives a
+    /// once + every-100th `warn`, so a peer sending a stream this decoder cannot read is visible in
+    /// a log rather than silently quiet.
+    malformed: u32,
+    /// Samples the last packet DECLARED, from its TOC, which is not always what `decode` returned:
+    /// a SID, a drop or a standard-Opus escape emits a fixed slot regardless of duration. Consumers
+    /// sizing a jitter cushion need the declared value, since that is what sets arrival cadence.
+    last_packet_samps: usize,
 }
 
 impl Default for MlowDecoder {
@@ -51,6 +83,8 @@ impl MlowDecoder {
             redundancy: 0,
             had_error: false,
             dropped_unsupported: 0,
+            malformed: 0,
+            last_packet_samps: OPUS_FRAME_SAMPS,
         }
     }
 
@@ -60,6 +94,12 @@ impl MlowDecoder {
     #[cfg(test)]
     pub(crate) fn had_error(&self) -> bool {
         self.had_error
+    }
+
+    /// Samples in the most recent packet as its TOC declared them, independent of what `decode`
+    /// emitted for it. Starts at a 60 ms packet.
+    pub fn last_packet_samps(&self) -> usize {
+        self.last_packet_samps
     }
 
     /// Set the negotiated RED redundancy level (0 = bare frames, the common case).
@@ -73,7 +113,8 @@ impl MlowDecoder {
         self.had_error = false;
     }
 
-    /// Decode one RTP MLow payload into a 60 ms (960-sample) PCM frame, float in [-1, 1].
+    /// Decode one RTP MLow payload into a PCM frame, float in [-1, 1]. The sample count follows
+    /// the packet's declared duration; a dropped or silenced frame yields a 60 ms slot.
     pub fn decode(&mut self, payload: &[u8]) -> Vec<f32> {
         if payload.is_empty() {
             return vec![0.0; OPUS_FRAME_SAMPS];
@@ -100,6 +141,9 @@ impl MlowDecoder {
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         let toc = parse_mlow_toc(frame[0]);
+        if toc.frame_ms > 0 && toc.sample_rate > 0 {
+            self.last_packet_samps = (toc.sample_rate / 1000 * toc.frame_ms) as usize;
+        }
         if toc.std_opus {
             let out_len = (16000 / 1000 * toc.frame_ms) as usize;
             log::debug!(
@@ -108,27 +152,29 @@ impl MlowDecoder {
             );
             return vec![0.0; out_len];
         }
-        // Inactive / SID (DTX/CNG) frames carry no decodable voice and are silenced without opening the
-        // range coder, so their geometry can never desync. Handle them before the operating-point guard:
-        // otherwise an inactive off-point frame (e.g. the 10ms startup silence a real peer emits before
-        // speech) would trip the loud "dropped" canary instead of being the benign silence it is. A full
-        // 60ms slot keeps the playout cadence regardless of the frame's nominal duration.
-        if toc.sid || !toc.active {
-            log::debug!("mlow: DTX/SID TOC 0x{:02x} -> 60ms silence", frame[0]);
+        // A SID (DTX/CNG) frame carries comfort noise rather than coded voice and is silenced without
+        // opening the range coder, so its geometry can never desync. Handle it before the
+        // operating-point guard so an off-point SID is the benign silence it is rather than tripping
+        // the "dropped" canary. A full 60ms slot keeps the playout cadence regardless of the frame's
+        // nominal duration.
+        //
+        // A frame that is merely coded inactive is NOT silence: with DTX off the encoder keeps sending
+        // background noise this way, and the reference decodes it. It goes through the normal path.
+        if toc.sid {
+            log::debug!("mlow: SID TOC 0x{:02x} -> 60ms silence", frame[0]);
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
-        // Operating-point guard for active frames: an active frame at a different internal rate, the
-        // low_rate=1 2x160 geometry, or a non-60ms duration would desync the range coder, since
-        // decode_active_frame always runs the 3x20ms / 60ms geometry and would consume the payload with
-        // the wrong symbol count (garbage plus a poisoned cross-frame predictor that propagates to later
-        // packets). Drop it as a lost frame so the predictor holds its last good values. flag2 is the
-        // smpl TOC's low_rate bit; the warn names the offending dimension so a live capture shows whether
-        // real peers ever emit active out-of-point frames in 1:1 calls.
+        // Operating-point guard for active frames: a different internal rate, the low_rate=1 2x160
+        // geometry, or a duration whose internal geometry differs would consume the payload with the
+        // wrong symbol count and desync the range coder (garbage plus a poisoned cross-frame predictor
+        // that propagates to later packets). Drop those as lost frames so the predictor holds its last
+        // good values. flag2 is the smpl TOC's low_rate bit.
+        let frames = internal_frames(toc.frame_ms);
         let off_point = if toc.sample_rate != 16000 {
             Some(("rate", i64::from(toc.sample_rate / 1000)))
         } else if toc.flag2 {
             Some(("low_rate", 1))
-        } else if toc.frame_ms != 60 {
+        } else if frames.is_none() {
             Some(("frame_ms", i64::from(toc.frame_ms)))
         } else {
             None
@@ -138,17 +184,26 @@ impl MlowDecoder {
             if self.dropped_unsupported == 1 || self.dropped_unsupported.is_multiple_of(100) {
                 log::warn!(
                     "mlow: dropping out-of-operating-point frame #{} ({dim}={val}, TOC 0x{:02x}); \
-                     the 1:1 decoder is 16kHz / low_rate=0 / 60ms only",
+                     the decoder runs 16kHz / low_rate=0 / 20-120ms",
                     self.dropped_unsupported,
                     frame[0]
                 );
             }
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
-        self.decode_active_frame(frame, OPUS_FRAME_SAMPS)
+        let frames = frames.expect("the guard above rejected every unsupported duration");
+        self.decode_active_frame(frame, frames * SMPL_INTF_LEN, frames, toc.active)
     }
 
-    fn decode_active_frame(&mut self, frame: &[u8], out_len: usize) -> Vec<f32> {
+    /// `coded_as_active_voice` gates two symbols that a frame coded inactive never puts on the wire;
+    /// reading them would consume symbols that were never written and desync everything after.
+    fn decode_active_frame(
+        &mut self,
+        frame: &[u8],
+        out_len: usize,
+        frames: usize,
+        coded_as_active_voice: bool,
+    ) -> Vec<f32> {
         let config = (frame[0] >> 2) as usize & 1;
         let tbl = load_smpl_tables();
         let synth_t = load_smpl_synth_tables();
@@ -159,19 +214,34 @@ impl MlowDecoder {
         // The low_rate bit of the smpl TOC (this capture is low_rate==0; the synth gates on it).
         let low_rate = (frame[0] >> 2) & 1 != 0;
 
-        let mut out: Vec<f32> = Vec::with_capacity(3 * SMPL_INTF_LEN);
-        // Collect the per-40-block lags (8 per frame, 24 per packet) and the average normalized
-        // bitrate for the per-packet harmonic postfilter.
-        let mut packet_lags: Vec<f32> = Vec::with_capacity(3 * 8);
+        // The overrun that invalidates a body is only detectable after the last internal frame, by
+        // which point the loop has already advanced the LSF predictor, the CELP history and
+        // `prev_nlsf`. Keep a copy so concealment can undo them: parameters invented past the end of
+        // a bad body must not seed the next packet. The reference leaves them advanced, but it never
+        // meets a stream it cannot read; this decoder does, and the leak is audible in the frame
+        // after. The copy is a few KB once per packet, against 20-120 ms of audio.
+        let state_before = self.state.clone();
+
+        let mut out: Vec<f32> = Vec::with_capacity(frames * SMPL_INTF_LEN);
+        // Collect the per-40-block lags (8 per internal frame) and the average normalized bitrate
+        // for the per-packet harmonic postfilter.
+        let mut packet_lags: Vec<f32> = Vec::with_capacity(frames * 8);
         let mut avg_norm_br = 0.0f32;
-        for f in 0..3 {
-            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut self.state.lstate, config, f);
+        for f in 0..frames {
+            let lsf = decode_smpl_lsf(
+                &mut dec,
+                tbl,
+                &mut self.state.lstate,
+                config,
+                f,
+                coded_as_active_voice,
+            );
             let pulses = decode_smpl_pulses(
                 &mut dec,
                 cc,
                 SMPL_INTF_LEN as i32,
                 4,
-                1,
+                i32::from(coded_as_active_voice),
                 config as i32,
                 lsf.stage1,
             );
@@ -241,6 +311,36 @@ impl MlowDecoder {
             out.extend_from_slice(&sig);
         }
 
+        // Endpoint check, before the postfilter as in the reference: the range decoder returns zero
+        // past either end of its storage WITHOUT flagging it, so an impossible stream decodes into
+        // plausible-looking symbols and the synthesis can diverge to full scale. Comparing where the
+        // decode ended against what the body actually held is the only way to see it. Anything
+        // outside the accepted window is a malformed frame, concealed as a lost one rather than
+        // synthesized. State already advanced is left as-is, matching the reference, which also
+        // returns without rolling back.
+        let consumed_bytes = (dec.tell().max(0) as u32).div_ceil(8);
+        let body = dec.storage();
+        if !endpoint_is_valid(body, consumed_bytes) || dec.err != 0 {
+            // Sticky flag first: this branch swallows the range-decoder failure it is reporting, and
+            // `had_error` is what the suites read to see it.
+            if dec.err != 0 {
+                self.had_error = true;
+            }
+            self.state = state_before;
+            self.malformed += 1;
+            if self.malformed == 1 || self.malformed.is_multiple_of(100) {
+                log::warn!(
+                    "mlow: concealing malformed frame #{} (TOC 0x{:02x}: decode ended at {} bytes \
+                     of a {}-byte body)",
+                    self.malformed,
+                    frame[0],
+                    consumed_bytes,
+                    body
+                );
+            }
+            return vec![0.0; out_len];
+        }
+
         // Per-packet harmonic postfilter (the codec's final pitch comb + 48-sample group delay), run
         // once over the whole packet with the 24 per-40-block lags and the average normalized bitrate.
         let plen = out.len();
@@ -250,7 +350,7 @@ impl MlowDecoder {
             plen,
             &packet_lags,
             packet_lags.len(),
-            avg_norm_br / 3.0,
+            avg_norm_br / frames as f32,
         );
 
         // The C-domain synthesis output is already float in [-1, 1]; clamp in place.
@@ -309,7 +409,7 @@ pub(crate) fn diag_decode_params() -> Vec<DiagParam> {
         let config = (frame[0] >> 2) as usize & 1;
         let mut dec = RangeDecoder::new(&frame[1..]);
         for f in 0..3 {
-            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut lstate, config, f);
+            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut lstate, config, f, true);
             let pulses = decode_smpl_pulses(
                 &mut dec,
                 cc,
@@ -361,6 +461,318 @@ pub(crate) fn diag_decode_params() -> Vec<DiagParam> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loop count per packet duration, against the reference decoder's
+    /// `num_frames = (packet_len_ms + 10) / 20`. 10 ms is excluded because it also changes the
+    /// internal frame length and subframe count, which the synthesis does not implement.
+    #[test]
+    fn internal_frame_count_matches_the_reference_geometry() {
+        assert_eq!(internal_frames(20), Some(1));
+        assert_eq!(internal_frames(60), Some(3));
+        assert_eq!(internal_frames(120), Some(6));
+        assert_eq!(internal_frames(10), None);
+    }
+
+    /// WhatsApp Desktop sends 120 ms packets (TOC 0x58) on ordinary 1:1 calls. They must decode,
+    /// not be discarded: dropping them silences the whole stream while the peer is speaking.
+    #[test]
+    fn multi_frame_packet_decodes_to_its_full_duration() {
+        let toc = parse_mlow_toc(0x58);
+        assert_eq!(toc.frame_ms, 120, "0x58 declares a 120 ms packet");
+        assert!(toc.active && !toc.sid && !toc.std_opus);
+        assert_eq!(toc.sample_rate, 16000);
+        assert!(!toc.flag2, "0x58 is the supported rate mode");
+
+        let mut dec = MlowDecoder::new();
+        let out = dec.decode(&[0x58, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
+        assert_eq!(
+            out.len(),
+            6 * SMPL_INTF_LEN,
+            "a 120 ms packet must yield 120 ms of PCM"
+        );
+    }
+
+    /// A 20 ms packet shares the same internal geometry and must decode to exactly one frame.
+    #[test]
+    fn single_frame_packet_decodes_to_one_internal_frame() {
+        let mut dec = MlowDecoder::new();
+        let out = dec.decode(&[0x48, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(
+            out.len(),
+            SMPL_INTF_LEN,
+            "a 20 ms packet is one 20 ms frame"
+        );
+    }
+
+    /// The failure case the geometry guard exists for: 10 ms halves the internal frame length and
+    /// the subframe count, so it must still be dropped rather than decoded under the wrong geometry,
+    /// into the same 60 ms silence slot the other drops use.
+    #[test]
+    fn ten_ms_active_packet_is_still_dropped() {
+        let toc = parse_mlow_toc(0x40);
+        assert_eq!(toc.frame_ms, 10);
+        assert!(toc.active);
+
+        let mut dec = MlowDecoder::new();
+        let out = dec.decode(&[0x40, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(out.len(), OPUS_FRAME_SAMPS);
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "10 ms runs a geometry the synthesis does not implement"
+        );
+        assert!(!dec.had_error(), "the drop must not open the range decoder");
+    }
+
+    /// The playout cushion is sized from the peer's packet duration, and a SID must not shrink it:
+    /// a DTX transition returns a fixed 60 ms silence slot regardless of the duration the packet
+    /// declares, so reading the cushion off the OUTPUT length would drop buffered speech that had
+    /// not been played yet. The declared duration is the one that governs arrival cadence.
+    #[test]
+    fn declared_duration_survives_a_dtx_transition() {
+        let mut dec = MlowDecoder::new();
+        let _ = dec.decode(&[0x58, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
+        assert_eq!(dec.last_packet_samps(), 6 * SMPL_INTF_LEN);
+
+        // A SID that still declares 120 ms (0x98 = SID | 120 ms) emits a 60 ms silence slot.
+        let sid = dec.decode(&[0x98, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(sid.len(), OPUS_FRAME_SAMPS, "SID is a fixed silence slot");
+        assert_eq!(
+            dec.last_packet_samps(),
+            6 * SMPL_INTF_LEN,
+            "the peer is still on 120 ms packets; the cushion must not shrink"
+        );
+
+        // A peer that genuinely moves to 60 ms is learned.
+        let _ = dec.decode(&[0x50, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(dec.last_packet_samps(), 3 * SMPL_INTF_LEN);
+    }
+
+    /// A `VoA=00` packet is a normal frame carrying background noise, not a SID: the reference
+    /// decodes it, and with DTX off a peer sends nothing else during a pause. Silencing it drops
+    /// ~12% of a real stream on the floor while the call merely sounds quiet.
+    #[test]
+    fn dtx_off_frames_decode_to_audio() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/mlow_dtx_off_frames.json"))
+                .expect("mlow_dtx_off_frames.json");
+        let refp: Vec<f32> = include_bytes!("testdata/ref_dtx_off_expected.raw")
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+
+        let mut dec = MlowDecoder::new();
+        let mut out: Vec<f32> = Vec::new();
+        let mut spans = Vec::new();
+        for hex_frame in &frames {
+            let frame = hex::decode(hex_frame).unwrap();
+            let start = out.len();
+            out.extend_from_slice(&dec.decode(&frame));
+            // The frames this covers: not SID, VoA=0, hang-over clear, i.e. coded_as_active_voice
+            // == 0. `0x12` shares VoA=0 but sets the hang-over bit, which makes it active and
+            // already decoded, so it must not be counted here.
+            if frame[0] & 0xC2 == 0 {
+                spans.push((start, out.len()));
+            }
+        }
+        assert!(
+            !spans.is_empty(),
+            "fixture lost its DTX-off frames: this path is no longer covered"
+        );
+        assert_eq!(out.len(), refp.len());
+
+        let energy = |v: &[f32]| v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>();
+        let (mut e_ref, mut e_ours, mut n) = (0.0, 0.0, 0usize);
+        for (s, e) in &spans {
+            e_ref += energy(&refp[*s..*e]);
+            e_ours += energy(&out[*s..*e]);
+            n += e - s;
+        }
+        let (rms_ref, rms_ours) = ((e_ref / n as f64).sqrt(), (e_ours / n as f64).sqrt());
+        assert!(
+            rms_ref > 0.01,
+            "the reference itself has no audio here; the fixture is wrong"
+        );
+        assert!(
+            rms_ours > rms_ref * 0.5,
+            "DTX-off frames decoded to {rms_ours:.5} rms against the reference's {rms_ref:.5}"
+        );
+    }
+
+    /// A stream that ends where it claims to must be accepted. This is the guard against the
+    /// endpoint check being too strict: the synthetic 120 ms vector is a well-formed six-frame
+    /// packet, and rejecting it would silence audio that decodes correctly.
+    #[test]
+    fn endpoint_check_accepts_a_well_formed_packet() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/mlow_120ms_frames.json")).unwrap();
+        let mut dec = MlowDecoder::new();
+        for hex_frame in &frames {
+            let out = dec.decode(&hex::decode(hex_frame).unwrap());
+            assert!(
+                out.iter().any(|&s| s != 0.0),
+                "a valid packet must not be rejected as malformed"
+            );
+        }
+    }
+
+    /// The accepted window is the shipped decoder's, not the C fork's. The fork stops at `+2`, so a
+    /// stream ending three or four bytes long would be concealed here and played by the official
+    /// client. Pinned as arithmetic because no synthetic body lands on `+3` on demand.
+    #[test]
+    fn endpoint_window_matches_the_shipped_decoder() {
+        assert!(endpoint_is_valid(40, 40), "exact end is valid");
+        assert!(endpoint_is_valid(40, 42), "the fork's +2 stays valid");
+        assert!(
+            endpoint_is_valid(40, 44),
+            "+4 is valid: WhatsAppNative.dll @ 0x180337e30 adds 4 before its second compare, and \
+             rejecting here would silence audio the official client plays"
+        );
+        assert!(!endpoint_is_valid(40, 45), "+5 over-runs");
+        assert!(
+            !endpoint_is_valid(40, 39),
+            "under-running is always malformed"
+        );
+    }
+
+    /// A body whose decode consumes far more bits than it holds is malformed: the range decoder
+    /// returns zero past the end without flagging it, so the synthesis runs on invented symbols and
+    /// can diverge to full scale. Conceal it as a lost frame rather than emitting that.
+    #[test]
+    fn endpoint_check_rejects_an_overrunning_body() {
+        // A 120 ms TOC with a body far too short for six internal frames.
+        let mut dec = MlowDecoder::new();
+        let out = dec.decode(&[0x58, 0x03, 0x1a, 0xfb, 0x0a]);
+        assert_eq!(out.len(), 6 * SMPL_INTF_LEN, "still a full 120 ms slot");
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "an over-running body must be concealed, not synthesized"
+        );
+    }
+
+    /// Real 120 ms packets captured from a live WhatsApp Desktop peer must decode to speech, not to
+    /// full-scale noise. Reported on #1105 after the multi-frame admission landed: frames are now
+    /// accepted, but the decode diverges partway through the packet and saturates, which is audibly
+    /// worse than the silence it replaced.
+    ///
+    /// The assertions are deliberately coarse — this pins "the output is not garbage", which is what
+    /// regressed, without pretending to a bit-exact target the fixture cannot supply.
+    ///
+    /// Concealing a malformed frame must leave no trace: the decode loop mutates the LSF predictor,
+    /// the CELP history and `prev_nlsf` before the overrun is detectable, so without a rollback the
+    /// NEXT packet is synthesized partly from parameters invented past the end of the bad body.
+    /// The reference does not roll back, but it also never meets these packets; we do, repeatedly.
+    #[test]
+    fn a_concealed_frame_does_not_contaminate_the_next() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
+        let real = hex::decode(&frames[0]).unwrap();
+
+        let mut fresh = MlowDecoder::new();
+        let want = fresh.decode(&real);
+
+        let mut contaminated = MlowDecoder::new();
+        let bad = contaminated.decode(&[0x58, 0x03, 0x1a, 0xfb, 0x0a]);
+        assert!(bad.iter().all(|&s| s == 0.0), "the bad frame is concealed");
+        let got = contaminated.decode(&real);
+
+        assert_eq!(got.len(), want.len());
+        assert!(
+            got == want,
+            "a real frame after a concealed one must decode identically to one decoded on a fresh \
+             decoder; state from the malformed body leaked into it"
+        );
+    }
+
+    /// The two halves of a cross-check vector come out of one harness run and mean nothing apart:
+    /// refreshing only one leaves the comparison reading mismatched data, which surfaces as a
+    /// correlation number that moved rather than as an obvious error. Pin what ties them, and pin
+    /// that the fixture still exercises the multi-frame path it was added for.
+    #[test]
+    fn multi_frame_fixture_halves_stay_in_step() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/mlow_120ms_frames.json"))
+                .expect("mlow_120ms_frames.json");
+        let pcm_bytes = include_bytes!("testdata/ref_120ms_expected.raw").len();
+
+        // An absolute count, not just "non-empty": a regeneration that ends early produces a
+        // shorter vector whose PCM length still matches its own frame count, so a relative check
+        // would accept it and the coverage loss would be invisible.
+        assert_eq!(
+            frames.len(),
+            8,
+            "fixture no longer holds the 8 packets it was generated with; a short regeneration              silently reduces coverage"
+        );
+        for (i, f) in frames.iter().enumerate() {
+            let toc = hex::decode(f).expect("hex frame")[0];
+            assert_eq!(
+                toc, 0x58,
+                "frame {i} is TOC {toc:#04x}, not the 120 ms packet this fixture exists to cover"
+            );
+        }
+        assert_eq!(
+            pcm_bytes,
+            frames.len() * 6 * SMPL_INTF_LEN * 2,
+            "reference PCM does not match the frame count; regenerate both halves together with \
+             scripts/regenerate-mlow-vectors.sh"
+        );
+    }
+
+    /// The content check: decode a stream of real 120 ms packets and compare against the reference
+    /// decoder's own output for the same bytes. Geometry alone is not enough, since running the loop
+    /// the wrong number of times would still produce plausibly-shaped audio while consuming the
+    /// payload at the wrong symbol count. See testdata/PROVENANCE.md for the oracle.
+    #[test]
+    fn multi_frame_decode_matches_the_reference() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/mlow_120ms_frames.json"))
+                .expect("mlow_120ms_frames.json");
+        let refp: Vec<f32> = include_bytes!("testdata/ref_120ms_expected.raw")
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+
+        let mut dec = MlowDecoder::new();
+        let mut out: Vec<f32> = Vec::new();
+        for hex_frame in &frames {
+            let frame = hex::decode(hex_frame).unwrap();
+            assert_eq!(frame[0], 0x58, "the fixture must stay 120 ms packets");
+            out.extend_from_slice(&dec.decode(&frame));
+        }
+        assert_eq!(out.len(), refp.len(), "decode length vs reference");
+
+        let n = refp.len();
+        let (mr, mo) = (
+            refp.iter().map(|&v| v as f64).sum::<f64>() / n as f64,
+            out.iter().map(|&v| v as f64).sum::<f64>() / n as f64,
+        );
+        let (mut sxy, mut sxx, mut syy) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            let (dr, dz) = (refp[i] as f64 - mr, out[i] as f64 - mo);
+            sxy += dr * dz;
+            sxx += dr * dr;
+            syy += dz * dz;
+        }
+        let corr = sxy / (sxx * syy).sqrt();
+        assert!(corr > 0.999, "lag-0 corr {corr:.6} vs reference");
+    }
+
+    /// Decoding a multi-frame packet must leave the cross-frame predictor usable: a real 60 ms frame
+    /// after it still has to produce audio.
+    #[test]
+    fn multi_frame_packet_does_not_poison_later_frames() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
+        let real = hex::decode(&frames[0]).unwrap();
+
+        let mut dec = MlowDecoder::new();
+        let _ = dec.decode(&[0x58, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
+        let after = dec.decode(&real);
+        assert_eq!(after.len(), 960);
+        assert!(
+            after.iter().any(|&s| s != 0.0),
+            "a real 60 ms frame after a 120 ms packet must still decode"
+        );
+    }
 
     // End-to-end: decode the whole capture and compare against the reference output
     // (`ref_usesmpl_expected.raw`; see testdata/PROVENANCE.md).
@@ -555,13 +967,14 @@ mod tests {
             "low_rate=1 frame must drop to silence"
         );
 
-        // A non-60ms ACTIVE 16kHz/low_rate=0 TOC (20ms, e.g. 0x48) must also drop: decode_active_frame
-        // hardcodes the 3x20ms / 60ms geometry, so a 20ms frame would otherwise desync the range coder.
-        let out_20ms = dec.decode(&[0x48, 0xAA, 0xBB, 0xCC]);
-        assert_eq!(out_20ms.len(), 960);
+        // A 10ms ACTIVE 16kHz/low_rate=0 TOC (0x40) must also drop: it is the one duration whose
+        // internal frame length and subframe count differ, so decoding it under the implemented
+        // geometry would desync the range coder. 20/60/120ms all decode (see the geometry tests).
+        let out_10ms = dec.decode(&[0x40, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(out_10ms.len(), 960);
         assert!(
-            out_20ms.iter().all(|&s| s == 0.0),
-            "a non-60ms active frame must drop to silence"
+            out_10ms.iter().all(|&s| s == 0.0),
+            "a 10ms active frame must drop to silence"
         );
 
         // The drops never opened the range decoder, so the predictor is intact: the real frame still
@@ -577,13 +990,12 @@ mod tests {
         );
     }
 
-    // An inactive / DTX frame (TOC 0x00: vad=false so active=false, 16kHz, low_rate=0, 10ms) is the
-    // benign startup/comfort silence a real peer emits, not a desync hazard: inactive frames are
-    // silenced without opening the range coder regardless of geometry. It must take the quiet DTX/SID
-    // path (a full 60ms silence slot, range coder untouched) and must NOT count as an out-of-operating
-    // -point drop, which is reserved for active frames that would have lost decodable audio.
+    // A SID frame (TOC 0x80, the DTX/CNG marker) is comfort noise, not a desync hazard: it is
+    // silenced without opening the range coder regardless of geometry. It must take the quiet path (a
+    // full 60ms silence slot, range coder untouched) and must NOT count as an out-of-operating-point
+    // drop, which is reserved for frames that would have lost decodable audio.
     #[test]
-    fn inactive_off_point_frame_is_silenced_not_dropped() {
+    fn sid_frame_is_silenced_not_dropped() {
         let frames: Vec<String> =
             serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
         let real = hex::decode(&frames[0]).unwrap();
@@ -594,8 +1006,8 @@ mod tests {
             "a real low_rate=0 frame must decode to audio"
         );
 
-        // TOC 0x00 -> inactive: silenced via the DTX/SID path, not the operating-point drop.
-        let inactive = dec.decode(&[0x00, 0xAA, 0xBB, 0xCC]);
+        // TOC 0x80 -> SID: silenced via the comfort-noise path, not the operating-point drop.
+        let inactive = dec.decode(&[0x80, 0xAA, 0xBB, 0xCC]);
         assert_eq!(
             inactive.len(),
             960,
@@ -607,16 +1019,16 @@ mod tests {
         );
         assert_eq!(
             dec.dropped_unsupported, 0,
-            "an inactive frame is the DTX/silence path, not an operating-point drop"
+            "a SID frame is the comfort-noise path, not an operating-point drop"
         );
         assert!(
             !dec.had_error(),
-            "the inactive path must not open the range decoder"
+            "the SID path must not open the range decoder"
         );
 
-        // Contrast: an active off-point frame (0x48 = vad=true, 20ms) IS counted, proving the drop
+        // Contrast: an active off-point frame (0x60 = vad=true, 32 kHz) IS counted, proving the drop
         // counter discriminates real audio loss from benign inactive silence.
-        let _ = dec.decode(&[0x48, 0xAA, 0xBB, 0xCC]);
+        let _ = dec.decode(&[0x60, 0xAA, 0xBB, 0xCC]);
         assert_eq!(
             dec.dropped_unsupported, 1,
             "an active off-point frame must count as a drop"

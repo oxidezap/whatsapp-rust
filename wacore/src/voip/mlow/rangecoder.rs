@@ -337,6 +337,13 @@ impl<'a> RangeDecoder<'a> {
     pub(crate) fn tell(&self) -> i32 {
         self.nbits_total - ilog(self.rng)
     }
+
+    /// Bytes the payload actually holds. Paired with [`tell`] this is how a caller checks that a
+    /// stream ended where it claimed to: reads past either end silently return zero here, so an
+    /// impossible length is only visible by comparing the two.
+    pub(crate) fn storage(&self) -> u32 {
+        self.storage
+    }
 }
 
 /// Opus/CELT range ENCODER (`ec_enc`), the exact inverse of `RangeDecoder`, used by the mlow

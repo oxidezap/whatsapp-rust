@@ -78,3 +78,43 @@ the reference decoder, one record per frame, compared byte-for-byte by the Rust 
 exact wire bytes (config-1 `0x10` and config-2 `0x12` frames included). The tripwire test asserts the
 committed stream still carries `0x10`, `0x12`, and `0x50` TOCs so the per-config decode branches stay
 covered; regenerating it requires the external encoder above on `synth_mic.raw`.
+
+## Multi-frame (120 ms) packets — regenerable in one command
+
+| fixture | consumer / test | oracle recipe |
+| --- | --- | --- |
+| `mlow_120ms_frames.json` | `decoder.rs::multi_frame_decode_matches_the_reference` | `scripts/regenerate-mlow-vectors.sh` |
+| `ref_120ms_expected.raw` | same test | same run of the same script |
+
+```sh
+MLOW_REFERENCE=/path/to/opus_mlow scripts/regenerate-mlow-vectors.sh
+```
+
+The harness it builds lives in `scripts/mlow-vectors/mlow_frames.c`: it encodes `synth_mic.raw` at
+the requested duration through the `smpl` C reference and decodes each packet back, emitting both
+halves of the vector in one pass.
+
+The committed bytes were produced against one specific oracle —
+`github.com/edgardmessias/opus_mlow` at `84b076e0809412df22e8a0d26f944610c4a3e40f`. Reproduction is
+byte for byte **against that revision**, which is what makes a changed fixture a real change rather
+than tool drift; against a different checkout the reference itself may have moved, so the script
+prints the revision it built with and warns when it does not match.
+
+The committed vector is an intentional 8-packet prefix, not the whole input: `synth_mic.raw` chunked
+into 120 ms frames would yield ~55 packets, which is far more than the decode path needs and 7x the
+bytes. A regeneration that produces more is the script defaulting to the whole file — pass the
+packet count, as the script does.
+
+Both halves must be regenerated together — `decoder.rs::multi_frame_fixture_halves_stay_in_step`
+fails if the PCM length stops matching the frame count, and asserts every frame is still TOC `0x58`
+so the fixture cannot quietly drift off the multi-frame path.
+
+## What is still not reproducible, and why
+
+The fixtures above the multi-frame section predate the harness and were produced by tools that no
+longer exist here. The harness reproduces their SHAPE — run at 60 ms with DTX off it emits the same
+TOC mix as `inbound_capture_frames.json` (13x `0x10`, 2x `0x12`, 95x `0x50`) — but not their exact
+bytes: packet sizes bracket the committed ones without landing on them, so the original run used an
+encoder configuration (or reference build) that was not recorded. Regenerating them would therefore
+REPLACE those vectors rather than reproduce them, which is a deliberate decision to make with the
+correlation thresholds in hand, not a mechanical refresh.

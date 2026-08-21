@@ -660,8 +660,13 @@ fn decoder_silence_frames_produce_zero() {
         let ref_r = rms(&want);
         let got = dec.decode(&frame);
         let rust_r = rms(&got);
-        // A frame the reference decodes to near-silence must also be near-silence in Rust.
-        if ref_r < 0.001 {
+        // Only a SID frame is genuinely silence. This fixture also holds coded-inactive frames
+        // (VoA=0, hang-over clear) whose PCM was ZEROED when it was generated, to match a decoder
+        // that routed them to silence. The reference decodes those to background noise, so they are
+        // not an oracle for this property and asserting over them would re-pin the old behavior;
+        // `decoder.rs::dtx_off_frames_decode_to_audio` covers them against an unmodified vector.
+        let is_sid = frame[0] & 0x80 != 0;
+        if ref_r < 0.001 && is_sid {
             assert!(
                 rust_r < 0.001,
                 "frame {i}: reference is silence (RMS={ref_r:.6}) but Rust produced RMS={rust_r:.6}"

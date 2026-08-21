@@ -344,6 +344,26 @@ pub(crate) struct CelpDecState {
     pub(crate) dbg_exc_pre: Vec<f32>,
 }
 
+// Hand-written so the test-only excitation trace is NOT carried along. It accumulates every
+// synthesized subframe for the whole stream and is never cleared, so copying it in the per-packet
+// rollback snapshot would make decoding quadratic in stream length. It is a diagnostic capture, not
+// codec state that concealment has to restore.
+impl Clone for CelpDecState {
+    fn clone(&self) -> Self {
+        Self {
+            noise: self.noise.clone(),
+            acb_state: self.acb_state.clone(),
+            acb_state_len: self.acb_state_len,
+            lpc_synth_mem: self.lpc_synth_mem,
+            lsf_prev: self.lsf_prev,
+            prev_nrgres: self.prev_nrgres,
+            hp: self.hp.clone(),
+            #[cfg(test)]
+            dbg_exc_pre: Vec::new(),
+        }
+    }
+}
+
 impl Default for CelpDecState {
     fn default() -> Self {
         let acb_state_len = SMPL_SUBFR_LEN + 2 * SMPL_MAX_PITCH_LAG + SMPL_LTP_INTERPOL_DELAY;
@@ -541,7 +561,7 @@ mod tests {
             let low_rate = (frame[0] >> 2) & 1 != 0;
             let mut dec = crate::voip::mlow::rangecoder::RangeDecoder::new(&frame[1..]);
             for f in 0..3 {
-                let lsf = decode_smpl_lsf(&mut dec, tbl, &mut lstate, config, f);
+                let lsf = decode_smpl_lsf(&mut dec, tbl, &mut lstate, config, f, true);
                 let pulses = decode_smpl_pulses(&mut dec, cc, 320, 4, 1, config as i32, lsf.stage1);
                 let voiced = lsf.stage1 == 1;
                 let mut params = CelpDecParams {

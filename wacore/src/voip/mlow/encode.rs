@@ -660,6 +660,7 @@ mod tests {
                     &mut lstate,
                     config,
                     f,
+                    true,
                 );
                 let pulses = super::super::smpl_pulse::decode_smpl_pulses(
                     &mut dec,
