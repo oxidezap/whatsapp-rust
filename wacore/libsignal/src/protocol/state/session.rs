@@ -1946,9 +1946,16 @@ mod tests {
             .expect("skipped key stored");
         let expected = create_test_message_key_generator(5).generate_keys();
 
+        // Rebuild the shape those records had: the derived triple written out,
+        // no seed beside it. The skip loop stores the seed alone now, so the
+        // fixture has to put the triple back before stripping the seed.
         let mut structure = SessionStructure::from(&state);
-        assert!(structure.receiver_chains[0].message_keys[0].seed.is_some());
-        structure.receiver_chains[0].message_keys[0].seed = None;
+        let stored = &mut structure.receiver_chains[0].message_keys[0];
+        assert!(stored.seed.is_some());
+        stored.cipher_key = Some(bytes::Bytes::copy_from_slice(expected.cipher_key()));
+        stored.mac_key = Some(bytes::Bytes::copy_from_slice(expected.mac_key()));
+        stored.iv = Some(bytes::Bytes::copy_from_slice(expected.iv()));
+        stored.seed = None;
         let bytes = SessionRecord::new(SessionState::from(structure))
             .serialize()
             .expect("serialize");

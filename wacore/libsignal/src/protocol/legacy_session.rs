@@ -1667,14 +1667,22 @@ mod tests {
             native.session_state().expect("current state"),
         );
         let stored = &persisted.receiver_chains[0].message_keys[0];
-        let expected = MessageKeyGenerator::new_from_seed(&seed, 0).generate_keys();
-        assert_eq!(
-            stored.cipher_key.as_deref(),
-            Some(&expected.cipher_key()[..])
-        );
-        assert_eq!(stored.mac_key.as_deref(), Some(&expected.mac_key()[..]));
-        assert_eq!(stored.iv.as_deref(), Some(&expected.iv()[..]));
+        // The seed is what gets stored, and nothing derived from it: the
+        // import no longer expands it into a triple it would have to keep
+        // consistent.
         assert_eq!(stored.seed.as_deref(), Some(&seed[..]));
+        assert_eq!(stored.cipher_key, None);
+        assert_eq!(stored.mac_key, None);
+        assert_eq!(stored.iv, None);
+
+        // What the stored entry stands for is still the canonical derivation.
+        let expected = MessageKeyGenerator::new_from_seed(&seed, 0).generate_keys();
+        let reloaded = MessageKeyGenerator::from_pb(stored.clone())
+            .expect("imported key stays loadable")
+            .generate_keys();
+        assert_eq!(reloaded.cipher_key(), expected.cipher_key());
+        assert_eq!(reloaded.mac_key(), expected.mac_key());
+        assert_eq!(reloaded.iv(), expected.iv());
 
         let material = &native
             .into_components()

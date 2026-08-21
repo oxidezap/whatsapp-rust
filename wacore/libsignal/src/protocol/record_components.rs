@@ -340,20 +340,23 @@ impl SessionMessageKeyComponents {
             .ok_or_else(|| invalid("session message-key index", "present"))?;
         // A persisted seed supersedes the derived triple on export rather than
         // complementing it, so one that does not reproduce that triple would
-        // hand a consumer a key decrypting nothing, undetectably. Both are
-        // written from the same material; disagreeing means the record is
-        // corrupt.
+        // hand a consumer a key decrypting nothing, undetectably. A record that
+        // carries both wrote them from the same material; disagreeing means it
+        // is corrupt. A record written since the triple stopped being persisted
+        // carries the seed alone, and there the seed is simply the material.
         if let Some(seed) = value.seed.take() {
             let seed = key_material(seed, "session message-key seed")?;
-            let derived = MessageKeys::derive_keys(&seed, None, index);
-            if value.cipher_key.as_deref() != Some(derived.cipher_key())
-                || value.mac_key.as_deref() != Some(derived.mac_key())
-                || value.iv.as_deref() != Some(derived.iv())
-            {
-                return Err(invalid(
-                    "session message-key seed",
-                    "consistent with the derived keys stored beside it",
-                ));
+            if value.cipher_key.is_some() || value.mac_key.is_some() || value.iv.is_some() {
+                let derived = MessageKeys::derive_keys(&seed, None, index);
+                if value.cipher_key.as_deref() != Some(derived.cipher_key())
+                    || value.mac_key.as_deref() != Some(derived.mac_key())
+                    || value.iv.as_deref() != Some(derived.iv())
+                {
+                    return Err(invalid(
+                        "session message-key seed",
+                        "consistent with the derived keys stored beside it",
+                    ));
+                }
             }
             return Ok(Self {
                 index,
@@ -1084,15 +1087,28 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// A message key as it was persisted while the derived triple was still
+    /// written beside the seed. `into_structure` emits the seed alone now, so
+    /// the fixtures for those older records have to be built here.
+    fn legacy_persisted_key(
+        seed: [u8; SYMMETRIC_KEY_BYTES],
+        index: u32,
+    ) -> session_structure::chain::MessageKey {
+        let derived = MessageKeys::derive_keys(&seed, None, index);
+        session_structure::chain::MessageKey {
+            index: Some(index),
+            cipher_key: Some(Bytes::copy_from_slice(derived.cipher_key())),
+            mac_key: Some(Bytes::copy_from_slice(derived.mac_key())),
+            iv: Some(Bytes::copy_from_slice(derived.iv())),
+            seed: Some(Bytes::copy_from_slice(&seed)),
+        }
+    }
+
     /// Keys persisted before the seed was retained carry only the derived
     /// triple and must keep projecting as `Derived`.
     #[test]
     fn a_persisted_key_without_a_seed_projects_as_derived() {
-        let mut persisted = SessionMessageKeyComponents {
-            index: 3,
-            material: SessionMessageKeyMaterial::Seed([9; SYMMETRIC_KEY_BYTES]),
-        }
-        .into_structure();
+        let mut persisted = legacy_persisted_key([9; SYMMETRIC_KEY_BYTES], 3);
         persisted.seed = None;
 
         let actual =
@@ -1129,11 +1145,7 @@ mod tests {
     /// the export would look fine and the exported key would decrypt nothing.
     #[test]
     fn a_persisted_seed_that_derives_other_keys_is_rejected() {
-        let mut persisted = SessionMessageKeyComponents {
-            index: 3,
-            material: SessionMessageKeyMaterial::Seed([9; SYMMETRIC_KEY_BYTES]),
-        }
-        .into_structure();
+        let mut persisted = legacy_persisted_key([9; SYMMETRIC_KEY_BYTES], 3);
         persisted.seed = Some(Bytes::copy_from_slice(&[10; SYMMETRIC_KEY_BYTES]));
 
         let error = SessionMessageKeyComponents::from_structure(persisted)

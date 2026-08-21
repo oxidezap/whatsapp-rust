@@ -1495,6 +1495,22 @@ fn decrypt_with_pending_state<R: Rng + CryptoRng>(
     Ok((plaintext, sender_chain_reset))
 }
 
+/// Hex-formats a byte slice at `Display` time rather than up front.
+///
+/// `hex::encode` returns a `String`, so passing one to a log macro allocates
+/// whether or not the record is ever emitted. This writes straight into the
+/// formatter instead.
+struct Hex<'a>(&'a [u8]);
+
+impl std::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 fn decrypt_with_message_keys(
     current_or_previous: CurrentOrPrevious,
     state: &SessionState,
@@ -1521,21 +1537,22 @@ fn decrypt_with_message_keys(
     )?;
 
     if !mac_valid {
-        let their_id_fingerprint = hex::encode(their_identity_key.public_key().public_key_bytes());
-        let local_id_fingerprint = hex::encode(local_identity_key.public_key().public_key_bytes());
-
-        let mac_key_bytes = message_keys.mac_key();
-        let mac_key_fingerprint: String = hex::encode(mac_key_bytes).chars().take(8).collect();
-
+        // A MAC failure here is not exceptional: the decrypt path probes the
+        // current session and then each archived one, and every miss lands
+        // exactly here. Formatting through `Hex` defers the three allocations
+        // to `log::error!`'s own argument formatting, so a probe that the next
+        // candidate session goes on to satisfy pays nothing, and a build with
+        // the level filtered out pays nothing either.
         log::error!(
             "MAC verification failed for message from {}. \
              Remote Identity: {}, \
              Local Identity: {}, \
              MAC Key Fingerprint: {}...",
             remote_address,
-            their_id_fingerprint,
-            local_id_fingerprint,
-            mac_key_fingerprint
+            Hex(their_identity_key.public_key().public_key_bytes()),
+            Hex(local_identity_key.public_key().public_key_bytes()),
+            // Four bytes render as the eight hex digits the message names.
+            Hex(&message_keys.mac_key()[..4]),
         );
         return Err(SignalProtocolError::BadMac(original_message_type));
     }
@@ -1651,6 +1668,12 @@ fn get_or_create_message_key(
 
     let mut chain_key = *chain_key;
 
+    // Each skipped index is buffered as the seed it was derived from, never as
+    // the key that seed expands to: `MessageKeyGenerator::into_pb` keeps the
+    // `Seed` arm lazy, so catching up over `jump` messages runs `jump` chain
+    // steps and no HKDF expansions. The expansion happens in
+    // `MessageKeyGenerator::generate_keys`, once, for the one buffered key a
+    // late message actually claims.
     while chain_key.index() < counter {
         let (message_keys, next_chain) = chain_key.step_with_message_keys()?;
         state.set_message_keys(their_ephemeral, message_keys)?;
@@ -2153,6 +2176,141 @@ mod tests {
         tp.bob_sessions
             .0
             .insert(tp.alice_addr.as_str().to_owned(), reloaded);
+    }
+
+    /// Repeated forward jumps on a 1-on-1 chain, then every skipped message
+    /// delivered late, across a persistence round trip.
+    ///
+    /// The catch-up loop buffers a skipped counter as the chain seed alone and
+    /// expands it only when the late message claims it, so a wrong seed, a seed
+    /// filed under the wrong counter, or a buffer that does not survive
+    /// serialization shows up here as a decrypt failure or a swapped plaintext
+    /// rather than as a chain that merely ends at the wrong index.
+    #[test]
+    fn dm_forward_jumps_buffer_keys_that_still_decrypt_in_any_order() {
+        let mut tp = setup_established_session();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+        const TOTAL: usize = 40;
+        // Three jumps of different sizes, so the catch-up loop runs with 12, 14
+        // and 11 skipped counters rather than one uniform gap.
+        const JUMP_TARGETS: [usize; 3] = [12, 27, 39];
+
+        futures::executor::block_on(async {
+            // Bob answers once so Alice's pending pre-key is acknowledged and
+            // every message below is a plain SignalMessage on a settled chain.
+            let reply = message_encrypt(
+                b"ratchet reply",
+                &tp.alice_addr,
+                &mut tp.bob_sessions,
+                &mut tp.bob_identity,
+            )
+            .await
+            .expect("encrypt reply");
+            let CiphertextMessage::SignalMessage(reply) = reply else {
+                panic!("established responder sends a signal message");
+            };
+            message_decrypt_signal(
+                &reply,
+                &tp.bob_addr,
+                &mut tp.alice_sessions,
+                &mut tp.alice_identity,
+                &mut rng,
+            )
+            .await
+            .expect("decrypt reply");
+
+            let mut ciphertexts = Vec::with_capacity(TOTAL);
+            for i in 0..TOTAL {
+                let message = message_encrypt(
+                    format!("msg {i}").as_bytes(),
+                    &tp.bob_addr,
+                    &mut tp.alice_sessions,
+                    &mut tp.alice_identity,
+                )
+                .await
+                .expect("alice encrypts");
+                let CiphertextMessage::SignalMessage(message) = message else {
+                    panic!("pending pre-key was acknowledged");
+                };
+                ciphertexts.push(message);
+            }
+
+            for target in JUMP_TARGETS {
+                let decrypted = message_decrypt_signal(
+                    &ciphertexts[target],
+                    &tp.alice_addr,
+                    &mut tp.bob_sessions,
+                    &mut tp.bob_identity,
+                    &mut rng,
+                )
+                .await
+                .expect("bob decrypts the message he jumped to");
+                assert_eq!(decrypted.plaintext, format!("msg {target}").as_bytes());
+            }
+
+            // Reload the backlog through the wire format: the buffered keys are
+            // stored as seeds, so a record that dropped or mangled them on the
+            // way out would fail the deliveries below and nowhere earlier.
+            let stored = tp
+                .bob_sessions
+                .0
+                .remove(tp.alice_addr.as_str())
+                .expect("stored session");
+            let reloaded = SessionRecord::deserialize(&stored.serialize().expect("serialize"))
+                .expect("reload persisted record");
+            tp.bob_sessions
+                .0
+                .insert(tp.alice_addr.as_str().to_owned(), reloaded);
+
+            // Now every message the jumps skipped, delivered late. The order
+            // alternates between the tail and the head of the backlog rather
+            // than running oldest-first: the backlog is a vector searched by a
+            // linear scan, so ascending delivery would remove the front entry
+            // every time and never look past index 0.
+            let buffered: Vec<usize> = (0..TOTAL).filter(|i| !JUMP_TARGETS.contains(i)).collect();
+            let mut delivery_order = Vec::with_capacity(buffered.len());
+            let (mut head, mut tail) = (0usize, buffered.len());
+            while head < tail {
+                tail -= 1;
+                delivery_order.push(buffered[tail]);
+                if head < tail {
+                    delivery_order.push(buffered[head]);
+                    head += 1;
+                }
+            }
+
+            for &i in &delivery_order {
+                let decrypted = message_decrypt_signal(
+                    &ciphertexts[i],
+                    &tp.alice_addr,
+                    &mut tp.bob_sessions,
+                    &mut tp.bob_identity,
+                    &mut rng,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("skipped message {i} must still decrypt: {e:?}"));
+                assert_eq!(decrypted.plaintext, format!("msg {i}").as_bytes());
+            }
+
+            // Every buffered key is consumed exactly once: a replay is a
+            // duplicate, never a second successful decrypt.
+            for &i in &delivery_order {
+                let replay = message_decrypt_signal(
+                    &ciphertexts[i],
+                    &tp.alice_addr,
+                    &mut tp.bob_sessions,
+                    &mut tp.bob_identity,
+                    &mut rng,
+                )
+                .await
+                .expect_err("consumed key stays consumed");
+                assert!(
+                    matches!(replay, SignalProtocolError::DuplicatedMessage(_, _)),
+                    "replay of message {i} must be reported as a duplicate: {replay:?}"
+                );
+            }
+        });
     }
 
     #[test]
