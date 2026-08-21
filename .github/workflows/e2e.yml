@@ -103,3 +103,7 @@ jobs:
           path: ${{ runner.temp }}/test-timings
           retention-days: 14
           if-no-files-found: warn
+          # Immutable v4 artifacts are per-run, not per-attempt; without this a
+          # rerun 409s on the artifact attempt 1 already uploaded. Reasoning in
+          # main.yml, on the first of these uploads.
+          overwrite: true

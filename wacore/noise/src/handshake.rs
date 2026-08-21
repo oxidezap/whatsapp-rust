@@ -992,13 +992,8 @@ mod tests {
         );
     }
 
-    // Ignored under Miri, not skipped: `ik_to_xx_fallback_round_trip` below
-    // walks a superset of the unsafe this leg exists to interpret. It builds
-    // an IK hello, reads a server hello, finishes the XX pattern, exchanges
-    // AEAD in both directions and decodes the served cert chain, so the same
-    // x25519, sha2, aes-gcm and zero-copy decode paths are covered. What is
-    // left over here is the order of the protocol steps, which is safe Rust.
-    // Both still run natively on every push.
+    // Ignored under Miri for the reason given above
+    // `xx_handshake_round_trip_completes`.
     #[cfg_attr(miri, ignore)]
     #[test]
     fn ik_handshake_round_trip_continue() {
