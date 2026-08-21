@@ -128,7 +128,9 @@ like a passenger and is not one.
 Failing test 1 leaves two options: a fifth `Subsystem` hook, or somewhere else.
 The hook needs two askers and a measured floor, and WAM is one asker, so it goes
 where a watcher belongs, on the plugin host's `events.core.observe`. The core
-gains nothing: `git diff` over `src/` for that batch is empty.
+gains nothing: production code under `src/` and `wacore/` is untouched by that
+batch apart from the files whatspec regenerates, and one pinned literal in a
+`mod tests` that moved with the spec bump.
 
 What the capability surface does not have, recorded because the next watcher will
 want the same things:
@@ -145,6 +147,12 @@ want the same things:
 - **A way to see what the core counts.** Two WAM events describe things
   `wacore::telemetry` already measures, whose doc comments name those very WAM
   ids, and a plugin cannot reach a counter, only the event bus.
+- **A per-stanza inbound seam that is not the whole firehose.** A metric about
+  receipt stanzas has to be derived from `Event::RawNode`, because the typed
+  `Event::Receipt` fans out per peer on the aggregated shape and is skipped
+  entirely on the retry path. `RawNode` gives the right unit and forwards every
+  decoded stanza to get there, so a watcher that wants one tag pays for all of
+  them.
 
 `agent_docs/wam_telemetry.md` has the rest.
 

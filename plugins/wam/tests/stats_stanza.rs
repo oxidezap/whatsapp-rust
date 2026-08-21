@@ -32,7 +32,7 @@ impl WamUploader for CapturingUploader {
 
 /// The records in a buffer, as `(kind, id)` pairs: kind 0 global, 1 event,
 /// 2 field.
-fn records(bytes: &[u8]) -> Vec<(u8, u32)> {
+fn records(bytes: &[u8]) -> Vec<Record> {
     let mut out = Vec::new();
     let mut i = 8;
     while i < bytes.len() {
@@ -47,7 +47,8 @@ fn records(bytes: &[u8]) -> Vec<(u8, u32)> {
             i += 1;
             id
         };
-        i += match flags & 0xf0 {
+        let class = flags & 0xf0;
+        let payload = match class {
             0 | 16 | 32 => 0,
             48 => 1,
             64 => 2,
@@ -65,9 +66,60 @@ fn records(bytes: &[u8]) -> Vec<(u8, u32)> {
             }
             _ => panic!("unexpected size class in {flags:#x}"),
         };
-        out.push((flags & 3, id));
+        // Only the string classes carry text. Reading the payload of a numeric
+        // record as text is what makes a byte scan over a whole buffer report
+        // an `@` that is really the high byte of a double.
+        let text = matches!(class, 128 | 144)
+            .then(|| String::from_utf8_lossy(&bytes[i..i + payload]).into_owned());
+        i += payload;
+        out.push(Record {
+            kind: flags & 3,
+            id,
+            text,
+        });
     }
     out
+}
+
+/// One decoded record: what kind it is, which id it names, and its text when it
+/// is one of the string classes.
+struct Record {
+    kind: u8,
+    id: u32,
+    text: Option<String>,
+}
+
+/// The first record whose text names a person, if any.
+///
+/// Read per string record rather than by scanning the whole buffer, so a numeric
+/// payload whose bytes happen to spell an `@` cannot decide the answer either
+/// way. A tripwire for a future derivation, so
+/// [`the_privacy_check_catches_a_jid_that_reaches_a_buffer`] proves it can fire.
+fn names_somebody(records: &[Record]) -> Option<u32> {
+    records.iter().find_map(|r| {
+        let text = r.text.as_ref()?;
+        (text.contains('@') || text.contains("s.whatsapp.net")).then_some(r.id)
+    })
+}
+
+#[test]
+fn the_privacy_check_catches_a_jid_that_reaches_a_buffer() {
+    // A check that has nothing to find passes whether or not it works. This is
+    // the record the check exists for.
+    let planted = [
+        Record {
+            kind: 0,
+            id: 17,
+            text: Some("2.3000.1045368834".to_string()),
+        },
+        Record {
+            kind: 2,
+            id: 99,
+            text: Some("15550000001@s.whatsapp.net".to_string()),
+        },
+    ];
+    assert_eq!(names_somebody(&planted), Some(99));
+    assert_eq!(names_somebody(&planted[..1]), None);
 }
 
 #[tokio::test]
@@ -102,15 +154,19 @@ async fn one_observation_reaches_the_wire_as_a_stats_stanza() {
     let records = records(buffer);
     let written_globals: Vec<u32> = records
         .iter()
-        .filter(|(kind, _)| *kind == 0)
-        .map(|(_, id)| *id)
+        .filter(|r| r.kind == 0)
+        .map(|r| r.id)
         .collect();
     // Exactly the globals the default identity can derive, plus the per-event
     // timestamp, in ascending id order.
     assert_eq!(written_globals, vec![11, 15, 17, 21, 47, 6251]);
     // Nothing private-only, which a regular buffer may not carry.
     assert!(!written_globals.contains(&globals::PS_ID.id));
-    assert!(records.contains(&(1, events::WamDroppedEvent::CODE)));
+    assert!(
+        records
+            .iter()
+            .any(|r| r.kind == 1 && r.id == events::WamDroppedEvent::CODE)
+    );
 
     // And now the stanza the client would put on the socket.
     let spec = SendBufferSpec {
@@ -154,9 +210,7 @@ async fn one_observation_reaches_the_wire_as_a_stats_stanza() {
 
     // Nothing that identifies anybody: the only string a buffer of this event
     // can carry is a global this client set, and none of them is a JID.
-    let text = String::from_utf8_lossy(buffer);
-    assert!(!text.contains('@'));
-    assert!(!text.contains("s.whatsapp.net"));
+    assert_eq!(names_somebody(&records), None);
 
     // The content is bytes on the way in as well, so nothing re-encodes it.
     let Some(NodeContent::Bytes(_)) = spec.build_iq().content.and_then(|c| match c {

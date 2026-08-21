@@ -16,6 +16,11 @@ Two crates, neither in the default build:
 | `plugins/wam-catalog` (`whatsapp-rust-wam-catalog`) | the generated catalog (every event, field id, enum member, global and constant WA Web declares) plus the buffer codec |
 | `plugins/wam` (`whatsapp-rust-plugin-wam`) | the runtime: observation, sampling, buffering, flush, upload |
 
+The `git diff` evidence for "the core gains nothing" is narrower than it sounds
+and is worth stating precisely: production code under `src/` and `wacore/` is
+untouched apart from the files whatspec regenerates, and one pinned literal in a
+`mod tests` moved with the spec bump.
+
 ## The one rule
 
 **An event is emitted only when every field it writes is honestly derivable from
@@ -45,8 +50,8 @@ Nor does it clear the bar for a fifth `Subsystem` hook, which needs two askers
 and a measured floor. One subsystem wanting an observation point is that
 subsystem's problem, and the plugin host already solves it: `events.core.observe`
 is exactly a watcher's seam. The result is that the core gains nothing: no
-field, no feature gate, no line, which `tests/subsystem_boundary.rs` and a
-`git diff` over `src/` both confirm.
+field, no feature gate, no line, which `tests/subsystem_boundary.rs` and the
+`git diff` above both confirm.
 
 What the capability surface is missing is recorded under "What is not emitted"
 below, since it is the same list.
@@ -140,6 +145,18 @@ minutes until unrelated traffic pushes it past the retention cap. It is counted
 the way a buffer past the upload ceiling is counted. A timeout or a lost
 connection is not a refusal and is retained.
 
+Shutdown gets one best-effort flush, inside the deadline the plugin host already
+applies to every shutdown callback rather than a new one of its own. The host
+drains the plugin's tasks first, so the flush loop has parked its buffers and
+nothing races for them; an upload that does not finish inside the bound leaves
+the buffer retained rather than delaying the teardown. It is the moment the
+official client writes `WebWamForceFlush`, so this writes it too.
+
+A retained buffer is removed from the store only once the server has answered.
+Removing it first would lose it to a crash between the delete and the answer,
+which is the one window a durable store exists to close, and a buffer left in
+place is already counted against the retention cap.
+
 Nothing on this path can reach the client. Telemetry that cannot be encoded,
 stored or uploaded is dropped and counted, and the count is reported as the
 `WamClientErrors` and `WamDroppedEvent` events the official client uses for the
@@ -160,10 +177,43 @@ With the in-memory store a restart renumbers from 1, which is what a fresh
 browser profile does, and loses whatever had not been delivered, which was
 best-effort already.
 
+## What each emitted event is derived from
+
+Seven of 436. Each one names the unit it counts, and the observation point is
+chosen to match that unit rather than to be convenient:
+
+| event | derived from | the unit it counts |
+| --- | --- | --- |
+| `E2eMessageRecv` | `DecryptedPayload`, `EncDecryptFailed` | one `<enc>` |
+| `MessageReceive` | `Messages` | one decrypted message |
+| `ReceiptStanzaReceive` | `RawNode`, filtered to `<receipt>` | one inbound receipt stanza |
+| `WebcSocketConnect` | `Connected` | one authenticated socket |
+| `WebWamForceFlush` | plugin shutdown | one flush ahead of schedule |
+| `WamClientErrors`, `WamDroppedEvent` | the runtime's own losses | one abandoned buffer or event |
+
+Two of those pairings are the result of getting them wrong first, and both are
+worth keeping in mind when adding an event:
+
+**`ReceiptStanzaReceive` reads the stanza, not `Event::Receipt`.** That event is
+not one per receipt stanza. The aggregated shape dispatches one for every
+`<user>` it names, and a retry receipt is consumed by the retry pipeline without
+dispatching one at all, so a per-stanza metric derived from it would report
+several stanzas where one arrived and none where one did. `RawNode` is one event
+per decoded stanza, which is the unit the metric's name claims. The cost is that
+every inbound stanza crosses the plugin bus for a tag comparison.
+
+**`EncDecryptFailed(PlaintextUnusable)` produces nothing.** It is the one reason
+that does not describe a decryption failure: the Signal layer handed back bytes
+and something after it could not use them. When the bytes were unpadded first,
+the same `<enc>` already produced a `DecryptedPayload` and was already counted as
+a success, so reporting it again as a failure would double-count one `<enc>` with
+two contradicting answers. WAM has no member for "decrypted but undecodable", so
+the honest report is none.
+
 ## What is not emitted, and why
 
-The catalog carries 436 events. The plugin emits five. The gap is the rule, and
-it splits into four causes worth telling apart.
+The catalog carries 436 events. The plugin emits seven. The gap is the rule, and
+it splits into five causes worth telling apart.
 
 **Blocked on an outbound observation point (the largest group).** Eighteen
 regular-channel events describe an outgoing message or its media:
@@ -196,6 +246,16 @@ client will handle from one it will not.
 an anonymous id. The catalog carries the nine rotation groups so a later batch
 starts with them.
 
+**Browser facts this client has no equivalent of.** `WebcPageResume`
+(`webcResumeCount`) and `WebcStreamModeChange` (`webcStreamMode`) are the
+lifecycle events left on the table. Both come from WA Web's stream model and both
+write exactly one field: a count of page resumes and a stream mode. This client
+has no page to resume and no stream mode of that vocabulary, so the field would
+have to be guessed and the event is not emitted. `WebcSocketConnect` and
+`WebWamForceFlush` are the two from the same family that *are* emitted, because
+WA Web writes no field at either call site: a fieldless event is the whole event,
+so there is nothing left to guess.
+
 **Deliberately not implemented.** Beaconing: the official client gives one client
 in a hundred a per-event sequence number, rolled once per UTC day and remembered.
 The roll only means anything if it happens once per client per day, and a process
@@ -203,6 +263,26 @@ that restarts five times a day against a store that cannot remember would roll
 five times and over-represent itself in a cohort built on the opposite
 assumption. Doing it right needs a durable per-event counter; not doing it at all
 is the honest answer to not having one.
+
+## The cost that recurs
+
+Turning the plugin on holds three lease-gated core events open for the life of
+the client, and they are the only cost here that recurs per message rather than
+once:
+
+| event | dispatched | what the plugin does with it |
+| --- | --- | --- |
+| `DecryptedPayload` | per `<enc>` that decrypted | derives one `E2eMessageRecv` |
+| `EncDecryptFailed` | per `<enc>` that did not | derives one `E2eMessageRecv`, or nothing |
+| `RawNode` | per decoded inbound stanza | compares one tag, keeps `<receipt>` |
+
+The payload is `Bytes`, so no plaintext is copied and the per-`<enc>` cost is
+building and dispatching the event, not cloning it; `RawNode` hands over an `Arc`
+clone. **None of this is measured.** There is no receive-side benchmark in this
+repository (`benches/` covers group send), so the number would have to come from
+a bench written for the purpose. It is stated as unmeasured rather than
+estimated, because a per-message cost with no number and no note is the wrong
+kind of silence.
 
 ## Globals
 

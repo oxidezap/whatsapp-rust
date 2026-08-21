@@ -125,6 +125,8 @@ fn write(buffer: &mut WamBuffer, event: &PendingEvent) {
         PendingEvent::ReceiptStanzaReceive(e) => buffer.write_event(e, 1_755_000_000, 1),
         PendingEvent::WamClientErrors(e) => buffer.write_event(e, 1_755_000_000, 1),
         PendingEvent::WamDroppedEvent(e) => buffer.write_event(e, 1_755_000_000, 1),
+        PendingEvent::WebcSocketConnect(e) => buffer.write_event(e, 1_755_000_000, 1),
+        PendingEvent::WebWamForceFlush(e) => buffer.write_event(e, 1_755_000_000, 1),
     }
     .expect("every emitted event belongs to the regular channel");
 }
@@ -137,6 +139,8 @@ fn name_of(event: &PendingEvent) -> &'static str {
         PendingEvent::ReceiptStanzaReceive(_) => events::ReceiptStanzaReceive::NAME,
         PendingEvent::WamClientErrors(_) => events::WamClientErrors::NAME,
         PendingEvent::WamDroppedEvent(_) => events::WamDroppedEvent::NAME,
+        PendingEvent::WebcSocketConnect(_) => events::WebcSocketConnect::NAME,
+        PendingEvent::WebWamForceFlush(_) => events::WebWamForceFlush::NAME,
     }
 }
 
@@ -183,6 +187,11 @@ fn maximal_events() -> Vec<PendingEvent> {
             dropped_event_count: Some(1),
             ..Default::default()
         }),
+        // Both of these are maximal while empty: WA Web writes no field at
+        // either call site, so filling one would be the thing this gate exists
+        // to catch.
+        PendingEvent::WebcSocketConnect(events::WebcSocketConnect::default()),
+        PendingEvent::WebWamForceFlush(events::WebWamForceFlush::default()),
     ]
 }
 
@@ -195,7 +204,7 @@ fn every_field_this_plugin_writes_is_one_wa_web_writes() {
             call_sites_for(name).unwrap_or_else(|| panic!("{name} is not in the call-site table"));
         let union: Vec<&str> = sites.union().collect();
         assert!(
-            !union.is_empty(),
+            !sites.sites.is_empty(),
             "{name} has no recovered call site, so nothing can be checked against it"
         );
         assert!(
@@ -203,7 +212,22 @@ fn every_field_this_plugin_writes_is_one_wa_web_writes() {
             "{name} has a partial call site, so its field union is only a lower bound; \
              re-read the site before trusting this check"
         );
-        for field in written_fields(&event) {
+        let written = written_fields(&event);
+        // An event WA Web constructs without writing a field is a counter, and
+        // this plugin has to emit it as one. Checking the two directions apart
+        // keeps "the union is empty" from reading as "nothing to check".
+        if union.is_empty() {
+            assert!(
+                written.is_empty(),
+                "{name} is written with {} field(s) here and none at any of its \
+                 {} call sites in WA Web",
+                written.len(),
+                sites.sites.len(),
+            );
+            checked += 1;
+            continue;
+        }
+        for field in written {
             assert!(
                 union.contains(&field),
                 "{name}.{field} is written by this plugin and by no call site of \
@@ -222,9 +246,11 @@ fn every_field_this_plugin_writes_is_one_wa_web_writes() {
 fn no_derivation_writes_an_undeclared_field() {
     use whatsapp_rust::wacore::types::events::EncDecryptFailureReason;
     use whatsapp_rust::wacore::types::message::{AddressingMode, MessageInfo, MessageSource};
-    use whatsapp_rust::wacore::types::presence::ReceiptType;
     use whatsapp_rust::wacore::types::wire_enums::EncMediaType;
-    use whatsapp_rust::wacore_binary::{Jid, Server};
+    use whatsapp_rust::wacore_binary::builder::NodeBuilder;
+    use whatsapp_rust::wacore_binary::marshal::marshal;
+    use whatsapp_rust::wacore_binary::util::unpack;
+    use whatsapp_rust::wacore_binary::{Jid, OwnedNodeRef, Server};
 
     // Inputs chosen so every optional field a derivation can fill is filled:
     // a lid sender on a companion device, in a group, carrying a media type,
@@ -246,6 +272,19 @@ fn no_derivation_writes_an_undeclared_field() {
         ..Default::default()
     };
 
+    // A read receipt for one message: the shape whose derivation fills every
+    // field this plugin can fill on that event.
+    let read_receipt = {
+        let node = NodeBuilder::new("receipt")
+            .attr("id", "STANZA-ID")
+            .attr("from", "15550000002@s.whatsapp.net")
+            .attr("type", "read")
+            .build();
+        let packed = marshal(&node).expect("a receipt marshals");
+        let bytes = unpack(&packed).expect("a marshalled receipt unpacks");
+        OwnedNodeRef::new(bytes.into_owned()).expect("a receipt decodes")
+    };
+
     let produced = [
         PendingEvent::MessageReceive(crate::derive::message_receive(&info)),
         PendingEvent::E2eMessageRecv(crate::derive::e2e_message_recv(
@@ -254,10 +293,10 @@ fn no_derivation_writes_an_undeclared_field() {
             false,
             Some(&EncDecryptFailureReason::NoSession),
         )),
-        PendingEvent::ReceiptStanzaReceive(crate::derive::receipt_stanza_receive(
-            &ReceiptType::Read,
-            2,
-        )),
+        PendingEvent::ReceiptStanzaReceive(
+            crate::derive::receipt_stanza_receive(read_receipt.get())
+                .expect("read is a type this client names"),
+        ),
     ];
 
     for event in produced {

@@ -69,15 +69,17 @@ pub mod store;
 #[cfg(test)]
 mod parity;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use log::warn;
+use whatsapp_rust::wacore::stanza::wire_tags::StanzaTag;
 use whatsapp_rust::wacore::types::events::{Event, EventHandler, EventInterest, EventKind};
 use whatsapp_rust::{
     ClientPlugin, PluginCapability, PluginContext, PluginCoreEventSubscription, PluginFuture,
     PluginIq, PluginManifest, PluginTasks,
 };
+use whatsapp_rust_wam_catalog::events;
 
 pub use identity::WamIdentity;
 pub use runtime::{PendingEvent, UploadFailure, WamStats, WamUploader};
@@ -145,6 +147,15 @@ impl WamApi {
 pub struct WamPlugin {
     config: WamConfig,
     runtime: OnceLock<Arc<WamRuntime>>,
+    /// Kept so the shutdown flush can send through the same capability the flush
+    /// loop uses, rather than opening a second path to the server.
+    uploader: OnceLock<Arc<IqUploader>>,
+    /// Where the flush loop leaves its buffers when it stops.
+    ///
+    /// `None` until the loop parks them, and `None` again once the shutdown
+    /// flush has taken them, so neither can run a second writer against the same
+    /// store no matter how the two are ordered.
+    parked_writer: Arc<Mutex<Option<WamWriter>>>,
 }
 
 impl WamPlugin {
@@ -152,6 +163,8 @@ impl WamPlugin {
         Self {
             config,
             runtime: OnceLock::new(),
+            uploader: OnceLock::new(),
+            parked_writer: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -185,15 +198,25 @@ impl EventHandler for WamEventHandler {
                     )));
             }
             Event::EncDecryptFailed(failed) => {
-                self.0
-                    .observe(PendingEvent::E2eMessageRecv(derive::from_enc_failure(
-                        failed,
-                    )));
+                if let Some(event) = derive::from_enc_failure(failed) {
+                    self.0.observe(PendingEvent::E2eMessageRecv(event));
+                }
             }
-            Event::Receipt(receipt) => {
-                self.0.observe(PendingEvent::ReceiptStanzaReceive(
-                    derive::receipt_stanza_receive(&receipt.r#type, receipt.message_ids.len()),
+            Event::Connected(_) => {
+                // The socket this client just authenticated on. WA Web writes
+                // this one at the same moment and fills none of its fields, so
+                // a fieldless event here is the whole event, not a stub.
+                self.0.observe(PendingEvent::WebcSocketConnect(
+                    events::WebcSocketConnect::default(),
                 ));
+            }
+            Event::RawNode(node) => {
+                let node = node.get();
+                if node.tag.as_ref() == StanzaTag::Receipt.as_str()
+                    && let Some(event) = derive::receipt_stanza_receive(node)
+                {
+                    self.0.observe(PendingEvent::ReceiptStanzaReceive(event));
+                }
             }
             _ => {}
         }
@@ -206,15 +229,23 @@ impl EventHandler for WamEventHandler {
 
 /// The core events this plugin subscribes to.
 ///
-/// Two of them, `DecryptedPayload` and `EncDecryptFailed`, are lease-gated:
-/// the client builds and dispatches them only while a consumer asks for them,
-/// and subscribing here is what asks. That is the running cost of turning WAM
-/// on, and it is per `<enc>` rather than per message.
+/// Three of them, `DecryptedPayload`, `EncDecryptFailed` and `RawNode`, are
+/// lease-gated: the client builds and dispatches them only while a consumer asks
+/// for them, and subscribing here is what asks. That is the running cost of
+/// turning WAM on.
+///
+/// `RawNode` is the widest of the three, since it forwards every decoded stanza
+/// and this handler keeps only `<receipt>`. It is here anyway because
+/// `ReceiptStanzaReceive` is a per-stanza metric, and the `Receipt` event it
+/// would otherwise be derived from is not one per stanza. Paying a tag
+/// comparison per inbound stanza is the price of the number being the number it
+/// claims to be.
 const WAM_INTEREST: EventInterest = EventInterest::none()
     .with(EventKind::Messages)
     .with(EventKind::DecryptedPayload)
     .with(EventKind::EncDecryptFailed)
-    .with(EventKind::Receipt);
+    .with(EventKind::RawNode)
+    .with(EventKind::Connected);
 
 impl ClientPlugin for WamPlugin {
     type Api = WamApi;
@@ -247,9 +278,14 @@ impl ClientPlugin for WamPlugin {
                 .set(runtime.clone())
                 .map_err(|_| anyhow::anyhow!("the wam plugin was installed more than once"))?;
 
+            let uploader = Arc::new(IqUploader(iq));
+            self.uploader
+                .set(uploader.clone())
+                .map_err(|_| anyhow::anyhow!("the wam plugin was installed more than once"))?;
+
             let subscription =
                 core_events.subscribe(WAM_INTEREST, Arc::new(WamEventHandler(runtime.clone())))?;
-            spawn_flush_loop(tasks, iq, runtime.clone())?;
+            spawn_flush_loop(tasks, uploader, runtime.clone(), self.parked_writer.clone())?;
             Ok(Arc::new(WamApi {
                 runtime,
                 _core_events: subscription,
@@ -257,11 +293,42 @@ impl ClientPlugin for WamPlugin {
         })
     }
 
+    /// Flush what is still queued, best effort, inside the deadline the host
+    /// already applies to this callback.
+    ///
+    /// Not a new deadline and not a guarantee: the host bounds every shutdown
+    /// callback, and an upload that does not finish inside that bound leaves the
+    /// buffer retained rather than delaying the teardown. With the in-memory
+    /// store that means the last buffer is lost, which is what an in-memory
+    /// store is; with a durable one the next run sends it.
+    ///
+    /// The host drains a plugin's tasks before it calls this, so the flush loop
+    /// has already parked its buffers and nothing races for them.
     fn shutdown(&self) -> PluginFuture<'_, Result<()>> {
-        // Nothing to flush synchronously: the last buffer is telemetry, and
-        // holding a shutdown open to deliver it would trade a client's teardown
-        // deadline for a metric. The store keeps what a durable one was given.
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            let (Some(runtime), Some(uploader)) = (self.runtime.get(), self.uploader.get()) else {
+                return Ok(());
+            };
+            let parked = self
+                .parked_writer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("the wam writer lock was poisoned"))?
+                .take();
+            let Some(mut writer) = parked else {
+                return Ok(());
+            };
+            // The official client's own answer to this instant. Observed before
+            // the flush so it rides the buffer it describes.
+            runtime.observe(PendingEvent::WebWamForceFlush(
+                events::WebWamForceFlush::default(),
+            ));
+            let now = whatsapp_rust::wacore::time::now_utc().timestamp();
+            let mut roll = rand::random::<f64>;
+            runtime
+                .tick(&mut writer, uploader.as_ref(), now, &mut roll, true)
+                .await;
+            Ok(())
+        })
     }
 }
 
@@ -271,17 +338,27 @@ impl ClientPlugin for WamPlugin {
 /// reconnect, so the events observed just before a drop are still uploaded after
 /// it. An upload attempted while disconnected fails and the buffer is retained,
 /// which is the same path a server error takes.
-fn spawn_flush_loop(tasks: PluginTasks, iq: PluginIq, runtime: Arc<WamRuntime>) -> Result<()> {
+fn spawn_flush_loop(
+    tasks: PluginTasks,
+    uploader: Arc<IqUploader>,
+    runtime: Arc<WamRuntime>,
+    parked_writer: Arc<Mutex<Option<WamWriter>>>,
+) -> Result<()> {
     let worker = tasks.clone();
     tasks.spawn(async move {
-        let uploader = IqUploader(iq);
         let mut writer = WamWriter::default();
         while worker.sleep(BUFFERING_INTERVAL).await.is_ok() {
             let now = whatsapp_rust::wacore::time::now_utc().timestamp();
             let mut roll = rand::random::<f64>;
             runtime
-                .tick(&mut writer, &uploader, now, &mut roll, false)
+                .tick(&mut writer, uploader.as_ref(), now, &mut roll, false)
                 .await;
+        }
+        // Parked for the shutdown flush, which is the only thing that runs after
+        // this loop. A poisoned lock means a panic already lost the buffers, so
+        // there is nothing left to hand over.
+        if let Ok(mut slot) = parked_writer.lock() {
+            *slot = Some(writer);
         }
     })?;
     Ok(())

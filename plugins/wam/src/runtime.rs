@@ -79,6 +79,14 @@ pub enum PendingEvent {
     ReceiptStanzaReceive(events::ReceiptStanzaReceive),
     WamClientErrors(events::WamClientErrors),
     WamDroppedEvent(events::WamDroppedEvent),
+    /// The client opened its chat socket. Fieldless here because it is fieldless
+    /// at WA Web's own call site: the four fields the catalog declares for it
+    /// name a browser handshake this client does not perform, and the official
+    /// constructor writes none of them either.
+    WebcSocketConnect(events::WebcSocketConnect),
+    /// The client is flushing its buffers ahead of the schedule, which for this
+    /// plugin means shutdown. The event declares no fields at all.
+    WebWamForceFlush(events::WebWamForceFlush),
 }
 
 impl PendingEvent {
@@ -90,6 +98,8 @@ impl PendingEvent {
             Self::ReceiptStanzaReceive(_) => events::ReceiptStanzaReceive::CODE,
             Self::WamClientErrors(_) => events::WamClientErrors::CODE,
             Self::WamDroppedEvent(_) => events::WamDroppedEvent::CODE,
+            Self::WebcSocketConnect(_) => events::WebcSocketConnect::CODE,
+            Self::WebWamForceFlush(_) => events::WebWamForceFlush::CODE,
         }
     }
 
@@ -103,6 +113,8 @@ impl PendingEvent {
             }
             Self::WamClientErrors(_) => events::WamClientErrors::WEIGHTS[sampling::RELEASE],
             Self::WamDroppedEvent(_) => events::WamDroppedEvent::WEIGHTS[sampling::RELEASE],
+            Self::WebcSocketConnect(_) => events::WebcSocketConnect::WEIGHTS[sampling::RELEASE],
+            Self::WebWamForceFlush(_) => events::WebWamForceFlush::WEIGHTS[sampling::RELEASE],
         }
     }
 
@@ -113,6 +125,8 @@ impl PendingEvent {
             Self::ReceiptStanzaReceive(e) => buffer.write_event(e, now_secs, weight),
             Self::WamClientErrors(e) => buffer.write_event(e, now_secs, weight),
             Self::WamDroppedEvent(e) => buffer.write_event(e, now_secs, weight),
+            Self::WebcSocketConnect(e) => buffer.write_event(e, now_secs, weight),
+            Self::WebWamForceFlush(e) => buffer.write_event(e, now_secs, weight),
         };
         match written {
             Ok(()) => true,
@@ -170,6 +184,12 @@ pub struct WamStats {
     pub sampled_out: u64,
     /// Events dropped because the queue was full.
     pub dropped: u64,
+    /// Events lost because no buffer could be started to hold them: the store
+    /// would not issue a sequence number, or a global no longer belongs on the
+    /// channel. Counted apart from [`Self::dropped`] because the two say
+    /// different things about a client, and the fix for one is not the fix for
+    /// the other.
+    pub unbuffered: u64,
     /// Buffers the server accepted.
     pub uploaded: u64,
     /// Buffers abandoned: too large to upload, or over the retention cap.
@@ -284,11 +304,29 @@ impl WamRuntime {
                         Some(report.dropped_event_count.unwrap_or(0).saturating_add(1));
                 }
                 _ => {
-                    shared.queue.pop_back();
+                    // The report needs a slot and the queue has none, so the
+                    // newest queued event pays for it. That event is dropped as
+                    // surely as the one that just arrived, so it is counted the
+                    // same way, and named in the report too when it was the same
+                    // kind. A report evicted here needs no second count: its
+                    // drops were counted as they happened.
+                    let mut count = 1;
+                    if let Some(evicted) = shared.queue.pop_back()
+                        && !matches!(evicted, PendingEvent::WamDroppedEvent(_))
+                    {
+                        shared.stats.dropped += 1;
+                        // The report names one code. An evicted event of another
+                        // kind is real and counted, but there is nowhere on the
+                        // wire to say which kind it was without inventing a
+                        // second report the queue has no room for.
+                        if i64::from(evicted.code()) == code {
+                            count += 1;
+                        }
+                    }
                     shared.queue.push_back(PendingEvent::WamDroppedEvent(
                         events::WamDroppedEvent {
                             dropped_event_code: Some(code),
-                            dropped_event_count: Some(1),
+                            dropped_event_count: Some(count),
                             ..Default::default()
                         },
                     ));
@@ -350,7 +388,7 @@ impl WamRuntime {
                 match self.start_buffer().await {
                     Some(buffer) => writer.current = Some(buffer),
                     None => {
-                        self.lock().stats.dropped += 1;
+                        self.lock().stats.unbuffered += 1;
                         continue;
                     }
                 }
@@ -485,7 +523,21 @@ impl WamRuntime {
     /// is a set whose sequence numbers have holes, which is worse for the server
     /// than none at all.
     async fn retain(&self, bytes: Vec<u8>) {
-        let pending = self.store.pending().await.unwrap_or_default();
+        // A read that failed is not an empty store. Treating it as one would put
+        // this buffer under a key a retained buffer may already hold and let the
+        // store's insert semantics overwrite an undelivered one, and it would
+        // compare the retention cap against a total known to be wrong. Dropping
+        // the newest buffer costs one buffer; guessing costs whichever buffer it
+        // lands on.
+        let pending = match self.store.pending().await {
+            Ok(pending) => pending,
+            Err(err) => {
+                warn!("wam: cannot retain a buffer without reading the retained set: {err}");
+                self.lock().stats.discarded += 1;
+                self.report_buffer_drop();
+                return;
+            }
+        };
         let retained: usize = pending.iter().map(|b| b.bytes.len()).sum();
         if retained.saturating_add(bytes.len()) > MAX_BUFFER_SIZE {
             for buffer in pending {
@@ -528,27 +580,40 @@ impl WamRuntime {
             }
         };
         for buffer in pending {
-            // Removed first either way. A buffer that failed again is offered
-            // back to `retain`, which is where the retention cap lives; leaving
-            // it in place instead would let the cap be exceeded by a buffer that
-            // is already past it.
-            let _ = self.store.remove_pending(buffer.key).await;
+            // Removed once the outcome is known, never before it. Removing first
+            // would lose the buffer to a crash or a cancelled flush between the
+            // delete and the answer, which is the one window a durable store
+            // exists to close. A buffer left in place is already counted against
+            // the retention cap, so keeping it there instead of re-storing it
+            // also keeps the cap honest without a second write.
             match self
                 .deliver(writer, uploader, now_secs, &buffer.bytes)
                 .await
             {
                 Delivery::Accepted => {
                     writer.last_upload_secs = Some(now_secs);
+                    self.forget(buffer.key).await;
                 }
                 Delivery::Retryable => {
-                    self.retain(buffer.bytes).await;
                     // One failing buffer means the server or the link is
                     // unhappy; marching through the rest would just fail as
                     // many times.
                     return;
                 }
-                Delivery::Unsendable => {}
+                Delivery::Unsendable => self.forget(buffer.key).await,
             }
+        }
+    }
+
+    /// Drop a retained buffer that has been dealt with.
+    ///
+    /// A removal that fails leaves the buffer retained, so the next drain offers
+    /// it again. For one the server accepted that is a duplicate upload, which is
+    /// the direction to fail in: the server sees a buffer twice instead of this
+    /// client losing one, and the log says which happened.
+    async fn forget(&self, key: u64) {
+        if let Err(err) = self.store.remove_pending(key).await {
+            warn!("wam: a delivered buffer stayed retained and may be sent again: {err}");
         }
     }
 }
@@ -591,7 +656,7 @@ pub fn backoff(failures: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::InMemoryWamStore;
+    use crate::store::{InMemoryWamStore, WamStoreError};
     use std::sync::Mutex as StdMutex;
 
     /// An uploader whose answers a test scripts, recording what it was given.
@@ -831,18 +896,22 @@ mod tests {
         runtime.observe(receipt());
         let stats = runtime.stats();
         assert_eq!(stats.observed, 3);
-        assert_eq!(stats.dropped, 1);
+        // Two: the event that arrived to a full queue, and the queued event
+        // evicted to make room for the report about it.
+        assert_eq!(stats.dropped, 2);
 
         // A fourth drop of the same event coalesces into the report already
         // queued rather than pushing another one out.
         runtime.observe(receipt());
-        assert_eq!(runtime.stats().dropped, 2);
+        assert_eq!(runtime.stats().dropped, 3);
         let queued = runtime.queued();
         assert_eq!(queued.len(), 2, "the queue stayed at its bound");
         let PendingEvent::WamDroppedEvent(report) = &queued[1] else {
             panic!("the newest slot holds the drop report");
         };
-        assert_eq!(report.dropped_event_count, Some(2));
+        // What the server is told matches what the local counter says, because
+        // every one of those drops was a receipt.
+        assert_eq!(report.dropped_event_count, Some(3));
         assert_eq!(
             report.dropped_event_code,
             Some(i64::from(events::ReceiptStanzaReceive::CODE))
@@ -1003,6 +1072,224 @@ mod tests {
                 .any(|b| b.bytes == b"WAM-from-a-previous-run"),
             "the previous run's buffer survived"
         );
+    }
+
+    /// A store that answers `pending()` with an error while still accepting
+    /// writes, which is the failure that matters: the runtime cannot see what is
+    /// retained but can still overwrite it.
+    #[derive(Debug)]
+    struct BlindStore {
+        inner: InMemoryWamStore,
+        blind: StdMutex<bool>,
+    }
+
+    impl BlindStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryWamStore::new(),
+                blind: StdMutex::new(true),
+            }
+        }
+
+        fn see_again(&self) {
+            *self.blind.lock().expect("blind lock") = false;
+        }
+    }
+
+    #[async_trait]
+    impl WamStore for BlindStore {
+        async fn next_sequence(&self, channel: Channel) -> Result<u16, WamStoreError> {
+            self.inner.next_sequence(channel).await
+        }
+
+        async fn put_pending(&self, buffer: PendingBuffer) -> Result<(), WamStoreError> {
+            self.inner.put_pending(buffer).await
+        }
+
+        async fn pending(&self) -> Result<Vec<PendingBuffer>, WamStoreError> {
+            if *self.blind.lock().expect("blind lock") {
+                return Err(WamStoreError::new("the store cannot be read"));
+            }
+            self.inner.pending().await
+        }
+
+        async fn remove_pending(&self, key: u64) -> Result<(), WamStoreError> {
+            self.inner.remove_pending(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_be_read_does_not_get_a_guessed_key() {
+        // A failed read is not an empty store. Retaining under a guessed key
+        // would overwrite whichever undelivered buffer already holds it, so the
+        // new buffer is dropped and counted instead.
+        let store = Arc::new(BlindStore::new());
+        store
+            .inner
+            .put_pending(PendingBuffer {
+                key: 1,
+                channel: Channel::Regular,
+                bytes: b"WAM-undelivered".to_vec(),
+            })
+            .await
+            .expect("seed");
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([Err(UploadFailure::Retryable("503".into()))]);
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                false,
+            )
+            .await;
+
+        store.see_again();
+        let pending = store.pending().await.expect("pending");
+        assert_eq!(pending.len(), 1, "nothing was written over the seeded key");
+        assert_eq!(pending[0].bytes, b"WAM-undelivered");
+        assert_eq!(runtime.stats().discarded, 1);
+    }
+
+    /// A store that will not issue a sequence number, so no buffer can start.
+    #[derive(Debug, Default)]
+    struct SequencelessStore;
+
+    #[async_trait]
+    impl WamStore for SequencelessStore {
+        async fn next_sequence(&self, _channel: Channel) -> Result<u16, WamStoreError> {
+            Err(WamStoreError::new("no sequence"))
+        }
+
+        async fn put_pending(&self, _buffer: PendingBuffer) -> Result<(), WamStoreError> {
+            Ok(())
+        }
+
+        async fn pending(&self) -> Result<Vec<PendingBuffer>, WamStoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn remove_pending(&self, _key: u64) -> Result<(), WamStoreError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_with_no_buffer_to_hold_it_is_counted_apart_from_queue_pressure() {
+        // Both lose an event, but one says the client is producing faster than
+        // it uploads and the other says the store is broken. An operator acts on
+        // them differently, so they are counted differently.
+        let runtime = WamRuntime::new(WamIdentity::web(), Arc::new(SequencelessStore), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([Ok(())]);
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                false,
+            )
+            .await;
+        let stats = runtime.stats();
+        assert_eq!(stats.unbuffered, 1);
+        assert_eq!(stats.dropped, 0, "the queue was never full");
+        assert_eq!(stats.written, 0);
+    }
+
+    /// A store that counts the removals asked of it, so a test can see *when*
+    /// a retained buffer was forgotten and not only that it eventually was.
+    #[derive(Debug, Default)]
+    struct CountingStore {
+        inner: InMemoryWamStore,
+        removals: StdMutex<Vec<u64>>,
+    }
+
+    impl CountingStore {
+        fn removals(&self) -> Vec<u64> {
+            self.removals.lock().expect("removals lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl WamStore for CountingStore {
+        async fn next_sequence(&self, channel: Channel) -> Result<u16, WamStoreError> {
+            self.inner.next_sequence(channel).await
+        }
+
+        async fn put_pending(&self, buffer: PendingBuffer) -> Result<(), WamStoreError> {
+            self.inner.put_pending(buffer).await
+        }
+
+        async fn pending(&self) -> Result<Vec<PendingBuffer>, WamStoreError> {
+            self.inner.pending().await
+        }
+
+        async fn remove_pending(&self, key: u64) -> Result<(), WamStoreError> {
+            self.removals.lock().expect("removals lock").push(key);
+            self.inner.remove_pending(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retained_buffer_is_forgotten_only_once_the_server_has_taken_it() {
+        // Removing before the answer loses the buffer to a crash in between,
+        // which is the one window a durable store exists to close. So the test
+        // is about when the removal happens, not about whether the bytes are
+        // still somewhere afterwards.
+        let store = Arc::new(CountingStore::default());
+        store
+            .put_pending(PendingBuffer {
+                key: 1,
+                channel: Channel::Regular,
+                bytes: b"WAM-retained".to_vec(),
+            })
+            .await
+            .expect("seed");
+        store.removals.lock().expect("removals lock").clear();
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+
+        // First tick: the server refuses. Nothing is removed, and the buffer
+        // stays under the key it already had.
+        let refusing = ScriptedUploader::with([Err(UploadFailure::Retryable("503".into()))]);
+        runtime
+            .tick(
+                &mut writer,
+                &refusing,
+                1_755_000_000,
+                &mut keep_all(),
+                false,
+            )
+            .await;
+        assert_eq!(
+            store.removals(),
+            Vec::<u64>::new(),
+            "a refused buffer is never unstored"
+        );
+        let pending = store.pending().await.expect("pending");
+        assert_eq!(pending.len(), 1, "a refused buffer is still retained");
+        assert_eq!(pending[0].key, 1, "and under the key it already had");
+        assert_eq!(pending[0].bytes, b"WAM-retained");
+
+        // Second tick, past the cooldown: accepted, and only now forgotten.
+        let accepting = ScriptedUploader::with([Ok(())]);
+        runtime
+            .tick(
+                &mut writer,
+                &accepting,
+                1_755_000_600,
+                &mut keep_all(),
+                false,
+            )
+            .await;
+        assert_eq!(store.removals(), vec![1], "an accepted buffer is forgotten");
+        assert!(store.pending().await.expect("pending").is_empty());
+        assert_eq!(accepting.seen().len(), 1);
     }
 
     #[test]
