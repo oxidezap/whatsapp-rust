@@ -409,7 +409,13 @@ what a component can introspect — absent means "not reported", not zero):
   memory that was not resident. `Some(0)` rather than `None` because an empty
   pool is a measured fact, not an absence of introspection. Once a request has
   gone out the cap is a floor, not a ceiling: a pooled TLS connection measures
-  ~98 KiB, of which the 32 KiB of ureq buffers is all this field claims. A
+  ~98 KiB, of which the 32 KiB of ureq buffers is all this field claims. That
+  post-request estimate is a latch and deliberately not a timer: ureq expires an
+  idle connection only when a later request touches the pool, so the bytes stay
+  resident for exactly as long as the latch keeps claiming them. It overreports
+  in one case — when the request that finally purges pools nothing itself, a
+  second version fetch a day later say — leaving an empty pool the latch still
+  reports as the cap. A
   custom agent reports `None` throughout — its buffer sizes are opaque, and
   since agents share one pool with all their clones it may already have
   connected before the client wrapped it, so its pool is not knowably empty
@@ -428,10 +434,11 @@ worker.
 `connect()` fetches `sw.js` over TLS through `version::resolve_and_update_version`
 unless `with_version` is set or the cached version is under 24h old, so a session
 that never touches media still opens one TLS connection. A pooled connection is
-retained until something touches the pool again — ureq's `max_idle_age` never
-fires, because `Connection::age()` returns zero — and the next fetch for that
-device is a day away, so the connection would sit resident for the whole session
-buying nothing. Measured at **88 KiB of `RssAnon` per session** (median over 16
+retained until something touches the pool again — `max_idle_age` (15s by
+default) is enforced lazily, inside `ConnectionPool::connect` and
+`Connection::reuse`, so an idle connection ages out on the next request and not
+a moment before — and the next fetch for that device is a day away, so the
+connection would sit resident for the whole session buying nothing. Measured at **88 KiB of `RssAnon` per session** (median over 16
 agents, release, against a keep-alive TLS server).
 
 `fetch_latest_app_version` therefore sends `Connection: close`, which ureq acts

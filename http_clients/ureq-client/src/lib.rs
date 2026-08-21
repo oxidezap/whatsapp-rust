@@ -336,6 +336,14 @@ impl HttpClient for UreqHttpClient {
     /// session's estimate on memory that was not resident, and the client's
     /// `resource_report()` total promises a lower bound.
     ///
+    /// A latch, not a timer, even though ureq does expire idle connections
+    /// (`max_idle_age`, 15s): it expires them lazily, from `connect` and
+    /// `reuse`, so the buffers of an aged-out connection stay resident until
+    /// some later request touches the pool. Residency is what this reports, so
+    /// dropping the estimate on a clock would understate it for as long as
+    /// nothing asks ureq for a connection — the one direction a lower bound
+    /// must never take.
+    ///
     /// Both answers need an agent we built. A caller-supplied one
     /// ([`UreqHttpClient::with_agent`]) may already have connected before it
     /// reached us, since agents share their pool with every clone, so its pool
