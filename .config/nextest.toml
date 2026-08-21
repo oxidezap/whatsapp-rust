@@ -26,11 +26,12 @@ slow-timeout = { period = "60s" }
 # is the last thing in the log rather than something to scroll back for.
 fail-fast = false
 failure-output = "immediate-final"
-# 20s names an outlier while it is still one test's problem; the inherited 60s
-# left a 120s test reported as one SLOW line. The ceiling is 6 periods: enough
-# headroom that the slowest test here has ~3x of it under a loaded runner, low
-# enough that a hang costs one test's wall clock instead of the job's.
-slow-timeout = { period = "20s", terminate-after = 6 }
+# The report below is what makes cost visible now, so this line is only an alarm
+# for something new: 60s sits above the slowest test measured on a CI runner (a
+# MLow fuzz shard at 54s, with 5116 tests contending for four vCPUs). What the
+# profile never had is the ceiling: 3 periods puts it at 180s, so a hang costs
+# one test's wall clock instead of the job's.
+slow-timeout = { period = "60s", terminate-after = 3 }
 # A PASS line per test is thousands of lines of nothing; the summary carries the
 # count and the report below carries the times. `slow` rather than `fail` because
 # the levels nest: this is what names the tests that trip the slow-timeout, where

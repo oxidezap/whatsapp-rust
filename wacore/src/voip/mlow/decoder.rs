@@ -406,6 +406,15 @@ mod tests {
         assert!(corr > 0.95, "lag-0 corr {corr:.4} vs reference");
     }
 
+    /// Inputs the corpus below produces: 8000 LCG buffers, then per capture frame
+    /// eight bit-flips and one truncation per byte plus the frame itself.
+    ///
+    /// Asserted at the end of every shard rather than derived, so growing the
+    /// corpus without re-dividing it fails instead of leaving the new tail
+    /// unfuzzed.
+    const FUZZ_CORPUS_LEN: usize = 149_104;
+    const FUZZ_SHARDS: usize = 4;
+
     // R2 (fuzz no-panic): the decoder is fed adversarial inputs and must neither panic nor over-emit.
     // Corpus: a deterministic LCG of random byte vectors, plus every capture frame with each single
     // byte flipped and each prefix truncation. The contract is purely structural (no panic, bounded
@@ -415,11 +424,28 @@ mod tests {
     // span {16,32} kHz and {10,20,60,120} ms. The hard ceiling is therefore 32 * 120 = 3840 samples,
     // not the 960 of a common 60 ms / 16 kHz frame; a fuzzed TOC can legitimately declare a larger
     // frame, which the decoder fills with silence on the SID/inactive/std-opus paths.
-    #[test]
-    fn fuzz_decode_no_panic_bounded_output() {
+    //
+    // Sharded because ~149k decoder calls in one process were 90% of the unit suite's wall clock
+    // with three of the runner's four cores idle. Each shard walks the whole corpus and decodes
+    // only its own contiguous slice, through a decoder it keeps for the length of that slice: the
+    // property includes what a poisoned frame leaves behind for the next one, which a fresh decoder
+    // per input would not exercise. Four slices, contiguous and disjoint, so their union is the
+    // corpus the single test fed. Do not merge them back.
+    fn fuzz_decode_shard(shard: usize) {
         const MAX_SAMPS: usize = 32 * 120; // max sample_rate(kHz) * max frame_ms across all TOCs
+        let lo = FUZZ_CORPUS_LEN * shard / FUZZ_SHARDS;
+        let hi = FUZZ_CORPUS_LEN * (shard + 1) / FUZZ_SHARDS;
+
+        let mut index = 0usize;
+        let mut decoded = 0usize;
         let mut dec = MlowDecoder::new();
-        let check = |dec: &mut MlowDecoder, input: &[u8]| {
+        let mut check = |dec: &mut MlowDecoder, input: &[u8]| {
+            let mine = index >= lo && index < hi;
+            index += 1;
+            if !mine {
+                return;
+            }
+            decoded += 1;
             let out = dec.decode(input);
             assert!(
                 out.len() <= MAX_SAMPS,
@@ -460,6 +486,37 @@ mod tests {
             }
             check(&mut dec, &frame);
         }
+
+        assert_eq!(
+            index, FUZZ_CORPUS_LEN,
+            "corpus is {index} inputs, not the {FUZZ_CORPUS_LEN} the shards divide"
+        );
+        assert_eq!(
+            decoded,
+            hi - lo,
+            "shard {shard} covered {decoded} of {}",
+            hi - lo
+        );
+    }
+
+    #[test]
+    fn fuzz_decode_no_panic_bounded_output_shard_0() {
+        fuzz_decode_shard(0);
+    }
+
+    #[test]
+    fn fuzz_decode_no_panic_bounded_output_shard_1() {
+        fuzz_decode_shard(1);
+    }
+
+    #[test]
+    fn fuzz_decode_no_panic_bounded_output_shard_2() {
+        fuzz_decode_shard(2);
+    }
+
+    #[test]
+    fn fuzz_decode_no_panic_bounded_output_shard_3() {
+        fuzz_decode_shard(3);
     }
 
     // Fail-loud guards: a frame outside our single operating point (32kHz/fullband, or low_rate=1) is
