@@ -245,28 +245,20 @@ impl std::fmt::Debug for WamRuntime {
     }
 }
 
-/// Why a tick is running, which decides what it is allowed to ignore.
-///
-/// The two differ only in how they treat the cooldown a failed upload sets.
-/// Everything else a tick does is the same.
+/// Why a tick is running, which decides whether it may talk to the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickKind {
     /// The recurring flush. Uploads a buffer that is due and skips one inside a
     /// cooldown, so a failing server is asked at the backoff's pace.
     Scheduled,
-    /// The last tick before the client goes away. Uploads whatever it holds and
-    /// makes one attempt even inside a cooldown: a cooldown defers to the next
-    /// tick, and there is no next tick, so honouring it here is not patience but
-    /// a discard, silent against the default store, which keeps nothing. The
-    /// attempt is bounded by the shutdown deadline the host already applies.
+    /// The last tick before the client goes away. Finishes whatever it holds
+    /// and persists it, and asks the server nothing, because by the time it runs
+    /// the server can no longer be asked: the host closes a plugin's resources
+    /// before invoking its `shutdown` callback, so the IQ capability answers
+    /// `ShuttingDown` rather than sending. What this tick is for is the store: a
+    /// durable one carries the buffer into the next run. The chain is spelled
+    /// out where the decision is taken, in `upload_current`.
     Final,
-}
-
-impl TickKind {
-    /// Whether a cooldown still stops an upload.
-    fn honours_cooldown(self) -> bool {
-        matches!(self, Self::Scheduled)
-    }
 }
 
 /// How draining the retained buffers ended.
@@ -537,12 +529,27 @@ impl WamRuntime {
             return;
         }
         let bytes = buffer.into_bytes();
+        // A final tick finishes the buffer and persists it without asking the
+        // server, because by then it cannot be asked. `PluginHost::shutdown`
+        // runs `signal_shutdown` first, which calls `close_installed_resources`
+        // and sets each plugin's resources closed; only then does it invoke the
+        // `shutdown` callback this tick runs in. `PluginIq::execute` opens with
+        // `ensure_active`, so every upload from here answers
+        // `PluginResourceError::ShuttingDown` before a byte leaves. The attempt
+        // is cheap, since it fails before any I/O, and it is skipped anyway: it
+        // ends at the same retained buffer while recording an upload failure
+        // that was never an upload, and that counter is one an operator reads.
+        // A durable store delivers the buffer on the next run; the in-memory
+        // default loses it either way, which is what it says about itself
+        // through `store_is_durable`.
+        if kind == TickKind::Final {
+            self.retain(bytes).await;
+            return;
+        }
         // Inside a cooldown the buffer is retained without an attempt: the
         // cooldown exists so a failing server is asked at the backoff's pace,
-        // and a buffer finished mid-drain must not get around it. A final tick
-        // is the exception, because retaining is only deferral while there is a
-        // later tick to defer to.
-        if kind.honours_cooldown() && writer.retry_after_secs.is_some_and(|at| now_secs < at) {
+        // and a buffer finished mid-drain must not get around it.
+        if writer.retry_after_secs.is_some_and(|at| now_secs < at) {
             self.retain(bytes).await;
             return;
         }
@@ -678,7 +685,12 @@ impl WamRuntime {
         now_secs: i64,
         kind: TickKind,
     ) -> Drained {
-        if kind.honours_cooldown() && writer.retry_after_secs.is_some_and(|at| now_secs < at) {
+        // Nothing to do on a final tick: it cannot reach the server (see
+        // `upload_current`), and what is already retained is already persisted.
+        if kind == TickKind::Final {
+            return Drained::WithoutFailing;
+        }
+        if writer.retry_after_secs.is_some_and(|at| now_secs < at) {
             return Drained::WithoutFailing;
         }
         let pending = match self.store.pending().await {
@@ -957,90 +969,6 @@ mod tests {
         assert!(store.pending().await.expect("pending").is_empty());
     }
 
-    /// The cooldown defers to the next tick, and a final tick is the one with
-    /// none. Honouring it there retains into a store the default implementation
-    /// throws away, so the shutdown flush would do nothing in exactly the case
-    /// it exists for: a client that had been failing to upload.
-    #[tokio::test]
-    async fn a_final_tick_attempts_an_upload_the_cooldown_would_have_deferred() {
-        let store = Arc::new(InMemoryWamStore::new());
-        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
-        let mut writer = WamWriter::default();
-        let uploader = ScriptedUploader::with([Err(UploadFailure::retryable("503"))]);
-
-        runtime.observe(receipt());
-        runtime
-            .tick(
-                &mut writer,
-                &uploader,
-                1_755_000_000,
-                &mut keep_all(),
-                TickKind::Scheduled,
-            )
-            .await;
-        assert_eq!(uploader.seen().len(), 1);
-        assert_eq!(store.pending().await.expect("pending").len(), 1);
-
-        // Same second, so the cooldown the failure started is still running.
-        // A scheduled tick would not ask again; this one does, and takes both
-        // the buffer left behind and the one the queue just produced.
-        runtime.observe(receipt());
-        runtime
-            .tick(
-                &mut writer,
-                &uploader,
-                1_755_000_000,
-                &mut keep_all(),
-                TickKind::Final,
-            )
-            .await;
-        assert_eq!(uploader.seen().len(), 3);
-        assert_eq!(runtime.stats().uploaded, 2);
-        assert!(store.pending().await.expect("pending").is_empty());
-    }
-
-    /// The other half of the same rule. Ignoring a cooldown an earlier tick set
-    /// is the fix; ignoring one this tick set would be asking a server that just
-    /// refused, in the same instant, which is the hammering the backoff is for.
-    #[tokio::test]
-    async fn a_final_tick_still_waits_for_a_cooldown_it_set_itself() {
-        let store = Arc::new(InMemoryWamStore::new());
-        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
-        let mut writer = WamWriter::default();
-        let uploader = ScriptedUploader::with([
-            Err(UploadFailure::retryable("503")),
-            Err(UploadFailure::retryable("503")),
-        ]);
-
-        runtime.observe(receipt());
-        runtime
-            .tick(
-                &mut writer,
-                &uploader,
-                1_755_000_000,
-                &mut keep_all(),
-                TickKind::Scheduled,
-            )
-            .await;
-        assert_eq!(uploader.seen().len(), 1);
-
-        // The final tick's drain retries the retained buffer and is refused
-        // again. The buffer it builds from the queue behind that refusal is
-        // retained rather than offered: one attempt per instant, not two.
-        runtime.observe(receipt());
-        runtime
-            .tick(
-                &mut writer,
-                &uploader,
-                1_755_000_000 + backoff(0),
-                &mut keep_all(),
-                TickKind::Final,
-            )
-            .await;
-        assert_eq!(uploader.seen().len(), 2);
-        assert_eq!(store.pending().await.expect("pending").len(), 2);
-    }
-
     /// The local curve is a guess about a server that stopped answering. A
     /// `backoff` the server named is that server saying when to come back, and
     /// its first local step is one second, so dropping it asks again 29 seconds
@@ -1168,6 +1096,46 @@ mod tests {
         let pending = store.pending().await.expect("pending");
         assert_eq!(pending.len(), 1, "the private one is still retained");
         assert_eq!(pending[0].channel, Channel::Private);
+    }
+
+    /// The host closes a plugin's resources before it calls that plugin's
+    /// `shutdown`, so the IQ capability answers `ShuttingDown` rather than
+    /// sending. A final tick therefore does the half it still can: finish the
+    /// buffer and put it in the store, where a durable one carries it into the
+    /// next run.
+    #[tokio::test]
+    async fn a_final_tick_persists_its_buffer_without_asking_the_server() {
+        let store = Arc::new(InMemoryWamStore::new());
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([]);
+
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Final,
+            )
+            .await;
+
+        assert!(
+            uploader.seen().is_empty(),
+            "the server cannot be reached from a shutdown callback"
+        );
+        let stats = runtime.stats();
+        assert_eq!(stats.written, 1, "the event still reached a buffer");
+        assert_eq!(
+            stats.upload_failures, 0,
+            "and no upload was recorded as having failed"
+        );
+        assert_eq!(
+            store.pending().await.expect("pending").len(),
+            1,
+            "the buffer is in the store for the next run"
+        );
     }
 
     #[tokio::test]
@@ -1370,7 +1338,7 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                TickKind::Final,
+                TickKind::Scheduled,
             )
             .await;
         assert!(
@@ -1389,7 +1357,7 @@ mod tests {
                 &uploader,
                 1_755_000_001,
                 &mut roll,
-                TickKind::Final,
+                TickKind::Scheduled,
             )
             .await;
         let seen = uploader.seen();
@@ -1543,7 +1511,20 @@ mod tests {
                 &uploader,
                 1_755_000_000,
                 &mut keep_all(),
-                TickKind::Final,
+                TickKind::Scheduled,
+            )
+            .await;
+        assert_eq!(uploader.seen().len(), 1, "the retained one goes first");
+
+        // The drain stamped `last_upload_secs`, so the held buffer is not due
+        // in the same instant; it goes out on the rotate that follows.
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000 + ROTATE_INTERVAL_SECS,
+                &mut keep_all(),
+                TickKind::Scheduled,
             )
             .await;
         let seen = uploader.seen();

@@ -141,7 +141,7 @@ async fn one_observation_reaches_the_wire_as_a_stats_stanza() {
             &uploader,
             1_755_000_000,
             &mut || 0.0,
-            TickKind::Final,
+            TickKind::Scheduled,
         )
         .await;
 
