@@ -401,16 +401,8 @@ pub async fn prepare_group_stanza(
         .await?;
 
         if let Some(plan) = session_plan {
-            let skdm_wrapper_msg = wa::Message {
-                sender_key_distribution_message: buffa::MessageField::some(
-                    wa::message::SenderKeyDistributionMessage {
-                        group_id: Some(to_jid.to_string()),
-                        axolotl_sender_key_distribution_message: Some(axolotl_skdm_bytes),
-                    },
-                ),
-                ..Default::default()
-            };
-            let skdm_plaintext_to_encrypt = MessageUtils::encode_and_pad(&skdm_wrapper_msg);
+            let skdm_plaintext_to_encrypt =
+                MessageUtils::encode_and_pad_skdm_wrapper(to_jid, &axolotl_skdm_bytes);
 
             // SKDM distribution failure must not prevent the group message from
             // being sent. Only successfully encrypted devices are tracked.

@@ -11,9 +11,11 @@ use waproto::whatsapp as wa;
 
 pub struct MessageUtils;
 
-/// Names the DSM destination without requiring it to exist as a string.
+/// Names a JID-valued protobuf string field without requiring it to exist as a
+/// `String`: the DSM destination, and the group id on the sender-key
+/// distribution wrapper.
 ///
-/// The DSM field needs the JID's length before its bytes, so the caller used to
+/// Such a field needs the JID's length before its bytes, so the caller used to
 /// render one into a `String` just to measure it and copy it. A `Jid` can do
 /// both without the intermediate: this is what lets `&Jid` and `&str` share the
 /// same body instead of the format existing in two shapes.
@@ -165,6 +167,47 @@ impl MessageUtils {
         let size = waproto::codec::message_compute_size(msg, &mut cache);
         let mut buf = Vec::with_capacity(size + pad as usize);
         waproto::codec::message_write_to(msg, &mut cache, &mut buf);
+        buf.resize(buf.len() + pad as usize, pad);
+        buf
+    }
+
+    /// Encode + pad the sender-key distribution wrapper a group send fans out to
+    /// every recipient device: `Message { sender_key_distribution_message {
+    /// group_id, axolotl_sender_key_distribution_message } }`.
+    ///
+    /// Two scalar fields around an already-serialized SKDM, so building a
+    /// `wa::Message` for it walked the whole `Message` schema twice (size then
+    /// write) to place three tags, and rendering the group JID into a `String`
+    /// allocated a name the wire form copies and drops immediately. Both nested
+    /// lengths are known before a byte is written, so the wrapper is framed
+    /// directly into one exactly-sized allocation. Byte-identical to
+    /// `encode_and_pad` over that message for any given pad, which
+    /// `skdm_wrapper_framing_matches_message_encode` locks.
+    pub fn encode_and_pad_skdm_wrapper(
+        group_id: impl DsmDestination,
+        axolotl_skdm: &[u8],
+    ) -> Vec<u8> {
+        let pad = Self::random_pad_len();
+        let group_len = group_id.encoded_len();
+        let inner_len = len_delimited_len(TAG_SKDM_GROUP_ID, group_len)
+            + len_delimited_len(TAG_SKDM_AXOLOTL, axolotl_skdm.len());
+        let mut buf = Vec::with_capacity(
+            len_delimited_len(TAG_SENDER_KEY_DISTRIBUTION_MESSAGE, inner_len) + pad as usize,
+        );
+        push_wire_tag(
+            TAG_SENDER_KEY_DISTRIBUTION_MESSAGE,
+            buffa::encoding::WireType::LengthDelimited,
+            &mut buf,
+        );
+        push_varint(inner_len as u64, &mut buf);
+        push_wire_tag(
+            TAG_SKDM_GROUP_ID,
+            buffa::encoding::WireType::LengthDelimited,
+            &mut buf,
+        );
+        push_varint(group_len as u64, &mut buf);
+        group_id.write_into(&mut buf);
+        push_len_delimited(TAG_SKDM_AXOLOTL, axolotl_skdm, &mut buf);
         buf.resize(buf.len() + pad as usize, pad);
         buf
     }
@@ -930,6 +973,11 @@ const TAG_DEVICE_SENT_MESSAGE: u32 = waproto::tags::message::DEVICE_SENT_MESSAGE
 const TAG_MESSAGE_CONTEXT_INFO: u32 = waproto::tags::message::MESSAGE_CONTEXT_INFO;
 const TAG_DSM_DESTINATION_JID: u32 = waproto::tags::message::device_sent_message::DESTINATION_JID;
 const TAG_DSM_MESSAGE: u32 = waproto::tags::message::device_sent_message::MESSAGE;
+const TAG_SENDER_KEY_DISTRIBUTION_MESSAGE: u32 =
+    waproto::tags::message::SENDER_KEY_DISTRIBUTION_MESSAGE;
+const TAG_SKDM_GROUP_ID: u32 = waproto::tags::message::sender_key_distribution_message::GROUP_ID;
+const TAG_SKDM_AXOLOTL: u32 =
+    waproto::tags::message::sender_key_distribution_message::AXOLOTL_SENDER_KEY_DISTRIBUTION_MESSAGE;
 
 const DEVICE_SENT_INNER_MESSAGE_PATH: &[u32] = &[TAG_DEVICE_SENT_MESSAGE, TAG_DSM_MESSAGE];
 const DIRECT_HISTORY_PAYLOAD_PATH: &[u32] = &[
@@ -2619,6 +2667,95 @@ mod device_sent_tests {
             first_field_number(&dsm_msg.encode_to_vec()),
             TAG_DSM_MESSAGE,
             "DeviceSentMessage.message tag drifted from the .proto"
+        );
+    }
+
+    /// The hand-framed SKDM wrapper must be byte-identical to encoding the
+    /// equivalent `wa::Message` — same tags, same nested lengths, same order —
+    /// once the pads are stripped. `to_jid` is a `Jid` here, so the
+    /// `DsmDestination` render is compared against `Jid::to_string` too.
+    #[test]
+    fn skdm_wrapper_framing_matches_message_encode() {
+        use std::str::FromStr as _;
+
+        let axolotl = vec![0x33u8; 197];
+        for group in [
+            "120363000000000001@g.us",
+            "120363000000000001@lid",
+            "5511999998888-1600000000@g.us",
+        ] {
+            let jid = wacore_binary::jid::Jid::from_str(group).expect("valid group jid");
+
+            let reference = wa::Message {
+                sender_key_distribution_message: buffa::MessageField::some(
+                    wa::message::SenderKeyDistributionMessage {
+                        group_id: Some(jid.to_string()),
+                        axolotl_sender_key_distribution_message: Some(axolotl.clone()),
+                    },
+                ),
+                ..Default::default()
+            };
+
+            let framed = MessageUtils::encode_and_pad_skdm_wrapper(&jid, &axolotl);
+            assert_eq!(
+                MessageUtils::unpad_message_ref(&framed, 2).unwrap(),
+                reference.encode_to_vec(),
+                "hand-framed SKDM wrapper drifted from the schema encode for {group}"
+            );
+
+            // And it still decodes back into the same message.
+            let decoded = decode_padded(&framed);
+            let skdm = decoded
+                .sender_key_distribution_message
+                .as_option()
+                .expect("wrapper carries the SKDM field");
+            assert_eq!(skdm.group_id.as_deref(), Some(group));
+            assert_eq!(
+                skdm.axolotl_sender_key_distribution_message.as_deref(),
+                Some(axolotl.as_slice())
+            );
+        }
+    }
+
+    /// Same drift guard as `splice_tags_match_generated_schema`, for the three
+    /// field numbers the SKDM wrapper frames by hand.
+    #[test]
+    fn skdm_wrapper_tags_match_generated_schema() {
+        fn first_field_number(mut bytes: &[u8]) -> u32 {
+            buffa::encoding::Tag::decode(&mut bytes)
+                .expect("probe should start with a valid protobuf tag")
+                .field_number()
+        }
+
+        let outer = wa::Message {
+            sender_key_distribution_message: wa::message::SenderKeyDistributionMessage::default()
+                .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&outer.encode_to_vec()),
+            TAG_SENDER_KEY_DISTRIBUTION_MESSAGE,
+            "Message.sender_key_distribution_message tag drifted from the .proto"
+        );
+
+        let group = wa::message::SenderKeyDistributionMessage {
+            group_id: Some("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&group.encode_to_vec()),
+            TAG_SKDM_GROUP_ID,
+            "SenderKeyDistributionMessage.group_id tag drifted from the .proto"
+        );
+
+        let axolotl = wa::message::SenderKeyDistributionMessage {
+            axolotl_sender_key_distribution_message: Some(vec![1]),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&axolotl.encode_to_vec()),
+            TAG_SKDM_AXOLOTL,
+            "SenderKeyDistributionMessage.axolotl_... tag drifted from the .proto"
         );
     }
 
