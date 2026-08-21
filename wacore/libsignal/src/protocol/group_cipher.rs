@@ -542,10 +542,25 @@ mod tests {
             assert_eq!(plaintext, format!("msg {target}").as_bytes());
         }
 
-        // Now every message the jumps skipped, oldest first, then re-checked in
-        // reverse to cover both ends of the backlog scan.
-        let mut skipped: Vec<usize> = (0..TOTAL).filter(|i| !jump_targets.contains(i)).collect();
-        for &i in &skipped {
+        // Now every message the jumps skipped, delivered late. The order
+        // alternates between the tail and the head of the backlog rather than
+        // running oldest-first: the backlog is a vector searched by a linear
+        // scan, so ascending delivery would remove the front entry every time
+        // and never look past index 0. Alternating makes the first lookup scan
+        // the whole buffer and leaves the later ones landing in its middle.
+        let buffered: Vec<usize> = (0..TOTAL).filter(|i| !jump_targets.contains(i)).collect();
+        let mut delivery_order = Vec::with_capacity(buffered.len());
+        let (mut head, mut tail) = (0usize, buffered.len());
+        while head < tail {
+            tail -= 1;
+            delivery_order.push(buffered[tail]);
+            if head < tail {
+                delivery_order.push(buffered[head]);
+                head += 1;
+            }
+        }
+
+        for &i in &delivery_order {
             let plaintext = block_on(group_decrypt(&ciphertexts[i], &mut bob, &name))
                 .unwrap_or_else(|e| panic!("skipped message {i} must still decrypt: {e:?}"));
             assert_eq!(plaintext, format!("msg {i}").as_bytes());
@@ -553,8 +568,7 @@ mod tests {
 
         // Every buffered key is consumed exactly once: a replay is a duplicate,
         // never a second successful decrypt.
-        skipped.reverse();
-        for &i in &skipped {
+        for &i in &delivery_order {
             assert!(
                 matches!(
                     block_on(group_decrypt(&ciphertexts[i], &mut bob, &name)),
