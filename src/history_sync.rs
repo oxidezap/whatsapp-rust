@@ -424,14 +424,13 @@ impl Client {
                         .await;
                 }
 
-                // Store tctokens extracted during streaming (move to avoid cloning)
-                for candidate in sync_result.tc_token_candidates {
-                    self.store_tc_token_candidate(candidate).await;
-                }
-
-                self.store_history_sync_msg_secret_entries(secret_entries, secret_seed_config)
-                    .await;
-
+                // Learn the identity pairs BEFORE storing tc tokens. A token is
+                // keyed through `resolve_tc_token_key`, which answers with the
+                // LID once a mapping exists and the PN before that — so storing
+                // first files a PN-addressed conversation's token under the PN,
+                // and the mapping learned a moment later sends every later
+                // lookup to the LID, stranding it.
+                //
                 // Bulk PN-LID identity seed from field 15; persist and migrations
                 // run detached, like the other batch learn paths. `Other`
                 // matches WA Web's `learningSource: "other"` for this harvest
@@ -454,6 +453,14 @@ impl Client {
                     )
                     .await;
                 }
+
+                // Store tctokens extracted during streaming (move to avoid cloning)
+                for candidate in sync_result.tc_token_candidates {
+                    self.store_tc_token_candidate(candidate).await;
+                }
+
+                self.store_history_sync_msg_secret_entries(secret_entries, secret_seed_config)
+                    .await;
 
                 // No interest pre-check: dispatch() evaluates handler interest
                 // against a single bus snapshot (and skips materializing the
