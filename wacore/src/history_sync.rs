@@ -540,6 +540,9 @@ where
     }
 
     result.decompressed_size = walker.total_out() as usize;
+    // Both sources have been walked by now, so this is the first point where a
+    // LID's competing pairs can be compared against each other.
+    dedupe_lid_mappings(&mut result.lid_mappings);
     Ok(result)
 }
 
@@ -841,12 +844,106 @@ fn extract_own_pushname(data: &[u8], own_user: &str) -> Option<String> {
     pushname.filter(|name| name != PUSHNAME_ABSENT_SENTINEL)
 }
 
-/// One PN↔LID pair from `HistorySync.phoneNumberToLidMappings`, reduced to
-/// bare user parts (no server, no device).
+/// Where a mapping was harvested from.
+///
+/// Load-bearing, not informational: the two sources can disagree about which
+/// phone a LID belongs to during number drift, and the batch learner
+/// deduplicates by phone number rather than by LID, so two pairs sharing a LID
+/// both survive into a `HashMap` whose iteration order decides which one wins.
+/// Resolving the conflict here, by source, is what makes the outcome
+/// deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryLidMappingSource {
+    /// `HistorySync.phoneNumberToLidMappings` — the server's explicit identity
+    /// table, and the authority when the two disagree.
+    Bulk,
+    /// A conversation's own `pnJid`/`lidJid`, which is incidental metadata and
+    /// can lag behind the bulk block.
+    Conversation,
+}
+
+/// One PN↔LID pair from a history sync, reduced to bare user parts (no server,
+/// no device).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryLidMapping {
     pub phone_number: String,
     pub lid: String,
+    pub source: HistoryLidMappingSource,
+}
+
+/// Collapse mappings that name the same LID, keeping one pair per LID.
+///
+/// [`Bulk`](HistoryLidMappingSource::Bulk) outranks
+/// [`Conversation`](HistoryLidMappingSource::Conversation); within one source
+/// the first occurrence wins. Order is otherwise preserved, so the result does
+/// not depend on which source the wire happened to put first.
+fn dedupe_lid_mappings(mappings: &mut Vec<HistoryLidMapping>) {
+    use std::collections::HashMap;
+    use std::collections::hash_map::Entry;
+
+    // Keyed by LID, holding the index of the entry currently winning it. The
+    // key is cloned because deciding a duplicate has to compare against the
+    // kept entry, which rules out borrowing from the vector being edited.
+    let mut winner: HashMap<String, usize> = HashMap::with_capacity(mappings.len());
+    let mut drop = vec![false; mappings.len()];
+
+    for i in 0..mappings.len() {
+        match winner.entry(mappings[i].lid.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(i);
+            }
+            Entry::Occupied(mut slot) => {
+                let kept = *slot.get();
+                if mappings[i].source == HistoryLidMappingSource::Bulk
+                    && mappings[kept].source == HistoryLidMappingSource::Conversation
+                {
+                    drop[kept] = true;
+                    slot.insert(i);
+                } else {
+                    drop[i] = true;
+                }
+            }
+        }
+    }
+
+    let mut i = 0;
+    mappings.retain(|_| {
+        let keep = !drop[i];
+        i += 1;
+        keep
+    });
+}
+
+/// Outcome of reading an optional string field.
+enum OptionalStr<'a> {
+    Value(&'a str),
+    /// Well-framed, but not usable text. The cursor has advanced past it, so
+    /// the walk continues and only this field's value is discarded.
+    Unusable,
+    /// The framing itself is broken; nothing after this point can be trusted.
+    Malformed,
+}
+
+/// Read an optional length-delimited string, distinguishing bad framing from
+/// bad text.
+///
+/// [`read_str_field`] collapses both into `None`, which callers can only answer
+/// by aborting the walk. For an optional field that is wrong to do: invalid
+/// UTF-8 in a piece of incidental metadata would cost every field that follows
+/// it — in a conversation, the tctoken and its timestamps.
+fn read_optional_str_field<'a>(data: &'a [u8], pos: &mut usize) -> OptionalStr<'a> {
+    let Some((len, vlen)) = read_varint(&data[*pos..]) else {
+        return OptionalStr::Malformed;
+    };
+    let value_start = *pos + vlen;
+    let Some(end) = checked_end(value_start, len, data.len()) else {
+        return OptionalStr::Malformed;
+    };
+    *pos = end;
+    match smoothutf8::from_utf8(&data[value_start..end]) {
+        Some(value) => OptionalStr::Value(value),
+        None => OptionalStr::Unusable,
+    }
 }
 
 /// Read one length-delimited UTF-8 string field, advancing `pos` past it.
@@ -886,17 +983,24 @@ fn extract_lid_mapping(data: &[u8]) -> Option<HistoryLidMapping> {
         }
     }
 
-    history_lid_mapping(pn_raw?, lid_raw?)
+    history_lid_mapping(pn_raw?, lid_raw?, HistoryLidMappingSource::Bulk)
 }
 
-fn history_lid_mapping(pn_raw: &str, lid_raw: &str) -> Option<HistoryLidMapping> {
+fn history_lid_mapping(
+    pn_raw: &str,
+    lid_raw: &str,
+    source: HistoryLidMappingSource,
+) -> Option<HistoryLidMapping> {
     use wacore_binary::{Jid, Server};
 
     let pn: Jid = pn_raw.parse().ok()?;
     let lid: Jid = lid_raw.parse().ok()?;
-    // Legacy `@c.us` is the PN namespace under its old name (whatsmeow maps it
-    // to `@s.whatsapp.net` the same way); the user part is the phone either way.
-    if !(pn.is_pn() || pn.server == Server::Legacy) || !lid.is_lid() {
+    // Family predicates, not the exact-server ones: `@hosted` and `@hosted.lid`
+    // are the PN and LID namespaces for hosted accounts, and the mapping and
+    // Signal-address code elsewhere already treats them as such. Legacy `@c.us`
+    // is the PN namespace under its old name (whatsmeow maps it to
+    // `@s.whatsapp.net` the same way); the user part is the phone either way.
+    if !(pn.server.is_pn_family() || pn.server == Server::Legacy) || !lid.server.is_lid_family() {
         return None;
     }
     if pn.user_base().is_empty() || lid.user_base().is_empty() {
@@ -905,6 +1009,7 @@ fn history_lid_mapping(pn_raw: &str, lid_raw: &str) -> Option<HistoryLidMapping>
     Some(HistoryLidMapping {
         phone_number: pn.user_base().to_string(),
         lid: lid.user_base().to_string(),
+        source,
     })
 }
 
@@ -1913,16 +2018,18 @@ where
                 pos += vl;
             }
             (tags::conversation::PN_JID, wire_type::LENGTH_DELIMITED) => {
-                let Some(value) = read_str_field(data, &mut pos) else {
-                    break;
-                };
-                pn_jid = Some(value);
+                match read_optional_str_field(data, &mut pos) {
+                    OptionalStr::Value(value) => pn_jid = Some(value),
+                    OptionalStr::Unusable => {}
+                    OptionalStr::Malformed => break,
+                }
             }
             (tags::conversation::LID_JID, wire_type::LENGTH_DELIMITED) => {
-                let Some(value) = read_str_field(data, &mut pos) else {
-                    break;
-                };
-                lid_jid = Some(value);
+                match read_optional_str_field(data, &mut pos) {
+                    OptionalStr::Value(value) => lid_jid = Some(value),
+                    OptionalStr::Unusable => {}
+                    OptionalStr::Malformed => break,
+                }
             }
             _ => match skip_field(wt, data, pos) {
                 Ok(np) => pos = np,
@@ -1931,16 +2038,26 @@ where
         }
     }
 
+    // A conversation addressed in one namespace supplies that half itself, so a
+    // row carrying only the opposite field still yields a complete pair. Family
+    // predicates so hosted accounts (`@hosted`, `@hosted.lid`) are recognized
+    // as the PN and LID namespaces they are.
     let chat_jid = chat_id.parse::<wacore_binary::Jid>().ok();
-    let pn_jid = pn_jid.or_else(|| chat_jid.as_ref().filter(|jid| jid.is_pn()).map(|_| chat_id));
+    let pn_jid = pn_jid.or_else(|| {
+        chat_jid
+            .as_ref()
+            .filter(|jid| jid.server.is_pn_family())
+            .map(|_| chat_id)
+    });
     let lid_jid = lid_jid.or_else(|| {
         chat_jid
             .as_ref()
-            .filter(|jid| jid.is_lid())
+            .filter(|jid| jid.server.is_lid_family())
             .map(|_| chat_id)
     });
     if let (Some(pn_jid), Some(lid_jid)) = (pn_jid, lid_jid)
-        && let Some(mapping) = history_lid_mapping(pn_jid, lid_jid)
+        && let Some(mapping) =
+            history_lid_mapping(pn_jid, lid_jid, HistoryLidMappingSource::Conversation)
     {
         lid_mappings.push(mapping);
     }
@@ -2248,14 +2365,17 @@ mod tests {
                 HistoryLidMapping {
                     phone_number: "5511777776666".to_string(),
                     lid: "111222333444555".to_string(),
+                    source: HistoryLidMappingSource::Bulk,
                 },
                 HistoryLidMapping {
                     phone_number: "15550001111".to_string(),
                     lid: "222333444555666".to_string(),
+                    source: HistoryLidMappingSource::Bulk,
                 },
                 HistoryLidMapping {
                     phone_number: "5511222223333".to_string(),
                     lid: "333444555666777".to_string(),
+                    source: HistoryLidMappingSource::Bulk,
                 },
             ]
         );
@@ -2287,10 +2407,12 @@ mod tests {
                 HistoryLidMapping {
                     phone_number: "12025550143".to_string(),
                     lid: "111222333444555".to_string(),
+                    source: HistoryLidMappingSource::Conversation,
                 },
                 HistoryLidMapping {
                     phone_number: "12025550144".to_string(),
                     lid: "222333444555666".to_string(),
+                    source: HistoryLidMappingSource::Conversation,
                 },
             ]
         );
@@ -2320,6 +2442,121 @@ mod tests {
         assert!(result.lid_mappings.is_empty());
         assert_eq!(result.tc_token_candidates.len(), 1);
         assert_eq!(result.tc_token_candidates[0].tc_token, tc_token);
+    }
+
+    /// The reviewer's case for the tolerant reader: unlike
+    /// `malformed_optional_mapping_does_not_drop_tc_token`, the bad field comes
+    /// FIRST, so aborting the walk on it would cost the tctoken behind it.
+    #[test]
+    fn malformed_optional_mapping_before_tc_token_does_not_drop_it() {
+        let chat = "12025550143@s.whatsapp.net";
+        let tc_token = vec![0xAB; 16];
+        let mut conv = Vec::new();
+        emit_len_field(&mut conv, tags::conversation::ID, chat.as_bytes());
+        // Well-framed, but not UTF-8.
+        emit_len_field(&mut conv, tags::conversation::PN_JID, &[0xFF, 0xFE]);
+        emit_len_field(&mut conv, tags::conversation::TC_TOKEN, &tc_token);
+        emit_varint(
+            &mut conv,
+            ((tags::conversation::TC_TOKEN_TIMESTAMP << 3) | wire_type::VARINT) as u64,
+        );
+        emit_varint(&mut conv, 1_700_000_000);
+
+        let mut raw = Vec::new();
+        emit_len_field(&mut raw, tags::history_sync::CONVERSATIONS, &conv);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let result = process_history_sync(compressed, None, false).unwrap();
+        assert!(result.lid_mappings.is_empty(), "unusable pair discarded");
+        assert_eq!(
+            result.tc_token_candidates.len(),
+            1,
+            "the field after the bad one must still be read"
+        );
+        assert_eq!(result.tc_token_candidates[0].tc_token, tc_token);
+        assert_eq!(
+            result.tc_token_candidates[0].tc_token_timestamp,
+            1_700_000_000
+        );
+    }
+
+    /// Hosted accounts live in `@hosted` / `@hosted.lid`, which the rest of the
+    /// mapping code already treats as the PN and LID families.
+    #[test]
+    fn hosted_conversations_yield_mappings() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: "111222333444555@hosted.lid".to_string(),
+                pn_jid: Some("12025550143@hosted".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
+        assert_eq!(
+            result.lid_mappings,
+            vec![HistoryLidMapping {
+                phone_number: "12025550143".to_string(),
+                lid: "111222333444555".to_string(),
+                source: HistoryLidMappingSource::Conversation,
+            }]
+        );
+    }
+
+    /// The bulk block is the server's explicit identity table, so it decides a
+    /// LID whose two sources disagree — whichever order the wire put them in.
+    #[test]
+    fn bulk_mappings_outrank_conversation_mappings_for_the_same_lid() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: "111222333444555@lid".to_string(),
+                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
+                ..Default::default()
+            }],
+            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
+                pn_jid: Some("12025550199@s.whatsapp.net".to_string()),
+                lid_jid: Some("111222333444555@lid".to_string()),
+            }],
+            ..Default::default()
+        };
+
+        let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
+        assert_eq!(
+            result.lid_mappings,
+            vec![HistoryLidMapping {
+                phone_number: "12025550199".to_string(),
+                lid: "111222333444555".to_string(),
+                source: HistoryLidMappingSource::Bulk,
+            }],
+            "one pair per LID, and the bulk block wins the conflict"
+        );
+    }
+
+    /// Agreement between the two sources must not produce two pairs.
+    #[test]
+    fn agreeing_sources_collapse_to_one_mapping() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: "111222333444555@lid".to_string(),
+                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
+                ..Default::default()
+            }],
+            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
+                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
+                lid_jid: Some("111222333444555@lid".to_string()),
+            }],
+            ..Default::default()
+        };
+
+        let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
+        assert_eq!(result.lid_mappings.len(), 1);
+        assert_eq!(result.lid_mappings[0].phone_number, "12025550143");
     }
 
     /// Prost-only oracle: what the pre-fast-path pipeline produced for one
@@ -3836,6 +4073,7 @@ mod tests {
                 }
             }
         }
+        dedupe_lid_mappings(&mut result.lid_mappings);
         result
     }
 
@@ -3965,6 +4203,7 @@ mod tests {
                 vec![HistoryLidMapping {
                     phone_number: "5511777776666".to_string(),
                     lid: "111222333444555".to_string(),
+                    source: HistoryLidMappingSource::Bulk,
                 }],
                 "valid mapping extracted, wrong-namespace entry skipped"
             );
