@@ -73,10 +73,7 @@ impl<'a> Presence<'a> {
     pub async fn set(&self, status: PresenceStatus) -> Result<(), PresenceError> {
         let device_snapshot = self.client.persistence_manager().get_device_snapshot();
 
-        debug!(
-            "send_presence called with push_name: '{}'",
-            device_snapshot.push_name
-        );
+        debug!("send_presence called");
 
         if device_snapshot.push_name.is_empty() {
             warn!("Cannot send presence: push_name is empty!");
