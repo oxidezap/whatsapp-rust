@@ -323,7 +323,7 @@ pub async fn prepare_group_stanza(
     // Empty when the failure was batch-wide; see `stale_users_for`.
     let mut skdm_rejected_devices: Vec<Jid> = Vec::new();
 
-    let sender_key_name = make_sender_key_name(to_jid, &own_sending_jid.to_protocol_address());
+    let sender_key_name = make_sender_key_name_for_jid(to_jid, &own_sending_jid);
 
     // Hold the per-device session locks the DM path uses across BOTH the X3DH setup
     // and the SKDM fan-out below, so a concurrent DM or group send sharing a device

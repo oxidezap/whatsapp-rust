@@ -3,6 +3,7 @@
 use super::*;
 use crate::client::context::{GroupInfo, SendContextResolver};
 use crate::libsignal::protocol::{IdentityKeyPair, KeyPair, PreKeyBundle};
+use crate::types::jid::make_sender_key_name;
 use std::collections::HashMap;
 use wacore_binary::Jid;
 
