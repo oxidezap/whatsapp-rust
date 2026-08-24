@@ -1,21 +1,23 @@
-//! VoIP media-plane hot paths: the per-packet work a live 1:1 call pays every 60 ms each way.
+//! VoIP media-plane hot paths: the per-packet work a live 1:1 call pays every 60 ms each way on
+//! audio, and ~1200 times a second on video.
 //! Two layers are benched so a regression can be localized: the raw primitives (MLow encode/decode,
-//! E2E-SRTP protect/unprotect, the AES-CTR payload cipher, SFrame) and the full engine inputs that
-//! compose them (`on_mic`, `on_rtp`). `divan::AllocProfiler` is wired as the global allocator so each
-//! row reports allocation count + bytes alongside wall time -- the codec dominates CPU, but the
-//! crypto/framing seam is where the avoidable per-packet allocations live.
+//! E2E-SRTP protect/unprotect, the AES-CTR payload cipher, SFrame, H.264 packetize/depacketize) and
+//! the full engine inputs that compose them (`on_mic`, `on_rtp`). `divan::AllocProfiler` is wired as
+//! the global allocator so each row reports allocation count + bytes alongside wall time -- the codec
+//! dominates CPU, but the crypto/framing seam is where the avoidable per-packet allocations live.
 
 use bytes::Bytes;
 use divan::{Bencher, black_box};
 use wacore::voip::{
     CallConfig, CallDirection, CallEngine, Input, MediaPipeline, MediaPipelineParams, MlowDecoder,
-    MlowEncoder, Output,
+    MlowEncoder, Output, VideoPipeline, VideoPipelineParams,
 };
 // Internal crypto/framing primitives the bench drives directly. They are intentionally off the
 // `voip` facade and `#[doc(hidden)]` (not part of the consumer API); the bench reaches them via
 // their source-module paths.
 use wacore::voip::e2e_srtp::{crypt_payload, derive_e2e_keys};
 use wacore::voip::engine::SequentialTxIds;
+use wacore::voip::h264::{H264Depacketizer, PacketizedAu, packetize_au};
 use wacore::voip::sframe::SframeSession;
 
 /// Allocation profiler: makes every bench row also report allocs/frees and bytes, which is the
@@ -315,18 +317,20 @@ mod codec_stages {
 // --- Crypto + framing: the seam where avoidable per-packet allocations live ---
 
 /// `protect_audio`: RTP header + AES-CTR encrypt + WARP MI tag. The outbound framing path; its alloc
-/// count is the headline number for the seam-level optimization work.
+/// count is the headline number for the seam-level optimization work. One allocation is the floor
+/// here -- the returned packet itself.
 #[divan::bench]
-fn e2e_srtp_protect(bencher: Bencher) {
+fn audio_protect_packet(bencher: Bencher) {
     let frame = encoded_frame();
     bencher
         .with_inputs(|| (pipeline(), frame.clone()))
         .bench_refs(|(pipe, f)| black_box(pipe.protect_audio(black_box(f.as_slice()))));
 }
 
-/// `unprotect_audio`: strip tag, parse header, AES-CTR decrypt. The inbound framing path.
+/// `unprotect_audio`: strip tag, parse header, AES-CTR decrypt. The inbound framing path. Its floor
+/// is likewise one allocation: the plaintext handed back to the decoder.
 #[divan::bench]
-fn e2e_srtp_unprotect(bencher: Bencher) {
+fn audio_unprotect_packet(bencher: Bencher) {
     let frame = encoded_frame();
     bencher
         .with_inputs(|| {
@@ -345,6 +349,144 @@ fn crypt_payload_one(bencher: Bencher) {
     bencher
         .with_inputs(|| frame.clone())
         .bench_refs(|f| black_box(crypt_payload(black_box(&keys), SSRC, 1, 0, f.as_slice())));
+}
+
+// --- Video: the H.264 packetize + protect path, ~1200 packets/s at 30 fps ---
+
+const VIDEO_SSRC: u32 = 0x5741_0101;
+/// 90 kHz video clock at 30 fps.
+const VIDEO_TS_STRIDE: u32 = 3000;
+
+/// One NAL of `len` bytes with a non-zero header byte and a body that can never contain a
+/// start code (consecutive bytes always differ, so `00 00 01` cannot appear).
+fn video_nal(kind: u8, len: usize) -> Vec<u8> {
+    let mut n = vec![0x60 | kind];
+    n.extend((0..len.saturating_sub(1)).map(|i| (i % 251) as u8));
+    n
+}
+
+fn video_au(nals: &[Vec<u8>]) -> Vec<u8> {
+    let mut au = Vec::new();
+    for n in nals {
+        au.extend_from_slice(&[0, 0, 0, 1]);
+        au.extend_from_slice(n);
+    }
+    au
+}
+
+/// A keyframe-shaped access unit: AUD + SPS + PPS + a 32 KB IDR slice, which fragments into
+/// ~41 FU-A payloads. This is the frame that sets the video send path's per-frame bill.
+fn video_au_1080p() -> Vec<u8> {
+    video_au(&[
+        video_nal(9, 2),
+        video_nal(7, 24),
+        video_nal(8, 10),
+        video_nal(5, 32 * 1024),
+    ])
+}
+
+/// A delta frame small enough for a single-NAL payload -- the common case between keyframes.
+fn video_au_single_nal() -> Vec<u8> {
+    video_au(&[video_nal(9, 2), video_nal(1, 600)])
+}
+
+fn video_pipeline_for(self_lid: &str, peer_lid: &str) -> VideoPipeline {
+    VideoPipeline::new(&VideoPipelineParams {
+        call_key: &call_key(),
+        self_lid,
+        peer_lid,
+        ssrc: VIDEO_SSRC,
+        ts_stride: VIDEO_TS_STRIDE,
+        warp_mi_tag_len: 4,
+    })
+    .unwrap()
+}
+
+/// RFC 6184 packetization of a keyframe, reusing the output buffer the way the send path does.
+/// The signal is the allocation count: a reused `PacketizedAu` should hold at zero.
+#[divan::bench]
+fn h264_packetize_au_1080p(bencher: Bencher) {
+    let au = video_au_1080p();
+    bencher
+        .with_inputs(|| {
+            // Primed outside the timed body so the row measures steady-state reuse rather
+            // than the first frame's buffer growth.
+            let mut out = PacketizedAu::default();
+            packetize_au(&au, &mut out);
+            out
+        })
+        .bench_refs(|out| {
+            packetize_au(black_box(&au), out);
+            black_box(out.len())
+        });
+}
+
+/// The delta-frame packetize: one single-NAL payload, no fragmentation.
+#[divan::bench]
+fn h264_packetize_au_single_nal(bencher: Bencher) {
+    let au = video_au_single_nal();
+    bencher
+        .with_inputs(|| {
+            let mut out = PacketizedAu::default();
+            packetize_au(&au, &mut out);
+            out
+        })
+        .bench_refs(|out| {
+            packetize_au(black_box(&au), out);
+            black_box(out.len())
+        });
+}
+
+/// Reassembly of one keyframe's whole FU-A run: every fragment of the AU pushed in wire order,
+/// the last carrying the marker. The inbound video counterpart of `h264_packetize_au_1080p`.
+#[divan::bench]
+fn h264_depacketize_fua_stream(bencher: Bencher) {
+    let payloads: Vec<Vec<u8>> = {
+        let mut out = PacketizedAu::default();
+        packetize_au(&video_au_1080p(), &mut out);
+        out.iter().map(<[u8]>::to_vec).collect()
+    };
+    bencher
+        .with_inputs(H264Depacketizer::default)
+        .bench_refs(|d| {
+            let last = payloads.len() - 1;
+            for (i, p) in payloads.iter().enumerate() {
+                black_box(d.push(i as u16, 90_000, black_box(p.as_slice()), i == last));
+            }
+        });
+}
+
+/// `protect_video` over a whole keyframe: packetize, then per fragment an RTP header, an AES-CTR
+/// encrypt and a WARP MI tag. One frame is ~43 packets, so this row is ~43x a single audio
+/// `protect`, and its allocation floor is one `Vec` per packet plus the outer one -- the
+/// packetizer's fragment buffer is reused across frames and should add nothing.
+#[divan::bench]
+fn video_protect_frame(bencher: Bencher) {
+    let au = video_au_1080p();
+    bencher
+        .with_inputs(|| {
+            // One frame sent outside the timed body, so the row measures a steady-state
+            // frame rather than the call's first one (which grows the fragment buffer).
+            let mut pipe = video_pipeline_for(SELF_LID, PEER_LID);
+            pipe.protect_video(&au);
+            pipe
+        })
+        .bench_refs(|pipe| black_box(pipe.protect_video(black_box(au.as_slice()))));
+}
+
+/// `unprotect_video` for one received FU-A packet: MI tag, header parse, AES-CTR decrypt, and the
+/// depacketizer push. The keyframe's first FU-A fragment, so it opens a partial NAL and no AU
+/// completes -- the row is the per-packet inbound cost, not a frame's reassembly.
+#[divan::bench]
+fn video_unprotect_packet(bencher: Bencher) {
+    let packet = {
+        let mut peer = video_pipeline_for(PEER_LID, SELF_LID);
+        // Payload order is SPS, PPS, then the IDR's FU-A run: index 2 is its start fragment.
+        peer.protect_video(&video_au_1080p()).swap_remove(2)
+    };
+    bencher
+        .with_inputs(|| (video_pipeline_for(SELF_LID, PEER_LID), packet.clone()))
+        .bench_refs(|(rx, pkt)| black_box(rx.unprotect_video(black_box(pkt.as_slice()))));
 }
 
 /// SFrame recv decrypt (the live SFrame direction: inbound GCM-unwrap with a plaintext fallback).
