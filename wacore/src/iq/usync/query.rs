@@ -614,24 +614,24 @@ impl UsyncProtocol {
                 if let Some(phone) = &user.phone {
                     return Some(
                         NodeBuilder::new(UsyncProtocolKind::Contact.as_str())
-                            .string_content(phone.clone())
+                            .string_content(phone.as_str())
                             .build(),
                     );
                 }
                 if let Some(username) = &user.username {
                     let mut builder = NodeBuilder::new(UsyncProtocolKind::Contact.as_str())
-                        .attr(ATTR_USERNAME, username.clone());
+                        .attr(ATTR_USERNAME, username.as_str());
                     if let Some(pin) = &user.username_pin {
-                        builder = builder.attr(ATTR_PIN, pin.clone());
+                        builder = builder.attr(ATTR_PIN, pin.as_str());
                     }
                     if let Some(lid) = &user.known_lid {
-                        builder = builder.attr(ATTR_LID, lid.clone());
+                        builder = builder.attr(ATTR_LID, lid);
                     }
                     return Some(builder.build());
                 }
                 user.contact_type.as_ref().map(|contact_type| {
                     NodeBuilder::new(UsyncProtocolKind::Contact.as_str())
-                        .attr(ATTR_TYPE, contact_type.clone())
+                        .attr(ATTR_TYPE, contact_type.as_str())
                         .build()
                 })
             }
@@ -641,13 +641,17 @@ impl UsyncProtocol {
                 }
                 let mut builder = NodeBuilder::new(UsyncProtocolKind::Devices.as_str());
                 if let Some(hash) = &hint.device_hash {
-                    builder = builder.attr(ATTR_DEVICE_HASH, hash.clone());
+                    builder = builder.attr(ATTR_DEVICE_HASH, hash.as_str());
                 }
+                // The integers go to `attr` as integers: `NodeValue`'s `From<u64>`
+                // renders them through `itoa` into an inline `CompactString`, where
+                // `to_string()` first built a heap `String` only for the conversion
+                // to copy it out of and drop it.
                 if let Some(timestamp) = hint.timestamp {
-                    builder = builder.attr(ATTR_TIMESTAMP, timestamp.to_string());
+                    builder = builder.attr(ATTR_TIMESTAMP, timestamp);
                 }
                 if let Some(expected) = hint.expected_timestamp {
-                    builder = builder.attr(ATTR_EXPECTED_TIMESTAMP, expected.to_string());
+                    builder = builder.attr(ATTR_EXPECTED_TIMESTAMP, expected);
                 }
                 Some(builder.build())
             }),
@@ -657,13 +661,13 @@ impl UsyncProtocol {
                 .map(|token| build_tc_token_node(token)),
             Self::Lid => user.known_lid.as_ref().map(|lid| {
                 NodeBuilder::new(UsyncProtocolKind::Lid.as_str())
-                    .attr(ATTR_JID, lid.clone())
+                    .attr(ATTR_JID, lid)
                     .build()
             }),
             Self::BotProfileV1 => {
                 let mut profile = NodeBuilder::new(TAG_PROFILE);
                 if let Some(persona_id) = &user.persona_id {
-                    profile = profile.attr(ATTR_PERSONA_ID, persona_id.clone());
+                    profile = profile.attr(ATTR_PERSONA_ID, persona_id.as_str());
                 }
                 Some(
                     NodeBuilder::new(UsyncProtocolKind::Bot.as_str())
@@ -825,10 +829,10 @@ impl UsyncQuery {
         let users = self.users.iter().map(|user| {
             let mut builder = NodeBuilder::new(TAG_USER);
             if let Some(jid) = &user.id {
-                builder = builder.attr(ATTR_JID, jid.clone());
+                builder = builder.attr(ATTR_JID, jid);
             }
             if let Some(pn_jid) = &user.pn_jid {
-                builder = builder.attr(ATTR_PN_JID, pn_jid.clone());
+                builder = builder.attr(ATTR_PN_JID, pn_jid);
             }
             builder
                 .children(
