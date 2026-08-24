@@ -281,9 +281,15 @@ impl PreKeyUtils {
         use crate::xml::DisplayableNodeRef;
         use wacore_binary::NodeContentRef;
 
-        fn extract_bytes_ref(node: Option<&NodeRef<'_>>) -> Result<Vec<u8>, anyhow::Error> {
+        // Borrows out of the decoded node instead of copying: every value in a
+        // bundle is fixed-width and ends up in an array, so the owned `Vec` this
+        // used to hand back was allocated only to be length-checked, copied out
+        // and dropped. With the `<value>` and `<signature>` reads below that is
+        // five allocations per device, on a path that runs for every device of
+        // every user in a fetch.
+        fn extract_bytes_ref<'a>(node: Option<&'a NodeRef<'_>>) -> Result<&'a [u8], anyhow::Error> {
             match node.and_then(|n| n.content.as_ref()) {
-                Some(NodeContentRef::Bytes(b)) => Ok(b.to_vec()),
+                Some(NodeContentRef::Bytes(b)) => Ok(b.as_ref()),
                 _ => Err(anyhow::anyhow!("Expected bytes in node content")),
             }
         }
@@ -296,23 +302,20 @@ impl PreKeyUtils {
         }
 
         let reg_id_bytes = extract_bytes_ref(node.get_optional_child("registration"))?;
-        if reg_id_bytes.len() != 4 {
-            return Err(anyhow::anyhow!("Invalid registration ID length"));
-        }
-        let registration_id = u32::from_be_bytes([
-            reg_id_bytes[0],
-            reg_id_bytes[1],
-            reg_id_bytes[2],
-            reg_id_bytes[3],
-        ]);
+        let registration_id = u32::from_be_bytes(
+            <[u8; 4]>::try_from(reg_id_bytes)
+                .map_err(|_| anyhow::anyhow!("Invalid registration ID length"))?,
+        );
 
         let keys_node = node.get_optional_child("keys").unwrap_or(node);
 
         let identity_key_bytes = extract_bytes_ref(keys_node.get_optional_child("identity"))?;
-        let identity_key_array: [u8; 32] =
-            identity_key_bytes.try_into().map_err(|v: Vec<u8>| {
-                anyhow::anyhow!("Invalid identity key length: got {}, expected 32", v.len())
-            })?;
+        let identity_key_array: [u8; 32] = identity_key_bytes.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid identity key length: got {}, expected 32",
+                identity_key_bytes.len()
+            )
+        })?;
         let identity_key =
             IdentityKey::new(PublicKey::from_djb_public_key_bytes(&identity_key_array)?);
 
@@ -422,18 +425,14 @@ impl PreKeyUtils {
             .and_then(|n| n.content.as_ref())
             .and_then(|c| {
                 if let NodeContentRef::Bytes(b) = c {
-                    Some(b.to_vec())
+                    Some(b.as_ref())
                 } else {
                     None
                 }
             })
             .ok_or(anyhow::anyhow!("Missing pre-key value"))?;
-        if value_bytes.len() != 32 {
-            return Err(anyhow::anyhow!("Invalid pre-key value length"));
-        }
-
-        let mut value_arr = [0u8; 32];
-        value_arr.copy_from_slice(&value_bytes);
+        let value_arr = <[u8; 32]>::try_from(value_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid pre-key value length"))?;
         Ok(Some((id, value_arr)))
     }
 
@@ -451,18 +450,14 @@ impl PreKeyUtils {
             .and_then(|n| n.content.as_ref())
             .and_then(|c| {
                 if let NodeContentRef::Bytes(b) = c {
-                    Some(b.to_vec())
+                    Some(b.as_ref())
                 } else {
                     None
                 }
             })
             .ok_or(anyhow::anyhow!("Missing signed pre-key signature"))?;
-        if signature_bytes.len() != 64 {
-            return Err(anyhow::anyhow!("Invalid signature length"));
-        }
-
-        let mut sig_arr = [0u8; 64];
-        sig_arr.copy_from_slice(&signature_bytes);
+        let sig_arr = <[u8; 64]>::try_from(signature_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid signature length"))?;
         Ok((id, public_key_bytes, sig_arr))
     }
 }
