@@ -97,15 +97,10 @@ impl<'a> Presence<'a> {
             .attr("name", &device_snapshot.push_name)
             .build();
 
-        debug!(
-            "Sending presence stanza: <presence type=\"{}\" name=\"{}\"/>",
-            presence_type,
-            node.attrs
-                .get("name")
-                .map(|s| s.as_str())
-                .as_deref()
-                .unwrap_or("")
-        );
+        // The stanza carries the push name, so log the type alone: reprinting
+        // the attribute puts the user's display name back in the log this
+        // module just took it out of.
+        debug!("Sending presence stanza: type={presence_type}");
 
         self.client.send_node(node).await?;
         Ok(())
