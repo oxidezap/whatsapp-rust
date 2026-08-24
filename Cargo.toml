@@ -227,7 +227,7 @@ hashbrown = { workspace = true }
 hex = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
-opus = { version = "0.3", optional = true }
+opus = { version = "0.4", optional = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
 # The sans-IO media stack for `voip`. Pinned exactly: 0.21 is a pre-1.0 beta, so a minor bump
@@ -235,16 +235,16 @@ rand = { workspace = true }
 # than at compile time. Revisit the pin when 0.21.0 goes stable. `crypto-ring` (the default) rather
 # than aws-lc-rs because `ring` is already compiled here for rustls, via the websocket transport and
 # the HTTP client, so the media stack costs no new crypto crate.
-rtc-datachannel = { version = "=0.21.0-beta.1", optional = true }
-rtc-dtls = { version = "=0.21.0-beta.1", optional = true, default-features = false, features = [
+rtc-datachannel = { version = "=0.21.0-beta.2", optional = true }
+rtc-dtls = { version = "=0.21.0-beta.2", optional = true, default-features = false, features = [
     "crypto-ring",
 ] }
-rtc-sctp = { version = "=0.21.0-beta.1", optional = true }
+rtc-sctp = { version = "=0.21.0-beta.2", optional = true }
 # The vocabulary crate of the three above: they take and return its `TransportProtocol` and `Error`
 # in public signatures and none of them re-exports it, so a caller that has to name a transport
 # protocol or tell a peer close apart from a corrupt datagram needs it directly. Adds no crate to
 # the tree; it is already there under the other three.
-rtc-shared = { version = "=0.21.0-beta.1", optional = true, default-features = false }
+rtc-shared = { version = "=0.21.0-beta.2", optional = true, default-features = false }
 scopeguard = "1.2"
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
