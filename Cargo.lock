@@ -4258,26 +4258,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "whatsapp-rust-chat-store"
-version = "0.1.0"
-dependencies = [
- "buffa",
- "chrono",
- "diesel",
- "diesel_migrations",
- "flate2",
- "log",
- "portable-atomic",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "wacore",
- "wacore-binary",
- "waproto",
- "whatsapp-rust-sqlite-storage",
-]
-
-[[package]]
 name = "whatsapp-rust-plugin-metrics"
 version = "0.1.0"
 dependencies = [

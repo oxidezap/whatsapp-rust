@@ -474,7 +474,7 @@ jobs:
         run: >
           cargo check --no-default-features --verbose
           -p whatsapp-rust -p wacore-derive -p wacore-libsignal -p wacore-noise -p waproto
-          -p whatsapp-rust-ureq-http-client -p whatsapp-rust-chat-store
+          -p whatsapp-rust-ureq-http-client
           -p whatsapp-rust-sqlite-storage -p whatsapp-rust-tokio-transport
       - name: Publish test timings
         if: always()

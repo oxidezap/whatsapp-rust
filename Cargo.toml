@@ -26,7 +26,6 @@ members = [
     "plugins/metrics",
     "plugins/wam",
     "plugins/wam-catalog",
-    "storages/chat-store",
     "storages/sqlite-storage",
     "tests/bench-integration",
     "tests/e2e",
