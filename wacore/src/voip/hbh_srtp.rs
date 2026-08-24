@@ -160,9 +160,10 @@ fn aes_icm_key30(aes_key: &[u8], salt: &[u8]) -> [u8; 30] {
     out
 }
 
-/// libsrtp AES-ICM: counter = (salt zero-padded to 16) XOR iv, keystream = AES(counter),
-/// counter increments byte 15 with a single carry into byte 14 (2-level, not 128-bit).
-fn aes_icm_crypt(key30: &[u8], iv16: &[u8], data: &[u8]) -> Vec<u8> {
+/// libsrtp AES-ICM over `data` in place: counter = (salt zero-padded to 16) XOR iv,
+/// keystream = AES(counter), counter increments byte 15 with a single carry into byte 14
+/// (2-level, not 128-bit). The cipher is symmetric, so this is both directions.
+fn aes_icm_crypt_in_place(key30: &[u8], iv16: &[u8], data: &mut [u8]) {
     let aes_key = &key30[..16];
     let salt = &key30[16..30];
     let mut counter = [0u8; 16];
@@ -172,31 +173,26 @@ fn aes_icm_crypt(key30: &[u8], iv16: &[u8], data: &[u8]) -> Vec<u8> {
         .zip(iv16.iter())
         .for_each(|(c, v)| *c ^= v);
     let cipher = Aes128::new_from_slice(aes_key).expect("16-byte AES key");
-    let mut out = data.to_vec();
-    let mut pos = 0;
-    while pos < out.len() {
+    for block in data.chunks_mut(16) {
         let mut ks = Block::<Aes128>::from(counter);
         cipher.encrypt_block(&mut ks);
-        let n = core::cmp::min(16, out.len() - pos);
-        out[pos..pos + n]
-            .iter_mut()
-            .zip(ks.iter())
-            .for_each(|(o, k)| *o ^= k);
-        pos += n;
+        block.iter_mut().zip(ks.iter()).for_each(|(o, k)| *o ^= k);
         counter[15] = counter[15].wrapping_add(1);
         if counter[15] == 0 {
             counter[14] = counter[14].wrapping_add(1);
         }
     }
-    out
 }
 
-/// libsrtp srtp_kdf_generate: IV is all-zero except byte 7 = label.
-fn derive_session_bytes(master_key: &[u8], master_salt: &[u8], label: u8, len: usize) -> Vec<u8> {
+/// libsrtp srtp_kdf_generate: IV is all-zero except byte 7 = label. `out` is the caller's
+/// destination field (a fixed-size key/salt array), keystreamed straight into rather than
+/// through a `Vec` that only exists to be copied out of.
+fn derive_session_bytes(master_key: &[u8], master_salt: &[u8], label: u8, out: &mut [u8]) {
     let kdf_key = aes_icm_key30(master_key, master_salt);
     let mut iv = [0u8; 16];
     iv[7] = label;
-    aes_icm_crypt(&kdf_key, &iv, &vec![0u8; len])
+    out.fill(0);
+    aes_icm_crypt_in_place(&kdf_key, &iv, out);
 }
 
 /// libsrtp session-key expansion (labels 0x00 enc, 0x01 auth, 0x02 salt).
@@ -206,24 +202,24 @@ pub fn expand_libsrtp_session_keys(keying: &SrtpKeyingMaterial) -> LibsrtpSessio
         session_salt: [0u8; 14],
         auth_key: [0u8; 20],
     };
-    out.session_key.copy_from_slice(&derive_session_bytes(
+    derive_session_bytes(
         &keying.master_key,
         &keying.master_salt,
         LABEL_RTP_ENCRYPTION,
-        16,
-    ));
-    out.session_salt.copy_from_slice(&derive_session_bytes(
+        &mut out.session_key,
+    );
+    derive_session_bytes(
         &keying.master_key,
         &keying.master_salt,
         LABEL_RTP_SALT,
-        14,
-    ));
-    out.auth_key.copy_from_slice(&derive_session_bytes(
+        &mut out.session_salt,
+    );
+    derive_session_bytes(
         &keying.master_key,
         &keying.master_salt,
         LABEL_RTP_AUTH,
-        20,
-    ));
+        &mut out.auth_key,
+    );
     out
 }
 
@@ -234,24 +230,24 @@ pub fn expand_libsrtcp_session_keys(keying: &SrtpKeyingMaterial) -> LibsrtpSessi
         session_salt: [0u8; 14],
         auth_key: [0u8; 20],
     };
-    out.session_key.copy_from_slice(&derive_session_bytes(
+    derive_session_bytes(
         &keying.master_key,
         &keying.master_salt,
         LABEL_RTCP_ENCRYPTION,
-        16,
-    ));
-    out.session_salt.copy_from_slice(&derive_session_bytes(
+        &mut out.session_key,
+    );
+    derive_session_bytes(
         &keying.master_key,
         &keying.master_salt,
         LABEL_RTCP_SALT,
-        14,
-    ));
-    out.auth_key.copy_from_slice(&derive_session_bytes(
+        &mut out.session_salt,
+    );
+    derive_session_bytes(
         &keying.master_key,
         &keying.master_salt,
         LABEL_RTCP_AUTH,
-        20,
-    ));
+        &mut out.auth_key,
+    );
     out
 }
 
@@ -314,9 +310,22 @@ pub fn crypt_rtp_payload(
     packet_index: u64,
     payload: &[u8],
 ) -> Vec<u8> {
+    let mut out = payload.to_vec();
+    crypt_rtp_payload_in_place(session, ssrc, packet_index, &mut out);
+    out
+}
+
+/// In-place sibling of [`crypt_rtp_payload`] for a caller that already has the payload
+/// sitting in its packet buffer.
+pub fn crypt_rtp_payload_in_place(
+    session: &LibsrtpSessionKeys,
+    ssrc: u32,
+    packet_index: u64,
+    payload: &mut [u8],
+) {
     let icm_key = aes_icm_key30(&session.session_key, &session.session_salt);
     let nonce = build_rtp_icm_nonce(ssrc, packet_index);
-    aes_icm_crypt(&icm_key, &nonce, payload)
+    aes_icm_crypt_in_place(&icm_key, &nonce, payload);
 }
 
 #[cfg(test)]
