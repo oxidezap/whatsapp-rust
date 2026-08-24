@@ -879,31 +879,48 @@ pub struct HistoryLidMapping {
 /// not depend on which source the wire happened to put first.
 fn dedupe_lid_mappings(mappings: &mut Vec<HistoryLidMapping>) {
     use std::collections::HashMap;
-    use std::collections::hash_map::Entry;
 
-    // Keyed by LID, holding the index of the entry currently winning it. The
-    // key is cloned because deciding a duplicate has to compare against the
-    // kept entry, which rules out borrowing from the vector being edited.
-    let mut winner: HashMap<String, usize> = HashMap::with_capacity(mappings.len());
+    // Both keys, not just the LID. The learner deduplicates by phone number
+    // with last-write-wins, so two LIDs sharing a phone would survive a
+    // LID-only pass and let whichever the wire put last override the other —
+    // protobuf field order is not significant, so that is not a decision at
+    // all. Keys are cloned because deciding a conflict has to compare against
+    // an entry in the vector being edited.
+    let mut by_lid: HashMap<String, usize> = HashMap::with_capacity(mappings.len());
+    let mut by_phone: HashMap<String, usize> = HashMap::with_capacity(mappings.len());
     let mut drop = vec![false; mappings.len()];
 
     for i in 0..mappings.len() {
-        match winner.entry(mappings[i].lid.clone()) {
-            Entry::Vacant(slot) => {
-                slot.insert(i);
-            }
-            Entry::Occupied(mut slot) => {
-                let kept = *slot.get();
-                if mappings[i].source == HistoryLidMappingSource::Bulk
-                    && mappings[kept].source == HistoryLidMappingSource::Conversation
-                {
-                    drop[kept] = true;
-                    slot.insert(i);
-                } else {
-                    drop[i] = true;
-                }
-            }
+        let mut conflicts: Vec<usize> = Vec::new();
+        if let Some(&kept) = by_lid.get(&mappings[i].lid) {
+            conflicts.push(kept);
         }
+        if let Some(&kept) = by_phone.get(&mappings[i].phone_number)
+            && !conflicts.contains(&kept)
+        {
+            conflicts.push(kept);
+        }
+
+        // A bulk pair displaces conflicting conversation pairs and nothing
+        // else, so a bulk entry is never removed by a conversation one and the
+        // first occurrence wins within a source.
+        let incoming_wins = !conflicts.is_empty()
+            && mappings[i].source == HistoryLidMappingSource::Bulk
+            && conflicts
+                .iter()
+                .all(|&k| mappings[k].source == HistoryLidMappingSource::Conversation);
+
+        if !conflicts.is_empty() && !incoming_wins {
+            drop[i] = true;
+            continue;
+        }
+        for &kept in &conflicts {
+            drop[kept] = true;
+            by_lid.remove(&mappings[kept].lid);
+            by_phone.remove(&mappings[kept].phone_number);
+        }
+        by_lid.insert(mappings[i].lid.clone(), i);
+        by_phone.insert(mappings[i].phone_number.clone(), i);
     }
 
     let mut i = 0;
@@ -2046,7 +2063,9 @@ where
     let pn_jid = pn_jid.or_else(|| {
         chat_jid
             .as_ref()
-            .filter(|jid| jid.server.is_pn_family())
+            .filter(|jid| {
+                jid.server.is_pn_family() || jid.server == wacore_binary::jid::Server::Legacy
+            })
             .map(|_| chat_id)
     });
     let lid_jid = lid_jid.or_else(|| {
@@ -2557,6 +2576,84 @@ mod tests {
         let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
         assert_eq!(result.lid_mappings.len(), 1);
         assert_eq!(result.lid_mappings[0].phone_number, "12025550143");
+    }
+
+    /// `@c.us` is the PN namespace under its old name. The shared validator
+    /// accepts it, so the chat-id fallback has to as well or a legacy row
+    /// carrying only `lidJid` silently loses its pair.
+    #[test]
+    fn legacy_pn_conversation_ids_yield_mappings() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: "15550001111@c.us".to_string(),
+                lid_jid: Some("222333444555666@lid".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
+        assert_eq!(
+            result.lid_mappings,
+            vec![HistoryLidMapping {
+                phone_number: "15550001111".to_string(),
+                lid: "222333444555666".to_string(),
+                source: HistoryLidMappingSource::Conversation,
+            }]
+        );
+    }
+
+    /// The learner deduplicates by phone with last-write-wins, so two LIDs
+    /// sharing a phone must not both reach it: the survivor would be decided
+    /// by wire order, which protobuf does not define.
+    #[test]
+    fn bulk_mappings_outrank_conversation_mappings_for_the_same_phone() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: "999888777666555@lid".to_string(),
+                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
+                ..Default::default()
+            }],
+            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
+                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
+                lid_jid: Some("111222333444555@lid".to_string()),
+            }],
+            ..Default::default()
+        };
+
+        let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
+        assert_eq!(
+            result.lid_mappings,
+            vec![HistoryLidMapping {
+                phone_number: "12025550143".to_string(),
+                lid: "111222333444555".to_string(),
+                source: HistoryLidMappingSource::Bulk,
+            }],
+            "one pair per phone, and the bulk block wins the conflict"
+        );
+    }
+
+    /// Independent pairs must survive the conflict pass untouched.
+    #[test]
+    fn non_conflicting_mappings_are_all_kept() {
+        let hs = wa::HistorySync {
+            sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
+            conversations: vec![wa::Conversation {
+                id: "222333444555666@lid".to_string(),
+                pn_jid: Some("12025550144@s.whatsapp.net".to_string()),
+                ..Default::default()
+            }],
+            phone_number_to_lid_mappings: vec![wa::PhoneNumberToLIDMapping {
+                pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
+                lid_jid: Some("111222333444555@lid".to_string()),
+            }],
+            ..Default::default()
+        };
+
+        let result = process_history_sync(encode_and_compress(&hs), None, false).unwrap();
+        assert_eq!(result.lid_mappings.len(), 2);
     }
 
     /// Prost-only oracle: what the pre-fast-path pipeline produced for one
