@@ -650,7 +650,50 @@ impl Client {
                     .await;
                 self.migrate_signal_sessions_on_lid_discovery(&entry.phone_number, &entry.lid)
                     .await;
+                self.migrate_tc_token_on_lid_discovery(&entry.phone_number, &entry.lid)
+                    .await;
             }
+        }
+    }
+
+    /// Move a received tc token from the PN key to the LID key.
+    ///
+    /// `resolve_tc_token_key` answers with the LID as soon as a mapping exists,
+    /// so a token filed while the peer was still PN-only becomes unreachable
+    /// the moment that mapping lands — the send path then behaves as if the
+    /// token had never arrived. The registry and Signal sessions were already
+    /// migrated here; the token was the one piece keyed the same way that was
+    /// left behind.
+    ///
+    /// `sender_timestamp` is not carried over: it only gates re-issuing our own
+    /// token, so losing it costs at most one extra issue, whereas the received
+    /// token is what the send path cannot do without.
+    async fn migrate_tc_token_on_lid_discovery(&self, pn: &str, lid: &str) {
+        use log::warn;
+
+        let backend = self.persistence_manager.backend();
+        let entry = match backend.get_tc_token(pn).await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return,
+            Err(e) => {
+                warn!("tc token migration: reading PN-keyed token failed: {e}");
+                return;
+            }
+        };
+
+        // Newer-wins in the store, so a token already filed under the LID by a
+        // later arrival is not regressed by the older PN-keyed one.
+        if let Err(e) = backend
+            .store_received_tc_token(lid, &entry.token, entry.token_timestamp)
+            .await
+        {
+            warn!("tc token migration: writing LID-keyed token failed: {e}");
+            return;
+        }
+        // Only after the write succeeded: a failure here leaves a stale but
+        // unreachable row, while deleting first could lose the token outright.
+        if let Err(e) = backend.delete_tc_token(pn).await {
+            warn!("tc token migration: dropping PN-keyed token failed: {e}");
         }
     }
 
@@ -2789,6 +2832,71 @@ mod tests {
                 .await,
             "second call finds the PN side already drained"
         );
+    }
+
+    /// A token filed while the peer was PN-only has to follow the key when the
+    /// mapping lands, or `resolve_tc_token_key` starts asking for a LID row
+    /// that does not exist and the send path behaves as if no token arrived.
+    #[tokio::test]
+    async fn tc_token_follows_the_key_when_the_lid_is_discovered() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000002222";
+        let lid = "133333333333333";
+        let token = b"tc-token-bytes".to_vec();
+
+        let backend = client.persistence_manager.backend();
+        backend
+            .store_received_tc_token(pn, &token, 1_700_000_000)
+            .await
+            .unwrap();
+
+        client.migrate_tc_token_on_lid_discovery(pn, lid).await;
+
+        let moved = backend.get_tc_token(lid).await.unwrap().expect("LID row");
+        assert_eq!(moved.token, token);
+        assert_eq!(moved.token_timestamp, 1_700_000_000);
+        assert!(
+            backend.get_tc_token(pn).await.unwrap().is_none(),
+            "the PN key is never consulted again once the mapping exists"
+        );
+    }
+
+    /// Newer-wins: a token that arrived already correctly keyed must not be
+    /// regressed by an older one being migrated off the PN key.
+    #[tokio::test]
+    async fn tc_token_migration_does_not_regress_a_newer_lid_token() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000003333";
+        let lid = "144444444444444";
+
+        let backend = client.persistence_manager.backend();
+        backend
+            .store_received_tc_token(pn, b"older", 1_700_000_000)
+            .await
+            .unwrap();
+        backend
+            .store_received_tc_token(lid, b"newer", 1_700_000_500)
+            .await
+            .unwrap();
+
+        client.migrate_tc_token_on_lid_discovery(pn, lid).await;
+
+        let kept = backend.get_tc_token(lid).await.unwrap().expect("LID row");
+        assert_eq!(kept.token, b"newer".to_vec());
+        assert_eq!(kept.token_timestamp, 1_700_000_500);
+    }
+
+    /// Nothing to move must not fail, and must not invent a row.
+    #[tokio::test]
+    async fn tc_token_migration_is_a_no_op_without_a_pn_token() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5500000004444";
+        let lid = "155555555555555";
+
+        client.migrate_tc_token_on_lid_discovery(pn, lid).await;
+
+        let backend = client.persistence_manager.backend();
+        assert!(backend.get_tc_token(lid).await.unwrap().is_none());
     }
 
     /// Identity cleanup still needs a durable flush, but cannot make a failed
