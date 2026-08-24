@@ -1,8 +1,8 @@
-use crate::libsignal::crypto::CryptographicHash;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use buffa::MessageView;
 use compact_str::CompactString;
+use sha2::{Digest, Sha256};
 // Encode/decode of proto trees is routed through `waproto::codec` so the tree is
 // instantiated once in waproto; tests still call the trait methods directly.
 #[cfg(test)]
@@ -557,15 +557,16 @@ impl MessageUtils {
             arena[a.0 as usize..a.1 as usize].cmp(&arena[b.0 as usize..b.1 as usize])
         });
 
-        let mut h = CryptographicHash::new("SHA-256")
-            .map_err(|e| anyhow!("failed to initialize SHA-256 hasher: {:?}", e))?;
+        // `sha2::Sha256` directly rather than `CryptographicHash`: the algorithm
+        // is fixed by the phash format, so going through the by-name constructor
+        // only bought a string match and a per-`update` enum dispatch, plus two
+        // fallible steps that could not fail once the name was a literal.
+        let mut h = Sha256::new();
         for &(start, end) in &ranges {
             h.update(&arena[start as usize..end as usize]);
         }
 
-        let full_hash = h
-            .finalize_sha256_array()
-            .map_err(|e| anyhow!("failed to finalize hash: {:?}", e))?;
+        let full_hash = h.finalize();
 
         // Standard base64 ('+'/'/'), matching whatsmeow (`base64.RawStdEncoding`)
         // and WA Web (`WABase64.encodeB64`). URL-safe ('-'/'_') diverges from the
