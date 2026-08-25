@@ -3449,6 +3449,9 @@ impl CallHandle {
         // One ordered transition per call: two cloned handles muting at once would otherwise race,
         // and the older value could land on the wire after the newer one.
         let _transition = client.lock_answer_transition(&self.call_id).await;
+        // Re-checked under the lane: a call that ended while we waited must report that, not the
+        // `Ok(())` a live call still ringing gets.
+        self.ensure_current()?;
         let Some(target) = self.mute_target() else {
             return Ok(());
         };
@@ -5916,6 +5919,32 @@ mod tests {
         assert!(handle.is_muted(), "the local mute must hold regardless");
     }
 
+    /// The lines of `source` that a release build compiles: `#[cfg(test)]` items are dropped whole,
+    /// by brace depth, and `use` lines with them.
+    fn runtime_lines(source: &str) -> Vec<String> {
+        let mut kept = Vec::new();
+        let mut lines = source.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim() != "#[cfg(test)]" {
+                if !line.trim_start().starts_with("use ") {
+                    kept.push(line.to_string());
+                }
+                continue;
+            }
+            let mut depth = 0i32;
+            let mut opened = false;
+            for item in lines.by_ref() {
+                depth += item.matches('{').count() as i32;
+                depth -= item.matches('}').count() as i32;
+                opened |= item.contains('{');
+                if opened && depth <= 0 {
+                    break;
+                }
+            }
+        }
+        kept
+    }
+
     // A call-signaling builder nobody sends is the cheap signal of the bug this pair exists for: an
     // action with a wire form that never leaves the process. A new one must be wired to a caller or
     // listed here (suffixes only, so this list is not its own evidence of a caller) with the reason.
@@ -5936,18 +5965,12 @@ mod tests {
         let Ok(builders) = std::fs::read_to_string(root.join("wacore/src/stanza/call.rs")) else {
             return;
         };
-        // `use` lines are imports, not calls, and a builder can be imported long after its last
-        // caller went away.
+        // Runtime callers only: `use` lines are imports rather than calls, and a `#[cfg(test)]` item
+        // calling a builder says nothing about whether anything sends it.
         let callers = CALLERS
             .iter()
             .filter_map(|path| std::fs::read_to_string(root.join(path)).ok())
-            .flat_map(|source| {
-                source
-                    .lines()
-                    .filter(|line| !line.trim_start().starts_with("use "))
-                    .map(|line| line.to_string())
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|source| runtime_lines(&source))
             .collect::<Vec<_>>();
 
         // A call, not a prefix: `build_preaccept_with_capability` must not stand in for a caller of
