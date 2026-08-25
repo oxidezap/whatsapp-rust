@@ -79,8 +79,17 @@ pub fn append_warp_mi_tag_in_place(
     roc: u32,
     tag_len: usize,
 ) {
+    // Both media pipelines reject a `tag_len` outside 1..=20 in their constructors, so a built
+    // pipeline can never reach the clamp below. It stays as a release-mode floor because this
+    // runs per packet on the send path, where a panic would take the call down; the assert is
+    // what surfaces the misuse to a direct caller, since a send/recv length disagreement
+    // otherwise shows up only as every inbound packet failing to authenticate.
+    debug_assert!(
+        (1..=WARP_MI_TAG_MAX_LEN).contains(&tag_len),
+        "WARP MI tag_len must be 1..=20, got {tag_len}"
+    );
     let tag = compute_warp_mi_tag(auth_key, packet, roc);
-    packet.extend_from_slice(&tag[..tag_len.min(WARP_MI_TAG_MAX_LEN)]);
+    packet.extend_from_slice(&tag[..tag_len.clamp(1, WARP_MI_TAG_MAX_LEN)]);
 }
 
 #[cfg(test)]

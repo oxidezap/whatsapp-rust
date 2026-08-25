@@ -1275,11 +1275,24 @@ mod tests {
             samples_per_packet: 960,
             warp_mi_tag_len: tag_len,
         };
-        // Above the 20-byte HMAC digest (or zero) would panic when slicing the tag, so reject it.
+        // The tag is a prefix of a 20-byte HMAC-SHA1 digest, so a longer one cannot exist and a
+        // zero-length one would authenticate every packet. Rejecting both here is what keeps
+        // `append_warp_mi_tag_in_place`'s clamp unreachable from a built pipeline.
         assert!(MediaPipeline::new(&params(21)).is_none());
         assert!(MediaPipeline::new(&params(0)).is_none());
         assert!(MediaPipeline::new(&params(WARP_MI_TAG_LEN)).is_some());
         assert!(MediaPipeline::new(&params(20)).is_some());
+
+        // The video pipeline shares the tag helpers, so it has to reject the same range --
+        // otherwise the audio guard alone would leave the send-side clamp reachable.
+        let video = |tag_len| VideoPipelineParams {
+            warp_mi_tag_len: tag_len,
+            ..video_params(&call_key, lid, lid)
+        };
+        assert!(VideoPipeline::new(&video(21)).is_none());
+        assert!(VideoPipeline::new(&video(0)).is_none());
+        assert!(VideoPipeline::new(&video(WARP_MI_TAG_LEN)).is_some());
+        assert!(VideoPipeline::new(&video(20)).is_some());
     }
 
     #[test]

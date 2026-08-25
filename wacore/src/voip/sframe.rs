@@ -9,7 +9,7 @@
 
 use aes_gcm::aes::Aes128;
 use aes_gcm::aes::cipher::consts::U16;
-use aes_gcm::{AesGcm, KeyInit, Nonce, aead::Aead};
+use aes_gcm::{AesGcm, KeyInit, Nonce, aead::Aead, aead::AeadInOut};
 
 use crate::voip::hkdf_sha256;
 
@@ -123,12 +123,21 @@ fn parse_sframe_header(header: &[u8]) -> Option<(u64, u64)> {
     Some((counter, key_id))
 }
 
-fn gcm_encrypt(key: &[u8], nonce16: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+/// Encrypt `plaintext` into one buffer that already has room for the trailing header, so a
+/// frame costs a single allocation. `Aead::encrypt` would instead size its own `Vec` to
+/// exactly ciphertext + tag, and appending the header to that reallocates the whole frame.
+fn gcm_encrypt_framed(key: &[u8], nonce16: &[u8; 16], plaintext: &[u8], header: &[u8]) -> Vec<u8> {
     let cipher = Aes128Gcm16::new_from_slice(&key[..AES_KEY_LEN]).expect("16-byte key");
     let nonce = Nonce::<U16>::from(*nonce16);
+    let mut out = Vec::with_capacity(plaintext.len() + GCM_TAG_LEN + header.len());
+    out.extend_from_slice(plaintext);
+    // AES-GCM is a postfix-tag AEAD, so this appends the tag after the ciphertext -- the same
+    // `[ciphertext || tag]` layout `Aead::encrypt` produces.
     cipher
-        .encrypt(&nonce, plaintext)
-        .expect("AES-GCM encrypt is infallible for valid key/nonce")
+        .encrypt_in_place(&nonce, b"", &mut out)
+        .expect("AES-GCM encrypt is infallible for valid key/nonce");
+    out.extend_from_slice(header);
+    out
 }
 
 fn gcm_decrypt(key: &[u8], nonce16: &[u8; 16], ciphertext_with_tag: &[u8]) -> Option<Vec<u8>> {
@@ -188,9 +197,7 @@ impl SframeSession {
         let mut header_buf = [0u8; SFRAME_HEADER_MAX];
         let header = build_sframe_header(counter, 0, &mut header_buf);
         let iv = counter_to_iv(counter);
-        let mut out = gcm_encrypt(&self.encrypt_key, &iv, plaintext);
-        out.extend_from_slice(header);
-        out
+        gcm_encrypt_framed(&self.encrypt_key, &iv, plaintext, header)
     }
 
     /// Decrypt one frame. Returns [`SframeIn::Decrypted`] only when the trailing SFrame header parses
@@ -262,6 +269,31 @@ mod tests {
         assert_eq!(
             parse_sframe_header(build_sframe_header(5, 0, &mut buf)),
             Some((5, 0))
+        );
+    }
+
+    /// The stack buffer is sized for the worst case two `u64` varints can produce, and
+    /// `build_sframe_header` indexes it without bounds-checking the write. Pin that bound
+    /// with the largest header that can exist: anything narrower would panic here rather
+    /// than silently truncate a frame's counter.
+    #[test]
+    fn max_varint_header_fits_the_stack_bound_and_round_trips() {
+        let mut buf = [0u8; SFRAME_HEADER_MAX];
+        let header = build_sframe_header(u64::MAX, u64::MAX, &mut buf);
+        assert_eq!(
+            header.len(),
+            SFRAME_HEADER_MAX,
+            "two 10-byte varints plus the length byte is the worst case"
+        );
+        assert_eq!(
+            *header.last().unwrap() as usize,
+            SFRAME_HEADER_MAX,
+            "the trailing byte counts itself"
+        );
+        assert_eq!(
+            parse_sframe_header(header),
+            Some((u64::MAX, u64::MAX)),
+            "a maximal header must still round-trip"
         );
     }
 
