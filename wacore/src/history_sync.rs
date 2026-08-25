@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use compact_str::CompactString;
+use smallvec::SmallVec;
 use std::sync::Arc;
 use thiserror::Error;
 use wacore_binary::zlib_pool::InflateReader;
@@ -864,10 +865,15 @@ pub enum HistoryLidMappingSource {
 
 /// One PN↔LID pair from a history sync, reduced to bare user parts (no server,
 /// no device).
+///
+/// Both halves are [`CompactString`]: a phone user part and a LID user part are
+/// 11-16 digits, so they live inline and a bootstrap's mapping block — hundreds
+/// to thousands of pairs, each one also cloned into the dedupe index — costs no
+/// heap at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryLidMapping {
-    pub phone_number: String,
-    pub lid: String,
+    pub phone_number: CompactString,
+    pub lid: CompactString,
     pub source: HistoryLidMappingSource,
 }
 
@@ -885,9 +891,10 @@ fn dedupe_lid_mappings(mappings: &mut Vec<HistoryLidMapping>) {
     // LID-only pass and let whichever the wire put last override the other —
     // protobuf field order is not significant, so that is not a decision at
     // all. Keys are cloned because deciding a conflict has to compare against
-    // an entry in the vector being edited.
-    let mut by_lid: HashMap<String, usize> = HashMap::with_capacity(mappings.len());
-    let mut by_phone: HashMap<String, usize> = HashMap::with_capacity(mappings.len());
+    // an entry in the vector being edited; cloning a `CompactString` of a
+    // phone or LID user part is a memcpy, so the two indexes cost no heap.
+    let mut by_lid: HashMap<CompactString, usize> = HashMap::with_capacity(mappings.len());
+    let mut by_phone: HashMap<CompactString, usize> = HashMap::with_capacity(mappings.len());
     let mut drop = vec![false; mappings.len()];
 
     for i in 0..mappings.len() {
@@ -1024,8 +1031,8 @@ fn history_lid_mapping(
         return None;
     }
     Some(HistoryLidMapping {
-        phone_number: pn.user_base().to_string(),
-        lid: lid.user_base().to_string(),
+        phone_number: CompactString::from(pn.user_base()),
+        lid: CompactString::from(lid.user_base()),
         source,
     })
 }
@@ -2059,7 +2066,16 @@ where
     // row carrying only the opposite field still yields a complete pair. Family
     // predicates so hosted accounts (`@hosted`, `@hosted.lid`) are recognized
     // as the PN and LID namespaces they are.
-    let chat_jid = chat_id.parse::<wacore_binary::Jid>().ok();
+    //
+    // `parse_jid_ref` rather than `parse::<Jid>()`: only the resolved server is
+    // read here (and, below, to reject the chat kinds that never carry a
+    // tctoken), so building an owned `Jid` per conversation buys nothing. The
+    // shapes the borrowed parser declines — no `@`, an empty user, a server
+    // outside the known set — are exactly the ones that lose here anyway: the
+    // first two have an empty `user_base()` and the third is not in any family,
+    // and `history_lid_mapping` still validates both halves in full before a
+    // pair is emitted.
+    let chat_jid = wacore_binary::jid::parse_jid_ref(chat_id);
     let pn_jid = pn_jid.or_else(|| {
         chat_jid
             .as_ref()
@@ -2087,14 +2103,22 @@ where
     if chat_id.is_empty() || tc_token.is_empty() {
         return None;
     }
-    if let Some(parts) = wacore_binary::jid::parse_jid_fast(chat_id)
-        && (parts.server == "g.us" || parts.server == "newsletter" || parts.server == "bot")
+    // Reuses the scan above rather than re-parsing: an unresolved server is not
+    // one of these three either way, so the outcome is the same as the string
+    // comparison this replaced.
+    if let Some(jid) = chat_jid.as_ref()
+        && matches!(
+            jid.server,
+            wacore_binary::jid::Server::Group
+                | wacore_binary::jid::Server::Newsletter
+                | wacore_binary::jid::Server::Bot
+        )
     {
         return None;
     }
     Some(TcTokenCandidate {
-        id: chat_id.to_string(),
-        tc_token: tc_token.to_vec(),
+        id: CompactString::from(chat_id),
+        tc_token: SmallVec::from_slice(tc_token),
         tc_token_timestamp: tc_token_timestamp?,
         tc_token_sender_timestamp,
     })
@@ -2318,13 +2342,24 @@ fn context_info_is_forwarded(context: &wa::ContextInfo) -> bool {
 }
 
 /// Tctoken data extracted from a conversation during streaming.
+///
+/// Both payloads stay off the heap for the shapes the wire actually carries: a
+/// 1:1 chat id is a JID short enough to sit inline in a [`CompactString`], and
+/// a tctoken is a short opaque blob (well under the 32-byte inline capacity).
+/// A bootstrap emits one candidate per 1:1 conversation that carries a token,
+/// so that is two heap allocations per chat avoided.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TcTokenCandidate {
-    pub id: String,
-    pub tc_token: Vec<u8>,
+    pub id: CompactString,
+    pub tc_token: SmallVec<[u8; TC_TOKEN_INLINE]>,
     pub tc_token_timestamp: u64,
     pub tc_token_sender_timestamp: Option<u64>,
 }
+
+/// Inline capacity for [`TcTokenCandidate::tc_token`]. Live captures put the
+/// token at 16-24 bytes; 32 keeps headroom without growing the candidate past
+/// what the id beside it already costs.
+pub const TC_TOKEN_INLINE: usize = 32;
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
@@ -2382,18 +2417,18 @@ mod tests {
             result.lid_mappings,
             vec![
                 HistoryLidMapping {
-                    phone_number: "5511777776666".to_string(),
-                    lid: "111222333444555".to_string(),
+                    phone_number: "5511777776666".into(),
+                    lid: "111222333444555".into(),
                     source: HistoryLidMappingSource::Bulk,
                 },
                 HistoryLidMapping {
-                    phone_number: "15550001111".to_string(),
-                    lid: "222333444555666".to_string(),
+                    phone_number: "15550001111".into(),
+                    lid: "222333444555666".into(),
                     source: HistoryLidMappingSource::Bulk,
                 },
                 HistoryLidMapping {
-                    phone_number: "5511222223333".to_string(),
-                    lid: "333444555666777".to_string(),
+                    phone_number: "5511222223333".into(),
+                    lid: "333444555666777".into(),
                     source: HistoryLidMappingSource::Bulk,
                 },
             ]
@@ -2424,13 +2459,13 @@ mod tests {
             result.lid_mappings,
             vec![
                 HistoryLidMapping {
-                    phone_number: "12025550143".to_string(),
-                    lid: "111222333444555".to_string(),
+                    phone_number: "12025550143".into(),
+                    lid: "111222333444555".into(),
                     source: HistoryLidMappingSource::Conversation,
                 },
                 HistoryLidMapping {
-                    phone_number: "12025550144".to_string(),
-                    lid: "222333444555666".to_string(),
+                    phone_number: "12025550144".into(),
+                    lid: "222333444555666".into(),
                     source: HistoryLidMappingSource::Conversation,
                 },
             ]
@@ -2460,7 +2495,10 @@ mod tests {
         let result = process_history_sync(compressed, None, false).unwrap();
         assert!(result.lid_mappings.is_empty());
         assert_eq!(result.tc_token_candidates.len(), 1);
-        assert_eq!(result.tc_token_candidates[0].tc_token, tc_token);
+        assert_eq!(
+            result.tc_token_candidates[0].tc_token.as_slice(),
+            tc_token.as_slice()
+        );
     }
 
     /// The reviewer's case for the tolerant reader: unlike
@@ -2494,7 +2532,10 @@ mod tests {
             1,
             "the field after the bad one must still be read"
         );
-        assert_eq!(result.tc_token_candidates[0].tc_token, tc_token);
+        assert_eq!(
+            result.tc_token_candidates[0].tc_token.as_slice(),
+            tc_token.as_slice()
+        );
         assert_eq!(
             result.tc_token_candidates[0].tc_token_timestamp,
             1_700_000_000
@@ -2519,8 +2560,8 @@ mod tests {
         assert_eq!(
             result.lid_mappings,
             vec![HistoryLidMapping {
-                phone_number: "12025550143".to_string(),
-                lid: "111222333444555".to_string(),
+                phone_number: "12025550143".into(),
+                lid: "111222333444555".into(),
                 source: HistoryLidMappingSource::Conversation,
             }]
         );
@@ -2548,8 +2589,8 @@ mod tests {
         assert_eq!(
             result.lid_mappings,
             vec![HistoryLidMapping {
-                phone_number: "12025550199".to_string(),
-                lid: "111222333444555".to_string(),
+                phone_number: "12025550199".into(),
+                lid: "111222333444555".into(),
                 source: HistoryLidMappingSource::Bulk,
             }],
             "one pair per LID, and the bulk block wins the conflict"
@@ -2597,8 +2638,8 @@ mod tests {
         assert_eq!(
             result.lid_mappings,
             vec![HistoryLidMapping {
-                phone_number: "15550001111".to_string(),
-                lid: "222333444555666".to_string(),
+                phone_number: "15550001111".into(),
+                lid: "222333444555666".into(),
                 source: HistoryLidMappingSource::Conversation,
             }]
         );
@@ -2627,8 +2668,8 @@ mod tests {
         assert_eq!(
             result.lid_mappings,
             vec![HistoryLidMapping {
-                phone_number: "12025550143".to_string(),
-                lid: "111222333444555".to_string(),
+                phone_number: "12025550143".into(),
+                lid: "111222333444555".into(),
                 source: HistoryLidMappingSource::Bulk,
             }],
             "one pair per phone, and the bulk block wins the conflict"
@@ -3967,7 +4008,10 @@ mod tests {
                 1,
                 "tctoken must survive a malformed message (retain={retain})"
             );
-            assert_eq!(result.tc_token_candidates[0].tc_token, tc_token);
+            assert_eq!(
+                result.tc_token_candidates[0].tc_token.as_slice(),
+                tc_token.as_slice()
+            );
         }
     }
 
@@ -4298,8 +4342,8 @@ mod tests {
             assert_eq!(
                 result.lid_mappings,
                 vec![HistoryLidMapping {
-                    phone_number: "5511777776666".to_string(),
-                    lid: "111222333444555".to_string(),
+                    phone_number: "5511777776666".into(),
+                    lid: "111222333444555".into(),
                     source: HistoryLidMappingSource::Bulk,
                 }],
                 "valid mapping extracted, wrong-namespace entry skipped"
