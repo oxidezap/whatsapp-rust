@@ -5973,12 +5973,37 @@ mod tests {
                 depth += item.matches('{').count() as i32;
                 depth -= item.matches('}').count() as i32;
                 opened |= item.contains('{');
-                if opened && depth <= 0 {
+                if opened {
+                    if depth <= 0 {
+                        break;
+                    }
+                    continue;
+                }
+                // A brace-less item (a `use`, a const) ends at its `;`. Without this the scan waits
+                // for a body that never comes and swallows the runtime code after it, which is how a
+                // builder with no caller would slip past the check below.
+                if item.trim_end().ends_with(';') {
                     break;
                 }
             }
         }
         kept
+    }
+
+    #[test]
+    fn runtime_lines_resume_after_a_brace_less_test_item() {
+        let kept = runtime_lines(
+            "fn before() {}\n#[cfg(test)]\nconst ONLY_IN_TESTS: u8 = 1;\nfn after() { build_mute_v2(); }\n",
+        );
+
+        assert!(
+            kept.iter().any(|line| line.contains("build_mute_v2")),
+            "runtime code after a brace-less test item must still be scanned: {kept:?}"
+        );
+        assert!(
+            !kept.iter().any(|line| line.contains("ONLY_IN_TESTS")),
+            "the test item itself is not runtime code: {kept:?}"
+        );
     }
 
     // A call-signaling builder nobody sends is the cheap signal of the bug this pair exists for: an

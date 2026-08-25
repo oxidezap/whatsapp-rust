@@ -1572,7 +1572,7 @@ fn spawn_stdin_ui(state: Arc<Mutex<CallState>>) {
                     info!("⌨  hanging up {cid}");
                     match handle.terminate().await {
                         CallTermination::LocalOnly(e) => {
-                            warn!("⌨  terminate could not reach the peer ({e}); ended locally")
+                            warn!("⌨  terminate to the peer is unconfirmed ({e}); ended locally")
                         }
                         CallTermination::PartlyNotified {
                             notified,
