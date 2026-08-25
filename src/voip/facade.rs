@@ -3431,15 +3431,23 @@ impl CallHandle {
         // Local first: the microphone must stop when the user says so, even if the announcement
         // cannot go out.
         self.muted.store(muted, Ordering::Relaxed);
-        let target = self.peer_jid();
-        if target == self.peer_jid
-            && self
-                .client_registry
-                .snapshot_if_current(&self.call_id, self.generation)
-                .is_some_and(|session| !session.ring_devices.is_empty())
+        // Where the state can land: the call scope once the call is a group one, the device that
+        // answered a direct call. Resolved here rather than through `peer_jid()`, whose bare-peer
+        // fallback is an address to ring, not a call that could hold a mute state.
+        let target = if self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            .is_some()
         {
+            Jid::new(&self.call_id, Server::Call)
+        } else if let Some(device) = self
+            .client_registry
+            .answering_device_if_current(&self.call_id, self.generation)
+        {
+            device
+        } else {
             return Ok(());
-        }
+        };
         let client = self.upgrade_client()?;
         client
             .voip()
@@ -5774,22 +5782,27 @@ mod tests {
     }
 
     // A direct call still ringing has no answered call on any device to carry the state, so the mute
-    // stays local until one answers.
+    // stays local until one answers. True of a single-device callee too, which retains no rung set.
     #[tokio::test]
     async fn muting_a_ringing_direct_call_stays_local() {
-        let (client, sends) = make_sending_client().await;
-        let mut session = mk_session();
-        session.ring_devices = vec![caller().with_device(1), caller().with_device(2)];
-        let generation = client.call_registry().insert(session);
-        let handle = registry_handle(&client, generation);
+        for ring_devices in [
+            Vec::new(),
+            vec![caller().with_device(1), caller().with_device(2)],
+        ] {
+            let (client, sends) = make_sending_client().await;
+            let mut session = mk_session();
+            session.ring_devices = ring_devices;
+            let generation = client.call_registry().insert(session);
+            let handle = registry_handle(&client, generation);
 
-        handle
-            .set_muted(true)
-            .await
-            .expect("a ringing mute is local");
+            handle
+                .set_muted(true)
+                .await
+                .expect("a ringing mute is local");
 
-        assert!(handle.is_muted(), "the local half still applies");
-        assert_eq!(sends.load(Ordering::SeqCst), 0, "nobody to announce it to");
+            assert!(handle.is_muted(), "the local half still applies");
+            assert_eq!(sends.load(Ordering::SeqCst), 0, "nobody to announce it to");
+        }
     }
 
     // The microphone must stop when the user says so, even when the announcement cannot go out: the
