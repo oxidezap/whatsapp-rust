@@ -142,6 +142,19 @@ pub fn au_has_idr(au: &[u8]) -> bool {
     split_annexb(au).any(|nal| nal_unit_type(nal) == NAL_TYPE_IDR)
 }
 
+/// Capacity a [`PacketizedAu`] keeps between frames. A 1080p keyframe packs into tens of KB,
+/// so this holds an ordinary stream's working set without ever reallocating; an access unit
+/// may be up to [`H264_MAX_AU_BYTES`] (4 MiB), and since the send path keeps one buffer for
+/// the whole call, a single outlier frame would otherwise pin that much per video pipeline
+/// until the call ended. `Vec<Vec<u8>>` did not have this problem: clearing it dropped every
+/// fragment's allocation outright.
+const PACKETIZED_AU_RETAINED_BYTES: usize = 128 * 1024;
+
+/// Payload-count sibling of [`PACKETIZED_AU_RETAINED_BYTES`]: no fragment exceeds
+/// `H264_SINGLE_NAL_MAX`, so this many boundaries cover the retained byte budget.
+const PACKETIZED_AU_RETAINED_PAYLOADS: usize =
+    PACKETIZED_AU_RETAINED_BYTES / H264_SINGLE_NAL_MAX + 1;
+
 /// One access unit's RTP payloads, packed back-to-back in a single buffer.
 ///
 /// The send path holds one across the whole call and hands it to [`packetize_au`] per
@@ -179,6 +192,30 @@ impl PacketizedAu {
     fn clear(&mut self) {
         self.data.clear();
         self.ends.clear();
+    }
+
+    /// Hand back the capacity an outlier frame grew, instead of pinning it for the rest of
+    /// the call. Runs once the frame is packed, so it keys on what that frame actually
+    /// needed: a stream that stays large never shrinks (and so never regrows), while one
+    /// that spikes and returns to normal releases the excess on the very next frame.
+    fn release_outlier_capacity(&mut self) {
+        if self.data.len() <= PACKETIZED_AU_RETAINED_BYTES
+            && self.data.capacity() > PACKETIZED_AU_RETAINED_BYTES
+        {
+            self.data.shrink_to(PACKETIZED_AU_RETAINED_BYTES);
+        }
+        if self.ends.len() <= PACKETIZED_AU_RETAINED_PAYLOADS
+            && self.ends.capacity() > PACKETIZED_AU_RETAINED_PAYLOADS
+        {
+            self.ends.shrink_to(PACKETIZED_AU_RETAINED_PAYLOADS);
+        }
+    }
+
+    /// Bytes currently reserved for payload storage. Test-only: the retention behaviour above
+    /// is invisible through the payload accessors, so this is what pins it.
+    #[cfg(test)]
+    fn payload_capacity(&self) -> usize {
+        self.data.capacity()
     }
 
     /// Close the payload whose bytes were just appended to `data`, recording its boundary.
@@ -229,6 +266,7 @@ pub fn packetize_au(au: &[u8], out: &mut PacketizedAu) {
             out.finish_payload();
         }
     }
+    out.release_outlier_capacity();
 }
 
 /// Access units completed but not yet returned can briefly exceed one when a
@@ -535,6 +573,50 @@ mod tests {
         assert!(au_is_keyframe(&au_from_nals(&[nal(9, 2), nal(5, 10)])));
         assert!(!au_is_keyframe(&au_from_nals(&[nal(9, 2), nal(1, 100)])));
         assert!(!au_is_keyframe(&[]));
+    }
+
+    /// A spike frame must not pin its buffer for the rest of the call. `Vec<Vec<u8>>` dropped
+    /// every fragment allocation on each clear; the packed buffer has to release an outlier
+    /// deliberately, or one 4 MiB access unit costs that much per video pipeline until hangup.
+    #[test]
+    fn an_outlier_access_unit_does_not_pin_its_buffer_for_the_call() {
+        let mut payloads = PacketizedAu::default();
+        let big = au_from_nals(&[nal(5, 512 * 1024)]);
+        packetize_au(&big, &mut payloads);
+        assert!(
+            payloads.payload_capacity() > PACKETIZED_AU_RETAINED_BYTES,
+            "the large AU should have grown the buffer past the retained cap"
+        );
+
+        // Back to ordinary frames: the spike's capacity is handed back.
+        let small = au_from_nals(&[nal(1, 50)]);
+        packetize_au(&small, &mut payloads);
+        assert!(
+            payloads.payload_capacity() <= PACKETIZED_AU_RETAINED_BYTES,
+            "an outlier's capacity must not survive the next frame"
+        );
+        assert_eq!(depacketize_all(payloads.iter()), Some(small));
+
+        // And the steady state still reuses one buffer: no growth across ordinary frames.
+        let steady = payloads.payload_capacity();
+        for _ in 0..4 {
+            packetize_au(&au_from_nals(&[nal(1, 400)]), &mut payloads);
+            assert_eq!(
+                payloads.payload_capacity(),
+                steady,
+                "an ordinary frame must not reallocate"
+            );
+        }
+
+        // A run of large frames keeps its buffer rather than shrinking and regrowing each time.
+        packetize_au(&big, &mut payloads);
+        let large = payloads.payload_capacity();
+        packetize_au(&big, &mut payloads);
+        assert_eq!(
+            payloads.payload_capacity(),
+            large,
+            "consecutive large frames must not thrash the allocator"
+        );
     }
 
     #[test]
