@@ -1972,7 +1972,10 @@ impl Voip<'_> {
         let _teardown = LocalTeardown {
             client: self.client,
             call_id,
-            generation: _generation,
+            // Pinned at entry, even for the generation-less public path: on a cancelled send, a
+            // teardown resolved at drop time would find a same-call-id replacement and end that
+            // instead of the call the caller asked to hang up.
+            generation: _generation.or_else(|| self.client.call_registry().generation_of(call_id)),
         };
         let mut notified = 0usize;
         let mut result = Ok(());
@@ -1995,8 +1998,10 @@ impl Voip<'_> {
     }
 }
 
-/// How much of a multi-target `<terminate>` fan-out reached the wire. A still-ringing call is told
-/// per device, so "some devices, not all" is a real outcome and not the same as telling nobody.
+/// How much of a multi-target `<terminate>` fan-out was confirmed sent. A still-ringing call is told
+/// per device, so "some devices, not all" is a real outcome and not the same as telling nobody. A
+/// send that errors is unconfirmed rather than known-undelivered: the transport can fail after
+/// putting bytes on the wire.
 #[cfg(feature = "voip-runtime")]
 pub(crate) struct TerminateDelivery {
     pub(crate) notified: usize,
@@ -2008,8 +2013,8 @@ pub(crate) struct TerminateDelivery {
 pub(crate) struct LocalTeardown<'a> {
     pub(crate) client: &'a Client,
     pub(crate) call_id: &'a str,
-    /// `None` tears down whatever generation currently holds the call-id, which is what the public
-    /// `terminate` (no handle, no generation) can promise.
+    /// The generation this teardown owns, pinned when the terminate started. `None` only for a
+    /// call-id nothing was registered under, where there is nothing to tear down.
     pub(crate) generation: Option<u64>,
 }
 

@@ -3026,11 +3026,12 @@ impl EndedFlag {
 pub enum CallTermination {
     /// `<terminate>` went out to every address this call had to reach.
     PeerNotified,
-    /// Some of a still-ringing call's devices were told and others could not be reached, so the rest
-    /// keep ringing until their own transport gives up. The local side is down either way.
-    PartlyNotified { notified: usize, unreachable: usize },
-    /// The stanza could not be sent, so the peer keeps ringing/talking until its own transport gives
-    /// up. Carries why the send failed.
+    /// Some of a still-ringing call's devices were told and the rest could not be confirmed, so those
+    /// may keep ringing until their own transport gives up. The local side is down either way.
+    /// `unconfirmed` is not the same as undelivered: a send can fail after bytes reach the wire.
+    PartlyNotified { notified: usize, unconfirmed: usize },
+    /// No send was confirmed, so the peer may keep ringing or talking until its own transport gives
+    /// up. Carries why the send failed; it may still have reached the wire.
     LocalOnly(CallError),
     /// The call was already over (peer terminate, superseded handle, earlier local teardown): nothing
     /// was sent and nothing was torn down.
@@ -3038,8 +3039,8 @@ pub enum CallTermination {
 }
 
 impl CallTermination {
-    /// Whether every address this call had to reach was told. `false` for a partial fan-out too, so
-    /// match on [`CallTermination::PartlyNotified`] to tell that apart from a fully silent hangup.
+    /// Whether every address this call had to reach was confirmed sent. `false` for a partial fan-out
+    /// too, so match on [`CallTermination::PartlyNotified`] to tell that apart from a silent hangup.
     pub fn peer_notified(&self) -> bool {
         matches!(self, Self::PeerNotified)
     }
@@ -3990,7 +3991,7 @@ impl CallHandle {
             Some(error) if delivery.notified == 0 => CallTermination::LocalOnly(error),
             Some(_) => CallTermination::PartlyNotified {
                 notified: delivery.notified,
-                unreachable: targets.len() - delivery.notified,
+                unconfirmed: targets.len() - delivery.notified,
             },
         }
     }
@@ -5889,12 +5890,12 @@ mod tests {
                 outcome,
                 CallTermination::PartlyNotified {
                     notified: 1,
-                    unreachable: 1
+                    unconfirmed: 1
                 }
             ),
             "a partial fan-out must be reported as such: {outcome:?}"
         );
-        assert!(!outcome.peer_notified(), "not every device was told");
+        assert!(!outcome.peer_notified(), "not every device was confirmed");
         assert_eq!(sends.load(Ordering::SeqCst), 2, "both sends were attempted");
         assert_eq!(
             client.call_registry().active_count(),
