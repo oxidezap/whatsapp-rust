@@ -1928,14 +1928,9 @@ impl Voip<'_> {
         peer: &Jid,
         call_creator: &Jid,
     ) -> Result<(), CallError> {
-        self.terminate_inner(
-            call_id,
-            std::slice::from_ref(peer),
-            call_creator,
-            None,
-            None,
-        )
-        .await
+        self.terminate_inner(call_id, std::slice::from_ref(peer), call_creator, None)
+            .await
+            .1
     }
 
     /// [`terminate`](Self::terminate) restricted to one registry generation and addressed at every
@@ -1949,23 +1944,13 @@ impl Voip<'_> {
         call_creator: &Jid,
         generation: u64,
     ) -> TerminateDelivery {
-        let mut delivery = TerminateDelivery {
-            notified: 0,
-            failure: None,
-        };
-        if let Err(error) = self
-            .terminate_inner(
-                call_id,
-                peers,
-                call_creator,
-                Some(generation),
-                Some(&mut delivery),
-            )
-            .await
-        {
-            delivery.failure = Some(error);
+        let (notified, result) = self
+            .terminate_inner(call_id, peers, call_creator, Some(generation))
+            .await;
+        TerminateDelivery {
+            notified,
+            failure: result.err(),
         }
-        delivery
     }
 
     async fn terminate_inner(
@@ -1974,10 +1959,9 @@ impl Voip<'_> {
         peers: &[Jid],
         call_creator: &Jid,
         _generation: Option<u64>,
-        mut delivery: Option<&mut TerminateDelivery>,
-    ) -> Result<(), CallError> {
+    ) -> (usize, Result<(), CallError>) {
         if call_id.is_empty() {
-            return Err(CallError::EmptyCallId);
+            return (0, Err(CallError::EmptyCallId));
         }
         // Tear the local call down whatever happens to the stanzas: the app asked to hang up, and
         // neither a failed send nor a caller that drops this future mid-send (a timeout, a `select!`)
@@ -1990,6 +1974,7 @@ impl Voip<'_> {
             call_id,
             generation: _generation,
         };
+        let mut notified = 0usize;
         let mut result = Ok(());
         for peer in peers {
             let id = self.client.generate_request_id();
@@ -2001,16 +1986,12 @@ impl Voip<'_> {
                 reason: None,
             });
             match self.client.send_node(stanza).await {
-                Ok(()) => {
-                    if let Some(delivery) = delivery.as_deref_mut() {
-                        delivery.notified += 1;
-                    }
-                }
+                Ok(()) => notified += 1,
                 Err(error) if result.is_ok() => result = Err(error.into()),
                 Err(_) => {}
             }
         }
-        result
+        (notified, result)
     }
 }
 
