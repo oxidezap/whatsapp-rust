@@ -71,6 +71,13 @@ pub struct EncryptedMediaInfo {
 ///   its tail so the ciphertext is written exactly once
 /// - `update_to_writer()` / `finalize_to_writer()` — write out in whole
 ///   flush-sized runs, holding at most one run at a time
+///
+/// Every call delivers all of its own ciphertext to the destination it was
+/// given before returning, so the modes may be interleaved: concatenating the
+/// destinations in call order reproduces the stream. Handing two calls the
+/// *same* `Vec` with a writer call between them does not — the writer's bytes
+/// belong between them, and no concatenation of the two destinations can put
+/// them there. Give each call its own destination if you interleave.
 #[must_use = "call finalize() or finalize_to_writer() to complete encryption"]
 pub struct MediaEncryptor {
     /// Owns both the AES key schedule and the CBC chaining block, so a batch
@@ -84,9 +91,9 @@ pub struct MediaEncryptor {
     remainder: Vec<u8>,
     /// Staging buffer for the writer output mode, which has no destination
     /// buffer of its own. Holds ciphertext awaiting a flush (<[`WRITE_FLUSH`]
-    /// plus one batch), grown on demand so a small payload never pays for the
-    /// full buffer, and kept across calls so a streaming encrypt allocates it
-    /// once for the whole file.
+    /// plus one batch) and is empty between calls; it lives on the encryptor
+    /// only so a streaming encrypt allocates it once for the whole file rather
+    /// than once per chunk.
     scratch: Vec<u8>,
     media_key: [u8; 32],
     file_length: u64,
@@ -139,14 +146,12 @@ impl MediaEncryptor {
 
     /// Feed plaintext, append encrypted blocks to `out`.
     pub fn update(&mut self, plaintext: &[u8], out: &mut Vec<u8>) {
-        self.drain_staged(out);
         self.feed(plaintext, out, &mut keep_in_place)
             .expect("a Vec destination performs no I/O");
     }
 
-    /// Feed plaintext, writing whole flush-sized runs of ciphertext to `writer`.
-    /// Any tail below a full run stays staged until the next call or
-    /// [`Self::finalize_to_writer`].
+    /// Feed plaintext, writing its ciphertext to `writer` in whole flush-sized
+    /// runs. Everything this call produces reaches `writer` before it returns.
     ///
     /// On error the encryptor state is unspecified — discard it.
     pub fn update_to_writer<W: Write>(
@@ -155,16 +160,17 @@ impl MediaEncryptor {
         writer: &mut W,
     ) -> std::io::Result<()> {
         let mut scratch = std::mem::take(&mut self.scratch);
-        let result = self.feed(plaintext, &mut scratch, &mut |staging, _start| {
-            flush_full(staging, writer)
-        });
+        let result = self
+            .feed(plaintext, &mut scratch, &mut |staging, _start| {
+                flush_full(staging, writer)
+            })
+            .and_then(|()| flush_rest(&mut scratch, writer));
         self.scratch = scratch;
         result
     }
 
     /// PKCS7 pad + 10-byte MAC. Appends final bytes to `out`.
     pub fn finalize(mut self, out: &mut Vec<u8>) -> Result<EncryptedMediaInfo> {
-        self.drain_staged(out);
         self.pad_and_encrypt(out, &mut keep_in_place)
             .expect("a Vec destination performs no I/O");
         let mac = self.compute_mac()?;
@@ -172,33 +178,17 @@ impl MediaEncryptor {
         self.finish_hashes(&mac)
     }
 
-    /// PKCS7 pad + 10-byte MAC. Flushes everything still staged to `writer`.
+    /// PKCS7 pad + 10-byte MAC. Writes the last of the ciphertext to `writer`.
     pub fn finalize_to_writer<W: Write>(mut self, writer: &mut W) -> Result<EncryptedMediaInfo> {
         let mut scratch = std::mem::take(&mut self.scratch);
         self.pad_and_encrypt(&mut scratch, &mut |staging, _start| {
             flush_full(staging, writer)
         })?;
-        // Whatever is left never reached the flush threshold.
-        writer.write_all(&scratch)?;
+        flush_rest(&mut scratch, writer)?;
 
         let mac = self.compute_mac()?;
         writer.write_all(&mac)?;
         self.finish_hashes(&mac)
-    }
-
-    /// Hand a `Vec` destination whatever the writer mode left staged.
-    ///
-    /// Nothing in the API forbids switching output modes mid-stream, and the
-    /// writer mode holds back the tail below a full flush. Those bytes are
-    /// already covered by the MAC and the ciphertext hash, so dropping them
-    /// would produce a blob that cannot be decrypted — they go to the `Vec`
-    /// instead, ahead of anything encrypted after them, which is where they
-    /// belong in the stream.
-    fn drain_staged(&mut self, out: &mut Vec<u8>) {
-        if !self.scratch.is_empty() {
-            out.extend_from_slice(&self.scratch);
-            self.scratch.clear();
-        }
     }
 
     /// Hash plaintext, then encrypt complete blocks directly from the input
@@ -319,7 +309,7 @@ impl MediaEncryptor {
 /// caller's destination `Vec` and [`keep_in_place`], leaving the batch where it
 /// already belongs; `update_to_writer`/`finalize_to_writer` pass the encryptor's
 /// scratch buffer and [`flush_full`], which drains it a [`WRITE_FLUSH`] run at
-/// a time.
+/// a time; the call then flushes whatever tail is left before returning.
 type Deliver<'a> = dyn FnMut(&mut Vec<u8>, usize) -> std::io::Result<()> + 'a;
 
 /// The [`Deliver`] of a `Vec` destination: the batch is already in it.
@@ -328,9 +318,19 @@ fn keep_in_place(_staging: &mut Vec<u8>, _start: usize) -> std::io::Result<()> {
 }
 
 /// The [`Deliver`] of a writer destination: hand the writer one whole
-/// [`WRITE_FLUSH`]-sized run at a time and keep any tail staged.
+/// [`WRITE_FLUSH`]-sized run at a time, so a single large `update_to_writer`
+/// still writes in bounded runs and never stages the whole input.
 fn flush_full<W: Write>(staging: &mut Vec<u8>, writer: &mut W) -> std::io::Result<()> {
     if staging.len() >= WRITE_FLUSH {
+        writer.write_all(staging)?;
+        staging.clear();
+    }
+    Ok(())
+}
+
+/// Write the sub-run tail a call ends on, so nothing is staged across calls.
+fn flush_rest<W: Write>(staging: &mut Vec<u8>, writer: &mut W) -> std::io::Result<()> {
+    if !staging.is_empty() {
         writer.write_all(staging)?;
         staging.clear();
     }
@@ -940,30 +940,31 @@ mod tests {
     }
 
     #[test]
-    fn switching_output_mode_mid_stream_loses_no_ciphertext() {
-        // The writer mode holds back the tail below a full flush. If a caller
-        // then finishes through the `Vec` mode — which the API permits — those
-        // staged bytes must still come out, in order: the MAC and the
-        // ciphertext hash cover them either way, so dropping them would yield a
-        // blob that cannot be decrypted.
+    fn interleaved_output_modes_concatenate_in_call_order() {
+        // Every call must deliver all of its own ciphertext before returning. A
+        // call that staged a sub-run tail for later would strand those bytes
+        // behind whatever the *next* destination receives, and no concatenation
+        // of the destinations could reproduce the stream. The cuts straddle a
+        // flush so each writer call ends mid-run, where a tail would be held.
         let key = [0x5Du8; 32];
-        // Past one flush so a run is written, and off the boundary so a tail is
-        // definitely still staged when the mode switches.
-        let data = payload(WRITE_FLUSH + 777, 0x3E);
-        let split = WRITE_FLUSH + 300;
+        let data = payload(3 * WRITE_FLUSH + 777, 0x3E);
+        let cuts = [WRITE_FLUSH + 300, 2 * WRITE_FLUSH + 91, 3 * WRITE_FLUSH + 5];
 
         let mut enc = MediaEncryptor::with_key(key, MediaType::Document).unwrap();
-        let mut written = Vec::new();
-        enc.update_to_writer(&data[..split], &mut written).unwrap();
-        assert!(!written.is_empty(), "a full run should have been flushed");
+        // Vec -> writer -> Vec -> writer, each call with its own destination.
+        let mut first = Vec::new();
+        enc.update(&data[..cuts[0]], &mut first);
+        let mut second = Vec::new();
+        enc.update_to_writer(&data[cuts[0]..cuts[1]], &mut second)
+            .unwrap();
+        let mut third = Vec::new();
+        enc.update(&data[cuts[1]..cuts[2]], &mut third);
+        let mut fourth = Vec::new();
+        enc.update_to_writer(&data[cuts[2]..], &mut fourth).unwrap();
+        let mut last = Vec::new();
+        enc.finalize(&mut last).unwrap();
 
-        // Both drain points: `update` first, then `finalize`.
-        let mut rest = Vec::new();
-        enc.update(&data[split..], &mut rest);
-        enc.finalize(&mut rest).unwrap();
-
-        let mut blob = written;
-        blob.extend_from_slice(&rest);
+        let blob: Vec<u8> = [first, second, third, fourth, last].concat();
 
         let expected = encrypt_media_with_key(&data, MediaType::Document, Some(&key)).unwrap();
         assert_eq!(
