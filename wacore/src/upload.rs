@@ -139,6 +139,7 @@ impl MediaEncryptor {
 
     /// Feed plaintext, append encrypted blocks to `out`.
     pub fn update(&mut self, plaintext: &[u8], out: &mut Vec<u8>) {
+        self.drain_staged(out);
         self.feed(plaintext, out, &mut keep_in_place)
             .expect("a Vec destination performs no I/O");
     }
@@ -163,6 +164,7 @@ impl MediaEncryptor {
 
     /// PKCS7 pad + 10-byte MAC. Appends final bytes to `out`.
     pub fn finalize(mut self, out: &mut Vec<u8>) -> Result<EncryptedMediaInfo> {
+        self.drain_staged(out);
         self.pad_and_encrypt(out, &mut keep_in_place)
             .expect("a Vec destination performs no I/O");
         let mac = self.compute_mac()?;
@@ -182,6 +184,21 @@ impl MediaEncryptor {
         let mac = self.compute_mac()?;
         writer.write_all(&mac)?;
         self.finish_hashes(&mac)
+    }
+
+    /// Hand a `Vec` destination whatever the writer mode left staged.
+    ///
+    /// Nothing in the API forbids switching output modes mid-stream, and the
+    /// writer mode holds back the tail below a full flush. Those bytes are
+    /// already covered by the MAC and the ciphertext hash, so dropping them
+    /// would produce a blob that cannot be decrypted — they go to the `Vec`
+    /// instead, ahead of anything encrypted after them, which is where they
+    /// belong in the stream.
+    fn drain_staged(&mut self, out: &mut Vec<u8>) {
+        if !self.scratch.is_empty() {
+            out.extend_from_slice(&self.scratch);
+            self.scratch.clear();
+        }
     }
 
     /// Hash plaintext, then encrypt complete blocks directly from the input
@@ -920,6 +937,43 @@ mod tests {
             "expected at most {max_writes} batched writes, got {}",
             writer.writes
         );
+    }
+
+    #[test]
+    fn switching_output_mode_mid_stream_loses_no_ciphertext() {
+        // The writer mode holds back the tail below a full flush. If a caller
+        // then finishes through the `Vec` mode — which the API permits — those
+        // staged bytes must still come out, in order: the MAC and the
+        // ciphertext hash cover them either way, so dropping them would yield a
+        // blob that cannot be decrypted.
+        let key = [0x5Du8; 32];
+        // Past one flush so a run is written, and off the boundary so a tail is
+        // definitely still staged when the mode switches.
+        let data = payload(WRITE_FLUSH + 777, 0x3E);
+        let split = WRITE_FLUSH + 300;
+
+        let mut enc = MediaEncryptor::with_key(key, MediaType::Document).unwrap();
+        let mut written = Vec::new();
+        enc.update_to_writer(&data[..split], &mut written).unwrap();
+        assert!(!written.is_empty(), "a full run should have been flushed");
+
+        // Both drain points: `update` first, then `finalize`.
+        let mut rest = Vec::new();
+        enc.update(&data[split..], &mut rest);
+        enc.finalize(&mut rest).unwrap();
+
+        let mut blob = written;
+        blob.extend_from_slice(&rest);
+
+        let expected = encrypt_media_with_key(&data, MediaType::Document, Some(&key)).unwrap();
+        assert_eq!(
+            blob, expected.data_to_upload,
+            "ciphertext must be identical"
+        );
+
+        let plain =
+            DownloadUtils::decrypt_stream(Cursor::new(&blob), &key, MediaType::Document).unwrap();
+        assert_eq!(plain, data, "the blob must still decrypt");
     }
 
     #[test]
