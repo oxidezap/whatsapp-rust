@@ -1928,6 +1928,28 @@ impl Voip<'_> {
         peer: &Jid,
         call_creator: &Jid,
     ) -> Result<(), CallError> {
+        #[cfg(feature = "voip-runtime")]
+        {
+            let pinned = self.client.call_registry().generation_of(call_id);
+            // Armed before the lane, since waiting for it is cancellable too, and pinned so it can
+            // only ever end the call this terminate started on.
+            let _teardown = LocalTeardown {
+                client: self.client,
+                call_id,
+                generation: pinned,
+            };
+            // Held across the send: a replacement installed in that window would be ended by a
+            // `<terminate>` the peer cannot tell apart from ours, since both carry the same call-id.
+            let _transition = self.client.lock_answer_transition(call_id).await;
+            if pinned.is_some() && self.client.call_registry().generation_of(call_id) != pinned {
+                return Err(CallError::Media("call is no longer active"));
+            }
+            return self
+                .terminate_inner(call_id, std::slice::from_ref(peer), call_creator, pinned)
+                .await
+                .1;
+        }
+        #[cfg(not(feature = "voip-runtime"))]
         self.terminate_inner(call_id, std::slice::from_ref(peer), call_creator, None)
             .await
             .1

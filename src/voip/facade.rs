@@ -6035,6 +6035,47 @@ mod tests {
         );
     }
 
+    // The generation-less public terminate holds the same lane, so a replacement installed while it
+    // sends is not ended by a `<terminate>` the peer cannot tell apart from ours.
+    #[tokio::test]
+    async fn public_terminate_refuses_a_replaced_call() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        registry.insert(mk_session());
+        let live = registry.insert(mk_session());
+        let held = client.lock_answer_transition("CID-FACADE").await;
+
+        let terminating = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .voip()
+                    .terminate("CID-FACADE", &caller(), &caller())
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The replacement lands while the terminate waits for the lane.
+        let newest = registry.insert(mk_session());
+        drop(held);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), terminating)
+                .await
+                .expect("terminate must finish")
+                .expect("join")
+                .is_err(),
+            "a call replaced under the lane must not be terminated"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "no stanza for a dead call");
+        assert_ne!(live, newest);
+        assert_eq!(
+            registry.generation_of("CID-FACADE"),
+            Some(newest),
+            "the replacement must survive"
+        );
+    }
+
     // Waiting for the answer-transition lane is cancellable too: a caller that gives up while another
     // transition holds it must not be left with a live call and an open microphone.
     #[tokio::test]
