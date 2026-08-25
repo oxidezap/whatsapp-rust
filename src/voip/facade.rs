@@ -3202,6 +3202,23 @@ impl CallHandle {
             .unwrap_or_else(|| self.peer_jid.clone())
     }
 
+    /// Every address a `<terminate>` for this call must reach. One, except while an outgoing call is
+    /// still ringing: call signaling is routed per device and the server does not fan a terminate
+    /// out, so until one device answers, every device the offer rang has to be told.
+    fn terminate_targets(&self) -> Vec<Jid> {
+        let addressed = self.peer_jid();
+        if addressed != self.peer_jid {
+            return vec![addressed];
+        }
+        match self
+            .client_registry
+            .snapshot_if_current(&self.call_id, self.generation)
+        {
+            Some(session) if !session.ring_devices.is_empty() => session.ring_devices,
+            _ => vec![addressed],
+        }
+    }
+
     /// The call's creator JID, as carried in the signaling (needed by `voip().terminate(..)`).
     pub fn call_creator(&self) -> &Jid {
         &self.call_creator
@@ -3913,7 +3930,7 @@ impl CallHandle {
             .voip()
             .terminate_for_generation(
                 &self.call_id,
-                &self.peer_jid(),
+                &self.terminate_targets(),
                 &self.call_creator,
                 self.generation,
             )
@@ -5772,12 +5789,26 @@ mod tests {
         let Ok(builders) = std::fs::read_to_string(root.join("wacore/src/stanza/call.rs")) else {
             return;
         };
+        // `use` lines are imports, not calls, and a builder can be imported long after its last
+        // caller went away.
         let callers = CALLERS
             .iter()
             .filter_map(|path| std::fs::read_to_string(root.join(path)).ok())
-            .collect::<String>();
+            .flat_map(|source| {
+                source
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("use "))
+                    .map(|line| line.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
-        let is_wired = |suffix: &str| callers.contains(&format!("build_{suffix}"));
+        // A call, not a prefix: `build_preaccept_with_capability` must not stand in for a caller of
+        // `build_preaccept`.
+        let is_wired = |suffix: &str| {
+            let call = format!("build_{suffix}(");
+            callers.iter().any(|line| line.contains(&call))
+        };
         for suffix in builders.lines().filter_map(|line| {
             line.strip_prefix("pub fn build_")
                 .and_then(|rest| rest.split('(').next())
@@ -5830,6 +5861,70 @@ mod tests {
             node.as_node_ref().attrs().optional_jid("to"),
             Some(Jid::new("CID-FACADE", Server::Call)),
             "a promoted call must be ended at its call scope"
+        );
+    }
+
+    // An outgoing call still ringing has no answering device yet, and the server does not fan a
+    // terminate out: cancelling it must reach every device the offer rang, or the rest keep ringing.
+    #[tokio::test]
+    async fn terminate_while_ringing_reaches_every_rung_device() {
+        let (client, sends) = make_sending_client().await;
+        let first = caller().with_device(1);
+        let second = caller().with_device(2);
+        let mut session = mk_session();
+        session.ring_devices = vec![first.clone(), second.clone()];
+        let generation = client.call_registry().insert(session);
+        let handle = registry_handle(&client, generation);
+
+        let to_first = client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("call").attr("to", first.to_string()),
+        );
+        let to_second = client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("call").attr("to", second.to_string()),
+        );
+        assert!(handle.terminate().await.peer_notified());
+
+        for (waiter, device) in [(to_first, first), (to_second, second)] {
+            let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .unwrap_or_else(|_| panic!("{device} must be told"))
+                .expect("waiter");
+            assert_eq!(
+                node.as_node_ref().children().expect("call action")[0]
+                    .tag
+                    .as_ref(),
+                "terminate"
+            );
+        }
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            2,
+            "one stanza per rung device"
+        );
+    }
+
+    // Cancellation (a timeout, a `select!`) at the send await must not strand the media task with the
+    // microphone open: the local teardown is a drop guard, not a statement after the await.
+    #[tokio::test]
+    async fn cancelling_terminate_mid_send_still_ends_the_call() {
+        let client = make_client().await;
+        let (transport, entered, _release) = gated_send_transport(0, false);
+        install_noise_transport(&client, transport).await;
+        let generation = client.call_registry().insert(mk_session());
+        let handle = registry_handle(&client, generation);
+
+        let terminate = tokio::spawn(async move { handle.terminate().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.recv())
+            .await
+            .expect("the terminate send must reach the gate")
+            .expect("gate observer");
+        terminate.abort();
+        let _ = terminate.await;
+
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "a cancelled terminate must still tear the local call down"
         );
     }
 

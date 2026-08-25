@@ -1918,64 +1918,95 @@ impl Voip<'_> {
 
     /// Terminate an active call: `<terminate>` to `peer`, then the local teardown.
     ///
-    /// Holding a `CallHandle`, prefer its own `terminate()`: it knows all three identifiers and
-    /// resolves `peer` to the device that answered.
+    /// Holding a `CallHandle`, prefer its own `terminate()`: it knows all three identifiers, resolves
+    /// `peer` to the device that answered, and reaches every device a still-ringing call rang.
     pub async fn terminate(
         &self,
         call_id: &str,
         peer: &Jid,
         call_creator: &Jid,
     ) -> Result<(), CallError> {
-        self.terminate_inner(call_id, peer, call_creator, None)
+        self.terminate_inner(call_id, std::slice::from_ref(peer), call_creator, None)
             .await
     }
 
-    /// [`terminate`](Self::terminate) restricted to one registry generation, so a handle superseded
-    /// by a same-call-id replacement tears down its own call instead of the replacement's.
+    /// [`terminate`](Self::terminate) restricted to one registry generation and addressed at every
+    /// device that must be told, so a handle superseded by a same-call-id replacement tears down its
+    /// own call instead of the replacement's.
     #[cfg(feature = "voip-runtime")]
     pub(crate) async fn terminate_for_generation(
         &self,
         call_id: &str,
-        peer: &Jid,
+        peers: &[Jid],
         call_creator: &Jid,
         generation: u64,
     ) -> Result<(), CallError> {
-        self.terminate_inner(call_id, peer, call_creator, Some(generation))
+        self.terminate_inner(call_id, peers, call_creator, Some(generation))
             .await
     }
 
     async fn terminate_inner(
         &self,
         call_id: &str,
-        peer: &Jid,
+        peers: &[Jid],
         call_creator: &Jid,
         _generation: Option<u64>,
     ) -> Result<(), CallError> {
         if call_id.is_empty() {
             return Err(CallError::EmptyCallId);
         }
-        let id = self.client.generate_request_id();
-        let stanza = build_terminate(&TerminateParams {
-            call_id,
-            to: peer,
-            id: Some(&id),
-            call_creator,
-            reason: None,
-        });
-        let sent = self.client.send_node(stanza).await;
-        // Tear the local call down regardless of whether the stanza reached the peer: the app asked to
-        // hang up, and a failed signaling send must not leave the media task capturing/sending (or a
-        // dormant outgoing call free to attach on a late relay ack). Reuse the same teardown the peer's
-        // `<terminate>` triggers so the public hangup actually ends our side too.
+        // Tear the local call down whatever happens to the stanzas: the app asked to hang up, and
+        // neither a failed send nor a caller that drops this future mid-send (a timeout, a `select!`)
+        // may leave the media task capturing or a dormant outgoing call free to attach on a late
+        // relay ack. A drop guard is what survives the cancellation; it reuses the same teardown the
+        // peer's `<terminate>` triggers.
         #[cfg(feature = "voip-runtime")]
-        match _generation {
-            Some(generation) => {
-                crate::voip::facade::terminate_call_if_current(self.client, call_id, generation)
+        let _teardown = LocalTeardown {
+            client: self.client,
+            call_id,
+            generation: _generation,
+        };
+        let mut result = Ok(());
+        for peer in peers {
+            let id = self.client.generate_request_id();
+            let stanza = build_terminate(&TerminateParams {
+                call_id,
+                to: peer,
+                id: Some(&id),
+                call_creator,
+                reason: None,
+            });
+            if let Err(error) = self.client.send_node(stanza).await
+                && result.is_ok()
+            {
+                result = Err(error.into());
             }
-            None => crate::voip::facade::terminate_call(self.client, call_id),
         }
-        sent?;
-        Ok(())
+        result
+    }
+}
+
+/// Local call teardown that runs even when the terminate future is cancelled mid-send.
+#[cfg(feature = "voip-runtime")]
+struct LocalTeardown<'a> {
+    client: &'a Client,
+    call_id: &'a str,
+    /// `None` tears down whatever generation currently holds the call-id, which is what the public
+    /// `terminate` (no handle, no generation) can promise.
+    generation: Option<u64>,
+}
+
+#[cfg(feature = "voip-runtime")]
+impl Drop for LocalTeardown<'_> {
+    fn drop(&mut self) {
+        match self.generation {
+            Some(generation) => crate::voip::facade::terminate_call_if_current(
+                self.client,
+                self.call_id,
+                generation,
+            ),
+            None => crate::voip::facade::terminate_call(self.client, self.call_id),
+        }
     }
 }
 
