@@ -3430,9 +3430,11 @@ impl CallHandle {
 
     /// Mute or unmute the local microphone and tell the other side.
     ///
-    /// The local half applies first and always: while muted the engine sends DTX comfort-noise (the
-    /// stream stays fed) instead of gapping, so the peer doesn't re-negotiate the transport. This
-    /// affects PCM audio only; encoded-audio callers must mute their external source.
+    /// The local half applies first: while muted the engine sends DTX comfort-noise (the stream stays
+    /// fed) instead of gapping, so the peer doesn't re-negotiate the transport. This affects PCM audio
+    /// only; encoded-audio callers must mute their external source. A future dropped while it waits its
+    /// turn leaves the microphone as it was, so the two sides cannot end up on opposite states with
+    /// nothing said about it.
     ///
     /// The new state is then announced as `<mute_v2>`, addressed like the rest of this call's
     /// signaling: the call scope for a group or call-link call, whose roster shows who is muted, and
@@ -3443,9 +3445,6 @@ impl CallHandle {
     /// that does not exist on any of the devices still ringing.
     pub async fn set_muted(&self, muted: bool) -> Result<(), CallError> {
         self.ensure_current()?;
-        // Local first: the microphone must stop when the user says so, even if the announcement
-        // cannot go out.
-        self.muted.store(muted, Ordering::Relaxed);
         let client = self.upgrade_client()?;
         // One ordered transition per call: two cloned handles muting at once would otherwise race,
         // and the older value could land on the wire after the newer one.
@@ -3453,6 +3452,12 @@ impl CallHandle {
         // Re-checked under the lane: a call that ended while we waited must report that, not the
         // `Ok(())` a live call still ringing gets.
         self.ensure_current()?;
+        // Applied under the lane rather than on entry: a caller that drops this future while it waits
+        // for the lane (a timeout, a `select!`) gets no announcement, so a local state stored before
+        // the wait would leave this side muted and the peer showing the opposite with no `Err` to say
+        // so. Both sides stay on the old state instead, and the microphone changes only alongside the
+        // announcement that follows it here.
+        self.muted.store(muted, Ordering::Relaxed);
         let Some(target) = self.mute_target() else {
             return Ok(());
         };
@@ -3970,7 +3975,7 @@ impl CallHandle {
         let _teardown = crate::client::voip::LocalTeardown {
             client: &client,
             call_id: &self.call_id,
-            generation: Some(self.generation),
+            generation: self.generation,
         };
         // The answer-transition lane, held across the check AND the send: a replacement installed in
         // that window would be ended by a `<terminate>` the peer cannot tell apart from ours, since
@@ -5796,6 +5801,36 @@ mod tests {
         assert_eq!(sends.load(Ordering::SeqCst), 1);
     }
 
+    // Dropped before the announcement can go out, a mute must leave the microphone where it was:
+    // applying it locally alone would show this side muted while the peer still sees it open, and the
+    // cancelled caller gets no `Err` to tell it apart.
+    #[tokio::test]
+    async fn cancelling_a_mute_at_the_lane_leaves_both_sides_on_the_old_state() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+            "CID-FACADE",
+            caller(),
+            caller(),
+        ));
+        registry.set_answering_device("CID-FACADE", caller().with_device(3));
+        let handle = registry_handle(&client, generation);
+        let held = client.lock_answer_transition("CID-FACADE").await;
+
+        let muting = handle.clone();
+        let task = tokio::spawn(async move { muting.set_muted(true).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+        drop(held);
+
+        assert!(
+            !handle.is_muted(),
+            "a mute nobody was told about must not apply locally"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "the send never started");
+    }
+
     // A superseded handle must not announce a state the replacement never chose.
     #[tokio::test]
     async fn stale_handle_mute_announces_nothing() {
@@ -6096,6 +6131,37 @@ mod tests {
             client.call_registry().active_count(),
             0,
             "a terminate cancelled at the lane must still tear the local call down"
+        );
+    }
+
+    // A terminate that starts on a call-id nothing is registered under owns no local call. A call
+    // registered while it waits for the lane is somebody else's, so it must neither be signalled (the
+    // peer cannot tell two same-call-id terminates apart) nor torn down.
+    #[tokio::test]
+    async fn terminate_of_an_unregistered_call_spares_a_call_registered_while_it_waits() {
+        let (client, sends) = make_sending_client().await;
+        let held = client.lock_answer_transition("CID-FACADE").await;
+
+        let terminating = client.clone();
+        let task = tokio::spawn(async move {
+            terminating
+                .voip()
+                .terminate("CID-FACADE", &caller(), &caller())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let generation = client.call_registry().insert(mk_session());
+        drop(held);
+
+        assert!(
+            task.await.expect("join").is_err(),
+            "the call-id now belongs to a call this terminate never started on"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "nothing to tell the peer");
+        assert_eq!(
+            client.call_registry().generation_of("CID-FACADE"),
+            Some(generation),
+            "the call registered meanwhile must survive"
         );
     }
 

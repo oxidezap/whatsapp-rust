@@ -1932,16 +1932,19 @@ impl Voip<'_> {
         {
             let pinned = self.client.call_registry().generation_of(call_id);
             // Armed before the lane, since waiting for it is cancellable too, and pinned so it can
-            // only ever end the call this terminate started on.
-            let _teardown = LocalTeardown {
+            // only ever end the call this terminate started on. Nothing registered under this call-id
+            // means there is no local call of ours to end, so this path stays teardown-free.
+            let _teardown = pinned.map(|generation| LocalTeardown {
                 client: self.client,
                 call_id,
-                generation: pinned,
-            };
+                generation,
+            });
             // Held across the send: a replacement installed in that window would be ended by a
             // `<terminate>` the peer cannot tell apart from ours, since both carry the same call-id.
             let _transition = self.client.lock_answer_transition(call_id).await;
-            if pinned.is_some() && self.client.call_registry().generation_of(call_id) != pinned {
+            // Any change since entry -- a replacement, a removal, or a first registration under a
+            // call-id that had none -- belongs to a different call than the one asked to end.
+            if self.client.call_registry().generation_of(call_id) != pinned {
                 return Err(CallError::Media("call is no longer active"));
             }
             return self
@@ -1990,15 +1993,16 @@ impl Voip<'_> {
         // may leave the media task capturing or a dormant outgoing call free to attach on a late
         // relay ack. A drop guard is what survives the cancellation; it reuses the same teardown the
         // peer's `<terminate>` triggers.
+        // Pinned by the caller, never resolved here: a teardown that read the registry at drop time
+        // would find a same-call-id replacement and end that instead of the call the caller asked to
+        // hang up. `None` is a call-id with nothing of ours registered under it, which has no local
+        // side to tear down.
         #[cfg(feature = "voip-runtime")]
-        let _teardown = LocalTeardown {
+        let _teardown = _generation.map(|generation| LocalTeardown {
             client: self.client,
             call_id,
-            // Pinned at entry, even for the generation-less public path: on a cancelled send, a
-            // teardown resolved at drop time would find a same-call-id replacement and end that
-            // instead of the call the caller asked to hang up.
-            generation: _generation.or_else(|| self.client.call_registry().generation_of(call_id)),
-        };
+            generation,
+        });
         let mut notified = 0usize;
         let mut result = Ok(());
         for peer in peers {
@@ -2035,22 +2039,15 @@ pub(crate) struct TerminateDelivery {
 pub(crate) struct LocalTeardown<'a> {
     pub(crate) client: &'a Client,
     pub(crate) call_id: &'a str,
-    /// The generation this teardown owns, pinned when the terminate started. `None` only for a
-    /// call-id nothing was registered under, where there is nothing to tear down.
-    pub(crate) generation: Option<u64>,
+    /// The generation this teardown owns, pinned when the terminate started, so it can only ever end
+    /// that call and never a replacement registered under the same call-id afterwards.
+    pub(crate) generation: u64,
 }
 
 #[cfg(feature = "voip-runtime")]
 impl Drop for LocalTeardown<'_> {
     fn drop(&mut self) {
-        match self.generation {
-            Some(generation) => crate::voip::facade::terminate_call_if_current(
-                self.client,
-                self.call_id,
-                generation,
-            ),
-            None => crate::voip::facade::terminate_call(self.client, self.call_id),
-        }
+        crate::voip::facade::terminate_call_if_current(self.client, self.call_id, self.generation);
     }
 }
 
