@@ -3019,8 +3019,31 @@ impl EndedFlag {
     }
 }
 
+/// What [`CallHandle::terminate`] achieved. The local side is down in every case; the variants only
+/// say how much the peer learned, so a consumer can log a silent hangup without having to handle an
+/// error in order to end a call.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CallTermination {
+    /// `<terminate>` went out to the peer.
+    PeerNotified,
+    /// The stanza could not be sent, so the peer keeps ringing/talking until its own transport gives
+    /// up. Carries why the send failed.
+    LocalOnly(CallError),
+    /// The call was already over (peer terminate, superseded handle, earlier local teardown): nothing
+    /// was sent and nothing was torn down.
+    AlreadyEnded,
+}
+
+impl CallTermination {
+    /// Whether the peer was told. `false` means the call ended locally only.
+    pub fn peer_notified(&self) -> bool {
+        matches!(self, Self::PeerNotified)
+    }
+}
+
 /// Opaque handle to a live call. Drop does NOT end the call (the driver task owns its own lifetime);
-/// call [`hangup`](Self::hangup) to tear it down. No public fields, so the surface can grow without
+/// call [`terminate`](Self::terminate) to end it. No public fields, so the surface can grow without
 /// breaking callers. `Clone` is cheap (shared `Arc` state); every clone controls the SAME live call.
 #[derive(Clone)]
 pub struct CallHandle {
@@ -3800,19 +3823,21 @@ impl CallHandle {
         }
     }
 
-    /// Tear the call down: abort the media task (which closes the relay and the audio channels).
-    /// Idempotent. Signaling `<terminate>` is a separate concern; send it via
-    /// [`Voip::terminate`](crate::Voip::terminate) if the peer must be told.
+    /// Drop this side of the call without telling the peer: aborts the media task (which closes the
+    /// relay and the audio channels). Idempotent, infallible, and silent on the wire, so the peer
+    /// keeps its own call up until its transport times out. That is what you want only when the call
+    /// is already over for the peer (it sent `<terminate>`/`<reject>`, or this handle was superseded);
+    /// to end a live call use [`terminate`](Self::terminate).
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
-            name = "wa.voip.hangup",
+            name = "wa.voip.hangup_local",
             level = "debug",
             skip_all,
             fields(call_id = %self.call_id)
         )
     )]
-    pub async fn hangup(&self) {
+    pub async fn hangup_local(&self) {
         // Generation-guarded: if a same-call-id glare/retry replaced this call under a newer
         // generation, this no-ops instead of aborting the replacement. For an ATTACHED call this
         // aborts the media task, whose drop-guard notifies `ended`. The bool reports whether we
@@ -3837,6 +3862,40 @@ impl CallHandle {
         // the dial. A superseded/already-gone handle removed nothing and stays quiet.
         if removed_registry || removed_pending.is_some() {
             self.ended.notify();
+        }
+    }
+
+    /// End the call: send `<terminate>` to the peer, then tear the local side down.
+    ///
+    /// The peer is addressed exactly as [`peer_jid`](Self::peer_jid) resolves it, so a direct call
+    /// reaches the device that answered and a group/call-link one the call scope. The local teardown
+    /// runs whether or not the stanza went out, which is why this reports its outcome instead of
+    /// returning an error the caller must handle to hang up.
+    pub async fn terminate(&self) -> CallTermination {
+        // Nothing of ours is live: a superseded handle must not signal, or the peer would drop the
+        // replacement that now owns this call-id.
+        if self.client_registry.generation_of(&self.call_id) != Some(self.generation) {
+            return CallTermination::AlreadyEnded;
+        }
+        let client = match self.upgrade_client() {
+            Ok(client) => client,
+            Err(error) => {
+                self.hangup_local().await;
+                return CallTermination::LocalOnly(error);
+            }
+        };
+        match client
+            .voip()
+            .terminate_for_generation(
+                &self.call_id,
+                &self.peer_jid(),
+                &self.call_creator,
+                self.generation,
+            )
+            .await
+        {
+            Ok(()) => CallTermination::PeerNotified,
+            Err(error) => CallTermination::LocalOnly(error),
         }
     }
 
@@ -5473,11 +5532,222 @@ mod tests {
         .await
         .expect("spawn_call");
         assert_eq!(client.call_registry().active_count(), 1);
-        handle.hangup().await;
+        handle.hangup_local().await;
         assert_eq!(
             client.call_registry().active_count(),
             0,
             "hangup deregisters the call"
+        );
+    }
+
+    /// A handle over an already-registered call with no engine behind it: enough to drive the
+    /// signaling-only methods (`terminate`) without standing a media task up.
+    fn registry_handle(client: &Arc<Client>, generation: u64) -> CallHandle {
+        let (_ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
+        CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: client.call_registry(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
+            client: Arc::downgrade(client),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: Arc::new(VideoShared::new()),
+            events: ev_rx,
+            ended: Arc::new(EndedFlag::default()),
+        }
+    }
+
+    // The reported symptom: ending a call from the handle used to be local-only, so the peer kept
+    // talking until its transport timed out. terminate() must put exactly one <terminate> on the wire,
+    // addressed at the device that answered the <accept>, and tear the local call down.
+    #[tokio::test]
+    async fn terminate_signals_the_answering_device() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let device = caller().with_device(3);
+        registry.set_answering_device("CID-FACADE", device.clone());
+        let handle = registry_handle(&client, generation);
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let outcome = handle.terminate().await;
+        assert!(
+            outcome.peer_notified(),
+            "a reachable peer must be told: {outcome:?}"
+        );
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("terminate must be sent")
+            .expect("waiter");
+        let wrapper = node.as_node_ref();
+        assert_eq!(
+            wrapper.attrs().optional_jid("to"),
+            Some(device),
+            "the terminate must reach the device that answered, not the bare peer"
+        );
+        let action = &wrapper.children().expect("call action")[0];
+        assert_eq!(action.tag.as_ref(), "terminate");
+        assert_eq!(
+            action.attrs().optional_string("call-id").as_deref(),
+            Some("CID-FACADE")
+        );
+        assert_eq!(action.attrs().optional_jid("call-creator"), Some(caller()));
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "exactly one terminate, not one per teardown step"
+        );
+        assert_eq!(
+            registry.active_count(),
+            0,
+            "signaling the peer must still end our own call"
+        );
+    }
+
+    // A call-signaling builder nobody sends is the cheap signal of the bug this pair exists for: an
+    // action with a wire form that never leaves the process. A new one must be wired to a caller or
+    // listed here (suffixes only, so this list is not its own evidence of a caller) with the reason.
+    #[test]
+    fn call_stanza_builders_are_wired_to_the_runtime() {
+        // Media-plane keepalives and mute: no public call-control method claims to send them today,
+        // and what the official client emits for them is not established here. See the audit notes.
+        const UNWIRED: &[&str] = &["transport", "relay_latency", "heartbeat", "mute_v2"];
+        const CALLERS: &[&str] = &[
+            "src/voip/facade.rs",
+            "src/client/voip.rs",
+            "src/handlers/call.rs",
+            "wacore/src/stanza/group_call.rs",
+        ];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Absent when this crate is consumed unpacked from a registry: nothing to check, not a failure.
+        let Ok(builders) = std::fs::read_to_string(root.join("wacore/src/stanza/call.rs")) else {
+            return;
+        };
+        let callers = CALLERS
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(root.join(path)).ok())
+            .collect::<String>();
+
+        let is_wired = |suffix: &str| callers.contains(&format!("build_{suffix}"));
+        for suffix in builders.lines().filter_map(|line| {
+            line.strip_prefix("pub fn build_")
+                .and_then(|rest| rest.split('(').next())
+        }) {
+            assert!(
+                is_wired(suffix) || UNWIRED.contains(&suffix),
+                "build_{suffix} has no runtime caller: send it, or list it in UNWIRED with why"
+            );
+        }
+        for suffix in UNWIRED {
+            assert!(
+                !is_wired(suffix),
+                "build_{suffix} is wired now; drop it from UNWIRED"
+            );
+        }
+    }
+
+    // Group and call-link calls address every transition at the call scope, not at a device. Ending one
+    // must follow that, or the terminate reaches nobody.
+    #[tokio::test]
+    async fn terminate_of_a_group_call_addresses_the_call_scope() {
+        let (client, _sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let handle = registry_handle(&client, generation);
+        let update = GroupCallUpdate::builder()
+            .call_id("CID-FACADE".to_string())
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        assert_eq!(
+            registry.apply_group_update(update),
+            wacore::voip::GroupStateApply::Applied
+        );
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        assert!(handle.terminate().await.peer_notified());
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("terminate must be sent")
+            .expect("waiter");
+        assert_eq!(
+            node.as_node_ref().attrs().optional_jid("to"),
+            Some(Jid::new("CID-FACADE", Server::Call)),
+            "a promoted call must be ended at its call scope"
+        );
+    }
+
+    // The local teardown is not conditional on the wire: an offline/failing send still ends the call
+    // here, and the outcome says the peer was not reached.
+    #[tokio::test]
+    async fn terminate_send_failure_still_ends_the_call_locally() {
+        let client = make_failing_send_client().await; // send_node errors (no noise socket)
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let handle = registry_handle(&client, generation);
+
+        let outcome = handle.terminate().await;
+        assert!(
+            matches!(outcome, CallTermination::LocalOnly(_)),
+            "a failed send must be reported as a local-only hangup: {outcome:?}"
+        );
+        assert_eq!(
+            registry.active_count(),
+            0,
+            "a failed terminate send must not leave the call registered"
+        );
+    }
+
+    // hangup_local() is the deliberately silent half of the pair. Naming it is the fix for the trap;
+    // this pins the behavior difference so the two can't drift back together.
+    #[tokio::test]
+    async fn hangup_local_tells_the_peer_nothing() {
+        let (client, sends) = make_sending_client().await;
+        let generation = client.call_registry().insert(mk_session());
+        let handle = registry_handle(&client, generation);
+
+        handle.hangup_local().await;
+
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            0,
+            "hangup_local must stay off the wire"
+        );
+        assert_eq!(client.call_registry().active_count(), 0);
+    }
+
+    // A superseded handle (same-call-id glare/retry replaced it) must not signal: the peer would drop
+    // the replacement that now owns this call-id.
+    #[tokio::test]
+    async fn stale_handle_terminate_spares_the_replacement() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let stale_generation = registry.insert(mk_session());
+        let stale = registry_handle(&client, stale_generation);
+        let live_generation = registry.insert(mk_session());
+        assert_ne!(stale_generation, live_generation);
+
+        let outcome = stale.terminate().await;
+        assert!(
+            matches!(outcome, CallTermination::AlreadyEnded),
+            "a superseded handle has nothing to end: {outcome:?}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "no stanza for a dead call");
+        assert_eq!(
+            registry.generation_of("CID-FACADE"),
+            Some(live_generation),
+            "the live replacement must survive"
         );
     }
 
@@ -5528,14 +5798,14 @@ mod tests {
         );
 
         // The stale handle hangs up: it must NOT abort the replacement.
-        stale.hangup().await;
+        stale.hangup_local().await;
         assert_eq!(
             client.call_registry().active_count(),
             1,
             "stale hangup must leave the live replacement registered"
         );
         // The live handle still tears it down.
-        live.hangup().await;
+        live.hangup_local().await;
         assert_eq!(client.call_registry().active_count(), 0);
     }
 
@@ -5636,7 +5906,7 @@ mod tests {
         // Let the waiter register its listener and pass the still-present phase check, so it is truly
         // parked on `listener.await` (the path the guard must cover), not the early return.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        handle.hangup().await;
+        handle.hangup_local().await;
         tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("wait_ended must resolve after hangup aborts the task")
@@ -6609,7 +6879,7 @@ mod tests {
             "the dormant call is parked pending the relay"
         );
 
-        handle.hangup().await;
+        handle.hangup_local().await;
 
         assert!(
             client
@@ -6628,6 +6898,33 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("dormant hangup must resolve wait_ended (no engine task to notify it)");
+    }
+
+    // A call still dormant (offer sent, relay not back yet) terminated through the handle must drop its
+    // pending entry, so the relay riding a late ack cannot resurrect it.
+    #[tokio::test]
+    async fn dormant_outgoing_terminate_signals_and_survives_a_late_relay_ack() {
+        let (client, _sends) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+
+        let outcome = handle.terminate().await;
+        assert!(
+            outcome.peer_notified(),
+            "a dormant call still rings the peer, so it must be told: {outcome:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
+            .await
+            .expect("dormant terminate must resolve wait_ended (no engine task to notify it)");
+
+        let attached = attach_outgoing_relay(&client, &call_id, &sample_relay())
+            .await
+            .expect("late relay ack");
+        assert!(!attached, "a terminated call must not attach a late relay");
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "the late ack must not re-register the call"
+        );
     }
 
     // A disconnect must tear down dormant outgoing calls: drain pending_outgoing_calls and notify each
@@ -6849,7 +7146,7 @@ mod tests {
         // Let attach_engine reach the gated connect before hanging up.
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        handle.hangup().await;
+        handle.hangup_local().await;
 
         tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
@@ -8293,7 +8590,7 @@ mod tests {
             Some("3"),
             "the stanza that starts video must carry the rotation already set"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     /// A rotation while video is running is announced on its own, as a `state=1`
@@ -8331,7 +8628,7 @@ mod tests {
             ar.attrs().optional_string("device_orientation").as_deref(),
             Some("1")
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     /// Every mutating method on `CallHandle` refuses a handle a replacement has
@@ -8386,7 +8683,7 @@ mod tests {
             Some(0),
             "the live call keeps the rotation it had"
         );
-        live.hangup().await;
+        live.hangup_local().await;
     }
 
     /// A camera does not un-rotate because a negotiation restarted. Six paths
@@ -8425,7 +8722,7 @@ mod tests {
             Some("3"),
             "restarting video must announce the rotation still in force"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     /// A video-from-start offer leaves `self_state` Enabled while the peer is
@@ -8474,7 +8771,7 @@ mod tests {
             Some(2),
             "and the rotation is kept for the answer"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     /// Out of range is refused rather than folded in: `4` is a caller counting
@@ -8498,7 +8795,7 @@ mod tests {
             Some(2),
             "a rejected value must not have replaced the one in force"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     /// Stopping leaves no direction for a rotation to describe, so the stanza
@@ -8524,7 +8821,7 @@ mod tests {
             None,
             "a stopped direction has no rotation to announce"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -8566,7 +8863,7 @@ mod tests {
                 .is_video,
             "start_video must mark the session as video"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -8588,7 +8885,7 @@ mod tests {
             handle.video.sink_slot.lock().unwrap().is_none(),
             "invalid timing must not attach endpoints"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -8627,7 +8924,7 @@ mod tests {
             handle.video.sink_slot.lock().unwrap().is_none(),
             "an ineligible group call must not attach video endpoints"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -8690,7 +8987,7 @@ mod tests {
             handle.video.sink_slot.lock().unwrap().is_none(),
             "the overtaken upgrade must not attach video endpoints"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[test]
@@ -8794,7 +9091,7 @@ mod tests {
             None,
             "an accept must not carry the upgrade marker"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -8884,7 +9181,7 @@ mod tests {
                 .client_registry
                 .peer_video_request_is_current(&handle.call_id, second)
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -8954,7 +9251,7 @@ mod tests {
             registry.video_states("CID-FACADE", generation),
             Some((VideoState::Disabled, VideoState::Disabled))
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -9001,7 +9298,7 @@ mod tests {
             .await
             .expect("restart_video");
         assert!(handle.video.sink_slot.lock().unwrap().is_some());
-        handle.hangup().await;
+        handle.hangup_local().await;
         assert!(
             handle.video.sink_slot.lock().unwrap().is_none(),
             "a restarted video plane must rearm terminal teardown"
@@ -9042,7 +9339,7 @@ mod tests {
             Some((VideoState::Stopped, VideoState::Enabled))
         );
         assert!(registry.snapshot(&call_id).unwrap().is_video);
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     // The VideoFeed pumps the consumer's source into the drive loop's channel and dies on the
