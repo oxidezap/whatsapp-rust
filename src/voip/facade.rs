@@ -3396,33 +3396,27 @@ impl CallHandle {
             .await
     }
 
-    /// Mute or unmute the local microphone, announcing it to a group call's roster.
+    /// Mute or unmute the local microphone and tell the other side.
     ///
     /// The local half applies first and always: while muted the engine sends DTX comfort-noise (the
     /// stream stays fed) instead of gapping, so the peer doesn't re-negotiate the transport. This
     /// affects PCM audio only; encoded-audio callers must mute their external source.
     ///
-    /// In a group call the new state is then announced as `<mute_v2>`, which is what makes the
-    /// roster show who is muted; an `Err` there means the peers still show the old state while this
-    /// side is really muted. A 1:1 call has no roster to publish to and stays local-only, so it
-    /// always returns `Ok`.
+    /// The new state is then announced as `<mute_v2>`, addressed like the rest of this call's
+    /// signaling: the call scope for a group or call-link call, whose roster shows who is muted, and
+    /// the device that answered for a direct call. An `Err` means the other side still shows the old
+    /// state while this side is really muted; it never means the microphone stayed open.
     pub async fn set_muted(&self, muted: bool) -> Result<(), CallError> {
         self.ensure_current()?;
         // Local first: the microphone must stop when the user says so, even if the announcement
         // cannot go out.
         self.muted.store(muted, Ordering::Relaxed);
-        if self
-            .client_registry
-            .group_state_if_current(&self.call_id, self.generation)
-            .is_none()
-        {
-            return Ok(());
-        }
         let client = self.upgrade_client()?;
         client
             .voip()
             .announce_muted_for_generation(
                 &self.call_id,
+                &self.peer_jid(),
                 &self.call_creator,
                 self.generation,
                 muted,
@@ -5696,20 +5690,50 @@ mod tests {
         assert_eq!(sends.load(Ordering::SeqCst), 2, "one stanza per transition");
     }
 
-    // A 1:1 call has no roster to publish to, so muting there stays local and still succeeds.
+    // A direct call has no roster, but it has a peer device, and mute is addressed there like the
+    // rest of its signaling: the answering device, not the bare JID the offer rang.
     #[tokio::test]
-    async fn muting_a_direct_call_stays_local() {
+    async fn muting_a_direct_call_announces_to_the_answering_device() {
         let (client, sends) = make_sending_client().await;
-        let generation = client.call_registry().insert(mk_session());
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let device = caller().with_device(3);
+        registry.set_answering_device("CID-FACADE", device.clone());
         let handle = registry_handle(&client, generation);
 
-        handle
-            .set_muted(true)
-            .await
-            .expect("a direct mute cannot fail");
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.set_muted(true).await.expect("announce");
 
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("mute must be announced")
+            .expect("waiter");
+        let wrapper = node.as_node_ref();
+        assert_eq!(wrapper.attrs().optional_jid("to"), Some(device));
+        let action = &wrapper.children().expect("call action")[0];
+        assert_eq!(action.tag.as_ref(), "mute_v2");
+        assert_eq!(
+            action.attrs().optional_string("mute-state").as_deref(),
+            Some("1")
+        );
         assert!(handle.is_muted());
-        assert_eq!(sends.load(Ordering::SeqCst), 0, "nothing to announce");
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    // A superseded handle must not announce a state the replacement never chose.
+    #[tokio::test]
+    async fn stale_handle_mute_announces_nothing() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let stale_generation = registry.insert(mk_session());
+        let stale = registry_handle(&client, stale_generation);
+        registry.insert(mk_session());
+
+        assert!(
+            stale.set_muted(true).await.is_err(),
+            "a superseded handle has no call to mute"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
     }
 
     // The microphone must stop when the user says so, even when the announcement cannot go out: the

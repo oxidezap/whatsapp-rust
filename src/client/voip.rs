@@ -1593,15 +1593,17 @@ impl Voip<'_> {
         }
     }
 
-    /// Announce this side's microphone state to a group call's participants.
+    /// Announce this side's microphone state, as `<mute_v2 mute-state>`.
     ///
-    /// Group-scoped on purpose: `mute_v2` is how a roster shows who is muted, and the official
-    /// engine handles peer mute only for group calls. A 1:1 call has no such roster, so muting there
-    /// stays local (see [`CallHandle::set_muted`](crate::voip::CallHandle::set_muted)).
+    /// `peer` is where the state is published: the call scope for a group or call-link call, whose
+    /// roster shows who is muted, and the peer device for a direct call, the same address the rest of
+    /// its signaling uses. From a `CallHandle` prefer its own `set_muted()`, which applies the local
+    /// mute and resolves `peer` for both shapes.
     #[cfg(feature = "voip-runtime")]
     pub async fn announce_muted(
         &self,
         call_id: &str,
+        peer: &Jid,
         call_creator: &Jid,
         muted: bool,
     ) -> Result<(), CallError> {
@@ -1610,7 +1612,7 @@ impl Voip<'_> {
             .call_registry()
             .generation_of(call_id)
             .ok_or(CallError::Media("call is no longer active"))?;
-        self.announce_muted_for_generation(call_id, call_creator, generation, muted)
+        self.announce_muted_for_generation(call_id, peer, call_creator, generation, muted)
             .await
     }
 
@@ -1618,6 +1620,7 @@ impl Voip<'_> {
     pub(crate) async fn announce_muted_for_generation(
         &self,
         call_id: &str,
+        peer: &Jid,
         call_creator: &Jid,
         generation: u64,
         muted: bool,
@@ -1627,17 +1630,16 @@ impl Voip<'_> {
             .group_transition_lock(call_id, generation)
             .ok_or(CallError::Media("call is no longer active"))?;
         let _transition_guard = transition_lock.lock().await;
-        if !registry.group_creator_matches_if_current(call_id, generation, call_creator) {
-            return Err(CallError::Media(
-                "call creator does not match the active group call",
-            ));
+        // Re-checked under the lock: a handle superseded while it waited must not announce a state
+        // for the replacement that now owns this call-id.
+        if registry.generation_of(call_id) != Some(generation) {
+            return Err(CallError::Media("call is no longer active"));
         }
-        let target = Jid::new(call_id, Server::Call);
         self.send_group_control(
             call_id,
             build_mute_v2(
                 call_id,
-                &target,
+                peer,
                 call_creator,
                 &self.client.generate_request_id(),
                 muted,
