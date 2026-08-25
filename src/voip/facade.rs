@@ -1615,7 +1615,7 @@ async fn place_call(
     let multi_device = ring_devices.len() > 1;
     // Diagnostic: the resolved callee device set drives sibling-dismiss. If a multi-device callee
     // shows only one here, a device-list resolution gap (e.g. the primary missing) is why a sibling
-    // keeps ringing -- the dismiss is gated on `multi_device`.
+    // keeps ringing -- a lone device has no sibling to dismiss.
     log::debug!(
         "voip: call {call_id} resolved {} callee device(s) (sibling-dismiss {}): [{}]",
         ring_devices.len(),
@@ -1756,10 +1756,9 @@ async fn place_call(
     // call deregisters (every end path removes the registry entry). Use the FULL server-rung set, NOT
     // the encrypted `device_keys` subset: a device we couldn't encrypt for (e.g. the primary phone,
     // dropped as pkmsg without an ADV account) still rings and must be dismissed, or it times the call
-    // out. Only when the callee is multi-device -- a single-device callee has no sibling.
-    if multi_device {
-        session.ring_devices = ring_devices.to_vec();
-    }
+    // out. Retained for a single-device callee too: it has no sibling to dismiss, but it is still the
+    // device a `<terminate>` has to reach if the call is cancelled before anyone answers.
+    session.ring_devices = ring_devices.to_vec();
     let _ = session.transition_to(CallPhase::Calling);
     let generation = registry.insert(session);
     registry.set_group_invite_self_device(
@@ -6063,6 +6062,49 @@ mod tests {
             2,
             "one stanza per rung device"
         );
+    }
+
+    // A single-device callee is still a device: cancelling before it answers must reach that JID, the
+    // one the offer resolved, not the bare peer.
+    #[tokio::test]
+    async fn terminate_while_ringing_reaches_a_lone_device() {
+        let (client, sends) = make_sending_client().await;
+        let device = peer_lid();
+        seed_peer_session(&client, &device).await;
+        let own_lid = client.lid().expect("own lid");
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+        let handle = place_call(
+            &client,
+            "00abcdef0123456789abcdef01234567".into(),
+            &Jid::new("333333333333333", Server::Lid),
+            &own_lid,
+            &own_lid,
+            std::slice::from_ref(&device),
+            std::slice::from_ref(&device),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
+        )
+        .await
+        .expect("place_call");
+        let offers = sends.load(Ordering::SeqCst);
+
+        let waiter = client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("call").attr("to", device.to_string()),
+        );
+        assert!(handle.terminate().await.peer_notified());
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the lone device must be told")
+            .expect("waiter");
+        assert_eq!(
+            node.as_node_ref().children().expect("call action")[0]
+                .tag
+                .as_ref(),
+            "terminate"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), offers + 1);
     }
 
     // Cancellation (a timeout, a `select!`) at the send await must not strand the media task with the
