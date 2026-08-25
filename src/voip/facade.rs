@@ -3209,17 +3209,28 @@ impl CallHandle {
     /// still ringing: call signaling is routed per device and the server does not fan a terminate
     /// out, so until one device answers, every device the offer rang has to be told.
     fn terminate_targets(&self) -> Vec<Jid> {
-        let addressed = self.peer_jid();
-        if addressed != self.peer_jid {
-            return vec![addressed];
+        if self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            .is_some()
+        {
+            return vec![Jid::new(&self.call_id, Server::Call)];
         }
-        match self
+        // One snapshot for both: read separately, an `<accept>` landing between them sets the
+        // answerer and drains the rung set, leaving neither read holding a target.
+        let Some(session) = self
             .client_registry
             .snapshot_if_current(&self.call_id, self.generation)
-        {
-            Some(session) if !session.ring_devices.is_empty() => session.ring_devices,
-            _ => vec![addressed],
+        else {
+            return vec![self.peer_jid.clone()];
+        };
+        if let Some(device) = session.answering_device {
+            return vec![device];
         }
+        if !session.ring_devices.is_empty() {
+            return session.ring_devices;
+        }
+        vec![self.peer_jid.clone()]
     }
 
     /// The call's creator JID, as carried in the signaling (needed by `voip().terminate(..)`).
@@ -3469,9 +3480,7 @@ impl CallHandle {
             .snapshot_if_current(&self.call_id, self.generation)?;
         match session.direction {
             CallDirection::Incoming => Some(session.peer_jid),
-            _ => self
-                .client_registry
-                .answering_device_if_current(&self.call_id, self.generation),
+            _ => session.answering_device,
         }
     }
 
