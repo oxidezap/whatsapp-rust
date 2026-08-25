@@ -3430,16 +3430,16 @@ impl CallHandle {
 
     /// Mute or unmute the local microphone and tell the other side.
     ///
-    /// The local half applies first: while muted the engine sends DTX comfort-noise (the stream stays
-    /// fed) instead of gapping, so the peer doesn't re-negotiate the transport. This affects PCM audio
-    /// only; encoded-audio callers must mute their external source. A future dropped while it waits its
-    /// turn leaves the microphone as it was, so the two sides cannot end up on opposite states with
-    /// nothing said about it.
+    /// While muted the engine sends DTX comfort-noise (the stream stays fed) instead of gapping, so the
+    /// peer doesn't re-negotiate the transport. This affects PCM audio only; encoded-audio callers must
+    /// mute their external source.
     ///
-    /// The new state is then announced as `<mute_v2>`, addressed like the rest of this call's
-    /// signaling: the call scope for a group or call-link call, whose roster shows who is muted, and
-    /// the device that answered for a direct call. An `Err` means the other side still shows the old
-    /// state while this side is really muted; it never means the microphone stayed open.
+    /// The state is announced as `<mute_v2>`, addressed like the rest of this call's signaling: the
+    /// call scope for a group or call-link call, whose roster shows who is muted, and the device that
+    /// answered for a direct call. Muting takes effect locally whatever becomes of the stanza, so an
+    /// `Err` there means the peer still shows this side open while it is really muted. Unmuting waits
+    /// for the announcement, so an `Err` there means the microphone is still muted. Dropping this
+    /// future resolves the same way: the microphone is never left live while the peer shows it muted.
     ///
     /// An outgoing call nobody has answered yet is muted locally only: the state belongs to a call
     /// that does not exist on any of the devices still ringing.
@@ -3452,15 +3452,20 @@ impl CallHandle {
         // Re-checked under the lane: a call that ended while we waited must report that, not the
         // `Ok(())` a live call still ringing gets.
         self.ensure_current()?;
-        // Applied under the lane rather than on entry: a caller that drops this future while it waits
-        // for the lane (a timeout, a `select!`) gets no announcement, so a local state stored before
-        // the wait would leave this side muted and the peer showing the opposite with no `Err` to say
-        // so. Both sides stay on the old state instead, and the microphone changes only alongside the
-        // announcement that follows it here.
-        self.muted.store(muted, Ordering::Relaxed);
         let Some(target) = self.mute_target() else {
+            // Nobody to mislead: a call still ringing carries the state locally and announces it to
+            // the device that answers, if one does.
+            self.muted.store(muted, Ordering::Relaxed);
             return Ok(());
         };
+        // The two directions commit around the announcement rather than at one point, because either
+        // half can be lost: the stanza to a failed send, the local half to a caller that drops this
+        // future (a timeout, a `select!`) while the send is in flight. Muting applies first and
+        // unmuting only once the announcement is out, so whatever is lost, the microphone is never
+        // live while the peer is still showing this side muted.
+        if muted {
+            self.muted.store(true, Ordering::Relaxed);
+        }
         client
             .voip()
             .announce_muted_locked(
@@ -3468,9 +3473,10 @@ impl CallHandle {
                 &target,
                 &self.call_creator,
                 self.generation,
-                self.muted.load(Ordering::Relaxed),
+                muted,
             )
             .await
+            .inspect(|()| self.muted.store(muted, Ordering::Relaxed))
     }
 
     /// Where this call's mute state can land: the call scope once it is a group call, the peer device
@@ -5799,6 +5805,68 @@ mod tests {
             Some("1")
         );
         assert!(handle.is_muted());
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    // An unmute is only local once the peer has been told, so a caller that drops it mid-send leaves
+    // the microphone muted rather than live while the peer still shows this side muted.
+    #[tokio::test]
+    async fn cancelling_an_unmute_mid_send_keeps_the_microphone_muted() {
+        let client = make_client().await;
+        let (transport, entered, _release) = gated_send_transport(0, false);
+        install_noise_transport(&client, transport).await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+            "CID-FACADE",
+            caller(),
+            caller(),
+        ));
+        registry.set_answering_device("CID-FACADE", caller().with_device(3));
+        let handle = registry_handle(&client, generation);
+        handle.muted.store(true, Ordering::Relaxed);
+
+        let unmuting = handle.clone();
+        let task = tokio::spawn(async move { unmuting.set_muted(false).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.recv())
+            .await
+            .expect("the unmute send must reach the gate")
+            .expect("gate observer");
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            handle.is_muted(),
+            "an unmute nobody was told about must leave the microphone muted"
+        );
+    }
+
+    // The other half of that rule: an announced unmute does open the microphone again.
+    #[tokio::test]
+    async fn an_announced_unmute_opens_the_microphone() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+            "CID-FACADE",
+            caller(),
+            caller(),
+        ));
+        registry.set_answering_device("CID-FACADE", caller().with_device(3));
+        let handle = registry_handle(&client, generation);
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.set_muted(false).await.expect("announce");
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the state must be announced")
+            .expect("waiter");
+        let wrapper = node.as_node_ref();
+        let action = &wrapper.children().expect("call action")[0];
+        assert_eq!(
+            action.attrs().optional_string("mute-state").as_deref(),
+            Some("0")
+        );
+        assert!(!handle.is_muted());
         assert_eq!(sends.load(Ordering::SeqCst), 1);
     }
 
