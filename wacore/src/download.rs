@@ -540,9 +540,13 @@ impl DownloadUtils {
 
         // Single buffer: refilled from `reader` after the retained bytes, then
         // decrypted in place so the whole batch reaches `writer` in one call.
-        // Sized so a full `STREAM_CHUNK_SIZE` read always fits after the largest
-        // possible carry (`WITHHELD` + a partial block, i.e. 41 bytes).
-        let mut buf = [0u8; STREAM_CHUNK_SIZE + WITHHELD + AES_BLOCK_SIZE];
+        // It replaces the separate read buffer and `tail`/`final_plain` vectors,
+        // and is kept to exactly `STREAM_CHUNK_SIZE` rather than that plus the
+        // carry, so the stack this holds on an embedded target is no more than
+        // the read buffer alone used to be. A refill after a carry just reads
+        // that much less; the carry is at most 41 bytes, so a whole number of
+        // blocks is always processable and the loop always advances.
+        let mut buf = [0u8; STREAM_CHUNK_SIZE];
         let mut filled = 0usize;
 
         loop {
