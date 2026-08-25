@@ -10,7 +10,7 @@ use std::time::Duration;
 
 #[cfg(feature = "voip-runtime")]
 use log::warn;
-use wacore::stanza::call::{TerminateParams, build_reject, build_terminate};
+use wacore::stanza::call::{TerminateParams, build_mute_v2, build_reject, build_terminate};
 #[cfg(feature = "voip-runtime")]
 use wacore::stanza::group_call::{
     build_active_group_accept, build_active_group_preaccept, build_call_link_create,
@@ -1591,6 +1591,59 @@ impl Voip<'_> {
                 "call was replaced while applying group control",
             ))
         }
+    }
+
+    /// Announce this side's microphone state to a group call's participants.
+    ///
+    /// Group-scoped on purpose: `mute_v2` is how a roster shows who is muted, and the official
+    /// engine handles peer mute only for group calls. A 1:1 call has no such roster, so muting there
+    /// stays local (see [`CallHandle::set_muted`](crate::voip::CallHandle::set_muted)).
+    #[cfg(feature = "voip-runtime")]
+    pub async fn announce_muted(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        muted: bool,
+    ) -> Result<(), CallError> {
+        let generation = self
+            .client
+            .call_registry()
+            .generation_of(call_id)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        self.announce_muted_for_generation(call_id, call_creator, generation, muted)
+            .await
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn announce_muted_for_generation(
+        &self,
+        call_id: &str,
+        call_creator: &Jid,
+        generation: u64,
+        muted: bool,
+    ) -> Result<(), CallError> {
+        let registry = self.client.call_registry();
+        let transition_lock = registry
+            .group_transition_lock(call_id, generation)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        if !registry.group_creator_matches_if_current(call_id, generation, call_creator) {
+            return Err(CallError::Media(
+                "call creator does not match the active group call",
+            ));
+        }
+        let target = Jid::new(call_id, Server::Call);
+        self.send_group_control(
+            call_id,
+            build_mute_v2(
+                call_id,
+                &target,
+                call_creator,
+                &self.client.generate_request_id(),
+                muted,
+            ),
+        )
+        .await
     }
 
     /// Publish the local persistent raise/lower-hand state.

@@ -965,13 +965,22 @@ pub(crate) fn build_typed_call_ack(original: &NodeRef<'_>, action_type: &str) ->
     Some(ack.build())
 }
 
-pub fn build_mute_v2(call_id: &str, to: &Jid, call_creator: &Jid, mute_state: &str) -> Node {
+/// `<call to=peer id=wrapper_id><mute_v2 call-id call-creator mute-state="1|0"/></call>`: this
+/// side announcing its own microphone state. `mute-state` is the boolean sibling of
+/// `raise-hand-state`, which the same signaling carries in the same shape.
+pub fn build_mute_v2(
+    call_id: &str,
+    to: &Jid,
+    call_creator: &Jid,
+    wrapper_id: &str,
+    muted: bool,
+) -> Node {
     let action = NodeBuilder::new("mute_v2")
         .attr("call-id", call_id)
         .attr("call-creator", call_creator)
-        .attr("mute-state", mute_state.to_string())
+        .attr("mute-state", if muted { "1" } else { "0" })
         .build();
-    call_wrap(to, None, action)
+    call_wrap(to, Some(wrapper_id), action)
 }
 
 /// `<call to=peer id=wrapper_id><reject call-id call-creator count="0"/></call>`.

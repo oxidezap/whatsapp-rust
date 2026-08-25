@@ -3396,11 +3396,38 @@ impl CallHandle {
             .await
     }
 
-    /// Mute or unmute the local microphone. While muted the engine sends DTX comfort-noise (the
-    /// stream stays fed); it does not gap, so the peer doesn't re-negotiate the transport.
-    /// This affects PCM audio only; encoded-audio callers must mute their external source.
-    pub fn set_muted(&self, muted: bool) {
+    /// Mute or unmute the local microphone, announcing it to a group call's roster.
+    ///
+    /// The local half applies first and always: while muted the engine sends DTX comfort-noise (the
+    /// stream stays fed) instead of gapping, so the peer doesn't re-negotiate the transport. This
+    /// affects PCM audio only; encoded-audio callers must mute their external source.
+    ///
+    /// In a group call the new state is then announced as `<mute_v2>`, which is what makes the
+    /// roster show who is muted; an `Err` there means the peers still show the old state while this
+    /// side is really muted. A 1:1 call has no roster to publish to and stays local-only, so it
+    /// always returns `Ok`.
+    pub async fn set_muted(&self, muted: bool) -> Result<(), CallError> {
+        self.ensure_current()?;
+        // Local first: the microphone must stop when the user says so, even if the announcement
+        // cannot go out.
         self.muted.store(muted, Ordering::Relaxed);
+        if self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            .is_none()
+        {
+            return Ok(());
+        }
+        let client = self.upgrade_client()?;
+        client
+            .voip()
+            .announce_muted_for_generation(
+                &self.call_id,
+                &self.call_creator,
+                self.generation,
+                muted,
+            )
+            .await
     }
 
     /// Whether the microphone is currently muted.
@@ -3872,11 +3899,6 @@ impl CallHandle {
     /// runs whether or not the stanza went out, which is why this reports its outcome instead of
     /// returning an error the caller must handle to hang up.
     pub async fn terminate(&self) -> CallTermination {
-        // Nothing of ours is live: a superseded handle must not signal, or the peer would drop the
-        // replacement that now owns this call-id.
-        if self.client_registry.generation_of(&self.call_id) != Some(self.generation) {
-            return CallTermination::AlreadyEnded;
-        }
         let client = match self.upgrade_client() {
             Ok(client) => client,
             Err(error) => {
@@ -3884,6 +3906,15 @@ impl CallHandle {
                 return CallTermination::LocalOnly(error);
             }
         };
+        // The answer-transition lane, held across the check AND the send: a replacement installed in
+        // that window would be ended by a `<terminate>` the peer cannot tell apart from ours, since
+        // both carry the same call-id.
+        let _transition = client.lock_answer_transition(&self.call_id).await;
+        // Nothing of ours is live: a superseded handle must not signal, or the peer would drop the
+        // replacement that now owns this call-id.
+        if self.client_registry.generation_of(&self.call_id) != Some(self.generation) {
+            return CallTermination::AlreadyEnded;
+        }
         match client
             .voip()
             .terminate_for_generation(
@@ -5607,14 +5638,104 @@ mod tests {
         );
     }
 
+    /// Promote a registered call to a group call, which is what gives it a roster to publish to.
+    fn apply_group_state(client: &Arc<Client>) {
+        let update = GroupCallUpdate::builder()
+            .call_id("CID-FACADE".to_string())
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        assert_eq!(
+            client.call_registry().apply_group_update(update),
+            wacore::voip::GroupStateApply::Applied
+        );
+    }
+
+    // Muting in a group call is state the roster shows, so it must reach the participants: one
+    // <mute_v2> at the call scope carrying the new state, both ways.
+    #[tokio::test]
+    async fn muting_a_group_call_announces_the_new_state() {
+        let (client, sends) = make_sending_client().await;
+        let generation = client.call_registry().insert(mk_session());
+        apply_group_state(&client);
+        let handle = registry_handle(&client, generation);
+
+        for (muted, expected) in [(true, "1"), (false, "0")] {
+            let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+            handle.set_muted(muted).await.expect("announce");
+            assert_eq!(handle.is_muted(), muted, "the local half must apply too");
+
+            let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .expect("mute must be announced")
+                .expect("waiter");
+            let wrapper = node.as_node_ref();
+            assert_eq!(
+                wrapper.attrs().optional_jid("to"),
+                Some(Jid::new("CID-FACADE", Server::Call)),
+                "the roster lives at the call scope"
+            );
+            let action = &wrapper.children().expect("call action")[0];
+            assert_eq!(action.tag.as_ref(), "mute_v2");
+            assert_eq!(
+                action.attrs().optional_string("mute-state").as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                action.attrs().optional_jid("call-creator"),
+                Some(caller()),
+                "the action must carry the call creator"
+            );
+        }
+        assert_eq!(sends.load(Ordering::SeqCst), 2, "one stanza per transition");
+    }
+
+    // A 1:1 call has no roster to publish to, so muting there stays local and still succeeds.
+    #[tokio::test]
+    async fn muting_a_direct_call_stays_local() {
+        let (client, sends) = make_sending_client().await;
+        let generation = client.call_registry().insert(mk_session());
+        let handle = registry_handle(&client, generation);
+
+        handle
+            .set_muted(true)
+            .await
+            .expect("a direct mute cannot fail");
+
+        assert!(handle.is_muted());
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "nothing to announce");
+    }
+
+    // The microphone must stop when the user says so, even when the announcement cannot go out: the
+    // local half is applied first and the error only reports that the roster is now stale.
+    #[tokio::test]
+    async fn mute_announce_failure_still_mutes_locally() {
+        let client = make_failing_send_client().await; // send_node errors (no noise socket)
+        let generation = client.call_registry().insert(mk_session());
+        apply_group_state(&client);
+        let handle = registry_handle(&client, generation);
+
+        assert!(
+            handle.set_muted(true).await.is_err(),
+            "a failed announcement must be reported"
+        );
+        assert!(handle.is_muted(), "the local mute must hold regardless");
+    }
+
     // A call-signaling builder nobody sends is the cheap signal of the bug this pair exists for: an
     // action with a wire form that never leaves the process. A new one must be wired to a caller or
     // listed here (suffixes only, so this list is not its own evidence of a caller) with the reason.
     #[test]
     fn call_stanza_builders_are_wired_to_the_runtime() {
-        // Media-plane keepalives and mute: no public call-control method claims to send them today,
-        // and what the official client emits for them is not established here. See the audit notes.
-        const UNWIRED: &[&str] = &["transport", "relay_latency", "heartbeat", "mute_v2"];
+        // Media-plane keepalives: no public call-control method claims to send them today, and what
+        // the official client emits for them is not established here. See the audit notes.
+        const UNWIRED: &[&str] = &["transport", "relay_latency", "heartbeat"];
         const CALLERS: &[&str] = &[
             "src/voip/facade.rs",
             "src/client/voip.rs",
