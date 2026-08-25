@@ -1614,12 +1614,17 @@ impl Voip<'_> {
             .call_registry()
             .generation_of(call_id)
             .ok_or(CallError::Media("call is no longer active"))?;
-        self.announce_muted_for_generation(call_id, peer, call_creator, generation, muted)
+        // The answer-transition lane is the lock a replacement generation is installed under; a
+        // per-entry lock belongs to the entry being replaced and so cannot close that window.
+        let _transition = self.client.lock_answer_transition(call_id).await;
+        self.announce_muted_locked(call_id, peer, call_creator, generation, muted)
             .await
     }
 
+    /// [`announce_muted`](Self::announce_muted) for a caller that already holds the call's
+    /// answer-transition lane and its own generation.
     #[cfg(feature = "voip-runtime")]
-    pub(crate) async fn announce_muted_for_generation(
+    pub(crate) async fn announce_muted_locked(
         &self,
         call_id: &str,
         peer: &Jid,
@@ -1627,14 +1632,9 @@ impl Voip<'_> {
         generation: u64,
         muted: bool,
     ) -> Result<(), CallError> {
-        // The answer-transition lane, held across the check AND the send, is the lock a replacement
-        // generation is installed under; a per-entry lock belongs to the entry being replaced and so
-        // cannot close that window.
-        let _transition_guard = self.client.lock_answer_transition(call_id).await;
-        let registry = self.client.call_registry();
         // A handle superseded while it waited must not announce a state for the replacement that now
         // owns this call-id.
-        if registry.generation_of(call_id) != Some(generation) {
+        if self.client.call_registry().generation_of(call_id) != Some(generation) {
             return Err(CallError::Media("call is no longer active"));
         }
         self.send_group_control(
@@ -1928,8 +1928,14 @@ impl Voip<'_> {
         peer: &Jid,
         call_creator: &Jid,
     ) -> Result<(), CallError> {
-        self.terminate_inner(call_id, std::slice::from_ref(peer), call_creator, None)
-            .await
+        self.terminate_inner(
+            call_id,
+            std::slice::from_ref(peer),
+            call_creator,
+            None,
+            None,
+        )
+        .await
     }
 
     /// [`terminate`](Self::terminate) restricted to one registry generation and addressed at every
@@ -1942,9 +1948,24 @@ impl Voip<'_> {
         peers: &[Jid],
         call_creator: &Jid,
         generation: u64,
-    ) -> Result<(), CallError> {
-        self.terminate_inner(call_id, peers, call_creator, Some(generation))
+    ) -> TerminateDelivery {
+        let mut delivery = TerminateDelivery {
+            notified: 0,
+            failure: None,
+        };
+        if let Err(error) = self
+            .terminate_inner(
+                call_id,
+                peers,
+                call_creator,
+                Some(generation),
+                Some(&mut delivery),
+            )
             .await
+        {
+            delivery.failure = Some(error);
+        }
+        delivery
     }
 
     async fn terminate_inner(
@@ -1953,6 +1974,7 @@ impl Voip<'_> {
         peers: &[Jid],
         call_creator: &Jid,
         _generation: Option<u64>,
+        mut delivery: Option<&mut TerminateDelivery>,
     ) -> Result<(), CallError> {
         if call_id.is_empty() {
             return Err(CallError::EmptyCallId);
@@ -1978,14 +2000,26 @@ impl Voip<'_> {
                 call_creator,
                 reason: None,
             });
-            if let Err(error) = self.client.send_node(stanza).await
-                && result.is_ok()
-            {
-                result = Err(error.into());
+            match self.client.send_node(stanza).await {
+                Ok(()) => {
+                    if let Some(delivery) = delivery.as_deref_mut() {
+                        delivery.notified += 1;
+                    }
+                }
+                Err(error) if result.is_ok() => result = Err(error.into()),
+                Err(_) => {}
             }
         }
         result
     }
+}
+
+/// How much of a multi-target `<terminate>` fan-out reached the wire. A still-ringing call is told
+/// per device, so "some devices, not all" is a real outcome and not the same as telling nobody.
+#[cfg(feature = "voip-runtime")]
+pub(crate) struct TerminateDelivery {
+    pub(crate) notified: usize,
+    pub(crate) failure: Option<CallError>,
 }
 
 /// Local call teardown that runs even when the terminate future is cancelled mid-send.

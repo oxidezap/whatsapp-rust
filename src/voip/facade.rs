@@ -3025,8 +3025,11 @@ impl EndedFlag {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CallTermination {
-    /// `<terminate>` went out to the peer.
+    /// `<terminate>` went out to every address this call had to reach.
     PeerNotified,
+    /// Some of a still-ringing call's devices were told and others could not be reached, so the rest
+    /// keep ringing until their own transport gives up. The local side is down either way.
+    PartlyNotified { notified: usize, unreachable: usize },
     /// The stanza could not be sent, so the peer keeps ringing/talking until its own transport gives
     /// up. Carries why the send failed.
     LocalOnly(CallError),
@@ -3036,7 +3039,8 @@ pub enum CallTermination {
 }
 
 impl CallTermination {
-    /// Whether the peer was told. `false` means the call ended locally only.
+    /// Whether every address this call had to reach was told. `false` for a partial fan-out too, so
+    /// match on [`CallTermination::PartlyNotified`] to tell that apart from a fully silent hangup.
     pub fn peer_notified(&self) -> bool {
         matches!(self, Self::PeerNotified)
     }
@@ -3424,41 +3428,52 @@ impl CallHandle {
     /// the device that answered for a direct call. An `Err` means the other side still shows the old
     /// state while this side is really muted; it never means the microphone stayed open.
     ///
-    /// A direct call nobody has answered yet is muted locally only, since the state belongs to a call
+    /// An outgoing call nobody has answered yet is muted locally only: the state belongs to a call
     /// that does not exist on any of the devices still ringing.
     pub async fn set_muted(&self, muted: bool) -> Result<(), CallError> {
         self.ensure_current()?;
         // Local first: the microphone must stop when the user says so, even if the announcement
         // cannot go out.
         self.muted.store(muted, Ordering::Relaxed);
-        // Where the state can land: the call scope once the call is a group one, the device that
-        // answered a direct call. Resolved here rather than through `peer_jid()`, whose bare-peer
-        // fallback is an address to ring, not a call that could hold a mute state.
-        let target = if self
-            .client_registry
-            .group_state_if_current(&self.call_id, self.generation)
-            .is_some()
-        {
-            Jid::new(&self.call_id, Server::Call)
-        } else if let Some(device) = self
-            .client_registry
-            .answering_device_if_current(&self.call_id, self.generation)
-        {
-            device
-        } else {
+        let client = self.upgrade_client()?;
+        // One ordered transition per call: two cloned handles muting at once would otherwise race,
+        // and the older value could land on the wire after the newer one.
+        let _transition = client.lock_answer_transition(&self.call_id).await;
+        let Some(target) = self.mute_target() else {
             return Ok(());
         };
-        let client = self.upgrade_client()?;
         client
             .voip()
-            .announce_muted_for_generation(
+            .announce_muted_locked(
                 &self.call_id,
                 &target,
                 &self.call_creator,
                 self.generation,
-                muted,
+                self.muted.load(Ordering::Relaxed),
             )
             .await
+    }
+
+    /// Where this call's mute state can land: the call scope once it is a group call, the peer device
+    /// otherwise. An outgoing call has one only after an `<accept>` names the device that answered;
+    /// an incoming call we answered has had the caller's device since the offer.
+    fn mute_target(&self) -> Option<Jid> {
+        if self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            .is_some()
+        {
+            return Some(Jid::new(&self.call_id, Server::Call));
+        }
+        let session = self
+            .client_registry
+            .snapshot_if_current(&self.call_id, self.generation)?;
+        match session.direction {
+            CallDirection::Incoming => Some(session.peer_jid),
+            _ => self
+                .client_registry
+                .answering_device_if_current(&self.call_id, self.generation),
+        }
     }
 
     /// Whether the microphone is currently muted.
@@ -3954,18 +3969,18 @@ impl CallHandle {
         if self.client_registry.generation_of(&self.call_id) != Some(self.generation) {
             return CallTermination::AlreadyEnded;
         }
-        match client
+        let targets = self.terminate_targets();
+        let delivery = client
             .voip()
-            .terminate_for_generation(
-                &self.call_id,
-                &self.terminate_targets(),
-                &self.call_creator,
-                self.generation,
-            )
-            .await
-        {
-            Ok(()) => CallTermination::PeerNotified,
-            Err(error) => CallTermination::LocalOnly(error),
+            .terminate_for_generation(&self.call_id, &targets, &self.call_creator, self.generation)
+            .await;
+        match delivery.failure {
+            None => CallTermination::PeerNotified,
+            Some(error) if delivery.notified == 0 => CallTermination::LocalOnly(error),
+            Some(_) => CallTermination::PartlyNotified {
+                notified: delivery.notified,
+                unreachable: targets.len() - delivery.notified,
+            },
         }
     }
 
@@ -5741,7 +5756,11 @@ mod tests {
     async fn muting_a_direct_call_announces_to_the_answering_device() {
         let (client, sends) = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(mk_session());
+        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+            "CID-FACADE",
+            caller(),
+            caller(),
+        ));
         let device = caller().with_device(3);
         registry.set_answering_device("CID-FACADE", device.clone());
         let handle = registry_handle(&client, generation);
@@ -5790,7 +5809,8 @@ mod tests {
             vec![caller().with_device(1), caller().with_device(2)],
         ] {
             let (client, sends) = make_sending_client().await;
-            let mut session = mk_session();
+            let mut session =
+                wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
             session.ring_devices = ring_devices;
             let generation = client.call_registry().insert(session);
             let handle = registry_handle(&client, generation);
@@ -5803,6 +5823,73 @@ mod tests {
             assert!(handle.is_muted(), "the local half still applies");
             assert_eq!(sends.load(Ordering::SeqCst), 0, "nobody to announce it to");
         }
+    }
+
+    // An answered incoming call has known its peer device since the offer, so muting it must reach the
+    // caller: there is no `<accept>` of ours to learn an answering device from.
+    #[tokio::test]
+    async fn muting_an_answered_incoming_call_announces_to_the_caller_device() {
+        let (client, sends) = make_sending_client().await;
+        let device = caller().with_device(5);
+        let generation = client
+            .call_registry()
+            .insert(wacore::voip::CallSession::new_incoming(
+                "CID-FACADE",
+                device.clone(),
+                caller(),
+            ));
+        let handle = registry_handle(&client, generation);
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.set_muted(true).await.expect("announce");
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("mute must be announced")
+            .expect("waiter");
+        let wrapper = node.as_node_ref();
+        assert_eq!(
+            wrapper.attrs().optional_jid("to"),
+            Some(device),
+            "an answered incoming call is addressed at the caller's device"
+        );
+        assert_eq!(
+            wrapper.children().expect("call action")[0].tag.as_ref(),
+            "mute_v2"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    // A still-ringing call told some of its devices and not others is not the same as telling nobody:
+    // the outcome has to say which, or a consumer logs a silent hangup that was not silent.
+    #[tokio::test]
+    async fn partly_delivered_terminate_reports_what_reached_the_wire() {
+        // The second send fails, so the first device is told and the second is not.
+        let (client, sends) = make_sending_client_with_failure_after(Some(1)).await;
+        let mut session = wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+        session.ring_devices = vec![caller().with_device(1), caller().with_device(2)];
+        let generation = client.call_registry().insert(session);
+        let handle = registry_handle(&client, generation);
+
+        let outcome = handle.terminate().await;
+
+        assert!(
+            matches!(
+                outcome,
+                CallTermination::PartlyNotified {
+                    notified: 1,
+                    unreachable: 1
+                }
+            ),
+            "a partial fan-out must be reported as such: {outcome:?}"
+        );
+        assert!(!outcome.peer_notified(), "not every device was told");
+        assert_eq!(sends.load(Ordering::SeqCst), 2, "both sends were attempted");
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "the local call ends either way"
+        );
     }
 
     // The microphone must stop when the user says so, even when the announcement cannot go out: the
@@ -5946,7 +6033,7 @@ mod tests {
         let (client, sends) = make_sending_client().await;
         let first = caller().with_device(1);
         let second = caller().with_device(2);
-        let mut session = mk_session();
+        let mut session = wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
         session.ring_devices = vec![first.clone(), second.clone()];
         let generation = client.call_registry().insert(session);
         let handle = registry_handle(&client, generation);
