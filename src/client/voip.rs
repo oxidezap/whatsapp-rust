@@ -10,7 +10,9 @@ use std::time::Duration;
 
 #[cfg(feature = "voip-runtime")]
 use log::warn;
-use wacore::stanza::call::{TerminateParams, build_mute_v2, build_reject, build_terminate};
+#[cfg(feature = "voip-runtime")]
+use wacore::stanza::call::build_mute_v2;
+use wacore::stanza::call::{TerminateParams, build_reject, build_terminate};
 #[cfg(feature = "voip-runtime")]
 use wacore::stanza::group_call::{
     build_active_group_accept, build_active_group_preaccept, build_call_link_create,
@@ -1625,13 +1627,13 @@ impl Voip<'_> {
         generation: u64,
         muted: bool,
     ) -> Result<(), CallError> {
+        // The answer-transition lane, held across the check AND the send, is the lock a replacement
+        // generation is installed under; a per-entry lock belongs to the entry being replaced and so
+        // cannot close that window.
+        let _transition_guard = self.client.lock_answer_transition(call_id).await;
         let registry = self.client.call_registry();
-        let transition_lock = registry
-            .group_transition_lock(call_id, generation)
-            .ok_or(CallError::Media("call is no longer active"))?;
-        let _transition_guard = transition_lock.lock().await;
-        // Re-checked under the lock: a handle superseded while it waited must not announce a state
-        // for the replacement that now owns this call-id.
+        // A handle superseded while it waited must not announce a state for the replacement that now
+        // owns this call-id.
         if registry.generation_of(call_id) != Some(generation) {
             return Err(CallError::Media("call is no longer active"));
         }

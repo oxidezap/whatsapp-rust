@@ -3423,17 +3423,29 @@ impl CallHandle {
     /// signaling: the call scope for a group or call-link call, whose roster shows who is muted, and
     /// the device that answered for a direct call. An `Err` means the other side still shows the old
     /// state while this side is really muted; it never means the microphone stayed open.
+    ///
+    /// A direct call nobody has answered yet is muted locally only, since the state belongs to a call
+    /// that does not exist on any of the devices still ringing.
     pub async fn set_muted(&self, muted: bool) -> Result<(), CallError> {
         self.ensure_current()?;
         // Local first: the microphone must stop when the user says so, even if the announcement
         // cannot go out.
         self.muted.store(muted, Ordering::Relaxed);
+        let target = self.peer_jid();
+        if target == self.peer_jid
+            && self
+                .client_registry
+                .snapshot_if_current(&self.call_id, self.generation)
+                .is_some_and(|session| !session.ring_devices.is_empty())
+        {
+            return Ok(());
+        }
         let client = self.upgrade_client()?;
         client
             .voip()
             .announce_muted_for_generation(
                 &self.call_id,
-                &self.peer_jid(),
+                &target,
                 &self.call_creator,
                 self.generation,
                 muted,
@@ -5751,6 +5763,25 @@ mod tests {
             "a superseded handle has no call to mute"
         );
         assert_eq!(sends.load(Ordering::SeqCst), 0);
+    }
+
+    // A direct call still ringing has no answered call on any device to carry the state, so the mute
+    // stays local until one answers.
+    #[tokio::test]
+    async fn muting_a_ringing_direct_call_stays_local() {
+        let (client, sends) = make_sending_client().await;
+        let mut session = mk_session();
+        session.ring_devices = vec![caller().with_device(1), caller().with_device(2)];
+        let generation = client.call_registry().insert(session);
+        let handle = registry_handle(&client, generation);
+
+        handle
+            .set_muted(true)
+            .await
+            .expect("a ringing mute is local");
+
+        assert!(handle.is_muted(), "the local half still applies");
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "nobody to announce it to");
     }
 
     // The microphone must stop when the user says so, even when the announcement cannot go out: the
