@@ -69,8 +69,8 @@ pub struct EncryptedMediaInfo {
 /// Two output modes (zero duplicated crypto logic):
 /// - `update()` / `finalize()` — append to a `Vec<u8>`, encrypted in place in
 ///   its tail so the ciphertext is written exactly once
-/// - `update_to_writer()` / `finalize_to_writer()` — write out in
-///   [`WRITE_FLUSH`]-sized runs, holding at most that much at a time
+/// - `update_to_writer()` / `finalize_to_writer()` — write out in whole
+///   flush-sized runs, holding at most one run at a time
 #[must_use = "call finalize() or finalize_to_writer() to complete encryption"]
 pub struct MediaEncryptor {
     /// Owns both the AES key schedule and the CBC chaining block, so a batch
@@ -143,8 +143,8 @@ impl MediaEncryptor {
             .expect("a Vec destination performs no I/O");
     }
 
-    /// Feed plaintext, writing whole [`WRITE_FLUSH`]-sized runs of ciphertext to
-    /// `writer`. Any tail below that stays staged until the next call or
+    /// Feed plaintext, writing whole flush-sized runs of ciphertext to `writer`.
+    /// Any tail below a full run stays staged until the next call or
     /// [`Self::finalize_to_writer`].
     ///
     /// On error the encryptor state is unspecified — discard it.
