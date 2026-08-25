@@ -3957,10 +3957,11 @@ impl CallHandle {
 
     /// End the call: send `<terminate>` to the peer, then tear the local side down.
     ///
-    /// The peer is addressed exactly as [`peer_jid`](Self::peer_jid) resolves it, so a direct call
-    /// reaches the device that answered and a group/call-link one the call scope. The local teardown
-    /// runs whether or not the stanza went out, which is why this reports its outcome instead of
-    /// returning an error the caller must handle to hang up.
+    /// A group or call-link call is addressed at the call scope. A direct call is addressed at the
+    /// device that answered, or, while it is still ringing, at every device the offer rang, since the
+    /// server does not fan a terminate out. The local teardown runs whether or not the stanzas went
+    /// out, which is why this reports its outcome instead of returning an error the caller must
+    /// handle to hang up.
     pub async fn terminate(&self) -> CallTermination {
         let client = match self.upgrade_client() {
             Ok(client) => client,
