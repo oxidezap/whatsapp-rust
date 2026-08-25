@@ -78,6 +78,16 @@ struct HistorySecretSeedCollector {
     last_chat_is_bot: Option<bool>,
     last_chat: Option<Jid>,
     last_chat_non_ad_id: Option<Arc<str>>,
+    /// The raw participant field the previous group record resolved from, and
+    /// the `Arc<str>` it resolved to. A group history arrives in bursts from
+    /// the same sender, and resolving one costs a JID parse plus a fresh
+    /// `Arc<str>` render per message; keyed on the raw field so the cache
+    /// cannot disagree with what a re-resolve would produce. Scoped to one
+    /// chat: both slots are cleared whenever `last_chat_id` changes, because
+    /// the resolution also depends on the chat (a sender that *is* the chat
+    /// aliases its id instead of getting its own).
+    last_participant_raw: String,
+    last_participant_sender_id: Option<Arc<str>>,
     entries: Vec<MsgSecretEntry>,
 }
 
@@ -91,6 +101,8 @@ impl HistorySecretSeedCollector {
             last_chat_is_bot: None,
             last_chat: None,
             last_chat_non_ad_id: None,
+            last_participant_raw: String::new(),
+            last_participant_sender_id: None,
             entries: Vec::new(),
         }
     }
@@ -105,6 +117,8 @@ impl HistorySecretSeedCollector {
             self.last_chat_id.push_str(record.chat_id);
             self.last_chat = None;
             self.last_chat_non_ad_id = None;
+            self.last_participant_raw.clear();
+            self.last_participant_sender_id = None;
             self.last_chat_is_bot =
                 wacore_binary::jid::parse_jid_ref(record.chat_id).map(|chat| chat.is_bot());
             if self.last_chat_is_bot.is_none()
@@ -151,20 +165,44 @@ impl HistorySecretSeedCollector {
             return;
         };
 
+        let secret = match <&[u8; HISTORY_MSG_SECRET_SIZE]>::try_from(record.secret) {
+            Ok(secret) => *secret,
+            Err(_) => return,
+        };
+        let chat_id = Arc::clone(chat_non_ad_id);
+        let msg_id: Arc<str> = Arc::from(record.msg_id);
+
+        // Only the group branch reads a participant field, and it yields a
+        // single sender, so a hit replaces the whole parse-and-render pass.
+        let participant_raw = group_participant_raw(chat, record);
+        if let Some(raw) = participant_raw
+            && let Some(cached) = self.last_participant_sender_id.as_ref()
+            && self.last_participant_raw == raw
+        {
+            self.entries.push(MsgSecretEntry {
+                chat: chat_id,
+                sender: Arc::clone(cached),
+                msg_id,
+                secret,
+                expires_at,
+                message_ts,
+            });
+            return;
+        }
+
         let senders =
             history_msg_secret_senders(chat, record, self.own_pn.as_ref(), self.own_lid.as_ref());
         if senders.iter().all(Option::is_none) {
             return;
         }
 
-        let chat_id = Arc::clone(chat_non_ad_id);
-        let msg_id: Arc<str> = Arc::from(record.msg_id);
-        let secret = match <&[u8; HISTORY_MSG_SECRET_SIZE]>::try_from(record.secret) {
-            Ok(secret) => *secret,
-            Err(_) => return,
-        };
         for sender in senders.into_iter().flatten() {
             let sender_id = MsgSecretEntry::sender_id_for(chat, &chat_id, &sender);
+            if let Some(raw) = participant_raw {
+                self.last_participant_raw.clear();
+                self.last_participant_raw.push_str(raw);
+                self.last_participant_sender_id = Some(Arc::clone(&sender_id));
+            }
             self.entries.push(MsgSecretEntry {
                 chat: Arc::clone(&chat_id),
                 sender: sender_id,
@@ -437,10 +475,14 @@ impl Client {
                 // (WAWebHistorySyncChunk): a conservative seed that only adds
                 // new LIDs and never clobbers a live-learned mapping.
                 if !sync_result.lid_mappings.is_empty() {
+                    // `into_string` rather than `to_string`: the batch learner
+                    // takes owned `String`s, and this consumes the mapping, so
+                    // a pair that did spill to the heap hands its buffer over
+                    // instead of being copied a second time.
                     let pairs: Vec<(String, String)> = sync_result
                         .lid_mappings
                         .into_iter()
-                        .map(|m| (m.lid, m.phone_number))
+                        .map(|m| (m.lid.into_string(), m.phone_number.into_string()))
                         .collect();
                     log::info!(
                         "History sync provided {} PN-LID mappings; learning",
@@ -622,6 +664,22 @@ impl Client {
 const MAX_HISTORY_SECRET_SENDERS: usize = 2;
 type HistorySecretSenders = [Option<Jid>; MAX_HISTORY_SECRET_SENDERS];
 
+/// The raw participant field this record's sender is read from, or `None` when
+/// the sender comes from our own identity (`fromMe`) or from the chat itself
+/// (1:1, bot) instead.
+///
+/// Single source of truth for that condition rather than a second copy of the
+/// branch order in [`history_msg_secret_senders`]: the seed collector caches a
+/// resolved sender under this key, and a cache whose key disagreed with the
+/// branch actually taken would file a group message's secret under the wrong
+/// sender.
+fn group_participant_raw<'a>(chat: &Jid, record: HistoryMsgSecretRecordRef<'a>) -> Option<&'a str> {
+    if record.from_me || chat.is_pn() || chat.is_lid() || chat.is_bot() {
+        return None;
+    }
+    record.key_participant.or(record.web_msg_participant)
+}
+
 fn history_msg_secret_senders(
     chat: &Jid,
     record: HistoryMsgSecretRecordRef<'_>,
@@ -650,7 +708,7 @@ fn history_msg_secret_senders(
         return senders;
     }
 
-    if let Some(raw_sender) = record.key_participant.or(record.web_msg_participant)
+    if let Some(raw_sender) = group_participant_raw(chat, record)
         && let Ok(sender) = raw_sender.parse::<Jid>()
     {
         push_unique_sender(&mut senders, sender.to_non_ad());
@@ -1361,6 +1419,61 @@ mod tests {
         );
     }
 
+    /// The seed collector reuses the previous message's resolved sender when
+    /// the raw participant field repeats. A roster that alternates must still
+    /// file every secret under its own sender — a cache that outlived the
+    /// switch would file the next participant's messages under the previous
+    /// one, and the add-on decrypt would look them up under a sender that
+    /// never sent them.
+    #[tokio::test]
+    async fn history_seed_group_alternating_participants_keep_own_senders() {
+        use crate::cache_config::MsgSecretPolicy;
+        let client = seeded_client("seed_group_alt", MsgSecretPolicy::Full).await;
+        let group = "120363021033254949@g.us";
+        let alice = "5511888887777@s.whatsapp.net";
+        let bob = "5511999996666@s.whatsapp.net";
+        let now = wacore::time::now_secs() as u64;
+
+        let notification = history_notification(
+            group,
+            vec![
+                group_history_msg(group, alice, "A1", &[0x11u8; 32], now - 60, false),
+                group_history_msg(group, alice, "A2", &[0x12u8; 32], now - 59, false),
+                group_history_msg(group, bob, "B1", &[0x21u8; 32], now - 58, false),
+                group_history_msg(group, bob, "B2", &[0x22u8; 32], now - 57, false),
+                group_history_msg(group, alice, "A3", &[0x13u8; 32], now - 56, false),
+            ],
+        );
+        client
+            .process_history_sync_task("SG".to_string(), notification.into())
+            .await;
+
+        let backend = client.persistence_manager.backend();
+        for (sender, msg_id, secret) in [
+            (alice, "A1", 0x11u8),
+            (alice, "A2", 0x12u8),
+            (bob, "B1", 0x21u8),
+            (bob, "B2", 0x22u8),
+            (alice, "A3", 0x13u8),
+        ] {
+            assert_eq!(
+                backend.get_msg_secret(group, sender, msg_id).await.unwrap(),
+                Some(vec![secret; 32]),
+                "{msg_id} must be filed under its own participant"
+            );
+        }
+        assert_eq!(
+            backend.get_msg_secret(group, bob, "A1").await.unwrap(),
+            None,
+            "a sender switch must not leak the previous participant's rows"
+        );
+        assert_eq!(
+            backend.get_msg_secret(group, alice, "B1").await.unwrap(),
+            None,
+            "a sender switch must not file the new participant under the old one"
+        );
+    }
+
     #[tokio::test]
     async fn history_sync_tctoken_replaces_byteless_placeholder() {
         let client = crate::test_utils::create_test_client_with_name("history_tctoken_ph").await;
@@ -1375,8 +1488,8 @@ mod tests {
 
         client
             .store_tc_token_candidate(TcTokenCandidate {
-                id: "555000999@lid".to_string(),
-                tc_token: vec![0xAB, 0xCD],
+                id: "555000999@lid".into(),
+                tc_token: smallvec::smallvec![0xAB, 0xCD],
                 tc_token_timestamp: 1000,
                 tc_token_sender_timestamp: None,
             })
@@ -1404,8 +1517,8 @@ mod tests {
         // No prior local state — the candidate's own sender timestamp seeds it.
         client
             .store_tc_token_candidate(TcTokenCandidate {
-                id: "555000998@lid".to_string(),
-                tc_token: vec![0x01],
+                id: "555000998@lid".into(),
+                tc_token: smallvec::smallvec![0x01],
                 tc_token_timestamp: 1000,
                 tc_token_sender_timestamp: Some(1500),
             })
