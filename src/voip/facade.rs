@@ -3442,7 +3442,8 @@ impl CallHandle {
     /// future resolves the same way: the microphone is never left live while the peer shows it muted.
     ///
     /// An outgoing call nobody has answered yet is muted locally only: the state belongs to a call
-    /// that does not exist on any of the devices still ringing.
+    /// that does not exist on any of the devices still ringing, and answering does not replay it. Call
+    /// this again once the call is up to announce a state chosen while it rang.
     pub async fn set_muted(&self, muted: bool) -> Result<(), CallError> {
         self.ensure_current()?;
         let client = self.upgrade_client()?;
@@ -3453,8 +3454,9 @@ impl CallHandle {
         // `Ok(())` a live call still ringing gets.
         self.ensure_current()?;
         let Some(target) = self.mute_target() else {
-            // Nobody to mislead: a call still ringing carries the state locally and announces it to
-            // the device that answers, if one does.
+            // Nobody to mislead: a call still ringing has no answered call anywhere to carry the
+            // state. The answer path does not replay it either, so a caller that mutes before the
+            // callee picks up has to set it again once the call is up.
             self.muted.store(muted, Ordering::Relaxed);
             return Ok(());
         };
