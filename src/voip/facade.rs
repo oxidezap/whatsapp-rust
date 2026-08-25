@@ -3929,6 +3929,14 @@ impl CallHandle {
                 return CallTermination::LocalOnly(error);
             }
         };
+        // Armed before the first await: waiting for the lane is cancellable too, and a caller that
+        // drops this future must not be left with a live call. Generation-scoped, so a superseded
+        // handle tears down nothing.
+        let _teardown = crate::client::voip::LocalTeardown {
+            client: &client,
+            call_id: &self.call_id,
+            generation: Some(self.generation),
+        };
         // The answer-transition lane, held across the check AND the send: a replacement installed in
         // that window would be ended by a `<terminate>` the peer cannot tell apart from ours, since
         // both carry the same call-id.
@@ -5892,6 +5900,29 @@ mod tests {
             node.as_node_ref().attrs().optional_jid("to"),
             Some(Jid::new("CID-FACADE", Server::Call)),
             "a promoted call must be ended at its call scope"
+        );
+    }
+
+    // Waiting for the answer-transition lane is cancellable too: a caller that gives up while another
+    // transition holds it must not be left with a live call and an open microphone.
+    #[tokio::test]
+    async fn cancelling_terminate_while_waiting_for_the_lane_still_ends_the_call() {
+        let (client, sends) = make_sending_client().await;
+        let generation = client.call_registry().insert(mk_session());
+        let handle = registry_handle(&client, generation);
+        let held = client.lock_answer_transition("CID-FACADE").await;
+
+        let terminate = tokio::spawn(async move { handle.terminate().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        terminate.abort();
+        let _ = terminate.await;
+        drop(held);
+
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "the send never started");
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "a terminate cancelled at the lane must still tear the local call down"
         );
     }
 

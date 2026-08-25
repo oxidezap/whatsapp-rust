@@ -1990,12 +1990,12 @@ impl Voip<'_> {
 
 /// Local call teardown that runs even when the terminate future is cancelled mid-send.
 #[cfg(feature = "voip-runtime")]
-struct LocalTeardown<'a> {
-    client: &'a Client,
-    call_id: &'a str,
+pub(crate) struct LocalTeardown<'a> {
+    pub(crate) client: &'a Client,
+    pub(crate) call_id: &'a str,
     /// `None` tears down whatever generation currently holds the call-id, which is what the public
     /// `terminate` (no handle, no generation) can promise.
-    generation: Option<u64>,
+    pub(crate) generation: Option<u64>,
 }
 
 #[cfg(feature = "voip-runtime")]
