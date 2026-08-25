@@ -3937,6 +3937,7 @@ dependencies = [
  "buffa",
  "buffa-build",
  "bytes",
+ "cbc",
  "chrono",
  "codspeed-divan-compat",
  "compact_str",

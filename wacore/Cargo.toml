@@ -59,6 +59,9 @@ base64 = { workspace = true }
 bon = { workspace = true }
 buffa = { workspace = true }
 bytes = { workspace = true }
+# Media upload/download run AES-256-CBC incrementally over a stream, which the
+# mode's own batch loop does with the chaining block in a register.
+cbc = { workspace = true }
 chrono = { workspace = true, features = ["now", "serde"] }
 compact_str = { workspace = true }
 ctr = { workspace = true }
@@ -150,6 +153,10 @@ harness = false
 
 [[bench]]
 name = "prekey_store_benchmark"
+harness = false
+
+[[bench]]
+name = "media_benchmark"
 harness = false
 
 [[bench]]
