@@ -33,8 +33,10 @@ impl Client {
     /// (no ack) so a transient storage error cannot drop a message that still
     /// needs its hook to commit.
     ///
-    /// Returns `true` when a buffered copy was replayed, which dispatches the
-    /// message again: a caller counting suppressions must not count that one.
+    /// Returns `true` when a buffered copy was replayed *and* its commit will
+    /// dispatch it, which hands the message to consumers again: a caller
+    /// counting suppressions must not count that one. A replay whose commit
+    /// failed returns `false`, because nothing reached a consumer.
     pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) -> bool {
         if self.inbound_durability_hook().is_some() {
             let backend = self.persistence_manager.backend();
@@ -43,15 +45,22 @@ impl Client {
             match backend.get_pending_inbound(&chat, &sender, &info.id).await {
                 Ok(Some(bytes)) => match waproto::codec::message_decode(&bytes) {
                     Ok(msg) => {
-                        self.commit_or_batch_inbound(
-                            InboundMessage::builder()
-                                .message(Arc::new(msg))
-                                .info(Arc::clone(info))
-                                .build(),
-                            false,
-                        )
-                        .await;
-                        return true;
+                        // Only a replay that will actually reach the consumer
+                        // counts as one. `Deferred` still does, later, when its
+                        // batch commits; `Failed` dispatched nothing, so the
+                        // caller must count that resend as a suppression or the
+                        // message reaches no one and nothing records it.
+                        return !matches!(
+                            self.commit_or_batch_inbound(
+                                InboundMessage::builder()
+                                    .message(Arc::new(msg))
+                                    .info(Arc::clone(info))
+                                    .build(),
+                                false,
+                            )
+                            .await,
+                            InboundCommitState::Failed
+                        );
                     }
                     Err(e) => {
                         // Corrupt row (our own serialization): it can never be

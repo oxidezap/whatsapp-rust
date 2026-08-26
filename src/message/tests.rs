@@ -15676,6 +15676,235 @@ async fn an_unresolved_secret_envelope_is_not_claimed() {
     );
 }
 
+/// A replay whose commit fails dispatches nothing. Reporting it as a replay
+/// would skip the suppression counter, so a message that reached no consumer
+/// would leave no trace in the one number that exists to explain exactly that.
+#[tokio::test]
+async fn a_replay_that_fails_to_commit_counts_as_a_suppression() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::InboundMessage;
+
+    struct SilentHook;
+
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for SilentHook {
+        async fn on_messages(
+            &self,
+            _client: Arc<Client>,
+            _batch: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (client, _transport) = capturing_client("failed_replay_counts").await;
+    client
+        .inbound_durability_hook
+        .set(Arc::new(SilentHook) as Arc<dyn InboundDurabilityHook>)
+        .ok()
+        .expect("hook registers once");
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "REPLAY_THAT_FAILS";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+    let msg = wa::Message {
+        conversation: Some("the copy still buffered".into()),
+        ..Default::default()
+    };
+
+    // The state the resend arrives into: the id was claimed by a delivery that
+    // dispatched, but its pending row outlived the commit that should have
+    // cleared it, so the replay path finds a buffered copy to re-commit.
+    client
+        .persistence_manager
+        .backend()
+        .store_pending_inbound(
+            &info.source.chat.to_string(),
+            &info.source.sender.to_string(),
+            id,
+            &{
+                let mut buf = Vec::new();
+                waproto::codec::message_encode_into(&msg, &mut buf);
+                buf
+            },
+        )
+        .await
+        .expect("buffer a copy");
+    client.mark_message_dispatched(&info).await;
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(true, Ordering::Release);
+
+    client
+        .handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&msg),
+            2,
+            0,
+            Default::default(),
+            &info,
+        )
+        .await
+        .expect("handle the resend");
+
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        1,
+        "a replay whose commit failed reached no consumer, so it is a suppression"
+    );
+}
+
+/// `extract_secret_encrypted` returns `None` both for a plain message and for a
+/// tagged envelope that is malformed, so the claim must test for the envelope's
+/// presence: a malformed one is no more readable to a consumer than an
+/// unopenable one.
+#[tokio::test]
+async fn a_malformed_secret_envelope_is_not_claimed() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("malformed_envelope").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "MALFORMED_REACTION";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    // Tagged as an encrypted reaction, but the IV is not 12 bytes, so
+    // extraction rejects it while the consumer still gets only the envelope.
+    let malformed = wa::Message {
+        enc_reaction_message: buffa::MessageField::some(wa::message::EncReactionMessage {
+            target_message_key: buffa::MessageField::some(wa::MessageKey {
+                id: Some("TARGET".into()),
+                remote_jid: Some(peer.to_string()),
+                from_me: Some(false),
+                ..Default::default()
+            }),
+            enc_payload: Some(vec![9; 16]),
+            enc_iv: Some(vec![7; 5]),
+        }),
+        ..Default::default()
+    };
+
+    for _ in 0..2 {
+        client
+            .handle_decrypted_plaintext(
+                "msg",
+                MessageUtils::encode_and_pad(&malformed),
+                2,
+                0,
+                Default::default(),
+                &info,
+            )
+            .await
+            .expect("handle the envelope");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "a malformed envelope must not claim the id its corrected resend needs"
+    );
+}
+
+/// Two dispatches of one stanza share its `MessageInfo`, which is what the
+/// msmsg loop hands every bot-reply part. Equal parts are not a repeat of each
+/// other, so identity plus content is not enough on its own.
+#[tokio::test]
+async fn two_identical_msmsg_parts_under_one_id_both_reach_the_consumer() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("msmsg_identical_parts").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "BOT_REPLY_SAME_TWICE";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    client.inbound_commit_batch.reset();
+    for _ in 0..2 {
+        client
+            .dispatch_parsed_message(
+                wa::Message {
+                    conversation: Some("the same bot reply twice".into()),
+                    ..Default::default()
+                },
+                &info,
+                false,
+            )
+            .await;
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "parts of one stanza are not repeats of each other, even when identical"
+    );
+}
+
+/// One participant reusing an id across a whole drain batch must not make the
+/// collapse compare every payload against every earlier one. Past the bound it
+/// gives up on that identity and keeps everything, which is the safe direction
+/// and is what this asserts: a repeat that arrives after the bound survives.
+#[tokio::test]
+async fn an_id_reused_past_the_bound_stops_being_collapsed() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("id_reuse_bound").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "REUSED_PAST_THE_BOUND";
+    let repeated = "the payload that comes back";
+
+    client.inbound_commit_batch.reset();
+    // Distinct stanzas (each its own info) all claiming one id: the first
+    // payload, then enough different ones to exhaust the bound, then the first
+    // payload again. Below the bound that last one would collapse into the
+    // first; past it the collapse has stopped looking at this identity.
+    let payloads = std::iter::once(repeated.to_string())
+        .chain((0..8).map(|n| format!("filler {n}")))
+        .chain(std::iter::once(repeated.to_string()));
+    for text in payloads {
+        client
+            .dispatch_parsed_message(
+                wa::Message {
+                    conversation: Some(text),
+                    ..Default::default()
+                },
+                &Arc::new(create_test_message_info(peer, id, peer)),
+                false,
+            )
+            .await;
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        10,
+        "past the bound the collapse gives up on an identity and keeps everything"
+    );
+}
+
 /// The msmsg loop dispatches every bot-reply part of one stanza under a single
 /// `info`, so a drain batch can hold several genuinely different payloads that
 /// share an identity. Collapsing them would ack every part and deliver one.

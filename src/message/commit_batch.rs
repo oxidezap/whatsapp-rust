@@ -723,19 +723,38 @@ impl Client {
         if items.len() < 2 {
             return items;
         }
+        /// Distinct payloads compared per identity before the collapse gives
+        /// up on it. A resend repeats one message, so a real duplicate is
+        /// found against the first or second entry; an identity accumulating
+        /// more than this is not the pattern this function exists for, and
+        /// without a bound a participant could reuse one id across a full
+        /// 400-message drain batch and force ~80k structural compares on the
+        /// receive path while it holds the processing permit. Giving up keeps
+        /// everything, which is the safe direction.
+        const MAX_COMPARED_PER_ID: usize = 8;
         type Seen = std::collections::HashMap<
             wacore::types::message::SenderMessageId,
-            Vec<Arc<waproto::whatsapp::Message>>,
+            Vec<(Arc<MessageInfo>, Arc<waproto::whatsapp::Message>)>,
         >;
         fn keep(seen: &mut Seen, item: &InboundMessage) -> bool {
             let kept = seen.entry(Client::dispatch_key(&item.info)).or_default();
-            if kept
-                .iter()
-                .any(|m| Arc::ptr_eq(m, &item.message) || **m == *item.message)
-            {
+            if kept.len() >= MAX_COMPARED_PER_ID {
+                return true;
+            }
+            if kept.iter().any(|(info, m)| {
+                // Never collapse two dispatches of one stanza. They share the
+                // `MessageInfo` the stanza was parsed into, which the msmsg
+                // loop hands to every bot-reply part, so equal parts are not a
+                // repeat of each other. Best-effort by construction: two
+                // separate stanzas always allocate separate infos, so this
+                // never exempts a genuine resend, while a part whose info was
+                // copied on write falls through to the content compare.
+                !Arc::ptr_eq(info, &item.info)
+                    && (Arc::ptr_eq(m, &item.message) || **m == *item.message)
+            }) {
                 return false;
             }
-            kept.push(Arc::clone(&item.message));
+            kept.push((Arc::clone(&item.info), Arc::clone(&item.message)));
             true
         }
         let mut seen = Seen::with_capacity(items.len());
@@ -993,12 +1012,15 @@ impl Client {
         for item in dispatched.iter() {
             // An unresolved secret envelope is a placeholder in the same sense
             // as an UndecryptableMessage: what reached the consumer is not the
-            // content. Claiming it would suppress the resend that arrives once
+            // content. Presence, not extractability: a malformed envelope is
+            // just as unreadable to a consumer as an unopenable one, and
+            // `extract_secret_encrypted` returns `None` for both a plain
+            // message and a malformed envelope. Claiming it would suppress the resend that arrives once
             // the parent secret is known, so leave it unclaimed and take the
             // duplicate instead. The batch collapse keeps such a resend for a
             // related reason: it compares content, and the envelope is not the
             // content.
-            if crate::features::message_edit::extract_secret_encrypted(&item.message).is_some() {
+            if crate::features::message_edit::carries_secret_encrypted(&item.message) {
                 continue;
             }
             self.mark_message_dispatched(&item.info).await;
