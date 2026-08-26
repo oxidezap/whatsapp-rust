@@ -896,6 +896,11 @@ pub enum Event {
     /// messages (plaintext, acked on their own path, never redelivered) and
     /// PDO placeholder recoveries (identified by
     /// `info.unavailable_request_id`) dispatch event-only.
+    ///
+    /// A sender retrying its own outbox resends one message re-encrypted, which
+    /// no ratchet can see as a duplicate. Those collapse to a single dispatch,
+    /// keyed by chat, id and sender, for as long as the `dispatched_messages`
+    /// window holds; `stats().messages_suppressed_duplicate` counts them.
     Messages(MessageBatch),
     Receipt(Receipt),
     /// The server `<ack>`-ed (or nack-ed) an outgoing stanza.
