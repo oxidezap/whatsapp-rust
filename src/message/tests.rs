@@ -15462,6 +15462,77 @@ async fn two_resends_inside_one_deferred_batch_dispatch_once() {
         1,
         "one message must not reach the consumer twice inside a single batch"
     );
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        1,
+        "what the batch collapse drops is a suppression like any other, and has to be counted as one"
+    );
+}
+
+/// A resent `app_state_sync_key_request` is our phone saying it still has no
+/// keys. Suppressing the duplicate event must not suppress the recovery.
+#[tokio::test]
+async fn suppressed_key_request_resend_still_schedules_the_share() {
+    use wacore::messages::MessageUtils;
+
+    let (client, transport) = capturing_client("key_request_resend").await;
+    let requester_str = "5511000000001:33@s.whatsapp.net";
+    let requester: Jid = requester_str.parse().expect("requester jid");
+    let mut peer = AlicePeer::new(requester_str).await;
+    let (bundle, own_jid) = bobs_prekey_bundle(&client).await;
+    let own_address = own_jid.to_protocol_address();
+    peer.install_bob_session(&own_address, &bundle).await;
+    let establishing = peer.encrypt_text(&own_address, "establish session").await;
+    let (decrypted, _, _, session_present) =
+        submit_and_check_session(&client, &requester, &establishing).await;
+    assert!(decrypted && session_present, "precondition: peer session");
+    client.flush_signal_cache().await.expect("flush session");
+
+    let request = wa::Message {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest),
+            app_state_sync_key_request: buffa::MessageField::some(
+                wa::message::AppStateSyncKeyRequest {
+                    key_ids: vec![wa::message::AppStateSyncKeyId {
+                        key_id: Some(vec![1, 2, 3, 4]),
+                    }],
+                },
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut info = create_test_message_info(requester_str, "AKR_RESEND", requester_str);
+    info.source.is_from_me = true;
+    let info = Arc::new(info);
+
+    let plaintext = || MessageUtils::encode_and_pad(&request);
+    client
+        .handle_decrypted_plaintext("msg", plaintext(), 2, 0, Default::default(), &info)
+        .await
+        .expect("handle key request");
+    crate::test_utils::poll_until("the first key share", || {
+        message_count_to_after(&transport.sent(), 0, requester_str) == 1
+    })
+    .await;
+    let after_first = transport.sent().len();
+
+    // Same request again, re-encrypted: the event is a duplicate, the phone's
+    // need for the keys is not.
+    client
+        .handle_decrypted_plaintext("msg", plaintext(), 2, 0, Default::default(), &info)
+        .await
+        .expect("handle resent key request");
+
+    crate::test_utils::poll_until("the key share for the resent request", || {
+        has_message_to_after(&transport.sent(), after_first, requester_str)
+    })
+    .await;
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        1,
+        "the resend's consumer event is still suppressed"
+    );
 }
 
 /// The server spells `participant` bare on an skmsg and device-qualified on the

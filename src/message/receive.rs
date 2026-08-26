@@ -1876,8 +1876,7 @@ impl Client {
         } else if self.message_already_dispatched(info).await {
             // The sender resent a message we already handed to consumers. Ack
             // it the way the ratchet-level duplicate is acked, so a registered
-            // durability hook still gets its replay instead of a bare ack; the
-            // key share (if any) was scheduled by the delivery that dispatched.
+            // durability hook still gets its replay instead of a bare ack.
             // status is acked by the should_ack gate. A hook whose buffered copy
             // survived replays instead of being acked, which dispatches the
             // message again: that is the documented at-least-once shape, not a
@@ -1892,6 +1891,14 @@ impl Client {
                     "[msg:{}] already dispatched for this sender; suppressing the resend's event",
                     info.id
                 );
+            }
+            // The event is a duplicate; the key share is not. Our phone asking
+            // again is what it does when it did not get the keys, so the first
+            // delivery's send having been scheduled is no reason to skip this
+            // one. Sending them twice costs a stanza; not sending them leaves
+            // the requester without app-state keys until it changes request id.
+            if let Some((requester, request)) = app_state_key_share_job {
+                self.schedule_app_state_sync_key_share(requester, request, None);
             }
             Ok(PlaintextHandleOutcome {
                 dispatched: true,

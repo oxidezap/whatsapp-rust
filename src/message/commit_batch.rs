@@ -708,7 +708,7 @@ impl Client {
     ///
     /// Returns the input untouched when there is nothing to drop, which is
     /// every live batch (they hold one message) and almost every drained one.
-    fn dedup_batch_by_message(items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
+    fn dedup_batch_by_message(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
         if items.len() < 2 {
             return items;
         }
@@ -720,11 +720,20 @@ impl Client {
             return items;
         }
         seen.clear();
-        items
+        let kept: Arc<[InboundMessage]> = items
             .iter()
             .filter(|item| seen.insert(Self::dispatch_key(&item.info)))
             .cloned()
-            .collect()
+            .collect();
+        // Counted like any other suppression: what this drops never reaches a
+        // consumer, so leaving it out would make the metric disagree with what
+        // the consumer saw for exactly the deliveries it exists to explain.
+        for _ in 0..(items.len() - kept.len()) {
+            self.duplicate_dispatch_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            wacore::telemetry::recv("duplicate_resend");
+        }
+        kept
     }
 
     /// Commit one batch: durable buffer → Signal flush → hook → clear buffer →
@@ -767,7 +776,7 @@ impl Client {
         // reduced to one copy.
         let arrived = Arc::clone(&items);
         let items = if self.dispatch_gate_enabled() {
-            Self::dedup_batch_by_message(items)
+            self.dedup_batch_by_message(items)
         } else {
             items
         };
