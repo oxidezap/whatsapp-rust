@@ -766,7 +766,11 @@ impl Client {
         // acked from `arrived`; only what the hook and the consumer see is
         // reduced to one copy.
         let arrived = Arc::clone(&items);
-        let items = Self::dedup_batch_by_message(items);
+        let items = if self.dispatch_gate_enabled() {
+            Self::dedup_batch_by_message(items)
+        } else {
+            items
+        };
         let mut reinsert = ReinsertGuard {
             batcher: &self.inbound_commit_batch,
             items: is_drain.then(|| Arc::clone(&items)),
@@ -913,9 +917,7 @@ impl Client {
         if is_drain {
             self.flush_offline_receipts();
         }
-        for item in items.iter() {
-            self.mark_message_dispatched(&item.info).await;
-        }
+        let dispatched = Arc::clone(&items);
         self.core.event_bus.dispatch(Event::Messages(
             MessageBatch::builder()
                 .messages(items)
@@ -923,6 +925,14 @@ impl Client {
                 .hook_committed(hook_committed)
                 .build(),
         ));
+        // Claimed after the dispatch, never between the acks and it: this is the
+        // one suspension point in that span, and a teardown cancelling it there
+        // would leave the batch acked with its event never sent, which for a
+        // consumer without a hook is a lost message. Cancelled here instead, the
+        // claim is simply missing and a resend dispatches twice.
+        for item in dispatched.iter() {
+            self.mark_message_dispatched(&item.info).await;
+        }
         true
     }
 }

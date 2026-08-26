@@ -32,7 +32,10 @@ impl Client {
     /// a genuine duplicate (no buffered copy). A read failure fails closed
     /// (no ack) so a transient storage error cannot drop a message that still
     /// needs its hook to commit.
-    pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) {
+    ///
+    /// Returns `true` when a buffered copy was replayed, which dispatches the
+    /// message again: a caller counting suppressions must not count that one.
+    pub(crate) async fn ack_or_replay_to_hook(self: &Arc<Self>, info: &Arc<MessageInfo>) -> bool {
         if self.inbound_durability_hook().is_some() {
             let backend = self.persistence_manager.backend();
             let chat = info.source.chat.to_string();
@@ -48,6 +51,7 @@ impl Client {
                             false,
                         )
                         .await;
+                        return true;
                     }
                     Err(e) => {
                         // Corrupt row (our own serialization): it can never be
@@ -74,6 +78,7 @@ impl Client {
         } else {
             self.ack_received_message(info);
         }
+        false
     }
 }
 

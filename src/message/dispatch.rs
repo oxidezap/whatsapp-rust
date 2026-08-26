@@ -38,6 +38,13 @@ impl Client {
             .is_some()
     }
 
+    /// Whether the dispatch-once gate is on. Capacity 0 is its documented off
+    /// switch, and it has to turn off the batch collapse too, or the switch
+    /// would restore the old behaviour for live traffic only.
+    pub(crate) fn dispatch_gate_enabled(&self) -> bool {
+        self.dispatched_messages.configured_capacity() != Some(0)
+    }
+
     /// Claim a message id, called where a committed batch is dispatched.
     ///
     /// Placing it there rather than at the call site is what makes the offline

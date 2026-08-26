@@ -15201,6 +15201,45 @@ async fn zero_capacity_disables_the_gate() {
     );
 }
 
+/// The off switch has to reach the batch collapse too, or capacity 0 would
+/// restore the old behaviour for live traffic only.
+#[tokio::test]
+async fn zero_capacity_disables_the_batch_collapse() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) =
+        capturing_client_with_cache_config("gate_disabled_drain", gate_disabled_config()).await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000012@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    client.inbound_commit_batch.reset();
+
+    let id = "GATE_OFF_DRAIN";
+    for _ in 0..2 {
+        let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .await;
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "capacity 0 must leave a drained batch carrying both deliveries, as it did before the gate"
+    );
+}
+
 /// Nothing was dispatched on the delivery that failed to decrypt, so the key is
 /// not in the cache and the resend must come through.
 #[tokio::test]

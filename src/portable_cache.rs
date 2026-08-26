@@ -597,6 +597,13 @@ where
         log::warn!("PortableCache::invalidate_all: could not acquire write lock after retries");
     }
 
+    /// The configured capacity, or `None` when unbounded. `Some(0)` is the
+    /// off switch: `insert` short-circuits, so the cache never holds anything
+    /// and a caller can skip work that only makes sense when it does.
+    pub fn configured_capacity(&self) -> Option<u64> {
+        self.max_capacity
+    }
+
     pub fn entry_count(&self) -> u64 {
         self.inner
             .try_read()

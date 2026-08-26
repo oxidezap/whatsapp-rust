@@ -1878,16 +1878,20 @@ impl Client {
             // it the way the ratchet-level duplicate is acked, so a registered
             // durability hook still gets its replay instead of a bare ack; the
             // key share (if any) was scheduled by the delivery that dispatched.
-            // status is acked by the should_ack gate.
-            self.duplicate_dispatch_suppressed
-                .fetch_add(1, Ordering::Relaxed);
-            wacore::telemetry::recv("duplicate_resend");
-            log::debug!(
-                "[msg:{}] already dispatched for this sender; suppressing the resend's event",
-                info.id
-            );
-            if !info.source.chat.is_status_broadcast() {
-                self.ack_or_replay_to_hook(info).await;
+            // status is acked by the should_ack gate. A hook whose buffered copy
+            // survived replays instead of being acked, which dispatches the
+            // message again: that is the documented at-least-once shape, not a
+            // suppression, so it is not counted as one.
+            let replayed =
+                !info.source.chat.is_status_broadcast() && self.ack_or_replay_to_hook(info).await;
+            if !replayed {
+                self.duplicate_dispatch_suppressed
+                    .fetch_add(1, Ordering::Relaxed);
+                wacore::telemetry::recv("duplicate_resend");
+                log::debug!(
+                    "[msg:{}] already dispatched for this sender; suppressing the resend's event",
+                    info.id
+                );
             }
             Ok(PlaintextHandleOutcome {
                 dispatched: true,
