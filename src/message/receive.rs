@@ -1874,6 +1874,14 @@ impl Client {
                 ..Default::default()
             })
         } else if self.message_already_dispatched(info).await {
+            // The event is a duplicate; the message secret it carries may not
+            // be. Capture is write-behind and can drop an entry when its
+            // backend is down, and this branch skips `dispatch_parsed_message`,
+            // which is the only other caller: without this the resend is the
+            // second chance we would have thrown away, and every later
+            // encrypted edit, reaction or comment on that parent stays
+            // unopenable. It is a no-op for a message carrying no secret.
+            self.maybe_capture_inbound_msg_secret(&msg, info).await;
             // The sender resent a message we already handed to consumers. Ack
             // it the way the ratchet-level duplicate is acked, so a registered
             // durability hook still gets its replay instead of a bare ack.

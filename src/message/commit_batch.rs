@@ -709,26 +709,36 @@ impl Client {
     /// Returns the input untouched when there is nothing to drop, which is
     /// every live batch (they hold one message) and almost every drained one.
     ///
-    /// An item still carrying an unresolved secret envelope is never collapsed,
-    /// in either direction. One batch can hold the envelope and, after the
-    /// parent secret arrived mid-drain, a retry of the same id that resolved to
-    /// the inner message; keeping the first would drop the only copy the
-    /// consumer can read, and both were acked. Whether the envelope comes first
-    /// or second, letting it through costs a duplicate and keeps the content.
+    /// A repeat is identity *and* content: a resend re-encrypts the same
+    /// message, so the decoded protos are equal. Identity alone is not enough,
+    /// because one stanza id can carry several genuinely different payloads
+    /// that share an `info`. The msmsg loop in `handle_incoming_message`
+    /// dispatches every bot-reply part under one id, and a drain batch can hold
+    /// an unresolved secret envelope beside the retry that resolved to the
+    /// inner message; collapsing on identity alone would drop those and ack
+    /// them, losing content with nothing left to redeliver it. Comparing the
+    /// message keeps them and costs a structural compare only where identities
+    /// actually collide, which is the rare case this whole function exists for.
     fn dedup_batch_by_message(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
         if items.len() < 2 {
             return items;
         }
-        fn keep(
-            seen: &mut std::collections::HashSet<wacore::types::message::SenderMessageId>,
-            item: &InboundMessage,
-        ) -> bool {
-            if crate::features::message_edit::extract_secret_encrypted(&item.message).is_some() {
-                return true;
+        type Seen = std::collections::HashMap<
+            wacore::types::message::SenderMessageId,
+            Vec<Arc<waproto::whatsapp::Message>>,
+        >;
+        fn keep(seen: &mut Seen, item: &InboundMessage) -> bool {
+            let kept = seen.entry(Client::dispatch_key(&item.info)).or_default();
+            if kept
+                .iter()
+                .any(|m| Arc::ptr_eq(m, &item.message) || **m == *item.message)
+            {
+                return false;
             }
-            seen.insert(Client::dispatch_key(&item.info))
+            kept.push(Arc::clone(&item.message));
+            true
         }
-        let mut seen = std::collections::HashSet::with_capacity(items.len());
+        let mut seen = Seen::with_capacity(items.len());
         if items.iter().all(|item| keep(&mut seen, item)) {
             return items;
         }
@@ -985,8 +995,9 @@ impl Client {
             // as an UndecryptableMessage: what reached the consumer is not the
             // content. Claiming it would suppress the resend that arrives once
             // the parent secret is known, so leave it unclaimed and take the
-            // duplicate instead. `dedup_batch_by_message` exempts the same
-            // items for the same reason.
+            // duplicate instead. The batch collapse keeps such a resend for a
+            // related reason: it compares content, and the envelope is not the
+            // content.
             if crate::features::message_edit::extract_secret_encrypted(&item.message).is_some() {
                 continue;
             }

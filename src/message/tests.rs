@@ -15676,6 +15676,122 @@ async fn an_unresolved_secret_envelope_is_not_claimed() {
     );
 }
 
+/// The msmsg loop dispatches every bot-reply part of one stanza under a single
+/// `info`, so a drain batch can hold several genuinely different payloads that
+/// share an identity. Collapsing them would ack every part and deliver one.
+#[tokio::test]
+async fn two_msmsg_parts_under_one_id_both_reach_the_consumer() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("msmsg_parts_one_id").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "BOT_REPLY_PARTS";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    client.inbound_commit_batch.reset();
+    // What `handle_msmsg_payload` does per part: one `dispatch_parsed_message`
+    // with the stanza's shared info and this part's own decrypted content.
+    for part in [
+        "first half of the bot reply",
+        "second half of the bot reply",
+    ] {
+        client
+            .dispatch_parsed_message(
+                wa::Message {
+                    conversation: Some(part.into()),
+                    ..Default::default()
+                },
+                &info,
+                false,
+            )
+            .await;
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "both bot-reply parts must reach the consumer: one stanza id, two different payloads"
+    );
+}
+
+/// Capture is write-behind and can lose an entry when its backend is down. A
+/// resend is the second chance, so suppressing its event must not also skip
+/// the capture, or every later encrypted addon on that parent stays unopenable.
+#[tokio::test]
+async fn a_suppressed_resend_still_captures_the_message_secret() {
+    use wacore::messages::MessageUtils;
+
+    let (client, _transport) = capturing_client("suppressed_secret_capture").await;
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "SECRET_PARENT";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    let with_secret = |forwarded: bool| wa::Message {
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+            text: Some("parent of a later reaction".into()),
+            context_info: buffa::MessageField::some(wa::ContextInfo {
+                is_forwarded: Some(forwarded),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+            message_secret: Some(vec![4; 32]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // The first delivery dispatches and claims the id but stores no secret.
+    // Forwarding is the controllable stand-in here for any reason the capture
+    // did not land; the branch the resend then takes is the same either way.
+    client
+        .handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&with_secret(true)),
+            2,
+            0,
+            Default::default(),
+            &info,
+        )
+        .await
+        .expect("handle the first delivery");
+    assert_eq!(
+        client.memory_report().await.msg_secret_buffer,
+        0,
+        "precondition: the first delivery stored no secret"
+    );
+
+    client
+        .handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&with_secret(false)),
+            2,
+            0,
+            Default::default(),
+            &info,
+        )
+        .await
+        .expect("handle the resend");
+
+    assert_eq!(
+        client.memory_report().await.msg_secret_buffer,
+        1,
+        "the suppressed resend must still capture the secret it carries"
+    );
+}
+
 /// A drain batch can hold an unresolved envelope and, once the parent secret
 /// arrived mid-drain, a retry of the same id that resolved to the inner
 /// message. Collapsing them would drop the only copy the consumer can read.
