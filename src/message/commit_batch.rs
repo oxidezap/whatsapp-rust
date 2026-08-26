@@ -708,21 +708,34 @@ impl Client {
     ///
     /// Returns the input untouched when there is nothing to drop, which is
     /// every live batch (they hold one message) and almost every drained one.
+    ///
+    /// An item still carrying an unresolved secret envelope is never collapsed,
+    /// in either direction. One batch can hold the envelope and, after the
+    /// parent secret arrived mid-drain, a retry of the same id that resolved to
+    /// the inner message; keeping the first would drop the only copy the
+    /// consumer can read, and both were acked. Whether the envelope comes first
+    /// or second, letting it through costs a duplicate and keeps the content.
     fn dedup_batch_by_message(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
         if items.len() < 2 {
             return items;
         }
+        fn keep(
+            seen: &mut std::collections::HashSet<wacore::types::message::SenderMessageId>,
+            item: &InboundMessage,
+        ) -> bool {
+            if crate::features::message_edit::extract_secret_encrypted(&item.message).is_some() {
+                return true;
+            }
+            seen.insert(Client::dispatch_key(&item.info))
+        }
         let mut seen = std::collections::HashSet::with_capacity(items.len());
-        if items
-            .iter()
-            .all(|item| seen.insert(Self::dispatch_key(&item.info)))
-        {
+        if items.iter().all(|item| keep(&mut seen, item)) {
             return items;
         }
         seen.clear();
         let kept: Arc<[InboundMessage]> = items
             .iter()
-            .filter(|item| seen.insert(Self::dispatch_key(&item.info)))
+            .filter(|item| keep(&mut seen, item))
             .cloned()
             .collect();
         // Counted like any other suppression: what this drops never reaches a
@@ -972,7 +985,8 @@ impl Client {
             // as an UndecryptableMessage: what reached the consumer is not the
             // content. Claiming it would suppress the resend that arrives once
             // the parent secret is known, so leave it unclaimed and take the
-            // duplicate instead.
+            // duplicate instead. `dedup_batch_by_message` exempts the same
+            // items for the same reason.
             if crate::features::message_edit::extract_secret_encrypted(&item.message).is_some() {
                 continue;
             }

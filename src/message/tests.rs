@@ -15650,7 +15650,6 @@ async fn an_unresolved_secret_envelope_is_not_claimed() {
             }),
             enc_payload: Some(vec![9; 16]),
             enc_iv: Some(vec![7; 12]),
-            ..Default::default()
         }),
         ..Default::default()
     };
@@ -15674,6 +15673,67 @@ async fn an_unresolved_secret_envelope_is_not_claimed() {
         dispatch_count(&drain_message_events(&rx), id),
         2,
         "the resend must still reach the consumer: the first delivery handed it an envelope it could not open"
+    );
+}
+
+/// A drain batch can hold an unresolved envelope and, once the parent secret
+/// arrived mid-drain, a retry of the same id that resolved to the inner
+/// message. Collapsing them would drop the only copy the consumer can read.
+#[tokio::test]
+async fn a_batch_keeps_the_resolved_copy_of_an_unresolved_envelope() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("envelope_then_resolved").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "ENC_THEN_PLAIN";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    let envelope = wa::Message {
+        enc_reaction_message: buffa::MessageField::some(wa::message::EncReactionMessage {
+            target_message_key: buffa::MessageField::some(wa::MessageKey {
+                id: Some("TARGET".into()),
+                remote_jid: Some(peer.to_string()),
+                from_me: Some(false),
+                ..Default::default()
+            }),
+            enc_payload: Some(vec![9; 16]),
+            enc_iv: Some(vec![7; 12]),
+        }),
+        ..Default::default()
+    };
+    // What the retry looks like once the secret is known: the inner message,
+    // under the same id the envelope carried.
+    let resolved = wa::Message {
+        conversation: Some("the reaction we could finally read".into()),
+        ..Default::default()
+    };
+
+    client.inbound_commit_batch.reset();
+    for payload in [
+        MessageUtils::encode_and_pad(&envelope),
+        MessageUtils::encode_and_pad(&resolved),
+    ] {
+        client
+            .handle_decrypted_plaintext("msg", payload, 2, 0, Default::default(), &info)
+            .await
+            .expect("handle the delivery");
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "the resolved copy must survive the collapse: the envelope is not the content"
     );
 }
 
