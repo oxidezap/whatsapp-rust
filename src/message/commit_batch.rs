@@ -732,16 +732,34 @@ impl Client {
         /// receive path while it holds the processing permit. Giving up keeps
         /// everything, which is the safe direction.
         const MAX_COMPARED_PER_ID: usize = 8;
-        type Seen = std::collections::HashMap<
-            wacore::types::message::SenderMessageId,
-            Vec<(Arc<MessageInfo>, Arc<waproto::whatsapp::Message>)>,
-        >;
+        /// A kept payload, with its wire form filled in only if some later
+        /// item in the batch turns out to share its identity.
+        struct Kept {
+            info: Arc<MessageInfo>,
+            message: Arc<waproto::whatsapp::Message>,
+            encoded: Option<Vec<u8>>,
+        }
+        /// Compare the wire form rather than the decoded proto. `wa::Message`
+        /// derives `PartialEq`, but nothing else calls it, so one `==` here
+        /// makes the whole message tree's comparison code live and costs
+        /// ~236 KiB of binary. Encoding is already instantiated for the commit
+        /// path's durable write, so this adds no code and one memcmp.
+        fn wire(msg: &waproto::whatsapp::Message) -> Vec<u8> {
+            let mut buf = Vec::with_capacity(waproto::codec::message_encoded_len(msg));
+            waproto::codec::message_encode_into(msg, &mut buf);
+            buf
+        }
+        type Seen = std::collections::HashMap<wacore::types::message::SenderMessageId, Vec<Kept>>;
         fn keep(seen: &mut Seen, item: &InboundMessage) -> bool {
             let kept = seen.entry(Client::dispatch_key(&item.info)).or_default();
             if kept.len() >= MAX_COMPARED_PER_ID {
                 return true;
             }
-            if kept.iter().any(|(info, m)| {
+            // Encoded lazily and at most once per side, so a batch whose
+            // identities are all distinct (every live batch, and almost every
+            // drained one) never encodes anything here.
+            let mut candidate: Option<Vec<u8>> = None;
+            for k in kept.iter_mut() {
                 // Never collapse two dispatches of one stanza. They share the
                 // `MessageInfo` the stanza was parsed into, which the msmsg
                 // loop hands to every bot-reply part, so equal parts are not a
@@ -749,12 +767,23 @@ impl Client {
                 // separate stanzas always allocate separate infos, so this
                 // never exempts a genuine resend, while a part whose info was
                 // copied on write falls through to the content compare.
-                !Arc::ptr_eq(info, &item.info)
-                    && (Arc::ptr_eq(m, &item.message) || **m == *item.message)
-            }) {
-                return false;
+                if Arc::ptr_eq(&k.info, &item.info) {
+                    continue;
+                }
+                if Arc::ptr_eq(&k.message, &item.message) {
+                    return false;
+                }
+                let candidate = candidate.get_or_insert_with(|| wire(&item.message));
+                let existing = k.encoded.get_or_insert_with(|| wire(&k.message));
+                if *existing == *candidate {
+                    return false;
+                }
             }
-            kept.push((Arc::clone(&item.info), Arc::clone(&item.message)));
+            kept.push(Kept {
+                info: Arc::clone(&item.info),
+                message: Arc::clone(&item.message),
+                encoded: candidate,
+            });
             true
         }
         let mut seen = Seen::with_capacity(items.len());
