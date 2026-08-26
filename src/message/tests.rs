@@ -15052,16 +15052,16 @@ async fn resent_group_message_dispatches_once() {
             .await;
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Receipts leave through the delivery-receipt worker, so wait on the count
+    // rather than on a fixed delay.
+    crate::test_utils::poll_until("both delivery receipts", || {
+        delivery_receipts_for(&transport.sent(), id) == 2
+    })
+    .await;
     assert_eq!(
         message_events_for_id(&rx, id),
         (1, 1),
         "one logical message must reach the consumer once, however often the sender resends it"
-    );
-    assert_eq!(
-        delivery_receipts_for(&transport.sent(), id),
-        2,
-        "every delivery still gets its receipt: WA Web sends one after each decryption"
     );
     assert_eq!(
         client.stats().messages_suppressed_duplicate,
@@ -15521,7 +15521,10 @@ async fn suppressed_resend_replays_to_a_durability_hook() {
             .await;
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    crate::test_utils::poll_until("the replayed commit's receipt", || {
+        delivery_receipts_for(&transport.sent(), id) == 1
+    })
+    .await;
     assert_eq!(
         hook.calls.load(Ordering::SeqCst),
         2,
@@ -15531,10 +15534,5 @@ async fn suppressed_resend_replays_to_a_durability_hook() {
         dispatch_count(&drain_message_events(&rx), id),
         1,
         "the replay is what delivers the message the failed commit owed the consumer"
-    );
-    assert_eq!(
-        delivery_receipts_for(&transport.sent(), id),
-        1,
-        "the ack follows the commit that finally succeeded, not the one that failed"
     );
 }

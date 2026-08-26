@@ -22,9 +22,15 @@ impl Client {
     /// the two deliveries are one message.
     ///
     /// Read here and written by [`Self::mark_message_dispatched`] once the
-    /// batch carrying the message becomes observable. The read-then-write is
-    /// safe because `chat_lanes` serializes incoming processing per chat, and
-    /// both deliveries of one message are in one chat.
+    /// batch carrying the message becomes observable. Those are two points in
+    /// time, so this cannot be an atomic `get_with` the way the sibling
+    /// `undecryptable_dispatched` gate is: claiming at the check would claim
+    /// for a commit that may still fail. `chat_lanes` serializes incoming
+    /// processing per chat and so closes the window for ordinary traffic, but
+    /// two workers for one chat can coexist after a lane eviction. The race
+    /// they leave is a second dispatch of one message, which is the behaviour
+    /// this gate improves on rather than a regression, and it is the safe
+    /// direction: the alternative loses the message.
     pub(crate) async fn message_already_dispatched(&self, info: &Arc<MessageInfo>) -> bool {
         self.dispatched_messages
             .get(&Self::dispatch_key(info))
