@@ -15535,6 +15535,148 @@ async fn suppressed_key_request_resend_still_schedules_the_share() {
     );
 }
 
+/// A pending row is keyed on the sender exactly as its delivery spelled it,
+/// while the collapse folds spellings together. Clearing only the kept spelling
+/// leaves a row that a later resend replays as an already committed message.
+#[tokio::test]
+async fn a_collapsed_batch_clears_every_arrived_pending_row() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use wacore::types::events::{BatchOrigin, InboundMessage};
+
+    struct OkHook;
+
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for OkHook {
+        async fn on_messages(
+            &self,
+            _client: Arc<Client>,
+            _batch: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (client, _transport) = capturing_client("collapsed_pending_rows").await;
+    client
+        .inbound_durability_hook
+        .set(Arc::new(OkHook) as Arc<dyn InboundDurabilityHook>)
+        .ok()
+        .expect("hook registers once");
+
+    let chat: Jid = "120363000000000013@g.us".parse().expect("group");
+    let bare: Jid = "100000000000001@lid".parse().expect("bare sender");
+    let device: Jid = "100000000000001:75@lid".parse().expect("device sender");
+    let id = "COLLAPSED_ROWS";
+
+    let item = |sender: &Jid| {
+        let sender_str = sender.to_string();
+        let mut info = create_test_message_info(&sender_str, id, &sender_str);
+        info.source.chat = chat.clone();
+        info.source.sender = sender.clone();
+        InboundMessage::builder()
+            .message(Arc::new(wa::Message {
+                conversation: Some("ping".to_string()),
+                ..Default::default()
+            }))
+            .info(Arc::new(info))
+            .build()
+    };
+
+    // Both spellings buffered by earlier failed commits.
+    let backend = client.persistence_manager.backend();
+    for sender in [&bare, &device] {
+        backend
+            .store_pending_inbound_batch(&[crate::store::traits::PendingInboundRow {
+                chat: &chat.to_string(),
+                sender: &sender.to_string(),
+                id,
+                message: &waproto::codec::message_to_vec(&wa::Message {
+                    conversation: Some("ping".to_string()),
+                    ..Default::default()
+                }),
+            }])
+            .await
+            .expect("buffer the delivery");
+    }
+
+    assert!(
+        client
+            .commit_inbound_batch(
+                Arc::from(vec![item(&bare), item(&device)]),
+                BatchOrigin::Live,
+                None,
+            )
+            .await,
+        "the batch must commit"
+    );
+
+    for sender in [&bare, &device] {
+        assert!(
+            backend
+                .get_pending_inbound(&chat.to_string(), &sender.to_string(), id)
+                .await
+                .expect("read pending")
+                .is_none(),
+            "every arrived spelling's row must be cleared, not just the kept one"
+        );
+    }
+}
+
+/// An unresolved secret envelope is a placeholder: the consumer got a payload
+/// it cannot read. Claiming it would suppress the resend that arrives once the
+/// parent secret is known, so it must not be claimed.
+#[tokio::test]
+async fn an_unresolved_secret_envelope_is_not_claimed() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("unresolved_envelope").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "ENC_REACTION";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    // A reaction whose secret we do not hold: the envelope cannot be opened, so
+    // what reaches the consumer is the envelope itself.
+    let envelope = wa::Message {
+        enc_reaction_message: buffa::MessageField::some(wa::message::EncReactionMessage {
+            target_message_key: buffa::MessageField::some(wa::MessageKey {
+                id: Some("TARGET".into()),
+                remote_jid: Some(peer.to_string()),
+                from_me: Some(false),
+                ..Default::default()
+            }),
+            enc_payload: Some(vec![9; 16]),
+            enc_iv: Some(vec![7; 12]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    for _ in 0..2 {
+        client
+            .handle_decrypted_plaintext(
+                "msg",
+                MessageUtils::encode_and_pad(&envelope),
+                2,
+                0,
+                Default::default(),
+                &info,
+            )
+            .await
+            .expect("handle the envelope");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "the resend must still reach the consumer: the first delivery handed it an envelope it could not open"
+    );
+}
+
 /// The server spells `participant` bare on an skmsg and device-qualified on the
 /// pkmsg that carries an SKDM, so the two deliveries of one message can differ.
 /// The key drops the device for exactly this reason.

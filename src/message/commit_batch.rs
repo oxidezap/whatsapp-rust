@@ -883,15 +883,43 @@ impl Client {
             }
             hook_committed = true;
 
-            let delete_keys: Vec<PendingInboundKey<'_>> = items
-                .iter()
-                .zip(&keys)
-                .map(|(item, (chat, sender))| PendingInboundKey {
-                    chat,
-                    sender,
-                    id: &item.info.id,
-                })
-                .collect();
+            // Cleared for every stanza that arrived, not just the ones kept: a
+            // pending row is keyed on the sender exactly as that delivery spelled
+            // it, while the collapse folds spellings together. Deleting only the
+            // kept spelling would leave a row that a later resend replays as an
+            // already committed message. Deleting a row that is not there is a
+            // no-op, so the superset is free.
+            let arrived_keys: Vec<(String, String)>;
+            let delete_keys: Vec<PendingInboundKey<'_>> = if arrived.len() == items.len() {
+                items
+                    .iter()
+                    .zip(&keys)
+                    .map(|(item, (chat, sender))| PendingInboundKey {
+                        chat,
+                        sender,
+                        id: &item.info.id,
+                    })
+                    .collect()
+            } else {
+                arrived_keys = arrived
+                    .iter()
+                    .map(|m| {
+                        (
+                            m.info.source.chat.to_string(),
+                            m.info.source.sender.to_string(),
+                        )
+                    })
+                    .collect();
+                arrived
+                    .iter()
+                    .zip(&arrived_keys)
+                    .map(|(item, (chat, sender))| PendingInboundKey {
+                        chat,
+                        sender,
+                        id: &item.info.id,
+                    })
+                    .collect()
+            };
             if let Err(e) = backend.delete_pending_inbound_batch(&delete_keys).await {
                 // Leftover rows replay as duplicates; the idempotent hook
                 // re-commits and the replay path clears them.
@@ -940,6 +968,14 @@ impl Client {
         // consumer without a hook is a lost message. Cancelled here instead, the
         // claim is simply missing and a resend dispatches twice.
         for item in dispatched.iter() {
+            // An unresolved secret envelope is a placeholder in the same sense
+            // as an UndecryptableMessage: what reached the consumer is not the
+            // content. Claiming it would suppress the resend that arrives once
+            // the parent secret is known, so leave it unclaimed and take the
+            // duplicate instead.
+            if crate::features::message_edit::extract_secret_encrypted(&item.message).is_some() {
+                continue;
+            }
             self.mark_message_dispatched(&item.info).await;
         }
         true
