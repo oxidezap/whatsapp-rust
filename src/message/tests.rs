@@ -15387,6 +15387,44 @@ async fn resend_after_a_deferred_batch_commits_is_suppressed() {
     );
 }
 
+/// Both deliveries can land in one drained batch: each checked the gate before
+/// either claim existed, so the batch itself has to collapse them.
+#[tokio::test]
+async fn two_resends_inside_one_deferred_batch_dispatch_once() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_same_batch").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000011@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    client.inbound_commit_batch.reset();
+
+    let id = "SAME_BATCH_RESEND";
+    for _ in 0..2 {
+        let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .await;
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "one message must not reach the consumer twice inside a single batch"
+    );
+}
+
 /// The server spells `participant` bare on an skmsg and device-qualified on the
 /// pkmsg that carries an SKDM, so the two deliveries of one message can differ.
 /// The key drops the device for exactly this reason.

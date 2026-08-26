@@ -704,6 +704,29 @@ impl Client {
         .await
     }
 
+    /// Collapse deliveries of one message inside a batch, keeping the first.
+    ///
+    /// Returns the input untouched when there is nothing to drop, which is
+    /// every live batch (they hold one message) and almost every drained one.
+    fn dedup_batch_by_message(items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
+        if items.len() < 2 {
+            return items;
+        }
+        let mut seen = std::collections::HashSet::with_capacity(items.len());
+        if items
+            .iter()
+            .all(|item| seen.insert(Self::dispatch_key(&item.info)))
+        {
+            return items;
+        }
+        seen.clear();
+        items
+            .iter()
+            .filter(|item| seen.insert(Self::dispatch_key(&item.info)))
+            .cloned()
+            .collect()
+    }
+
     /// Commit one batch: durable buffer → Signal flush → hook → clear buffer →
     /// acks → event. Nothing is acked or observable before it is durable (WA
     /// Web's `createSnapshot` ordering); acks precede the event dispatch so a
@@ -737,6 +760,13 @@ impl Client {
             debug_assert!(commit_ticket.is_none());
             return true;
         }
+        // A drain can accumulate two deliveries of one message before the batch
+        // commits: both read the gate before either claim landed, so the
+        // collapse has to happen here too. Every stanza that arrived is still
+        // acked from `arrived`; only what the hook and the consumer see is
+        // reduced to one copy.
+        let arrived = Arc::clone(&items);
+        let items = Self::dedup_batch_by_message(items);
         let mut reinsert = ReinsertGuard {
             batcher: &self.inbound_commit_batch,
             items: is_drain.then(|| Arc::clone(&items)),
@@ -870,7 +900,7 @@ impl Client {
         // synchronously, so a handler that panics or blocks must not be able
         // to suppress acks for messages the consumer already owns — the
         // pre-batch at-most-once path acked before dispatching too.
-        for item in items.iter() {
+        for item in arrived.iter() {
             self.ack_received_message(&item.info);
         }
         // WA Web `createSnapshot` sends `sendAggregateOfflineReceipts` per
@@ -883,10 +913,6 @@ impl Client {
         if is_drain {
             self.flush_offline_receipts();
         }
-        // Claim the ids here, at the one place a batch becomes observable, so
-        // the drain path claims too. Marking at the call site instead would
-        // miss a deferred batch: its dispatch happens here, later, and a resend
-        // after the drain would then find no claim.
         for item in items.iter() {
             self.mark_message_dispatched(&item.info).await;
         }

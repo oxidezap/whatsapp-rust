@@ -62,7 +62,7 @@ impl Client {
     ///
     /// The PN/LID namespace stays as it arrived, deliberately unresolved, for
     /// the reasons [`Self::dispatch_undecryptable_event`] states at length.
-    fn dispatch_key(info: &Arc<MessageInfo>) -> wacore::types::message::SenderMessageId {
+    pub(crate) fn dispatch_key(info: &Arc<MessageInfo>) -> wacore::types::message::SenderMessageId {
         wacore::types::message::SenderMessageId::new(
             info.source.chat.clone(),
             info.id.clone(),
