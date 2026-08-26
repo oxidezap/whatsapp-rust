@@ -1897,7 +1897,6 @@ impl Client {
             let commit_state = self
                 .dispatch_parsed_message(msg, info, app_state_key_share_job.is_some())
                 .await;
-            self.mark_message_dispatched(info, &commit_state).await;
             if let Some((requester, request)) = app_state_key_share_job {
                 match commit_state {
                     InboundCommitState::Durable => {

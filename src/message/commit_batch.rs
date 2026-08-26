@@ -883,6 +883,13 @@ impl Client {
         if is_drain {
             self.flush_offline_receipts();
         }
+        // Claim the ids here, at the one place a batch becomes observable, so
+        // the drain path claims too. Marking at the call site instead would
+        // miss a deferred batch: its dispatch happens here, later, and a resend
+        // after the drain would then find no claim.
+        for item in items.iter() {
+            self.mark_message_dispatched(&item.info).await;
+        }
         self.core.event_bus.dispatch(Event::Messages(
             MessageBatch::builder()
                 .messages(items)

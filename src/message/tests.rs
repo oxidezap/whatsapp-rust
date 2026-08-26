@@ -15343,6 +15343,86 @@ async fn suppressed_resend_still_installs_the_sender_key_it_carries() {
     );
 }
 
+/// A batch deferred by the offline drain claims its ids when the batch itself
+/// commits, not before, so a resend arriving after the drain is still caught.
+#[tokio::test]
+async fn resend_after_a_deferred_batch_commits_is_suppressed() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_after_drain").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000009@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    // Back into drain mode: the first delivery joins the accumulating batch
+    // instead of committing on its own.
+    client.inbound_commit_batch.reset();
+
+    let id = "DRAIN_THEN_RESEND";
+    let first = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, first))
+        .await;
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    let resent = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, resent))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "a batch that committed has been handed to the consumer, so the resend is a duplicate"
+    );
+}
+
+/// The server spells `participant` bare on an skmsg and device-qualified on the
+/// pkmsg that carries an SKDM, so the two deliveries of one message can differ.
+/// The key drops the device for exactly this reason.
+#[tokio::test]
+async fn resend_with_a_device_qualified_participant_is_suppressed() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_device_spelling").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000010@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    let bare = alice.jid.to_non_ad();
+
+    let id = "DEVICE_SPELLING";
+    let first = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &bare, id, first))
+        .await;
+
+    let resent = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, resent))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "one message spelled two ways on the wire is still one message"
+    );
+}
+
 /// A commit that failed handed nothing to a consumer, so the claim must not be
 /// taken: suppressing the resend there would lose the message rather than
 /// deduplicate it.

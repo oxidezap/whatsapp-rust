@@ -21,13 +21,10 @@ impl Client {
     /// stanza the server replays), so identity is the only thing left that says
     /// the two deliveries are one message.
     ///
-    /// Read here and written by [`Self::mark_message_dispatched`] after the
-    /// dispatch is durable; the read-then-write is safe because `chat_lanes`
-    /// serializes incoming processing per chat, and both deliveries of one
-    /// message are in one chat.
-    ///
-    /// Keyed on the wire spelling of the sender, deliberately unresolved, for
-    /// the reasons [`Self::dispatch_undecryptable_event`] states at length.
+    /// Read here and written by [`Self::mark_message_dispatched`] once the
+    /// batch carrying the message becomes observable. The read-then-write is
+    /// safe because `chat_lanes` serializes incoming processing per chat, and
+    /// both deliveries of one message are in one chat.
     pub(crate) async fn message_already_dispatched(&self, info: &Arc<MessageInfo>) -> bool {
         self.dispatched_messages
             .get(&Self::dispatch_key(info))
@@ -35,31 +32,35 @@ impl Client {
             .is_some()
     }
 
-    /// Claim a message id once its dispatch is durable.
+    /// Claim a message id, called where a committed batch is dispatched.
     ///
-    /// Only `Durable` claims it. A deferred commit (the offline drain) may
-    /// still fail, and a claim taken on one that does would let the redelivery
-    /// be suppressed and acked with nothing ever handed to a consumer, losing
-    /// the message instead of duplicating it. The cost is that a resend
-    /// arriving mid-drain still dispatches twice; drains carry the server's
-    /// byte-identical replays, which the ratchet rejects on its own.
-    pub(crate) async fn mark_message_dispatched(
-        &self,
-        info: &Arc<MessageInfo>,
-        state: &InboundCommitState,
-    ) {
-        if matches!(state, InboundCommitState::Durable) {
-            self.dispatched_messages
-                .insert(Self::dispatch_key(info), ())
-                .await;
-        }
+    /// Placing it there rather than at the call site is what makes the offline
+    /// drain claim as well: a deferred batch dispatches later, and a claim
+    /// taken before that could be taken for a batch that never commits, which
+    /// would suppress and ack the redelivery with nothing ever handed to a
+    /// consumer, losing the message instead of duplicating it.
+    pub(crate) async fn mark_message_dispatched(&self, info: &Arc<MessageInfo>) {
+        self.dispatched_messages
+            .insert(Self::dispatch_key(info), ())
+            .await;
     }
 
+    /// The message's identity: chat, id, and the sender without its device.
+    ///
+    /// Dropping the device matches WA Web, whose `MsgKey` for a group message
+    /// takes `participant: asUserWidOrThrow(author)`, a device-less wid. It
+    /// also has to: the server sends `skmsg` with a bare participant and
+    /// `pkmsg` with a device-qualified one, so a resend bundling a rotated
+    /// SKDM would otherwise be spelled differently from the delivery it
+    /// repeats and slip past the gate.
+    ///
+    /// The PN/LID namespace stays as it arrived, deliberately unresolved, for
+    /// the reasons [`Self::dispatch_undecryptable_event`] states at length.
     fn dispatch_key(info: &Arc<MessageInfo>) -> wacore::types::message::SenderMessageId {
         wacore::types::message::SenderMessageId::new(
             info.source.chat.clone(),
             info.id.clone(),
-            info.source.sender.clone(),
+            info.source.sender.to_non_ad(),
         )
     }
 
