@@ -476,6 +476,9 @@ impl Client {
 
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
 
+            dispatched_messages: cache_config.dispatched_messages.build_with_ttl(),
+            duplicate_dispatch_suppressed: AtomicU64::new(0),
+
             offline_sync_metrics: Arc::new(OfflineSyncMetrics {
                 active: AtomicBool::new(false),
                 total_messages: AtomicUsize::new(0),

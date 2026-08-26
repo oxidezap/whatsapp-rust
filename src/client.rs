@@ -432,6 +432,8 @@ pub struct MemoryReport {
     pub dm_devices_memo: CollectionStats,
     pub message_retry_counts: u64,
     pub undecryptable_dispatched: u64,
+    /// Entries in the dispatch-once gate for decrypted messages.
+    pub dispatched_messages: u64,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
     /// Queued/running history-sync tasks and their logical compressed-payload
@@ -662,6 +664,7 @@ impl std::fmt::Display for MemoryReport {
             "  undec_dispatched:       {}",
             self.undecryptable_dispatched
         )?;
+        writeln!(f, "  dispatched_messages:    {}", self.dispatched_messages)?;
         writeln!(f, "  pdo_pending_requests:   {}", self.pdo_pending_requests)?;
         writeln!(f, "  pdo_requested:          {}", self.pdo_requested)?;
         writeln!(f, "--- Capacity-only caches ---")?;
@@ -1421,6 +1424,16 @@ pub struct Client {
     /// duplicate event. Mirrors WA Web's DB-level placeholder uniqueness
     /// in `WAWebMessageProcessPlaceholder`.
     pub(crate) undecryptable_dispatched: Cache<wacore::types::message::SenderMessageId, ()>,
+
+    /// Dispatch-once gate for a decrypted message. A sender retrying its own
+    /// outbox resends one id as fresh ciphertext on a new ratchet iteration,
+    /// which decrypts as new traffic, so only message identity can collapse it.
+    pub(crate) dispatched_messages: Cache<wacore::types::message::SenderMessageId, ()>,
+
+    /// Lifetime count of resent messages this gate kept from reaching
+    /// consumers. Client-level, so it survives reconnects: the sender's retry
+    /// window does not end because our socket did.
+    pub(crate) duplicate_dispatch_suppressed: AtomicU64,
 
     pub enable_auto_reconnect: Arc<AtomicBool>,
     /// Set by [`Client::pause`] and cleared by [`Client::resume`]: the run loop

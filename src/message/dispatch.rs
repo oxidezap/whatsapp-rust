@@ -13,6 +13,56 @@ fn delivery_receipt_burst_warning(
 }
 
 impl Client {
+    /// Has this message already been dispatched to consumers?
+    ///
+    /// A sender whose network is bad re-runs its own outbox: same message id,
+    /// fresh ciphertext on a new ratchet iteration. Neither ratchet can call
+    /// that a duplicate (`DuplicatedMessage` covers only the byte-identical
+    /// stanza the server replays), so identity is the only thing left that says
+    /// the two deliveries are one message.
+    ///
+    /// Read here and written by [`Self::mark_message_dispatched`] after the
+    /// dispatch is durable; the read-then-write is safe because `chat_lanes`
+    /// serializes incoming processing per chat, and both deliveries of one
+    /// message are in one chat.
+    ///
+    /// Keyed on the wire spelling of the sender, deliberately unresolved, for
+    /// the reasons [`Self::dispatch_undecryptable_event`] states at length.
+    pub(crate) async fn message_already_dispatched(&self, info: &Arc<MessageInfo>) -> bool {
+        self.dispatched_messages
+            .get(&Self::dispatch_key(info))
+            .await
+            .is_some()
+    }
+
+    /// Claim a message id once its dispatch is durable.
+    ///
+    /// Only `Durable` claims it. A deferred commit (the offline drain) may
+    /// still fail, and a claim taken on one that does would let the redelivery
+    /// be suppressed and acked with nothing ever handed to a consumer, losing
+    /// the message instead of duplicating it. The cost is that a resend
+    /// arriving mid-drain still dispatches twice; drains carry the server's
+    /// byte-identical replays, which the ratchet rejects on its own.
+    pub(crate) async fn mark_message_dispatched(
+        &self,
+        info: &Arc<MessageInfo>,
+        state: &InboundCommitState,
+    ) {
+        if matches!(state, InboundCommitState::Durable) {
+            self.dispatched_messages
+                .insert(Self::dispatch_key(info), ())
+                .await;
+        }
+    }
+
+    fn dispatch_key(info: &Arc<MessageInfo>) -> wacore::types::message::SenderMessageId {
+        wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        )
+    }
+
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.dispatch", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn dispatch_parsed_message(

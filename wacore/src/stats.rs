@@ -155,7 +155,8 @@ pub struct SessionStats {
 }
 
 /// Point-in-time copy of [`SessionStats`], plus client-level counters the
-/// client fills in ([`Self::reconnect_errors`], [`Self::resends_throttled`]).
+/// client fills in ([`Self::reconnect_errors`], [`Self::resends_throttled`],
+/// [`Self::messages_suppressed_duplicate`]).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StatsSnapshot {
@@ -201,6 +202,10 @@ pub struct StatsSnapshot {
     /// Outbound resends dropped by the per-chat rate limiter. Surfaces storm
     /// chats.
     pub resends_throttled: u64,
+    /// Decrypted messages not dispatched because the same message had already
+    /// reached consumers: a sender resending one id as fresh ciphertext. This
+    /// is the number to check first when a consumer reports a missing message.
+    pub messages_suppressed_duplicate: u64,
     pub last_data_received_ms: u64,
 }
 
@@ -370,8 +375,8 @@ impl SessionStats {
     }
 
     /// Copy the session-level counters. Client-level fields
-    /// (`reconnect_errors`, `resends_throttled`) are left zero for the owner
-    /// to fill.
+    /// (`reconnect_errors`, `resends_throttled`,
+    /// `messages_suppressed_duplicate`) are left zero for the owner to fill.
     pub fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
@@ -391,6 +396,7 @@ impl SessionStats {
             reconnects: self.reconnects.load(Ordering::Relaxed),
             reconnect_errors: 0,
             resends_throttled: 0,
+            messages_suppressed_duplicate: 0,
             last_data_received_ms: self.last_data_received_ms.load(Ordering::Relaxed),
         }
     }

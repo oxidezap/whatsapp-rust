@@ -5681,6 +5681,16 @@ async fn capturing_client(
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
+    capturing_client_with_cache_config(test_id, crate::cache_config::CacheConfig::default()).await
+}
+
+async fn capturing_client_with_cache_config(
+    test_id: &str,
+    cache_config: crate::cache_config::CacheConfig,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
     use crate::socket::NoiseSocket;
     use crate::store::SqliteStore;
     use crate::store::persistence_manager::PersistenceManager;
@@ -5710,12 +5720,13 @@ async fn capturing_client(
     );
     let factory = CapturingMockTransportFactory::new();
     let transport = factory.transport();
-    let (client, _sync_rx) = Client::new(
+    let (client, _sync_rx) = Client::new_with_cache_config(
         Arc::new(crate::runtime_impl::TokioRuntime),
         pm,
         Arc::new(factory),
         Arc::new(MockHttpClient),
         None,
+        cache_config,
     )
     .await;
 
@@ -14953,5 +14964,497 @@ async fn a_namespace_switch_mid_flight_is_seen_as_a_second_message() {
         switched,
         "an unresolved key cannot tell this from a new sender, and the duplicate \
          placeholder is the cost this design accepts"
+    );
+}
+
+// --- Resent-message dispatch gate --------------------------------------
+//
+// A sender whose network is bad re-runs its own outbox: same message id, fresh
+// ciphertext at a new sender-key iteration. The ratchet cannot see that as a
+// duplicate, so only message identity can.
+
+/// A group participant whose sender key the client already holds, as a real
+/// first message would have left it.
+async fn joined_group_sender(client: &Arc<Client>, jid_str: &str, group: &Jid) -> AlicePeer {
+    let mut peer = AlicePeer::new(jid_str).await;
+    let skdm = peer.create_group_skdm(group).await;
+    let axolotl = skdm
+        .axolotl_sender_key_distribution_message
+        .expect("skdm bytes");
+    client
+        .handle_sender_key_distribution_message(group, &peer.jid, "SKDM_INSTALL", &axolotl)
+        .await;
+    peer
+}
+
+fn group_skmsg_stanza(
+    group: &Jid,
+    sender: &Jid,
+    id: &str,
+    ciphertext: Vec<u8>,
+) -> Arc<OwnedNodeRef> {
+    let enc = NodeBuilder::new("enc")
+        .attr("type", "skmsg")
+        .attr("v", "2")
+        .bytes(ciphertext)
+        .build();
+    node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", group.clone())
+            .attr("participant", sender.clone())
+            .attr("id", id)
+            .attr("t", wacore::time::now_secs().to_string())
+            .attr("type", "text")
+            .attr(
+                "addressing_mode",
+                crate::types::message::AddressingMode::Lid.as_str(),
+            )
+            .children(vec![enc])
+            .build(),
+    )
+}
+
+async fn encrypt_group_text(peer: &mut AlicePeer, group: &Jid, text: &str) -> Vec<u8> {
+    use wacore::messages::MessageUtils;
+
+    let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+        conversation: Some(text.to_string()),
+        ..Default::default()
+    });
+    peer.encrypt_group_message(group, &plaintext).await
+}
+
+/// The production bug: the sender re-encrypts and resends under one id, so both
+/// deliveries decrypt cleanly and the consumer sees one message twice.
+#[tokio::test]
+async fn resent_group_message_dispatches_once() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, transport) = capturing_client("resend_dispatch_once").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000001@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    let id = "RESEND_ONCE";
+    let first = encrypt_group_text(&mut alice, &group, "ping").await;
+    let second = encrypt_group_text(&mut alice, &group, "ping").await;
+    assert_ne!(
+        first, second,
+        "a resend is fresh ciphertext, not the same bytes"
+    );
+
+    for ciphertext in [first, second] {
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        message_events_for_id(&rx, id),
+        (1, 1),
+        "one logical message must reach the consumer once, however often the sender resends it"
+    );
+    assert_eq!(
+        delivery_receipts_for(&transport.sent(), id),
+        2,
+        "every delivery still gets its receipt: WA Web sends one after each decryption"
+    );
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        1,
+        "the suppression is counted, so a report of a missing message can be told from this fix"
+    );
+}
+
+/// The reason the key carries the sender: two participants of one group picked
+/// the same id (seen in production, 116s apart), and folding them together
+/// would drop the second one's message.
+#[tokio::test]
+async fn same_id_from_two_participants_dispatches_twice() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_two_participants").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000002@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    let mut bob = joined_group_sender(&client, "100000000000002:12@lid", &group).await;
+
+    let id = "SHARED_ID";
+    let from_alice = encrypt_group_text(&mut alice, &group, "from alice").await;
+    let from_bob = encrypt_group_text(&mut bob, &group, "from bob").await;
+
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, from_alice))
+        .await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &bob.jid, id, from_bob))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        message_events_for_id(&rx, id),
+        (2, 2),
+        "an id is the sending client's to choose; two senders sharing one is two messages"
+    );
+}
+
+/// Drain the event channel into `(id, conversation)` pairs so one test can
+/// count dispatches for more than one message id.
+fn drain_message_events(rx: &async_channel::Receiver<Arc<Event>>) -> Vec<(String, Option<String>)> {
+    let mut seen = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        for m in event.messages() {
+            seen.push((m.info.id.to_string(), m.message.conversation.clone()));
+        }
+    }
+    seen
+}
+
+fn dispatch_count(seen: &[(String, Option<String>)], id: &str) -> usize {
+    seen.iter().filter(|(seen_id, _)| seen_id == id).count()
+}
+
+fn gate_disabled_config() -> crate::cache_config::CacheConfig {
+    let mut config = crate::cache_config::CacheConfig::default();
+    config.dispatched_messages.capacity = 0;
+    config
+}
+
+/// The server replaying the identical stanza is a different failure mode, and
+/// the persisted ratchet already rejects it. Run it with the new gate off so
+/// the assertion can only be satisfied by `DuplicatedMessage`.
+#[tokio::test]
+async fn byte_identical_redelivery_is_still_rejected_by_the_ratchet() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) =
+        capturing_client_with_cache_config("redelivery_ratchet", gate_disabled_config()).await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000003@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    let id = "REDELIVERED";
+    let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
+    for _ in 0..2 {
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(
+                &group,
+                &alice.jid,
+                id,
+                ciphertext.clone(),
+            ))
+            .await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "the persisted ratchet rejects a byte-identical replay without help from the gate"
+    );
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        0,
+        "a ratchet-level duplicate is not counted as a suppressed resend"
+    );
+}
+
+/// Capacity 0 is the off switch (`PortableCache` short-circuits the insert), and
+/// turning it off must restore the pre-fix behaviour exactly.
+#[tokio::test]
+async fn zero_capacity_disables_the_gate() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) =
+        capturing_client_with_cache_config("gate_disabled", gate_disabled_config()).await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000004@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    let id = "GATE_OFF";
+    for _ in 0..2 {
+        let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "capacity 0 must leave the resend dispatching twice, as it did before the gate"
+    );
+}
+
+/// Nothing was dispatched on the delivery that failed to decrypt, so the key is
+/// not in the cache and the resend must come through.
+#[tokio::test]
+async fn resend_after_our_own_decrypt_failure_dispatches() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_after_failure").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000005@g.us".parse().expect("group");
+    // Sender key deliberately not installed yet: the first delivery fails with
+    // NoSenderKey, exactly as it does before an SKDM arrives.
+    let mut alice = AlicePeer::new("100000000000001:75@lid").await;
+    let skdm = alice.create_group_skdm(&group).await;
+
+    let id = "RESEND_AFTER_FAILURE";
+    let failed = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, failed))
+        .await;
+
+    client
+        .handle_sender_key_distribution_message(
+            &group,
+            &alice.jid,
+            "SKDM_LATE",
+            &skdm
+                .axolotl_sender_key_distribution_message
+                .expect("skdm bytes"),
+        )
+        .await;
+
+    let resent = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, resent))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "a resend after our own decrypt failure is the first dispatch, not a duplicate"
+    );
+}
+
+/// Suppressing the event must not suppress the session `<enc>` the resend
+/// carries: dropping the SKDM would turn one duplicate into a run of
+/// NoSenderKey failures on everything after it.
+#[tokio::test]
+async fn suppressed_resend_still_installs_the_sender_key_it_carries() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_with_skdm").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000006@g.us".parse().expect("group");
+    let sender_jid = "100000000000001:75@lid";
+    let mut alice = joined_group_sender(&client, sender_jid, &group).await;
+
+    let id = "RESEND_WITH_SKDM";
+    let first = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, first))
+        .await;
+
+    // The sender rotated its sender key before retrying, so the resend carries
+    // a pkmsg with the new SKDM alongside the skmsg.
+    let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+    let bob_addr = bob_jid.to_protocol_address();
+    let mut rotated = AlicePeer::new(sender_jid).await;
+    rotated.install_bob_session(&bob_addr, &bundle).await;
+    let skdm = rotated.create_group_skdm(&group).await;
+    let session_ct = rotated
+        .encrypt(
+            &bob_addr,
+            &MessageUtils::encode_and_pad(&wa::Message {
+                sender_key_distribution_message: buffa::MessageField::some(skdm),
+                ..Default::default()
+            }),
+        )
+        .await;
+    let CiphertextMessage::PreKeySignalMessage(pkmsg) = &session_ct else {
+        panic!("expected a pkmsg");
+    };
+    let resent = encrypt_group_text(&mut rotated, &group, "ping").await;
+
+    let stanza = node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", group.clone())
+            .attr("participant", alice.jid.clone())
+            .attr("id", id)
+            .attr("t", wacore::time::now_secs().to_string())
+            .attr("type", "text")
+            .attr(
+                "addressing_mode",
+                crate::types::message::AddressingMode::Lid.as_str(),
+            )
+            .children(vec![
+                NodeBuilder::new("enc")
+                    .attr("type", "pkmsg")
+                    .attr("v", "2")
+                    .bytes(pkmsg.serialized().to_vec())
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "skmsg")
+                    .attr("v", "2")
+                    .bytes(resent)
+                    .build(),
+            ])
+            .build(),
+    );
+    client.clone().handle_incoming_message(stanza).await;
+
+    // The next message rides the rotated chain: it only decrypts if the
+    // suppressed resend still installed the key it carried.
+    let next_id = "AFTER_ROTATION";
+    let next = encrypt_group_text(&mut rotated, &group, "pong").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, next_id, next))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let seen = drain_message_events(&rx);
+    assert_eq!(
+        dispatch_count(&seen, id),
+        1,
+        "the resend's own event is suppressed"
+    );
+    assert_eq!(
+        dispatch_count(&seen, next_id),
+        1,
+        "the rotated sender key the suppressed resend carried must still be installed"
+    );
+}
+
+/// A commit that failed handed nothing to a consumer, so the claim must not be
+/// taken: suppressing the resend there would lose the message rather than
+/// deduplicate it.
+#[tokio::test]
+async fn resend_after_a_failed_commit_dispatches() {
+    use std::sync::atomic::Ordering;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_after_failed_commit").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000008@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    let id = "COMMIT_FAILED";
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(true, Ordering::Release);
+    let first = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, first))
+        .await;
+
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(false, Ordering::Release);
+    let resent = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, resent))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "the resend is the first delivery the consumer actually gets"
+    );
+}
+
+/// With a hook registered and its first commit failed, the message is buffered
+/// and unacked. The suppression must replay that buffered copy instead of
+/// acking it away: a bare ack here would lose the message for the consumer
+/// while telling the server it was handled.
+#[tokio::test]
+async fn suppressed_resend_replays_to_a_durability_hook() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use std::sync::atomic::AtomicUsize;
+    use wacore::types::events::{ChannelEventHandler, InboundMessage};
+
+    /// Fails the first commit (leaving a buffered, unacked copy) and succeeds
+    /// after, the way a consumer recovering from a transient storage error does.
+    struct FlakyHook {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for FlakyHook {
+        async fn on_messages(
+            &self,
+            _client: Arc<Client>,
+            _batch: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(anyhow::anyhow!("commit failed"));
+            }
+            Ok(())
+        }
+    }
+
+    let (client, transport) = capturing_client("resend_hook_replay").await;
+    let hook = Arc::new(FlakyHook {
+        calls: AtomicUsize::new(0),
+    });
+    client
+        .inbound_durability_hook
+        .set(hook.clone() as Arc<dyn InboundDurabilityHook>)
+        .ok()
+        .expect("hook registers once");
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000007@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    let id = "HOOK_REPLAY";
+    for _ in 0..2 {
+        let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        hook.calls.load(Ordering::SeqCst),
+        2,
+        "the suppressed resend replays the buffered copy to the hook"
+    );
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "the replay is what delivers the message the failed commit owed the consumer"
+    );
+    assert_eq!(
+        delivery_receipts_for(&transport.sent(), id),
+        1,
+        "the ack follows the commit that finally succeeded, not the one that failed"
     );
 }

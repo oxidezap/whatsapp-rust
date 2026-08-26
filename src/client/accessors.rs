@@ -290,6 +290,8 @@ impl Client {
         let mut snapshot = self.stats.snapshot();
         snapshot.reconnect_errors = self.auto_reconnect_errors.load(Ordering::Relaxed);
         snapshot.resends_throttled = self.resend_rate_limiter.throttled_total();
+        snapshot.messages_suppressed_duplicate =
+            self.duplicate_dispatch_suppressed.load(Ordering::Relaxed);
         snapshot
     }
 
@@ -425,6 +427,7 @@ impl Client {
             dm_devices_memo,
             message_retry_counts: self.message_retry_counts.entry_count(),
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
+            dispatched_messages: self.dispatched_messages.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count(),
             pdo_requested: self.pdo_requested.entry_count(),
             history_sync_tasks,

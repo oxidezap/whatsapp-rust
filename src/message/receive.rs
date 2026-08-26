@@ -1873,10 +1873,31 @@ impl Client {
                 skdm_only: true,
                 ..Default::default()
             })
+        } else if self.message_already_dispatched(info).await {
+            // The sender resent a message we already handed to consumers. Ack
+            // it the way the ratchet-level duplicate is acked, so a registered
+            // durability hook still gets its replay instead of a bare ack; the
+            // key share (if any) was scheduled by the delivery that dispatched.
+            // status is acked by the should_ack gate.
+            self.duplicate_dispatch_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            wacore::telemetry::recv("duplicate_resend");
+            log::debug!(
+                "[msg:{}] already dispatched for this sender; suppressing the resend's event",
+                info.id
+            );
+            if !info.source.chat.is_status_broadcast() {
+                self.ack_or_replay_to_hook(info).await;
+            }
+            Ok(PlaintextHandleOutcome {
+                dispatched: true,
+                ..Default::default()
+            })
         } else {
             let commit_state = self
                 .dispatch_parsed_message(msg, info, app_state_key_share_job.is_some())
                 .await;
+            self.mark_message_dispatched(info, &commit_state).await;
             if let Some((requester, request)) = app_state_key_share_job {
                 match commit_state {
                     InboundCommitState::Durable => {
