@@ -11,6 +11,7 @@ mod analysis;
 mod decoder;
 mod encode;
 mod golden;
+mod multiframe;
 mod param_decode_match;
 mod params;
 mod quality_metrics;

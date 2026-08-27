@@ -4,6 +4,7 @@
 //! cross-frame predictor and synthesis history persist across calls because the stream is
 //! continuous.
 
+use super::multiframe::{is_multiframe, split_multiframe};
 use super::rangecoder::RangeDecoder;
 use super::red::depack_split_red;
 use super::smpl_cc_tables::load_cc_tables;
@@ -176,7 +177,49 @@ impl MlowDecoder {
                 }
             };
         }
+        // The multiframe envelope is checked before the TOC is read, because under the TOC grammar
+        // its first byte reads as a SID: bit 7 set. A decoder that skips this check answers every
+        // packet of such a call with comfort noise and never reports anything, which is a total
+        // silence with no symptom at all.
+        if is_multiframe(payload) {
+            return self.decode_multiframe(payload);
+        }
         self.decode_frame(payload)
+    }
+
+    /// Decode every sub-frame of an envelope, in transmission order, into one contiguous packet.
+    ///
+    /// Order matters and is not obvious: the envelope's RTP timestamp belongs to the LAST sub-frame
+    /// and the earlier ones run backwards from it, so array order is time order and concatenating
+    /// is what puts the audio back where it belongs.
+    fn decode_multiframe(&mut self, payload: &[u8]) -> Vec<f32> {
+        let frames = match split_multiframe(payload) {
+            Ok(frames) => frames,
+            Err(e) => {
+                self.malformed += 1;
+                if self.malformed == 1 || self.malformed.is_multiple_of(100) {
+                    log::warn!(
+                        "mlow: failed to parse multiframe packet #{} (indicator 0x{:02x}): {e}",
+                        self.malformed,
+                        payload[0]
+                    );
+                }
+                MlowFrameReport::bump(&mut self.report.concealed);
+                self.last_packet_samps = OPUS_FRAME_SAMPS;
+                return vec![0.0; OPUS_FRAME_SAMPS];
+            }
+        };
+        let mut out = Vec::new();
+        let mut declared = 0usize;
+        for frame in frames {
+            let decoded = self.decode_frame(frame);
+            // `decode_frame` overwrote `last_packet_samps` with this sub-frame's duration; the
+            // packet's own duration is their sum, which is what the playout cushion has to size to.
+            declared += self.last_packet_samps;
+            out.extend_from_slice(&decoded);
+        }
+        self.last_packet_samps = declared.max(OPUS_FRAME_SAMPS);
+        out
     }
 
     fn decode_frame(&mut self, frame: &[u8]) -> Vec<f32> {
@@ -524,8 +567,16 @@ mod tests {
         assert_eq!(internal_frames(10), None);
     }
 
-    /// WhatsApp Desktop sends 120 ms packets (TOC 0x58) on ordinary 1:1 calls. They must decode,
-    /// not be discarded: dropping them silences the whole stream while the peer is speaking.
+    /// A 120 ms MLow packet decodes to its full duration.
+    ///
+    /// Note what this does NOT claim. TOC `0x58` was originally taken as evidence that WhatsApp
+    /// Desktop sends 120 ms MLow packets; it is not. The packets that prompted that reading are
+    /// standard Opus SILK wideband at 60 ms, where the same byte is an RFC 6716 config-11 TOC (see
+    /// `voip::opus_packet`). The reference geometry `num_frames = (ms + 10) / 20` is nonetheless
+    /// real, verified against the shipped decoder, so a single-block 120 ms packet is legal and is
+    /// decoded here. The shipped encoder does not emit one - it aggregates 60 ms blocks through the
+    /// multiframe envelope instead - so this is correctness for a form that exists in the format
+    /// rather than support for an observed stream.
     #[test]
     fn multi_frame_packet_decodes_to_its_full_duration() {
         let toc = parse_mlow_toc(0x58);
@@ -601,6 +652,61 @@ mod tests {
     /// A `VoA=00` packet is a normal frame carrying background noise, not a SID: the reference
     /// decodes it, and with DTX off a peer sends nothing else during a pause. Silencing it drops
     /// ~12% of a real stream on the floor while the call merely sounds quiet.
+    /// The way the shipped client actually reaches a packet longer than its frame length.
+    ///
+    /// Its encoder caches a fixed three blocks of 20 ms, so `frame_length_ms = 120` produces two
+    /// 60 ms blocks in one envelope, not one 120 ms block. Before this was implemented the
+    /// envelope's first byte read as a SID and every packet of such a call became comfort noise:
+    /// a totally silent call with no error anywhere.
+    #[test]
+    fn a_multiframe_envelope_decodes_instead_of_becoming_comfort_noise() {
+        let mut encoder = super::super::encode::MlowEncoder::new();
+        let tone: Vec<f32> = (0..OPUS_FRAME_SAMPS)
+            .map(|i| 0.3 * (i as f32 * 0.05).sin())
+            .collect();
+        let first = encoder.encode(&tone).expect("mlow encode");
+        let second = encoder.encode(&tone).expect("mlow encode");
+        assert!(first.len() < 252 && second.len() < 252);
+
+        let mut envelope = vec![0x82 | (first[0] & 0x39), 0x02, first.len() as u8];
+        envelope.extend_from_slice(&first);
+        envelope.extend_from_slice(&second);
+
+        // The bug this replaces: read as a TOC, the indicator has bit 7 set and is a SID.
+        assert!(parse_mlow_toc(envelope[0]).sid);
+
+        let mut decoder = MlowDecoder::new();
+        let pcm = decoder.decode(&envelope);
+        let report = decoder.take_frame_report();
+        assert_eq!(
+            report.decoded, 6,
+            "two 60 ms blocks are six internal frames"
+        );
+        assert_eq!(report.inactive_or_sid, 0, "the envelope is not a SID");
+        assert_eq!(pcm.len(), 2 * OPUS_FRAME_SAMPS);
+        assert_eq!(
+            decoder.last_packet_samps(),
+            2 * OPUS_FRAME_SAMPS,
+            "the playout cushion must size to the whole envelope, not one sub-frame"
+        );
+        let energy: f32 = pcm.iter().map(|s| s * s).sum();
+        assert!(energy > 0.0, "a decoded envelope must not be silence");
+    }
+
+    /// A malformed envelope is concealed and counted, never mistaken for comfort noise.
+    #[test]
+    fn a_malformed_multiframe_envelope_is_concealed_and_reported() {
+        let mut decoder = MlowDecoder::new();
+        // Two frames declared, the first taking the entire body.
+        let mut envelope = vec![0x92u8, 0x02, 10];
+        envelope.extend(0..10u8);
+        let pcm = decoder.decode(&envelope);
+        let report = decoder.take_frame_report();
+        assert_eq!(report.concealed, 1);
+        assert_eq!(report.inactive_or_sid, 0);
+        assert!(pcm.iter().all(|&s| s == 0.0));
+    }
+
     #[test]
     fn dtx_off_frames_decode_to_audio() {
         let frames: Vec<String> =
