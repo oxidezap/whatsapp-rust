@@ -1255,7 +1255,11 @@ async fn run_call_with_clock_and_wallclock(
                             }
                         }
                     }
-                    if !eng.rekey_recv(now_ms(), &answer.answering_lid) {
+                    // The `<accept>` is also the caller's proof that the callee picked up, which
+                    // is what arms the health watchdog: the relay was allocated back when the
+                    // server acked the offer, long before anyone answered.
+                    eng.peer_answered(now_ms());
+                    if !eng.rekey_recv(&answer.answering_lid) {
                         break 'drive; // malformed stored call_key (a setup invariant violated)
                     }
                 }

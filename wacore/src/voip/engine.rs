@@ -1664,12 +1664,7 @@ impl CallEngine {
     /// `<accept>`). The dialed base callee LID is wrong once a companion device answers — without this
     /// every inbound frame decrypts to garbage. No-op (`true`) for a control-only engine (no media).
     /// `false` means the stored call_key is malformed (a setup invariant), so the driver ends the call.
-    pub fn rekey_recv(&mut self, now: Millis, answering_peer_lid: &str) -> bool {
-        // The caller's proof that the callee picked up, and so the first instant its silence means
-        // anything. Idempotent, and a no-op for the callee, which armed at allocate.
-        if self.group.is_none() {
-            self.health.media_started(now);
-        }
+    pub fn rekey_recv(&mut self, answering_peer_lid: &str) -> bool {
         let Some(m) = self.media.as_mut() else {
             return true;
         };
@@ -1683,6 +1678,20 @@ impl CallEngine {
             return v.pipe.rekey_recv(&m.call_key, answering_peer_lid);
         }
         true
+    }
+
+    /// The peer picked up.
+    ///
+    /// Separate from [`rekey_recv`](Self::rekey_recv), which the caller also does on an `<accept>`,
+    /// because they are different facts: that one re-keys the receive path to the answering device,
+    /// this one is the first instant the peer's silence means anything. An outgoing call allocates
+    /// its relay when the SERVER acks the offer, so the health watchdog cannot arm there without
+    /// reporting a stall three seconds into every ordinary ring. Idempotent, and a no-op for a
+    /// callee, which was answered before its media plane existed and armed at allocate.
+    pub fn peer_answered(&mut self, now: Millis) {
+        if self.group.is_none() {
+            self.health.media_started(now);
+        }
     }
 
     /// Whether the video plane is currently up (sending is possible, inbound PT-97 decodes).
@@ -5821,7 +5830,7 @@ mod tests {
             let _ = drain(&mut eng);
         }
 
-        assert!(eng.rekey_recv(1, answering));
+        assert!(eng.rekey_recv(answering));
 
         // After rekey: the companion's frames decode to real audio that reaches playout.
         for n in 2..4u32 {
@@ -6310,7 +6319,7 @@ mod tests {
         }
 
         // The callee answers. From here its silence means something, and the alarm must come.
-        assert!(eng.rekey_recv(20_000, PEER_LID));
+        eng.peer_answered(20_000);
         let mut stalls = 0;
         for tick in 41..=60u64 {
             eng.handle_input(tick * 500, Input::Timeout);
@@ -8046,7 +8055,7 @@ mod tests {
             "pre-rekey: companion-keyed video must not decode"
         );
 
-        assert!(eng.rekey_recv(1, answering));
+        assert!(eng.rekey_recv(answering));
         for p in answerer.protect_video(&au) {
             eng.handle_input(2, Input::RelayPacket(&p));
         }
@@ -8066,7 +8075,7 @@ mod tests {
         eng.start(0, 0);
         let _ = drain(&mut eng);
         let answering = "222222222222222:2@lid";
-        assert!(eng.rekey_recv(1, answering));
+        assert!(eng.rekey_recv(answering));
         assert!(eng.enable_video(), "upgrade after rekey");
 
         let call_key: Vec<u8> = (0u8..32).collect();
