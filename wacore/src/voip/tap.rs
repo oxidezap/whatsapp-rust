@@ -81,19 +81,20 @@ async fn tap_forward(
         if let RelayTransportEvent::PacketReceived(data) = &ev {
             tap.on_packet(PacketDir::Inbound, data);
         }
+        // Handed over BEFORE the packet, for the same reason as the native pump's `deliver`: under
+        // the backpressure this report describes the driver frees one slot per packet, so a report
+        // sent after the packet that just refilled it would stay pending for the life of the call.
+        // The engine folds it into `inbound_pipe_dropped`; without it a tapped call under
+        // backpressure loses audio with no counter moving and the watchdog blames the codec.
+        if local_drops > 0
+            && out_tx
+                .try_send(RelayTransportEvent::InboundDropped(local_drops))
+                .is_ok()
+        {
+            local_drops = 0;
+        }
         match out_tx.try_send(ev) {
-            Ok(()) => {
-                // Room again, so the backlog can be handed over. The engine folds it into
-                // `inbound_pipe_dropped`; without this a tapped call under backpressure loses audio
-                // with no counter moving and the watchdog blaming the codec for it.
-                if local_drops > 0
-                    && out_tx
-                        .try_send(RelayTransportEvent::InboundDropped(local_drops))
-                        .is_ok()
-                {
-                    local_drops = 0;
-                }
-            }
+            Ok(()) => {}
             // Mirror the native relay pump: media is loss tolerant, but a dropped STUN Binding
             // Request means the engine never replies Binding Success and relay consent expires.
             // This forwarder sits AFTER the pump, so it must preserve STUN too (a Request that
@@ -363,6 +364,44 @@ mod tests {
         assert_eq!(
             reported, 2,
             "both dropped media packets are accounted for, got {seen:?}"
+        );
+    }
+
+    // The steady state of a tapped call that is behind: the driver frees exactly one slot before
+    // each arriving packet. Reported after the packet, the report loses that slot to the packet
+    // every time and never leaves the forwarder -- so the tap would hide the very losses the
+    // counter exists to expose.
+    #[test]
+    fn tap_forward_flushes_its_drop_report_under_sustained_backpressure() {
+        let media = || RelayTransportEvent::PacketReceived(Bytes::from_static(b"\x90\x78\x01\x02"));
+        let (inner_tx, inner_rx) = async_channel::unbounded();
+        // One fills the cap-1 channel, the second is dropped and becomes the pending report.
+        for _ in 0..2 {
+            inner_tx.try_send(media()).unwrap();
+        }
+        let (out_tx, out_rx) = async_channel::bounded(1);
+        let tap = Arc::new(InMemoryTap::default());
+
+        let seen = futures::executor::block_on(async {
+            let fwd = tap_forward(inner_rx, out_tx, tap);
+            let drive = async {
+                let mut seen = vec![out_rx.recv().await.unwrap()];
+                // One slot freed, one packet arriving: the slot must go to the report.
+                inner_tx.try_send(media()).unwrap();
+                inner_tx.close();
+                while let Ok(ev) = out_rx.recv().await {
+                    seen.push(ev);
+                }
+                seen
+            };
+            let (_, seen) = futures::join!(fwd, drive);
+            seen
+        });
+
+        assert!(
+            seen.iter()
+                .any(|ev| matches!(ev, RelayTransportEvent::InboundDropped(1))),
+            "the drop report must reach the driver, got {seen:?}"
         );
     }
 }

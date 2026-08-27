@@ -72,7 +72,12 @@ pub struct CallMediaStats {
     /// is healthy -- and it IS healthy: this is the one loss on the receive path that belongs to
     /// the consumer rather than to the call, which is why it does not feed the silence alarm.
     pub audio_sink_dropped: u32,
-    /// Relay datagrams that failed to classify as STUN, RTP or RTCP.
+    /// Relay datagrams the media plane could not read: neither STUN, RTP nor RTCP, or RTP-shaped
+    /// but too short or malformed to parse a header from.
+    ///
+    /// Both are the same fact -- bytes arrived and meant nothing here -- and both have to be
+    /// counted, because the silence alarm reads arrivals: a stream of unreadable datagrams that
+    /// left no trace would be reported as a reception that never started.
     pub relay_packet_unclassified: u32,
     /// Group forwarding envelopes that failed to unwrap.
     pub forwarding_envelope_rejected: u32,

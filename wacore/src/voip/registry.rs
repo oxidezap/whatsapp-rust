@@ -347,6 +347,15 @@ impl CallEntry {
                 .group_invite_peer_device
                 .as_ref()
                 .map_or(0, HeapSize::heap_bytes)
+            + self
+                .peer_announced_capability
+                .capacity()
+                .saturating_mul(size_of::<(Jid, crate::stanza::call::CapabilityBit)>())
+            + self
+                .peer_announced_capability
+                .iter()
+                .map(|(device, _)| device.heap_bytes())
+                .sum::<usize>()
             + size_of::<AsyncMutex<()>>() * 2
             + size_of::<event_listener::Event>()
             + queued_bytes
@@ -2485,6 +2494,7 @@ impl CallRegistry {
     pub fn note_peer_capability(
         &self,
         call_id: &str,
+        generation: u64,
         device: &Jid,
         peer: crate::stanza::call::CapabilityBit,
     ) {
@@ -2494,7 +2504,14 @@ impl CallRegistry {
             return;
         }
         let mut calls = self.active_calls();
-        let Some(entry) = calls.get_mut(call_id) else {
+        // Generation-guarded like every other asynchronous write here: a delayed `<preaccept>` from
+        // a superseded call would otherwise write its statement into the retry that replaced it,
+        // and a later capability-less `<accept>` from that same device would resolve against it and
+        // pick the wrong codec for a call that never said anything of the sort.
+        let Some(entry) = calls
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
             return;
         };
         if let Some(slot) = entry
@@ -5122,6 +5139,34 @@ mod tests {
         }
     }
 
+    // Every other asynchronous write here is generation-guarded, and this one holds the statement a
+    // later capability-less `<accept>` is resolved against -- so an unguarded write lets a delayed
+    // stanza from a superseded call choose the codec of the retry that replaced it.
+    #[test]
+    fn a_superseded_generation_cannot_state_a_capability_for_its_replacement() {
+        use crate::stanza::call::CapabilityBit;
+
+        let reg = CallRegistry::new();
+        let stale = reg.insert(session("CID"));
+        let device = Jid::new("222222222222222", Server::Lid).with_device(2);
+        // A same-id retry replaces the entry; the delayed `<preaccept>` belongs to the old one.
+        let current = reg.insert(session("CID"));
+        assert_ne!(stale, current);
+
+        reg.note_peer_capability("CID", stale, &device, CapabilityBit::Clear);
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &device, CapabilityBit::Unknown),
+            CapabilityBit::Unknown,
+            "the replacement has heard nothing from this device"
+        );
+        // The live generation is recorded as usual.
+        reg.note_peer_capability("CID", current, &device, CapabilityBit::Clear);
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &device, CapabilityBit::Unknown),
+            CapabilityBit::Clear
+        );
+    }
+
     // A video `<accept>` omits the `<capability>` child by construction, so the accept alone reads
     // as "the peer said nothing" and leaves MLow on -- against the same device that just said, in
     // its `<preaccept>`, that it does not speak it.
@@ -5130,12 +5175,12 @@ mod tests {
         use crate::stanza::call::CapabilityBit;
 
         let reg = CallRegistry::new();
-        reg.insert(session("CID"));
+        let generation = reg.insert(session("CID"));
         let answering = Jid::new("222222222222222", Server::Lid).with_device(2);
         let sibling = Jid::new("222222222222222", Server::Lid).with_device(3);
 
-        reg.note_peer_capability("CID", &answering, CapabilityBit::Clear);
-        reg.note_peer_capability("CID", &sibling, CapabilityBit::Set);
+        reg.note_peer_capability("CID", generation, &answering, CapabilityBit::Clear);
+        reg.note_peer_capability("CID", generation, &sibling, CapabilityBit::Set);
         assert_eq!(
             reg.resolve_peer_capability("CID", &answering, CapabilityBit::Unknown),
             CapabilityBit::Clear,
@@ -5152,7 +5197,7 @@ mod tests {
             CapabilityBit::Set
         );
         // Unknown is an absence, not a statement: it never overwrites one.
-        reg.note_peer_capability("CID", &answering, CapabilityBit::Unknown);
+        reg.note_peer_capability("CID", generation, &answering, CapabilityBit::Unknown);
         assert_eq!(
             reg.resolve_peer_capability("CID", &answering, CapabilityBit::Unknown),
             CapabilityBit::Clear

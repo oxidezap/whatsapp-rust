@@ -340,6 +340,7 @@ impl StanzaHandler for CallHandler {
                         // which would leave MLow on against a peer outside the rollout.
                         client.call_registry().note_peer_capability(
                             call.action.call_id(),
+                            generation,
                             &routed_call_sender(&call),
                             peer_mlow_bit,
                         );

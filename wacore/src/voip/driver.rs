@@ -1255,7 +1255,7 @@ async fn run_call_with_clock_and_wallclock(
                             }
                         }
                     }
-                    if !eng.rekey_recv(&answer.answering_lid) {
+                    if !eng.rekey_recv(now_ms(), &answer.answering_lid) {
                         break 'drive; // malformed stored call_key (a setup invariant violated)
                     }
                 }
