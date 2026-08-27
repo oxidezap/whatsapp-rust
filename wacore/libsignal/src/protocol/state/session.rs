@@ -862,13 +862,35 @@ fn session_pointed_bytes(session: &SessionStructure) -> usize {
 #[derive(Clone, PartialEq, Eq)]
 struct ArchivedSession(Box<[u8]>);
 
+/// Append `msg`'s encoding to `out`.
+///
+/// Direct buffa calls, on the same grounds as `serialize_into_inner` below:
+/// the session storage protos are encoded only inside this file, so this
+/// duplicates nothing — `serialize_into_inner` already instantiates
+/// `SessionStructure`'s encode tree here. A `waproto::codec` pin would add a
+/// second copy of that tree to `waproto`, which is the cost the rule exists to
+/// avoid, not to incur.
+#[allow(clippy::disallowed_methods)]
+fn encode_message(msg: &impl Message, out: &mut Vec<u8>) {
+    let mut cache = buffa::SizeCache::new();
+    let len = msg.compute_size(&mut cache) as usize;
+    out.reserve(len);
+    msg.write_to(&mut cache, out);
+}
+
 impl ArchivedSession {
     fn encode(session: &SessionStructure) -> Self {
-        Self(waproto::codec::session_structure_to_vec(session).into_boxed_slice())
+        let mut buf = Vec::new();
+        encode_message(session, &mut buf);
+        Self(buf.into_boxed_slice())
     }
 
+    /// Decode through the view, which `deserialize` already instantiates for
+    /// every archived state — an owned `Message::decode` would be a second
+    /// decode tree for the same type.
     fn decode(&self) -> Result<SessionStructure, InvalidSessionError> {
-        waproto::codec::session_structure_decode(&self.0)
+        self.view()?
+            .to_owned_message()
             .map_err(|_| InvalidSessionError("failed to decode archived session protobuf"))
     }
 
