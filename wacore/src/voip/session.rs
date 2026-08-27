@@ -262,7 +262,15 @@ const SRTP_REPLAY_STREAM_CAP: usize = 16;
 /// SSRCs.
 #[derive(Default)]
 struct SrtpRecvStreams {
-    streams: Vec<(u32, RecvRocTracker, SrtpReplayWindow)>,
+    /// The first stream, held inline.
+    ///
+    /// A 1:1 call has exactly one inbound SSRC, so this is the case that runs on every packet of
+    /// every call. Spilling it to the heap to serve a second stream that usually never arrives puts
+    /// an allocation on the first packet of every call, and measured, that allocation was the entire
+    /// cost of making this per-SSRC in the first place.
+    primary: Option<(u32, RecvRocTracker, SrtpReplayWindow)>,
+    /// Streams past the first, allocated only if a peer really does renumber or use several SSRCs.
+    overflow: Vec<(u32, RecvRocTracker, SrtpReplayWindow)>,
 }
 
 impl SrtpRecvStreams {
@@ -273,8 +281,9 @@ impl SrtpRecvStreams {
     /// RTP header, so anyone able to inject datagrams could otherwise spend the whole stream table
     /// on forged SSRCs before the peer's first real packet and leave the call permanently deaf.
     fn estimate_roc(&self, ssrc: u32, seq: u16) -> u32 {
-        self.streams
+        self.primary
             .iter()
+            .chain(self.overflow.iter())
             .find(|(known, _, _)| *known == ssrc)
             .map_or_else(
                 || RecvRocTracker::default().estimate_roc(seq),
@@ -288,16 +297,31 @@ impl SrtpRecvStreams {
     /// stream: evicting would reset a rollover counter that a real stream is still using. Reaching
     /// the cap now requires that many distinct SSRCs to have each produced a packet with a valid tag.
     fn commit_mut(&mut self, ssrc: u32) -> Option<(&mut RecvRocTracker, &mut SrtpReplayWindow)> {
-        if let Some(index) = self.streams.iter().position(|(known, _, _)| *known == ssrc) {
-            let (_, roc, replay) = &mut self.streams[index];
+        // `matches!` before the borrow: taking `&mut self.primary` inside the condition would hold
+        // it across the fallthrough and the borrow checker would reject the overflow path below.
+        if self.primary.is_none() || matches!(self.primary, Some((known, _, _)) if known == ssrc) {
+            let (_, roc, replay) = self.primary.get_or_insert((
+                ssrc,
+                RecvRocTracker::default(),
+                SrtpReplayWindow::default(),
+            ));
             return Some((roc, replay));
         }
-        if self.streams.len() >= SRTP_REPLAY_STREAM_CAP {
+        if let Some(index) = self
+            .overflow
+            .iter()
+            .position(|(known, _, _)| *known == ssrc)
+        {
+            let (_, roc, replay) = &mut self.overflow[index];
+            return Some((roc, replay));
+        }
+        // The cap counts every tracked stream, the inline one included.
+        if self.overflow.len() + 1 >= SRTP_REPLAY_STREAM_CAP {
             return None;
         }
-        self.streams
+        self.overflow
             .push((ssrc, RecvRocTracker::default(), SrtpReplayWindow::default()));
-        let (_, roc, replay) = self.streams.last_mut().expect("just pushed");
+        let (_, roc, replay) = self.overflow.last_mut().expect("just pushed");
         Some((roc, replay))
     }
 }

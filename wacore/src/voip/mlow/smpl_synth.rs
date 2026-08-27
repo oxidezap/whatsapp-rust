@@ -564,3 +564,19 @@ pub(crate) struct SmplDecoderState {
     /// Per-packet harmonic postfilter state (runs once per packet after all internal frames).
     pub(crate) harm: super::smpl_harm_postfilter::HarmPostfilterState,
 }
+
+impl SmplDecoderState {
+    /// Copy `source` into `self` without giving up the buffers `self` already owns.
+    ///
+    /// The decoder snapshots this once per packet so a malformed body can be rolled back.
+    /// `#[derive(Clone)]` generates only `clone`, and the trait's default `clone_from` is
+    /// `*self = source.clone()`, so using it would allocate the whole state afresh every packet.
+    /// Measured on the MLow decode bench: the snapshot alone was the entire memory regression
+    /// against the pre-rollback decoder, and reusing the buffers gives it back.
+    pub(crate) fn copy_from(&mut self, source: &Self) {
+        self.lstate = source.lstate.clone();
+        self.prev_nlsf.clone_from(&source.prev_nlsf);
+        self.celp.clone_from(&source.celp);
+        self.harm.copy_from(&source.harm);
+    }
+}

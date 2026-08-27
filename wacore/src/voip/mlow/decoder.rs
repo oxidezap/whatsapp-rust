@@ -107,6 +107,11 @@ pub struct MlowDecoder {
     /// once + every-100th `warn`, so a peer sending a stream this decoder cannot read is visible in
     /// a log rather than silently quiet.
     malformed: u32,
+    /// Snapshot of `state` taken before each active decode, so a malformed body can be undone.
+    ///
+    /// Owned by the decoder and reused: see the `clone_from` in `decode_active_frame` for why this
+    /// is a field rather than a local.
+    state_backup: SmplDecoderState,
     /// What the in-flight `decode` call has done so far. Reset at the top of every `decode` and
     /// drained by the caller through [`MlowDecoder::take_frame_report`].
     report: MlowFrameReport,
@@ -126,6 +131,7 @@ impl MlowDecoder {
     pub fn new() -> Self {
         MlowDecoder {
             state: SmplDecoderState::default(),
+            state_backup: SmplDecoderState::default(),
             redundancy: 0,
             had_error: false,
             dropped_unsupported: 0,
@@ -165,6 +171,7 @@ impl MlowDecoder {
     /// Clear the cross-frame state (call at a stream discontinuity).
     pub fn reset(&mut self) {
         self.state = SmplDecoderState::default();
+        self.state_backup = SmplDecoderState::default();
         self.had_error = false;
     }
 
@@ -360,8 +367,13 @@ impl MlowDecoder {
         // `prev_nlsf`. Keep a copy so concealment can undo them: parameters invented past the end of
         // a bad body must not seed the next packet. The reference leaves them advanced, but it never
         // meets a stream it cannot read; this decoder does, and the leak is audible in the frame
-        // after. The copy is a few KB once per packet, against 20-120 ms of audio.
-        let state_before = self.state.clone();
+        // after.
+        //
+        // `clone_from` into a buffer the decoder owns, not a fresh `clone()`. Every field here is a
+        // `Vec` of fixed length, so cloning into an existing snapshot reuses its allocations and the
+        // copy costs a `memcpy`; a fresh clone allocates four buffers on every packet, which at
+        // ~17 packets a second is pure churn on a heap that an ESP32 target has to keep unfragmented.
+        self.state_backup.copy_from(&self.state);
 
         let mut out: Vec<f32> = Vec::with_capacity(frames * SMPL_INTF_LEN);
         // Collect the per-40-block lags (8 per internal frame) and the average normalized bitrate
@@ -467,7 +479,9 @@ impl MlowDecoder {
             if dec.err != 0 {
                 self.had_error = true;
             }
-            self.state = state_before;
+            // Swap rather than assign: the advanced state moves into the backup slot, whose
+            // allocations the next packet's `clone_from` then reuses. Assigning would drop them.
+            core::mem::swap(&mut self.state, &mut self.state_backup);
             self.malformed += 1;
             if self.malformed == 1 || self.malformed.is_multiple_of(100) {
                 log::warn!(

@@ -96,6 +96,22 @@ pub(crate) struct HarmPostfilterState {
     prev_did_filter: i32,
 }
 
+impl HarmPostfilterState {
+    /// Copy `source` into `self`, reusing the comb buffer.
+    ///
+    /// `#[derive(Clone)]` generates only `clone`; the trait's default `clone_from` is
+    /// `*self = source.clone()`, which reallocates `state_comb` on every call. The decoder takes one
+    /// of these per packet for the concealment snapshot, so the default turns a `memcpy` into an
+    /// allocate-and-drop at the packet rate.
+    pub(crate) fn copy_from(&mut self, source: &Self) {
+        self.state1 = source.state1;
+        self.lpcoefs = source.lpcoefs;
+        self.state_comb.clone_from(&source.state_comb);
+        self.prev_lag = source.prev_lag;
+        self.prev_did_filter = source.prev_did_filter;
+    }
+}
+
 impl Default for HarmPostfilterState {
     fn default() -> Self {
         HarmPostfilterState {

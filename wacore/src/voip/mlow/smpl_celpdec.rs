@@ -362,6 +362,24 @@ impl Clone for CelpDecState {
             dbg_exc_pre: Vec::new(),
         }
     }
+
+    /// Reuse the destination's buffers instead of replacing them.
+    ///
+    /// Written out because a hand-rolled `Clone` gets the trait's default `clone_from`, which is
+    /// `*self = source.clone()` and therefore allocates every buffer afresh on each call. The
+    /// decoder does exactly one of these per packet for the concealment snapshot, so the default
+    /// turns a `memcpy` into a round of allocate-and-drop roughly seventeen times a second, on a
+    /// heap an ESP32 target has to keep unfragmented.
+    fn clone_from(&mut self, source: &Self) {
+        self.noise.clone_from(&source.noise);
+        self.acb_state.clone_from(&source.acb_state);
+        self.acb_state_len = source.acb_state_len;
+        self.lpc_synth_mem = source.lpc_synth_mem;
+        self.lsf_prev = source.lsf_prev;
+        self.prev_nrgres = source.prev_nrgres;
+        self.hp.clone_from(&source.hp);
+        // `dbg_exc_pre` is deliberately not carried, for the reason above the `clone` impl.
+    }
 }
 
 impl Default for CelpDecState {
