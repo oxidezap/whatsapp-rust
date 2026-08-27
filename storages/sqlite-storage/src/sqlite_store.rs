@@ -4543,12 +4543,12 @@ mod tests {
             .expect("get failed")
             .expect("record should exist");
 
-        assert_eq!(loaded.user, "1234567890");
+        assert_eq!(&*loaded.user, "1234567890");
         assert_eq!(loaded.devices.len(), 2);
         assert_eq!(loaded.devices[0].device_id(), 0);
         assert_eq!(loaded.devices[1].device_id(), 1);
         assert_eq!(loaded.devices[1].key_index(), Some(42));
-        assert_eq!(loaded.phash, Some("2:abcdef".to_string()));
+        assert_eq!(loaded.phash.as_deref(), Some("2:abcdef"));
     }
 
     #[tokio::test]
@@ -4586,7 +4586,7 @@ mod tests {
             .expect("record should exist");
 
         assert_eq!(loaded.devices.len(), 2);
-        assert_eq!(loaded.phash, Some("2:new".to_string()));
+        assert_eq!(loaded.phash.as_deref(), Some("2:new"));
     }
 
     #[tokio::test]
@@ -6124,7 +6124,7 @@ mod read_routing_tests {
         store
             .update_device_list(DeviceListRecord {
                 user: "559990000001".into(),
-                devices: Vec::new(),
+                devices: Box::default(),
                 timestamp: 5,
                 phash: None,
                 raw_id: None,
