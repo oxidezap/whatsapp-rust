@@ -1245,10 +1245,14 @@ async fn run_call_with_clock_and_wallclock(
                     // decides what the plaintext under them means. Getting either wrong is silence,
                     // and both have to be right before the first inbound packet either way.
                     if let Some(codec) = answer.audio_codec {
-                        let before = eng.active_audio_codec();
+                        // Compared as FORMATS: a peer clearing the capability moves an escape-profile
+                        // call from MLOW's container to native Opus without changing the codec name,
+                        // and codec equality reads that real change as no change -- leaving queued
+                        // packets with rewritten TOCs to reach a peer that cannot parse them.
+                        let before = eng.active_audio_format();
                         if let Err(e) = eng.switch_audio_codec(codec, engine::CodecDecisionSource::Negotiated) {
                             log::debug!("voip: peer capability selected {codec:?}, not switching: {e}");
-                        } else if eng.active_audio_codec() != before {
+                        } else if eng.active_audio_format() != before {
                             // Whatever is queued was protected under the grammar the peer has just
                             // told us it does not speak, so sending it delays the audio it CAN
                             // decode behind bytes that will only feed its decoder garbage. Retire

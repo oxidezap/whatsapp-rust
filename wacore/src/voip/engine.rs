@@ -74,22 +74,18 @@ const APP_DATA_RETRANSMIT_MS: Millis = 50;
 const APP_DATA_RETRANSMIT_COUNT: u8 = 10;
 const MAX_PENDING_REACTIONS: usize = 64;
 /// 20ms @ 16kHz: samples drained to the speaker per playout tick.
-#[cfg(feature = "voip-mlow")]
 const PLAYOUT_DRAIN: usize = 320;
 /// 60ms @ 16kHz: the peer packet size the playout constants were written for, and the assumption
 /// used until the first decode reports what the peer actually sends.
-#[cfg(feature = "voip-mlow")]
 const OPUS_FRAME_SAMPS_60MS: usize = 960;
 /// ~150ms latency ceiling for a 60ms peer frame; a burst past this resyncs (drops oldest) instead
 /// of lagging. The floor for [`playout_bounds`], which scales it to the peer's packet.
-#[cfg(feature = "voip-mlow")]
 const PLAYOUT_CAP: usize = 2400;
 /// Prebuffer target: prime playout until the jitter buffer holds two 60ms peer frames, so the
 /// steady-state buffer never drains below one frame (a 60ms cushion that absorbs the relay's
 /// inter-arrival jitter). Priming to a single frame is a zero cushion: that one frame drains away
 /// over its own 60ms cycle, so the buffer returns to empty before the next packet and any late
 /// arrival underruns. The cushion has to be one frame above what the per-cycle drain consumes.
-#[cfg(feature = "voip-mlow")]
 const PLAYOUT_TARGET: usize = 1920;
 
 /// Prime target and latency ceiling for a peer sending `packet_samps`-sample packets.
@@ -99,7 +95,6 @@ const PLAYOUT_TARGET: usize = 1920;
 /// with no cushion at all, and two in flight would exceed [`PLAYOUT_CAP`] and be trimmed on arrival.
 /// Keep the same shape instead: prime to two packets so the steady-state buffer never drains below
 /// one, and let the ceiling hold that cushion plus a drain slice.
-#[cfg(feature = "voip-mlow")]
 fn playout_bounds(packet_samps: usize) -> (usize, usize) {
     let target = PLAYOUT_TARGET.max(packet_samps.saturating_mul(2));
     (target, PLAYOUT_CAP.max(target + PLAYOUT_DRAIN))
@@ -118,7 +113,6 @@ fn playout_bounds(packet_samps: usize) -> (usize, usize) {
 /// rest of the call. Instead it gives up one packet's worth per packet until it reaches the target:
 /// the trim that follows discards at most one packet of the OLDEST queued audio at a time, and a
 /// few packets later the call is back to the latency its current cadence asks for.
-#[cfg(feature = "voip-mlow")]
 fn effective_playout_cap(current: usize, packet_samps: usize, queued: usize) -> usize {
     let want = playout_bounds(packet_samps).1;
     if want >= current || queued <= want {
@@ -131,7 +125,6 @@ fn effective_playout_cap(current: usize, packet_samps: usize, queued: usize) -> 
 /// then goes DTX the jitter buffer never reaches `PLAYOUT_TARGET`, so after this many 20ms ticks
 /// (~200ms) drain whatever is queued instead of holding it (silent) forever. Comfortably above the
 /// few ticks a normal jittered second-frame arrival takes, so it never trips in steady operation.
-#[cfg(feature = "voip-mlow")]
 const MAX_PRIME_TICKS: u32 = 10;
 /// One-byte mlow DTX comfort-noise token sent on a muted (exact-zero) mic frame so the media stream
 /// never gaps; protect_audio frames it with the DTX RTP header and the peer decodes it to silence.
@@ -809,20 +802,24 @@ struct MediaState {
     /// Until then the two are genuinely indistinguishable and the silence alarm is what reports a
     /// call whose keys are wrong from end to end.
     sframe_authenticated: bool,
-    #[cfg(feature = "voip-mlow")]
+    /// Playout state for a PCM call. Not gated on the built-in codec: an injected `Opus` decoder
+    /// feeds this very buffer, and without it the samples it produced would have nowhere to go.
     pcm: Option<PcmAudioState>,
     /// `NEVER` for encoded I/O, which has no core-side playout timer.
     playout_deadline: Millis,
 }
 
-#[cfg(feature = "voip-mlow")]
 struct PcmAudioState {
+    #[cfg(feature = "voip-mlow")]
     encoder: mlow::MlowEncoder,
+    #[cfg(feature = "voip-mlow")]
     decoder: mlow::MlowDecoder,
     /// Reused per outbound frame to hold the i16->f32 conversion, so the encode hot path doesn't
     /// allocate a fresh Vec each frame.
+    #[cfg(feature = "voip-mlow")]
     scratch: Vec<f32>,
     /// Reused codec output before SRTP copies it into the protected packet.
+    #[cfg(feature = "voip-mlow")]
     encoded: Vec<u8>,
     jitter: VecDeque<i16>,
     /// Playout emits silence (without draining) while the jitter buffer fills to `PLAYOUT_TARGET`, so
@@ -1103,11 +1100,14 @@ impl CallEngine {
                 audio_tx_invalid_streak: 0,
                 sframe,
                 sframe_authenticated: false,
-                #[cfg(feature = "voip-mlow")]
                 pcm: (config.audio.io == AudioIo::Pcm).then(|| PcmAudioState {
+                    #[cfg(feature = "voip-mlow")]
                     encoder: mlow::MlowEncoder::new(),
+                    #[cfg(feature = "voip-mlow")]
                     decoder: mlow::MlowDecoder::new(),
+                    #[cfg(feature = "voip-mlow")]
                     scratch: Vec::with_capacity(config.audio.format.samples_per_frame as usize),
+                    #[cfg(feature = "voip-mlow")]
                     encoded: Vec::with_capacity(MLOW_ENCODED_CAPACITY),
                     jitter: VecDeque::new(),
                     priming: true,
@@ -1972,6 +1972,10 @@ impl CallEngine {
             self.started && media.audio.io == AudioIo::Pcm && now >= media.playout_deadline
         });
         if playout_due {
+            // Group mixing decodes each participant with the built-in codec, so without it there is
+            // no mixed frame -- but the per-call playout tick below still has to run.
+            #[cfg(not(feature = "voip-mlow"))]
+            let group_frame: Option<Vec<i16>> = None;
             #[cfg(feature = "voip-mlow")]
             let group_frame = self.group.as_mut().map(|group| {
                 let mut frame = Vec::with_capacity(PLAYOUT_DRAIN);
@@ -1984,7 +1988,6 @@ impl CallEngine {
                 }
                 frame
             });
-            #[cfg(feature = "voip-mlow")]
             if let Some(m) = self.media.as_mut() {
                 let frame = if let Some(frame) = group_frame {
                     frame
@@ -2084,10 +2087,10 @@ impl CallEngine {
         // follow the grammar rather than the negotiated profile.
         m.pipe
             .set_audio_mlow_profile(matches!(target.rtp_profile, AudioRtpProfile::Mlow));
-        #[cfg(feature = "voip-mlow")]
         if let Some(pcm) = m.pcm.as_mut() {
             // The MLow decoder carries cross-frame predictor and synthesis history. Whatever it
             // built from the other codec's bytes is not a starting point for this one.
+            #[cfg(feature = "voip-mlow")]
             pcm.decoder.reset();
             // A switch the CONTENT forced is one the probe only asks for after packets stopped
             // becoming audio, so what is queued is the concealment those packets produced -- up to
@@ -2125,6 +2128,14 @@ impl CallEngine {
     /// The codec currently decoding and encoding this call's audio.
     pub fn active_audio_codec(&self) -> Option<AudioCodec> {
         self.media.as_ref().map(|m| m.active_format.codec)
+    }
+
+    /// The full format currently on the wire, container included.
+    ///
+    /// Not the same question as [`Self::active_audio_codec`]: MLOW's escape and native Opus are
+    /// both codec `Opus`, so a caller deciding whether the grammar changed has to ask this one.
+    pub fn active_audio_format(&self) -> Option<AudioFormat> {
+        self.media.as_ref().map(|m| m.active_format)
     }
 
     /// Fold in playout the consumer's sink refused after the engine produced it.
@@ -2650,7 +2661,6 @@ impl CallEngine {
                             self.media_stats.audio_frames_concealed.saturating_add(1);
                     }
                 }
-                #[cfg(feature = "voip-mlow")]
                 if let Some(pcm) = m.pcm.as_mut() {
                     pcm.packet_samps = samples.max(1);
                     pcm.jitter.extend(m.foreign_pcm.iter().copied());
@@ -3328,7 +3338,6 @@ fn next_tick(deadline: Millis, now: Millis, interval: Millis) -> Millis {
 /// re-prime rather than a silence pad every tick. Priming also gives up after `MAX_PRIME_TICKS` if
 /// the buffer holds some audio but never reaches the target (the peer sent one frame then went DTX),
 /// flushing it instead of stalling silent forever.
-#[cfg(feature = "voip-mlow")]
 fn drain_playout(
     jitter: &mut VecDeque<i16>,
     priming: &mut bool,
@@ -5121,6 +5130,35 @@ mod encoded_tests {
         assert_eq!(engine.media_stats().outbound_frames_without_encoder, 1);
     }
 
+    /// A decoder that fills every packet with one recognisable sample value, so a test can follow
+    /// decoded audio all the way to playout without pulling libopus into `wacore`.
+    #[cfg(not(feature = "voip-mlow"))]
+    struct DecodeToConstant(i16);
+
+    #[cfg(not(feature = "voip-mlow"))]
+    impl ForeignAudioCodec for DecodeToConstant {
+        fn decode(
+            &mut self,
+            _payload: &[u8],
+            out: &mut Vec<i16>,
+        ) -> Result<(), crate::voip::audio::ForeignCodecError> {
+            out.extend(core::iter::repeat_n(self.0, MIC_FRAME_SAMPLES));
+            Ok(())
+        }
+
+        fn conceal(&mut self, samples: usize, out: &mut Vec<i16>) {
+            out.resize(out.len() + samples, 0);
+        }
+
+        fn encode(
+            &mut self,
+            _pcm: &[i16],
+            _out: &mut Vec<u8>,
+        ) -> Result<(), crate::voip::audio::ForeignCodecError> {
+            Err(crate::voip::audio::ForeignCodecError::InvalidPayload)
+        }
+    }
+
     /// An encoder that answers with a fixed payload, so the send path can be proven without
     /// pulling libopus into `wacore`.
     #[cfg(not(feature = "voip-mlow"))]
@@ -5176,6 +5214,57 @@ mod encoded_tests {
             .count();
         assert_eq!(sent, 1, "the mic frame has to reach the wire");
         assert_eq!(eng.media_stats().outbound_frames_without_encoder, 0);
+    }
+
+    // Sending is only half of it. The injected decoder feeds the SAME jitter buffer the MLOW path
+    // feeds, and both that transfer and the playout tick that drains it were gated on the built-in
+    // codec -- so this configuration decoded every packet, reported `foreign_frames_decoded`, and
+    // played nothing: the next packet cleared the samples. Silence with the counters saying
+    // otherwise is the exact shape of #1105.
+    #[cfg(not(feature = "voip-mlow"))]
+    #[test]
+    fn decoded_opus_reaches_playout_without_the_built_in_codec() {
+        let mut cfg = config();
+        cfg.audio = AudioConfig::OPUS_PCM;
+        let mut eng = CallEngine::new(cfg.clone(), Box::new(SequentialTxIds::new()))
+            .expect("standard Opus PCM does not need the MLOW codec")
+            .with_foreign_audio_codec(Box::new(DecodeToConstant(4321)));
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocation_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        let mut peer = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &cfg.call_key,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: cfg.ssrc,
+            samples_per_packet: AudioFormat::OPUS_16KHZ_60MS.rtp_timestamp_step,
+            warp_mi_tag_len: cfg.warp_mi_tag_len,
+        })
+        .expect("peer pipeline");
+        assert!(peer.set_audio_payload_type(AudioFormat::OPUS_16KHZ_60MS.rtp_payload_type));
+
+        let mut heard = Vec::new();
+        for n in 0..8u64 {
+            let packet = peer.protect_audio(&[0xE8, 0x11, 0x22, 0x33]);
+            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
+            for tick in 0..3u64 {
+                eng.handle_input(1 + n * 60 + tick * 20, Input::Timeout);
+                for output in drain(&mut eng) {
+                    if let Output::Playout(frame) = output {
+                        heard.extend(frame);
+                    }
+                }
+            }
+        }
+
+        assert!(eng.media_stats().foreign_frames_decoded > 0, "it decodes");
+        assert!(
+            heard.contains(&4321),
+            "and what it decoded has to be what the consumer hears"
+        );
     }
 
     #[test]

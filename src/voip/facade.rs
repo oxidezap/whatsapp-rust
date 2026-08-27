@@ -34,9 +34,10 @@ use wacore::types::group_call::{
 use wacore::voip::relay_parse::RelayData;
 use wacore::voip::transport::RelayTransportFactory;
 use wacore::voip::{
-    AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection, CallEngine,
-    CallEvent, CallPhase, EncodedAudioFrame, GroupEngineConfig, VideoControl, VideoControlReceiver,
-    VideoControlSender, VideoFrame, VideoUpgradeToken, video_control_channel,
+    AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection,
+    CallEngine, CallEvent, CallPhase, CodecDecisionSource, EncodedAudioFrame, GroupEngineConfig,
+    VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame, VideoUpgradeToken,
+    video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -203,40 +204,23 @@ impl<'a> AcceptCall<'a> {
         // decoded under the wrong grammar. MLow survives only if we asked for it and the peer
         // announced index 31; a peer outside that rollout emits standard Opus on the same payload
         // type, and decoding it as MLow is what makes the call silent (issue #1105).
-        if let Some(codec) = peer_selected_codec_from_offer(self.incoming, audio_config.format)
-            && let Some(format) = audio_config.format.sibling_for(codec)
-        {
-            // An encoded endpoint's format is a promise the APPLICATION made about the bytes it will
-            // hand us: the source is already built and carries no per-frame codec, so there is
-            // nothing to tell that the call chose the other one. Rewriting the config would keep
-            // taking its MLow bytes and send them in a profile that accepts any nonempty payload,
-            // and the peer would hear noise with nothing on this side noticing. Refusing is the
-            // only honest answer -- the application picks the codec, so only it can pick again.
-            // Only a change of CODEC is unanswerable: the source emits one grammar and cannot be
-            // told to emit another. A change of container is not -- the escape profile and native
-            // Opus both consume the same Opus bytes from the source, and the engine is what stops
-            // rewriting their TOCs.
-            if let AudioEndpoints::Encoded { format: fixed, .. } = &audio
-                && fixed.codec != codec
-            {
-                return Err(CallError::EncodedAudioCodecNotNegotiated {
-                    configured: fixed.codec,
-                    selected: codec,
-                });
-            }
-            audio_config.format = format;
-        }
+        let selected = peer_selected_codec_from_offer(self.incoming, audio_config.format);
+        let plan = negotiated_audio_plan(
+            audio_config.format,
+            matches!(&audio, AudioEndpoints::Encoded { .. }),
+            selected,
+        )?;
+        audio_config.format = plan.engine_format;
+        let wire_format = plan.wire_format;
+        let engine_switch = plan.engine_switch;
         let audio_config = audio_config;
         if let CallAction::Offer { audio, .. } = &self.incoming.action
             && !audio.is_empty()
             && !audio.iter().any(|codec| {
-                codec.enc.eq_ignore_ascii_case("opus")
-                    && codec.rate == audio_config.format.signaling_rate
+                codec.enc.eq_ignore_ascii_case("opus") && codec.rate == wire_format.signaling_rate
             })
         {
-            return Err(CallError::AudioFormatNotOffered(
-                audio_config.format.signaling_rate,
-            ));
+            return Err(CallError::AudioFormatNotOffered(wire_format.signaling_rate));
         }
         let CallAction::Offer {
             call_id,
@@ -336,7 +320,7 @@ impl<'a> AcceptCall<'a> {
         };
         let mut session =
             wacore::voip::CallSession::new_incoming(call_id, peer_jid, call_creator.clone());
-        session.audio_format = Some(audio_config.format);
+        session.audio_format = Some(wire_format);
         session.is_video = has_video;
         session.group = group.clone();
         // Register BEFORE the decrypt await. A peer <terminate> can now reap this generation during
@@ -356,13 +340,13 @@ impl<'a> AcceptCall<'a> {
         let accept_id = self.client.generate_request_id();
         let (preaccept, accept) = build_answer_signaling(
             self.incoming,
-            audio_config.format,
+            wire_format,
             has_video,
             is_group,
             &preaccept_id,
             &accept_id,
         )?;
-        let (engine, built_call_id, addr) = send_preaccept_then_prepare(
+        let (mut engine, built_call_id, addr) = send_preaccept_then_prepare(
             self.client,
             &registration,
             &mut teardown,
@@ -370,6 +354,17 @@ impl<'a> AcceptCall<'a> {
             self.build_engine(has_video, audio_config, group),
         )
         .await?;
+        // Before a single packet: the escape and native Opus share every timing field, so this
+        // changes no RTP header and nothing that was signaled above, only which grammar the engine
+        // puts on the wire -- while `audio.format` keeps describing what the source hands it.
+        if let Some(codec) = engine_switch
+            && let Err(e) = engine.switch_audio_codec(codec, CodecDecisionSource::Negotiated)
+        {
+            log::debug!("voip: the offer selected {codec:?} and the engine refused it: {e}");
+            return Err(CallError::Media(
+                "the audio codec the peer selected could not be installed",
+            ));
+        }
         debug_assert_eq!(built_call_id, registration.call_id);
         // The decrypt above may await on the network (prekey fetch). If the connection dropped
         // meanwhile, cleanup_connection_state reaped the pending registration. Preserve the
@@ -397,7 +392,7 @@ impl<'a> AcceptCall<'a> {
                 &handle.call_id,
                 handle.generation,
                 GroupCallDevice::new(own_lid)
-                    .with_capability(1, offer_capability(has_video, audio_config.format)),
+                    .with_capability(1, offer_capability(has_video, wire_format)),
             );
             if let Some(peer_device) = peer_invite_device {
                 self.client.call_registry().set_group_invite_peer_device(
@@ -1240,10 +1235,66 @@ fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
 /// peer whose blob is unreadable resets everything, and MLow needs both sides to have asked for it.
 /// Only the MLow/Opus pair at one RTP timing is swappable, so a locally-selected profile outside
 /// that pair (the 48 kHz RFC 7587 one) is left exactly as the consumer configured it.
+/// What the peer's capability decides about a call that has not started yet.
+///
+/// Three facts come out of one selection and they are not the same fact: which format the ENGINE is
+/// built with, which one the SIGNALING announces, and whether the engine has to be switched after
+/// construction. They coincide for a PCM endpoint and part company for an encoded one, whose format
+/// is a promise the APPLICATION made about the bytes it will hand us -- the source is already built
+/// and carries no per-frame codec, so nothing can tell it the call chose the other one.
+#[derive(Debug, PartialEq, Eq)]
+struct NegotiatedAudioPlan {
+    /// What the engine is constructed with. For an encoded endpoint this stays the source's own
+    /// format, because that is what `audio.format` means to the engine: what arrives from the
+    /// application, not what goes on the wire. Overwriting it is what let escape-profile bytes
+    /// reach a native-Opus peer with their rewritten TOCs intact -- the engine compares the two to
+    /// decide whether to translate, and had been told they agreed.
+    engine_format: AudioFormat,
+    /// What the peer is told, and what the wire actually carries.
+    wire_format: AudioFormat,
+    /// Set when the engine must be moved off the format it was built with, before media flows.
+    engine_switch: Option<AudioCodec>,
+}
+
+fn negotiated_audio_plan(
+    configured: AudioFormat,
+    encoded_endpoint: bool,
+    selected: Option<AudioCodec>,
+) -> Result<NegotiatedAudioPlan, CallError> {
+    let unchanged = NegotiatedAudioPlan {
+        engine_format: configured,
+        wire_format: configured,
+        engine_switch: None,
+    };
+    let Some(codec) = selected else {
+        return Ok(unchanged);
+    };
+    // A codec with no sibling at this timing cannot be reached without re-signalling, so the call
+    // stays as configured rather than silently changing what the peer was told.
+    let Some(format) = configured.sibling_for(codec) else {
+        return Ok(unchanged);
+    };
+    // Only a change of CODEC is unanswerable: the source emits one grammar and cannot be told to
+    // emit another, so the application has to pick again. A change of container is answerable --
+    // the escape profile and native Opus carry the same Opus bytes, and the engine is what stops
+    // rewriting their TOCs.
+    if encoded_endpoint && configured.codec != codec {
+        return Err(CallError::EncodedAudioCodecNotNegotiated {
+            configured: configured.codec,
+            selected: codec,
+        });
+    }
+    Ok(NegotiatedAudioPlan {
+        engine_format: if encoded_endpoint { configured } else { format },
+        wire_format: format,
+        engine_switch: encoded_endpoint.then_some(codec),
+    })
+}
+
 fn peer_selected_codec_from_offer(
     incoming: &IncomingCall,
     format: AudioFormat,
-) -> Option<wacore::voip::AudioCodec> {
+) -> Option<AudioCodec> {
     use wacore::stanza::call::{CAPABILITY_INDEX_MLOW_V1, CapabilityBit, capability_bit};
     use wacore::voip::{AudioCodec, AudioFormat};
 
@@ -5036,6 +5087,57 @@ mod tests {
             peer_selected_codec_from_offer(&inside_rollout, AudioFormat::OPUS_MLOW_16KHZ_60MS),
             None
         );
+    }
+
+    // Which format the ENGINE gets and which one the WIRE gets are two answers, and for an encoded
+    // endpoint they differ. Collapsing them told the engine its source was already native Opus,
+    // which is exactly the comparison it uses to decide whether the escape's TOCs need translating
+    // -- so it translated nothing and the peer got bytes it cannot parse.
+    #[test]
+    fn an_encoded_endpoint_keeps_its_own_format_while_the_wire_moves() {
+        use wacore::voip::AudioCodec;
+
+        let plan = negotiated_audio_plan(
+            AudioFormat::OPUS_MLOW_16KHZ_60MS,
+            true,
+            Some(AudioCodec::Opus),
+        )
+        .expect("a container change is answerable");
+        assert_eq!(
+            plan.engine_format,
+            AudioFormat::OPUS_MLOW_16KHZ_60MS,
+            "the engine has to keep knowing what the source emits"
+        );
+        assert_eq!(plan.wire_format, AudioFormat::OPUS_16KHZ_60MS);
+        assert_eq!(
+            plan.engine_switch,
+            Some(AudioCodec::Opus),
+            "so the move onto the wire format is a switch, applied before any packet"
+        );
+
+        // A PCM endpoint has no fixed source, so the engine is simply built on the wire format and
+        // there is nothing to switch.
+        let plan =
+            negotiated_audio_plan(AudioFormat::MLOW_16KHZ_60MS, false, Some(AudioCodec::Opus))
+                .expect("PCM follows the negotiation");
+        assert_eq!(plan.engine_format, AudioFormat::OPUS_16KHZ_60MS);
+        assert_eq!(plan.wire_format, AudioFormat::OPUS_16KHZ_60MS);
+        assert_eq!(plan.engine_switch, None);
+
+        // A codec the source cannot emit is still refused: nothing can tell it to encode MLow.
+        assert!(matches!(
+            negotiated_audio_plan(AudioFormat::OPUS_16KHZ_60MS, true, Some(AudioCodec::Mlow)),
+            Err(CallError::EncodedAudioCodecNotNegotiated { .. })
+        ));
+
+        // Nothing selected changes nothing, for either kind of endpoint.
+        for encoded in [true, false] {
+            let plan = negotiated_audio_plan(AudioFormat::MLOW_16KHZ_60MS, encoded, None)
+                .expect("no selection is not a failure");
+            assert_eq!(plan.engine_format, AudioFormat::MLOW_16KHZ_60MS);
+            assert_eq!(plan.wire_format, AudioFormat::MLOW_16KHZ_60MS);
+            assert_eq!(plan.engine_switch, None);
+        }
     }
 
     // A blob the peer sent that cannot be read resets everything, unlike a blob it never sent. The

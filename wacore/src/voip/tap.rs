@@ -261,14 +261,27 @@ pub struct InMemoryTap {
 
 impl InMemoryTap {
     /// A snapshot of every captured packet, in capture order, as `(direction, bytes)`.
+    ///
+    /// A poisoned lock yields whatever was captured before the panic rather than propagating it:
+    /// this is a diagnostic decorator on the relay's forwarding path, and losing capture is the
+    /// worst it may ever cost a live call.
     pub fn captured(&self) -> Vec<(PacketDir, Vec<u8>)> {
-        self.captured.lock().unwrap().clone()
+        self.captured.lock().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |guard| guard.clone(),
+        )
     }
 }
 
 impl PacketTap for InMemoryTap {
     fn on_packet(&self, dir: PacketDir, data: &[u8]) {
-        self.captured.lock().unwrap().push((dir, data.to_vec()));
+        // Same reasoning as `captured`: a tap that panics here would take the call down with it, on
+        // the forwarding task, for a buffer nothing on the media path reads.
+        let mut captured = match self.captured.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        captured.push((dir, data.to_vec()));
     }
 }
 
