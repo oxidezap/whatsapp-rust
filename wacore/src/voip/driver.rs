@@ -697,6 +697,13 @@ fn apply_group_epoch_control(
     }
 }
 
+/// Force-sent: an event that is emitted ONCE and that the consumer has to act on.
+///
+/// Everything else here repeats -- a re-alarming `AudioSilent`, a per-frame drop report -- so a
+/// full queue costs a copy of something that will be said again. These are said once per call or
+/// once per condition, so a `try_send` that loses the race with a slow consumer loses the fact
+/// itself: a call stays deaf, or sends audio its peer cannot decode, with nothing ever reported.
+/// Displacing the oldest queued event is the cheaper mistake.
 fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) {
     if matches!(
         &event,
@@ -704,6 +711,8 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
             | CallEvent::RelayAllocateFailed(_)
             | CallEvent::RelayAllocateTimedOut
             | CallEvent::RelayReconnectTimedOut
+            | CallEvent::AudioReceptionStalled { .. }
+            | CallEvent::AudioCodecSourceIsFixed { .. }
     ) {
         let _ = events.force_send(event);
     } else {
@@ -1518,6 +1527,7 @@ mod tests {
         GroupCallDevice, GroupCallParticipant, GroupCallRelay, GroupCallRelayEndpoint,
         GroupCallUpdate,
     };
+    use crate::voip::AudioCodec;
     use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
     use crate::voip::engine::{CallConfig, GroupEngineConfig, SequentialTxIds};
     use crate::voip::mlow::MlowEncoder;
@@ -1704,13 +1714,24 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 
+    // A slow consumer fills the event queue exactly when a call goes wrong. An event that is said
+    // ONCE and is lost there is lost for good: the two audio ones below mean a call is deaf, or is
+    // sending audio its peer cannot decode, and neither repeats.
     #[test]
-    fn relay_lifecycle_events_replace_saturated_diagnostics() {
-        for lifecycle in [
+    fn events_that_are_said_once_replace_saturated_diagnostics() {
+        for said_once in [
             CallEvent::RelayAllocated,
             CallEvent::RelayAllocateFailed(486),
             CallEvent::RelayAllocateTimedOut,
             CallEvent::RelayReconnectTimedOut,
+            CallEvent::AudioReceptionStalled {
+                silent_for_ms: 3_000,
+            },
+            CallEvent::AudioCodecSourceIsFixed {
+                sending: AudioCodec::Mlow,
+                peer_expects: AudioCodec::Opus,
+                source: engine::CodecDecisionSource::Negotiated,
+            },
         ] {
             let (tx, rx) = async_channel::bounded(1);
             tx.try_send(CallEvent::GroupControlRejected {
@@ -1718,11 +1739,35 @@ mod tests {
             })
             .expect("diagnostic fills the event queue");
 
-            publish_engine_event(&tx, lifecycle.clone());
+            publish_engine_event(&tx, said_once.clone());
 
-            assert_eq!(rx.try_recv(), Ok(lifecycle));
+            assert_eq!(rx.try_recv(), Ok(said_once));
             assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
         }
+    }
+
+    // The other half of the rule: an event that repeats yields to the queue, because it will be
+    // said again and displacing something else to say it early buys nothing.
+    #[test]
+    fn a_repeating_diagnostic_yields_to_a_full_queue() {
+        let (tx, rx) = async_channel::bounded(1);
+        let queued = CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        };
+        tx.try_send(queued.clone()).expect("fills the queue");
+
+        publish_engine_event(
+            &tx,
+            CallEvent::AudioSilent {
+                silent_for_ms: 2_000,
+                rtp_received: 40,
+                frames_produced: 0,
+                dominant_reason: crate::voip::media_stats::AudioSilenceReason::Unknown,
+            },
+        );
+
+        assert_eq!(rx.try_recv(), Ok(queued));
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 
     #[test]

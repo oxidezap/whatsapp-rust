@@ -246,6 +246,13 @@ impl SrtcpReplayState {
     }
 }
 
+/// How long a just-retired video SSRC stays ignorable, in packets of the stream that replaced it.
+///
+/// The window a renumbering's stragglers arrive in is a network reordering window -- milliseconds --
+/// and 15fps video puts a handful of packets in one. Sized well above that and far below any real
+/// gap, so it covers the overlap without outliving it.
+const RETIRED_SSRC_GRACE_PACKETS: u32 = 64;
+
 const SRTP_REPLAY_WINDOW_BITS: u64 = 64;
 /// Concurrent inbound RTP streams tracked per pipeline, matching [`SRTCP_REPLAY_STREAM_CAP`].
 ///
@@ -753,6 +760,19 @@ pub struct VideoPipeline {
     /// renumbered stream's restarted timestamps read as an old frame and its fragments splice onto
     /// the previous stream's.
     depacketizer_ssrc: Option<u32>,
+    /// The stream we just left, and how many packets the current one has delivered since.
+    ///
+    /// A renumbering is not instantaneous on the wire: packets from the old SSRC keep arriving for
+    /// a few milliseconds after the first packet of the new one. Each of those looks like another
+    /// stream commitment, so without this they take the depacketizer back, discard whatever the new
+    /// stream has half-assembled, and lose it again on the next new-SSRC fragment -- valid frames
+    /// dropped for the whole overlap.
+    ///
+    /// Bounded rather than permanent: a late packet is late by milliseconds, so a short grace is
+    /// enough, and after it any SSRC is free to claim the depacketizer again. Retiring one forever
+    /// would leave a peer that legitimately returns to a previous SSRC with no video at all.
+    retired_ssrc: Option<u32>,
+    packets_since_stream_change: u32,
     pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
 }
@@ -797,6 +817,8 @@ impl VideoPipeline {
             recv_streams: SrtpRecvStreams::default(),
             depacketizer: H264Depacketizer::default(),
             depacketizer_ssrc: None,
+            retired_ssrc: None,
+            packets_since_stream_change: 0,
             pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
         })
@@ -839,6 +861,8 @@ impl VideoPipeline {
         self.recv_streams = SrtpRecvStreams::default();
         self.depacketizer.reset();
         self.depacketizer_ssrc = None;
+        self.retired_ssrc = None;
+        self.packets_since_stream_change = 0;
         true
     }
 
@@ -879,6 +903,8 @@ impl VideoPipeline {
     pub(crate) fn reset_depacketizer(&mut self) {
         self.depacketizer.reset();
         self.depacketizer_ssrc = None;
+        self.retired_ssrc = None;
+        self.packets_since_stream_change = 0;
     }
 
     /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
@@ -934,11 +960,22 @@ impl VideoPipeline {
         // partial access unit is the correct trade: the alternative is emitting one spliced from two
         // encoders' fragments, which decodes to garbage rather than to nothing.
         if self.depacketizer_ssrc != Some(header.ssrc) {
+            // A straggler from the stream we just left is not a commitment to it -- see
+            // `retired_ssrc`. Its own access unit was discarded when we switched, so there is
+            // nothing it can complete; it is counted as received and otherwise ignored.
+            if self.retired_ssrc == Some(header.ssrc)
+                && self.packets_since_stream_change < RETIRED_SSRC_GRACE_PACKETS
+            {
+                return Some((header, Vec::new()));
+            }
             if self.depacketizer_ssrc.is_some() {
                 self.depacketizer.reset();
             }
+            self.retired_ssrc = self.depacketizer_ssrc;
             self.depacketizer_ssrc = Some(header.ssrc);
+            self.packets_since_stream_change = 0;
         }
+        self.packets_since_stream_change = self.packets_since_stream_change.saturating_add(1);
         let first = self.depacketizer.push(
             header.sequence_number,
             header.timestamp,
@@ -1774,6 +1811,56 @@ mod tests {
             rx.unprotect_video(&packet),
             Some(vec![au]),
             "a renumbered stream's first AU must not read as a reordered packet of the old one"
+        );
+    }
+
+    // A renumbering is not instantaneous: packets from the old SSRC keep arriving while the new
+    // stream is already sending. Each straggler used to look like another stream commitment, taking
+    // the depacketizer back and discarding the fragments the new stream had assembled -- so the
+    // frames spanning the overlap were lost, on a stream whose packets all authenticated.
+    #[test]
+    fn a_straggler_from_the_retired_stream_does_not_discard_the_new_one() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut old = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut new = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        // The old stream is established, and has one AU still in flight on the wire.
+        let established = video_au(60);
+        let packet = old.protect_video(&established).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![established]));
+        let straggler = old
+            .protect_video(&video_au(60))
+            .pop()
+            .expect("the packet still in flight when the peer renumbers");
+
+        // The new stream sends an AU large enough to span several packets.
+        let au = video_au(4_000);
+        let fragments = new.protect_video(&au);
+        assert!(
+            fragments.len() > 2,
+            "the AU must span packets for the overlap to be observable"
+        );
+
+        // Its first fragments arrive, then the straggler, then the rest.
+        for fragment in &fragments[..fragments.len() - 1] {
+            assert_eq!(rx.unprotect_video(fragment), None, "still assembling");
+        }
+        assert_eq!(
+            rx.unprotect_video(&straggler),
+            None,
+            "the straggler completes nothing: its own AU went with the stream it belonged to"
+        );
+        assert_eq!(
+            rx.unprotect_video(fragments.last().expect("marker packet")),
+            Some(vec![au]),
+            "the new stream's access unit must survive the overlap intact"
         );
     }
 

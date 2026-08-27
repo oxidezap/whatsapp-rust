@@ -33,8 +33,15 @@ pub enum PacketDir {
 
 /// A sink for relay packets crossing the seam. Implement it to dump to a file, a pcap, a log, an
 /// in-memory buffer, or to forward elsewhere. Called once per packet in both directions -- inline on
-/// the send path and on the inbound forwarding hop -- so keep it cheap and non-blocking. It sees
-/// every packet, including ones the driver later drops under backpressure (recording happens first).
+/// the send path and on the inbound forwarding hop -- so keep it cheap and non-blocking.
+///
+/// What it sees is everything that reaches the seam, which on the inbound side means everything the
+/// platform transport handed up: the tap decorates that transport, it does not replace it. Media
+/// the transport's own read pump discards before producing an event (see `inbound_pipe_dropped`)
+/// was never at the seam and is not recorded -- a capture taken during an overload is a capture of
+/// what survived it. Past that point nothing is lost: a packet the DRIVER later drops under
+/// backpressure is recorded first, so the tap and the call disagree only in the transport's
+/// favour.
 pub trait PacketTap: crate::sync_marker::MaybeSendSync {
     fn on_packet(&self, dir: PacketDir, data: &[u8]);
 }
