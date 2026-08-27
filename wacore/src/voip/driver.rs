@@ -697,13 +697,19 @@ fn apply_group_epoch_control(
     }
 }
 
-/// Force-sent: an event that is emitted ONCE and that the consumer has to act on.
+/// Force-sent: an event that is emitted ONCE and that the consumer has to act on. Both halves are
+/// required, and they are what keeps this list from growing to everything.
 ///
-/// Everything else here repeats -- a re-alarming `AudioSilent`, a per-frame drop report -- so a
-/// full queue costs a copy of something that will be said again. These are said once per call or
-/// once per condition, so a `try_send` that loses the race with a slow consumer loses the fact
-/// itself: a call stays deaf, or sends audio its peer cannot decode, with nothing ever reported.
-/// Displacing the oldest queued event is the cheaper mistake.
+/// Said once matters because a `try_send` that loses the race with a slow consumer loses the fact
+/// itself rather than a copy of it -- unlike a re-alarming `AudioSilent` or a per-frame drop
+/// report, which will be said again. Actionable matters because displacing a queued event is a
+/// real cost, worth paying only when the consumer must do something: a call stays deaf, or keeps
+/// sending audio its peer cannot decode, until it does.
+///
+/// `AudioCodecSwitched` deliberately stays on the ordinary path even though it is also said once:
+/// the engine has already re-pointed its own decoder, so nothing is asked of the consumer. Where a
+/// switch DOES demand action -- an encoded source that cannot follow it -- the demand rides on
+/// `AudioCodecSourceIsFixed`, which carries both codecs and is force-sent.
 fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) {
     if matches!(
         &event,
