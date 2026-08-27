@@ -3208,11 +3208,10 @@ mod tests {
                 .answering_device_if_current("CALL-ID-0001", generation),
             Some(routed_participant.clone())
         );
-        assert_eq!(
-            rekey_rx.try_recv(),
-            Ok(routed_participant.to_string()),
-            "the receive pipeline must rekey to the actual answering device"
-        );
+        let answer = rekey_rx
+            .try_recv()
+            .expect("the receive pipeline must rekey to the actual answering device");
+        assert_eq!(answer.answering_lid, routed_participant.to_string());
         client
             .call_registry()
             .remove_if_current("CALL-ID-0001", generation);

@@ -198,6 +198,40 @@ fn is_mlow_embedded_opus(payload: &[u8]) -> bool {
     payload.first().is_some_and(|byte| byte & 0xC0 == 0xC0)
 }
 
+/// An audio codec the core cannot implement, supplied by the platform.
+///
+/// `wacore` is sans-io and builds for wasm32 and ESP32, so it cannot link libopus. MLow is pure
+/// Rust and lives here; standard Opus does not. This is the seam: a runtime that has libopus hands
+/// one of these to the engine, and one that does not passes `None` and gets an honest
+/// [`crate::voip::CallEvent::AudioSilent`] instead of a call that pretends.
+///
+/// Implementations are stateful and per call. The engine owns exactly one and drives it from a
+/// single task, so the bound is `Send` and not `Send + Sync`: nothing here is ever shared by
+/// reference, and requiring `Sync` would exclude every real codec binding (libopus's decoder is
+/// `Send` but not `Sync`) for a guarantee no caller needs.
+pub trait ForeignAudioCodec: crate::sync_marker::MaybeSend {
+    /// Decode one payload, appending samples to `out`. `out` is reused across calls and arrives
+    /// empty; append rather than assigning so the caller keeps its allocation.
+    fn decode(&mut self, payload: &[u8], out: &mut Vec<i16>) -> Result<(), ForeignCodecError>;
+
+    /// Append `samples` of concealment for a packet that was lost or could not be decoded.
+    fn conceal(&mut self, samples: usize, out: &mut Vec<i16>);
+
+    /// Encode one frame of PCM, appending to `out` under the same contract as `decode`.
+    fn encode(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), ForeignCodecError>;
+}
+
+/// Why an injected codec refused a frame. Deliberately opaque: the engine counts and conceals, and
+/// the specific complaint belongs in the implementation's own log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ForeignCodecError {
+    #[error("the payload is not valid for this codec")]
+    InvalidPayload,
+    #[error("the frame size is not one this codec accepts")]
+    BadFrameSize,
+}
+
 /// Failure while translating between RFC Opus and MLOW's CELT packet header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]

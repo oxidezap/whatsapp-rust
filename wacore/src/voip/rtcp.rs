@@ -273,6 +273,15 @@ pub(crate) struct RtpReceptionStats {
     expected_prior: u32,
     received_prior: u32,
     transit: Option<u32>,
+    /// The last RTP timestamp seen, so consecutive packets can be differenced.
+    ///
+    /// The difference is the peer's own statement of how much audio each packet carries, in the
+    /// negotiated clock, and it is the only such statement that does not pass through a codec.
+    /// [`Self::frame_span`] is what turns two colliding payload grammars into one decidable
+    /// question; see `crate::voip::opus_packet`.
+    last_rtp_timestamp: Option<u32>,
+    /// Difference between the last two RTP timestamps of the CURRENT stream.
+    frame_span: Option<u32>,
     jitter_q4: u64,
     last_sender_report: u32,
     last_sender_report_at_ms: Option<u64>,
@@ -318,6 +327,29 @@ impl RtpReceptionStats {
                 .saturating_sub(decay);
         }
         self.transit = Some(transit);
+
+        // Only forward steps count. A reordered or retransmitted packet would produce a negative or
+        // absurd difference, and one bad sample must not be able to move a codec decision.
+        if let Some(previous) = self.last_rtp_timestamp {
+            let delta = rtp_timestamp.wrapping_sub(previous);
+            if delta > 0 && delta <= clock_rate {
+                self.frame_span = Some(delta);
+            }
+        }
+        self.last_rtp_timestamp = Some(rtp_timestamp);
+    }
+
+    /// The SSRC of the stream currently being tracked, if any.
+    pub(crate) fn ssrc(&self) -> Option<u32> {
+        self.ssrc
+    }
+
+    /// Samples between the last two packets of this stream, per the peer's own RTP timestamps.
+    ///
+    /// `None` until two consecutive in-order packets have been seen, and reset with the stream when
+    /// the SSRC changes, because a renumbered stream is a new statement and not a continuation.
+    pub(crate) fn frame_span(&self) -> Option<u32> {
+        self.frame_span
     }
 
     pub(crate) fn observe_sender_report(

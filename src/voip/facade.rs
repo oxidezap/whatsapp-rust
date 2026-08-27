@@ -414,6 +414,8 @@ impl<'a> AcceptCall<'a> {
             config.enable_video = enable_video;
             let addr = socket_addr_from_config(&config)?;
             let mut engine = CallEngine::new(config, Box::new(RandTxIds))
+                .map(with_platform_audio_codec)
+                .map(with_platform_audio_codec)
                 .map_err(|error| CallError::Setup(error.to_string()))?;
             engine
                 .configure_group(GroupEngineConfig {
@@ -468,6 +470,7 @@ impl<'a> AcceptCall<'a> {
         // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
         let addr = socket_addr_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
+            .map(with_platform_audio_codec)
             .map_err(|e| CallError::Setup(e.to_string()))?;
         Ok((engine, call_id.clone(), addr))
     }
@@ -891,6 +894,7 @@ impl<'a> OutgoingGroupCall<'a> {
         config.enable_video = video.is_some();
         let addr = socket_addr_from_config(&config)?;
         let mut engine = CallEngine::new(config, Box::new(RandTxIds))
+            .map(with_platform_audio_codec)
             .map_err(|error| CallError::Setup(error.to_string()))?;
         engine
             .configure_group(GroupEngineConfig {
@@ -1100,6 +1104,7 @@ impl<'a> CallLinkCall<'a> {
         config.enable_video = video.is_some();
         let addr = socket_addr_from_config(&config)?;
         let mut engine = CallEngine::new(config, Box::new(RandTxIds))
+            .map(with_platform_audio_codec)
             .map_err(|error| CallError::Setup(error.to_string()))?;
         engine
             .configure_group(GroupEngineConfig {
@@ -1174,6 +1179,24 @@ pub(crate) fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8]
         (true, false) => &CAPABILITY_VIDEO_OFFER,
         (false, false) => &CAPABILITY_OFFER,
     }
+}
+
+/// Give the engine the platform's standard-Opus codec, when this build has one.
+///
+/// A no-op without `voip-libopus`, and that is the honest outcome: the call still runs, and if the
+/// peer turns out to speak Opus the engine reports `CallEvent::AudioSilent` with
+/// `NoDecoderForNegotiatedCodec` rather than a call that looks connected and carries nothing.
+fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
+    #[cfg(feature = "voip-libopus")]
+    {
+        match crate::voip::audio::LibopusAudioCodec::new() {
+            Ok(codec) => return engine.with_foreign_audio_codec(Box::new(codec)),
+            Err(e) => {
+                log::warn!("voip: libopus unavailable for this call, Opus will not decode: {e}");
+            }
+        }
+    }
+    engine
 }
 
 /// The codec the offering peer's `<capability>` selects, or `None` when the local choice stands.
@@ -2138,6 +2161,7 @@ pub(crate) async fn attach_outgoing_relay(
         // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
         let addr = socket_addr_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
+            .map(with_platform_audio_codec)
             .map_err(|e| CallError::Setup(e.to_string()))?;
         Ok::<_, CallError>((
             engine,

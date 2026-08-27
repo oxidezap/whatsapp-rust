@@ -7,7 +7,7 @@ use bytes::Bytes;
 use opus::{Application, Bandwidth, Bitrate, Channels, Decoder, Encoder};
 use wacore::voip::EncodedAudioFrame;
 #[cfg(feature = "voip-libopus")]
-use wacore::voip::{depacketize_opus_from_mlow, packetize_opus_for_mlow};
+use wacore::voip::{ForeignCodecError, depacketize_opus_from_mlow, packetize_opus_for_mlow};
 
 /// A microphone source for a call: 60 ms / 960-sample mono i16 frames at 16 kHz. The media facade
 /// pulls frames from the returned channel and feeds them to the engine; a closed channel (e.g. the
@@ -192,6 +192,57 @@ impl WaOpusDecoder {
         depacketize_opus_from_mlow(&mut self.packet_scratch)
             .map_err(|e| anyhow!("depacketize Opus from MLOW: {e}"))?;
         Self::decode_packet(&mut self.dec, &mut self.pcm_scratch, &self.packet_scratch)
+    }
+}
+
+/// The platform's standard-Opus codec, handed to the engine so a call whose peer turns out to
+/// speak Opus is decoded instead of reported silent.
+///
+/// `wacore` cannot link libopus: it builds for wasm32 and ESP32. This is the seam that keeps the
+/// core portable while a native build still rescues the call. One instance per call, driven from
+/// the drive-loop task, so no synchronisation is needed.
+#[cfg(feature = "voip-libopus")]
+pub(crate) struct LibopusAudioCodec {
+    decoder: WaOpusDecoder,
+    encoder: WaOpusEncoder,
+}
+
+#[cfg(feature = "voip-libopus")]
+impl LibopusAudioCodec {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            decoder: WaOpusDecoder::new()?,
+            encoder: WaOpusEncoder::new()?,
+        })
+    }
+}
+
+#[cfg(feature = "voip-libopus")]
+impl wacore::voip::ForeignAudioCodec for LibopusAudioCodec {
+    fn decode(&mut self, payload: &[u8], out: &mut Vec<i16>) -> Result<(), ForeignCodecError> {
+        let pcm = self
+            .decoder
+            .decode(payload)
+            .map_err(|_| ForeignCodecError::InvalidPayload)?;
+        out.extend_from_slice(pcm);
+        Ok(())
+    }
+
+    fn conceal(&mut self, samples: usize, out: &mut Vec<i16>) {
+        // Opus packet-loss concealment needs the decoder's own state, and asking libopus for it
+        // costs an extra call per lost frame. Silence is the honest fallback here: the engine
+        // already counts the concealment, so a stream that is mostly concealed is visible as such
+        // rather than smoothed into something that sounds almost fine.
+        out.resize(out.len() + samples, 0);
+    }
+
+    fn encode(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), ForeignCodecError> {
+        let payload = self
+            .encoder
+            .encode(pcm)
+            .map_err(|_| ForeignCodecError::BadFrameSize)?;
+        out.extend_from_slice(&payload);
+        Ok(())
     }
 }
 

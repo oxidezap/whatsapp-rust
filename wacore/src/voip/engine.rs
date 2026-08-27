@@ -18,9 +18,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use bytes::Bytes;
 
 use super::app_data;
+use super::audio::ForeignAudioCodec;
 use super::audio::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
 };
+use super::codec_probe::InboundCodecProbe;
 use super::demux::{RelayPacketKind, classify_relay_packet, unwrap_group_forwarding_packet};
 use super::group_audio::ParticipantAudioMixer;
 use super::group_media::{
@@ -719,6 +721,15 @@ struct MediaState {
     video_ts_stride: u32,
     /// The video plane, present while video is enabled (from the start or via upgrade).
     video: Option<VideoPlaneState>,
+    /// Watches inbound payloads for a peer whose bytes contradict its signaling.
+    codec_probe: InboundCodecProbe,
+    /// The platform's decoder for a codec the core cannot implement. `None` on wasm32/ESP32 and on
+    /// any build without the libopus adapter; the engine then reports silence rather than faking it.
+    foreign_audio: Option<Box<dyn ForeignAudioCodec>>,
+    /// Reused across packets so the foreign decode path does not allocate per frame.
+    foreign_pcm: Vec<i16>,
+    /// The send-side twin of `foreign_pcm`.
+    foreign_encoded: Vec<u8>,
     audio_rtcp_announced: bool,
     audio_tx_invalid_streak: u8,
     sframe: Option<SframeSession>,
@@ -923,13 +934,16 @@ impl CallEngine {
         if config.enable_media && !config.audio.format.is_valid() {
             return Err(EngineError::BadAudioFormat);
         }
+        // PCM I/O accepts the one swappable pair and nothing else. Opus is admitted because a peer
+        // outside the MLow rollout selects it during signaling, before the engine is built, and
+        // refusing here would turn "the peer speaks Opus" into a call that never starts. A build
+        // with no decoder for it does not pretend: it reports `CallEvent::AudioSilent` with
+        // `NoDecoderForNegotiatedCodec` once media is flowing. Anything outside the pair has a
+        // different RTP timing and is still refused.
         if config.enable_media
             && config.audio.io == AudioIo::Pcm
-            && config.audio
-                != (AudioConfig {
-                    format: AudioFormat::MLOW_16KHZ_60MS,
-                    io: AudioIo::Pcm,
-                })
+            && config.audio.format != AudioFormat::MLOW_16KHZ_60MS
+            && config.audio.format != AudioFormat::OPUS_16KHZ_60MS
         {
             return Err(EngineError::UnsupportedPcmAudio);
         }
@@ -999,6 +1013,10 @@ impl CallEngine {
                 warp_mi_tag_len: config.warp_mi_tag_len,
                 video_ts_stride: VIDEO_TS_STRIDE_15FPS,
                 video,
+                codec_probe: InboundCodecProbe::default(),
+                foreign_audio: None,
+                foreign_pcm: Vec::new(),
+                foreign_encoded: Vec::new(),
                 audio_rtcp_announced: false,
                 audio_tx_invalid_streak: 0,
                 sframe,
@@ -1903,6 +1921,23 @@ impl CallEngine {
         self.media_stats
     }
 
+    /// Supply a decoder for a codec the core cannot implement.
+    ///
+    /// Consuming rather than a setter because it belongs at construction: installing a codec after
+    /// media has flowed would mean the packets before it were silently discarded, and the honest
+    /// answer to "this build has no decoder" is [`CallEvent::AudioSilent`], not a late rescue.
+    ///
+    /// Without one, a call whose peer turns out to speak standard Opus reports itself silent
+    /// instead of pretending; with one, the same call is rescued and keeps a single playout
+    /// schedule, because the decoded samples go into the very same jitter buffer.
+    #[must_use]
+    pub fn with_foreign_audio_codec(mut self, codec: Box<dyn ForeignAudioCodec>) -> Self {
+        if let Some(m) = self.media.as_mut() {
+            m.foreign_audio = Some(codec);
+        }
+        self
+    }
+
     /// Swap the audio payload grammar without touching the negotiated RTP timing.
     ///
     /// Accepts only the MLow/Opus pair at 16 kHz, 60 ms and payload type 120, because that is the
@@ -2306,6 +2341,9 @@ impl CallEngine {
             self.on_group_rtp(now, pkt, wire_header);
             return;
         }
+        // Set by the content probe below and applied once the media borrow has ended.
+        #[allow(unused_assignments)]
+        let mut probe_verdict: Option<AudioCodec> = None;
         let Some(m) = self.media.as_mut() else {
             return;
         };
@@ -2359,6 +2397,12 @@ impl CallEngine {
         };
         self.media_stats.rtp_received = self.media_stats.rtp_received.saturating_add(1);
         self.health.on_rtp();
+        // A renumbered stream restarts the timestamp sequence, so differences across the change are
+        // not comparable and the probe's streak has to start over. Its decision does not: a peer
+        // must not be able to reopen the codec question by changing its SSRC.
+        if m.audio_reception.ssrc() != Some(header.ssrc) {
+            m.codec_probe.stream_restarted();
+        }
         m.audio_reception.observe(
             header.ssrc,
             header.sequence_number,
@@ -2380,8 +2424,44 @@ impl CallEngine {
             None => payload,
         };
         let codec = m.active_format.inbound_codec(header.payload_type, &encoded);
-        #[cfg(feature = "voip-mlow")]
         if m.audio.io == AudioIo::Pcm && codec == AudioCodec::Opus {
+            // The peer speaks a codec the core does not implement. With a platform decoder the
+            // samples join the SAME jitter buffer the MLow path feeds, so there is one playout
+            // schedule regardless of which grammar produced the audio.
+            if let Some(foreign) = m.foreign_audio.as_mut() {
+                m.foreign_pcm.clear();
+                let samples = super::opus_packet_shape(&encoded)
+                    .and_then(|shape| shape.total_samples(m.active_format.rtp_clock_rate))
+                    .unwrap_or(m.active_format.samples_per_frame)
+                    as usize;
+                match foreign.decode(&encoded, &mut m.foreign_pcm) {
+                    Ok(()) => {
+                        self.media_stats.foreign_frames_decoded =
+                            self.media_stats.foreign_frames_decoded.saturating_add(1);
+                        self.health.on_audio_produced();
+                    }
+                    Err(e) => {
+                        log::debug!("voip: foreign audio decode failed: {e}");
+                        m.foreign_pcm.clear();
+                        foreign.conceal(samples, &mut m.foreign_pcm);
+                        self.media_stats.audio_frames_concealed =
+                            self.media_stats.audio_frames_concealed.saturating_add(1);
+                    }
+                }
+                #[cfg(feature = "voip-mlow")]
+                if let Some(pcm) = m.pcm.as_mut() {
+                    pcm.packet_samps = samples.max(1);
+                    pcm.jitter.extend(m.foreign_pcm.iter().copied());
+                }
+                return;
+            }
+            // No decoder for it. Surface the payload so a shell that has one can play it, and let
+            // the health watchdog report the call as silent rather than have it look like a peer
+            // who is not speaking.
+            self.media_stats.audio_frames_without_decoder = self
+                .media_stats
+                .audio_frames_without_decoder
+                .saturating_add(1);
             self.outbox
                 .push_back(Output::Event(CallEvent::ForeignAudio(Bytes::from(encoded))));
             return;
@@ -2449,6 +2529,19 @@ impl CallEngine {
                 self.health.on_audio_produced();
             }
         }
+        // Nothing became audio. Ask whether the peer's own two statements about this packet -- the
+        // duration its Opus header would declare, and the step its RTP timestamps actually advance
+        // by -- agree with each other. They cannot agree for any packet this decoder accepts (see
+        // `codec_probe`), so a run of agreements is evidence of a grammar we are not speaking.
+        #[cfg(feature = "voip-mlow")]
+        if decode_report.decoded == 0 {
+            let span = m.audio_reception.frame_span();
+            let clock_rate = m.active_format.rtp_clock_rate;
+            let active = m.active_format.codec;
+            // Applied after the media borrow ends: the switch needs the whole engine, and holding
+            // both borrows here would be a borrow-checker fight for no behavioural gain.
+            probe_verdict = m.codec_probe.observe(&encoded, active, span, clock_rate);
+        }
         // Bound the buffer on the feed side too: a burst of inbound packets arriving between two 20ms
         // playout ticks must not grow `jitter` without limit (drain_playout's cap only runs on a
         // tick). Drop oldest past the same ceiling the drain path uses.
@@ -2466,6 +2559,13 @@ impl CallEngine {
                     .playout_trimmed_samples
                     .saturating_add(drop_n as u32);
             }
+        }
+        // Content contradicting negotiation is a statement about our model of the peer, not just
+        // about this call, which is why the event names the source.
+        if let Some(codec) = probe_verdict
+            && let Err(e) = self.switch_audio_codec(codec, CodecDecisionSource::Content)
+        {
+            log::debug!("voip: inbound bytes indicate {codec:?}, not switching: {e}");
         }
     }
 
@@ -2634,17 +2734,34 @@ impl CallEngine {
         let Some(m) = self.media.as_mut() else {
             return;
         };
-        if m.audio.io != AudioIo::Pcm || m.active_format.codec != AudioCodec::Mlow {
+        if m.audio.io != AudioIo::Pcm {
             return;
         }
-        let Some(pcm_state) = m.pcm.as_mut() else {
-            return;
-        };
         // Drop a wrong-length frame before any send: the encoder needs exactly one 60ms frame, and a
         // mis-sized buffer must not reach the DTX fast-path (which would emit an off-cadence packet).
         if pcm.len() != MIC_FRAME_SAMPLES {
             return;
         }
+        // The gate is mutual, so a peer that selected standard Opus decodes only standard Opus.
+        // Sending MLow at it is the other half of the silence, and no amount of receive-side rescue
+        // fixes it: the peer has to hear us too.
+        if m.active_format.codec == AudioCodec::Opus {
+            let Some(foreign) = m.foreign_audio.as_mut() else {
+                return;
+            };
+            let mut encoded = core::mem::take(&mut m.foreign_encoded);
+            encoded.clear();
+            let sent = foreign.encode(pcm, &mut encoded);
+            let packet = sent.is_ok().then(|| m.pipe.protect_audio(&encoded));
+            m.foreign_encoded = encoded;
+            if let Some(packet) = packet {
+                self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
+            }
+            return;
+        }
+        let Some(pcm_state) = m.pcm.as_mut() else {
+            return;
+        };
         // OS mic-mute delivers an exactly all-zero frame; genuine quiet speech carries LSB noise.
         // Don't gap the wire on mute: send a cheap cached DTX comfort-noise frame so the peer's
         // media-liveness timer stays fed (no codec CPU) and it doesn't re-negotiate the transport.
@@ -5601,17 +5718,90 @@ mod tests {
             .expect("a call receiving packets and decoding none must report itself silent");
         assert!(silent.0 >= 20, "window must carry enough packets to judge");
         assert_eq!(silent.1, 0, "no audio was produced");
-        assert_eq!(silent.2, AudioSilenceReason::CodecRejectingFrames);
+        // The probe recognises the grammar from the bytes and the engine says exactly why the call
+        // is silent: not "the codec refused it", but "this build has no decoder for what the peer
+        // negotiated", which is the one reason a consumer can act on.
+        assert_eq!(
+            silent.2,
+            AudioSilenceReason::NoDecoderForNegotiatedCodec,
+            "an engine with no Opus decoder must name that as the reason"
+        );
+        let switched = events
+            .iter()
+            .find_map(|ev| match ev {
+                CallEvent::AudioCodecSwitched { to, source, .. } => Some((*to, *source)),
+                _ => None,
+            })
+            .expect("the bytes contradict the negotiation and that must be surfaced");
+        assert_eq!(switched, (AudioCodec::Opus, CodecDecisionSource::Content));
         let stats = eng.media_stats();
         assert_eq!(stats.rtp_received, 80);
         assert_eq!(stats.audio_frames_decoded, 0);
-        // The duration guard admits 120 ms, so these reach the range coder and fail its endpoint
-        // check instead of being refused up front. Either counter is the same user-visible outcome,
-        // which is why `dominant_reason` covers both.
+        assert!(stats.audio_frames_without_decoder > 0);
+    }
+
+    /// A decoder that turns any payload into a fixed run of samples, so a test can prove the
+    /// rescue path without pulling libopus into `wacore`.
+    struct StubForeignCodec {
+        samples: usize,
+    }
+
+    impl ForeignAudioCodec for StubForeignCodec {
+        fn decode(
+            &mut self,
+            payload: &[u8],
+            out: &mut Vec<i16>,
+        ) -> Result<(), super::super::audio::ForeignCodecError> {
+            if payload.is_empty() {
+                return Err(super::super::audio::ForeignCodecError::InvalidPayload);
+            }
+            out.extend(core::iter::repeat_n(1234, self.samples));
+            Ok(())
+        }
+
+        fn conceal(&mut self, samples: usize, out: &mut Vec<i16>) {
+            out.resize(out.len() + samples, 0);
+        }
+
+        fn encode(
+            &mut self,
+            pcm: &[i16],
+            out: &mut Vec<u8>,
+        ) -> Result<(), super::super::audio::ForeignCodecError> {
+            out.extend(core::iter::repeat_n(0x58, pcm.len() / 16));
+            Ok(())
+        }
+    }
+
+    // The whole point of issue #1105, end to end: a peer sending standard Opus on the MLow payload
+    // type is recognised from its own two statements, the codec is switched, and the call carries
+    // audio instead of silence.
+    #[test]
+    fn a_peer_sending_opus_on_the_mlow_profile_is_rescued_and_the_call_carries_audio() {
+        let mut eng = engine(true).with_foreign_audio_codec(Box::new(StubForeignCodec {
+            samples: SAMPLES as usize,
+        }));
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        let mut peer_tx = peer_pipeline();
+        let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        for n in 0..10u64 {
+            let packet = peer_tx.protect_audio(&body);
+            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+        assert_eq!(eng.active_audio_codec(), Some(AudioCodec::Opus));
+        let stats = eng.media_stats();
         assert!(
-            stats.audio_frames_concealed > 0 || stats.mlow_off_point_dropped > 0,
-            "the decoder must record refusing every frame, got {stats:?}"
+            stats.foreign_frames_decoded > 0,
+            "the rescued packets must actually decode, got {stats:?}"
         );
+        assert_eq!(stats.codec_switches, 1);
+        assert!(eng.jitter_len() > 0, "decoded samples must reach playout");
     }
 
     // A call carrying real audio must never alarm; without this the watchdog is a false-positive

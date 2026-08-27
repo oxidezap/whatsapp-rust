@@ -46,6 +46,9 @@ pub struct CallMediaStats {
     pub mlow_inactive_or_sid: u32,
     /// Frames decoded by an injected [`super::audio::ForeignAudioCodec`].
     pub foreign_frames_decoded: u32,
+    /// Frames the peer sent in a codec this build has no decoder for. Not recoverable inside the
+    /// call, and the one silence reason a consumer can act on before the next call.
+    pub audio_frames_without_decoder: u32,
     /// Samples discarded from the head of the playout buffer to hold the latency ceiling.
     pub playout_trimmed_samples: u32,
     /// Inbound media the relay read pump discarded under backpressure, before the engine.
@@ -267,6 +270,11 @@ impl AudioHealthWatch {
 /// Order matters and is not by magnitude: a build with no decoder explains everything downstream of
 /// it, and a failing tag explains a frame count of zero far better than "the codec refused it".
 fn dominant_reason(stats: &CallMediaStats) -> AudioSilenceReason {
+    // First because it explains everything downstream of it and is the only one a consumer can fix,
+    // by building with a decoder for the codec the peer negotiated.
+    if stats.audio_frames_without_decoder > 0 {
+        return AudioSilenceReason::NoDecoderForNegotiatedCodec;
+    }
     if stats.rtp_received == 0 && stats.srtp_unprotect_failed > 0 {
         return AudioSilenceReason::AuthenticationFailing;
     }
@@ -380,6 +388,22 @@ mod tests {
             stats.rtp_received += 1;
         }
         assert_eq!(watch.poll(2_100, &stats), None);
+    }
+
+    // The only reason a consumer can act on, so it outranks every downstream symptom.
+    #[test]
+    fn a_missing_decoder_outranks_everything_it_causes() {
+        let stats = CallMediaStats {
+            rtp_received: 100,
+            audio_frames_without_decoder: 100,
+            audio_frames_concealed: 100,
+            mlow_off_point_dropped: 100,
+            ..CallMediaStats::default()
+        };
+        assert_eq!(
+            dominant_reason(&stats),
+            AudioSilenceReason::NoDecoderForNegotiatedCodec
+        );
     }
 
     #[test]

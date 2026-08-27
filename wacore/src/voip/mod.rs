@@ -7,6 +7,7 @@
 
 pub mod app_data;
 pub mod audio;
+pub mod codec_probe;
 pub mod demux;
 pub mod driver;
 pub mod e2e_srtp;
@@ -19,6 +20,7 @@ pub mod hbh_srtp;
 pub mod media_stats;
 #[cfg(feature = "voip-mlow")]
 pub mod mlow;
+pub mod opus_packet;
 pub mod registry;
 pub mod relay_parse;
 pub mod rtcp;
@@ -40,7 +42,8 @@ pub mod warp;
 pub use app_data::{AppDataError, CallReaction};
 pub use audio::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
-    OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
+    ForeignAudioCodec, ForeignCodecError, OpusMlowPacketError, depacketize_opus_from_mlow,
+    packetize_opus_for_mlow,
 };
 pub use demux::{
     GroupForwardingError, RelayPacket, RelayPacketKind, classify_relay_packet,
@@ -68,6 +71,7 @@ pub use h264::{AnnexBAuSplitter, VideoFrame};
 pub use media_stats::{AudioSilenceReason, CallMediaStats, MediaStatsCell};
 #[cfg(feature = "voip-mlow")]
 pub use mlow::{MlowDecoder, MlowEncoder};
+pub use opus_packet::{OpusBandwidth, OpusMode, OpusPacketShape, opus_packet_shape};
 pub use registry::{CallRegistry, PeerVideoTransition, VideoUpgradeToken};
 pub use session::{
     CallDirection, CallPhase, CallSession, MediaPipeline, MediaPipelineParams, VideoPipeline,
