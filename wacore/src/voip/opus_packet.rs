@@ -56,7 +56,7 @@ impl OpusPacketShape {
     pub fn total_samples(self, clock_rate: u32) -> Option<u32> {
         let total_us = self.frame_duration_us.checked_mul(u32::from(self.frames))?;
         let numerator = u64::from(total_us) * u64::from(clock_rate);
-        (numerator % 1_000_000 == 0).then(|| (numerator / 1_000_000) as u32)
+        (numerator % 1_000_000 == 0).then_some((numerator / 1_000_000) as u32)
     }
 }
 

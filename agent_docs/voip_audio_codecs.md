@@ -24,12 +24,53 @@ clock, and 60 ms packet cadence for the call.
 | `OPUS_RFC7587_48KHZ_60MS` | Native Opus | 48 kHz mono | 48 kHz / 2880 | 111 |
 
 All current profiles signal `<audio enc="opus" rate="16000">`. The rate alone does not select the
-RTP profile.
+RTP profile, and it never discriminates MLOW from Opus: every profile above signals 16000.
+
+PT 121 is MLOW's `mlow-red-1` redundancy. The shipped client also registers PT 122 as a second
+`mlow-1` when `enable_mlow_separate_pt_rx` is on, and the `_rx` props are **not** gated by the peer's
+capability while the `_tx` ones (indices 36 and 38) are: a client always registers what it can
+receive and only conditions what it sends. We do not announce index 38, so a peer with parity never
+sends us PT 122.
 
 ## Negotiation
 
-MLOW capability index 31 controls the codec sent by the peer. Native Opus clears that bit and sends
-this minimal uncompressed settings overlay in the answer:
+**PT 120 carries either codec.** The shipped client registers the payload type once at stream setup
+with `name = use_mlow_codec ? "mlow-1" : "opus"`, and its decoder factory dispatches on that name
+alone. The payload type does not tell you what the bytes are; the negotiation does. This is the
+whole of issue #1105: a peer outside the MLow rollout sends standard Opus on PT 120, and reading it
+as MLow silences the call in both directions.
+
+**Capability index 31 is `use_mlow_codec_v1`**, and the gate is a mutual AND. Each side announces
+what it can do, and the client's `reset_voip_params_if_no_capability` walks every participant: if
+any of them fails to announce the index, the parameter drops to its safe default. One boolean drives
+both the encoder and the receive-side registration; there is no per-direction pair.
+
+Read a peer blob with `wacore::stanza::call::capability_bit`. It returns three states, and two of
+them are treated in **opposite** directions by the client:
+
+| peer `<capability>` | `CapabilityBit` | effect |
+| --- | --- | --- |
+| carries index 31 | `Set` | MLow survives if we asked for it too |
+| valid, without index 31 | `Clear` | MLow drops for both directions |
+| **absent** | `Unknown` | the participant is skipped; **nothing resets** |
+| **present but unreadable** (`ver` missing, unparseable, or below the index's version) | `Clear` | falls back to a capability that answers false for everything, so **all of it resets** |
+
+Our own video `<accept>` omits the blob, so `Unknown` is not hypothetical.
+
+Where the decision is applied differs by role, and neither needs a mutable `AudioFormat`:
+
+- **callee**: the peer's capability is in the `<offer>`, before the engine exists, so the call simply
+  starts on the right codec.
+- **caller**: it arrives with `<preaccept>`/`<accept>`, after setup. It rides the channel that
+  already carries the answering device's LID (`PeerAnswer`), because both have to be applied before
+  the first inbound packet.
+
+Mid-call the codec is swapped with `CallEngine::switch_audio_codec`, which accepts **only** the
+MLOW/Opus pair at 16 kHz, 60 ms, PT 120. Those two `AudioFormat`s agree on payload type, clock rate,
+timestamp step, sample rate, channels and samples per frame, so the swap changes no RTP header byte
+and is not a renegotiation. Anything else is refused: it would move the clock under a live stream.
+
+Native Opus also sends this minimal uncompressed settings overlay in the answer:
 
 ```json
 {
@@ -38,16 +79,51 @@ this minimal uncompressed settings overlay in the answer:
 }
 ```
 
-The capability selects the peer's encoder; `use_mlow_codec_v1` selects its decoder for the reverse
-direction. Both are required for full-duplex native Opus. `enable_48khz_rtp_clock=true` independently
-selects PT 111 and the 48 kHz RTP clock; the production default is PT 120 at 16 kHz.
+`enable_48khz_rtp_clock=true` independently selects PT 111 and the 48 kHz RTP clock; the production
+default is PT 120 at 16 kHz.
 
 Incoming calls reject a locally selected rate absent from the offer. A later incompatible
-preaccept/accept emits `CallEvent::AudioFormatMismatch` and terminates the call. Codec detection never
-overrides the negotiated RTP profile.
+preaccept/accept emits `CallEvent::AudioFormatMismatch` and terminates the call.
 
 The PT120 native-Opus path was verified against Android/Web implementations and with a live
-full-duplex Android call. MLOW remains the compatibility default.
+full-duplex Android call. MLOW remains the default we ask for, subject to the AND above.
+
+### Content is a corroborator, never the source
+
+The shipped client does no content sniffing at all, and neither do we for what we **send**. But the
+negotiation has two holes on the receive side: the capability can be absent, and on the caller side
+it can lose the race with the first media packet. `voip::codec_probe` closes them without guessing.
+
+It never reads the payload alone. It asks whether two independent statements by the same peer agree:
+the duration its Opus header declares (`voip::opus_packet::opus_packet_shape`, a structural RFC 6716
+read with no libopus, so it works on wasm32 and ESP32) and the step its RTP timestamps advance by.
+Three consecutive agreements switch the decoder, once.
+
+For every packet the MLow decoder accepts today the two **cannot** agree, and that is arithmetic
+rather than sampling: such a TOC is in `{0x10..=0x13, 0x50..=0x53}`, each reads as an Opus config of
+2 or 10 (both 40 ms), every reachable duration is a multiple of 640 samples, and the stream's step is
+960. A test walks all eight TOCs at every body length to pin it.
+
+A switch driven by content emits `CallEvent::AudioCodecSwitched { source: Content }`. That is worth
+acting on: it means our model of the peer is wrong, not just that one call was rescued.
+
+## Observability
+
+Every discard on the receive path increments exactly one named counter in
+`wacore::voip::CallMediaStats`, readable through `CallHandle::media_stats()`. Two events close the
+loop:
+
+- `CallEvent::AudioSilent` when audio RTP keeps arriving and none of it becomes sound, with a
+  `dominant_reason` naming the most specific explanation the counters support;
+- `CallEvent::AudioReceptionStalled` when none arrives at all.
+
+They are deliberately distinct: one is a codec problem and the other is transport, and conflating
+them is how #1105 was mis-triaged for months. `voip::tap::PacketTap` is public and sees every relay
+datagram in both directions, which is the difference between the next media incident being a dump
+and being an investigation.
+
+A build with no decoder for the negotiated codec does not pretend. It reports `AudioSilent` with
+`NoDecoderForNegotiatedCodec`, which is the one silence reason a consumer can act on.
 
 ## Cargo features
 

@@ -185,7 +185,7 @@ impl<'a> AcceptCall<'a> {
         // decoded under the wrong grammar. MLow survives only if we asked for it and the peer
         // announced index 31; a peer outside that rollout emits standard Opus on the same payload
         // type, and decoding it as MLow is what makes the call silent (issue #1105).
-        if let Some(codec) = peer_selected_codec_from_offer(&self.incoming, audio_config.format)
+        if let Some(codec) = peer_selected_codec_from_offer(self.incoming, audio_config.format)
             && let Some(format) = audio_config.format.sibling_for(codec)
         {
             audio_config.format = format;
@@ -1207,7 +1207,7 @@ fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
 /// that pair (the 48 kHz RFC 7587 one) is left exactly as the consumer configured it.
 fn peer_selected_codec_from_offer(
     incoming: &IncomingCall,
-    format: wacore::voip::AudioFormat,
+    format: AudioFormat,
 ) -> Option<wacore::voip::AudioCodec> {
     use wacore::stanza::call::{CAPABILITY_INDEX_MLOW_V1, CapabilityBit, capability_bit};
     use wacore::voip::{AudioCodec, AudioFormat};

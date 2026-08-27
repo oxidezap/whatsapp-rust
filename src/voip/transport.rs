@@ -1796,7 +1796,7 @@ mod udp_relay_e2e {
                     video_out: async_channel::bounded(1).0,
                     video_ctl: video_control_channel().1,
                     group_ctl: None,
-                    media_stats: std::sync::Arc::new(wacore::voip::MediaStatsCell::default()),
+                    media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
                 },
                 eng,
             ));

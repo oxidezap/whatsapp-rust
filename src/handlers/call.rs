@@ -334,7 +334,7 @@ impl StanzaHandler for CallHandler {
                                 None => Some(1),
                                 Some(version) => version.as_str().parse::<u32>().ok(),
                             };
-                            capability_bit(version, &bytes, CAPABILITY_INDEX_MLOW_V1)
+                            capability_bit(version, bytes, CAPABILITY_INDEX_MLOW_V1)
                         });
                         let device = if let Some(capability) = capability
                             && let Some(bytes) =

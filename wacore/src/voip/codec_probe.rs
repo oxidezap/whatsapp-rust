@@ -57,9 +57,7 @@ impl InboundCodecProbe {
         if self.decided || active != AudioCodec::Mlow {
             return None;
         }
-        let Some(span) = frame_span else {
-            return None;
-        };
+        let span = frame_span?;
         let agrees = opus_packet_shape(payload)
             .and_then(|shape| shape.total_samples(clock_rate))
             .is_some_and(|declared| declared == span);
