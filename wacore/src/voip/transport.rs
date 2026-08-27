@@ -45,6 +45,12 @@ pub enum RelayTransportEvent {
     Connected,
     /// One packet (STUN/RTP/RTCP) arrived from the relay.
     PacketReceived(Bytes),
+    /// Inbound media the transport discarded under backpressure before the call ever saw it.
+    ///
+    /// A silent drop here is indistinguishable from a peer who stopped sending, which is the class
+    /// of ambiguity that kept issue #1105 open. Carrying the count lets the engine fold it into
+    /// [`crate::voip::CallMediaStats`] instead of losing it at the crate boundary.
+    InboundDropped(u32),
     /// The channel was lost, with the reason if one was reported.
     Disconnected(RelayDisconnectReason),
 }

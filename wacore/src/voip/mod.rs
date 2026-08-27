@@ -16,6 +16,7 @@ pub mod group_audio;
 pub mod group_media;
 pub mod h264;
 pub mod hbh_srtp;
+pub mod media_stats;
 #[cfg(feature = "voip-mlow")]
 pub mod mlow;
 pub mod registry;
@@ -26,9 +27,9 @@ pub mod session;
 pub mod sframe;
 pub mod ssrc;
 pub mod stun;
-// Internal packet-capture facility. Now `pub(crate)` and wired by no non-test consumer, so its
-// only live callers are its own tests; retained as a debugging primitive rather than deleted.
-#[allow(dead_code)]
+// Packet-capture facility. Attachable by a consumer through `CallHandle::attach_packet_tap`: it
+// sees every relay datagram in both directions, which is what turns the next media incident into a
+// dump instead of an investigation.
 pub mod tap;
 pub mod transport;
 pub mod warp;
@@ -63,6 +64,7 @@ pub use group_media::{
     ParticipantVideo,
 };
 pub use h264::{AnnexBAuSplitter, VideoFrame};
+pub use media_stats::{AudioSilenceReason, CallMediaStats, MediaStatsCell};
 #[cfg(feature = "voip-mlow")]
 pub use mlow::{MlowDecoder, MlowEncoder};
 pub use registry::{CallRegistry, PeerVideoTransition, VideoUpgradeToken};
@@ -70,6 +72,7 @@ pub use session::{
     CallDirection, CallPhase, CallSession, MediaPipeline, MediaPipelineParams, VideoPipeline,
     VideoPipelineParams,
 };
+pub use tap::{InMemoryTap, PacketDir, PacketTap, TappedFactory, TappedTransport};
 pub use transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };

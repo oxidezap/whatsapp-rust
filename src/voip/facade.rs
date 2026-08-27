@@ -2743,6 +2743,14 @@ async fn attach_engine(
         video_shared.send_control(VideoControl::Enable);
     }
 
+    // One cell, two readers: the drive loop publishes into it and the consumer's `CallHandle` reads
+    // it back through the registry. Installed here rather than at registration because a call
+    // without a media plane has nothing to count.
+    let media_stats = Arc::new(wacore::voip::MediaStatsCell::default());
+    client
+        .call_registry()
+        .set_media_stats(call_id, generation, media_stats.clone());
+
     let channels = CallChannels {
         mic: mic_rx,
         speaker,
@@ -2754,6 +2762,7 @@ async fn attach_engine(
         video_out: video_out_tx,
         video_ctl: video_ctl_rx,
         group_ctl,
+        media_stats,
     };
 
     let registry = client.call_registry();
@@ -3187,6 +3196,17 @@ impl CallHandle {
     /// The call-id this handle controls.
     pub fn call_id(&self) -> &str {
         &self.call_id
+    }
+
+    /// Media counters for this call: what arrived, what was discarded, and where.
+    ///
+    /// All-zero until the media plane attaches, and additive after that; sample twice and subtract
+    /// for a rate. Pair it with [`wacore::voip::CallEvent::AudioSilent`], which fires on its own
+    /// when packets keep arriving and none of them becomes sound: the event says a call is silent
+    /// and these counters say why.
+    pub fn media_stats(&self) -> wacore::voip::CallMediaStats {
+        self.client_registry
+            .media_stats(&self.call_id, self.generation)
     }
 
     /// The peer this call is with, as the `<terminate>` target. For an outgoing call this is the

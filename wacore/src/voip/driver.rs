@@ -467,6 +467,8 @@ pub struct CallChannels {
     pub video_ctl: VideoControlReceiver,
     /// Group roster and decrypted epoch transitions. `None` for a 1:1 call.
     pub group_ctl: Option<async_channel::Receiver<GroupControl>>,
+    /// Where the drive loop publishes media counters for `CallHandle::media_stats`.
+    pub media_stats: Arc<crate::voip::media_stats::MediaStatsCell>,
 }
 
 /// Bound slow relay writes without truncating a complete video access unit.
@@ -960,7 +962,16 @@ async fn run_call_with_clock_and_wallclock(
     let mut timer: DeadlineTimer = Fuse::terminated();
     let mut armed_deadline: Option<engine::Millis> = None;
 
+    // Only republished when a counter actually moved: comparing fifteen `u32`s is cheaper than
+    // taking the lock, and on a healthy call only `rtp_received` and one decode counter ever move.
+    let mut published_stats = crate::voip::media_stats::CallMediaStats::default();
+
     'drive: loop {
+        let stats = eng.media_stats();
+        if stats != published_stats {
+            channels.media_stats.publish(stats);
+            published_stats = stats;
+        }
         // Drain every intent the last mutation produced; stop at the terminal Timeout.
         let mut pending_video = Vec::new();
         let mut reconnect_to = None;
@@ -1352,6 +1363,9 @@ async fn run_call_with_clock_and_wallclock(
                     {
                         eng.handle_input(now, Input::Timeout);
                     }
+                }
+                Ok(RelayTransportEvent::InboundDropped(packets)) => {
+                    eng.note_inbound_dropped(packets);
                 }
                 // The channel is already open by the time we run; Connected is a redundant confirm.
                 Ok(RelayTransportEvent::Connected) => {}
@@ -1764,6 +1778,7 @@ mod tests {
             video_out: vout_tx,
             video_ctl: vctl_rx,
             group_ctl: None,
+            media_stats: Arc::new(crate::voip::media_stats::MediaStatsCell::default()),
         }
     }
 
@@ -2858,6 +2873,7 @@ mod tests {
                 video_out: vout_tx,
                 video_ctl: vctl_rx,
                 group_ctl: None,
+                media_stats: Arc::new(crate::voip::media_stats::MediaStatsCell::default()),
             },
             eng,
         ));

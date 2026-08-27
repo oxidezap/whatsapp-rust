@@ -23,7 +23,7 @@ const TAP_FORWARD_CAP: usize = 256;
 
 /// Which way a captured packet was crossing the seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PacketDir {
+pub enum PacketDir {
     /// Sent by us to the relay (an engine `Output::Transmit`).
     Outbound,
     /// Received from the relay (a `RelayTransportEvent::PacketReceived`).
@@ -34,13 +34,13 @@ pub(crate) enum PacketDir {
 /// in-memory buffer, or to forward elsewhere. Called once per packet in both directions -- inline on
 /// the send path and on the inbound forwarding hop -- so keep it cheap and non-blocking. It sees
 /// every packet, including ones the driver later drops under backpressure (recording happens first).
-pub(crate) trait PacketTap: crate::sync_marker::MaybeSendSync {
+pub trait PacketTap: crate::sync_marker::MaybeSendSync {
     fn on_packet(&self, dir: PacketDir, data: &[u8]);
 }
 
 /// Decorates a [`RelayTransport`], recording every outbound packet before delegating to the inner
 /// transport. Pure: no runtime and no I/O of its own (any I/O is the sink's).
-pub(crate) struct TappedTransport {
+pub struct TappedTransport {
     inner: Arc<dyn RelayTransport>,
     tap: Arc<dyn PacketTap>,
 }
@@ -98,7 +98,7 @@ async fn tap_forward(
 /// [`TappedTransport`], inbound via a forwarding task spawned on the injected runtime that records
 /// each packet before handing it to the driver. Construct it only when capture is wanted -- the
 /// un-tapped path pays nothing. Runtime-agnostic, so native and the WASM bridge use the same tap.
-pub(crate) struct TappedFactory {
+pub struct TappedFactory {
     inner: Arc<dyn RelayTransportFactory>,
     tap: Arc<dyn PacketTap>,
     runtime: Arc<dyn Runtime>,
@@ -143,7 +143,7 @@ impl RelayTransportFactory for TappedFactory {
 /// A [`PacketTap`] that records every packet into an in-memory buffer. For tests and in-process
 /// inspection; a file/pcap sink lives in the consumer (e.g. the example's `VOIP_DUMP`).
 #[derive(Default)]
-pub(crate) struct InMemoryTap {
+pub struct InMemoryTap {
     captured: std::sync::Mutex<Vec<(PacketDir, Vec<u8>)>>,
 }
 

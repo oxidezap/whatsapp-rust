@@ -28,6 +28,7 @@ use super::group_media::{
     group_device_is_local,
 };
 use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
+use super::media_stats::{AudioHealthAlarm, AudioHealthWatch, AudioSilenceReason, CallMediaStats};
 #[cfg(feature = "voip-mlow")]
 use super::mlow;
 use super::rtcp::{
@@ -563,6 +564,25 @@ pub enum CallEvent {
         video_access_units: u32,
         packets: u32,
     },
+    /// Audio RTP keeps arriving and none of it is becoming sound.
+    ///
+    /// The consumer-visible answer to the failure mode behind issue #1105: a call that connects,
+    /// stays connected, and carries silence used to be indistinguishable from a peer who is not
+    /// speaking. Re-emitted on a fixed cadence while the condition holds, with a monotonic
+    /// `silent_for_ms`, so a truncated log still catches it. Diagnostic, never terminal.
+    AudioSilent {
+        silent_for_ms: Millis,
+        /// Packets counted in the window that produced this alarm, not for the whole call.
+        rtp_received: u32,
+        frames_produced: u32,
+        dominant_reason: AudioSilenceReason,
+    },
+    /// No audio RTP has arrived at all since the relay allocated.
+    ///
+    /// Deliberately distinct from [`Self::AudioSilent`]: this one is a transport problem and that
+    /// one is a codec problem, and conflating them is exactly how #1105 was mis-triaged for months.
+    /// Emitted once per call.
+    AudioReceptionStalled { silent_for_ms: Millis },
 }
 
 impl CallEvent {
@@ -624,7 +644,9 @@ impl CallEvent {
             | Self::WaitingRoomHeartbeatFailed
             | Self::GroupControlRejected { .. }
             | Self::GroupRekeyFailed
-            | Self::OutboundMediaDropped { .. } => 0,
+            | Self::OutboundMediaDropped { .. }
+            | Self::AudioSilent { .. }
+            | Self::AudioReceptionStalled { .. } => 0,
         }
     }
 }
@@ -827,6 +849,10 @@ pub struct CallEngine {
     /// Peer device orientation (0..3, ×90°) from the last `<video device_orientation>`; stamped on
     /// every reassembled inbound AU so the sink can rotate.
     peer_video_orientation: u8,
+    /// Media counters and the audio-health watchdog. On the engine rather than `MediaState` so a
+    /// call that never gets a media plane still reports zeroes instead of nothing.
+    media_stats: CallMediaStats,
+    health: AudioHealthWatch,
     outbox: VecDeque<Output>,
 }
 
@@ -969,6 +995,8 @@ impl CallEngine {
             group: None,
             media,
             peer_video_orientation: 0,
+            media_stats: CallMediaStats::default(),
+            health: AudioHealthWatch::default(),
             outbox: VecDeque::new(),
         })
     }
@@ -1725,6 +1753,9 @@ impl CallEngine {
         if let Some(m) = &self.media {
             next = next.min(m.playout_deadline);
             next = next.min(self.rtcp_deadline);
+            // The health watchdog needs its own tick: its whole job is to fire when nothing else
+            // is happening, so it cannot ride on a timer that inbound media drives.
+            next = next.min(self.health.deadline());
         }
         if let Some(deadline) = self
             .group
@@ -1815,7 +1846,50 @@ impl CallEngine {
             self.emit_sender_reports(now, self.rtcp_wallclock_at(now));
             self.rtcp_deadline = next_tick(self.rtcp_deadline, now, RTCP_MS);
         }
+        self.poll_audio_health(now);
         self.retransmit_group_reactions(now);
+    }
+
+    /// Media counters for this call. Additive for the call's life; sample twice for a rate.
+    pub fn media_stats(&self) -> CallMediaStats {
+        self.media_stats
+    }
+
+    /// Fold in inbound media the transport dropped before the engine could see it.
+    ///
+    /// The drop happens one crate out, in the relay read pump, so the engine cannot observe it
+    /// directly. Reporting it keeps every discard on the receive path attributable to exactly one
+    /// counter, which is the invariant that makes a silent call diagnosable.
+    pub fn note_inbound_dropped(&mut self, packets: u32) {
+        self.media_stats.inbound_pipe_dropped = self
+            .media_stats
+            .inbound_pipe_dropped
+            .saturating_add(packets);
+    }
+
+    fn poll_audio_health(&mut self, now: Millis) {
+        let Some(alarm) = self.health.poll(now, &self.media_stats) else {
+            return;
+        };
+        let event = match alarm {
+            AudioHealthAlarm::Silent {
+                silent_for_ms,
+                rtp_received,
+                frames_produced,
+                dominant_reason,
+            } => CallEvent::AudioSilent {
+                silent_for_ms,
+                rtp_received,
+                frames_produced,
+                dominant_reason,
+            },
+            AudioHealthAlarm::Stalled { silent_for_ms } => {
+                CallEvent::AudioReceptionStalled { silent_for_ms }
+            }
+        };
+        #[cfg(feature = "tracing")]
+        tracing::warn!(call_id = %self.call_id, ?event, "voip audio health");
+        self.outbox.push_back(Output::Event(event));
     }
 
     fn retransmit_group_reactions(&mut self, now: Millis) {
@@ -1927,6 +2001,10 @@ impl CallEngine {
 
     fn on_packet(&mut self, now: Millis, pkt: &[u8]) {
         let Ok(pkt) = unwrap_group_forwarding_packet(pkt) else {
+            self.media_stats.forwarding_envelope_rejected = self
+                .media_stats
+                .forwarding_envelope_rejected
+                .saturating_add(1);
             return;
         };
         let pkt = pkt.payload;
@@ -1934,7 +2012,12 @@ impl CallEngine {
             RelayPacketKind::Stun => self.on_stun(now, pkt),
             RelayPacketKind::Rtp => self.on_rtp(now, pkt),
             RelayPacketKind::Rtcp => self.on_rtcp(now, pkt),
-            RelayPacketKind::Other => {}
+            // Nothing the media plane speaks. Counted rather than ignored: a relay that starts
+            // wrapping packets differently would otherwise present as a call with no media at all.
+            RelayPacketKind::Other => {
+                self.media_stats.relay_packet_unclassified =
+                    self.media_stats.relay_packet_unclassified.saturating_add(1);
+            }
         }
     }
 
@@ -2080,6 +2163,9 @@ impl CallEngine {
                     .push_back(Output::Event(CallEvent::RelayAllocated));
                 if self.media.is_some() {
                     self.rtcp_deadline = now + RTCP_MS;
+                    // Inbound media only becomes possible here, so this is the earliest instant at
+                    // which "no audio has arrived" means anything.
+                    self.health.media_started(now);
                     self.announce_audio_rtcp_session();
                 }
             }
@@ -2151,11 +2237,23 @@ impl CallEngine {
             .format
             .accepts_rtp_payload_type(wire_header.payload_type)
         {
+            // A payload type outside the negotiated profile is indistinguishable from a peer who
+            // stopped talking unless it is counted: this discard is how a profile mismatch hides.
+            self.media_stats.rtp_payload_type_unexpected = self
+                .media_stats
+                .rtp_payload_type_unexpected
+                .saturating_add(1);
             return;
         }
         let Some((header, payload)) = m.pipe.unprotect_audio(pkt) else {
+            // Wrong recv keys, wrong peer LID or a desynced ROC all land here, and every one of
+            // them makes the call totally deaf with no other symptom.
+            self.media_stats.srtp_unprotect_failed =
+                self.media_stats.srtp_unprotect_failed.saturating_add(1);
             return;
         };
+        self.media_stats.rtp_received = self.media_stats.rtp_received.saturating_add(1);
+        self.health.on_rtp();
         m.audio_reception.observe(
             header.ssrc,
             header.sequence_number,
@@ -2166,7 +2264,15 @@ impl CallEngine {
         // SFrame on: use the GCM-decrypted bytes; otherwise the SRTP payload is already plain codec.
         let encoded = match m.sframe.as_ref().map(|s| s.decrypt(&payload)) {
             Some(SframeIn::Decrypted(plain)) => plain,
-            _ => payload,
+            Some(SframeIn::Plaintext) => {
+                // A session was installed and the tag did not authenticate. Passing the payload
+                // through is the documented contract, but doing it silently would hand ciphertext
+                // to the codec and call the result a codec problem.
+                self.media_stats.sframe_decrypt_failed =
+                    self.media_stats.sframe_decrypt_failed.saturating_add(1);
+                payload
+            }
+            None => payload,
         };
         let codec = m.audio.format.inbound_codec(header.payload_type, &encoded);
         #[cfg(feature = "voip-mlow")]
@@ -2176,6 +2282,9 @@ impl CallEngine {
             return;
         }
         if m.audio.io == AudioIo::Encoded {
+            self.media_stats.audio_frames_delivered =
+                self.media_stats.audio_frames_delivered.saturating_add(1);
+            self.health.on_audio_produced();
             self.outbox
                 .push_back(Output::EncodedAudio(EncodedAudioFrame {
                     format: m.audio.format,
@@ -2203,13 +2312,36 @@ impl CallEngine {
         pcm.decoder
             .set_redundancy(i32::from(header.payload_type == RTP_PAYLOAD_TYPE_MLOW_RED));
         #[cfg(feature = "voip-mlow")]
-        {
+        let decode_report = {
             let decoded = pcm.decoder.decode(&encoded);
             // Declared, not decoded; see `MlowDecoder::last_packet_samps`.
             pcm.packet_samps = pcm.decoder.last_packet_samps();
             for s in decoded {
                 pcm.jitter
                     .push_back((s * 32767.0).clamp(-32768.0, 32767.0) as i16);
+            }
+            pcm.decoder.take_frame_report()
+        };
+        #[cfg(feature = "voip-mlow")]
+        {
+            self.media_stats.audio_frames_decoded = self
+                .media_stats
+                .audio_frames_decoded
+                .saturating_add(u32::from(decode_report.decoded));
+            self.media_stats.audio_frames_concealed = self
+                .media_stats
+                .audio_frames_concealed
+                .saturating_add(u32::from(decode_report.concealed));
+            self.media_stats.mlow_off_point_dropped = self
+                .media_stats
+                .mlow_off_point_dropped
+                .saturating_add(u32::from(decode_report.off_point));
+            self.media_stats.mlow_inactive_or_sid = self
+                .media_stats
+                .mlow_inactive_or_sid
+                .saturating_add(u32::from(decode_report.inactive_or_sid));
+            if decode_report.decoded > 0 {
+                self.health.on_audio_produced();
             }
         }
         // Bound the buffer on the feed side too: a burst of inbound packets arriving between two 20ms
@@ -2222,6 +2354,12 @@ impl CallEngine {
             if pcm.jitter.len() > pcm.playout_cap {
                 let drop_n = pcm.jitter.len() - pcm.playout_cap;
                 pcm.jitter.drain(..drop_n);
+                // Trimming discards speech that was legally queued. Counted so a call that sounds
+                // chopped can be told apart from one that never decoded anything.
+                self.media_stats.playout_trimmed_samples = self
+                    .media_stats
+                    .playout_trimmed_samples
+                    .saturating_add(drop_n as u32);
             }
         }
     }
@@ -5244,6 +5382,181 @@ mod tests {
             "feed-side jitter must stay <= PLAYOUT_CAP, got {}",
             eng.jitter_len()
         );
+    }
+
+    /// A peer pipeline keyed the mirror of `engine(true)`, so its packets authenticate here.
+    fn peer_pipeline() -> MediaPipeline {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        MediaPipeline::new(&MediaPipelineParams {
+            call_key: &call_key,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: SSRC,
+            samples_per_packet: SAMPLES,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap()
+    }
+
+    /// Started, allocated, and with the health watchdog armed: the state a live call is in.
+    fn allocated_engine() -> CallEngine {
+        let mut eng = engine(true);
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+        eng
+    }
+
+    // Every discard on the receive path has to leave a trace. A payload type outside the negotiated
+    // profile used to `return` with no log and no counter, which is indistinguishable from a peer
+    // who stopped sending -- the ambiguity that kept issue #1105 open.
+    #[test]
+    fn an_unexpected_payload_type_is_counted_rather_than_silently_dropped() {
+        let mut eng = allocated_engine();
+        let mut peer_tx = peer_pipeline();
+        let mut packet = peer_tx.protect_audio(&[0x50, 1, 2, 3]);
+        // Rewrite the payload type in place; the WARP tag is over the packet, so this also makes it
+        // fail authentication. Assert only on the PT counter, which is checked first.
+        packet[1] = (packet[1] & 0x80) | 99;
+        eng.handle_input(1, Input::RelayPacket(&packet));
+        let _ = drain(&mut eng);
+        let stats = eng.media_stats();
+        assert_eq!(stats.rtp_payload_type_unexpected, 1);
+        assert_eq!(stats.rtp_received, 0);
+    }
+
+    // The most dangerous discard in the file: wrong recv keys make a call totally deaf, and before
+    // this counter existed there was no observation at all distinguishing it from silence.
+    #[test]
+    fn a_packet_that_fails_its_tag_is_counted() {
+        let mut eng = allocated_engine();
+        let mut peer_tx = peer_pipeline();
+        let mut packet = peer_tx.protect_audio(&[0x50, 1, 2, 3]);
+        let last = packet.len() - 1;
+        packet[last] ^= 0xff;
+        eng.handle_input(1, Input::RelayPacket(&packet));
+        let _ = drain(&mut eng);
+        let stats = eng.media_stats();
+        assert_eq!(stats.srtp_unprotect_failed, 1);
+        assert_eq!(stats.rtp_received, 0);
+    }
+
+    // A relay datagram the media plane does not speak is counted, so a relay that changes its
+    // framing presents as "unclassified packets" instead of as a call with no media.
+    #[test]
+    fn an_unclassifiable_relay_datagram_is_counted() {
+        let mut eng = allocated_engine();
+        // Version bits 01: not STUN (which is `b0 & 0xc0 == 0`), and not RTP/RTCP, which require
+        // version 2. Nothing the media plane speaks.
+        eng.handle_input(1, Input::RelayPacket(&[0x40, 0x00, 0x00, 0x00, 0xaa]));
+        let _ = drain(&mut eng);
+        assert_eq!(eng.media_stats().relay_packet_unclassified, 1);
+    }
+
+    // The consumer-visible half of the #1105 fix: packets keep arriving, none of them becomes
+    // sound, and the call says so instead of looking like a peer who is not speaking.
+    #[test]
+    fn a_call_that_receives_packets_and_produces_no_audio_reports_itself_silent() {
+        let mut eng = allocated_engine();
+        let mut peer_tx = peer_pipeline();
+        // TOC 0x58 is what a WhatsApp Desktop peer outside the MLow rollout actually sends: an Opus
+        // SILK wideband frame that the MLow decoder reads as a 120 ms packet and cannot decode.
+        let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        let mut now = 1;
+        let mut events = Vec::new();
+        for _ in 0..80 {
+            let packet = peer_tx.protect_audio(&body);
+            eng.handle_input(now, Input::RelayPacket(&packet));
+            let (outputs, _) = drain(&mut eng);
+            events.extend(outputs.into_iter().filter_map(|o| match o {
+                Output::Event(ev) => Some(ev),
+                _ => None,
+            }));
+            now += 60;
+            eng.handle_input(now, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            events.extend(outputs.into_iter().filter_map(|o| match o {
+                Output::Event(ev) => Some(ev),
+                _ => None,
+            }));
+        }
+        let silent = events
+            .iter()
+            .find_map(|ev| match ev {
+                CallEvent::AudioSilent {
+                    rtp_received,
+                    frames_produced,
+                    dominant_reason,
+                    ..
+                } => Some((*rtp_received, *frames_produced, *dominant_reason)),
+                _ => None,
+            })
+            .expect("a call receiving packets and decoding none must report itself silent");
+        assert!(silent.0 >= 20, "window must carry enough packets to judge");
+        assert_eq!(silent.1, 0, "no audio was produced");
+        assert_eq!(silent.2, AudioSilenceReason::CodecRejectingFrames);
+        let stats = eng.media_stats();
+        assert_eq!(stats.rtp_received, 80);
+        assert_eq!(stats.audio_frames_decoded, 0);
+        // The duration guard admits 120 ms, so these reach the range coder and fail its endpoint
+        // check instead of being refused up front. Either counter is the same user-visible outcome,
+        // which is why `dominant_reason` covers both.
+        assert!(
+            stats.audio_frames_concealed > 0 || stats.mlow_off_point_dropped > 0,
+            "the decoder must record refusing every frame, got {stats:?}"
+        );
+    }
+
+    // A call carrying real audio must never alarm; without this the watchdog is a false-positive
+    // generator and the first thing a consumer does is ignore it.
+    #[test]
+    fn a_healthy_call_never_reports_itself_silent() {
+        let mut eng = allocated_engine();
+        let mut peer_tx = peer_pipeline();
+        let mut peer_enc = MlowEncoder::new();
+        let mut now = 1;
+        for n in 0..80u32 {
+            let tone: Vec<f32> = (0..SAMPLES as usize)
+                .map(|i| 0.3 * ((i as f32 + (n * SAMPLES) as f32) * 0.05).sin())
+                .collect();
+            let frame = peer_enc.encode(&tone).expect("mlow encode");
+            let packet = peer_tx.protect_audio(&frame);
+            eng.handle_input(now, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+            now += 60;
+            eng.handle_input(now, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                assert!(
+                    !matches!(
+                        output,
+                        Output::Event(CallEvent::AudioSilent { .. })
+                            | Output::Event(CallEvent::AudioReceptionStalled { .. })
+                    ),
+                    "a call decoding audio must not alarm, got {output:?}"
+                );
+            }
+        }
+        assert!(eng.media_stats().audio_frames_decoded > 0);
+    }
+
+    // Reception that never starts is a transport problem, and it gets its own event: conflating it
+    // with a codec problem is how #1105 was mis-triaged.
+    #[test]
+    fn a_call_that_never_receives_rtp_reports_a_stall_exactly_once() {
+        let mut eng = allocated_engine();
+        let mut stalls = 0;
+        for tick in 1..=40u64 {
+            eng.handle_input(tick * 500, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            stalls += outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(CallEvent::AudioReceptionStalled { .. })))
+                .count();
+        }
+        assert_eq!(stalls, 1, "a stalled call does not become more stalled");
     }
 
     // Encoded routing follows negotiation, not an ambiguous TOC-byte heuristic.

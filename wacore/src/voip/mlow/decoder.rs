@@ -44,6 +44,34 @@ fn endpoint_is_valid(storage: u32, consumed: u32) -> bool {
     storage <= consumed && consumed <= storage + 4
 }
 
+/// What one call to [`MlowDecoder::decode`] did with the packet it was given.
+///
+/// The decoder answers with PCM either way, so without this a concealed frame, a frame outside the
+/// operating point and a frame of genuine background noise are the same observation: silence. That
+/// ambiguity is what let issue #1105 stay open, and it is the whole reason the engine counts.
+///
+/// Counts rather than flags because one packet can chain several internal frames, and a multiframe
+/// envelope can chain several packets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MlowFrameReport {
+    /// Frames that produced coded audio.
+    pub decoded: u8,
+    /// Frames concealed: an empty payload, a RED envelope that would not unwrap, or a body whose
+    /// decode did not end where the body said it should.
+    pub concealed: u8,
+    /// Frames refused by the operating-point guard, including a standard-Opus escape this decoder
+    /// does not run.
+    pub off_point: u8,
+    /// Frames that carried no coded voice (SID / comfort noise).
+    pub inactive_or_sid: u8,
+}
+
+impl MlowFrameReport {
+    fn bump(slot: &mut u8) {
+        *slot = slot.saturating_add(1);
+    }
+}
+
 /// Stateful pure-Rust MLow decoder. Decodes one RTP payload (a bare MLow frame, or a SplitRed
 /// packet when redundancy was negotiated) into a PCM frame at 16 kHz, one 20 ms internal frame
 /// per chained frame in the packet.
@@ -64,6 +92,9 @@ pub struct MlowDecoder {
     /// once + every-100th `warn`, so a peer sending a stream this decoder cannot read is visible in
     /// a log rather than silently quiet.
     malformed: u32,
+    /// What the in-flight `decode` call has done so far. Reset at the top of every `decode` and
+    /// drained by the caller through [`MlowDecoder::take_frame_report`].
+    report: MlowFrameReport,
     /// Samples the last packet DECLARED, from its TOC, which is not always what `decode` returned:
     /// a SID, a drop or a standard-Opus escape emits a fixed slot regardless of duration. Consumers
     /// sizing a jitter cushion need the declared value, since that is what sets arrival cadence.
@@ -84,6 +115,7 @@ impl MlowDecoder {
             had_error: false,
             dropped_unsupported: 0,
             malformed: 0,
+            report: MlowFrameReport::default(),
             last_packet_samps: OPUS_FRAME_SAMPS,
         }
     }
@@ -102,6 +134,14 @@ impl MlowDecoder {
         self.last_packet_samps
     }
 
+    /// Take what the last [`MlowDecoder::decode`] did, clearing it.
+    ///
+    /// Cleared on read so a caller that forgets to drain cannot silently accumulate one packet's
+    /// verdict into the next one's.
+    pub fn take_frame_report(&mut self) -> MlowFrameReport {
+        core::mem::take(&mut self.report)
+    }
+
     /// Set the negotiated RED redundancy level (0 = bare frames, the common case).
     pub fn set_redundancy(&mut self, n: i32) {
         self.redundancy = n;
@@ -116,7 +156,9 @@ impl MlowDecoder {
     /// Decode one RTP MLow payload into a PCM frame, float in [-1, 1]. The sample count follows
     /// the packet's declared duration; a dropped or silenced frame yields a 60 ms slot.
     pub fn decode(&mut self, payload: &[u8]) -> Vec<f32> {
+        self.report = MlowFrameReport::default();
         if payload.is_empty() {
+            MlowFrameReport::bump(&mut self.report.concealed);
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         if self.redundancy > 0 {
@@ -129,6 +171,7 @@ impl MlowDecoder {
                 },
                 Err(e) => {
                     log::warn!("mlow RED depacketization failed: {e:?}");
+                    MlowFrameReport::bump(&mut self.report.concealed);
                     vec![0.0; OPUS_FRAME_SAMPS]
                 }
             };
@@ -138,6 +181,7 @@ impl MlowDecoder {
 
     fn decode_frame(&mut self, frame: &[u8]) -> Vec<f32> {
         if frame.is_empty() {
+            MlowFrameReport::bump(&mut self.report.concealed);
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         let toc = parse_mlow_toc(frame[0]);
@@ -150,6 +194,7 @@ impl MlowDecoder {
                 "mlow: standard-opus TOC 0x{:02x} -> {out_len} samples silence",
                 frame[0]
             );
+            MlowFrameReport::bump(&mut self.report.off_point);
             return vec![0.0; out_len];
         }
         // A SID (DTX/CNG) frame carries comfort noise rather than coded voice and is silenced without
@@ -162,6 +207,7 @@ impl MlowDecoder {
         // background noise this way, and the reference decodes it. It goes through the normal path.
         if toc.sid {
             log::debug!("mlow: SID TOC 0x{:02x} -> 60ms silence", frame[0]);
+            MlowFrameReport::bump(&mut self.report.inactive_or_sid);
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         // Operating-point guard for active frames: a different internal rate, the low_rate=1 2x160
@@ -189,6 +235,7 @@ impl MlowDecoder {
                     frame[0]
                 );
             }
+            MlowFrameReport::bump(&mut self.report.off_point);
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         let frames = frames.expect("the guard above rejected every unsupported duration");
@@ -338,7 +385,11 @@ impl MlowDecoder {
                     body
                 );
             }
+            MlowFrameReport::bump(&mut self.report.concealed);
             return vec![0.0; out_len];
+        }
+        for _ in 0..frames {
+            MlowFrameReport::bump(&mut self.report.decoded);
         }
 
         // Per-packet harmonic postfilter (the codec's final pitch comb + 48-sample group delay), run

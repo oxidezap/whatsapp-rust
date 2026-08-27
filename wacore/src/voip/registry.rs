@@ -225,6 +225,10 @@ fn retained_epoch(control: GroupControl) -> Option<GroupRawEpoch> {
 struct CallEntry {
     session: CallSession,
     media_task: Option<AbortHandle>,
+    /// Media counters published by the drive loop, readable through the consumer's `CallHandle`.
+    /// Installed when the engine attaches; absent before that, which reads as all-zero rather than
+    /// as an error, because a call with no media plane genuinely has no media to count.
+    media_stats: Option<Arc<crate::voip::media_stats::MediaStatsCell>>,
     /// Keeps a pending call-link admission alive. Cleared on admission and aborted with the entry.
     waiting_room_task: Option<AbortHandle>,
     /// Monotonic token distinguishing this registration from a later same-call-id replacement, so a
@@ -1428,6 +1432,7 @@ impl CallRegistry {
             self_video_orientation: 0,
             session,
             media_task: None,
+            media_stats: None,
             waiting_room_task: None,
             generation,
             rekey_tx: None,
@@ -1520,6 +1525,32 @@ impl CallRegistry {
     /// Attach (or replace) the media task for the call registered under `generation`. If the call
     /// was removed or superseded by a newer generation, the handle is aborted immediately so its
     /// task can't outlive the call.
+    /// Install the cell the drive loop publishes media counters into.
+    pub fn set_media_stats(
+        &self,
+        call_id: &str,
+        generation: u64,
+        cell: Arc<crate::voip::media_stats::MediaStatsCell>,
+    ) {
+        if let Some(entry) = self
+            .active_calls()
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.media_stats = Some(cell);
+        }
+    }
+
+    /// Media counters for one call generation, or all-zero before the engine attaches.
+    pub fn media_stats(&self, call_id: &str, generation: u64) -> crate::voip::CallMediaStats {
+        self.active_calls()
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.media_stats.as_ref())
+            .map(|cell| cell.snapshot())
+            .unwrap_or_default()
+    }
+
     pub fn set_media_task(&self, call_id: &str, generation: u64, handle: AbortHandle) {
         let aborted = {
             let mut map = self.active_calls();

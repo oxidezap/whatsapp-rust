@@ -792,6 +792,8 @@ async fn relay_driver(
 ) {
     let mut buf = vec![0u8; RELAY_DATAGRAM_BUF];
     let mut announced = false;
+    // Media discarded under backpressure since the last report. See `deliver`.
+    let mut dropped_inbound = 0u32;
     let mut hung_up = false;
     loop {
         // Flush, deliver, announce: everything the stack produced since the last wakeup, before
@@ -804,7 +806,7 @@ async fn relay_driver(
             }
         }
         while let Some(packet) = stack.poll_inbound() {
-            if !deliver(&events, packet).await {
+            if !deliver(&events, packet, &mut dropped_inbound).await {
                 return; // the call dropped its receiver
             }
         }
@@ -867,10 +869,28 @@ async fn sleep_until(deadline: Option<Instant>) {
 
 /// Push one inbound packet to the call, dropping media (but never STUN) under backpressure. Returns
 /// `false` once the call has dropped its receiver and the driver should stop.
-async fn deliver(events: &async_channel::Sender<RelayTransportEvent>, packet: Bytes) -> bool {
+///
+/// `dropped` accumulates media discarded here. It cannot be reported at the moment of the drop: the
+/// queue being full is precisely why the packet is going away, so a notification sent right then
+/// would be discarded too. It is flushed on the next delivery that succeeds, which is the first
+/// instant the channel has room for it.
+async fn deliver(
+    events: &async_channel::Sender<RelayTransportEvent>,
+    packet: Bytes,
+    dropped: &mut u32,
+) -> bool {
     let kind = classify_relay_packet(&packet);
     match events.try_send(RelayTransportEvent::PacketReceived(packet)) {
-        Ok(()) => true,
+        Ok(()) => {
+            if *dropped > 0
+                && events
+                    .try_send(RelayTransportEvent::InboundDropped(*dropped))
+                    .is_ok()
+            {
+                *dropped = 0;
+            }
+            true
+        }
         // Media is loss tolerant, but STUN control is NOT: dropping a Binding Request means the
         // engine never replies Binding Success, so the relay's consent-freshness check fails and it
         // tears the call down (~4s) -- even though only media should be lossy. Under backpressure
@@ -882,6 +902,7 @@ async fn deliver(events: &async_channel::Sender<RelayTransportEvent>, packet: By
         // dead one. Past the bound the STUN goes the way of the media.
         Err(async_channel::TrySendError::Full(event)) => {
             if kind != RelayPacketKind::Stun {
+                *dropped = dropped.saturating_add(1);
                 return true;
             }
             match tokio::time::timeout(RELAY_STUN_HOLD, events.send(event)).await {
@@ -954,8 +975,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_maps_packets_to_events() {
         let (tx, rx) = async_channel::unbounded();
-        assert!(deliver(&tx, Bytes::from_static(&[1, 2, 3])).await);
-        assert!(deliver(&tx, Bytes::from_static(&[4, 5])).await);
+        assert!(deliver(&tx, Bytes::from_static(&[1, 2, 3]), &mut 0).await);
+        assert!(deliver(&tx, Bytes::from_static(&[4, 5]), &mut 0).await);
         match rx.try_recv() {
             Ok(RelayTransportEvent::PacketReceived(b)) => assert_eq!(b.as_ref(), &[1u8, 2, 3][..]),
             other => panic!("expected first packet, got {other:?}"),
@@ -972,7 +993,7 @@ mod tests {
         let (tx, rx) = async_channel::unbounded();
         rx.close();
         assert!(
-            !deliver(&tx, Bytes::from_static(&[1])).await,
+            !deliver(&tx, Bytes::from_static(&[1]), &mut 0).await,
             "a closed event receiver must stop the driver"
         );
     }
@@ -984,12 +1005,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deliver_bounds_how_long_stun_can_hold_the_driver() {
         let (tx, _rx) = async_channel::bounded(1);
-        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2])).await);
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2]), &mut 0).await);
         let held = tokio::time::Instant::now();
         // The outer bound is what makes an unbounded hold fail here rather than hang the suite.
         let kept_going = tokio::time::timeout(
             RELAY_STUN_HOLD * 50,
-            deliver(&tx, Bytes::from_static(&[0x00, 0x01, 5, 6])),
+            deliver(&tx, Bytes::from_static(&[0x00, 0x01, 5, 6]), &mut 0),
         )
         .await
         .expect("the STUN hold must give up, or the driver's timers never run again");
@@ -1013,9 +1034,9 @@ mod tests {
     async fn deliver_preserves_stun_but_drops_media_under_backpressure() {
         let (tx, rx) = async_channel::bounded(1);
         let feed = tokio::spawn(async move {
-            assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2])).await);
-            assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 3, 4])).await);
-            assert!(deliver(&tx, Bytes::from_static(&[0x00, 0x01, 5, 6])).await);
+            assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2]), &mut 0).await);
+            assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 3, 4]), &mut 0).await);
+            assert!(deliver(&tx, Bytes::from_static(&[0x00, 0x01, 5, 6]), &mut 0).await);
         });
 
         // Receiving the first media frees the slot the held STUN send is waiting on.
