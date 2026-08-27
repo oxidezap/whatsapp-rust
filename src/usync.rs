@@ -688,7 +688,7 @@ mod tests {
 
         let record = DeviceListRecord {
             user: "5551230000".into(),
-            devices: [].into(),
+            devices: Box::default(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -748,7 +748,7 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: "1111111111@s.whatsapp.net".parse().unwrap(),
-                devices: [UsyncDevice::new(0, None)].into(),
+                devices: vec![UsyncDevice::new(0, None)],
                 phash: Some("2:a".into()),
                 key_index_bytes: None,
             }],
@@ -787,11 +787,10 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
-                devices: [
+                devices: vec![
                     UsyncDevice::new(0, None),
                     UsyncDevice::new(7, Some(3)).with_hosting(true),
-                ]
-                .into(),
+                ],
                 phash: Some("2:hosted".into()),
                 key_index_bytes: None,
             }],
@@ -840,7 +839,7 @@ mod tests {
         let stale_response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
-                devices: [UsyncDevice::new(0, None)].into(),
+                devices: vec![UsyncDevice::new(0, None)],
                 phash: Some("1:stale".into()),
                 key_index_bytes: None,
             }],
@@ -975,7 +974,7 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: refreshed,
-                devices: [UsyncDevice::new(0, None)].into(),
+                devices: vec![UsyncDevice::new(0, None)],
                 phash: None,
                 key_index_bytes: None,
             }],
@@ -1011,7 +1010,7 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: refreshed,
-                devices: [UsyncDevice::new(0, None)].into(),
+                devices: vec![UsyncDevice::new(0, None)],
                 phash: None,
                 key_index_bytes: None,
             }],
@@ -1055,7 +1054,7 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: "3333333333@s.whatsapp.net".parse().unwrap(),
-                devices: [].into(),
+                devices: vec![],
                 phash: Some("3:empty".into()),
                 key_index_bytes: None,
             }],
@@ -1107,7 +1106,7 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
-                devices: [UsyncDevice::new(7, Some(3))].into(),
+                devices: vec![UsyncDevice::new(7, Some(3))],
                 phash: Some("2:incomplete".into()),
                 key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
             }],
@@ -1156,7 +1155,7 @@ mod tests {
                     user: identity_changed.clone(),
                     // A primary device survives key-index filtering, so this
                     // first user schedules a valid identity replacement.
-                    devices: [UsyncDevice::new(0, None)].into(),
+                    devices: vec![UsyncDevice::new(0, None)],
                     phash: Some("1:changed".into()),
                     key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
                 },
@@ -1164,7 +1163,7 @@ mod tests {
                     user: invalid,
                     // The second user makes the authoritative response invalid
                     // only after key-index projection.
-                    devices: [UsyncDevice::new(7, Some(3))].into(),
+                    devices: vec![UsyncDevice::new(7, Some(3))],
                     phash: Some("1:invalid".into()),
                     key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
                 },
@@ -1209,7 +1208,7 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
-                devices: [UsyncDevice::new(7, Some(3))].into(),
+                devices: vec![UsyncDevice::new(7, Some(3))],
                 phash: Some("1:changed".into()),
                 key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
             }],

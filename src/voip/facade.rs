@@ -7028,8 +7028,8 @@ mod tests {
         let update = rekey_update(&client, &recipients);
         let generation = register_group_update(&client, &update);
         let encrypted = wacore::send::EncryptForDevicesRaw {
-            devices: [wacore::send::EncryptedDevice {
-                device_jid: recipients[0].into().clone(),
+            devices: vec![wacore::send::EncryptedDevice {
+                device_jid: recipients[0].clone(),
                 enc_type: "msg",
                 is_prekey: false,
                 ciphertext: vec![7; 32],
