@@ -33,6 +33,8 @@
 
 pub mod flow;
 
+pub(crate) use flow::Passkey;
+
 use async_trait::async_trait;
 use base64::prelude::*;
 use std::future::Future;

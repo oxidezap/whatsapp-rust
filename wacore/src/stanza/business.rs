@@ -57,7 +57,7 @@ impl VerifiedName {
             .map(|s| s.into_owned())
             .or_else(|| {
                 node.get_optional_child_by_tag(&["name"])
-                    .and_then(|n| match n.content.as_deref() {
+                    .and_then(|n| match n.content.as_ref() {
                         Some(NodeContentRef::String(s)) => Some(s.to_string()),
                         _ => None,
                     })
@@ -72,7 +72,7 @@ impl VerifiedName {
             .attrs()
             .optional_string("issuer")
             .map(|s| s.into_owned());
-        let certificate = match node.content.as_deref() {
+        let certificate = match node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
             _ => None,
         };
@@ -279,7 +279,7 @@ impl BusinessNotification {
             for child in children {
                 if child.tag == "product"
                     && let Some(id_node) = child.get_optional_child_by_tag(&["id"])
-                    && let Some(NodeContentRef::String(id)) = id_node.content.as_deref()
+                    && let Some(NodeContentRef::String(id)) = id_node.content.as_ref()
                 {
                     product_ids.push(id.to_string());
                 } else if child.tag == "collection"

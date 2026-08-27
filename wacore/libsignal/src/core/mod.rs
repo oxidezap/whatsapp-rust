@@ -7,7 +7,15 @@ mod address;
 // Not exporting the members because they have overly-generic names.
 pub mod curve;
 
-pub use address::{
-    Aci, AddressBuf, DeviceId, Pni, ProtocolAddress, ServiceId, ServiceIdFixedWidthBinaryBytes,
-    ServiceIdKind, WrongKindOfServiceIdError,
-};
+pub use address::{AddressBuf, DeviceId, ProtocolAddress};
+
+/// A wire byte that names no variant of the enum it was converted into.
+///
+/// The `repr`-based `TryFrom` impls in this crate are hand-written rather than
+/// derived, so their error type lives here instead of being a third-party one
+/// leaked through the public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("no variant with discriminant {value}")]
+pub struct UnknownDiscriminant<T: std::fmt::Debug + std::fmt::Display> {
+    pub value: T,
+}

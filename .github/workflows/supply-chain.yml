@@ -13,6 +13,12 @@ on:
   schedule:
     - cron: '0 6 * * 1'
 
+concurrency:
+  # Grouped and scoped exactly as main.yml's concurrency block, for the reasons
+  # given there.
+  group: supply-chain-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # Keep in sync with PROTOC_VERSION in main.yml — env is per-workflow, so the

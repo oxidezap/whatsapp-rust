@@ -1,7 +1,8 @@
-use crate::libsignal::crypto::CryptographicHash;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use buffa::MessageView;
+use compact_str::CompactString;
+use sha2::{Digest, Sha256};
 // Encode/decode of proto trees is routed through `waproto::codec` so the tree is
 // instantiated once in waproto; tests still call the trait methods directly.
 #[cfg(test)]
@@ -10,9 +11,11 @@ use waproto::whatsapp as wa;
 
 pub struct MessageUtils;
 
-/// Names the DSM destination without requiring it to exist as a string.
+/// Names a JID-valued protobuf string field without requiring it to exist as a
+/// `String`: the DSM destination, and the group id on the sender-key
+/// distribution wrapper.
 ///
-/// The DSM field needs the JID's length before its bytes, so the caller used to
+/// Such a field needs the JID's length before its bytes, so the caller used to
 /// render one into a `String` just to measure it and copy it. A `Jid` can do
 /// both without the intermediate: this is what lets `&Jid` and `&str` share the
 /// same body instead of the format existing in two shapes.
@@ -164,6 +167,47 @@ impl MessageUtils {
         let size = waproto::codec::message_compute_size(msg, &mut cache);
         let mut buf = Vec::with_capacity(size + pad as usize);
         waproto::codec::message_write_to(msg, &mut cache, &mut buf);
+        buf.resize(buf.len() + pad as usize, pad);
+        buf
+    }
+
+    /// Encode + pad the sender-key distribution wrapper a group send fans out to
+    /// every recipient device: `Message { sender_key_distribution_message {
+    /// group_id, axolotl_sender_key_distribution_message } }`.
+    ///
+    /// Two scalar fields around an already-serialized SKDM, so building a
+    /// `wa::Message` for it walked the whole `Message` schema twice (size then
+    /// write) to place three tags, and rendering the group JID into a `String`
+    /// allocated a name the wire form copies and drops immediately. Both nested
+    /// lengths are known before a byte is written, so the wrapper is framed
+    /// directly into one exactly-sized allocation. Byte-identical to
+    /// `encode_and_pad` over that message for any given pad, which
+    /// `skdm_wrapper_framing_matches_message_encode` locks.
+    pub fn encode_and_pad_skdm_wrapper(
+        group_id: impl DsmDestination,
+        axolotl_skdm: &[u8],
+    ) -> Vec<u8> {
+        let pad = Self::random_pad_len();
+        let group_len = group_id.encoded_len();
+        let inner_len = len_delimited_len(TAG_SKDM_GROUP_ID, group_len)
+            + len_delimited_len(TAG_SKDM_AXOLOTL, axolotl_skdm.len());
+        let mut buf = Vec::with_capacity(
+            len_delimited_len(TAG_SENDER_KEY_DISTRIBUTION_MESSAGE, inner_len) + pad as usize,
+        );
+        push_wire_tag(
+            TAG_SENDER_KEY_DISTRIBUTION_MESSAGE,
+            buffa::encoding::WireType::LengthDelimited,
+            &mut buf,
+        );
+        push_varint(inner_len as u64, &mut buf);
+        push_wire_tag(
+            TAG_SKDM_GROUP_ID,
+            buffa::encoding::WireType::LengthDelimited,
+            &mut buf,
+        );
+        push_varint(group_len as u64, &mut buf);
+        group_id.write_into(&mut buf);
+        push_len_delimited(TAG_SKDM_AXOLOTL, axolotl_skdm, &mut buf);
         buf.resize(buf.len() + pad as usize, pad);
         buf
     }
@@ -456,45 +500,90 @@ impl MessageUtils {
         }
     }
 
+    /// The participant hash: `2:` plus the eight base64 characters of six hash
+    /// bytes, so ten bytes in total, which is why it is a `CompactString` and
+    /// not a `String` -- that width lives inline, and every holder of a phash
+    /// (the group and DM memos, the stanza attribute, the group query) carries
+    /// it as one, so the value never needs the heap on its way to the wire.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.send.participant_hash", level = "debug", skip_all)
     )]
     pub fn participant_list_hash<'a>(
         devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
-    ) -> Result<String> {
+    ) -> Result<CompactString> {
         // Format every device into one shared arena and sort range views over
-        // it: two allocations total instead of a heap String per device (this
-        // runs over the full device set on every group send). Sorting the
-        // slices is the same lexicographic order as sorting the individual
-        // ad_strings, so the hashed concatenation is byte-identical.
+        // it instead of a heap String per device (this runs over the full
+        // device set of a send). Sorting the slices is the same lexicographic
+        // order as sorting the individual ad_strings, so the hashed
+        // concatenation is byte-identical.
+        //
+        // The ranges are `u32` pairs, so the sort moves half the bytes per
+        // element that `usize` pairs would. They stay a plain `Vec`: an inline
+        // `SmallVec` would spare the small shape its one allocation, but this
+        // hash is memoised per resolved device set rather than run per message,
+        // and instantiating `SmallVec` for a new element type stamps its whole
+        // used surface into the binary -- measured at ~11 KiB of `.text` for no
+        // measurable time, on a crate that also builds for ESP32.
         let devices = devices.into_iter();
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(devices.size_hint().0);
-        let mut arena = String::with_capacity(ranges.capacity() * 36);
+        let hint = devices.size_hint().0;
+        let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(hint);
+        let mut arena = String::with_capacity(hint * 36);
         for jid in devices {
             let start = arena.len();
             jid.push_phash_form_to(&mut arena);
-            ranges.push((start, arena.len()));
+            ranges.push((start as u32, arena.len() as u32));
         }
-        ranges.sort_unstable_by(|a, b| arena[a.0..a.1].cmp(&arena[b.0..b.1]));
+        // The offsets above only ever grow, so one check on the finished arena
+        // covers every one of them: if the whole arena addresses in a `u32`,
+        // then so did each `start` and `end` recorded from it. A device set
+        // that large cannot come from a group -- it would need ~100M JIDs --
+        // but this is a public entry point, and a silently truncated offset
+        // would hash the wrong bytes or invert a range, so it is refused
+        // rather than trusted. Checking here instead of per JID keeps it to a
+        // single comparison, and the ranges are not read before this point.
+        if u32::try_from(arena.len()).is_err() {
+            return Err(anyhow!(
+                "participant list is too large to hash: {} bytes of rendered JIDs",
+                arena.len()
+            ));
+        }
+        // Compare and hash over the bytes, not the `String`: indexing a `str`
+        // re-checks a UTF-8 boundary at both ends of every probe, and the sort
+        // makes O(n log n) of them. The ranges are boundaries the arena was
+        // written at, so the slices are the same either way.
+        let arena = arena.as_bytes();
+        ranges.sort_unstable_by(|a, b| {
+            arena[a.0 as usize..a.1 as usize].cmp(&arena[b.0 as usize..b.1 as usize])
+        });
 
-        let mut h = CryptographicHash::new("SHA-256")
-            .map_err(|e| anyhow!("failed to initialize SHA-256 hasher: {:?}", e))?;
+        // `sha2::Sha256` directly rather than `CryptographicHash`: the algorithm
+        // is fixed by the phash format, so going through the by-name constructor
+        // only bought a string match and a per-`update` enum dispatch, plus two
+        // fallible steps that could not fail once the name was a literal.
+        let mut h = Sha256::new();
         for &(start, end) in &ranges {
-            h.update(&arena.as_bytes()[start..end]);
+            h.update(&arena[start as usize..end as usize]);
         }
 
-        let full_hash = h
-            .finalize_sha256_array()
-            .map_err(|e| anyhow!("failed to finalize hash: {:?}", e))?;
+        let full_hash = h.finalize();
 
         // Standard base64 ('+'/'/'), matching whatsmeow (`base64.RawStdEncoding`)
         // and WA Web (`WABase64.encodeB64`). URL-safe ('-'/'_') diverges from the
         // server on ~22% of phashes (any output hitting base64 index 62/63).
-        let mut out = String::with_capacity(10);
-        out.push_str("2:");
-        base64::prelude::BASE64_STANDARD_NO_PAD.encode_string(&full_hash[..6], &mut out);
-        Ok(out)
+        //
+        // Six input bytes are exactly eight base64 characters, so the whole
+        // `2:XXXXXXXX` result is ten bytes and lives inline in the returned
+        // `CompactString`. Every caller memoises it as one, so a `String` here
+        // would be a heap allocation made only to be copied into one.
+        let mut out = [0u8; 10];
+        out[..2].copy_from_slice(b"2:");
+        let encoded = base64::prelude::BASE64_STANDARD_NO_PAD
+            .encode_slice(&full_hash[..6], &mut out[2..])
+            .map_err(|e| anyhow!("failed to encode phash: {:?}", e))?;
+        let out = std::str::from_utf8(&out[..2 + encoded])
+            .map_err(|e| anyhow!("phash is not valid utf-8: {:?}", e))?;
+        Ok(CompactString::from(out))
     }
 
     /// Validate a broadcast-contact-list hash from an incoming `deviceSentMessage`
@@ -571,8 +660,32 @@ impl From<wa::message::HistorySyncNotification> for DetachedHistorySyncNotificat
     }
 }
 
-/// Decode an owned plaintext while detaching an inline history-sync payload as
-/// a zero-copy `Bytes` slice.
+/// Unpad a decrypted payload and decode it, detaching any inline history-sync
+/// payload.
+///
+/// The two halves are also available on their own — [`unpad_plaintext`] and
+/// [`decode_unpadded_detached_history_sync`] — for a caller that wants the
+/// plaintext bytes in between.
+pub fn decode_plaintext_detached_history_sync(
+    padded_plaintext: Vec<u8>,
+    padding_version: u8,
+) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>)> {
+    decode_unpadded_detached_history_sync(unpad_plaintext(padded_plaintext, padding_version)?)
+}
+
+/// Strip the padding a decrypted payload arrives with.
+///
+/// Separate from decoding because the two fail for unrelated reasons and the
+/// bytes in between are worth having on their own: a payload that unpads
+/// cleanly but does not decode is a protocol change, while one that fails here
+/// is a corrupt frame. Returns `Bytes`, so passing it on costs a refcount bump.
+pub fn unpad_plaintext(padded_plaintext: Vec<u8>, padding_version: u8) -> Result<bytes::Bytes> {
+    let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
+    Ok(bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len))
+}
+
+/// Decode an unpadded plaintext while detaching an inline history-sync payload
+/// as a zero-copy `Bytes` slice.
 ///
 /// Only the generated schema tags needed to reach the inline byte field are
 /// inspected. The field is removed from a lazily rewritten wire buffer before
@@ -580,13 +693,12 @@ impl From<wa::message::HistorySyncNotification> for DetachedHistorySyncNotificat
 /// into the owned protobuf tree. Every other field is still decoded by Buffa's
 /// generated implementation, keeping protobuf merge and unknown-field
 /// semantics in one place.
-pub fn decode_plaintext_detached_history_sync(
-    padded_plaintext: Vec<u8>,
-    padding_version: u8,
+///
+/// Takes the plaintext already unpadded — see [`unpad_plaintext`], or
+/// [`decode_plaintext_detached_history_sync`] to do both in one call.
+pub fn decode_unpadded_detached_history_sync(
+    source: bytes::Bytes,
 ) -> Result<(wa::Message, Option<DetachedHistorySyncNotification>)> {
-    let unpadded_len = MessageUtils::unpadded_message_len(&padded_plaintext, padding_version)?;
-    let source = bytes::Bytes::from(padded_plaintext).slice(0..unpadded_len);
-
     // Mirror `unwrap_device_sent`: once a DSM carries an inner message, only
     // that message is dispatched. Inspecting just this generated-tag path
     // avoids decoding/materializing the complete MessageView graph.
@@ -862,6 +974,11 @@ const TAG_DEVICE_SENT_MESSAGE: u32 = waproto::tags::message::DEVICE_SENT_MESSAGE
 const TAG_MESSAGE_CONTEXT_INFO: u32 = waproto::tags::message::MESSAGE_CONTEXT_INFO;
 const TAG_DSM_DESTINATION_JID: u32 = waproto::tags::message::device_sent_message::DESTINATION_JID;
 const TAG_DSM_MESSAGE: u32 = waproto::tags::message::device_sent_message::MESSAGE;
+const TAG_SENDER_KEY_DISTRIBUTION_MESSAGE: u32 =
+    waproto::tags::message::SENDER_KEY_DISTRIBUTION_MESSAGE;
+const TAG_SKDM_GROUP_ID: u32 = waproto::tags::message::sender_key_distribution_message::GROUP_ID;
+const TAG_SKDM_AXOLOTL: u32 =
+    waproto::tags::message::sender_key_distribution_message::AXOLOTL_SENDER_KEY_DISTRIBUTION_MESSAGE;
 
 const DEVICE_SENT_INNER_MESSAGE_PATH: &[u32] = &[TAG_DEVICE_SENT_MESSAGE, TAG_DSM_MESSAGE];
 const DIRECT_HISTORY_PAYLOAD_PATH: &[u32] = &[
@@ -1062,7 +1179,8 @@ pub fn parse_message_info(
     own_lid: Option<&wacore_binary::Jid>,
 ) -> Result<crate::types::message::MessageInfo> {
     use crate::types::message::{
-        AddressingMode, EditAttribute, MessageCategory, MessageInfo, MessageSource,
+        AddressingMode, EditAttribute, MessageCategory, MessageInfo, MessageSource, PollType,
+        ReportingBytes, StanzaMessageType,
     };
     use wacore_binary::{JidExt as _, STATUS_BROADCAST_USER, Server};
 
@@ -1183,6 +1301,14 @@ pub fn parse_message_info(
         .map(|s| MessageCategory::from(s.as_ref()))
         .unwrap_or_default();
 
+    // WA Web's parser requires this attribute and rejects the stanza without
+    // it. Rejecting here would drop a message this client currently delivers,
+    // for an attribute nothing downstream needs, so absence is recorded as
+    // `None` and an unrecognized value keeps its wire bytes.
+    let stanza_type = attrs
+        .optional_string("type")
+        .map(|s| StanzaMessageType::from(s.as_ref()));
+
     let server_id = attrs
         .optional_u64("server_id")
         .filter(|&v| (99..=2_147_476_647).contains(&v))
@@ -1217,23 +1343,33 @@ pub fn parse_message_info(
     let mut meta_info = crate::types::message::MsgMetaInfo::default();
     if let Some(meta) = node.get_optional_child("meta") {
         let mut ma = meta.attrs();
-        meta_info.content_type = ma.optional_string("content_type").map(|s| s.into_owned());
-        meta_info.appdata = ma.optional_string("appdata").map(|s| s.into_owned());
+        meta_info.content_type = ma.optional_string("content_type").map(CompactString::from);
+        meta_info.appdata = ma.optional_string("appdata").map(CompactString::from);
         // msmsg addon path needs the trio (target_id, target_sender_jid,
         // target_chat_jid) to look up the parent messageSecret.
-        meta_info.target_id = ma.optional_string("target_id").map(|s| s.into_owned());
+        meta_info.target_id = ma.optional_string("target_id").map(CompactString::from);
         meta_info.target_sender = ma.optional_jid("target_sender_jid");
         meta_info.target_chat = ma.optional_jid("target_chat_jid");
+        meta_info.thread_message_id = ma.optional_string("thread_msg_id").map(CompactString::from);
+        meta_info.thread_message_sender_jid = ma.optional_jid("thread_msg_sender_jid");
+        // WA Web scopes `polltype` to poll envelopes, so a value on any other
+        // type is not the poll stage and is not recorded as one. Unknown
+        // values parse to None (the attribute is enum-or-null upstream).
+        if stanza_type == Some(StanzaMessageType::Poll) {
+            meta_info.poll_type = ma
+                .optional_string("polltype")
+                .and_then(|s| PollType::try_from(s.as_ref()).ok());
+        }
     }
     if let Some(reporting) = node.get_optional_child("reporting")
         && let Some(tag) = reporting.get_optional_child("reporting_tag")
     {
-        meta_info.reporting_tag = tag.content_bytes().map(|b| b.to_vec());
+        meta_info.reporting_tag = tag.content_bytes().map(ReportingBytes::from_slice);
     }
     if let Some(reporting) = node.get_optional_child("reporting")
         && let Some(token) = reporting.get_optional_child("reporting_token")
     {
-        meta_info.reporting_token = token.content_bytes().map(|b| b.to_vec());
+        meta_info.reporting_token = token.content_bytes().map(ReportingBytes::from_slice);
         // WA Web `I()`: `c.maybeAttrInt("v")!=null?_:1`. Missing `v` is
         // not a parse failure — token format version defaults to 1.
         meta_info.reporting_token_version = Some(
@@ -1267,6 +1403,7 @@ pub fn parse_message_info(
         source,
         id,
         server_id,
+        r#type: stanza_type,
         push_name: attrs
             .optional_string("notify")
             .map(|s| s.to_string())
@@ -1974,6 +2111,140 @@ mod parse_message_info_tests {
             "group fanout participants are not a bcl"
         );
     }
+
+    fn envelope(stanza_type: Option<&str>) -> wacore_binary::Node {
+        let mut builder = NodeBuilder::new("message")
+            .attr("from", "559980000001@s.whatsapp.net")
+            .attr("id", "MSG-TYPE-1")
+            .attr("t", "1777415965");
+        if let Some(stanza_type) = stanza_type {
+            builder = builder.attr("type", stanza_type);
+        }
+        builder.build()
+    }
+
+    fn parse(node: &wacore_binary::Node) -> crate::types::message::MessageInfo {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        parse_message_info(&node.as_node_ref(), &own_pn, None).expect("envelope should parse")
+    }
+
+    /// Every variant of the envelope type has to survive a wire round trip.
+    /// Written as an exhaustive match so a variant added without a `#[wire]`
+    /// mapping fails to compile rather than silently parsing as `Unknown`.
+    #[test]
+    fn every_envelope_type_round_trips_through_the_wire() {
+        use crate::types::message::StanzaMessageType as T;
+        let all = [
+            T::Text,
+            T::Media,
+            T::MediaNotify,
+            T::Pay,
+            T::Poll,
+            T::Reaction,
+            T::Event,
+            T::Unknown("sticker_pack_share".to_owned()),
+        ];
+        for variant in &all {
+            // Exhaustive on purpose: a new variant lands here first.
+            let expected_wire = match variant {
+                T::Text => "text",
+                T::Media => "media",
+                T::MediaNotify => "medianotify",
+                T::Pay => "pay",
+                T::Poll => "poll",
+                T::Reaction => "reaction",
+                T::Event => "event",
+                T::Unknown(raw) => raw.as_str(),
+            };
+            assert_eq!(variant.as_str(), expected_wire);
+            assert_eq!(
+                parse(&envelope(Some(expected_wire))).r#type.as_ref(),
+                Some(variant),
+                "envelope type {expected_wire} did not round trip"
+            );
+        }
+    }
+
+    /// The official parser rejects both of these; this one keeps the stanza and
+    /// distinguishes them, so neither collapses into the other or into `text`.
+    #[test]
+    fn absent_and_unknown_envelope_types_stay_distinguishable() {
+        use crate::types::message::StanzaMessageType as T;
+        assert_eq!(parse(&envelope(None)).r#type, None);
+        assert_eq!(
+            parse(&envelope(Some("newsletter_admin_invite"))).r#type,
+            Some(T::Unknown("newsletter_admin_invite".to_owned()))
+        );
+    }
+
+    #[test]
+    fn polltype_is_read_only_on_a_poll_envelope() {
+        use crate::types::message::{PollType, StanzaMessageType as T};
+        let with_meta = |stanza_type: &str| {
+            let node = NodeBuilder::new("message")
+                .attr("from", "559980000001@s.whatsapp.net")
+                .attr("id", "MSG-POLL-1")
+                .attr("t", "1777415965")
+                .attr("type", stanza_type)
+                .children([NodeBuilder::new("meta").attr("polltype", "vote").build()])
+                .build();
+            parse(&node)
+        };
+
+        let poll = with_meta("poll");
+        assert_eq!(poll.r#type, Some(T::Poll));
+        assert_eq!(poll.meta_info.poll_type, Some(PollType::Vote));
+
+        let text = with_meta("text");
+        assert_eq!(text.r#type, Some(T::Text));
+        assert_eq!(
+            text.meta_info.poll_type, None,
+            "polltype belongs to poll envelopes only"
+        );
+    }
+
+    /// `attrEnumOrNullIfUnknown` upstream: a poll stage this build does not
+    /// model is dropped, not preserved as raw text.
+    #[test]
+    fn unknown_polltype_parses_as_absent() {
+        let node = NodeBuilder::new("message")
+            .attr("from", "559980000001@s.whatsapp.net")
+            .attr("id", "MSG-POLL-2")
+            .attr("t", "1777415965")
+            .attr("type", "poll")
+            .children([NodeBuilder::new("meta")
+                .attr("polltype", "retraction")
+                .build()])
+            .build();
+        assert_eq!(parse(&node).meta_info.poll_type, None);
+    }
+
+    #[test]
+    fn meta_thread_attributes_reach_message_info() {
+        let node = NodeBuilder::new("message")
+            .attr("from", "120363000000000001@g.us")
+            .attr("participant", "559980000001@s.whatsapp.net")
+            .attr("id", "MSG-THREAD-1")
+            .attr("t", "1777415965")
+            .attr("type", "text")
+            .children([NodeBuilder::new("meta")
+                .attr("thread_msg_id", "PARENT-1")
+                .attr("thread_msg_sender_jid", "559980000002@s.whatsapp.net")
+                .build()])
+            .build();
+        let info = parse(&node);
+        assert_eq!(
+            info.meta_info.thread_message_id.as_deref(),
+            Some("PARENT-1")
+        );
+        assert_eq!(
+            info.meta_info
+                .thread_message_sender_jid
+                .as_ref()
+                .map(|jid| jid.user.as_str()),
+            Some("559980000002")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2397,6 +2668,95 @@ mod device_sent_tests {
             first_field_number(&dsm_msg.encode_to_vec()),
             TAG_DSM_MESSAGE,
             "DeviceSentMessage.message tag drifted from the .proto"
+        );
+    }
+
+    /// The hand-framed SKDM wrapper must be byte-identical to encoding the
+    /// equivalent `wa::Message` — same tags, same nested lengths, same order —
+    /// once the pads are stripped. `to_jid` is a `Jid` here, so the
+    /// `DsmDestination` render is compared against `Jid::to_string` too.
+    #[test]
+    fn skdm_wrapper_framing_matches_message_encode() {
+        use std::str::FromStr as _;
+
+        let axolotl = vec![0x33u8; 197];
+        for group in [
+            "120363000000000001@g.us",
+            "120363000000000001@lid",
+            "5511999998888-1600000000@g.us",
+        ] {
+            let jid = wacore_binary::jid::Jid::from_str(group).expect("valid group jid");
+
+            let reference = wa::Message {
+                sender_key_distribution_message: buffa::MessageField::some(
+                    wa::message::SenderKeyDistributionMessage {
+                        group_id: Some(jid.to_string()),
+                        axolotl_sender_key_distribution_message: Some(axolotl.clone()),
+                    },
+                ),
+                ..Default::default()
+            };
+
+            let framed = MessageUtils::encode_and_pad_skdm_wrapper(&jid, &axolotl);
+            assert_eq!(
+                MessageUtils::unpad_message_ref(&framed, 2).unwrap(),
+                reference.encode_to_vec(),
+                "hand-framed SKDM wrapper drifted from the schema encode for {group}"
+            );
+
+            // And it still decodes back into the same message.
+            let decoded = decode_padded(&framed);
+            let skdm = decoded
+                .sender_key_distribution_message
+                .as_option()
+                .expect("wrapper carries the SKDM field");
+            assert_eq!(skdm.group_id.as_deref(), Some(group));
+            assert_eq!(
+                skdm.axolotl_sender_key_distribution_message.as_deref(),
+                Some(axolotl.as_slice())
+            );
+        }
+    }
+
+    /// Same drift guard as `splice_tags_match_generated_schema`, for the three
+    /// field numbers the SKDM wrapper frames by hand.
+    #[test]
+    fn skdm_wrapper_tags_match_generated_schema() {
+        fn first_field_number(mut bytes: &[u8]) -> u32 {
+            buffa::encoding::Tag::decode(&mut bytes)
+                .expect("probe should start with a valid protobuf tag")
+                .field_number()
+        }
+
+        let outer = wa::Message {
+            sender_key_distribution_message: wa::message::SenderKeyDistributionMessage::default()
+                .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&outer.encode_to_vec()),
+            TAG_SENDER_KEY_DISTRIBUTION_MESSAGE,
+            "Message.sender_key_distribution_message tag drifted from the .proto"
+        );
+
+        let group = wa::message::SenderKeyDistributionMessage {
+            group_id: Some("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&group.encode_to_vec()),
+            TAG_SKDM_GROUP_ID,
+            "SenderKeyDistributionMessage.group_id tag drifted from the .proto"
+        );
+
+        let axolotl = wa::message::SenderKeyDistributionMessage {
+            axolotl_sender_key_distribution_message: Some(vec![1]),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_field_number(&axolotl.encode_to_vec()),
+            TAG_SKDM_AXOLOTL,
+            "SenderKeyDistributionMessage.axolotl_... tag drifted from the .proto"
         );
     }
 

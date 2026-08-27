@@ -23,33 +23,28 @@ pub fn encode_record(
     // callers pass the value for the action they are encoding.
     version: i32,
 ) -> (wa::SyncdMutation, [u8; 32]) {
-    // 1. Build SyncActionData
-    let action_data = wa::SyncActionData {
-        index: Some(index.to_vec()),
-        value: buffa::MessageField::some(value.clone()),
-        padding: Some(vec![]),
-        version: Some(version),
-    };
-    let plaintext = waproto::codec::sync_action_data_to_vec(&action_data);
+    // 1. Encode the SyncActionData wrapper straight from the borrowed value.
+    let plaintext = waproto::codec::sync_action_data_to_vec(index, value, version);
 
-    // 2. AES-256-CBC encrypt
-    let mut ciphertext = Vec::new();
-    aes_256_cbc_encrypt_into(&plaintext, &keys.value_encryption, iv, &mut ciphertext)
+    // 2. Build the value blob in place: IV || ciphertext || MAC.
+    //
+    // The blob is the only buffer this path needs, so it is sized for the whole
+    // thing up front and the encryption writes its ciphertext directly after the
+    // IV (`aes_256_cbc_encrypt_into` appends). CBC pads to the next full block
+    // and always adds at least one byte, which is what fixes the ciphertext
+    // length before the encryption runs.
+    let cipher_len = plaintext.len() - plaintext.len() % 16 + 16;
+    let mut value_blob = Vec::with_capacity(16 + cipher_len + 32);
+    value_blob.extend_from_slice(iv);
+    aes_256_cbc_encrypt_into(&plaintext, &keys.value_encryption, iv, &mut value_blob)
         .expect("AES encryption should not fail with valid 32-byte key and 16-byte IV");
 
-    // 3. Build IV || ciphertext
-    let mut iv_and_cipher = Vec::with_capacity(16 + ciphertext.len());
-    iv_and_cipher.extend_from_slice(iv);
-    iv_and_cipher.extend_from_slice(&ciphertext);
-
-    // 4. Generate content MAC
-    let value_mac = generate_content_mac(operation, &iv_and_cipher, key_id, &keys.value_mac);
-
-    // 5. Complete value blob: IV || ciphertext || MAC
-    let mut value_blob = iv_and_cipher;
+    // 3. Generate the content MAC over IV || ciphertext, before the MAC is
+    //    appended to the same buffer.
+    let value_mac = generate_content_mac(operation, &value_blob, key_id, &keys.value_mac);
     value_blob.extend_from_slice(&value_mac);
 
-    // 6. Generate index MAC
+    // 4. Generate index MAC
     let index_mac = {
         let mut mac = CryptographicMac::new("HmacSha256", &keys.index)
             .expect("HmacSha256 is a valid algorithm");
@@ -57,7 +52,7 @@ pub fn encode_record(
         mac.finalize()
     };
 
-    // 7. Build the record
+    // 5. Build the record
     let record = wa::SyncdRecord {
         index: buffa::MessageField::some(wa::SyncdIndex {
             blob: Some(index_mac),
@@ -135,5 +130,52 @@ mod tests {
         );
         assert_eq!(decoded.index, vec!["setting_pushName"]);
         assert_eq!(decoded.operation, wa::syncd_mutation::SyncdOperation::SET);
+    }
+
+    /// The plaintext is written field by field instead of through an owned
+    /// `SyncActionData`, so the bytes are pinned against what the generated
+    /// encoder produces for the same four fields.
+    // The generated encoder is the reference this test exists to compare
+    // against, so it calls it directly instead of going through
+    // `waproto::codec` (which no longer has an owned-`SyncActionData` entry
+    // point). Test-only, so the extra instantiation ships nowhere.
+    #[allow(clippy::disallowed_methods)]
+    #[test]
+    fn hand_written_plaintext_matches_generated_encoder() {
+        use buffa::Message as _;
+
+        let index = b"[\"contact\",\"5511999998888@s.whatsapp.net\"]";
+        let cases = [
+            (
+                1,
+                wa::SyncActionValue {
+                    timestamp: Some(1_700_000_000),
+                    contact_action: wa::sync_action_value::ContactAction {
+                        full_name: Some("Contact Full Name".to_string()),
+                        ..Default::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                },
+            ),
+            // Empty value and a multi-byte version: the degenerate shapes the
+            // exact-size arithmetic is most likely to get wrong.
+            (0, wa::SyncActionValue::default()),
+            (i32::MAX, wa::SyncActionValue::default()),
+            (-1, wa::SyncActionValue::default()),
+        ];
+
+        for (version, value) in cases {
+            let expected = wa::SyncActionData {
+                index: Some(index.to_vec()),
+                value: buffa::MessageField::some(value.clone()),
+                padding: Some(vec![]),
+                version: Some(version),
+            }
+            .encode_to_vec();
+            let got = waproto::codec::sync_action_data_to_vec(index, &value, version);
+            assert_eq!(got, expected, "version {version}");
+            assert_eq!(got.capacity(), got.len(), "buffer must be exactly sized");
+        }
     }
 }

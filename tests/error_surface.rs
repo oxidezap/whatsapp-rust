@@ -7,7 +7,11 @@
 
 use std::error::Error as StdError;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+
+use wacore_binary::OwnedNodeRef;
+use wacore_binary::builder::NodeBuilder;
 
 use whatsapp_rust::client::{ConnectError, ConnectStage};
 use whatsapp_rust::handshake::HandshakeError;
@@ -20,7 +24,9 @@ use whatsapp_rust::features::{
     TcTokenError,
 };
 use whatsapp_rust::http::HttpStatusError;
-use whatsapp_rust::{ClientError, ErrorChainExt, IqError, SendError, ServerRejection};
+use whatsapp_rust::{
+    ClientError, ErrorChainExt, IqError, RejectionStanza, SendError, ServerRejection,
+};
 
 // ── Source scan ─────────────────────────────────────────────────────────────
 
@@ -216,7 +222,23 @@ fn rejected(code: u16) -> IqError {
         text: "forbidden".to_string(),
         error_type: Some("cancel".to_string()),
         backoff: None,
+        response: rejection_stanza(code, "forbidden"),
     }
+}
+
+/// The `<iq type="error">` a rejection carries, decoded the way the receive path decodes it.
+fn rejection_stanza(code: u16, text: &str) -> RejectionStanza {
+    let node = NodeBuilder::new("iq")
+        .attr("type", "error")
+        .children([NodeBuilder::new("error")
+            .attr("code", code.to_string())
+            .attr("text", text.to_string())
+            .build()])
+        .build();
+    let mut bytes = wacore_binary::marshal::marshal(&node).expect("the stanza should marshal");
+    // marshal() prepends a format byte OwnedNodeRef::new does not expect.
+    bytes.remove(0);
+    Arc::new(OwnedNodeRef::new(bytes).expect("the stanza should decode")).into()
 }
 
 #[track_caller]
@@ -316,6 +338,7 @@ fn group_description_conflict_409_exposes_its_code() {
         text: "conflict".to_string(),
         error_type: None,
         backoff: None,
+        response: rejection_stanza(409, "conflict"),
     });
     let rejection = err.server_rejection().expect("409 is recoverable");
     assert_eq!(rejection.code, 409);

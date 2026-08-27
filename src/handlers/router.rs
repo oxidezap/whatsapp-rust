@@ -57,6 +57,14 @@ impl StanzaRouter {
         }
     }
 
+    /// Whether this client models `tag` at all.
+    ///
+    /// A tag with no handler is one [`dispatch`](Self::dispatch) would report
+    /// unhandled, which is what makes the caller nack it.
+    pub fn models(&self, tag: &str) -> bool {
+        self.handlers.contains_key(tag)
+    }
+
     /// Get the number of registered handlers (useful for testing).
     pub fn handler_count(&self) -> usize {
         self.handlers.len()

@@ -39,6 +39,7 @@ use wacore_noise::test_util::build_cert_chain_bytes;
 use whatsapp_rust::waproto::whatsapp as wa;
 
 use whatsapp_rust::handshake::do_handshake;
+use whatsapp_rust::socket::noise_socket::SendObservers;
 use whatsapp_rust::transport::{Transport, TransportEvent};
 
 /// In-process responder driving Noise XX or IK from the server side.
@@ -311,7 +312,7 @@ async fn cold_start_xx_then_cached_ik_reconnect() {
         counter2.as_ref(),
         transport.clone(),
         &mut events_rx,
-        None,
+        SendObservers::default(),
     )
     .await;
 
@@ -355,7 +356,7 @@ async fn cold_start_xx_then_cached_ik_reconnect() {
         counter3.as_ref(),
         transport2.clone(),
         &mut events_rx2,
-        None,
+        SendObservers::default(),
     )
     .await;
 
@@ -455,7 +456,7 @@ async fn post_xxfallback_failure_does_not_invalidate_ik_cache() {
         counter.as_ref(),
         transport.clone(),
         &mut events_rx,
-        None,
+        SendObservers::default(),
     )
     .await;
     task.await.unwrap();
@@ -525,7 +526,7 @@ async fn ik_continue_does_not_overwrite_cached_chain() {
         counter.as_ref(),
         transport.clone(),
         &mut events_rx,
-        None,
+        SendObservers::default(),
     )
     .await;
     task.await.unwrap();
@@ -573,7 +574,7 @@ async fn xx_after_pair_success_persists_cert_chain() {
         counter.as_ref(),
         transport1.clone(),
         &mut events_rx1,
-        None,
+        SendObservers::default(),
     )
     .await
     .expect("unpaired XX must succeed");
@@ -603,7 +604,7 @@ async fn xx_after_pair_success_persists_cert_chain() {
         counter.as_ref(),
         transport2.clone(),
         &mut events_rx2,
-        None,
+        SendObservers::default(),
     )
     .await
     .expect("paired XX must succeed");
@@ -646,7 +647,7 @@ async fn unpaired_xx_does_not_persist_cert_chain() {
         counter.as_ref(),
         transport.clone(),
         &mut events_rx,
-        None,
+        SendObservers::default(),
     )
     .await;
     task.await.unwrap();
@@ -778,7 +779,7 @@ async fn ik_rejected_recovers_via_xxfallback_and_repopulates_cache() {
         counter.as_ref(),
         transport.clone(),
         &mut events_rx,
-        None,
+        SendObservers::default(),
     )
     .await;
     task.await.unwrap();
@@ -872,7 +873,7 @@ async fn ik_with_stale_cache_invalidates_and_increments_counter() {
         counter.as_ref(),
         transport.clone(),
         &mut events_rx,
-        None,
+        SendObservers::default(),
     )
     .await;
 

@@ -1,6 +1,6 @@
 [package]
 name = "wacore-appstate"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
@@ -11,14 +11,9 @@ description = "Appstate for WhatsApp protocol"
 [lib]
 crate-type = ["rlib"]
 
-[features]
-default = ["simd"]
-simd = ["wacore-binary/simd"]
-
 [dependencies]
 anyhow = { workspace = true }
 buffa = { workspace = true }
-bytemuck = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = { workspace = true }
@@ -28,7 +23,7 @@ serde-big-array = { workspace = true }
 serde_json = { workspace = true, features = ["alloc"] }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-wacore-binary = { workspace = true, default-features = false, features = ["serde"] }
+wacore-binary = { workspace = true, default-features = false }
 wacore-libsignal = { workspace = true }
 waproto = { workspace = true }
 

@@ -42,6 +42,10 @@ pub enum DeviceCommand {
     /// reserved for pair-success, where a fresh pairing must not inherit the
     /// previous account's migration state.
     SetLidMigrated(bool),
+    /// Record or withdraw the server's `<ib><client_expiration>` deadline for
+    /// the running build. Decided by [`crate::store::device::ServerClientExpiration::decide`];
+    /// this command only stores what that returned.
+    SetServerClientExpiration(Option<crate::store::device::ServerClientExpiration>),
     /// Install a freshly rotated signed pre-key (WA Web `RotateKeyJob`). Sets
     /// the current key trio and stamps the rotation clock in one command so the
     /// key and its cadence baseline can never be observed split.
@@ -89,6 +93,9 @@ impl std::fmt::Debug for DeviceCommand {
             Self::ClearServerCertChain => f.write_str("ClearServerCertChain"),
             Self::IncrementLoginCounter => f.write_str("IncrementLoginCounter"),
             Self::SetLidMigrated(v) => f.debug_tuple("SetLidMigrated").field(v).finish(),
+            Self::SetServerClientExpiration(v) => {
+                f.debug_tuple("SetServerClientExpiration").field(v).finish()
+            }
             // Redact key material; only the id and cadence stamp are logged.
             Self::SetSignedPreKey {
                 id, rotation_ms, ..
@@ -133,6 +140,9 @@ pub fn apply_command_to_device(device: &mut Device, command: DeviceCommand) {
         }
         DeviceCommand::SetClientProfile(profile) => {
             device.set_client_profile(profile);
+        }
+        DeviceCommand::SetServerClientExpiration(expiration) => {
+            device.server_client_expiration = expiration;
         }
         DeviceCommand::SetPropsHash(hash) => {
             device.props_hash = hash;

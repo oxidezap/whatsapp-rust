@@ -1,4 +1,4 @@
-use e2e_tests::TestClient;
+use e2e_tests::{TestClient, text_msg};
 use log::info;
 use wacore::types::events::Event;
 
@@ -24,15 +24,27 @@ async fn test_expired_chatstate_not_delivered() -> anyhow::Result<()> {
     client_a.client.chatstate().send_composing(&jid_b).await?;
     info!("A sent typing indicator to offline B");
 
-    let result = client_b
-        .wait_for_event(15, |e| matches!(e, Event::ChatPresence(_)))
-        .await;
+    // Queued behind the chatstate, and the barrier for the assertion below: the
+    // server drains B's queue in order, so an unexpired chatstate would come out
+    // of it before this message does. The old form waited fifteen seconds for
+    // nothing and called the silence a result.
+    let after_ttl = "sent after the chatstate expired";
+    client_a
+        .client
+        .send_message(jid_b.clone(), text_msg(after_ttl))
+        .await?;
 
-    assert!(
-        result.is_err(),
-        "B should NOT receive chatstate after TTL expired, but got: {:?}",
-        result.unwrap()
-    );
+    client_b
+        .assert_no_event_before(
+            30,
+            |e| matches!(e, Event::ChatPresence(_)),
+            |e| {
+                e.messages()
+                    .any(|m| m.message.conversation.as_deref() == Some(after_ttl))
+            },
+            "B should NOT receive a chatstate that expired while it was offline",
+        )
+        .await?;
     info!("Confirmed: expired chatstate was NOT delivered to B");
 
     client_a.disconnect().await;

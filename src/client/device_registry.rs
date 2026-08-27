@@ -156,11 +156,14 @@ impl Client {
         group_info: &Arc<wacore::client::context::GroupInfo>,
         own_sending_jid: &Jid,
     ) -> Result<Arc<wacore::send::ResolvedGroupDevices>, anyhow::Error> {
+        use crate::client::GroupDevicesMemoOutcome as Outcome;
         // Store-backed registry or mapping caches can be written by OTHER
         // processes (e.g. shared Redis across pods), which this process's
         // topology tracker cannot observe; the memo's freshness contract
         // doesn't hold there, so it is disabled and every send resolves.
         if !self.device_memos_enabled {
+            self.device_memo_counters
+                .record_group_devices(Outcome::Bypassed);
             return Ok(Arc::new(wacore::send::ResolvedGroupDevices::new(
                 self.resolve_group_devices_uncached(
                     group_info,
@@ -177,22 +180,30 @@ impl Client {
         // and serve their effects stale.
         let generation = self.device_topology.current();
 
-        if let Some(memo) = self.group_devices_memo.get(group).await
-            && std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info))
-        {
-            if memo.generation == generation {
+        // Each exit records the term that decided it, on the branch that
+        // decided it, rather than classifying into a value and dispatching on
+        // it twice — the counter is meant to be free on the hit path, and a
+        // second dispatch is not free.
+        if let Some(memo) = self.group_devices_memo.get(group).await {
+            if !std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info)) {
+                self.device_memo_counters
+                    .record_group_devices(Outcome::MissGroupInfo);
+            } else if memo.generation == generation {
                 // Refcount bump: the snapshot is immutable, so a hit shares
                 // it instead of cloning the device Vec.
+                self.device_memo_counters.record_group_devices(Outcome::Hit);
                 return Ok(Arc::clone(&memo.devices));
-            }
-            // Stale stamp: when every change since it touched only users
-            // outside this group, re-stamp instead of recomputing, so write
-            // storms on unrelated groups don't tank the hit rate. Any doubt
-            // (log overflow, member touched) falls through to the recompute.
-            if self
+            } else if self
                 .device_topology
                 .unchanged_for(memo.generation, |user| memo.members.contains(user))
             {
+                // Stale stamp, but every change since it touched only users
+                // outside this group: re-stamp instead of recomputing, so
+                // write storms on unrelated groups don't tank the hit rate.
+                // Any doubt (log overflow, member touched) falls through to
+                // the recompute below.
+                self.device_memo_counters
+                    .record_group_devices(Outcome::Restamp);
                 self.group_devices_memo
                     .insert(
                         group.clone(),
@@ -205,7 +216,13 @@ impl Client {
                     )
                     .await;
                 return Ok(Arc::clone(&memo.devices));
+            } else {
+                self.device_memo_counters
+                    .record_group_devices(Outcome::MissTopology);
             }
+        } else {
+            self.device_memo_counters
+                .record_group_devices(Outcome::MissAbsent);
         }
 
         let devices = self
@@ -3318,7 +3335,7 @@ mod tests {
             "rotation must wait for the in-flight advance"
         );
 
-        let mut sender_key_store = client.sender_key_adapter().await;
+        let mut sender_key_store = client.sender_key_adapter();
         group_encrypt(
             &mut sender_key_store,
             &name,
@@ -3493,11 +3510,7 @@ mod tests {
 
         let hashed: Jid = format!("{contact_lid}@lid").parse().expect("jid");
         assert!(
-            client
-                .pending_device_sync
-                .take_all()
-                .await
-                .contains(&hashed),
+            client.pending_device_sync.take_all().contains(&hashed),
             "the hashed contact must be queued for a device-list refresh"
         );
     }
@@ -3522,7 +3535,7 @@ mod tests {
             .await;
 
         assert!(
-            client.pending_device_sync.take_all().await.is_empty(),
+            client.pending_device_sync.take_all().is_empty(),
             "an unresolvable hash must not refresh an unrelated contact"
         );
     }

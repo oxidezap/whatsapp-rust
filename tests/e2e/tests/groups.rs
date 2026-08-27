@@ -167,7 +167,10 @@ async fn test_group_remove_member() -> anyhow::Result<()> {
         .wait_for_group_text(&group_jid, text_after, 30)
         .await?;
 
-    // B was removed, so should not receive anything
+    // B was removed, so should not receive anything. A window and not a barrier:
+    // the only event B can still be sent is in another chat, and chat lanes run
+    // concurrently, so nothing B receives orders itself after a group message B
+    // must never get.
     client_b
         .assert_no_event(
             3,
@@ -591,6 +594,7 @@ async fn test_group_leave() -> anyhow::Result<()> {
         .wait_for_group_text(&group_jid, text_after, 30)
         .await?;
 
+    // A window and not a barrier, for the reason given in the removal test above.
     client_b
         .assert_no_event(
             3,

@@ -367,6 +367,7 @@ impl Client {
         self: &Arc<Self>,
         group_jid: &Jid,
         sender_jid: &Jid,
+        message_id: &str,
         axolotl_bytes: &[u8],
     ) {
         if let Err(e) = self
@@ -374,11 +375,30 @@ impl Client {
             .process_sender_key_distribution_cached(group_jid, sender_jid, axolotl_bytes)
             .await
         {
-            log::error!(
-                "Failed to process SenderKeyDistributionMessage from {}: {:?}",
-                sender_jid.observe(),
-                e
-            );
+            // A malformed payload is what the sender put in the field, not a
+            // fault of ours, and WA Web logs that one at WARN too. Everything
+            // else reaching here is ours — `load_sender_key` surfaces storage
+            // failures as `Protocol(BackendError)` — and a deployment alerting
+            // on ERROR has to keep seeing those.
+            //
+            // The message id is what separates one peer resending a bad stanza
+            // from a peer whose every stanza is bad, and a burst of
+            // redeliveries is the shape this arrives in.
+            if matches!(e, crate::features::SignalError::InvalidInput(_)) {
+                log::warn!(
+                    "[msg:{}] Failed to process SenderKeyDistributionMessage from {}: {:?}",
+                    message_id,
+                    sender_jid.observe(),
+                    e
+                );
+            } else {
+                log::error!(
+                    "[msg:{}] Failed to process SenderKeyDistributionMessage from {}: {:?}",
+                    message_id,
+                    sender_jid.observe(),
+                    e
+                );
+            }
         } else {
             log::debug!(
                 "Successfully processed sender key distribution for group {} from {}",

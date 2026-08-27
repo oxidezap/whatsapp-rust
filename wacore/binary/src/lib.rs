@@ -1,5 +1,3 @@
-#![cfg_attr(feature = "simd", feature(portable_simd))]
-
 pub mod attrs;
 pub mod builder;
 pub mod consts;

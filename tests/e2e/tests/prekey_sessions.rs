@@ -103,10 +103,10 @@ async fn test_prekey_collision_regression() -> anyhow::Result<()> {
     }
     info!("All {OFFLINE_SENDERS} offline senders ready");
 
-    // --- Phase 5: Disconnect recipient via reconnect ---
+    // --- Phase 5: Take the recipient offline for exactly the sends below ---
     while recipient.event_rx.try_recv().is_ok() {}
-    info!("Disconnecting recipient (auto-reconnect in ~4s)...");
-    recipient.client.reconnect().await;
+    info!("Taking recipient offline...");
+    recipient.go_offline().await?;
 
     // --- Phase 6: Offline senders fire in parallel (drains server below MIN) ---
     let mut send_handles = Vec::with_capacity(OFFLINE_SENDERS);
@@ -141,6 +141,7 @@ async fn test_prekey_collision_regression() -> anyhow::Result<()> {
     }
 
     // --- Phase 7: Wait for reconnect + upload_pre_keys to complete ---
+    recipient.come_back_online();
     // Wait for Connected event (fires after upload_pre_keys + app state sync).
     // Consume and discard any message events that arrive before Connected.
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);

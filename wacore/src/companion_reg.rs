@@ -111,7 +111,8 @@ pub const fn companion_web_client_type_for_platform(
         | P::AR_DEVICE
         | P::VR
         | P::CLOUD_API
-        | P::SMARTGLASSES => C::OtherWebClient,
+        | P::SMARTGLASSES
+        | P::WAIL => C::OtherWebClient,
     }
 }
 
@@ -327,6 +328,7 @@ mod tests {
             P::TCL_TV,
             P::CLOUD_API,
             P::SMARTGLASSES,
+            P::WAIL,
         ] {
             assert_eq!(
                 companion_web_client_type_for_platform(pt),

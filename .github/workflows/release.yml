@@ -16,6 +16,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Everything downstream is keyed on this version, and publishing to crates.io
+  # cannot be undone. Read and check it before that point, not after, so a bad
+  # version costs a failed job instead of published crates with no tag, no
+  # release and no image.
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract and validate version
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          # Build metadata is rejected even though Cargo takes it. `+` is not a
+          # legal Docker tag character, so docker/metadata-action rewrites it to
+          # `-`: 0.7.0+build.5 would ship as the image 0.7.0-build.5, which is
+          # the tag a real prerelease of that name would claim. Being stricter
+          # than Cargo is only safe because this runs ahead of publish; as a
+          # post-publish check it would strand the release between crates.io
+          # and the tag.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Refusing to release '$VERSION': expected MAJOR.MINOR.PATCH[-prerelease], no build metadata" >&2
+            exit 1
+          fi
+          echo "Releasing $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
   validate:
     name: Validate
     uses: ./.github/workflows/main.yml
@@ -27,7 +59,7 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: [validate, validate-e2e]
+    needs: [preflight, validate, validate-e2e]
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -55,25 +87,18 @@ jobs:
 
   github-release:
     name: Create GitHub Release
-    needs: publish
+    needs: [preflight, publish]
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Extract version
-        id: version
-        run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Create tag
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
         run: |
-          TAG="${{ steps.version.outputs.tag }}"
+          TAG="$RELEASE_TAG"
           if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null 2>&1; then
             echo "Tag $TAG already exists on origin, skipping."
           else
@@ -83,26 +108,32 @@ jobs:
 
       - name: Create GitHub Release
         env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "${{ steps.version.outputs.tag }}" > /dev/null 2>&1; then
-            echo "Release ${{ steps.version.outputs.tag }} already exists, skipping."
+          TAG="$RELEASE_TAG"
+          # Hand-written notes win when the release has them: --generate-notes
+          # emits one bullet per PR, which for a release this size is thousands
+          # of lines with no structure. Falls back to the generated list so a
+          # release without a notes file still publishes.
+          NOTES=".github/release-notes/$TAG.md"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping."
+          elif [ -f "$NOTES" ]; then
+            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES" --latest
           else
-            gh release create "${{ steps.version.outputs.tag }}" \
-              --title "${{ steps.version.outputs.tag }}" \
-              --generate-notes \
-              --latest
+            gh release create "$TAG" --title "$TAG" --generate-notes --latest
           fi
 
   # The tag pushed above with GITHUB_TOKEN can't trigger docker.yml's tag event,
   # so invoke it directly and pass the version for the :X.Y.Z image tag.
   publish-docker:
     name: Publish Docker image
-    needs: github-release
+    needs: [preflight, github-release]
     # docker.yml logs into GHCR and pushes the multi-arch image manifest.
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/docker.yml
     with:
-      version: ${{ needs.github-release.outputs.version }}
+      version: ${{ needs.preflight.outputs.version }}

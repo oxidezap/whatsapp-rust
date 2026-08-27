@@ -43,7 +43,7 @@ pub(crate) fn collect_children<T: ProtocolNode>(
 /// Extract binary content from an optional `NodeRef` as `Vec<u8>`.
 /// Returns an empty vector if the node is `None` or does not hold byte content.
 pub(crate) fn extract_content_bytes(node: Option<&NodeRef<'_>>) -> Vec<u8> {
-    node.and_then(|n| match n.content.as_deref() {
+    node.and_then(|n| match n.content.as_ref() {
         Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
         _ => None,
     })
@@ -53,7 +53,7 @@ pub(crate) fn extract_content_bytes(node: Option<&NodeRef<'_>>) -> Vec<u8> {
 /// Extract binary content from an optional `NodeRef` as a big-endian `u32`.
 /// Returns 0 if the node is missing or does not hold byte content. Truncates to 4 bytes.
 pub(crate) fn extract_content_uint(node: Option<&NodeRef<'_>>) -> u32 {
-    node.and_then(|n| match n.content.as_deref() {
+    node.and_then(|n| match n.content.as_ref() {
         Some(NodeContentRef::Bytes(b)) => {
             let mut buf = [0u8; 4];
             let len = b.len().min(4);

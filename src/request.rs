@@ -13,7 +13,11 @@ use wacore_binary::Node;
 
 pub use wacore::request::{InfoQuery, InfoQueryType, RequestUtils};
 
-const DEFAULT_IQ_TIMEOUT: Duration = Duration::from_secs(75);
+/// How long an IQ waits for its answer when the caller does not pass a timeout
+/// of its own. Callers may pass a longer one, so this bounds the default path
+/// rather than every request; app-state derives its reservation wait from it on
+/// that basis, since the sends it waits behind take the default.
+pub(crate) const DEFAULT_IQ_TIMEOUT: Duration = Duration::from_secs(75);
 const IQ_ID_ATTR: &str = "id";
 const IQ_TAG: &str = "iq";
 
@@ -27,6 +31,18 @@ type IqSendFuture<'a> =
 #[cfg(target_arch = "wasm32")]
 type IqSendFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + 'a>>;
+
+/// Runs once the request is on the wire and before the response is awaited.
+///
+/// A caller that must hold a lock across the send — the waiter has to be in the
+/// map before the stanza leaves, or a fast response is dropped as unmatched —
+/// releases it here instead of holding it through the whole round trip. Boxed
+/// rather than generic for the same reason [`IqSendFuture`] is, and `None` on
+/// every other path costs nothing.
+#[cfg(not(target_arch = "wasm32"))]
+type IqOnSent<'a> = Box<dyn FnOnce() + Send + 'a>;
+#[cfg(target_arch = "wasm32")]
+type IqOnSent<'a> = Box<dyn FnOnce() + 'a>;
 
 /// Removes a pending `response_waiters` entry when dropped.
 ///
@@ -77,6 +93,48 @@ enum PreparedIq {
     Query(Box<InfoQuery<'static>>),
 }
 
+/// A rejection stanza kept for the caller, wrapping the node the receive path decoded.
+///
+/// Exists for its `Debug`, which names the stanza instead of printing it: background IQ
+/// failures are logged with `{e:?}` on the connect path, and an error stanza can carry a
+/// JID. Reading the contents is [`Deref`] away, but that is now the caller's choice.
+///
+/// [`Deref`]: std::ops::Deref
+#[derive(Clone)]
+pub struct RejectionStanza(Arc<wacore_binary::OwnedNodeRef>);
+
+impl RejectionStanza {
+    /// The preserved node behind its refcount, for a caller that wants to keep or share it.
+    pub fn as_arc(&self) -> &Arc<wacore_binary::OwnedNodeRef> {
+        &self.0
+    }
+
+    /// Takes the preserved node out, consuming the wrapper.
+    pub fn into_arc(self) -> Arc<wacore_binary::OwnedNodeRef> {
+        self.0
+    }
+}
+
+impl From<Arc<wacore_binary::OwnedNodeRef>> for RejectionStanza {
+    fn from(response: Arc<wacore_binary::OwnedNodeRef>) -> Self {
+        Self(response)
+    }
+}
+
+impl std::ops::Deref for RejectionStanza {
+    type Target = wacore_binary::OwnedNodeRef;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RejectionStanza {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{}>", self.0.tag())
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum IqError {
@@ -102,6 +160,10 @@ pub enum IqError {
         error_type: Option<String>,
         /// Server-directed retry delay in seconds from the `backoff` attr; `None` if absent.
         backoff: Option<u32>,
+        /// The `type="error"` stanza verbatim, handed over whole the way a `type="result"`
+        /// one is. What matters in a protocol error is the caller's judgement, so the summary
+        /// above does not replace it: unread attributes, children and bytes stay readable.
+        response: RejectionStanza,
     },
     #[error("received unexpected IQ response type: {got:?}")]
     UnexpectedResponseType { got: Option<String> },
@@ -147,10 +209,14 @@ impl IqError {
             | IqError::ParseError(_) => false,
         }
     }
-}
 
-impl From<wacore::request::IqError> for IqError {
-    fn from(err: wacore::request::IqError) -> Self {
+    /// Lifts a response-classification failure onto the response it was read
+    /// from. Taken by reference and cloned only on the arm that keeps it, so
+    /// the other arms cost nothing.
+    pub fn from_response(
+        err: wacore::request::IqError,
+        response: &Arc<wacore_binary::OwnedNodeRef>,
+    ) -> Self {
         match err {
             wacore::request::IqError::Timeout => Self::Timeout,
             wacore::request::IqError::NotConnected => Self::NotConnected,
@@ -165,6 +231,7 @@ impl From<wacore::request::IqError> for IqError {
                 text,
                 error_type,
                 backoff,
+                response: response.clone().into(),
             },
             wacore::request::IqError::UnexpectedResponseType { got } => {
                 Self::UnexpectedResponseType { got }
@@ -302,6 +369,7 @@ impl Client {
             req_id,
             iq_timeout,
             Box::pin(async { self.send_node(node).await }),
+            None,
         )
         .await
     }
@@ -311,14 +379,25 @@ impl Client {
     /// The stanza ID is preserved when supplied and generated otherwise. The
     /// same waiter, cancellation, timeout and response validation path used by
     /// typed IQ specifications handles the request.
+    pub async fn send_iq_node(
+        &self,
+        node: Node,
+        timeout: Option<Duration>,
+    ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
+        self.send_iq_node_then(node, timeout, None).await
+    }
+
+    /// [`Self::send_iq_node`] with a hook that runs between the send and the
+    /// wait. See [`IqOnSent`] for why a caller would want one.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.iq.node", level = "debug", skip_all, err(Debug))
     )]
-    pub async fn send_iq_node(
+    pub(crate) async fn send_iq_node_then(
         &self,
         mut node: Node,
         timeout: Option<Duration>,
+        on_sent: Option<IqOnSent<'_>>,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
@@ -342,6 +421,7 @@ impl Client {
             req_id,
             timeout.unwrap_or(DEFAULT_IQ_TIMEOUT),
             Box::pin(async { self.send_node(node).await }),
+            on_sent,
         )
         .await
     }
@@ -395,6 +475,7 @@ impl Client {
                     req_id,
                     DEFAULT_IQ_TIMEOUT,
                     Box::pin(async { self.send_raw_bytes(buf).await }),
+                    None,
                 )
                 .await
             }
@@ -423,6 +504,7 @@ impl Client {
         req_id: String,
         timeout: Duration,
         send_fn: IqSendFuture<'_>,
+        on_sent: Option<IqOnSent<'_>>,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
         let _t = wacore::telemetry::timer(wacore::telemetry::IQ_DURATION);
         if !self.is_running.load(Ordering::Relaxed) {
@@ -473,13 +555,17 @@ impl Client {
             };
         }
 
+        if let Some(on_sent) = on_sent {
+            on_sent();
+        }
+
         let request_utils = self.get_request_utils();
         let result = futures::select! {
             result = rt_timeout(&*self.runtime, timeout, rx).fuse() => {
                 match result {
                     Ok(Ok(response_node)) => match request_utils.parse_iq_response(response_node.get()) {
                         Ok(()) => Ok(response_node),
-                        Err(e) => Err(e.into()),
+                        Err(e) => Err(IqError::from_response(e, &response_node)),
                     },
                     Ok(Err(_)) => Err(IqError::InternalChannelClosed),
                     Err(_) => Err(IqError::Timeout),
@@ -542,14 +628,220 @@ mod tests {
 
     #[test]
     fn converts_unexpected_response_type() {
-        let err = IqError::from(wacore::request::IqError::UnexpectedResponseType {
-            got: Some("get".to_string()),
-        });
+        let response = crate::test_utils::node_to_owned_ref(&NodeBuilder::new(IQ_TAG).build());
+        let err = IqError::from_response(
+            wacore::request::IqError::UnexpectedResponseType {
+                got: Some("get".to_string()),
+            },
+            &response,
+        );
 
         match err {
             IqError::UnexpectedResponseType { got } => assert_eq!(got.as_deref(), Some("get")),
             other => panic!("expected UnexpectedResponseType, got {other:?}"),
         }
+    }
+
+    /// A rejection stanza carries more than the four attributes the parser reads: the
+    /// `<iq>`'s own attributes, attributes on `<error>` this library does not model, and
+    /// `<error>` children. All of it has to reach the caller.
+    #[tokio::test]
+    async fn a_server_error_keeps_the_stanza_behind_its_summary() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+        let request = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_iq_node(
+                        NodeBuilder::new(IQ_TAG)
+                            .attr("type", "get")
+                            .attr("xmlns", "w:test")
+                            .build(),
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request_id = sent
+            .attrs()
+            .optional_string(IQ_ID_ATTR)
+            .expect("the request carries an id")
+            .into_owned();
+        let delivered = crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &NodeBuilder::new(IQ_TAG)
+                .attr(IQ_ID_ATTR, request_id.as_str())
+                .attr("type", "error")
+                .attr("from", "s.whatsapp.net")
+                .children([NodeBuilder::new("error")
+                    .attr("code", "403")
+                    .attr("text", "forbidden")
+                    .attr("type", "cancel")
+                    .attr("backoff", "30")
+                    .attr("reason", "policy")
+                    .children([NodeBuilder::new("not-authorized").build()])
+                    .build()])
+                .build(),
+        )
+        .await;
+
+        let error = request
+            .await
+            .expect("the request task should not panic")
+            .expect_err("a type=error response must fail the request");
+        let IqError::ServerError {
+            code,
+            text,
+            error_type,
+            backoff,
+            response,
+        } = error
+        else {
+            panic!("expected ServerError, got {error:?}");
+        };
+
+        assert_eq!(code, 403);
+        assert_eq!(text, "forbidden");
+        assert_eq!(error_type.as_deref(), Some("cancel"));
+        assert_eq!(backoff, Some(30));
+        assert!(
+            Arc::ptr_eq(response.as_arc(), &delivered),
+            "the rejection must carry the decoded node itself, not a copy of it"
+        );
+        assert_eq!(
+            format!("{response:?}"),
+            "<iq>",
+            "Debug must name the stanza, not print it: background IQ failures are logged \
+             with {{e:?}} and an error stanza can carry a JID"
+        );
+
+        let response = response.get();
+        assert_eq!(
+            response.attrs().optional_string("from").as_deref(),
+            Some("s.whatsapp.net"),
+            "an attribute of the <iq> itself must survive"
+        );
+        let error_node = response
+            .get_optional_child("error")
+            .expect("the preserved stanza keeps its <error>");
+        assert_eq!(
+            error_node.attrs().optional_string("reason").as_deref(),
+            Some("policy"),
+            "an <error> attribute the parser does not model must survive"
+        );
+        assert!(
+            error_node.get_optional_child("not-authorized").is_some(),
+            "an <error> child must survive"
+        );
+    }
+
+    /// The corresponding failure: an `<error>` with neither `type` nor `backoff` still
+    /// classifies as it did, and still hands back the stanza it was read from.
+    #[tokio::test]
+    async fn a_server_error_without_the_optional_attrs_still_classifies() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+        let request = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_iq_node(NodeBuilder::new(IQ_TAG).attr("type", "get").build(), None)
+                    .await
+            })
+        };
+
+        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request_id = sent
+            .attrs()
+            .optional_string(IQ_ID_ATTR)
+            .expect("the request carries an id")
+            .into_owned();
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &NodeBuilder::new(IQ_TAG)
+                .attr(IQ_ID_ATTR, request_id.as_str())
+                .attr("type", "error")
+                .children([NodeBuilder::new("error")
+                    .attr("code", "404")
+                    .attr("text", "item-not-found")
+                    .build()])
+                .build(),
+        )
+        .await;
+
+        let error = request
+            .await
+            .expect("the request task should not panic")
+            .expect_err("a type=error response must fail the request");
+        let IqError::ServerError {
+            code,
+            text,
+            error_type,
+            backoff,
+            response,
+        } = error
+        else {
+            panic!("expected ServerError, got {error:?}");
+        };
+
+        assert_eq!(code, 404);
+        assert_eq!(text, "item-not-found");
+        assert_eq!(error_type, None);
+        assert_eq!(backoff, None);
+        assert_eq!(
+            response
+                .get()
+                .attrs()
+                .optional_string(IQ_ID_ATTR)
+                .as_deref(),
+            Some(request_id.as_str()),
+        );
+    }
+
+    /// The success path is untouched: the caller gets back the very allocation the receive
+    /// path decoded, so preserving the stanza on the error path bought no second parse here.
+    #[tokio::test]
+    async fn a_successful_iq_returns_the_delivered_allocation() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+        let request = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_iq_node(NodeBuilder::new(IQ_TAG).attr("type", "get").build(), None)
+                    .await
+            })
+        };
+
+        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request_id = sent
+            .attrs()
+            .optional_string(IQ_ID_ATTR)
+            .expect("the request carries an id")
+            .into_owned();
+        let delivered = crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &NodeBuilder::new(IQ_TAG)
+                .attr(IQ_ID_ATTR, request_id.as_str())
+                .attr("type", "result")
+                .build(),
+        )
+        .await;
+
+        let response = request
+            .await
+            .expect("the request task should not panic")
+            .expect("a type=result response must succeed");
+        assert!(
+            Arc::ptr_eq(&response, &delivered),
+            "the caller must receive the decoded node itself, not a re-parse of it"
+        );
     }
 
     // Cancellation cleanup: dropping a `send_and_wait_iq` future mid-await (e.g.

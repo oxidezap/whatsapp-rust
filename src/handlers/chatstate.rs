@@ -8,6 +8,7 @@ use std::sync::Arc;
 use wacore::iq::chatstate::{
     ChatstateParseError, ChatstateSource, ChatstateStanza, ReceivedChatState,
 };
+use wacore::stanza::wire_tags::StanzaTag;
 use wacore_binary::Jid;
 
 /// Event for incoming chatstate (`<chatstate/>`) stanzas.
@@ -50,7 +51,7 @@ pub struct ChatstateHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for ChatstateHandler {
     fn tag(&self) -> &'static str {
-        "chatstate"
+        StanzaTag::ChatState.as_str()
     }
 
     #[cfg_attr(

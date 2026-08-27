@@ -40,9 +40,8 @@ async fn test_offline_group_notification() -> anyhow::Result<()> {
     client_c.wait_for_group_notification(10).await?;
     info!("B and C received group create notification");
 
-    client_c.client.reconnect().await;
-    info!("C disconnected (will auto-reconnect)");
-    client_c.wait_for_disconnected(5).await?;
+    client_c.go_offline().await?;
+    info!("C is offline");
 
     let add_result = client_a
         .client
@@ -60,6 +59,7 @@ async fn test_offline_group_notification() -> anyhow::Result<()> {
     info!("B received add notification (online)");
 
     // C should receive the notification after reconnecting (from offline queue)
+    client_c.come_back_online();
     client_c.wait_for_group_notification(30).await?;
     info!("C received offline group notification");
 
@@ -103,9 +103,8 @@ async fn test_mixed_offline_event_ordering() -> anyhow::Result<()> {
     client_c.wait_for_group_notification(10).await?;
     client_b.wait_for_group_notification(10).await?;
 
-    client_c.client.reconnect().await;
-    info!("C disconnected");
-    client_c.wait_for_disconnected(5).await?;
+    client_c.go_offline().await?;
+    info!("C is offline");
 
     let text_1 = "First message while C offline";
     client_a
@@ -137,6 +136,7 @@ async fn test_mixed_offline_event_ordering() -> anyhow::Result<()> {
     info!("A sent second message");
 
     // Collect all events C receives after reconnecting
+    client_c.come_back_online();
     let mut messages_received = Vec::new();
     let mut notifications_received = 0;
     for _ in 0..5 {
@@ -162,6 +162,16 @@ async fn test_mixed_offline_event_ordering() -> anyhow::Result<()> {
             }
             Ok(_) => {}
             Err(_) => break,
+        }
+
+        // Exactly the three assertions below: once they can all pass there is
+        // nothing left to wait for, and the loop used to spend a final 10s
+        // timeout finding that out.
+        if messages_received.iter().any(|m| m == text_1)
+            && messages_received.iter().any(|m| m == text_2)
+            && notifications_received >= 1
+        {
+            break;
         }
     }
 
@@ -226,9 +236,8 @@ async fn test_offline_group_message_delivery() -> anyhow::Result<()> {
     client_b.wait_for_group_notification(10).await?;
     client_c.wait_for_group_notification(10).await?;
 
-    client_c.client.reconnect().await;
-    info!("C disconnected");
-    client_c.wait_for_disconnected(5).await?;
+    client_c.go_offline().await?;
+    info!("C is offline");
 
     let text = "Group message while C offline";
     client_a
@@ -241,6 +250,7 @@ async fn test_offline_group_message_delivery() -> anyhow::Result<()> {
     info!("B received group message (online)");
 
     // C should receive it after reconnecting (from offline queue)
+    client_c.come_back_online();
     let event = client_c.wait_for_text(text, 30).await?;
     if let Some(m) = event
         .messages()
@@ -338,14 +348,12 @@ async fn test_offline_multi_sender_group_messages() -> anyhow::Result<()> {
     }
     info!("All participants received group creation notifications");
 
-    // Take C offline. We use reconnect() (NOT reconnect_and_wait()) because we
-    // need C to be offline while messages are sent. reconnect() triggers a
-    // disconnect + background auto-reconnect; waiting for the teardown to land
-    // is what makes the server queue the messages below for C.
-    // This is the standard offline simulation pattern used by all offline tests.
-    client_c.client.reconnect().await;
-    info!("C disconnected (will auto-reconnect)");
-    client_c.wait_for_disconnected(5).await?;
+    // Take C offline for as long as this test needs and not a second longer:
+    // `go_offline` holds the connection down until `come_back_online`, so the
+    // sends below are queued for C as a fact rather than because they beat a
+    // backoff timer. This is the standard offline pattern in these tests.
+    client_c.go_offline().await?;
+    info!("C is offline");
 
     // Send multiple messages from multiple senders across both groups while C is offline.
     // This creates the conditions for the semaphore transition bug:
@@ -411,6 +419,7 @@ async fn test_offline_multi_sender_group_messages() -> anyhow::Result<()> {
     }
 
     info!("Sent {} messages while C offline", expected_messages.len());
+    client_c.come_back_online();
 
     // Verify B receives all messages (sanity check that sends worked)
     let mut b_received = 0;

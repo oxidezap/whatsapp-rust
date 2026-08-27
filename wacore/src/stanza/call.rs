@@ -84,12 +84,13 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .offline(offline)
         .action(action)
         .maybe_group(group);
+    let call = call.build();
     // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
     // capture it only on an <offer> and only when `voip` is on (RelayData lives there).
     #[cfg(feature = "voip")]
-    let call = call.maybe_media(media);
+    let call = call.with_media(media);
 
-    Ok(Some(call.build()))
+    Ok(Some(call))
 }
 
 /// Extract the media material from an `<offer>`: the `<enc>` addressed to us (direct child or under
@@ -680,6 +681,13 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     )
 }
 
+/// The rotation an offer, accept or preaccept announces.
+///
+/// Upright, and not a parameter: none of them has a `CallHandle` yet, so no
+/// rotation can have been set for the call they open. `CallHandle::set_video_orientation`
+/// is where one is set and what carries it from there.
+const INITIAL_DEVICE_ORIENTATION: &str = "0";
+
 /// Default initiator-side geometry used by the WaCalls reference.
 const VIDEO_SCREEN_WIDTH: &str = "1920";
 const VIDEO_SCREEN_HEIGHT: &str = "1080";
@@ -692,7 +700,7 @@ fn video_offer_node() -> Node {
         .attr("orientation", "0")
         .attr("screen_width", VIDEO_SCREEN_WIDTH)
         .attr("screen_height", VIDEO_SCREEN_HEIGHT)
-        .attr("device_orientation", "0")
+        .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .build()
 }
 
@@ -700,7 +708,7 @@ fn video_offer_node() -> Node {
 fn video_accept_node() -> Node {
     NodeBuilder::new("video")
         .attr("dec", "H264")
-        .attr("device_orientation", "0")
+        .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .build()
 }
 
@@ -709,7 +717,7 @@ fn video_accept_node() -> Node {
 fn video_preaccept_node() -> Node {
     NodeBuilder::new("video")
         .attr("dec", "H264")
-        .attr("device_orientation", "0")
+        .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .attr("screen_width", "0")
         .attr("screen_height", "0")
         .build()
@@ -957,13 +965,22 @@ pub(crate) fn build_typed_call_ack(original: &NodeRef<'_>, action_type: &str) ->
     Some(ack.build())
 }
 
-pub fn build_mute_v2(call_id: &str, to: &Jid, call_creator: &Jid, mute_state: &str) -> Node {
+/// `<call to=peer id=wrapper_id><mute_v2 call-id call-creator mute-state="1|0"/></call>`: this
+/// side announcing its own microphone state. `mute-state` is the boolean sibling of
+/// `raise-hand-state`, which the same signaling carries in the same shape.
+pub fn build_mute_v2(
+    call_id: &str,
+    to: &Jid,
+    call_creator: &Jid,
+    wrapper_id: &str,
+    muted: bool,
+) -> Node {
     let action = NodeBuilder::new("mute_v2")
         .attr("call-id", call_id)
         .attr("call-creator", call_creator)
-        .attr("mute-state", mute_state.to_string())
+        .attr("mute-state", if muted { "1" } else { "0" })
         .build();
-    call_wrap(to, None, action)
+    call_wrap(to, Some(wrapper_id), action)
 }
 
 /// `<call to=peer id=wrapper_id><reject call-id call-creator count="0"/></call>`.
@@ -1066,9 +1083,10 @@ mod tests {
         parse_call_stanza(&as_ref(&node))
             .expect("offer parses")
             .expect("recognized call")
-            .media
+            .media()
             .expect("media offer")
             .peer_device
+            .clone()
     }
 
     #[cfg(feature = "voip")]
@@ -1138,7 +1156,7 @@ mod tests {
             .build();
 
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
-        let media = call.media.expect("offer with <enc> must capture media");
+        let media = call.media().expect("offer with <enc> must capture media");
         let enc = media
             .enc_for(None)
             .expect("a bare <enc> is addressed to us");
@@ -1157,7 +1175,7 @@ mod tests {
         assert_eq!(peer_device.jid, fake_caller_lid());
         assert_eq!(peer_device.capability_version, Some(1));
         assert_eq!(peer_device.capability, CAPABILITY_OFFER);
-        let rd = media.relay.expect("the <relay> must be parsed");
+        let rd = media.relay.as_ref().expect("the <relay> must be parsed");
         assert_eq!(rd.warp_mi_tag_len, Some(4));
         assert_eq!(rd.relay_tokens[0], vec![0xaa, 0xbb]);
         assert_eq!(rd.endpoints[0].relay_name, "gru1c02");
@@ -1186,9 +1204,10 @@ mod tests {
         let device = parse_call_stanza(&as_ref(&node))
             .unwrap()
             .unwrap()
-            .media
+            .media()
             .expect("media offer")
             .peer_device
+            .clone()
             .expect("peer capability");
         assert_eq!(device.jid, participant);
     }
@@ -1207,7 +1226,7 @@ mod tests {
                 .build()])
             .build();
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
-        assert!(call.media.is_none());
+        assert!(call.media().is_none());
     }
 
     // A multi-device offer lists one <to jid><enc> per recipient device. The parser keeps every
@@ -1241,7 +1260,7 @@ mod tests {
             .build();
 
         let call = parse_call_stanza(&as_ref(&node)).unwrap().unwrap();
-        let media = call.media.expect("multi-device offer captures media");
+        let media = call.media().expect("multi-device offer captures media");
         // Selected by device jid, not by child order: dev2 is second but resolves to its own enc.
         assert_eq!(media.enc_for(Some(&dev2)).unwrap().ciphertext, vec![0xB2]);
         assert_eq!(media.enc_for(Some(&dev2)).unwrap().enc_type, "msg");
@@ -1282,11 +1301,10 @@ mod tests {
                 .build()])
             .build();
 
-        // marshal writes a leading format byte that unmarshal_ref does not expect.
         let bytes = wacore_binary::marshal::marshal(&node).unwrap();
-        let decoded = wacore_binary::marshal::unmarshal_ref(&bytes[1..]).unwrap();
+        let decoded = wacore_binary::marshal::unmarshal_packed_ref(&bytes).unwrap();
         let call = parse_call_stanza(&decoded).unwrap().unwrap();
-        let media = call.media.expect("offer captures media");
+        let media = call.media().expect("offer captures media");
 
         let from_wire = media.encs[0].to.as_ref().expect("<to jid> survives decode");
         let from_text: Jid = "111111111111111:7@lid".parse().unwrap();

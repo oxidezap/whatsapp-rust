@@ -144,8 +144,11 @@ impl HashState {
             }
         }
 
-        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &removed, &[] as &[Vec<u8>]);
-        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &[] as &[&[u8]], &added);
+        // One call, not one per direction: `subtract_then_add_in_place` already
+        // walks the subtract list then the add list, so splitting it in two ran
+        // each list past an empty counterpart and set the 128-byte derivation
+        // buffer up twice over.
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &removed, &added);
         (result, Ok(()))
     }
 

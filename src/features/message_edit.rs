@@ -347,6 +347,19 @@ impl<'a> SecretEncrypted<'a> {
     }
 }
 
+/// Whether the message carries a secret-encrypted addon envelope at all,
+/// regardless of whether that envelope is well formed.
+///
+/// [`extract_secret_encrypted`] answers "can this be opened", which is the
+/// wrong question for anything deciding that the consumer did not get real
+/// content: it returns `None` both for a plain message and for a tagged
+/// envelope that is malformed, and those two must not be treated alike.
+pub fn carries_secret_encrypted(msg: &wa::Message) -> bool {
+    msg.secret_encrypted_message.as_option().is_some()
+        || msg.enc_reaction_message.as_option().is_some()
+        || msg.enc_comment_message.as_option().is_some()
+}
+
 /// Extract any supported `secret_encrypted_message` envelope (EVENT_EDIT,
 /// MESSAGE_EDIT, POLL_EDIT, POLL_ADD_OPTION) from a received message.
 ///

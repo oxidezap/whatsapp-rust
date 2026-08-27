@@ -1,6 +1,7 @@
 //! Small accessors, config setters, node waiters and sync-error helpers.
 
 use super::*;
+use crate::client::interceptor::{InterceptorHandle, Registration, StanzaInterceptor};
 
 /// Identity for span/error tagging. Named fields, not a tuple — LID/PN transposition would
 /// otherwise be a silent, unchecked bug at call sites.
@@ -12,19 +13,15 @@ pub struct IdentityTags {
 }
 
 impl Client {
-    pub(crate) async fn get_group_cache(&self) -> Arc<GroupCache> {
-        let mut guard = self.group_cache.lock().await;
-        if let Some(cache) = guard.as_ref() {
-            return cache.clone();
-        }
-        debug!("Initializing Group Cache for the first time.");
-        let cache = Arc::new(
-            self.cache_config
-                .group_cache
-                .build_typed_ttl(self.cache_config.cache_stores.group_cache.clone(), "group"),
-        );
-        *guard = Some(cache.clone());
-        cache
+    pub(crate) fn get_group_cache(&self) -> &Arc<GroupCache> {
+        self.group_cache.get_or_init(|| {
+            debug!("Initializing Group Cache for the first time.");
+            Arc::new(
+                self.cache_config
+                    .group_cache
+                    .build_typed_ttl(self.cache_config.cache_stores.group_cache.clone(), "group"),
+            )
+        })
     }
 
     /// Subscribe an external event handler with an explicit event filter.
@@ -62,6 +59,164 @@ impl Client {
 
     pub(crate) fn raw_node_forwarding_enabled(&self) -> bool {
         self.raw_node_forwarding.load(Ordering::Relaxed) != 0
+    }
+
+    /// Acquire decrypted-payload forwarding for one consumer.
+    ///
+    /// [`Event::DecryptedPayload`] stays enabled until every acquired lease is
+    /// dropped. While none is held nothing is emitted and nothing is cloned:
+    /// the path costs one relaxed atomic load.
+    ///
+    /// [`Event::DecryptedPayload`]: wacore::types::events::Event::DecryptedPayload
+    pub fn acquire_decrypted_payload_forwarding(self: &Arc<Self>) -> DecryptedPayloadLease {
+        let incremented = self
+            .decrypted_payload_forwarding
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            })
+            .is_ok();
+        assert!(
+            incremented,
+            "decrypted-payload forwarding lease counter overflow"
+        );
+        DecryptedPayloadLease {
+            client: Arc::downgrade(self),
+        }
+    }
+
+    pub(crate) fn decrypted_payload_forwarding_enabled(&self) -> bool {
+        self.decrypted_payload_forwarding.load(Ordering::Relaxed) != 0
+    }
+
+    /// Acquire per-`<enc>` decrypt-failure forwarding for one consumer.
+    ///
+    /// [`Event::EncDecryptFailed`] stays enabled until every acquired lease is
+    /// dropped. While none is held nothing is emitted and nothing is built: each
+    /// failure branch costs one relaxed atomic load.
+    ///
+    /// Separate from
+    /// [`acquire_decrypted_payload_forwarding`](Self::acquire_decrypted_payload_forwarding)
+    /// on purpose — a consumer that wants both halves of a stanza's decryption
+    /// holds both leases, and one that wants only failures does not make the
+    /// success path clone plaintext.
+    ///
+    /// [`Event::EncDecryptFailed`]: wacore::types::events::Event::EncDecryptFailed
+    pub fn acquire_enc_decrypt_failed_forwarding(self: &Arc<Self>) -> EncDecryptFailedLease {
+        let incremented = self
+            .enc_decrypt_failed_forwarding
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            })
+            .is_ok();
+        assert!(
+            incremented,
+            "enc-decrypt-failure forwarding lease counter overflow"
+        );
+        EncDecryptFailedLease {
+            client: Arc::downgrade(self),
+        }
+    }
+
+    pub(crate) fn enc_decrypt_failed_forwarding_enabled(&self) -> bool {
+        self.enc_decrypt_failed_forwarding.load(Ordering::Relaxed) != 0
+    }
+
+    /// Acquire sent-frame forwarding for one consumer.
+    ///
+    /// [`Event::SentFrame`] stays enabled until every acquired lease is dropped.
+    /// While none is held nothing is emitted and nothing is cloned: the send
+    /// path costs one relaxed atomic load.
+    ///
+    /// This is the outbound counterpart of
+    /// [`acquire_raw_node_forwarding`](Self::acquire_raw_node_forwarding), and
+    /// unlike [`wait_for_sent_node`](Self::wait_for_sent_node) it is neither
+    /// filtered nor one-shot and covers every send path, including the ones that
+    /// never build a `Node`.
+    ///
+    /// [`Event::SentFrame`]: wacore::types::events::Event::SentFrame
+    pub fn acquire_sent_frame_forwarding(self: &Arc<Self>) -> SentFrameLease {
+        self.sent_frame_tap.acquire();
+        SentFrameLease {
+            client: Arc::downgrade(self),
+        }
+    }
+
+    /// Only tests ask this: the send path reads the gate through the tap the
+    /// noise sender already holds, not through the client.
+    #[cfg(test)]
+    pub(crate) fn sent_frame_forwarding_enabled(&self) -> bool {
+        self.sent_frame_tap.enabled()
+    }
+
+    /// Register an interceptor that sees each decoded stanza before the
+    /// built-in pipeline, and may take it.
+    ///
+    /// Interceptors run in registration order; the first to return
+    /// [`Interception::Handled`] wins and the rest are skipped.
+    ///
+    /// See [`crate::client::interceptor`] for what this is for and what it
+    /// costs.
+    ///
+    /// [`Interception::Handled`]: crate::client::interceptor::Interception::Handled
+    pub fn add_stanza_interceptor(
+        self: &Arc<Self>,
+        interceptor: Arc<dyn StanzaInterceptor>,
+    ) -> InterceptorHandle {
+        let id = self.next_interceptor_id.fetch_add(1, Ordering::Relaxed);
+        self.update_stanza_interceptors(|registered| {
+            registered.push(Registration { id, interceptor });
+        });
+        InterceptorHandle {
+            client: Arc::downgrade(self),
+            id,
+        }
+    }
+
+    pub(crate) fn remove_stanza_interceptor(&self, id: u64) {
+        self.update_stanza_interceptors(|registered| {
+            registered.retain(|entry| entry.id != id);
+        });
+    }
+
+    /// Whether any interceptor is registered.
+    ///
+    /// One relaxed load, so the read loop pays nothing while none are. Relaxed
+    /// is enough because the lock behind it does the synchronising: a reader
+    /// racing a registration either sees the count in time or does not, and a
+    /// stanza that arrived before the registration finished was never that
+    /// interceptor's to see.
+    pub(crate) fn has_stanza_interceptors(&self) -> bool {
+        self.stanza_interceptor_count.load(Ordering::Relaxed) != 0
+    }
+
+    /// The current interceptors.
+    ///
+    /// A refcount bump, not a copy — and the snapshot is released before any
+    /// interceptor runs, so one that registers another cannot deadlock.
+    pub(crate) fn stanza_interceptors(&self) -> Arc<Vec<Registration>> {
+        Arc::clone(
+            &self
+                .stanza_interceptors
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Copy-on-write, as the event bus does it: a reader keeps whatever
+    /// snapshot it took, so registering never blocks the read loop for longer
+    /// than the swap.
+    fn update_stanza_interceptors(&self, edit: impl FnOnce(&mut Vec<Registration>)) {
+        let mut guard = self
+            .stanza_interceptors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = guard.as_ref().clone();
+        edit(&mut next);
+        // Stored while the write lock is held, so a reader never sees a count
+        // promising more than the snapshot holds.
+        self.stanza_interceptor_count
+            .store(next.len(), Ordering::Relaxed);
+        *guard = Arc::new(next);
     }
 
     /// Enable or disable skipping of history sync notifications at runtime.
@@ -135,6 +290,8 @@ impl Client {
         let mut snapshot = self.stats.snapshot();
         snapshot.reconnect_errors = self.auto_reconnect_errors.load(Ordering::Relaxed);
         snapshot.resends_throttled = self.resend_rate_limiter.throttled_total();
+        snapshot.messages_suppressed_duplicate =
+            self.duplicate_dispatch_suppressed.load(Ordering::Relaxed);
         snapshot
     }
 
@@ -157,11 +314,15 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .len();
+        let pending_lid_refreshes_count = self
+            .pending_lid_refreshes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
 
-        // Only the Arc is taken under the mutex — the walk must not block
-        // get_group_cache(), which every group send goes through.
-        let group_cache_arc = self.group_cache.lock().await.clone();
-        let group_cache = match group_cache_arc {
+        // `get()`, not `get_group_cache()`: a report must not be what builds the
+        // cache, so an un-warmed client still reports zero entries.
+        let group_cache = match self.group_cache.get() {
             // Arc<T>'s HeapSize already includes size_of::<GroupInfo>().
             Some(cache) => {
                 cache
@@ -188,23 +349,31 @@ impl Client {
 
         // Each count read into a local so no two guards are ever held at once.
         let response_waiters = self.response_waiters_guard().len();
-        let presence_subscriptions = self.presence_subscriptions.lock().await.len();
+        let presence_subscriptions = self
+            .presence_subscriptions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
         let app_state_key_requests = self.app_state_key_requests.lock().await.len();
         let app_state_syncing = self.app_state_syncing.len();
-        let chatstate_handlers = self.chatstate_handlers.read().await.len();
+        // `get()`, not the builder: a report must not be what constructs the
+        // processor, so an un-synced client still reports zero.
+        let app_state_key_cache = match self.app_state_processor.get() {
+            Some(processor) => processor.cached_key_count().await,
+            None => 0,
+        };
+        let (commit_batch_entries, commit_batch_bytes) = self.inbound_commit_batch.pending_stats();
+        let inbound_commit_batch =
+            CollectionStats::new(commit_batch_entries as u64, commit_batch_bytes as u64);
+        let msg_secret_buffer = self.msg_secret_buffer.pending_len();
+        let pending_device_sync = self.pending_device_sync.len();
+        let chatstate_handlers = self.chatstate_handler_count.load(Ordering::Acquire);
         let history_sync_activity = self.history_sync_activity.snapshot();
         let history_sync_tasks = CollectionStats::new(
             history_sync_activity.tasks as u64,
             history_sync_activity.payload_bytes as u64,
         );
-        #[cfg(feature = "voip-runtime")]
-        let pending_call_link_updates = self
-            .pending_call_link_joins
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .memory_stats();
-        #[cfg(feature = "voip-runtime")]
-        let active_calls = self.call_registry.memory_stats();
+        let subsystems = subsystem::memory(&self.subsystems);
         #[cfg(feature = "plugins")]
         let plugin_stats = self.plugin_stats();
         #[cfg(feature = "plugins")]
@@ -214,6 +383,7 @@ impl Client {
             plugin_connection_tasks,
             plugin_connection_generations,
             plugin_core_event_subscriptions,
+            plugin_stanza_interceptors,
         ) = plugin_stats
             .as_ref()
             .map(|host| {
@@ -224,14 +394,17 @@ impl Client {
                         0u64,
                         0u64,
                         0u64,
+                        0u64,
                     ),
-                    |(plugins, install, connection, generations, subscriptions), plugin| {
+                    |(plugins, install, connection, generations, subscriptions, interceptors),
+                     plugin| {
                         (
                             plugins,
                             install.saturating_add(plugin.install_tasks),
                             connection.saturating_add(plugin.connection_tasks),
                             generations.saturating_add(plugin.connection_generations),
                             subscriptions.saturating_add(plugin.core_event_subscriptions),
+                            interceptors.saturating_add(plugin.stanza_interceptors),
                         )
                     },
                 )
@@ -254,32 +427,40 @@ impl Client {
             dm_devices_memo,
             message_retry_counts: self.message_retry_counts.entry_count(),
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
+            dispatched_messages: self.dispatched_messages.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count(),
             pdo_requested: self.pdo_requested.entry_count(),
             history_sync_tasks,
             history_sync_tasks_peak: history_sync_activity.tasks_peak as u64,
             history_sync_payload_bytes_peak: history_sync_activity.payload_bytes_peak as u64,
+            inbound_commit_batch,
+            msg_secret_buffer,
+            pending_device_sync,
             session_locks: self.session_locks.entry_count(),
+            ensure_inflight: self.ensure_inflight.len() as u64,
+            group_metadata_inflight: self.group_metadata_inflight.len() as u64,
             chat_lanes: self.chat_lanes.entry_count(),
             group_distribution_locks: group_distribution_locks.entries,
             group_distribution_lock_evictions: group_distribution_locks.evictions,
             group_distribution_lock_eviction_blocks: group_distribution_locks.eviction_blocks,
             resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
+            session_recreate_history: self.session_recreate_history.entry_count(),
+            skdm_warm_memo: self.skdm_warm_memo.entry_count(),
             transport_ack_queue: self.transport_ack_queue.get().map_or(0, |tx| tx.len()),
             delivery_receipt_queue: self.delivery_receipt_queue.get().map_or(0, |tx| tx.len()),
             response_waiters,
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
+            sent_node_waiters: self.sent_node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,
+            pending_lid_refreshes: pending_lid_refreshes_count,
             presence_subscriptions,
             app_state_key_requests,
+            app_state_key_cache,
             app_state_syncing,
             signal_sessions,
             signal_identities,
             signal_sender_keys,
-            #[cfg(feature = "voip-runtime")]
-            pending_call_link_updates,
-            #[cfg(feature = "voip-runtime")]
-            active_calls,
+            subsystems,
             #[cfg(feature = "plugins")]
             plugins,
             #[cfg(feature = "plugins")]
@@ -291,6 +472,8 @@ impl Client {
             #[cfg(feature = "plugins")]
             plugin_core_event_subscriptions,
             #[cfg(feature = "plugins")]
+            plugin_stanza_interceptors,
+            #[cfg(feature = "plugins")]
             plugin_event_endpoints: plugin_event_router.active_endpoints,
             #[cfg(feature = "plugins")]
             plugin_event_endpoint_capacity: plugin_event_router.endpoint_capacity,
@@ -301,6 +484,7 @@ impl Client {
             ),
             chatstate_handlers,
             custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
+            stanza_interceptors: self.stanza_interceptors().len(),
         }
     }
 
@@ -376,17 +560,22 @@ impl Client {
     /// Shared so every identity-tagged span leaves a field absent (not `""`) when unknown —
     /// duplicating this per call site would drift out of sync. Skips the snapshot read when
     /// the span is disabled.
+    ///
+    /// Records the JIDs borrowed from the held snapshot rather than through
+    /// [`Self::identity_tags`]: the tags struct renders both into owned `String`s,
+    /// and every send crosses several identity-tagged spans, so the formatting is
+    /// left to the subscriber that may not even want the field.
     #[cfg(feature = "tracing")]
     pub(crate) fn record_identity_on_span(&self, span: &tracing::Span) {
         if span.is_disabled() {
             return;
         }
-        let tags = self.identity_tags();
-        if let Some(lid) = tags.lid {
+        let snapshot = self.persistence_manager.get_device_snapshot();
+        if let Some(lid) = snapshot.lid.as_ref() {
             span.record("lid", tracing::field::display(lid));
         }
-        if let Some(pn) = tags.pn {
-            span.record("pn", tracing::field::display(pn));
+        if let Some(pn) = snapshot.pn.as_ref() {
+            span.record("pn", tracing::field::display(pn.observe()));
         }
     }
 
@@ -431,7 +620,7 @@ impl Client {
             return;
         }
 
-        log::debug!("Updating push name from '{}' -> '{}'", old_name, new_name);
+        log::debug!("Updating push name");
         self.persistence_manager
             .process_command(DeviceCommand::SetPushName(new_name.clone()))
             .await;
@@ -652,5 +841,170 @@ mod send_checks {
     #[allow(dead_code)]
     fn resource_report_future_is_send(c: &super::Client) {
         assert_send(&c.resource_report());
+    }
+}
+
+#[cfg(all(test, feature = "tracing"))]
+mod identity_span_tests {
+    use std::sync::Mutex;
+    use wacore::store::commands::DeviceCommand;
+
+    /// Captures what a subscriber would render for the `lid`/`pn` span fields,
+    /// so the recorded values can be asserted without a real fmt layer.
+    #[derive(Default)]
+    struct Captured(Mutex<Vec<(String, String)>>);
+
+    impl tracing::field::Visit for &Captured {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .lock()
+                .expect("capture mutex")
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    /// `None` visits nothing, for the allocation guard below.
+    struct CapturingSubscriber(Option<std::sync::Arc<Captured>>);
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::Id, values: &tracing::span::Record<'_>) {
+            if let Some(captured) = self.0.as_ref() {
+                values.record(&mut &**captured);
+            }
+        }
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
+    fn recorded(captured: &Captured, field: &str) -> Option<String> {
+        captured
+            .0
+            .lock()
+            .expect("capture mutex")
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, value)| value.clone())
+    }
+
+    #[tokio::test]
+    async fn identity_fields_render_lid_raw_and_pn_redacted() {
+        let client = crate::test_utils::create_test_client().await;
+        let pn: wacore_binary::Jid = "551199990000.0:1@s.whatsapp.net".parse().expect("pn");
+        let lid: wacore_binary::Jid = "199990000000000.0:1@lid".parse().expect("lid");
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(pn.clone())))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(lid.clone())))
+            .await;
+
+        let captured = std::sync::Arc::new(Captured::default());
+        let subscriber = CapturingSubscriber(Some(std::sync::Arc::clone(&captured)));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!(
+                "test.identity",
+                lid = tracing::field::Empty,
+                pn = tracing::field::Empty
+            );
+            client.record_identity_on_span(&span);
+        });
+
+        // The recorded values must still match what rendering the JIDs eagerly
+        // produced: LID in full, PN through the redacting wrapper.
+        assert_eq!(
+            recorded(&captured, "lid").as_deref(),
+            Some(lid.to_string().as_str()),
+            "lid field must render the LID in full"
+        );
+        assert_eq!(
+            recorded(&captured, "pn").as_deref(),
+            Some(pn.observe().to_string().as_str()),
+            "pn field must render through the redacting wrapper, not raw"
+        );
+        // `tracing-pii` exists to render the number raw, so this is the one
+        // claim it invalidates; same split as `observe_redacts_phone_but_not_lid_or_group`.
+        #[cfg(not(feature = "tracing-pii"))]
+        assert!(
+            !recorded(&captured, "pn")
+                .expect("pn recorded")
+                .contains("551199990000"),
+            "the raw phone number must never reach the span field"
+        );
+    }
+
+    /// Failure shape: an unpaired device leaves both fields absent rather than
+    /// recording an empty string, which is the contract the shared helper exists
+    /// to keep.
+    #[tokio::test]
+    async fn identity_fields_stay_absent_before_pairing() {
+        let client = crate::test_utils::create_test_client().await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(None))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(None))
+            .await;
+
+        let captured = std::sync::Arc::new(Captured::default());
+        let subscriber = CapturingSubscriber(Some(std::sync::Arc::clone(&captured)));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::debug_span!(
+                "test.identity",
+                lid = tracing::field::Empty,
+                pn = tracing::field::Empty
+            );
+            client.record_identity_on_span(&span);
+        });
+
+        assert_eq!(recorded(&captured, "lid"), None);
+        assert_eq!(recorded(&captured, "pn"), None);
+    }
+
+    /// Locks the reason this helper stopped going through `identity_tags`: on a
+    /// paired client it rendered two owned `String`s per identity-tagged span,
+    /// and a send crosses several of them.
+    #[tokio::test]
+    async fn recording_identity_does_not_heap_allocate() {
+        let client = crate::test_utils::create_test_client().await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(
+                "551199990000.0:1@s.whatsapp.net".parse().expect("pn"),
+            )))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(
+                "199990000000000.0:1@lid".parse().expect("lid"),
+            )))
+            .await;
+
+        // A subscriber that enables the span but does not visit the fields: what
+        // this locks is that the crate itself renders nothing, leaving the cost
+        // to whichever layer actually wants the value.
+        let min_delta = tracing::subscriber::with_default(CapturingSubscriber(None), || {
+            let span = tracing::debug_span!(
+                "test.identity",
+                lid = tracing::field::Empty,
+                pn = tracing::field::Empty
+            );
+            crate::test_alloc::min_allocs(0, || client.record_identity_on_span(&span))
+        });
+        assert_eq!(
+            min_delta, 0,
+            "recording identity on a span must not allocate on the crate side"
+        );
     }
 }

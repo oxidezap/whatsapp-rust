@@ -14,7 +14,7 @@ use super::smpl_decode::{SmplLsfState, SmplTables, load_smpl_tables};
 use super::smpl_mem::{SmplMem, load_smpl_mem};
 use super::smpl_pulse::mem8_static;
 
-const SMPL_ENCODE_BUF_BYTES: usize = 512;
+pub(crate) const SMPL_ENCODE_BUF_BYTES: usize = 512;
 const OPUS_FRAME_SAMPS: usize = 960; // 60 ms @ 16 kHz
 
 /// Why an MLow encode call failed. A consumer branches on this rather than parsing a string:
@@ -88,7 +88,7 @@ impl MlowEncoder {
     }
 }
 
-fn encode_smpl_frame_into(
+pub(crate) fn encode_smpl_frame_into(
     fp: &SmplFrameParams,
     enc: &mut RangeEncoder,
     output: &mut Vec<u8>,

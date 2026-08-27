@@ -1,16 +1,46 @@
 use std::io::Write;
 
-#[cfg(feature = "simd")]
-use core::simd::Select;
-#[cfg(feature = "simd")]
-use core::simd::prelude::*;
-#[cfg(feature = "simd")]
-use core::simd::{Simd, u8x16};
-
 use crate::error::{BinaryError, Result};
 use crate::jid::{self, Jid, JidRef};
 use crate::node::{Node, NodeContent, NodeContentRef, NodeRef, NodeValue, ValueRef};
 use crate::token;
+
+/// Marks a byte no packed encoding accepts. `validate_hex`/`validate_nibble`
+/// gate every caller, so a hit means the caller skipped that check.
+const PACK_INVALID: u8 = 0xFF;
+
+/// ASCII to nibble, the inverse of the decoder's `HEX_PAIRS`. Index 0 maps to
+/// 15 because that is the pad an odd-length string writes as its second half.
+static HEX_ENC: [u8; 256] = {
+    let mut table = [PACK_INVALID; 256];
+    let mut c = b'0';
+    while c <= b'9' {
+        table[c as usize] = c - b'0';
+        c += 1;
+    }
+    let mut c = b'A';
+    while c <= b'F' {
+        table[c as usize] = 10 + (c - b'A');
+        c += 1;
+    }
+    table[0] = 15;
+    table
+};
+
+/// ASCII to nibble for `NIBBLE_8`: digits plus the two punctuation characters
+/// a phone number can carry.
+static NIBBLE_ENC: [u8; 256] = {
+    let mut table = [PACK_INVALID; 256];
+    let mut c = b'0';
+    while c <= b'9' {
+        table[c as usize] = c - b'0';
+        c += 1;
+    }
+    table[b'-' as usize] = 10;
+    table[b'.' as usize] = 11;
+    table[0] = 15;
+    table
+};
 
 pub trait ByteWriter {
     fn write_u8(&mut self, value: u8) -> Result<()>;
@@ -61,48 +91,6 @@ impl ByteWriter for VecByteWriter<'_> {
     #[inline]
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         self.buffer.extend_from_slice(bytes);
-        Ok(())
-    }
-}
-
-pub(crate) struct SliceByteWriter<'a> {
-    buffer: &'a mut [u8],
-    position: usize,
-}
-
-impl<'a> SliceByteWriter<'a> {
-    fn new(buffer: &'a mut [u8]) -> Self {
-        Self {
-            buffer,
-            position: 0,
-        }
-    }
-
-    #[inline]
-    fn bytes_written(&self) -> usize {
-        self.position
-    }
-}
-
-impl ByteWriter for SliceByteWriter<'_> {
-    #[inline]
-    fn write_u8(&mut self, value: u8) -> Result<()> {
-        if self.position >= self.buffer.len() {
-            return Err(BinaryError::UnexpectedEof);
-        }
-        self.buffer[self.position] = value;
-        self.position += 1;
-        Ok(())
-    }
-
-    #[inline]
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        let end = self.position + bytes.len();
-        if end > self.buffer.len() {
-            return Err(BinaryError::UnexpectedEof);
-        }
-        self.buffer[self.position..end].copy_from_slice(bytes);
-        self.position = end;
         Ok(())
     }
 }
@@ -188,7 +176,7 @@ impl EncodeNode for NodeRef<'_> {
     }
 
     fn encode_content<'a, W: ByteWriter>(&self, encoder: &mut Encoder<'a, W>) -> Result<()> {
-        if let Some(content) = self.content.as_deref() {
+        if let Some(content) = self.content.as_ref() {
             match content {
                 NodeContentRef::String(s) => encoder.write_string(s)?,
                 NodeContentRef::Bytes(b) => encoder.write_bytes_with_len(b)?,
@@ -505,7 +493,7 @@ fn node_ref_encoded_size_with_cache(node: &NodeRef<'_>, hints: &mut StringHintCa
         };
     }
 
-    size += match node.content.as_deref() {
+    size += match node.content.as_ref() {
         Some(NodeContentRef::String(s)) => string_encoded_size_with_cache(s, hints),
         Some(NodeContentRef::Bytes(b)) => bytes_with_len_encoded_size(b.len()),
         Some(NodeContentRef::Nodes(nodes)) => {
@@ -635,39 +623,38 @@ impl<W: Write> Encoder<'static, IoByteWriter<W>> {
             writer: IoByteWriter::new(writer),
             string_hints: None,
         };
-        enc.write_u8(0)?;
+        enc.write_u8(crate::util::FORMAT_PLAIN)?;
         Ok(enc)
     }
 }
 
 impl<'v> Encoder<'static, VecByteWriter<'v>> {
     pub fn new_vec(buffer: &'v mut Vec<u8>) -> Result<Self> {
-        buffer.clear();
-        let mut enc = Self {
-            writer: VecByteWriter::new(buffer),
-            string_hints: None,
-        };
-        enc.write_u8(0)?;
-        Ok(enc)
+        Self::new_vec_with_hints(buffer, None)
     }
 }
 
-impl<'a> Encoder<'a, SliceByteWriter<'a>> {
-    pub(crate) fn new_slice(
-        buffer: &'a mut [u8],
+impl<'a, 'v> Encoder<'a, VecByteWriter<'v>> {
+    /// Append into `buffer`, replaying a plan's string hints.
+    ///
+    /// The exact-size marshallers reach for this rather than writing into a
+    /// pre-sized `&mut [u8]` so their output buffer can be reserved instead of
+    /// zero-filled: a `Vec` only ever grown by writes needs no initial value
+    /// for the bytes the encoder is about to overwrite, while a slice has to
+    /// be fully initialized before the encoder can borrow it. The exact-size
+    /// invariant is enforced the same way either side, by comparing the
+    /// written length against the plan.
+    pub(crate) fn new_vec_with_hints(
+        buffer: &'v mut Vec<u8>,
         string_hints: Option<&'a StringHintCache>,
     ) -> Result<Self> {
+        buffer.clear();
         let mut enc = Self {
-            writer: SliceByteWriter::new(buffer),
+            writer: VecByteWriter::new(buffer),
             string_hints,
         };
-        enc.write_u8(0)?;
+        enc.write_u8(crate::util::FORMAT_PLAIN)?;
         Ok(enc)
-    }
-
-    #[inline]
-    pub(crate) fn bytes_written(&self) -> usize {
-        self.writer.bytes_written()
     }
 }
 
@@ -867,32 +854,6 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
         Ok(())
     }
 
-    #[inline(always)]
-    fn pack_nibble(value: u8) -> u8 {
-        match value {
-            b'-' => 10,
-            b'.' => 11,
-            0 => 15,
-            c if c.is_ascii_digit() => c - b'0',
-            _ => panic!("Invalid char for nibble packing: {value}"),
-        }
-    }
-
-    #[inline(always)]
-    fn pack_hex(value: u8) -> u8 {
-        match value {
-            c if c.is_ascii_digit() => c - b'0',
-            c if (b'A'..=b'F').contains(&c) => 10 + (c - b'A'),
-            0 => 15,
-            _ => panic!("Invalid char for hex packing: {value}"),
-        }
-    }
-
-    #[inline(always)]
-    fn pack_byte_pair(packer: fn(u8) -> u8, part1: u8, part2: u8) -> u8 {
-        (packer(part1) << 4) | packer(part2)
-    }
-
     fn write_packed_bytes(&mut self, value: &str, data_type: u8) -> Result<()> {
         if value.len() > token::PACKED_MAX as usize {
             panic!("String too long to be packed: {}", value.len());
@@ -906,67 +867,49 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
         }
         self.write_u8(rounded_len)?;
 
-        #[allow(unused_mut)]
-        let mut input_bytes = value.as_bytes();
-
-        if data_type == token::NIBBLE_8 {
-            #[cfg(feature = "simd")]
-            {
-                const NIBBLE_LOOKUP: [u8; 16] =
-                    [10, 11, 255, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 255, 255, 255];
-                let lookup = Simd::from_array(NIBBLE_LOOKUP);
-                let nibble_base = Simd::splat(b'-');
-
-                while input_bytes.len() >= 16 {
-                    let (chunk, rest) = input_bytes.split_at(16);
-                    let input = u8x16::from_slice(chunk);
-                    let indices = input.saturating_sub(nibble_base);
-                    let nibbles = lookup.swizzle_dyn(indices);
-
-                    let (evens, odds) = nibbles.deinterleave(nibbles.rotate_elements_left::<1>());
-                    let packed: Simd<u8, 16> = (evens << Simd::splat(4)) | odds;
-                    let packed_bytes = packed.to_array();
-                    self.write_raw_bytes(&packed_bytes[..8])?;
-
-                    input_bytes = rest;
-                }
-            }
-
-            let mut bytes_iter = input_bytes.iter().copied();
-            while let Some(part1) = bytes_iter.next() {
-                let part2 = bytes_iter.next().unwrap_or(0);
-                self.write_u8(Self::pack_byte_pair(Self::pack_nibble, part1, part2))?;
-            }
+        let input_bytes = value.as_bytes();
+        let table = if data_type == token::NIBBLE_8 {
+            &NIBBLE_ENC
         } else {
-            #[cfg(feature = "simd")]
-            {
-                let ascii_0 = Simd::splat(b'0');
-                let ascii_a = Simd::splat(b'A');
-                let ten = Simd::splat(10);
+            &HEX_ENC
+        };
 
-                while input_bytes.len() >= 16 {
-                    let (chunk, rest) = input_bytes.split_at(16);
-                    let input = u8x16::from_slice(chunk);
+        // Whole pairs first, so the common even-length case carries no
+        // per-iteration "is there a second half" branch. `PACKED_MAX` is 127,
+        // so the buffer covers any string that reaches here.
+        let mut packed = [0u8; 64];
+        let (pairs, tail) = input_bytes.as_chunks::<2>();
 
-                    let digit_vals = input - ascii_0;
-                    let letter_vals = input - ascii_a + ten;
-                    let is_letter = input.simd_ge(ascii_a);
-                    let nibbles = is_letter.select(letter_vals, digit_vals);
+        // The validity test is an OR accumulator checked once below, not a
+        // branch per pair. Legal table entries are 0..=15 and `PACK_INVALID`
+        // is 0xFF, so a set high nibble in `seen` means some character was
+        // rejected. Keeping the branch out is what lets LLVM unroll this.
+        let mut seen = 0u8;
+        for (slot, pair) in packed.iter_mut().zip(pairs) {
+            let hi = table[pair[0] as usize];
+            let lo = table[pair[1] as usize];
+            seen |= hi | lo;
+            *slot = (hi << 4) | lo;
+        }
 
-                    let (evens, odds) = nibbles.deinterleave(nibbles.rotate_elements_left::<1>());
-                    let packed: Simd<u8, 16> = (evens << Simd::splat(4)) | odds;
-                    let packed_bytes = packed.to_array();
-                    self.write_raw_bytes(&packed_bytes[..8])?;
+        // Odd length: the low nibble is the 0 pad, which both tables map to 15.
+        let odd = if let [last] = tail {
+            let hi = table[*last as usize];
+            let lo = table[0];
+            seen |= hi | lo;
+            Some((hi << 4) | lo)
+        } else {
+            None
+        };
 
-                    input_bytes = rest;
-                }
-            }
+        // Checked before anything reaches the writer. `validate_hex` and
+        // `validate_nibble` gate every caller, so this is the same unreachable
+        // case the `match` ladders this replaced used to panic on.
+        assert!(seen & 0xF0 == 0, "invalid char for packing");
 
-            let mut bytes_iter = input_bytes.iter().copied();
-            while let Some(part1) = bytes_iter.next() {
-                let part2 = bytes_iter.next().unwrap_or(0);
-                self.write_u8(Self::pack_byte_pair(Self::pack_hex, part1, part2))?;
-            }
+        self.write_raw_bytes(&packed[..pairs.len()])?;
+        if let Some(byte) = odd {
+            self.write_u8(byte)?;
         }
         Ok(())
     }
@@ -1007,6 +950,48 @@ mod tests {
     use std::io::Cursor;
 
     type TestResult = Result<()>;
+
+    /// The `match` ladders `HEX_ENC`/`NIBBLE_ENC` replaced, kept here as the
+    /// specification they are checked against. `None` is the case the old code
+    /// panicked on and the tables mark with `PACK_INVALID`.
+    fn reference_hex(value: u8) -> Option<u8> {
+        match value {
+            c if c.is_ascii_digit() => Some(c - b'0'),
+            c if (b'A'..=b'F').contains(&c) => Some(10 + (c - b'A')),
+            0 => Some(15),
+            _ => None,
+        }
+    }
+
+    fn reference_nibble(value: u8) -> Option<u8> {
+        match value {
+            b'-' => Some(10),
+            b'.' => Some(11),
+            0 => Some(15),
+            c if c.is_ascii_digit() => Some(c - b'0'),
+            _ => None,
+        }
+    }
+
+    /// Exhaustive over the byte domain, so the tables cannot drift from the
+    /// ladders they were derived from: same accepted set, same nibble for
+    /// every accepted byte, same rejected set.
+    #[test]
+    fn encode_tables_match_the_ladders_they_replaced() {
+        for byte in 0u8..=255 {
+            let i = byte as usize;
+            assert_eq!(
+                reference_hex(byte),
+                (HEX_ENC[i] != PACK_INVALID).then_some(HEX_ENC[i]),
+                "hex table disagrees at {byte:#04x}"
+            );
+            assert_eq!(
+                reference_nibble(byte),
+                (NIBBLE_ENC[i] != PACK_INVALID).then_some(NIBBLE_ENC[i]),
+                "nibble table disagrees at {byte:#04x}"
+            );
+        }
+    }
 
     #[test]
     fn test_encode_node() -> TestResult {
@@ -1700,6 +1685,38 @@ mod tests {
             .get("from")
             .expect("from attr must survive the round-trip");
         assert_eq!(from.to_string(), "12345@call");
+        Ok(())
+    }
+
+    /// The AD form spends a single byte on the device, so a PN/LID device past
+    /// 255 has nowhere to go and the encoder says so instead of truncating it
+    /// into a different device. Interop carries its own `u16` device field and
+    /// is unaffected, which is why the limit cannot live on `Jid` itself.
+    #[test]
+    fn ad_jid_device_is_one_byte_wide_unlike_interop() -> TestResult {
+        let encode = |jid: Jid| -> Result<()> {
+            let node = NodeBuilder::new("msg").attr("from", jid).build();
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_node(&node)
+        };
+
+        encode(Jid::pn_device("5511987650001", 255)).expect("255 is the widest AD device");
+        let err = encode(Jid::pn_device("5511987650001", 256))
+            .expect_err("256 does not fit the AD device byte");
+        assert!(
+            err.to_string().contains("out of range"),
+            "the error must name the device, got {err}"
+        );
+
+        let interop = Jid {
+            user: "5511987650001".into(),
+            server: jid::Server::Interop,
+            agent: 0,
+            device: 65535,
+            integrator: 7,
+        };
+        encode(interop).expect("interop spends a full u16 on the device");
         Ok(())
     }
 

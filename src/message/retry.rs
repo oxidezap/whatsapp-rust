@@ -1,6 +1,7 @@
 //! Decrypt-failure handling, retry receipts and undecryptable events.
 
 use super::*;
+use wacore::stanza::wire_tags::StanzaTag;
 
 impl Client {
     /// Request retransmission of an inbound message stanza.
@@ -17,7 +18,7 @@ impl Client {
         stanza: &NodeRef<'_>,
         options: crate::features::RetryRequestOptions,
     ) -> Result<crate::features::RetryRequestOutcome, crate::features::RetryRequestError> {
-        if stanza.tag.as_ref() != "message" {
+        if stanza.tag.as_ref() != StanzaTag::Message.as_str() {
             return Err(crate::features::RetryRequestError::UnsupportedStanzaClass);
         }
         if stanza.get_attr("id").is_none() {
@@ -52,11 +53,94 @@ impl Client {
         .await
     }
 
-    /// Dispatch an `UndecryptableMessage` event at most once per `(chat, id)`
-    /// via the single-flight `get_with` semantic on `undecryptable_dispatched`.
+    /// Report that one `<enc>` of a stanza produced no plaintext.
+    ///
+    /// Pure observation: it neither decides nor reflects what the receive path
+    /// does next (retry receipt, nack, ack, or nothing). Every branch that
+    /// abandons an `<enc>` **this client was going to decrypt** calls this
+    /// exactly once for it, so a consumer holding the lease can pair each
+    /// [`Event::DecryptedPayload`] with the failure of every sibling that
+    /// produced none.
+    ///
+    /// Two kinds of `<enc>` are outside that pairing on purpose. A duplicate
+    /// was decrypted on an earlier delivery, so neither event fires. And an
+    /// `<enc>` claimed by a registered `EncHandler` is not this client's to
+    /// decrypt at all: the consumer that registered the handler already sees
+    /// its own `Err` directly, the handler runs in a detached task, and
+    /// reporting from there would break the one ordering this event does
+    /// promise — that a stanza's events all come from its receive task.
+    ///
+    /// Deliberately *not* deduplicated: `UndecryptableMessage` is single-flight
+    /// per [`SenderMessageId`] because a UI must not show two placeholders for one
+    /// message, and that is exactly what makes it silent on the second delivery
+    /// of a stanza that keeps failing. This one reports each delivery.
+    ///
+    /// [`SenderMessageId`]: wacore::types::message::SenderMessageId
+    pub(crate) fn report_enc_decrypt_failure(
+        &self,
+        info: &Arc<MessageInfo>,
+        enc_index: usize,
+        enc_type: &'static str,
+        reason: EncDecryptFailureReason,
+    ) {
+        if !self.enc_decrypt_failed_forwarding_enabled() {
+            return;
+        }
+        self.dispatch_enc_decrypt_failure(
+            info,
+            enc_index,
+            Some(std::borrow::Cow::Borrowed(enc_type)),
+            reason,
+        );
+    }
+
+    /// Same, for a classification-time failure where the `type` attribute is
+    /// whatever the wire carried — a type this build does not implement, or
+    /// none at all. The copy is made past the gate, so an unheld lease still
+    /// costs one atomic load.
+    pub(crate) fn report_raw_enc_decrypt_failure(
+        &self,
+        info: &Arc<MessageInfo>,
+        enc_index: usize,
+        enc_type: Option<&str>,
+        reason: EncDecryptFailureReason,
+    ) {
+        if !self.enc_decrypt_failed_forwarding_enabled() {
+            return;
+        }
+        self.dispatch_enc_decrypt_failure(
+            info,
+            enc_index,
+            enc_type.map(|enc_type| std::borrow::Cow::Owned(enc_type.to_owned())),
+            reason,
+        );
+    }
+
+    fn dispatch_enc_decrypt_failure(
+        &self,
+        info: &Arc<MessageInfo>,
+        enc_index: usize,
+        enc_type: Option<std::borrow::Cow<'static, str>>,
+        reason: EncDecryptFailureReason,
+    ) {
+        self.core.event_bus.dispatch(Event::EncDecryptFailed(
+            crate::types::events::EncDecryptFailed::builder()
+                .info(Arc::clone(info))
+                .enc_index(enc_index)
+                .maybe_enc_type(enc_type)
+                .reason(reason)
+                .build(),
+        ));
+    }
+
+    /// Dispatch an `UndecryptableMessage` event at most once per
+    /// [`SenderMessageId`] via the single-flight `get_with` semantic on
+    /// `undecryptable_dispatched`.
     /// The atomic arm avoids the get-then-insert race where two concurrent
     /// callers would both dispatch. Mirrors WA Web's DB-level placeholder
     /// uniqueness in `WAWebMessageProcessPlaceholder`.
+    ///
+    /// [`SenderMessageId`]: wacore::types::message::SenderMessageId
     ///
     /// Returns `true` if this call dispatched the event, `false` if a
     /// previous call already did.
@@ -68,8 +152,32 @@ impl Client {
         unavailable_type: crate::types::events::UnavailableType,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) -> bool {
-        let dedup_key =
-            wacore::types::message::ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+        // Keyed by sender as well as id: an id is the sending client's to
+        // choose, and one that two participants happen to share names two
+        // messages, not one. See `SenderMessageId`.
+        // Keyed on the wire spelling, deliberately unresolved.
+        //
+        // Resolving the sender to its encryption namespace looks like the
+        // careful thing to do, and it is a trap: the resolution depends on a
+        // LID mapping that is learned at runtime, so the key moves when the
+        // mapping appears. Chasing that with a second alias key spawns a
+        // problem per direction it can move — the chat migrates too in a 1:1,
+        // hosted namespaces are outside `swap_pn_lid_namespace`, two keys
+        // cannot be claimed under one atomic reservation, and every entry
+        // costs two slots of a bounded cache.
+        //
+        // So this key does not move at all, at a cost stated plainly: a
+        // redelivery that switches namespace mid-flight dispatches a second
+        // `UndecryptableMessage` for one message. That is the lesser harm.
+        // A duplicate placeholder is visible and recoverable; the alternative
+        // this replaced — one sender's message swallowing another's because
+        // they share an id — loses a message with nothing to say so.
+        let dedup_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
+
         // The init future only runs for the winning caller. Others receive
         // the cached `()` and leave the flag as false.
         let fresh = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -145,7 +253,9 @@ impl Client {
             }
             // Only ack once the resend request is actually out; otherwise leave
             // the stanza queued so the server redelivers and we retry.
-            let resend_sent = client.run_retry_receipt(&info, reason).await;
+            let resend_sent = client
+                .run_retry_receipt(&info, reason, decrypt_fail_mode)
+                .await;
             if resend_sent {
                 client.send_transport_ack(&info).await;
             }
@@ -259,7 +369,9 @@ impl Client {
         let client = Arc::clone(self);
         let info = Arc::clone(info);
         self.outbound_flush.spawn(&*self.runtime, async move {
-            client.run_retry_receipt(&info, reason).await;
+            client
+                .run_retry_receipt(&info, reason, crate::types::events::DecryptFailMode::Show)
+                .await;
         });
     }
 
@@ -306,7 +418,13 @@ impl Client {
         }
 
         let send_result = self
-            .send_retry_receipt(info, retry_count, reason, options.force_include_keys())
+            .send_retry_receipt(
+                info,
+                retry_count,
+                reason,
+                options.force_include_keys(),
+                options.decrypt_fail_mode(),
+            )
             .await;
 
         // PDO is an independent first-attempt recovery path. Preserve it even
@@ -356,11 +474,14 @@ impl Client {
         self: &Arc<Self>,
         info: &Arc<MessageInfo>,
         reason: RetryReason,
+        decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) -> bool {
         match self
             .request_retry_for_info(
                 info,
-                crate::features::RetryRequestOptions::new().with_reason(reason),
+                crate::features::RetryRequestOptions::new()
+                    .with_reason(reason)
+                    .with_decrypt_fail_mode(decrypt_fail_mode),
                 None,
             )
             .await

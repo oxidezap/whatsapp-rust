@@ -35,7 +35,7 @@
 
 const SMPL_PI: f32 = 3.1415926535897;
 
-const PERCW_NFFT: usize = 512 + 64; // 576
+pub(crate) const PERCW_NFFT: usize = 512 + 64; // 576
 const PERCW_FS_KHZ: f32 = 16.0;
 
 const SMPL_PERC_MASK_SMTH: f32 = 0.1158;
@@ -353,15 +353,36 @@ fn smallest_factor(n: usize) -> usize {
     n
 }
 
-/// Precomputed twiddle factors for one `(top-N, sign)` FFT. The butterfly cos/sin depend only on
-/// `(n, index)`, never on the input, so they are computed once at init and read in the hot loop.
+/// One level of the factorization chain: at length `n` the recursion splits into `p` sub-DFTs of
+/// length `m = n/p`. Every node at a given recursion depth sees the same `n`, so the chain is a flat
+/// list indexed by depth.
+struct FftLevel {
+    n: usize,
+    p: usize,
+    m: usize,
+    /// Combine-step twiddles for this level, indexed `k * p + q` (length `n * p`).
+    tw: Vec<Cpx>,
+}
+
+/// Precomputed factorization plan and twiddle factors for one `(top-N, sign)` FFT. Both depend only
+/// on `(n, index)`, never on the input, so they are computed once at init and read in the hot loop.
+///
+/// The plan is why the levels are a flat `Vec` indexed by depth rather than an `(n, table)`
+/// association list: `n` is fixed per stream (512 for LPC analysis, 576 for the perceptual model), so
+/// the whole chain of `(n, p, m)` is known at init. Re-deriving `p` with `smallest_factor` and
+/// re-finding the twiddle table by scanning for `n` at every node cost 5361 trial divisions and 5361
+/// linear scans per encoded frame -- the recursion visits 511 nodes per 512-point transform and 319
+/// per 576-point one, at 15 transforms per frame. Indexing by depth removes both without touching a
+/// single arithmetic operation, so the output stays bit-identical.
+///
 /// Each table reproduces the EXACT inline angle arithmetic (same f32 op order, same std cos/sin), so
 /// reading from it is bit-identical to the inline recompute; proven by `twiddle_table_is_bit_exact`.
 struct FftTwiddles {
-    /// Per visited length `n`, the combine-step twiddles indexed `k * p + q` (length `n * p`).
-    combine: Vec<(usize, Vec<Cpx>)>,
-    /// Per prime base length `n`, the base-DFT twiddles indexed `k * n + j` (length `n * n`).
-    base: Vec<(usize, Vec<Cpx>)>,
+    /// The chain from the top length down to (but excluding) the prime base, indexed by depth.
+    levels: Vec<FftLevel>,
+    /// The prime length the chain terminates in, and its base-DFT twiddles indexed `k * n + j`.
+    base_n: usize,
+    base: Vec<Cpx>,
 }
 
 /// Compute the combine twiddle for `(n, k, q, sign)` exactly as the inline butterfly does.
@@ -387,64 +408,102 @@ fn base_twiddle(n: usize, k: usize, j: usize, sign: f32) -> Cpx {
 }
 
 impl FftTwiddles {
-    /// Build the twiddle tables for the chain of `n` values the recursion visits from `top` down,
-    /// for the given `sign`.
+    /// Build the plan and twiddle tables for the chain of `n` values the recursion visits from `top`
+    /// down, for the given `sign`.
     fn new(top: usize, sign: f32) -> Self {
-        let mut combine = Vec::new();
-        let mut base = Vec::new();
+        let mut levels = Vec::new();
         let mut n = top;
+        let (mut base_n, mut base) = (1usize, Vec::new());
         while n > 1 {
             let p = smallest_factor(n);
             if p == n {
-                let mut tab = Vec::with_capacity(n * n);
+                base_n = n;
+                base = Vec::with_capacity(n * n);
                 for k in 0..n {
                     for j in 0..n {
-                        tab.push(base_twiddle(n, k, j, sign));
+                        base.push(base_twiddle(n, k, j, sign));
                     }
                 }
-                base.push((n, tab));
                 break;
             }
-            let mut tab = Vec::with_capacity(n * p);
+            let mut tw = Vec::with_capacity(n * p);
             for k in 0..n {
                 for q in 0..p {
-                    tab.push(combine_twiddle(n, k, q, sign));
+                    tw.push(combine_twiddle(n, k, q, sign));
                 }
             }
-            combine.push((n, tab));
+            levels.push(FftLevel { n, p, m: n / p, tw });
             n /= p;
         }
-        FftTwiddles { combine, base }
+        FftTwiddles {
+            levels,
+            base_n,
+            base,
+        }
     }
 
-    #[inline]
+    /// Test-only lookups by length, kept so `twiddle_table_is_bit_exact` can walk the chain the way
+    /// it always has. The hot path indexes `levels` by depth instead.
+    #[cfg(test)]
     fn combine_for(&self, n: usize) -> &[Cpx] {
-        for (m, tab) in &self.combine {
-            if *m == n {
-                return tab;
+        for lvl in &self.levels {
+            if lvl.n == n {
+                return &lvl.tw;
             }
         }
         unreachable!("combine twiddle table missing for n={n}");
     }
 
-    #[inline]
+    #[cfg(test)]
     fn base_for(&self, n: usize) -> &[Cpx] {
-        for (m, tab) in &self.base {
-            if *m == n {
-                return tab;
-            }
-        }
-        unreachable!("base twiddle table missing for n={n}");
+        assert_eq!(self.base_n, n, "base twiddle table missing for n={n}");
+        &self.base
     }
 }
 
 /// Reusable FFT workspace owned by `PercModelState`, so the per-frame perc model runs its ~12
 /// forward+backward FFTs of N=PERCW_NFFT without re-allocating the recursion scratch every call and
-/// without recomputing the input-independent butterfly cos/sin. `arena` backs `fft_rec`'s per-level
-/// `sub` buffers (carved by `split_at_mut`); `cin`/`spec`/`tout` back the real-FFT pack/unpack;
-/// `tw_fwd`/`tw_bwd` are the precomputed twiddles for the two signs. Reuse never touches the
-/// arithmetic, so the output is bit-identical.
+/// without recomputing the input-independent butterfly cos/sin.
+///
+/// A real transform of length `n` is one complex transform of length `m = n/2` plus an O(m)
+/// recombination, so this plan is sized for `m`, not `n`: `wn` is the recombination twiddle,
+/// `tw_fwd`/`tw_bwd` the butterfly twiddles for the two signs, `arena` backs `fft_rec`'s per-level
+/// `sub` buffers, and `z`/`zt` hold the packed input and its transform. Reuse never touches the
+/// arithmetic, so the output is bit-identical across calls.
 pub(crate) struct FftScratch {
+    /// `W_n^k = exp(-2*pi*i*k/n)` for `k` in `0..n/2`: the recombination twiddle. Built from the
+    /// same `combine_twiddle` the butterflies use, so both stages share one angle formula.
+    wn: Vec<Cpx>,
+    tw_fwd: FftTwiddles, // length n/2, sign = -1.0
+    tw_bwd: FftTwiddles, // length n/2, sign = +1.0
+    arena: Vec<Cpx>,
+    /// The packed input `z[j] = x[2j] + i*x[2j+1]` and its transform.
+    z: Vec<Cpx>,
+    zt: Vec<Cpx>,
+}
+
+impl FftScratch {
+    pub(crate) fn new(n: usize) -> Self {
+        // `n / 2` rounds an odd or zero `n` down to a plan the callers never use: the two
+        // production lengths (512, 576) are even, and the odd case is rejected at the call.
+        let m = n / 2;
+        FftScratch {
+            wn: (0..m).map(|k| combine_twiddle(n, k, 1, -1.0)).collect(),
+            tw_fwd: FftTwiddles::new(m, -1.0),
+            tw_bwd: FftTwiddles::new(m, 1.0),
+            arena: vec![Cpx::zero(); fft_arena_len(m)],
+            z: vec![Cpx::zero(); m],
+            zt: vec![Cpx::zero(); m],
+        }
+    }
+}
+
+/// Full-length workspace for the historical real-FFT path, kept only so the differential tests can
+/// grade the shipped transform against a second, independently written one. It is what the codec
+/// ran before the half-length plan replaced it; nothing outside `mod tests` builds it, which is why
+/// a shipping encoder no longer carries the length-`n` tables and arena at all.
+#[cfg(test)]
+pub(crate) struct RefFftScratch {
     arena: Vec<Cpx>,
     cin: Vec<Cpx>,
     spec: Vec<Cpx>,
@@ -453,9 +512,10 @@ pub(crate) struct FftScratch {
     tw_bwd: FftTwiddles, // sign = +1.0
 }
 
-impl FftScratch {
+#[cfg(test)]
+impl RefFftScratch {
     pub(crate) fn new(n: usize) -> Self {
-        FftScratch {
+        RefFftScratch {
             arena: vec![Cpx::zero(); fft_arena_len(n)],
             cin: vec![Cpx::zero(); n],
             spec: vec![Cpx::zero(); n],
@@ -464,6 +524,12 @@ impl FftScratch {
             tw_bwd: FftTwiddles::new(n, 1.0),
         }
     }
+}
+
+/// Whether a scratch was built for the half-length `m` the caller is about to run at.
+#[inline]
+fn sp_len_matches(sc: &FftScratch, m: usize) -> bool {
+    sc.z.len() == m && sc.zt.len() == m && sc.wn.len() == m
 }
 
 /// Worst-case `fft_rec` arena length: at each level we carve `n` `Cpx` for `sub` then recurse on
@@ -488,19 +554,22 @@ fn fft_arena_len(n: usize) -> usize {
 fn fft_rec(
     x: &[Cpx],
     stride: usize,
-    n: usize,
+    depth: usize,
     out: &mut [Cpx],
     scratch: &mut [Cpx],
     tw: &FftTwiddles,
 ) {
-    if n == 1 {
-        out[0] = x[0];
-        return;
-    }
-    let p = smallest_factor(n);
-    if p == n {
-        // Prime (or n with no small factor): naive O(n^2) DFT base case.
-        let bt = tw.base_for(n);
+    // Past the last split level the chain terminates in its prime base: the naive O(n^2) DFT.
+    let Some(lvl) = tw.levels.get(depth) else {
+        let n = tw.base_n;
+        if n <= 1 {
+            // A length-1 transform is the identity. `FftTwiddles::new(1)` splits nothing and builds
+            // no base table, so this must return before indexing one -- the guard the pre-plan
+            // recursion carried as its `n == 1` arm.
+            out[0] = x[0];
+            return;
+        }
+        let bt = &tw.base;
         for k in 0..n {
             let mut acc = Cpx::zero();
             let row = k * n;
@@ -510,16 +579,16 @@ fn fft_rec(
             out[k] = acc;
         }
         return;
-    }
-    let m = n / p;
+    };
+    let (n, p, m) = (lvl.n, lvl.p, lvl.m);
     // Carve this level's `sub` (size n) from the arena; the remainder feeds the child sub-DFTs.
     let (sub, rest) = scratch.split_at_mut(n);
     // Compute p sub-DFTs of length m over the decimated inputs (sub[q*m .. (q+1)*m]).
     for (q, dst) in sub.chunks_mut(m).enumerate() {
-        fft_rec(&x[q * stride..], stride * p, m, dst, rest, tw);
+        fft_rec(&x[q * stride..], stride * p, depth + 1, dst, rest, tw);
     }
     // Combine: out[k] = sum_q twiddle(q,k) * sub_q[k mod m], with the radix-p butterfly.
-    let ct = tw.combine_for(n);
+    let ct = &lvl.tw;
     for k in 0..n {
         let kmod = k % m;
         let mut acc = Cpx::zero();
@@ -536,28 +605,7 @@ fn cfft(input: &[Cpx], out: &mut [Cpx], sign: f32, arena: &mut [Cpx], tw: &FftTw
     let n = input.len();
     debug_assert!(out.len() == n);
     debug_assert!(sign == -1.0 || sign == 1.0);
-    fft_rec(input, 1, n, out, arena, tw);
-}
-
-/// Forward real FFT of `n` real samples, re-packed into the ordered REAL layout:
-/// f[0]=DC.re, f[1]=Nyquist.re, then [re,im] pairs for bins 1..n/2-1. Output length is n.
-/// Uses `sc.cin`/`sc.spec`/`sc.arena` as scratch (reused across calls).
-pub(crate) fn rfft_forward_ordered_sc(time: &[f32], f: &mut [f32], sc: &mut FftScratch) {
-    let n = time.len();
-    debug_assert!(f.len() == n);
-    let cin = &mut sc.cin;
-    for i in 0..n {
-        cin[i].re = time[i];
-        cin[i].im = 0.0;
-    }
-    cfft(cin, &mut sc.spec, -1.0, &mut sc.arena, &sc.tw_fwd);
-    let spec = &sc.spec;
-    f[0] = spec[0].re;
-    f[1] = spec[n / 2].re;
-    for i in 1..(n / 2) {
-        f[2 * i] = spec[i].re;
-        f[2 * i + 1] = spec[i].im;
-    }
+    fft_rec(input, 1, 0, out, arena, tw);
 }
 
 /// Test-only allocating wrapper preserving the original `rfft_forward_ordered` signature for the FFT
@@ -569,26 +617,114 @@ fn rfft_forward_ordered(time: &[f32], f: &mut [f32]) {
     rfft_forward_ordered_sc(time, f, &mut sc);
 }
 
-/// Inverse real FFT consuming the ordered REAL layout (as produced/modified above) and producing n
-/// real time samples, unnormalized (BACKWARD(FORWARD(x)) = n*x).
-/// Uses `sc.spec`/`sc.tout`/`sc.arena` as scratch (reused across calls).
-fn rfft_backward_ordered_sc(f: &[f32], time: &mut [f32], sc: &mut FftScratch) {
-    let n = f.len();
-    debug_assert!(time.len() == n);
-    // Rebuild the full Hermitian complex spectrum from the ordered real layout.
-    let spec = &mut sc.spec;
-    spec[0] = Cpx { re: f[0], im: 0.0 };
-    spec[n / 2] = Cpx { re: f[1], im: 0.0 };
-    for i in 1..(n / 2) {
-        let re = f[2 * i];
-        let im = f[2 * i + 1];
-        spec[i] = Cpx { re, im };
-        spec[n - i] = Cpx { re, im: -im }; // conjugate symmetry
+/// Forward real FFT of `n` real samples via one half-length complex transform, in the ordered REAL
+/// layout: f[0]=DC.re, f[1]=Nyquist.re, then [re,im] pairs for bins 1..n/2-1. Output length is n.
+///
+/// Packing `z[j] = x[2j] + i*x[2j+1]` turns the length-`n` real transform into a length-`m = n/2`
+/// complex one; the even- and odd-sample spectra are then recovered from `Z` by its Hermitian
+/// split and recombined with `W_n^k`. This is the same technique PFFFT uses, which is what the
+/// `smpl` C reference the per-stage vectors came from runs -- `front_end_a_matches_c` measures
+/// this path as marginally closer to that oracle than the full-length one it replaced.
+pub(crate) fn rfft_forward_ordered_sc(time: &[f32], f: &mut [f32], sc: &mut FftScratch) {
+    let n = time.len();
+    // Checked in release, not just under `debug_assert!`: every way these can disagree fails
+    // SILENTLY rather than loudly. A mismatched scratch truncates at the `zip` below, an odd `n`
+    // leaves `f[n - 1]` untouched, and a short `f` drops the top bins -- each yielding a
+    // plausible-looking spectrum the encoder would happily quantize. Measured at +0.26% on a
+    // 486 s encode, i.e. inside this machine's run-to-run noise, so the check is free.
+    assert!(
+        f.len() == n,
+        "rfft forward: output len {} != input len {n}",
+        f.len()
+    );
+    assert!(
+        n >= 2 && n.is_multiple_of(2),
+        "rfft forward: length {n} must be even and >= 2"
+    );
+    assert!(
+        sp_len_matches(sc, n / 2),
+        "rfft forward: FftScratch built for a different length than {n}"
+    );
+    let m = n / 2;
+    let sp = sc;
+    // z[j] = x[2j] + i*x[2j+1]: even samples into the real part, odd into the imaginary.
+    for (z, pair) in sp.z.iter_mut().zip(time.chunks_exact(2)) {
+        z.re = pair[0];
+        z.im = pair[1];
     }
-    cfft(spec, &mut sc.tout, 1.0, &mut sc.arena, &sc.tw_bwd);
-    let tout = &sc.tout;
-    for i in 0..n {
-        time[i] = tout[i].re;
+    fft_rec(&sp.z, 1, 0, &mut sp.zt, &mut sp.arena, &sp.tw_fwd);
+
+    // X[k] = E[k] + W_n^k * O[k], where E and O are the DFTs of the even and the odd samples:
+    //   E[k] = (Z[k] + conj(Z[m-k])) / 2      O[k] = (Z[k] - conj(Z[m-k])) / 2i
+    // At k = 0 both collapse onto Z[0], giving X[0] = Re Z0 + Im Z0 and X[n/2] = Re Z0 - Im Z0 --
+    // the two real bins the ordered layout keeps in f[0] and f[1].
+    let z0 = sp.zt[0];
+    f[0] = z0.re + z0.im;
+    f[1] = z0.re - z0.im;
+    for k in 1..m {
+        let a = sp.zt[k];
+        let b = sp.zt[m - k];
+        let e_re = 0.5 * (a.re + b.re);
+        let e_im = 0.5 * (a.im - b.im);
+        let o_re = 0.5 * (a.im + b.im);
+        let o_im = 0.5 * (b.re - a.re);
+        let w = sp.wn[k];
+        f[2 * k] = e_re + (o_re * w.re - o_im * w.im);
+        f[2 * k + 1] = e_im + (o_re * w.im + o_im * w.re);
+    }
+}
+
+/// Inverse real FFT via one half-length complex transform, consuming the ordered REAL layout and
+/// producing n real time samples, unnormalized (BACKWARD(FORWARD(x)) = n*x).
+pub(crate) fn rfft_backward_ordered_sc(f: &[f32], time: &mut [f32], sc: &mut FftScratch) {
+    let n = f.len();
+    // Release-checked for the same reason as the forward twin: a short `time` is only partially
+    // written and the caller reads stale samples as signal.
+    assert!(
+        time.len() == n,
+        "rfft backward: output len {} != input len {n}",
+        time.len()
+    );
+    assert!(
+        n >= 2 && n.is_multiple_of(2),
+        "rfft backward: length {n} must be even and >= 2"
+    );
+    assert!(
+        sp_len_matches(sc, n / 2),
+        "rfft backward: FftScratch built for a different length than {n}"
+    );
+    let m = n / 2;
+    let sp = sc;
+    // Invert the forward recombination: Z[k] = E[k] + i*O[k] with
+    //   E[k] = (X[k] + conj(X[m-k])) / 2      O[k] = conj(W_n^k) * (X[k] - conj(X[m-k])) / 2
+    // k = 0 pairs DC with Nyquist, which the ordered layout keeps in f[0] and f[1].
+    sp.z[0] = Cpx {
+        re: 0.5 * (f[0] + f[1]),
+        im: 0.5 * (f[0] - f[1]),
+    };
+    for k in 1..m {
+        let a_re = f[2 * k];
+        let a_im = f[2 * k + 1];
+        let c_re = f[2 * (m - k)];
+        let c_im = -f[2 * (m - k) + 1];
+        let e_re = 0.5 * (a_re + c_re);
+        let e_im = 0.5 * (a_im + c_im);
+        let d_re = 0.5 * (a_re - c_re);
+        let d_im = 0.5 * (a_im - c_im);
+        let w = sp.wn[k];
+        let o_re = d_re * w.re + d_im * w.im;
+        let o_im = d_im * w.re - d_re * w.im;
+        sp.z[k] = Cpx {
+            re: e_re - o_im,
+            im: e_im + o_re,
+        };
+    }
+    fft_rec(&sp.z, 1, 0, &mut sp.zt, &mut sp.arena, &sp.tw_bwd);
+    // The length-m inverse yields m*(x[2j] + i*x[2j+1]); the reference is unnormalized at length
+    // n = 2m, so the factor 2 restores its scale.
+    for (pair, z) in time.chunks_exact_mut(2).zip(&sp.zt[..m]) {
+        pair[0] = 2.0 * z.re;
+        pair[1] = 2.0 * z.im;
     }
 }
 
@@ -793,10 +929,12 @@ pub(crate) fn smpl_perc_ac2a(
 
     let b = [perc_emph, 1.0 + perc_emph * perc_emph, perc_emph];
     let state = [r[0], r[1]];
-    let mut r_ = vec![0.0f32; SMPL_MAX_L_RESP];
+    // `SMPL_MAX_L_RESP` is 33, so both intermediates are 132 bytes: on the stack they cost nothing,
+    // while as `vec!` they were two heap allocations per call and this runs 16x per 60 ms frame.
+    let mut r_ = [0.0f32; SMPL_MAX_L_RESP];
     smpl_filt_ma2(&r[1..], perc_resp_len, &b, &state, &mut r_);
 
-    let mut rc = vec![0.0f32; SMPL_MAX_L_RESP];
+    let mut rc = [0.0f32; SMPL_MAX_L_RESP];
     smpl_ac2rc(&r_, perc_resp_len - 1, reg, &mut rc);
 
     let mut a = vec![0.0f32; perc_resp_len];
@@ -1018,6 +1156,52 @@ impl BitrateController {
     }
 }
 
+/// The full-length real FFT the codec ran before the half-length plan replaced it: one length-`n`
+/// complex transform of the zero-imaginary input (forward), or of the rebuilt Hermitian spectrum
+/// (backward). Kept as a second, independently written implementation of the same transform so
+/// `rfft_matches_full_length_implementation` and `rfft_error_is_at_full_length_level` have something to
+/// grade the shipped one against. Not compiled into a shipping build.
+#[cfg(test)]
+pub(crate) fn rfft_forward_ordered_ref_sc(time: &[f32], f: &mut [f32], sc: &mut RefFftScratch) {
+    let n = time.len();
+    debug_assert!(f.len() == n);
+    let cin = &mut sc.cin;
+    for i in 0..n {
+        cin[i].re = time[i];
+        cin[i].im = 0.0;
+    }
+    cfft(cin, &mut sc.spec, -1.0, &mut sc.arena, &sc.tw_fwd);
+    let spec = &sc.spec;
+    f[0] = spec[0].re;
+    f[1] = spec[n / 2].re;
+    for i in 1..(n / 2) {
+        f[2 * i] = spec[i].re;
+        f[2 * i + 1] = spec[i].im;
+    }
+}
+
+/// Inverse twin of [`rfft_forward_ordered_ref_sc`], with the same role and the same unnormalized
+/// scale (BACKWARD(FORWARD(x)) = n*x).
+#[cfg(test)]
+pub(crate) fn rfft_backward_ordered_ref_sc(f: &[f32], time: &mut [f32], sc: &mut RefFftScratch) {
+    let n = f.len();
+    debug_assert!(time.len() == n);
+    let spec = &mut sc.spec;
+    spec[0] = Cpx { re: f[0], im: 0.0 };
+    spec[n / 2] = Cpx { re: f[1], im: 0.0 };
+    for i in 1..(n / 2) {
+        let re = f[2 * i];
+        let im = f[2 * i + 1];
+        spec[i] = Cpx { re, im };
+        spec[n - i] = Cpx { re, im: -im }; // conjugate symmetry
+    }
+    cfft(spec, &mut sc.tout, 1.0, &mut sc.arena, &sc.tw_bwd);
+    let tout = &sc.tout;
+    for i in 0..n {
+        time[i] = tout[i].re;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,6 +1261,18 @@ mod tests {
         }
     }
 
+    /// A length-1 transform is the identity, and its plan has no levels and no base table. The
+    /// depth-indexed recursion must return before indexing that empty table.
+    #[test]
+    fn fft_of_length_one_is_the_identity() {
+        let mut sc = FftScratch::new(1);
+        let input = [Cpx { re: 0.25, im: -0.5 }];
+        let mut out = [Cpx::zero()];
+        cfft(&input, &mut out, -1.0, &mut sc.arena, &sc.tw_fwd);
+        assert_eq!(out[0].re.to_bits(), input[0].re.to_bits());
+        assert_eq!(out[0].im.to_bits(), input[0].im.to_bits());
+    }
+
     #[test]
     fn percw_nfft_is_576_non_pow2() {
         assert_eq!(PERCW_NFFT, 576);
@@ -1088,6 +1284,196 @@ mod tests {
     }
 
     // FFT -> IFFT round-trips to n*x within float tolerance.
+    /// Deterministic input families covering the shapes the analysis front end actually feeds the
+    /// FFT: a windowed tone, broadband noise, an impulse (flat spectrum, worst case for relative
+    /// error) and a DC step.
+    fn rfft_test_signals(n: usize) -> Vec<(&'static str, Vec<f32>)> {
+        let mut noise = vec![0.0f32; n];
+        let mut seed: u32 = 12345;
+        for v in noise.iter_mut() {
+            seed = seed.wrapping_mul(196314165).wrapping_add(907633515);
+            // `>> 8` spans 0..2^24, so `/ 2^23 - 1.0` gives zero-mean [-1, 1). `>> 9` -- as the
+            // older `fft_roundtrip` generator in this file does it -- only reaches [-1, 0), which
+            // puts a bin of magnitude ~n/2 at DC and inflates the spectrum RMS the bounds below
+            // normalize by. That would make this family, the one meant to stress broadband
+            // behaviour, the loosest of the four.
+            *v = ((seed >> 8) as f32 / (1u32 << 23) as f32) - 1.0;
+        }
+        let tone: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / n as f32;
+                (2.0 * SMPL_PI * 13.0 * t).sin() * (0.5 - 0.5 * (2.0 * SMPL_PI * t).cos())
+            })
+            .collect();
+        let mut impulse = vec![0.0f32; n];
+        impulse[n / 3] = 1.0;
+        let step: Vec<f32> = (0..n).map(|i| if i < n / 2 { 1.0 } else { -1.0 }).collect();
+        vec![
+            ("tone", tone),
+            ("noise", noise),
+            ("impulse", impulse),
+            ("step", step),
+        ]
+    }
+
+    /// The shipped half-length transform and the full-length one it replaced are different
+    /// operation sequences for the same mathematical object, so they can never be compared bit for
+    /// bit -- this bounds how far they may drift instead. The bound is on the error relative to the
+    /// full-length spectrum's own RMS, which is the scale the perceptual model reads it at. The two
+    /// differ by 2e-7 to 1.6e-5 relative across these signals and lengths, so 1e-4 is about six
+    /// times the worst observed case -- loose enough not to be a flake, tight enough that a real
+    /// defect (a wrong twiddle, a dropped bin, a scale error) is orders of magnitude out.
+    ///
+    /// [`rfft_error_is_at_full_length_level`] is the companion that says what that difference
+    /// means: both implementations sit at the same distance from the exact transform.
+    #[test]
+    fn rfft_matches_full_length_implementation() {
+        const TOL: f32 = 1e-4;
+        for &n in &[512usize, PERCW_NFFT] {
+            let mut sc = FftScratch::new(n);
+            let mut rsc = RefFftScratch::new(n);
+            for (name, x) in rfft_test_signals(n) {
+                let mut want = vec![0.0f32; n];
+                rfft_forward_ordered_ref_sc(&x, &mut want, &mut rsc);
+                let mut got = vec![0.0f32; n];
+                rfft_forward_ordered_sc(&x, &mut got, &mut sc);
+                let rms =
+                    (want.iter().map(|v| (v * v) as f64).sum::<f64>() / n as f64).sqrt() as f32;
+                let err = want
+                    .iter()
+                    .zip(&got)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    err <= TOL * rms,
+                    "forward n={n} {name}: max abs error {err:e} exceeds {TOL:e} * rms {rms:e}"
+                );
+
+                // Backward from the same (reference) spectrum, so the inverse is compared on its own
+                // rather than inheriting the forward's difference.
+                let mut want_t = vec![0.0f32; n];
+                rfft_backward_ordered_ref_sc(&want, &mut want_t, &mut rsc);
+                let mut got_t = vec![0.0f32; n];
+                rfft_backward_ordered_sc(&want, &mut got_t, &mut sc);
+                let trms =
+                    (want_t.iter().map(|v| (v * v) as f64).sum::<f64>() / n as f64).sqrt() as f32;
+                let terr = want_t
+                    .iter()
+                    .zip(&got_t)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    terr <= TOL * trms,
+                    "backward n={n} {name}: max abs error {terr:e} exceeds {TOL:e} * rms {trms:e}"
+                );
+            }
+        }
+    }
+
+    /// Naive O(n^2) DFT in f64, as an oracle neither FFT path can be graded against by the other.
+    /// Returns the ordered REAL layout so it lines up with both.
+    fn exact_rfft_ordered(x: &[f32]) -> Vec<f64> {
+        let n = x.len();
+        let mut out = vec![0.0f64; n];
+        let bin = |k: usize| -> (f64, f64) {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (j, v) in x.iter().enumerate() {
+                let ang = -2.0 * std::f64::consts::PI * (k as f64) * (j as f64) / (n as f64);
+                re += (*v as f64) * ang.cos();
+                im += (*v as f64) * ang.sin();
+            }
+            (re, im)
+        };
+        out[0] = bin(0).0;
+        out[1] = bin(n / 2).0;
+        for k in 1..n / 2 {
+            let (re, im) = bin(k);
+            out[2 * k] = re;
+            out[2 * k + 1] = im;
+        }
+        out
+    }
+
+    /// The bound above says the two implementations are close; this says whether either is right.
+    /// Both are graded against an exact f64 DFT, on two axes: each must stay within f32 precision of
+    /// the exact transform, and the shipped one must not be more than a small factor noisier than
+    /// the full-length one. Without this, "they differ by 1.6e-5" would be equally consistent with
+    /// the shipped path simply being wrong.
+    ///
+    /// What `MAX_RATIO` does and does not measure. The worst ratio comes from `step`, and `step` is
+    /// a square wave: half of its spectrum is exactly zero (288 of 576 entries at n=576). The
+    /// maximum absolute error lands on those zero bins, and normalizing it by the RMS of the whole
+    /// spectrum -- rather than by the magnitude of the bin it sits on -- is what turns a rounding
+    /// residue into a ratio near 5.6x. The ratio is real, not an artifact, but it is a ratio between
+    /// two residues: measured in ULPs of the spectrum's largest coefficient, `step` at n=576 puts
+    /// the full-length path at 1.12 ULP and the shipped one at 6.25 ULP. On a signal whose spectrum
+    /// is dense (`noise`) the shipped path is the more accurate of the two (0.72x and 0.90x).
+    ///
+    /// So `MAX_RATIO = 8.0` is a drift guard with headroom over an already-measured 5.6x, not a
+    /// statement that the transform is 5.6x worse anywhere that matters: six ULPs of f32 sit three
+    /// orders of magnitude below the coarsest quantizer step in the encoder, and the encoder's
+    /// output was validated perceptually against the source signal rather than against a previous
+    /// bitstream.
+    #[test]
+    fn rfft_error_is_at_full_length_level() {
+        // Each path's own distance to the exact transform, relative to the spectrum RMS.
+        const MAX_REL: f64 = 1e-4;
+        // ... and how much noisier the split path may be than the reference.
+        const MAX_RATIO: f64 = 8.0;
+        for &n in &[512usize, PERCW_NFFT] {
+            let mut sc = FftScratch::new(n);
+            let mut rsc = RefFftScratch::new(n);
+            for (name, x) in rfft_test_signals(n) {
+                let exact = exact_rfft_ordered(&x);
+                let mut r = vec![0.0f32; n];
+                rfft_forward_ordered_ref_sc(&x, &mut r, &mut rsc);
+                let mut sp = vec![0.0f32; n];
+                rfft_forward_ordered_sc(&x, &mut sp, &mut sc);
+                let dist = |got: &[f32]| -> f64 {
+                    got.iter()
+                        .zip(&exact)
+                        .map(|(a, b)| ((*a as f64) - b).abs())
+                        .fold(0.0f64, f64::max)
+                };
+                let (dr, ds) = (dist(&r), dist(&sp));
+                let rms = (exact.iter().map(|v| v * v).sum::<f64>() / n as f64).sqrt();
+                assert!(
+                    dr <= MAX_REL * rms && ds <= MAX_REL * rms,
+                    "n={n} {name}: distance to the exact DFT exceeds {MAX_REL:e} * rms {rms:e} \
+                     (reference {dr:e}, split {ds:e})"
+                );
+                assert!(
+                    ds <= MAX_RATIO * dr.max(f64::MIN_POSITIVE),
+                    "n={n} {name}: split path is {:.2}x further from the exact DFT than the \
+                     reference ({ds:e} vs {dr:e})",
+                    ds / dr
+                );
+            }
+        }
+    }
+
+    /// The split path must satisfy the same unnormalized round-trip identity as the reference:
+    /// BACKWARD(FORWARD(x)) = n*x.
+    #[test]
+    fn rfft_roundtrip_is_unnormalized_identity() {
+        for &n in &[512usize, PERCW_NFFT] {
+            let mut sc = FftScratch::new(n);
+            for (name, x) in rfft_test_signals(n) {
+                let mut f = vec![0.0f32; n];
+                rfft_forward_ordered_sc(&x, &mut f, &mut sc);
+                let mut back = vec![0.0f32; n];
+                rfft_backward_ordered_sc(&f, &mut back, &mut sc);
+                for (i, (b, want)) in back.iter().zip(&x).enumerate() {
+                    let expected = want * n as f32;
+                    assert!(
+                        (b - expected).abs() < 1e-1 * (1.0 + expected.abs()),
+                        "n={n} {name} idx {i}: got {b}, want {expected}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn fft_roundtrip() {
         let n = PERCW_NFFT;
@@ -1096,7 +1482,9 @@ mod tests {
         let mut s: u32 = 12345;
         for v in x.iter_mut() {
             s = s.wrapping_mul(196314165).wrapping_add(907633515);
-            *v = ((s >> 9) as f32 / (1u32 << 23) as f32) - 1.0;
+            // `>> 8` spans 0..2^24 for a zero-mean [-1, 1); `>> 9` only reached [-1, 0), which is a
+            // DC step rather than the broadband signal this round-trip means to exercise.
+            *v = ((s >> 8) as f32 / (1u32 << 23) as f32) - 1.0;
         }
         let mut f = vec![0.0f32; n];
         rfft_forward_ordered(&x, &mut f);

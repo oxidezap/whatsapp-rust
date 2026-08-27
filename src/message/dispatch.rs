@@ -13,6 +13,70 @@ fn delivery_receipt_burst_warning(
 }
 
 impl Client {
+    /// Has this message already been dispatched to consumers?
+    ///
+    /// A sender whose network is bad re-runs its own outbox: same message id,
+    /// fresh ciphertext on a new ratchet iteration. Neither ratchet can call
+    /// that a duplicate (`DuplicatedMessage` covers only the byte-identical
+    /// stanza the server replays), so identity is the only thing left that says
+    /// the two deliveries are one message.
+    ///
+    /// Read here and written by [`Self::mark_message_dispatched`] once the
+    /// batch carrying the message becomes observable. Those are two points in
+    /// time, so this cannot be an atomic `get_with` the way the sibling
+    /// `undecryptable_dispatched` gate is: claiming at the check would claim
+    /// for a commit that may still fail. `chat_lanes` serializes incoming
+    /// processing per chat and so closes the window for ordinary traffic, but
+    /// two workers for one chat can coexist after a lane eviction. The race
+    /// they leave is a second dispatch of one message, which is the behaviour
+    /// this gate improves on rather than a regression, and it is the safe
+    /// direction: the alternative loses the message.
+    pub(crate) async fn message_already_dispatched(&self, info: &Arc<MessageInfo>) -> bool {
+        self.dispatched_messages
+            .get(&Self::dispatch_key(info))
+            .await
+            .is_some()
+    }
+
+    /// Whether the dispatch-once gate is on. Capacity 0 is its documented off
+    /// switch, and it has to turn off the batch collapse too, or the switch
+    /// would restore the old behaviour for live traffic only.
+    pub(crate) fn dispatch_gate_enabled(&self) -> bool {
+        self.dispatched_messages.configured_capacity() != Some(0)
+    }
+
+    /// Claim a message id, called where a committed batch is dispatched.
+    ///
+    /// Placing it there rather than at the call site is what makes the offline
+    /// drain claim as well: a deferred batch dispatches later, and a claim
+    /// taken before that could be taken for a batch that never commits, which
+    /// would suppress and ack the redelivery with nothing ever handed to a
+    /// consumer, losing the message instead of duplicating it.
+    pub(crate) async fn mark_message_dispatched(&self, info: &Arc<MessageInfo>) {
+        self.dispatched_messages
+            .insert(Self::dispatch_key(info), ())
+            .await;
+    }
+
+    /// The message's identity: chat, id, and the sender without its device.
+    ///
+    /// Dropping the device matches WA Web, whose `MsgKey` for a group message
+    /// takes `participant: asUserWidOrThrow(author)`, a device-less wid. It
+    /// also has to: the server sends `skmsg` with a bare participant and
+    /// `pkmsg` with a device-qualified one, so a resend bundling a rotated
+    /// SKDM would otherwise be spelled differently from the delivery it
+    /// repeats and slip past the gate.
+    ///
+    /// The PN/LID namespace stays as it arrived, deliberately unresolved, for
+    /// the reasons [`Self::dispatch_undecryptable_event`] states at length.
+    pub(crate) fn dispatch_key(info: &Arc<MessageInfo>) -> wacore::types::message::SenderMessageId {
+        wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.to_non_ad(),
+        )
+    }
+
     /// Dispatches a successfully parsed message to the event bus and sends a delivery receipt.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.dispatch", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
     pub(crate) async fn dispatch_parsed_message(

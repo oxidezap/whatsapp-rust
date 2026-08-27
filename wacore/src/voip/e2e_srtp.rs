@@ -11,7 +11,8 @@ use ctr::cipher::{KeyIvInit, StreamCipher};
 
 use crate::voip::hkdf_sha256;
 pub use crate::voip::warp::{
-    WARP_MI_TAG_LEN, append_warp_mi_tag, compute_warp_mi_tag, verify_warp_mi_tag,
+    WARP_MI_TAG_LEN, WARP_MI_TAG_MAX_LEN, append_warp_mi_tag_in_place, compute_warp_mi_tag,
+    verify_warp_mi_tag,
 };
 
 type AesCtr = Ctr128BE<Aes128>;
@@ -109,13 +110,29 @@ pub fn build_e2e_rtp_iv(salt: &[u8], ssrc: u32, roc: u32, seq: u16) -> [u8; 16] 
     iv
 }
 
-/// AES-128-CTR encrypt/decrypt of an RTP payload (the cipher is symmetric).
+/// AES-128-CTR encrypt/decrypt of an RTP payload already sitting where it belongs
+/// (the cipher is symmetric, so this is both directions). The send path copies the
+/// plaintext straight into the outgoing packet buffer and encrypts it there, which is
+/// what lets a protected packet be built in a single allocation.
+#[doc(hidden)]
+pub fn crypt_payload_in_place(
+    keys: &E2eSrtpKeys,
+    ssrc: u32,
+    seq: u16,
+    roc: u32,
+    buffer: &mut [u8],
+) {
+    let iv = build_e2e_rtp_iv(&keys.salt, ssrc, roc, seq);
+    let mut cipher = AesCtr::new_from_slices(&keys.cipher_key, &iv).expect("16-byte key/iv");
+    cipher.apply_keystream(buffer);
+}
+
+/// Allocating sibling of [`crypt_payload_in_place`], for the recv path, which has to
+/// hand back an owned plaintext anyway.
 #[doc(hidden)]
 pub fn crypt_payload(keys: &E2eSrtpKeys, ssrc: u32, seq: u16, roc: u32, payload: &[u8]) -> Vec<u8> {
-    let iv = build_e2e_rtp_iv(&keys.salt, ssrc, roc, seq);
     let mut out = payload.to_vec();
-    let mut cipher = AesCtr::new_from_slices(&keys.cipher_key, &iv).expect("16-byte key/iv");
-    cipher.apply_keystream(&mut out);
+    crypt_payload_in_place(keys, ssrc, seq, roc, &mut out);
     out
 }
 
@@ -177,11 +194,9 @@ pub fn protect_srtcp(keys: &E2eSrtpKeys, sender_ssrc: u32, index: u32, rtcp: &[u
         (index & 0xffff) as u16,
     );
     let mut out = Vec::with_capacity(rtcp.len() + 4 + SRTCP_AUTH_TAG_LEN);
-    out.extend_from_slice(&rtcp[..split]);
-    let mut body = rtcp[split..].to_vec();
+    out.extend_from_slice(rtcp);
     let mut cipher = AesCtr::new_from_slices(&keys.cipher_key, &iv).expect("16-byte key/iv");
-    cipher.apply_keystream(&mut body);
-    out.extend_from_slice(&body);
+    cipher.apply_keystream(&mut out[split..]);
     out.extend_from_slice(&(0x8000_0000u32 | (index & 0x7fff_ffff)).to_be_bytes());
     let tag = hmac_sha1_20(&keys.auth_key, &out);
     out.extend_from_slice(&tag[..SRTCP_AUTH_TAG_LEN]);
@@ -214,11 +229,9 @@ pub fn unprotect_srtcp(
         index >> 16,
         (index & 0xffff) as u16,
     );
-    let mut out = packet[..RTCP_HEADER_LEN].to_vec();
-    let mut body = packet[RTCP_HEADER_LEN..idx_start].to_vec();
+    let mut out = packet[..idx_start].to_vec();
     let mut cipher = AesCtr::new_from_slices(&keys.cipher_key, &iv).expect("16-byte key/iv");
-    cipher.apply_keystream(&mut body);
-    out.extend_from_slice(&body);
+    cipher.apply_keystream(&mut out[RTCP_HEADER_LEN..]);
     Some((out, index))
 }
 

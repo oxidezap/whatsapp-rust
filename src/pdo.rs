@@ -97,6 +97,16 @@ impl Client {
         };
         let cache_key = ChatMessageId::new(cache_chat, info.id.clone());
 
+        // Wire spelling, unresolved: this key is never compared against
+        // anything the phone produces, so it has no namespace to agree with,
+        // and a key that resolves would move when a LID mapping is learned.
+        // Why it names the sender at all is on `Client::pdo_requested`.
+        let gate_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
+
         // One request per message, like WA Web's session-lifetime set in
         // WAWebNonMessageDataRequestPlaceholderMessageResendUtils. The
         // pending cache below only covers in-flight requests; once the phone
@@ -110,7 +120,7 @@ impl Client {
         let claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let claimed_clone = claimed.clone();
         self.pdo_requested
-            .get_with(cache_key.clone(), async move {
+            .get_with(gate_key.clone(), async move {
                 claimed_clone.store(true, std::sync::atomic::Ordering::Release);
             })
             .await;
@@ -123,7 +133,41 @@ impl Client {
             return Ok(());
         }
 
-        if self.pdo_pending_requests.get(&cache_key).await.is_some() {
+        // Reserved atomically, not read-then-written. Two senders sharing one
+        // `(chat, id)` hold distinct gates and arrive here concurrently, and a
+        // `get` followed by an `insert` would let both see the slot empty,
+        // both overwrite it, and both send. The response is removed by
+        // `(chat, id)` and carries whichever `MessageInfo` won the overwrite,
+        // so the recovered content would be dispatched under the other
+        // sender's identity.
+        let pending = PendingPdoRequest {
+            message_info: Arc::clone(info),
+            requested_at: wacore::time::Instant::now(),
+        };
+        let reserved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reserved_clone = reserved.clone();
+        let holder = self
+            .pdo_pending_requests
+            .get_with(cache_key.clone(), async move {
+                reserved_clone.store(true, std::sync::atomic::Ordering::Release);
+                pending
+            })
+            .await;
+        if !reserved.load(std::sync::atomic::Ordering::Acquire) {
+            // Only when the slot belongs to a *different* sender. The gate
+            // cache has its own 512-entry capacity, so a burst can evict this
+            // sender's gate while its own request is still pending; a
+            // redelivery then recreates the gate, finds its own entry here,
+            // and removing it would let a later redelivery send a second
+            // request for a message that already has one out.
+            if holder.message_info.source.sender != info.source.sender {
+                self.pdo_requested.remove(&gate_key).await;
+            }
+            // Another sender's request for this `(chat, id)` is in flight.
+            // Nothing was sent for this one, so it must not keep the slot it
+            // claimed: holding it would suppress this sender for the gate's
+            // whole lifetime once that request is answered and the pending
+            // entry clears.
             debug!(
                 "PDO request already pending for message {} from {}",
                 info.id,
@@ -131,14 +175,6 @@ impl Client {
             );
             return Ok(());
         }
-
-        let pending = PendingPdoRequest {
-            message_info: Arc::clone(info),
-            requested_at: wacore::time::Instant::now(),
-        };
-        self.pdo_pending_requests
-            .insert(cache_key.clone(), pending)
-            .await;
 
         let message_key = wa::MessageKey {
             remote_jid: Some(resolved_jid.to_string()),
@@ -187,13 +223,13 @@ impl Client {
             .await
         {
             self.pdo_pending_requests.remove(&cache_key).await;
-            self.pdo_requested.remove(&cache_key).await;
+            self.pdo_requested.remove(&gate_key).await;
             return Err(e);
         }
 
         if let Err(e) = self.send_peer_message(peer_target, &msg).await {
             self.pdo_pending_requests.remove(&cache_key).await;
-            self.pdo_requested.remove(&cache_key).await;
+            self.pdo_requested.remove(&gate_key).await;
             warn!(
                 "Failed to send PDO request for message {}: {:?}",
                 info.id, e
@@ -350,6 +386,8 @@ impl Client {
         };
         let remote_jid_str = key.remote_jid.as_deref().unwrap_or("");
         let msg_id = key.id.as_deref().unwrap_or("");
+        let response_participant = key.participant.as_deref().map(str::to_owned);
+        let response_from_me = key.from_me.unwrap_or(false);
 
         let cache_key = match remote_jid_str.parse::<Jid>() {
             Ok(jid) => ChatMessageId::new(jid, msg_id.to_owned()),
@@ -363,6 +401,45 @@ impl Client {
         };
 
         let pending = self.pdo_pending_requests.remove(&cache_key).await;
+
+        // The pending map is keyed by `(chat, id)`, which does not name a
+        // sender, and the slot expires and can be evicted while a request is
+        // still in flight. So the entry found here is not necessarily the one
+        // this response answers: another participant sharing the id may have
+        // reserved the key in between. Trusting it then would dispatch this
+        // sender's recovered content under the other's identity.
+        //
+        // Only keep it when the response names the same author. On anything
+        // else — a different author, or a spelling this cannot match — fall
+        // through to rebuilding from the response, which is the authority on
+        // who sent what and is the same path a missing entry already takes.
+        let pending = pending.filter(|entry| {
+            let Some(participant) = response_participant.as_deref() else {
+                // Legitimately absent for a DM and for anything `from_me`, so
+                // the only thing left to agree on is the direction. An incoming
+                // and an outgoing message of one DM can share an id, and both
+                // their responses omit the participant.
+                return response_from_me == entry.message_info.source.is_from_me;
+            };
+            let Ok(participant) = participant.parse::<Jid>() else {
+                return false;
+            };
+            // Against both spellings the stanza gave us, not the raw string.
+            // A LID-addressed group stores the LID in `sender` and its PN in
+            // `sender_alt`, while the phone answers in PN, so comparing one
+            // spelling would reject every genuine entry and throw away the
+            // addressing mode, sender alias and stanza metadata with it.
+            //
+            // Both come from the delivery itself rather than from a mapping
+            // learned at runtime, so this comparison does not move under us.
+            let participant = participant.to_non_ad();
+            let source = &entry.message_info.source;
+            source.sender.to_non_ad() == participant
+                || source
+                    .sender_alt
+                    .as_ref()
+                    .is_some_and(|alt| alt.to_non_ad() == participant)
+        });
 
         let elapsed = pending
             .as_ref()
@@ -494,7 +571,7 @@ impl Client {
         Ok(MessageInfo {
             id: id.unwrap_or_default().to_owned(),
             server_id: 0,
-            r#type: String::new(),
+            r#type: None,
             source: MessageSource {
                 chat: remote_jid,
                 sender,
@@ -510,7 +587,7 @@ impl Client {
             push_name: push_name.unwrap_or_default().to_owned(),
             category: MessageCategory::default(),
             multicast: false,
-            media_type: String::new(),
+            media_type: None,
             edit: EditAttribute::default(),
             bot_info: None,
             meta_info: MsgMetaInfo::default(),
@@ -827,7 +904,12 @@ mod tests {
             "PDO_ONCE_1",
         );
         let key = ChatMessageId::new(info.source.chat.clone(), info.id.clone());
-        client.pdo_requested.insert(key.clone(), ()).await;
+        let gate_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
+        client.pdo_requested.insert(gate_key, ()).await;
 
         let res = client.send_pdo_placeholder_resend_request(&info).await;
 
@@ -835,6 +917,368 @@ mod tests {
         assert!(
             client.pdo_pending_requests.get(&key).await.is_none(),
             "gated request must not register a pending entry"
+        );
+    }
+
+    /// The once-per-message gate is per sender, because a message id belongs to
+    /// the sending client and two participants can pick the same one.
+    ///
+    /// Measured, not hypothetical: in a 14-hour production log, 2 of 851
+    /// `(chat, id)` pairs carried messages from two different participants.
+    /// Gating on `(chat, id)` alone means the second one never gets a
+    /// placeholder requested for it at all.
+    ///
+    /// Told apart by the return: a gated call returns early with `Ok`, while a
+    /// call that gets past the gate reaches the send and fails without a live
+    /// transport. `Err` here therefore means "was not gated".
+    #[tokio::test]
+    async fn the_pdo_gate_lets_a_second_sender_ask_for_its_own_message() {
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        client
+            .offline_sync_completed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let first = make_group_message_info(
+            "120363000000000001@g.us",
+            "203040904720543@lid",
+            "PDO_SHARED_ID",
+        );
+        let second = make_group_message_info(
+            "120363000000000001@g.us",
+            "111222333444555@lid",
+            "PDO_SHARED_ID",
+        );
+
+        // The first sender's request is already on record.
+        client
+            .pdo_requested
+            .insert(
+                wacore::types::message::SenderMessageId::new(
+                    first.source.chat.clone(),
+                    first.id.clone(),
+                    first.source.sender.clone(),
+                ),
+                (),
+            )
+            .await;
+
+        let gated = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.send_pdo_placeholder_resend_request(&first),
+        )
+        .await
+        .expect("the gated call returns without touching the network");
+        assert!(gated.is_ok(), "the first sender is gated by its own record");
+
+        let ungated = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.send_pdo_placeholder_resend_request(&second),
+        )
+        .await
+        .expect("send attempt must resolve fast without a live transport");
+        assert!(
+            ungated.is_err(),
+            "the second sender's message is its own, and must reach the send \
+             rather than being gated by the first"
+        );
+    }
+
+    /// A sender blocked by *another* sender's in-flight request must not keep
+    /// the gate it just claimed.
+    ///
+    /// The pending map is shared by `(chat, id)`, so one sender's in-flight
+    /// request short-circuits the other's call after it has already claimed its
+    /// own gate. Nothing was sent for it, so holding the slot would suppress it
+    /// for the gate's whole lifetime once the pending entry clears.
+    #[tokio::test]
+    async fn a_sender_short_circuited_by_a_shared_pending_entry_keeps_no_gate() {
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        client
+            .offline_sync_completed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let first = make_group_message_info(
+            "120363000000000001@g.us",
+            "203040904720543@lid",
+            "PDO_PENDING_SHARED",
+        );
+        let second = make_group_message_info(
+            "120363000000000001@g.us",
+            "111222333444555@lid",
+            "PDO_PENDING_SHARED",
+        );
+        let second_gate = wacore::types::message::SenderMessageId::new(
+            second.source.chat.clone(),
+            second.id.clone(),
+            second.source.sender.clone(),
+        );
+
+        // The first sender's request is in flight, under the shared key.
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(first.source.chat.clone(), first.id.clone()),
+                crate::pdo::PendingPdoRequest {
+                    message_info: first.clone(),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            client.send_pdo_placeholder_resend_request(&second),
+        )
+        .await
+        .expect("the short-circuited call returns without touching the network");
+        assert!(blocked.is_ok(), "the pending branch reports success");
+        assert!(
+            client.pdo_requested.get(&second_gate).await.is_none(),
+            "a sender that sent nothing must not hold its once-per-message slot"
+        );
+    }
+
+    /// A pending entry that belongs to another sender must not be used to
+    /// attribute this response.
+    ///
+    /// The pending map is keyed by `(chat, id)` and its slot expires and can be
+    /// evicted, so the entry present when a response lands is not necessarily
+    /// the one it answers. Adopting it anyway would dispatch one sender's
+    /// recovered content under the other's identity — worse than the missing
+    /// placeholder this change set out to fix.
+    #[tokio::test]
+    async fn a_response_does_not_adopt_another_senders_pending_entry() {
+        use buffa::Message as _;
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+
+        let chat = "120363000000000001@g.us";
+        let msg_id = "PDO_ATTRIBUTION";
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+
+        // Whoever holds the slot when the response lands is not who it answers.
+        client
+            .pdo_pending_requests
+            .insert(
+                key.clone(),
+                super::PendingPdoRequest {
+                    message_info: make_group_message_info(chat, "203040904720543@lid", msg_id),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.to_owned()),
+                participant: Some("111222333444555@lid".to_owned()),
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
+        };
+
+        client
+            .handle_placeholder_resend_response(&response, "req-attr")
+            .await;
+
+        assert!(
+            client.pdo_pending_requests.get(&key).await.is_none(),
+            "the response still consumes the slot it found"
+        );
+
+        let senders: Vec<String> = {
+            let mut senders = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                for m in event.messages().filter(|m| m.info.id == msg_id) {
+                    senders.push(m.info.source.sender.to_string());
+                }
+            }
+            senders
+        };
+        assert_eq!(
+            senders,
+            vec!["111222333444555@lid".to_string()],
+            "the response names its own author; a stale pending entry must not \
+             relabel the recovered content as the other sender"
+        );
+    }
+
+    /// The phone answers in PN while a LID-addressed group stored the LID, and
+    /// that is the same author — the entry must be kept.
+    ///
+    /// Comparing one spelling would reject every genuine entry from a LID
+    /// group and fall back to rebuilding, discarding the addressing mode,
+    /// the sender alias and the stanza metadata the original delivery carried.
+    #[tokio::test]
+    async fn a_pn_response_matches_the_lid_sender_it_was_requested_for() {
+        use buffa::Message as _;
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+
+        let chat = "120363000000000001@g.us";
+        let msg_id = "PDO_LID_ALIAS";
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+
+        // What a LID-addressed group delivery leaves behind: LID in `sender`,
+        // the PN the stanza carried in `sender_alt`.
+        let mut info = (*make_group_message_info(chat, "203040904720543@lid", msg_id)).clone();
+        info.source.sender_alt = Some("15550001234@s.whatsapp.net".parse().expect("pn"));
+        info.source.addressing_mode = Some(wacore::types::message::AddressingMode::Lid);
+        client
+            .pdo_pending_requests
+            .insert(
+                key,
+                super::PendingPdoRequest {
+                    message_info: std::sync::Arc::new(info),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(chat.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.to_owned()),
+                // The phone answers in PN.
+                participant: Some("15550001234@s.whatsapp.net".to_owned()),
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
+        };
+
+        client
+            .handle_placeholder_resend_response(&response, "req-alias")
+            .await;
+
+        let dispatched: Vec<(String, Option<wacore::types::message::AddressingMode>)> = {
+            let mut seen = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                for m in event.messages().filter(|m| m.info.id == msg_id) {
+                    seen.push((
+                        m.info.source.sender.to_string(),
+                        m.info.source.addressing_mode,
+                    ));
+                }
+            }
+            seen
+        };
+        assert_eq!(dispatched.len(), 1, "the response is dispatched");
+        assert_eq!(
+            dispatched[0].0, "203040904720543@lid",
+            "the pending entry is the same author under its other spelling, so \
+             its record is kept rather than rebuilt from the response"
+        );
+        assert_eq!(
+            dispatched[0].1,
+            Some(wacore::types::message::AddressingMode::Lid),
+            "keeping the entry keeps the addressing mode the delivery carried"
+        );
+    }
+
+    /// Two directions of one DM can share an id, and both their responses omit
+    /// the participant — so direction is the only thing left to agree on.
+    #[tokio::test]
+    async fn a_participant_less_response_checks_the_direction() {
+        use buffa::Message as _;
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::{ChatMessageId, MessageInfo, MessageSource};
+
+        let client = setup_reconstruct_client().await;
+        set_own_pn(&client).await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+
+        let peer = "5511999998888@s.whatsapp.net";
+        let msg_id = "PDO_DIRECTION";
+        let key = ChatMessageId::new(peer.parse().expect("chat jid"), msg_id.to_owned());
+
+        // The slot holds the outgoing half of the conversation.
+        let outgoing = MessageInfo {
+            id: msg_id.to_owned(),
+            source: MessageSource {
+                chat: peer.parse().expect("chat jid"),
+                sender: peer.parse().expect("chat jid"),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        client
+            .pdo_pending_requests
+            .insert(
+                key,
+                super::PendingPdoRequest {
+                    message_info: std::sync::Arc::new(outgoing),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        // The response answers the incoming one, and omits the participant too.
+        let web_msg = waproto::whatsapp::WebMessageInfo {
+            key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
+                remote_jid: Some(peer.to_owned()),
+                from_me: Some(false),
+                id: Some(msg_id.to_owned()),
+                participant: None,
+            }),
+            message: buffa::MessageField::some(waproto::whatsapp::Message {
+                conversation: Some("recovered by the phone".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
+        };
+
+        client
+            .handle_placeholder_resend_response(&response, "req-direction")
+            .await;
+
+        let from_me: Vec<bool> = {
+            let mut seen = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                for m in event.messages().filter(|m| m.info.id == msg_id) {
+                    seen.push(m.info.source.is_from_me);
+                }
+            }
+            seen
+        };
+        assert_eq!(from_me.len(), 1, "the response is dispatched");
+        assert!(
+            !from_me[0],
+            "the response is for the incoming message; the outgoing entry in \
+             the slot must not relabel it as ours"
         );
     }
 
@@ -867,8 +1311,13 @@ mod tests {
         .expect("send attempt must resolve fast without a live transport");
 
         assert!(res.is_err(), "no live transport, the send must fail");
+        let gate_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
         assert!(
-            client.pdo_requested.get(&key).await.is_none(),
+            client.pdo_requested.get(&gate_key).await.is_none(),
             "failed send must release the once-per-message slot"
         );
         assert!(
@@ -889,8 +1338,14 @@ mod tests {
         let chat = "5511999998888@s.whatsapp.net";
         let msg_id = "PDO_ONCE_3";
         let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+        // A DM: the chat jid is the sender, which is what the gate names.
+        let gate_key = wacore::types::message::SenderMessageId::new(
+            chat.parse().expect("chat jid"),
+            msg_id.to_owned(),
+            chat.parse().expect("chat jid"),
+        );
 
-        client.pdo_requested.insert(key.clone(), ()).await;
+        client.pdo_requested.insert(gate_key.clone(), ()).await;
         client
             .pdo_pending_requests
             .insert(
@@ -924,7 +1379,7 @@ mod tests {
             "response consumes the pending slot"
         );
         assert!(
-            client.pdo_requested.get(&key).await.is_some(),
+            client.pdo_requested.get(&gate_key).await.is_some(),
             "memo must survive a content-less response"
         );
     }

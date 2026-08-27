@@ -7,19 +7,21 @@ use std::result::Result;
 
 use crate::crypto::provider::provider;
 
-#[derive(Debug, displaydoc::Display, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum EncryptionError {
-    /// The key or IV is the wrong length.
+    #[error("The key or IV is the wrong length.")]
     BadKeyOrIv,
-    /// Padding error during encryption.
+    #[error("Padding error during encryption.")]
     BadPadding,
 }
 
-#[derive(Debug, displaydoc::Display, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum DecryptionError {
-    /// The key or IV is the wrong length.
+    #[error("The key or IV is the wrong length.")]
     BadKeyOrIv,
-    /// These cases should not be distinguished; message corruption can cause either problem.
+    #[error(
+        "These cases should not be distinguished; message corruption can cause either problem."
+    )]
     BadCiphertext(&'static str),
 }
 

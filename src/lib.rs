@@ -65,6 +65,13 @@ pub(crate) mod test_alloc {
     }
 }
 
+/// The app-state collections, named as they appear on the wire. Part of the
+/// public surface because [`Client::resync_app_state`] takes them.
+///
+/// [`WAPatchName::Unknown`] is not one of them: it is what parsing an
+/// unrecognised collection name yields, so the server has nothing under that
+/// name. `resync_app_state` rejects a request naming it.
+pub use wacore::appstate::patch_decode::WAPatchName;
 pub use wacore::appstate::schemas;
 pub use wacore::client_profile::ClientProfile;
 /// Optional metrics emission (the `metrics` feature). No-op when the feature is off.
@@ -120,16 +127,21 @@ pub(crate) mod flush_scope;
 /// types embed it.
 pub use client::ClientError;
 pub use client::NodeFilter;
+pub use client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
 pub use client::{
     AllocSnapshot, CollectionStats, HttpResourceReport, MemoryReport, ResourceReport,
-    StatsSnapshot, StorageResourceReport, TransportResourceReport,
+    StatsSnapshot, StorageResourceReport, SubsystemCollection, SubsystemMemory,
+    TransportResourceReport,
 };
 pub use client::{CallError, Voip};
-pub use client::{Client, ClientBuild, ClientBuilder, ClientBuilderError, RawNodeLease};
+pub use client::{
+    Client, ClientBuild, ClientBuilder, ClientBuilderError, Connection, DecryptedPayloadLease,
+    EncDecryptFailedLease, RawNodeLease, SentFrameLease,
+};
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
-pub use client::{ConnectError, ConnectStage, SignalMaintenanceError};
+pub use client::{ConnectError, ConnectStage, Reachability, SignalMaintenanceError};
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
@@ -145,6 +157,8 @@ pub mod message;
 pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
+#[cfg(feature = "passkey")]
+#[cfg_attr(docsrs, doc(cfg(feature = "passkey")))]
 pub mod passkey;
 #[cfg(feature = "plugins")]
 #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
@@ -159,13 +173,14 @@ pub use plugins::{
     PluginEventPublisherStats, PluginEventReceiveError, PluginEventRouteError, PluginEventRouter,
     PluginEventRouterStats, PluginEventSelector, PluginEventSubscribeError,
     PluginEventSubscription, PluginEventTopic, PluginEventTryReceiveError, PluginEvents,
-    PluginFuture, PluginHealth, PluginHostConfig, PluginHostStats, PluginIq, PluginIqError,
-    PluginManifest, PluginMessaging, PluginMessagingError, PluginPlanError, PluginResourceError,
-    PluginState, PluginStats, PluginTasks, UntypedClientPlugin,
+    PluginFuture, PluginHealth, PluginHostConfig, PluginHostStats, PluginInterceptorRegistration,
+    PluginIq, PluginIqError, PluginManifest, PluginMessaging, PluginMessagingError,
+    PluginPlanError, PluginResourceError, PluginStanzaInterception, PluginState, PluginStats,
+    PluginTasks, UntypedClientPlugin,
 };
 pub mod request;
 pub(crate) mod signal_flush;
-pub use request::IqError;
+pub use request::{IqError, RejectionStanza};
 #[cfg(feature = "tokio-runtime")]
 pub mod runtime_impl;
 #[cfg(feature = "tokio-runtime")]
@@ -196,27 +211,38 @@ pub mod usync;
 
 pub mod features;
 pub use features::{
-    AppStateError, BatchGroupResult, Blocking, BlockingError, BlocklistEntry, ChatActions,
-    ChatStateError, ChatStateType, Chatstate, Comments, Community, CommunityError,
-    CommunitySubgroup, ContactError, Contacts, CreateCommunityOptions, CreateCommunityResult,
-    CreateGroupResult, EncType, EncryptedEdit, EventCreationParams, EventResponseType, Events,
-    GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings, GroupError,
-    GroupJoinError, GroupMetadata, GroupParticipant, GroupParticipantDetails,
-    GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo,
+    AppStateError, AppStateResyncMode, AppStateResyncReport, AppStateSettings,
+    BUSINESS_PROFILE_MAX_WEBSITES, BatchGroupResult, Blocking, BlockingError, BlocklistEntry,
+    BotDefault, BotList, BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType,
+    BotSectionType, BotTheme, BotThemeMode, Bots, Business, BusinessCategory, BusinessError,
+    BusinessHourMode, BusinessHours, BusinessHoursConfig, BusinessHoursUpdate, BusinessProfile,
+    BusinessProfileUpdate, BusinessProfileUpdateError, CappingMvStatus, CappingOteStatus,
+    CappingStatus, Catalog, CatalogOptions, ChatActions, ChatStateError, ChatStateType, Chatstate,
+    Collection, CollectionOptions, Collections, Comments, Community, CommunityError,
+    CommunitySubgroup, ContactError, Contacts, CoverPhotoUpload, CreateCommunityOptions,
+    CreateCommunityResult, CreateGroupResult, DayOfWeek, EncType, EncryptedEdit,
+    EventCreationParams, EventResponseType, Events, GroupAppealStatus, GroupCreateOptions,
+    GroupDescription, GroupEphemeralSettings, GroupError, GroupJoinError, GroupMessageReporter,
+    GroupMetadata, GroupParticipant, GroupParticipantDetails, GroupParticipantOptions,
+    GroupProfilePicture, GroupSubject, GroupType, Groups, GrowthLockInfo, ImporterAddress,
     InviteInfoError, IsOnWhatsAppResult, JoinGroupResult, Labels, LinkSubgroupsResult,
     MediaRetryResult, MediaReupload, MediaReuploadError, MediaReuploadRequest, MemberAddMode,
     MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
     MessageEditError, MessageRetransmission, Mex, MexError, MexErrorExtensions, MexGraphQLError,
-    MexRequest, MexResponse, NackReason, Newsletter, NewsletterError, NewsletterMessage,
+    MexRequest, MexResponse, NackReason, NewChatMessageCapping, Newsletter, NewsletterAdminInfo,
+    NewsletterAdminProfile, NewsletterError, NewsletterFollower, NewsletterMessage,
     NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
-    NewsletterState, NewsletterVerification, ParticipantChangeResponse, ParticipantType,
-    PictureType, PollError, PollOptionResult, PollVoteCiphertext, Polls, Presence, PresenceError,
-    PresenceStatus, PreviousDescription, Profile, ProfileError, ProfilePicture, ReachoutTimelock,
-    RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome, SecretEncKind,
-    SecretEncrypted, SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo,
-    SignalSessionMigration, StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting,
-    StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult,
-    UserInfo, UsyncSubprotocolError, VerifiedName, group_type, message_key, message_range,
+    NewsletterState, NewsletterVerification, Order, OrderPriceDetails, OrderProduct,
+    ParticipantChangeResponse, ParticipantType, PictureType, PollError, PollOptionResult,
+    PollVoteCiphertext, Polls, Presence, PresenceError, PresenceStatus, PreviousDescription, Price,
+    Product, ProductAvailability, ProductImage, ProductVideo, Profile, ProfileError,
+    ProfilePicture, QuickReplies, ReachoutTimelock, ReportedGroupMessage, ReportedGroupMessages,
+    RetryReason, RetryRequestError, RetryRequestOptions, RetryRequestOutcome, SalePrice,
+    SecretEncKind, SecretEncrypted, SetProfilePictureResponse, Signal, SignalError,
+    SignalSessionInfo, SignalSessionMigration, StanzaRejection, StanzaResponseError, Status,
+    StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError,
+    UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError, VariantProperty, VerifiedName,
+    group_type, message_key, message_range,
 };
 
 pub mod bot;
@@ -233,7 +259,10 @@ pub mod version;
 /// `use whatsapp_rust::prelude::*;`.
 pub mod prelude {
     pub use crate::bot::{Bot, BotBuilder, BotHandle, EventDelivery, MessageContext};
-    pub use crate::client::{Client, ClientBuilder, ClientBuilderError, ClientError, RawNodeLease};
+    pub use crate::client::{
+        Client, ClientBuilder, ClientBuilderError, ClientError, Connection, DecryptedPayloadLease,
+        EncDecryptFailedLease, RawNodeLease, SentFrameLease,
+    };
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
@@ -245,9 +274,10 @@ pub mod prelude {
         PluginCoreEventSubscription, PluginEventEndpointConfig, PluginEventOverflow,
         PluginEventPayloadEncoding, PluginEventRouter, PluginEventSelector,
         PluginEventSubscription, PluginEventTopic, PluginEvents, PluginFuture, PluginHostConfig,
-        PluginManifest, UntypedClientPlugin,
+        PluginInterceptorRegistration, PluginManifest, PluginStanzaInterception,
+        UntypedClientPlugin,
     };
-    pub use crate::request::IqError;
+    pub use crate::request::{IqError, RejectionStanza};
     #[cfg(feature = "tokio-runtime")]
     pub use crate::runtime_impl::TokioRuntime;
     pub use crate::send::{EditOptions, SendError, SendOptions, SendResult};
@@ -269,6 +299,13 @@ pub mod prelude {
 }
 
 pub use spam_report::{SpamFlow, SpamReportRequest, SpamReportResult};
+
+/// Offline fixture the client-level benchmarks build on. Not a public API:
+/// gated behind the non-default `bench-harness` feature and hidden from docs,
+/// so an ordinary build carries neither the module nor its sink transport.
+#[cfg(feature = "bench-harness")]
+#[doc(hidden)]
+pub mod bench_support;
 
 #[cfg(test)]
 pub mod test_utils;

@@ -26,6 +26,21 @@ impl WAPatchName {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Rank in the order batched syncs reserve collections in, which is also the
+    /// order the collections reach the wire. The ranks reproduce [`Self::as_str`]
+    /// order, and the match is exhaustive so a new variant has to be given a
+    /// rank rather than silently landing anywhere.
+    pub const fn reservation_rank(self) -> u8 {
+        match self {
+            Self::CriticalBlock => 0,
+            Self::CriticalUnblockLow => 1,
+            Self::Regular => 2,
+            Self::RegularHigh => 3,
+            Self::RegularLow => 4,
+            Self::Unknown => 5,
+        }
+    }
 }
 
 impl FromStr for WAPatchName {
@@ -86,15 +101,42 @@ pub fn parse_patch_list(node: &Node) -> Result<PatchList> {
 }
 
 /// Zero-copy entry point for `parse_patch_list`.
+///
+/// The decoder hands the read loop a borrowed tree; deep-copying it here so the
+/// owned parser could run cloned every patch blob in the response (megabytes on
+/// a resume sync) only to decode each one and drop the copy. Everything this
+/// path reads is either parsed out of a borrowed slice or copied into the
+/// `PatchList` regardless, so it reads the borrowed tree directly.
 pub fn parse_patch_list_ref(node: &NodeRef<'_>) -> Result<PatchList> {
-    parse_patch_list(&node.to_owned())
+    let collection = node
+        .get_optional_child_by_tag(&["sync", "collection"]) // naive path descent
+        .ok_or_else(|| anyhow!("missing sync/collection"))?;
+    parse_single_collection_ref(collection)
 }
 
 /// Parse all `<collection>` children from a `<sync>` response into PatchLists.
 /// Used for batched multi-collection IQ responses.
 /// Tolerates both `<iq><sync>...</sync></iq>` and bare `<sync>...</sync>` roots.
+///
+/// Borrowed counterpart of [`parse_patch_lists`], for the same reason as
+/// [`parse_patch_list_ref`].
 pub fn parse_patch_lists_ref(node: &NodeRef<'_>) -> Result<Vec<PatchList>> {
-    parse_patch_lists(&node.to_owned())
+    let sync_node = if node.tag == "sync" {
+        node
+    } else {
+        node.get_optional_child("sync")
+            .ok_or_else(|| anyhow!("missing sync node in response"))?
+    };
+
+    let Some(children) = sync_node.children() else {
+        return Ok(Vec::new());
+    };
+
+    children
+        .iter()
+        .filter(|c| c.tag == "collection")
+        .map(parse_single_collection_ref)
+        .collect()
 }
 
 pub fn parse_patch_lists(node: &Node) -> Result<Vec<PatchList>> {
@@ -205,6 +247,95 @@ fn parse_collection_error(
     })
 }
 
+/// Borrowed counterpart of [`parse_single_collection`]. Kept as its own body
+/// rather than generic over the two node types: the owned and borrowed trees
+/// expose different attribute parsers and content enums, and the shared shape is
+/// three field reads.
+fn parse_single_collection_ref(collection: &NodeRef<'_>) -> Result<PatchList> {
+    let mut ag = collection.attrs();
+    let name_str = ag
+        .optional_string("name")
+        .ok_or_else(|| anyhow!("collection missing 'name' attribute"))?;
+    let has_more = ag.optional_bool("has_more_patches");
+
+    // Check for per-collection error (WA Web: `3JJWKHeu5-P.js:54222-54254`)
+    let col_type = ag.optional_string("type");
+    let error = parse_collection_error_ref(collection, col_type.as_deref());
+
+    ag.finish()?;
+
+    // snapshot (optional)
+    let mut snapshot_ref = None;
+    if let Some(snapshot_node) = collection.get_optional_child("snapshot")
+        && let Some(raw) = snapshot_node.content_bytes()
+        && let Ok(ext_ref) = waproto::codec::external_blob_reference_decode(raw)
+    {
+        snapshot_ref = Some(ext_ref);
+    }
+    let snapshot = None; // external only currently
+
+    // patches list
+    let children_ref = collection
+        .get_optional_child("patches")
+        .and_then(|n| n.children());
+    let mut patches: Vec<wa::SyncdPatch> = Vec::with_capacity(children_ref.map_or(0, |c| c.len()));
+    if let Some(children) = children_ref {
+        for child in children {
+            if child.tag == "patch"
+                && let Some(raw) = child.content_bytes()
+            {
+                match waproto::codec::syncd_patch_decode(raw) {
+                    Ok(p) => patches.push(p),
+                    Err(e) => return Err(anyhow!("failed to unmarshal patch: {e}")),
+                }
+            }
+        }
+    }
+
+    Ok(PatchList {
+        name: WAPatchName::from_str(&name_str).unwrap_or(WAPatchName::Unknown),
+        has_more_patches: has_more,
+        patches,
+        snapshot,
+        snapshot_ref,
+        error,
+    })
+}
+
+/// Borrowed counterpart of [`parse_collection_error`].
+fn parse_collection_error_ref(
+    collection: &NodeRef<'_>,
+    col_type: Option<&str>,
+) -> Option<CollectionSyncError> {
+    if col_type? != "error" {
+        return None;
+    }
+
+    // Parse error details from child node, or fall back to a default retryable
+    // error if the <error> child is missing/malformed.
+    let (code, text) = if let Some(error_node) = collection.get_optional_child("error") {
+        let mut error_attrs = error_node.attrs();
+        let code_str = error_attrs.optional_string("code");
+        let text = error_attrs
+            .optional_string("text")
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
+        let code: u16 = code_str.as_deref().unwrap_or("0").parse().unwrap_or(0);
+        (code, text)
+    } else {
+        (0u16, "missing <error> child".to_string())
+    };
+
+    Some(match code {
+        409 => CollectionSyncError::Conflict {
+            has_more: collection.attrs().optional_bool("has_more_patches"),
+        },
+        400 | 404 => CollectionSyncError::Fatal { code, text },
+        _ => CollectionSyncError::Retry { code, text },
+    })
+}
+
 #[cfg(test)]
 // Fixtures encode protos the pinned `waproto::codec` wrappers don't cover; the
 // binary-size reason for pinning them doesn't apply to test code.
@@ -213,6 +344,80 @@ mod tests {
     use super::*;
     use buffa::Message;
     use wacore_binary::builder::NodeBuilder;
+
+    /// Every collection, in an order no caller uses, so the ranks and not the
+    /// input decide the result.
+    const SHUFFLED: [WAPatchName; 6] = [
+        WAPatchName::RegularLow,
+        WAPatchName::Unknown,
+        WAPatchName::Regular,
+        WAPatchName::CriticalBlock,
+        WAPatchName::RegularHigh,
+        WAPatchName::CriticalUnblockLow,
+    ];
+
+    /// The reservation order used to be "sorted by `as_str`", and the batched
+    /// sync puts the collections on the wire in it, so it is pinned rather than
+    /// left to whatever the ranks happen to say.
+    #[test]
+    fn reservation_rank_reproduces_as_str_order() {
+        let mut ordered = SHUFFLED;
+        ordered.sort_unstable_by_key(|name| name.reservation_rank());
+        let names: Vec<&str> = ordered.iter().map(|name| name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            [
+                "critical_block",
+                "critical_unblock_low",
+                "regular",
+                "regular_high",
+                "regular_low",
+                "unknown",
+            ]
+        );
+
+        let mut by_name: Vec<&str> = SHUFFLED.iter().map(|name| name.as_str()).collect();
+        by_name.sort_unstable();
+        assert_eq!(names, by_name, "the ranks are the `as_str` order");
+    }
+
+    /// Exhaustive on purpose: a seventh collection stops this compiling, which
+    /// is what puts whoever adds it in front of the pinned order above. The
+    /// rank itself cannot be forgotten, because `reservation_rank` is a match
+    /// over the enum.
+    #[test]
+    fn the_pinned_order_covers_every_collection() {
+        for name in SHUFFLED {
+            match name {
+                WAPatchName::CriticalBlock
+                | WAPatchName::CriticalUnblockLow
+                | WAPatchName::Regular
+                | WAPatchName::RegularHigh
+                | WAPatchName::RegularLow
+                | WAPatchName::Unknown => {}
+            }
+        }
+    }
+
+    /// Two collections sharing a rank would leave their relative order up to the
+    /// caller, which is the cycle the shared order exists to rule out.
+    #[test]
+    fn every_collection_has_its_own_rank() {
+        let mut ranks: Vec<u8> = SHUFFLED
+            .iter()
+            .map(|name| name.reservation_rank())
+            .collect();
+        ranks.sort_unstable();
+        ranks.dedup();
+
+        assert_eq!(ranks.len(), SHUFFLED.len(), "ranks collide");
+        assert_eq!(
+            ranks.last().copied(),
+            Some(SHUFFLED.len() as u8 - 1),
+            "the ranks are contiguous from zero, so a new one is visibly appended"
+        );
+    }
 
     /// Length-delimited field 1 announcing 5 bytes but carrying 1, so every
     /// protobuf decoder in the tests below fails deterministically.
@@ -308,13 +513,100 @@ mod tests {
         assert_eq!(versions, vec![Some(1), Some(2)]);
     }
 
+    /// Comparable summary of a PatchList: it has no `PartialEq`, and the point
+    /// of the borrowed parser is that it produces the same thing as the owned
+    /// one, field for field.
+    fn summarize(list: &PatchList) -> String {
+        format!(
+            "{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+            list.name,
+            list.has_more_patches,
+            list.patches
+                .iter()
+                .map(|p| (
+                    p.version.as_option().and_then(|v| v.version),
+                    p.snapshot_mac.clone()
+                ))
+                .collect::<Vec<_>>(),
+            list.snapshot.is_some(),
+            list.snapshot_ref
+                .as_ref()
+                .map(|r| (r.direct_path.clone(), r.file_size_bytes)),
+            list.error.as_ref().map(|e| e.to_string()),
+        )
+    }
+
+    /// Every collection shape the two parsers can meet, so the differential
+    /// tests below cover the snapshot ref, the patch blobs and each error class
+    /// rather than only the happy path.
+    fn every_collection_shape() -> Vec<Node> {
+        vec![
+            full_collection(),
+            NodeBuilder::new("collection")
+                .attr("name", "regular_high")
+                .build(),
+            NodeBuilder::new("collection")
+                .attr("name", "collection_from_the_future")
+                .build(),
+            error_collection(Some(NodeBuilder::new("error").attr("code", "409").build())),
+            error_collection(Some(
+                NodeBuilder::new("error")
+                    .attr("code", "404")
+                    .attr("text", "not found")
+                    .build(),
+            )),
+            error_collection(Some(
+                NodeBuilder::new("error")
+                    .attr("code", "500")
+                    .attr("text", "internal")
+                    .build(),
+            )),
+            error_collection(None),
+            NodeBuilder::new("collection")
+                .attr("name", "regular")
+                .children([NodeBuilder::new("snapshot")
+                    .bytes(TRUNCATED_PROTOBUF.to_vec())
+                    .build()])
+                .build(),
+        ]
+    }
+
     #[test]
     fn parse_patch_list_ref_matches_owned_path() {
-        let node = iq_with([full_collection()]);
-        let list = parse_patch_list_ref(&node.as_node_ref()).expect("well-formed collection");
+        for collection in every_collection_shape() {
+            let node = iq_with([collection]);
+            let owned = parse_patch_list(&node).expect("owned parser accepts the shape");
+            let borrowed =
+                parse_patch_list_ref(&node.as_node_ref()).expect("borrowed parser agrees");
+            assert_eq!(summarize(&owned), summarize(&borrowed));
+        }
+    }
 
-        assert_eq!(list.name, WAPatchName::Regular);
-        assert_eq!(list.patches.len(), 2);
+    /// The two parsers must also agree on rejection, not just on results.
+    #[test]
+    fn parse_patch_list_ref_matches_owned_path_on_errors() {
+        let cases = [
+            NodeBuilder::new("iq").build(),
+            iq_with([]),
+            iq_with([NodeBuilder::new("collection")
+                .attr("has_more_patches", "true")
+                .build()]),
+            iq_with([NodeBuilder::new("collection")
+                .attr("name", "regular")
+                .children([NodeBuilder::new("patches")
+                    .children([NodeBuilder::new("patch")
+                        .bytes(TRUNCATED_PROTOBUF.to_vec())
+                        .build()])
+                    .build()])
+                .build()]),
+        ];
+
+        for node in cases {
+            let owned = parse_patch_list(&node).expect_err("owned parser rejects");
+            let borrowed =
+                parse_patch_list_ref(&node.as_node_ref()).expect_err("borrowed parser rejects");
+            assert_eq!(owned.to_string(), borrowed.to_string());
+        }
     }
 
     #[test]
@@ -428,9 +720,32 @@ mod tests {
 
     #[test]
     fn parse_patch_lists_ref_matches_owned_path() {
-        let node = sync_node([full_collection()]);
-        let lists = parse_patch_lists_ref(&node.as_node_ref()).expect("well-formed sync node");
-        assert_eq!(lists.len(), 1);
+        // Both accepted roots, and a childless sync, which returns empty rather
+        // than erroring.
+        let roots = [
+            sync_node(every_collection_shape()),
+            iq_with(every_collection_shape()),
+            NodeBuilder::new("sync").build(),
+        ];
+
+        for root in roots {
+            let owned = parse_patch_lists(&root).expect("owned parser accepts the root");
+            let borrowed =
+                parse_patch_lists_ref(&root.as_node_ref()).expect("borrowed parser agrees");
+            assert_eq!(owned.len(), borrowed.len());
+            for (o, b) in owned.iter().zip(borrowed.iter()) {
+                assert_eq!(summarize(o), summarize(b));
+            }
+        }
+
+        // A root with no sync node at all is rejected identically.
+        let bare = NodeBuilder::new("iq").build();
+        assert_eq!(
+            parse_patch_lists(&bare).expect_err("owned").to_string(),
+            parse_patch_lists_ref(&bare.as_node_ref())
+                .expect_err("borrowed")
+                .to_string()
+        );
     }
 
     #[test]

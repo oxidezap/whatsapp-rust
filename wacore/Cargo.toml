@@ -1,6 +1,6 @@
 [package]
 name = "wacore"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
@@ -17,8 +17,6 @@ autobenches = false
 ignored = ["getrandom"]
 
 [features]
-default = ["simd"]
-simd = ["wacore-appstate/simd"]
 debug-snapshots = []
 # Typed interop with the decoded libsignal SessionRecord v1 model.
 legacy-session-interop = ["wacore-libsignal/legacy-session-interop"]
@@ -45,6 +43,10 @@ voip-mlow = ["voip"]
 # Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
 # Dev/profiling only; off by default and not pulled into normal builds.
 dhat-heap = ["dep:dhat"]
+# Per-stage MLow codec bench surface (`voip::mlow::stage_bench`), so `voip_benchmark` can attribute
+# encoder CPU to a stage. Pure bench scaffolding: `#[doc(hidden)]` would hide it from rustdoc but
+# still compile it into every consumer, so it is a feature. Dev/bench only; off by default.
+bench-internals = []
 
 [dependencies]
 aes = { workspace = true }
@@ -57,12 +59,14 @@ base64 = { workspace = true }
 bon = { workspace = true }
 buffa = { workspace = true }
 bytes = { workspace = true }
+# Media upload/download run AES-256-CBC incrementally over a stream, which the
+# mode's own batch loop does with the chaining block in a register.
+cbc = { workspace = true }
 chrono = { workspace = true, features = ["now", "serde"] }
 compact_str = { workspace = true }
 ctr = { workspace = true }
 dhat = { version = "0.3", optional = true }
 event-listener = { workspace = true }
-flate2 = { workspace = true }
 futures = { workspace = true, features = ["std"] }
 getrandom = { workspace = true, optional = true }
 hashbrown = { workspace = true }
@@ -80,12 +84,13 @@ serde-big-array = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-smallvec = { workspace = true }
+# `serde` for the inline reporting-token buffers on `MsgMetaInfo`, which the
+# `Serialize` derive on `MessageInfo` reaches through.
+smallvec = { workspace = true, features = ["serde"] }
 smoothutf8 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true, optional = true }
-typed-builder = "0.23"
 wacore-appstate = { workspace = true }
 wacore-binary = { workspace = true, features = ["serde"] }
 zeroize = { workspace = true }
@@ -101,8 +106,13 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
-futures = { workspace = true, features = ["executor", "thread-pool"] }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+# Compression only: the runtime inflates through `wacore_binary::zlib_pool`
+# (zlib-rs directly), so flate2 stays out of the release dependency set.
+flate2 = { workspace = true }
+futures = { workspace = true, features = ["executor"] }
+# `rt-multi-thread` is test-only: the wire-gate race test needs two threads to
+# actually interleave a lease insert with the lock-free gate query.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [[bench]]
 name = "reporting_token_benchmark"
@@ -138,8 +148,25 @@ name = "appstate_sync_benchmark"
 harness = false
 
 [[bench]]
+name = "sender_key_derivation_benchmark"
+harness = false
+
+[[bench]]
+name = "prekey_store_benchmark"
+harness = false
+
+[[bench]]
+name = "media_benchmark"
+harness = false
+
+[[bench]]
 name = "voip_benchmark"
 harness = false
+# Only `voip-mlow` here on purpose: cargo SILENTLY SKIPS a bench target whose required features are
+# off, so listing `bench-internals` too would make the previously-working
+# `cargo bench --features voip-mlow --bench voip_benchmark` quietly run nothing -- dropping the MLow,
+# SRTP, SFrame and framing rows along with the stage rows. The `codec_stages` module is `#[cfg]`-gated
+# inside the bench instead, so it is the only part that needs the extra feature.
 required-features = ["voip-mlow"]
 
 [[example]]

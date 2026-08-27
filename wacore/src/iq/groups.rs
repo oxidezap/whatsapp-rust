@@ -5,7 +5,6 @@ use crate::protocol::ProtocolNode;
 use crate::request::InfoQuery;
 use anyhow::{Result, anyhow};
 use std::num::NonZeroU32;
-use typed_builder::TypedBuilder;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{CompactString, Jid, Server};
 use wacore_binary::{Node, NodeContent, NodeRef};
@@ -53,14 +52,7 @@ pub enum MemberLinkMode {
     AllMemberLink,
 }
 
-/// Member add mode for who can add participants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum MemberAddMode {
-    #[wire = "admin_add"]
-    AdminAdd,
-    #[wire = "all_member_add"]
-    AllMemberAdd,
-}
+pub use crate::types::wire_enums::MemberAddMode;
 
 /// Membership approval mode for join requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -72,15 +64,7 @@ pub enum MembershipApprovalMode {
     On,
 }
 
-/// Who can share message history with new members.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum MemberShareHistoryMode {
-    #[wire_default]
-    #[wire = "admin_share"]
-    AdminShare,
-    #[wire = "all_member_share"]
-    AllMemberShare,
-}
+pub use crate::types::wire_enums::MemberShareHistoryMode;
 
 /// Review state for an appeal on a suspended group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -224,14 +208,21 @@ crate::define_validated_string! {
     pub struct GroupDescription(max_len = GROUP_DESCRIPTION_MAX_LENGTH, name = "Group description")
 }
 /// Options for a participant when creating a group.
-#[derive(Debug, Clone, TypedBuilder)]
-#[builder(build_method(into))]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(finish_fn = finish)]
 pub struct GroupParticipantOptions {
     pub jid: Jid,
-    #[builder(default, setter(strip_option))]
     pub phone_number: Option<Jid>,
-    #[builder(default, setter(strip_option))]
     pub privacy: Option<Vec<u8>>,
+}
+
+/// `build()` finishes into anything the options convert into, not just `Self`.
+/// The reflexive `From` covers the plain case, so a caller that already has
+/// `impl From<GroupParticipantOptions> for T` keeps compiling.
+impl<S: group_participant_options_builder::IsComplete> GroupParticipantOptionsBuilder<S> {
+    pub fn build<T: From<GroupParticipantOptions>>(self) -> T {
+        self.finish().into()
+    }
 }
 
 impl GroupParticipantOptions {
@@ -259,20 +250,24 @@ impl GroupParticipantOptions {
 }
 
 /// Options for creating a new group.
-#[derive(Debug, Clone, TypedBuilder)]
-#[builder(build_method(into))]
+// `member_link_mode` and the three that follow default to `Some(..)` rather
+// than `None`, which bon spells only on a member marked `required` (its
+// `Option` shorthand hardcodes a `None` default). `with` restores the
+// bare-value setter that shorthand would otherwise have provided.
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(finish_fn = finish)]
 pub struct GroupCreateOptions {
-    #[builder(setter(into))]
+    #[builder(into)]
     pub subject: String,
     #[builder(default)]
     pub participants: Vec<GroupParticipantOptions>,
-    #[builder(default = Some(MemberLinkMode::AdminLink), setter(strip_option))]
+    #[builder(required, default = Some(MemberLinkMode::AdminLink), with = |v: MemberLinkMode| Some(v))]
     pub member_link_mode: Option<MemberLinkMode>,
-    #[builder(default = Some(MemberAddMode::AllMemberAdd), setter(strip_option))]
+    #[builder(required, default = Some(MemberAddMode::AllMemberAdd), with = |v: MemberAddMode| Some(v))]
     pub member_add_mode: Option<MemberAddMode>,
-    #[builder(default = Some(MembershipApprovalMode::Off), setter(strip_option))]
+    #[builder(required, default = Some(MembershipApprovalMode::Off), with = |v: MembershipApprovalMode| Some(v))]
     pub membership_approval_mode: Option<MembershipApprovalMode>,
-    #[builder(default = Some(0), setter(strip_option))]
+    #[builder(required, default = Some(0), with = |v: u32| Some(v))]
     pub ephemeral_expiration: Option<u32>,
     /// Create as a community (parent group). Emits `<parent/>` in the create stanza.
     #[builder(default)]
@@ -291,13 +286,20 @@ pub struct GroupCreateOptions {
     pub create_general_chat: bool,
     /// Parent community to link this subgroup to. Atomic alternative to
     /// creating then linking; mutually exclusive with `is_parent`.
-    #[builder(default, setter(strip_option, into))]
+    #[builder(into)]
     pub linked_parent: Option<Jid>,
     /// Inline description carried on the create stanza; avoids a follow-up
     /// SetGroupDescription IQ. Validation (length cap) goes through
     /// [`GroupDescription`] so both create paths share the same contract.
-    #[builder(default, setter(strip_option, into))]
+    #[builder(into)]
     pub description: Option<GroupDescription>,
+}
+
+/// See [`GroupParticipantOptionsBuilder::build`] for why this is generic.
+impl<S: group_create_options_builder::IsComplete> GroupCreateOptionsBuilder<S> {
+    pub fn build<T: From<GroupCreateOptions>>(self) -> T {
+        self.finish().into()
+    }
 }
 
 impl GroupCreateOptions {
@@ -1155,14 +1157,14 @@ impl ProtocolNode for GroupInfoResponse {
 
         let member_add_mode = node
             .get_optional_child_by_tag(&["member_add_mode"])
-            .and_then(|n| match n.content.as_deref() {
+            .and_then(|n| match n.content.as_ref() {
                 Some(NodeContentRef::String(s)) => MemberAddMode::try_from(s.as_ref()).ok(),
                 _ => None,
             });
 
         let member_link_mode = node
             .get_optional_child_by_tag(&["member_link_mode"])
-            .and_then(|n| match n.content.as_deref() {
+            .and_then(|n| match n.content.as_ref() {
                 Some(NodeContentRef::String(s)) => MemberLinkMode::try_from(s.as_ref()).ok(),
                 _ => None,
             });
@@ -1212,7 +1214,7 @@ impl ProtocolNode for GroupInfoResponse {
 
         let member_share_history_mode = node
             .get_optional_child_by_tag(&["member_share_group_history_mode"])
-            .and_then(|n| match n.content.as_deref() {
+            .and_then(|n| match n.content.as_ref() {
                 Some(NodeContentRef::String(s)) => {
                     MemberShareHistoryMode::try_from(s.as_ref()).ok()
                 }
@@ -1451,7 +1453,12 @@ pub enum GroupInfoOutcome {
 #[derive(Debug, Clone)]
 pub struct GroupQueryIq {
     pub group_jid: Jid,
-    pub phash: Option<String>,
+    /// A `CompactString` because that is what a phash is everywhere else:
+    /// `MessageUtils::participant_list_hash` produces one, the send memos hold
+    /// one, and a ten-byte value lives inside it with nothing on the heap. A
+    /// `String` here would allocate once to be built and again on the clone
+    /// into the node attribute below.
+    pub phash: Option<CompactString>,
 }
 
 impl GroupQueryIq {
@@ -1464,7 +1471,7 @@ impl GroupQueryIq {
 
     /// Query carrying the cached participant `phash` so the server can answer
     /// "not-modified" by omitting `<group>`.
-    pub fn with_phash(group_jid: &Jid, phash: Option<String>) -> Self {
+    pub fn with_phash(group_jid: &Jid, phash: Option<CompactString>) -> Self {
         Self {
             group_jid: group_jid.clone(),
             phash,
@@ -3501,15 +3508,410 @@ impl IqSpec for GetGroupProfilePicturesIq {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Report-to-admin IQ Specs
+// ---------------------------------------------------------------------------
+
+/// One account that reported a message to a group's admins.
+///
+/// The identity attributes are a mixin the server may attach to the same node,
+/// so a `<reporter>` addressed by LID can also carry the reporter's phone
+/// number and username. Both are absent as often as not, and neither is
+/// verified here beyond parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMessageReporter {
+    /// The reporting account, in whatever addressing the response declares.
+    pub jid: Jid,
+    /// When the report was filed, in seconds since the Unix epoch.
+    pub timestamp: u64,
+    /// The reporter's phone-number JID, when the identity mixin carries one.
+    pub phone_number: Option<Jid>,
+    /// The reporter's username, when the identity mixin carries one.
+    pub username: Option<String>,
+}
+
+/// One reported message and everyone who reported it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedGroupMessage {
+    /// The reported message's stanza id. Nothing guarantees this device holds
+    /// the message it names.
+    pub message_id: String,
+    pub reporters: Vec<GroupMessageReporter>,
+}
+
+/// The outstanding reports an admin can see for a group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedGroupMessages {
+    /// The addressing the server used for the JIDs in this response, when it
+    /// declared one.
+    pub addressing_mode: Option<AddressingMode>,
+    pub reports: Vec<ReportedGroupMessage>,
+}
+
+/// Report messages to a group's admins.
+///
+/// Distinct from the `spam` IQ in [`crate::iq::spam_report`], which reports to
+/// WhatsApp: this one stays inside the group and is what the group's own
+/// `allow_admin_reports` property gates (see [`SetAllowAdminReportsIq`]).
+///
+/// ```xml
+/// <iq type="set" xmlns="w:g2" to="{group_jid}">
+///   <reports><report message_id="{id}"/></reports>
+/// </iq>
+/// ```
+///
+/// The server answers an empty result, so nothing here reports which of the
+/// listed ids it accepted. A refusal arrives as an IQ error instead: 403
+/// (`forbidden`) for a group that does not allow admin reports or a sender who
+/// may not report in it, 429 (`rate-overlimit`) for too many reports in
+/// sequence, 404 (`item-not-found`) for an unknown group or message, 423
+/// (`locked`) for a locked group, 400 (`bad-request`) for a malformed list.
+#[derive(Debug, Clone)]
+pub struct ReportGroupMessagesIq {
+    pub group_jid: Jid,
+    pub message_ids: Vec<String>,
+}
+
+impl ReportGroupMessagesIq {
+    pub fn new(group_jid: &Jid, message_ids: &[String]) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+            message_ids: message_ids.to_vec(),
+        }
+    }
+}
+
+impl IqSpec for ReportGroupMessagesIq {
+    type Response = ();
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        let reports = NodeBuilder::new("reports")
+            .children(self.message_ids.iter().map(|id| {
+                NodeBuilder::new("report")
+                    .attr("message_id", id.as_str())
+                    .build()
+            }))
+            .build();
+
+        InfoQuery::set_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![reports])),
+        )
+    }
+
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
+        Ok(())
+    }
+}
+
+/// Fetch the messages already reported to a group's admins.
+///
+/// ```xml
+/// <iq type="get" xmlns="w:g2" to="{group_jid}"><reports/></iq>
+/// ```
+#[derive(Debug, Clone)]
+pub struct GetReportedGroupMessagesIq {
+    pub group_jid: Jid,
+}
+
+impl GetReportedGroupMessagesIq {
+    pub fn new(group_jid: &Jid) -> Self {
+        Self {
+            group_jid: group_jid.clone(),
+        }
+    }
+}
+
+impl IqSpec for GetReportedGroupMessagesIq {
+    type Response = ReportedGroupMessages;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::get_ref(
+            GROUP_IQ_NAMESPACE,
+            &self.group_jid,
+            Some(NodeContent::Nodes(vec![
+                NodeBuilder::new("reports").build(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        let addressing_mode = response
+            .attrs()
+            .optional_string("addressing_mode")
+            .and_then(|s| AddressingMode::try_from(s.as_ref()).ok());
+
+        let reports_node = required_child(response, "reports")?;
+        let mut reports = Vec::new();
+        for report in reports_node.get_children_by_tag("report") {
+            let message_id = required_attr(report, "message_id")?;
+            let mut reporters = Vec::new();
+            for reporter in report.get_children_by_tag("reporter") {
+                let mut attrs = reporter.attrs();
+                let jid = attrs
+                    .optional_jid("jid")
+                    .ok_or_else(|| anyhow!("reporter of {message_id} has no jid"))?;
+                let timestamp = attrs
+                    .optional_u64("timestamp")
+                    .ok_or_else(|| anyhow!("reporter of {message_id} has no timestamp"))?;
+                reporters.push(GroupMessageReporter {
+                    jid,
+                    timestamp,
+                    phone_number: attrs.optional_jid("phone_number"),
+                    username: attrs.optional_string("username").map(|s| s.into_owned()),
+                });
+            }
+            reports.push(ReportedGroupMessage {
+                message_id,
+                reporters,
+            });
+        }
+
+        Ok(ReportedGroupMessages {
+            addressing_mode,
+            reports,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::request::InfoQueryType;
 
+    /// Whether a `w:g2` request is addressed to the group server or to one
+    /// group's own JID, checked against what the whatspec IR resolves for each
+    /// upstream builder.
+    ///
+    /// The IR only started answering this in schema 4: before it, every `w:g2`
+    /// stanza reported the namespace's base target of `s.whatsapp.net`, so a
+    /// request sent to the wrong one of the two looked exactly like a request
+    /// sent to the right one. It now splits them (26 `group_jid`, 6 `g.us`),
+    /// and a mistake here is otherwise silent -- the server ignores the IQ and
+    /// the caller waits out its timeout.
+    ///
+    /// This is a regression lock, not a derivation: the expectations below were
+    /// read off the IR by hand, since the IR is not available at test time.
+    #[test]
+    fn group_requests_are_addressed_the_way_the_ir_resolves_them() {
+        use crate::iq::targets::{self, IqTarget};
+
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let server = Jid::new("", Server::Group);
+
+        // The expectation comes from the generated constants, so a request
+        // upstream moves between the two targets flips the constant on the next
+        // sync and fails here, rather than turning into a silent timeout.
+        let expect = |actual: Jid, want: IqTarget, spec: &str| {
+            let addressed = match want {
+                IqTarget::GroupServer => server.clone(),
+                IqTarget::GroupJid => group.clone(),
+                IqTarget::MainServer => Jid::new("", Server::Pn),
+            };
+            assert_eq!(actual, addressed, "{spec} is addressed to the wrong target");
+        };
+
+        expect(
+            LeaveGroupIq::new(&group).build_iq().to,
+            targets::LEAVE_GROUP,
+            "LeaveGroupIq",
+        );
+        expect(
+            GroupParticipatingIq::new().build_iq().to,
+            targets::GROUP_PARTICIPATING,
+            "GroupParticipatingIq",
+        );
+        expect(
+            BatchGetGroupInfoIq::new(std::slice::from_ref(&group))
+                .build_iq()
+                .to,
+            targets::BATCH_GET_GROUP_INFO,
+            "BatchGetGroupInfoIq",
+        );
+        expect(
+            GetGroupInviteInfoIq::new("ABC123").build_iq().to,
+            targets::GET_GROUP_INVITE_INFO,
+            "GetGroupInviteInfoIq",
+        );
+        expect(
+            GroupQueryIq::new(&group).build_iq().to,
+            targets::GROUP_QUERY,
+            "GroupQueryIq",
+        );
+        expect(
+            SetGroupSubjectIq::new(&group, GroupSubject::new("x").unwrap())
+                .build_iq()
+                .to,
+            targets::SET_GROUP_SUBJECT,
+            "SetGroupSubjectIq",
+        );
+        expect(
+            SetGroupDescriptionIq::new(&group, None, None).build_iq().to,
+            targets::SET_GROUP_DESCRIPTION,
+            "SetGroupDescriptionIq",
+        );
+        expect(
+            SetGroupLockedIq::lock(&group).build_iq().to,
+            targets::SET_GROUP_LOCKED,
+            "SetGroupLockedIq",
+        );
+        expect(
+            ReportGroupMessagesIq::new(&group, &["M1".to_string()])
+                .build_iq()
+                .to,
+            targets::REPORT_GROUP_MESSAGES,
+            "ReportGroupMessagesIq",
+        );
+        expect(
+            GetReportedGroupMessagesIq::new(&group).build_iq().to,
+            targets::GET_REPORTED_GROUP_MESSAGES,
+            "GetReportedGroupMessagesIq",
+        );
+        expect(
+            GetMembershipRequestsIq::new(&group).build_iq().to,
+            targets::GET_MEMBERSHIP_REQUESTS,
+            "GetMembershipRequestsIq",
+        );
+        expect(
+            MembershipRequestActionIq::approve(&group, &[])
+                .build_iq()
+                .to,
+            targets::MEMBERSHIP_REQUEST_ACTION,
+            "MembershipRequestActionIq",
+        );
+
+        // Still hand-asserted: `resetGroupInviteCode` has two entries in
+        // `WAWebGroupInviteJob` resolving to different targets, so the emitter
+        // refuses to pin either. Ours is the `group_jid` overload, the one with
+        // an empty `<invite/>`; the `g.us` overload carries a code and is a call
+        // this repository does not make.
+        assert_eq!(
+            GetGroupInviteLinkIq::new(&group, false).build_iq().to,
+            group
+        );
+        assert_eq!(GetGroupInviteLinkIq::new(&group, true).build_iq().to, group);
+    }
+
+    #[test]
+    fn report_messages_iq_matches_the_group_report_shape() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let iq = ReportGroupMessagesIq::new(&jid, &["MSG-AAA".to_string(), "MSG-BBB".to_string()])
+            .build_iq();
+
+        assert_eq!(iq.namespace, GROUP_IQ_NAMESPACE);
+        assert_eq!(iq.query_type, InfoQueryType::Set);
+        assert_eq!(iq.to, jid, "a group report is addressed to the group");
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].tag, "reports");
+        let Some(NodeContent::Nodes(reports)) = &nodes[0].content else {
+            panic!("expected <report> children");
+        };
+        let ids: Vec<_> = reports
+            .iter()
+            .map(|report| {
+                assert_eq!(report.tag, "report");
+                report.attrs.get("message_id").expect("message_id").as_str()
+            })
+            .collect();
+        assert_eq!(ids, ["MSG-AAA", "MSG-BBB"]);
+    }
+
+    #[test]
+    fn get_reported_messages_iq_is_an_empty_reports_get() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let iq = GetReportedGroupMessagesIq::new(&jid).build_iq();
+
+        assert_eq!(iq.namespace, GROUP_IQ_NAMESPACE);
+        assert_eq!(iq.query_type, InfoQueryType::Get);
+        assert_eq!(iq.to, jid);
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].tag, "reports");
+        assert!(nodes[0].content.is_none(), "the get carries no children");
+    }
+
+    #[test]
+    fn reported_messages_response_parses_repeats_and_the_identity_mixin() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let spec = GetReportedGroupMessagesIq::new(&jid);
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("addressing_mode", "lid")
+            .children([NodeBuilder::new("reports")
+                .children([
+                    NodeBuilder::new("report")
+                        .attr("message_id", "MSG-AAA")
+                        .children([
+                            NodeBuilder::new("reporter")
+                                .attr("jid", "100000000000001@lid")
+                                .attr("timestamp", "1777415965")
+                                .attr("phone_number", "559980000001@s.whatsapp.net")
+                                .attr("username", "reporter.one")
+                                .build(),
+                            NodeBuilder::new("reporter")
+                                .attr("jid", "100000000000002@lid")
+                                .attr("timestamp", "1777415999")
+                                .build(),
+                        ])
+                        .build(),
+                    NodeBuilder::new("report")
+                        .attr("message_id", "MSG-BBB")
+                        .children([NodeBuilder::new("reporter")
+                            .attr("jid", "100000000000003@lid")
+                            .attr("timestamp", "1777416100")
+                            .build()])
+                        .build(),
+                ])
+                .build()])
+            .build();
+
+        let parsed = spec
+            .parse_response(&response.as_node_ref())
+            .expect("a well-formed reports response should parse");
+
+        assert_eq!(parsed.addressing_mode, Some(AddressingMode::Lid));
+        assert_eq!(parsed.reports.len(), 2);
+        assert_eq!(parsed.reports[0].message_id, "MSG-AAA");
+        assert_eq!(parsed.reports[0].reporters.len(), 2);
+
+        let first = &parsed.reports[0].reporters[0];
+        assert_eq!(first.jid.user, "100000000000001");
+        assert_eq!(first.timestamp, 1_777_415_965);
+        assert_eq!(
+            first.phone_number.as_ref().map(|pn| pn.user.as_str()),
+            Some("559980000001"),
+            "the identity mixin is the LID to PN mapping this response carries"
+        );
+        assert_eq!(first.username.as_deref(), Some("reporter.one"));
+
+        let second = &parsed.reports[0].reporters[1];
+        assert_eq!(second.phone_number, None);
+        assert_eq!(second.username, None);
+
+        assert_eq!(parsed.reports[1].message_id, "MSG-BBB");
+        assert_eq!(parsed.reports[1].reporters.len(), 1);
+    }
+
+    #[test]
+    fn reported_messages_response_without_reports_is_rejected() {
+        let jid: Jid = "120363000000000001@g.us".parse().unwrap();
+        let spec = GetReportedGroupMessagesIq::new(&jid);
+        let response = NodeBuilder::new("iq").attr("type", "result").build();
+        assert!(spec.parse_response(&response.as_node_ref()).is_err());
+    }
+
     #[test]
     fn group_query_iq_with_phash_emits_attr() {
         let jid: Jid = "120363000000000001@g.us".parse().unwrap();
-        let iq = GroupQueryIq::with_phash(&jid, Some("2:abc123".to_string())).build_iq();
+        let iq = GroupQueryIq::with_phash(&jid, Some(CompactString::from("2:abc123"))).build_iq();
         let Some(NodeContent::Nodes(nodes)) = &iq.content else {
             panic!("expected NodeContent::Nodes");
         };

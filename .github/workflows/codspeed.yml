@@ -34,6 +34,12 @@ jobs:
   benchmarks:
     name: Run CodSpeed benchmarks (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
+    # The slowest shard finishes in ~13min. The cap exists because the CodSpeed
+    # runner shells out to apt with no timeout of its own, so a stalled archive
+    # leaves the job producing no output until the GitHub default of 6h -- which
+    # is what happened on 2026-08-18, when shards ran for two hours without
+    # executing a single benchmark.
+    timeout-minutes: 25
     strategy:
       # One shard failing must not cancel the other: CodSpeed merges shards
       # into a single run, and a cancelled shard leaves it incomplete.
@@ -43,10 +49,32 @@ jobs:
       # (codspeed.io/docs -> sharded-benchmarks).
       matrix:
         shard:
+          # `features` is required here, not optional: `voip_benchmark` and
+          # `sframe_varint_benchmark` carry `required-features`, and a bench
+          # target whose required features are off is SILENTLY SKIPPED by cargo
+          # rather than erroring. Without this the entire VoIP media plane --
+          # MLow encode/decode, E2E-SRTP, SFrame, the codec stage rows -- built
+          # nowhere and uploaded nothing, so none of it was regression-gated.
           - name: core
             packages: -p wacore -p wacore-noise
+            features: --features voip-mlow,bench-internals
           - name: proto-signal
             packages: -p wacore-binary -p wacore-libsignal -p wacore-appstate
+          # The client crate's own benchmarks. Its fixture needs crate-private
+          # internals a bench target cannot otherwise reach, so it builds with
+          # the non-default `bench-harness` feature. Its own shard rather than a
+          # third package on an existing one: it is the only shard that compiles
+          # the full client dependency tree (Diesel/SQLite, rustls, tokio), so
+          # folding it in would serialize that build behind benchmarks that do
+          # not need it. Unlike `integration-benchmarks` below it needs no mock
+          # server — the fixture drives the send path over a sink transport.
+          # `features` is separate from `packages` because only
+          # `cargo codspeed build` accepts it — `cargo codspeed run` rejects
+          # `--features` outright ("unexpected argument"), since by then the
+          # benchmark binaries are already built and it only selects among them.
+          - name: client
+            packages: -p whatsapp-rust
+            features: --features bench-harness
     steps:
       - uses: actions/checkout@v6
         with:
@@ -55,6 +83,98 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
+
+      # The CodSpeed runner installs its patched valgrind with a bare
+      # `apt-get update && apt-get install`, and it buffers that command's
+      # output, printing it only on failure -- so a stalled mirror or a held
+      # dpkg lock reads as a step that emits nothing and never returns. Two
+      # things follow from that, and the steps below do both.
+      #
+      # Bound apt globally: the config file applies to the runner's own
+      # invocation too, turning an unbounded wait into a bounded failure.
+      #
+      # Pre-install libc6-dbg: the runner's instrument cache restores valgrind's
+      # *files*, but its readiness check also runs `dpkg -s libc6-dbg`, which a
+      # file-level restore never satisfies, so every job fell through to a full
+      # network install. Having the package installed for real is what lets that
+      # check pass and the cached valgrind be used without touching apt at all.
+      #
+      # The budgets nest, and the order matters: apt's own limits are meant to
+      # fire first and `timeout` is only the backstop for the case they cannot
+      # see, which is a transfer that keeps trickling bytes. The step is not
+      # fatal -- if it gives up, the runner installs the package itself, now
+      # bounded by the same config, which is slow but still runs the benchmarks.
+      #
+      # `apt-get update` is the part that actually stalls: it fetches every
+      # index of every source, and on 2026-08-18 it repeatedly blew a 180s
+      # budget while the install that followed took 15s. So it is the last
+      # resort here, not the first move. The cached .deb comes first, then the
+      # image's own package lists, and only a miss on both refreshes them.
+      - name: Key the libc6-dbg cache on the installed libc6
+        id: libc6
+        run: echo "version=$(dpkg-query -W -f='${Version}' libc6)" >> "$GITHUB_OUTPUT"
+
+      # libc6-dbg must match libc6 exactly, so the installed libc6 version is
+      # the cache key: it hits while the package is valid and misses the moment
+      # the runner image bumps glibc.
+      - name: Cache the libc6-dbg package
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/libc6-dbg
+          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
+
+      - name: Bound apt and pre-install libc6-dbg
+        env:
+          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
+        run: |
+          sudo tee /etc/apt/apt.conf.d/99-ci-bounds > /dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          DPkg::Lock::Timeout "60";
+          APT::Keep-Downloaded-Packages "true";
+          EOF
+          cache="$HOME/.cache/libc6-dbg"
+          mkdir -p "$cache"
+          if sudo dpkg -i "$cache"/*.deb 2>/dev/null; then
+            echo "installed from the cached package, no network"
+            exit 0
+          fi
+          save_deb() {
+            sudo cp /var/cache/apt/archives/libc6-dbg_*.deb "$cache"/ 2>/dev/null || true
+          }
+          # Pinned, because libc6-dbg carries `Depends: libc6 (= <version>)`:
+          # an unpinned install of a newer build pulls a libc6 upgrade with it,
+          # swapping the C library out from under benchmarks whose malloc
+          # tunables this workflow freezes for exactly that kind of stability.
+          # It would also cache a package the key, taken before the upgrade, no
+          # longer describes.
+          pinned="libc6-dbg=$LIBC6_VERSION"
+          if sudo timeout 120 apt-get install -y "$pinned"; then
+            save_deb
+            exit 0
+          fi
+          # `-q` and not `-qq`: if this ever stalls again, the per-source Get:
+          # lines are what identify which mirror is responsible.
+          for attempt in 1 2; do
+            if sudo timeout 180 apt-get update -q \
+              && sudo timeout 120 apt-get install -y "$pinned"; then
+              save_deb
+              exit 0
+            fi
+            echo "apt attempt $attempt failed"
+            sleep 15
+          done
+          # The pin is gone from the pool: the archive moved past the runner
+          # image and dropped the older build. Take the newer package anyway --
+          # the runner would install exactly the same thing, only after a
+          # multi-minute apt of its own -- but leave it out of the cache, where
+          # it would sit under a key it does not match and never install again.
+          if sudo timeout 120 apt-get install -y libc6-dbg; then
+            echo "::warning::installed a libc6-dbg newer than the image's libc6; not cached"
+            exit 0
+          fi
+          echo "::warning::libc6-dbg pre-install gave up; the runner installs it itself"
 
       - name: Install tools (protoc, cargo-codspeed)
         uses: taiki-e/install-action@v2
@@ -72,14 +192,21 @@ jobs:
       - name: Build the benchmark targets
         env:
           SHARD_PACKAGES: ${{ matrix.shard.packages }}
+          SHARD_FEATURES: ${{ matrix.shard.features }}
         run: >
           cargo codspeed build -m simulation -m memory
-          $SHARD_PACKAGES
+          $SHARD_PACKAGES $SHARD_FEATURES
 
       # Both instruments run serially in a single invocation so each
       # benchmark uploads as one run carrying CPU and memory metrics.
+      #
+      # v5 weights each instruction by its estimated cycle cost rather than
+      # charging every instruction the same, so the simulation metric changes
+      # scale: expect a one-time step across every series at the first run on
+      # this action, and read the PR right after the bump against the new
+      # baseline, not the old one. `cycle-estimation: false` reverts it.
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+        uses: CodSpeedHQ/action@v5
         env:
           SHARD_PACKAGES: ${{ matrix.shard.packages }}
         with:
@@ -130,6 +257,98 @@ jobs:
         with:
           toolchain: nightly-2026-06-16
 
+      # The CodSpeed runner installs its patched valgrind with a bare
+      # `apt-get update && apt-get install`, and it buffers that command's
+      # output, printing it only on failure -- so a stalled mirror or a held
+      # dpkg lock reads as a step that emits nothing and never returns. Two
+      # things follow from that, and the steps below do both.
+      #
+      # Bound apt globally: the config file applies to the runner's own
+      # invocation too, turning an unbounded wait into a bounded failure.
+      #
+      # Pre-install libc6-dbg: the runner's instrument cache restores valgrind's
+      # *files*, but its readiness check also runs `dpkg -s libc6-dbg`, which a
+      # file-level restore never satisfies, so every job fell through to a full
+      # network install. Having the package installed for real is what lets that
+      # check pass and the cached valgrind be used without touching apt at all.
+      #
+      # The budgets nest, and the order matters: apt's own limits are meant to
+      # fire first and `timeout` is only the backstop for the case they cannot
+      # see, which is a transfer that keeps trickling bytes. The step is not
+      # fatal -- if it gives up, the runner installs the package itself, now
+      # bounded by the same config, which is slow but still runs the benchmarks.
+      #
+      # `apt-get update` is the part that actually stalls: it fetches every
+      # index of every source, and on 2026-08-18 it repeatedly blew a 180s
+      # budget while the install that followed took 15s. So it is the last
+      # resort here, not the first move. The cached .deb comes first, then the
+      # image's own package lists, and only a miss on both refreshes them.
+      - name: Key the libc6-dbg cache on the installed libc6
+        id: libc6
+        run: echo "version=$(dpkg-query -W -f='${Version}' libc6)" >> "$GITHUB_OUTPUT"
+
+      # libc6-dbg must match libc6 exactly, so the installed libc6 version is
+      # the cache key: it hits while the package is valid and misses the moment
+      # the runner image bumps glibc.
+      - name: Cache the libc6-dbg package
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/libc6-dbg
+          key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
+
+      - name: Bound apt and pre-install libc6-dbg
+        env:
+          LIBC6_VERSION: ${{ steps.libc6.outputs.version }}
+        run: |
+          sudo tee /etc/apt/apt.conf.d/99-ci-bounds > /dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          DPkg::Lock::Timeout "60";
+          APT::Keep-Downloaded-Packages "true";
+          EOF
+          cache="$HOME/.cache/libc6-dbg"
+          mkdir -p "$cache"
+          if sudo dpkg -i "$cache"/*.deb 2>/dev/null; then
+            echo "installed from the cached package, no network"
+            exit 0
+          fi
+          save_deb() {
+            sudo cp /var/cache/apt/archives/libc6-dbg_*.deb "$cache"/ 2>/dev/null || true
+          }
+          # Pinned, because libc6-dbg carries `Depends: libc6 (= <version>)`:
+          # an unpinned install of a newer build pulls a libc6 upgrade with it,
+          # swapping the C library out from under benchmarks whose malloc
+          # tunables this workflow freezes for exactly that kind of stability.
+          # It would also cache a package the key, taken before the upgrade, no
+          # longer describes.
+          pinned="libc6-dbg=$LIBC6_VERSION"
+          if sudo timeout 120 apt-get install -y "$pinned"; then
+            save_deb
+            exit 0
+          fi
+          # `-q` and not `-qq`: if this ever stalls again, the per-source Get:
+          # lines are what identify which mirror is responsible.
+          for attempt in 1 2; do
+            if sudo timeout 180 apt-get update -q \
+              && sudo timeout 120 apt-get install -y "$pinned"; then
+              save_deb
+              exit 0
+            fi
+            echo "apt attempt $attempt failed"
+            sleep 15
+          done
+          # The pin is gone from the pool: the archive moved past the runner
+          # image and dropped the older build. Take the newer package anyway --
+          # the runner would install exactly the same thing, only after a
+          # multi-minute apt of its own -- but leave it out of the cache, where
+          # it would sit under a key it does not match and never install again.
+          if sudo timeout 120 apt-get install -y libc6-dbg; then
+            echo "::warning::installed a libc6-dbg newer than the image's libc6; not cached"
+            exit 0
+          fi
+          echo "::warning::libc6-dbg pre-install gave up; the runner installs it itself"
+
       - name: Install tools (protoc, cargo-codspeed)
         uses: taiki-e/install-action@v2
         with:
@@ -169,7 +388,7 @@ jobs:
       # workspace default-member, so a bare `cargo codspeed run` discovers no
       # benchmarks for it ("No benchmarks found for the simulation mode").
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+        uses: CodSpeedHQ/action@v5
         env:
           MOCK_SERVER_URL: "wss://127.0.0.1:8080/ws/chat"
           RUST_LOG: warn

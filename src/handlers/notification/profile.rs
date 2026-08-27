@@ -127,7 +127,7 @@ pub(crate) fn handle_status_notification(client: &Arc<Client>, node: &NodeRef<'_
     let timestamp = notification_timestamp(node);
 
     if let Some(set_node) = node.get_optional_child("set") {
-        let status_text = match set_node.content.as_deref() {
+        let status_text = match set_node.content.as_ref() {
             Some(NodeContentRef::String(s)) => s.to_string(),
             Some(NodeContentRef::Bytes(b)) => String::from_utf8_lossy(b.as_ref()).into_owned(),
             _ => String::new(),

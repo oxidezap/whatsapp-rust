@@ -35,6 +35,7 @@ use crate::client::CallError;
 use crate::client::Client;
 
 use super::traits::StanzaHandler;
+use wacore::stanza::wire_tags::StanzaTag;
 
 /// Router sends the generic `<ack>` via `should_ack`, so this handler only
 /// parses and dispatches. On `Offer` it also emits the `<receipt><offer/></receipt>`
@@ -46,7 +47,7 @@ pub struct CallHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for CallHandler {
     fn tag(&self) -> &'static str {
-        "call"
+        StanzaTag::Call.as_str()
     }
 
     #[cfg_attr(
@@ -380,6 +381,17 @@ impl StanzaHandler for CallHandler {
                         client
                             .call_registry()
                             .send_rekey(call.action.call_id(), sender.to_string());
+                        if let Some(generation) =
+                            client.call_registry().generation_of(call.action.call_id())
+                        {
+                            announce_orientation_on_accept(
+                                &client,
+                                call.action.call_id(),
+                                generation,
+                                &sender,
+                            )
+                            .await;
+                        }
                     }
                     // Caller-side multi-device dismiss: when one of the callee's devices accepts or
                     // rejects an outbound call of ours, tell the rest to stop ringing.
@@ -849,7 +861,14 @@ impl StanzaHandler for CallHandler {
                                             call_creator: call.action.call_creator(),
                                             state: VideoState::UpgradeAccept,
                                             dec: Some("H264,AV1"),
-                                            device_orientation: Some(0),
+                                            // Ours, not the peer's: accepting an
+                                            // upgrade announces a direction, so it
+                                            // carries the rotation the app set.
+                                            device_orientation: Some(
+                                                registry
+                                                    .local_video_orientation(call_id, generation)
+                                                    .unwrap_or(0),
+                                            ),
                                         });
                                         if let Err(e) = client.send_node(accept).await {
                                             warn!(
@@ -866,7 +885,11 @@ impl StanzaHandler for CallHandler {
                                             call_creator: call.action.call_creator(),
                                             state: VideoState::Enabled,
                                             dec: Some("H264"),
-                                            device_orientation: Some(0),
+                                            device_orientation: Some(
+                                                registry
+                                                    .local_video_orientation(call_id, generation)
+                                                    .unwrap_or(0),
+                                            ),
                                         });
                                         if let Err(e) = client.send_node(enabled).await {
                                             warn!(
@@ -975,6 +998,53 @@ async fn apply_current_group_control(client: &Client, call: &IncomingCall) -> bo
         return false;
     }
     apply_group_control(client, call, generation).await
+}
+
+#[cfg(feature = "voip-runtime")]
+/// Announce a rotation the app set while the call was still ringing.
+///
+/// A video-from-start offer carries `device_orientation="0"`, and its caller
+/// sends no further `<video>` of its own, so a rotation set between `start()`
+/// and the answer would never reach the peer: while ringing there is no call
+/// entry on their side to apply one against. Upright needs no stanza — that is
+/// what the offer already said.
+#[cfg(feature = "voip-runtime")]
+async fn announce_orientation_on_accept(
+    client: &Arc<Client>,
+    call_id: &str,
+    generation: u64,
+    to: &Jid,
+) {
+    let registry = client.call_registry();
+    let orientation = registry
+        .local_video_orientation(call_id, generation)
+        .unwrap_or(0);
+    if orientation == 0 {
+        return;
+    }
+    let sending_video = registry
+        .video_states(call_id, generation)
+        .is_some_and(|(self_state, _)| self_state == VideoState::Enabled);
+    if !sending_video {
+        return;
+    }
+    let Some(session) = registry.snapshot_if_current(call_id, generation) else {
+        return;
+    };
+    let stanza = build_video_state(&VideoStateParams {
+        call_id,
+        // The device that answered, not `call_creator`: on an outgoing call that
+        // is our own LID, and the stanza would come straight back to us.
+        to,
+        id: &client.generate_request_id(),
+        call_creator: &session.call_creator,
+        state: VideoState::Enabled,
+        dec: Some("H264"),
+        device_orientation: Some(orientation),
+    });
+    if let Err(e) = client.send_node(stanza).await {
+        warn!("call: failed to announce video orientation after accept: {e}");
+    }
 }
 
 #[cfg(feature = "voip-runtime")]
@@ -2600,7 +2670,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
         (client, sends)
     }
 
@@ -2640,7 +2710,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
         (client, started_rx, release_tx)
     }
 
@@ -2986,6 +3056,75 @@ mod tests {
         client
             .call_registry()
             .remove_if_current("CALL-ID-0001", generation);
+    }
+
+    #[cfg(feature = "voip-runtime")]
+    /// A rotation set while the call was ringing has to reach the device that
+    /// answered. `call_creator` is our own LID on an outgoing call, so a stanza
+    /// addressed there comes straight back to us and the callee stays upright.
+    #[cfg(feature = "voip-runtime")]
+    #[tokio::test]
+    async fn the_deferred_orientation_goes_to_the_device_that_answered() {
+        let client = make_sending_client().await;
+        let (_event_rx, generation) = register_native_opus_call(&client, Vec::new());
+        assert!(
+            client
+                .call_registry()
+                .set_is_video("CALL-ID-0001", generation, true)
+        );
+        assert!(
+            client
+                .call_registry()
+                .set_local_video_orientation("CALL-ID-0001", generation, 3)
+        );
+
+        let answering_device = fake_caller_lid().with_device(4);
+        let accept = NodeBuilder::new("call")
+            .attr("from", Jid::new("CALL-ID-0001", Server::Call))
+            .attr("participant", answering_device.clone())
+            .attr("id", "STANZA-ID-ORIENTATION-ACCEPT")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("accept")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CALL-ID-0001")
+                .children([NodeBuilder::new("audio")
+                    .attr("enc", "opus")
+                    .attr("rate", "16000")
+                    .build()])
+                .build()])
+            .build();
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(client.clone(), node_to_owned_ref(&accept), &mut cancelled)
+                .await
+        );
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("the deferred rotation must be announced on accept")
+            .expect("waiter");
+
+        let r = sent.as_node_ref();
+        assert_eq!(
+            r.attrs().optional_string("to").as_deref(),
+            Some(answering_device.to_string().as_str()),
+            "the rotation must be addressed to the device that answered"
+        );
+        let action = r
+            .children()
+            .into_iter()
+            .flatten()
+            .find(|child| child.tag == "video")
+            .expect("a <video> carrying the rotation");
+        assert_eq!(
+            action
+                .attrs()
+                .optional_string("device_orientation")
+                .as_deref(),
+            Some("3")
+        );
     }
 
     #[cfg(feature = "voip-runtime")]
@@ -3883,7 +4022,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
 
         let node = node_to_owned_ref(&offer_stanza());
         let mut cancelled = false;
@@ -4594,7 +4733,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
 
         let (handler, rx) = ChannelEventHandler::new();
         client.subscribe_handler(handler).detach();

@@ -3,6 +3,7 @@ use crate::client::{ChatLane, Client, QueuedChatMessage};
 use async_trait::async_trait;
 use log::warn;
 use std::sync::Arc;
+use wacore::stanza::wire_tags::StanzaTag;
 
 /// WA Web: `WAWebMessageQueue` uses `promiseTimeout(r(), 2e4)` per queued handler.
 const MAX_MESSAGE_DELAY_MS: u64 = 20_000;
@@ -59,7 +60,7 @@ impl MessageHandler {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for MessageHandler {
     fn tag(&self) -> &'static str {
-        "message"
+        StanzaTag::Message.as_str()
     }
 
     async fn handle(

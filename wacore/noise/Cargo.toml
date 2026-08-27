@@ -1,6 +1,6 @@
 [package]
 name = "wacore-noise"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
@@ -35,7 +35,6 @@ waproto = { workspace = true }
 
 [dev-dependencies]
 divan = { workspace = true }
-waproto = { workspace = true }
 
 [[bench]]
 name = "noise_benchmark"

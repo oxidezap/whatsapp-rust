@@ -1,6 +1,6 @@
 use crate::client::Client;
 use crate::features::mex::{MexError, mex_request};
-use crate::request::IqError;
+use crate::request::{IqError, RejectionStanza};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,13 +13,14 @@ pub use wacore::iq::contacts::SetProfilePictureResponse;
 use wacore::iq::groups::{
     AcceptGroupInviteIq, AcceptGroupInviteV4Iq, AcknowledgeGroupIq, AddParticipantsIq,
     BatchGetGroupInfoIq, CancelMembershipRequestsIq, DemoteParticipantsIq, GetGroupInviteInfoIq,
-    GetGroupInviteLinkIq, GetGroupProfilePicturesIq, GetMembershipRequestsIq, GroupCreateIq,
-    GroupInfoOutcome, GroupInfoResponse, GroupParticipantResponse, GroupParticipatingIq,
-    GroupQueryIq, LeaveGroupIq, MembershipRequestActionIq, PromoteParticipantsIq,
-    RemoveParticipantsIncludingLinkedGroupsIq, RemoveParticipantsIq, RevokeRequestCodeIq,
-    SetAllowAdminReportsIq, SetGroupAnnouncementIq, SetGroupDescriptionIq, SetGroupEphemeralIq,
-    SetGroupHistoryIq, SetGroupLockedIq, SetGroupMembershipApprovalIq, SetGroupSubjectIq,
-    SetMemberAddModeIq, SetNoFrequentlyForwardedIq, normalize_participants,
+    GetGroupInviteLinkIq, GetGroupProfilePicturesIq, GetMembershipRequestsIq,
+    GetReportedGroupMessagesIq, GroupCreateIq, GroupInfoOutcome, GroupInfoResponse,
+    GroupParticipantResponse, GroupParticipatingIq, GroupQueryIq, LeaveGroupIq,
+    MembershipRequestActionIq, PromoteParticipantsIq, RemoveParticipantsIncludingLinkedGroupsIq,
+    RemoveParticipantsIq, ReportGroupMessagesIq, RevokeRequestCodeIq, SetAllowAdminReportsIq,
+    SetGroupAnnouncementIq, SetGroupDescriptionIq, SetGroupEphemeralIq, SetGroupHistoryIq,
+    SetGroupLockedIq, SetGroupMembershipApprovalIq, SetGroupSubjectIq, SetMemberAddModeIq,
+    SetNoFrequentlyForwardedIq, normalize_participants,
 };
 use wacore::iq::mex_operations::update_group_property;
 use wacore::types::message::AddressingMode;
@@ -28,10 +29,11 @@ use wacore_binary::{Jid, JidExt as _};
 use wacore::iq::groups::BatchGroupInfoResult as RawBatchResult;
 pub use wacore::iq::groups::{
     GroupAppealStatus, GroupCreateOptions, GroupDescription, GroupEphemeralSettings,
-    GroupJoinError, GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture,
-    GroupSubject, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
-    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
-    ParticipantType, PictureType,
+    GroupJoinError, GroupMessageReporter, GroupParticipantDetails, GroupParticipantOptions,
+    GroupProfilePicture, GroupSubject, GrowthLockInfo, InviteInfoError, JoinGroupResult,
+    MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
+    MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
+    ReportedGroupMessage, ReportedGroupMessages,
 };
 
 /// Error returned by group operations (metadata queries, participant and
@@ -338,6 +340,297 @@ pub struct Groups<'a> {
     client: &'a Client,
 }
 
+/// Metadata queries in flight, so a burst of callers for one group shares a
+/// single round trip instead of sending one query each.
+///
+/// Only [`Groups::get_metadata`] needs this: every other read goes through the
+/// group cache, whose cold path is already serialized by the per-group lock.
+#[derive(Default)]
+pub(crate) struct GroupMetadataRegistry {
+    inflight: std::sync::Mutex<HashMap<Jid, Arc<MetadataFlight>>>,
+}
+
+/// The server refusal behind a group error, if that is what it was.
+///
+/// Matched on the variant rather than read through `server_rejection`, because
+/// a waiter has to rebuild the error, not just inspect it.
+fn server_refusal(error: &GroupError) -> Option<ServerRefusal> {
+    let GroupError::Iq(IqError::ServerError {
+        code,
+        text,
+        error_type,
+        backoff,
+        response,
+    }) = error
+    else {
+        return None;
+    };
+    Some(ServerRefusal {
+        code: *code,
+        text: text.clone(),
+        error_type: error_type.clone(),
+        backoff: *backoff,
+        response: response.clone(),
+    })
+}
+
+/// What one flight produced, for the callers that joined it.
+///
+/// Shared by refcount: a waiter clones the pointer while holding the flight's
+/// lock and the payload after releasing it. Cloning a group's participants
+/// under a `std::sync::Mutex` would serialize the waiters and block runtime
+/// threads while it happened.
+enum FlightOutcome {
+    Answered(Box<GroupMetadata>),
+    /// The server refused. Re-asking during a rate limit is what the refusal is
+    /// telling us not to do, so waiters report it instead of querying again.
+    Refused(ServerRefusal),
+    /// The query ran and failed for a local reason — a timeout, a dropped
+    /// socket. Still an answer: the leader asked and got nowhere, so a waiter
+    /// taking its own turn would only wait out the same failure again. Twenty
+    /// callers behind one IQ black hole would otherwise serialize into twenty
+    /// timeouts.
+    Failed {
+        kind: FailureKind,
+        message: String,
+    },
+}
+
+/// What a waiter needs to know about a failure it did not run.
+///
+/// The classification rather than the error: `GroupError` is not `Clone`, and
+/// what a caller acts on is whether the request timed out or the transport is
+/// gone — the two questions `ErrorChainExt` asks of it. Rebuilding the
+/// canonical variant of each class keeps `is_timeout` and
+/// `is_transport_unavailable` answering the same for a waiter as for the
+/// leader, and with them the `GroupError` to `SendError` mapping.
+#[derive(Clone, Copy)]
+enum FailureKind {
+    TimedOut,
+    TransportUnavailable,
+    Other,
+}
+
+impl FailureKind {
+    fn of(error: &GroupError) -> Self {
+        use crate::error::ErrorChainExt;
+        if error.is_timeout() {
+            Self::TimedOut
+        } else if error.is_transport_unavailable() {
+            Self::TransportUnavailable
+        } else {
+            Self::Other
+        }
+    }
+
+    fn into_error(self, message: &str) -> GroupError {
+        match self {
+            Self::TimedOut => GroupError::Iq(IqError::Timeout),
+            Self::TransportUnavailable => GroupError::Iq(IqError::NotConnected),
+            Self::Other => GroupError::Internal(anyhow::anyhow!(
+                "group query failed on a shared attempt: {message}"
+            )),
+        }
+    }
+}
+
+/// A server refusal, kept whole enough for a waiter to rebuild the error.
+///
+/// Everything the leader's error carried, so `ErrorChainExt::server_rejection`
+/// answers the same for a waiter — including the `backoff` a caller needs to
+/// honour the delay the server asked for.
+#[derive(Clone)]
+struct ServerRefusal {
+    code: u16,
+    text: String,
+    error_type: Option<String>,
+    backoff: Option<u32>,
+    response: RejectionStanza,
+}
+
+impl ServerRefusal {
+    fn into_error(self) -> GroupError {
+        GroupError::Iq(IqError::ServerError {
+            code: self.code,
+            text: self.text,
+            error_type: self.error_type,
+            backoff: self.backoff,
+            response: self.response,
+        })
+    }
+}
+
+/// The shared side of one in-flight query.
+struct MetadataFlight {
+    /// Callers admitted to this flight, counted under the registry lock.
+    ///
+    /// Admissions only: a waiter that is cancelled before the leader finishes
+    /// stays counted, so the leader can publish an answer nobody reads. That
+    /// costs one clone in a case where the alternative — a drop guard on the
+    /// waiter side — adds another ordering-sensitive path to a structure whose
+    /// bugs have all been ordering bugs.
+    waiters: std::sync::atomic::AtomicUsize,
+    /// Set by the leader before it releases. Absent means the leader produced
+    /// nothing a waiter can act on, so a waiter asks for itself.
+    result: std::sync::Mutex<Option<Arc<FlightOutcome>>>,
+    /// Closes when the leader's lease drops — on success, on failure, and on a
+    /// cancelled or panicking leader alike.
+    released: async_channel::Receiver<std::convert::Infallible>,
+}
+
+impl MetadataFlight {
+    /// Wait for the leader to release, and read what it produced.
+    ///
+    /// Returns the outcome behind its refcount: the caller derives its own copy
+    /// after this returns, with no lock held.
+    async fn wait(&self) -> Option<Arc<FlightOutcome>> {
+        let _ = self.released.recv().await;
+        self.result().clone()
+    }
+
+    fn result(&self) -> std::sync::MutexGuard<'_, Option<Arc<FlightOutcome>>> {
+        self.result
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+/// What a caller got from [`GroupMetadataRegistry::claim`].
+enum MetadataClaim {
+    /// This caller runs the query.
+    Leader(MetadataLease),
+    /// Someone else is running it; wait on their flight.
+    Joined(Arc<MetadataFlight>),
+}
+
+/// The leader's side. Dropping it releases every waiter.
+pub(crate) struct MetadataLease {
+    registry: Arc<GroupMetadataRegistry>,
+    jid: Jid,
+    flight: Arc<MetadataFlight>,
+    _release: async_channel::Sender<std::convert::Infallible>,
+}
+
+impl MetadataLease {
+    /// Close this flight to new joiners and, if anyone is waiting, publish what
+    /// the round trip produced.
+    ///
+    /// Closing and deciding are atomic: a caller admitted after the leader
+    /// decided nobody was waiting would find the flight closed and empty, and
+    /// query again on the strength of a round trip that had just succeeded.
+    ///
+    /// `outcome` is only called when someone is actually waiting, so the
+    /// uncontended call — which is most of them — never copies a group's
+    /// participants just to drop the copy.
+    fn finish(&self, outcome: impl FnOnce() -> FlightOutcome) {
+        let publish = {
+            let mut inflight = self.registry.map();
+            // Retired first, so nobody else can join; the count read after it,
+            // still under the lock, therefore covers everyone who could.
+            Self::retire(&mut inflight, &self.jid, &self.flight);
+            self.flight
+                .waiters
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+        };
+
+        // Built after the lock is released. The clone is a whole participant
+        // list — up to `GROUP_INFO_PARTICIPANT_LIMIT` of them — and the registry
+        // lock is shared by every group, so holding it across that would stall
+        // claims for unrelated groups and `memory_report()` with them.
+        //
+        // Safe to publish here because a waiter reads only once the flight is
+        // released, which is this lease being dropped, after this returns.
+        if publish {
+            *self.flight.result() = Some(Arc::new(outcome()));
+        }
+    }
+
+    /// Remove this flight, but only where the registered one is still ours: the
+    /// entry may already belong to a later caller.
+    fn retire(
+        inflight: &mut HashMap<Jid, Arc<MetadataFlight>>,
+        jid: &Jid,
+        flight: &Arc<MetadataFlight>,
+    ) {
+        if let std::collections::hash_map::Entry::Occupied(entry) = inflight.entry(jid.clone())
+            && Arc::ptr_eq(entry.get(), flight)
+        {
+            entry.remove();
+        }
+    }
+}
+
+impl Drop for MetadataLease {
+    fn drop(&mut self) {
+        // Idempotent: a leader that reached `finish` is already gone from the
+        // map, and one that died never got there.
+        let mut inflight = self.registry.map();
+        Self::retire(&mut inflight, &self.jid, &self.flight);
+    }
+}
+
+impl GroupMetadataRegistry {
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<Jid, Arc<MetadataFlight>>> {
+        // Nothing in these critical sections can unwind, so honouring poison
+        // would strand a group with no way to ever query it again.
+        self.inflight
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Callers admitted to this group's flight, if one is in flight.
+    ///
+    /// Exposed so a test can wait for a joiner to be registered instead of
+    /// yielding a fixed number of times and hoping: a joiner that had not
+    /// claimed yet would become a leader, and the test would be asserting the
+    /// scheduler.
+    #[cfg(test)]
+    pub(crate) fn waiters_for(&self, jid: &Jid) -> Option<usize> {
+        self.map()
+            .get(jid)
+            .map(|flight| flight.waiters.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Number of groups currently being queried. Reported by `memory_report()`;
+    /// normally zero.
+    pub(crate) fn len(&self) -> usize {
+        self.map().len()
+    }
+
+    /// Become the caller that queries this group, or join the one that already
+    /// is.
+    ///
+    /// Returns the flight itself rather than a bare "someone else has it", so
+    /// there is no second lookup for the leader to finish and vanish between.
+    /// Synchronous, so two callers cannot both come away as leader.
+    fn claim(self: &Arc<Self>, jid: &Jid) -> MetadataClaim {
+        let mut inflight = self.map();
+        if let Some(flight) = inflight.get(jid) {
+            // Counted under the registry lock, which is the same one the leader
+            // publishes under — so a caller either lands before the leader
+            // decides, and is seen, or cannot land at all.
+            flight
+                .waiters
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            return MetadataClaim::Joined(flight.clone());
+        }
+        let (release, released) = async_channel::bounded(1);
+        let flight = Arc::new(MetadataFlight {
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+            result: std::sync::Mutex::new(None),
+            released,
+        });
+        inflight.insert(jid.clone(), flight.clone());
+        MetadataClaim::Leader(MetadataLease {
+            registry: self.clone(),
+            jid: jid.clone(),
+            flight,
+            _release: release,
+        })
+    }
+}
+
 /// Serializes one group's metadata publication with participant mutations and
 /// sender-key distribution, reusing the client's existing per-group lane.
 /// Keeping the guard in the type prevents persistence and cache publication
@@ -350,13 +643,12 @@ pub(crate) struct GroupMetadataGuard<'a> {
 
 impl GroupMetadataGuard<'_> {
     pub(crate) async fn current(&self) -> Option<Arc<GroupInfo>> {
-        self.client.get_group_cache().await.get(self.jid).await
+        self.client.get_group_cache().get(self.jid).await
     }
 
     async fn cache(&self, info: Arc<GroupInfo>) {
         self.client
             .get_group_cache()
-            .await
             .insert(self.jid.clone(), info)
             .await;
     }
@@ -399,11 +691,7 @@ impl GroupMetadataGuard<'_> {
                 self.jid
             );
         }
-        self.client
-            .get_group_cache()
-            .await
-            .invalidate(self.jid)
-            .await;
+        self.client.get_group_cache().invalidate(self.jid).await;
     }
 }
 
@@ -445,7 +733,7 @@ impl<'a> Groups<'a> {
         jid: &Jid,
         freshness: crate::cache::Freshness,
     ) -> Result<Arc<GroupInfo>, GroupError> {
-        let cache = self.client.get_group_cache().await;
+        let cache = self.client.get_group_cache();
         let mut cached = cache.get(jid).await;
         if freshness == crate::cache::Freshness::CachePreferred
             && let Some(cached) = cached.take()
@@ -680,13 +968,86 @@ impl<'a> Groups<'a> {
     /// LID-addressed group, participant phone numbers the server left out are
     /// backfilled from known LID/PN mappings on a best-effort basis; a
     /// participant with no known mapping keeps `phone_number: None`. The query
-    /// always hits the network (no phash is sent, so the server never answers
+    /// hits the network (no phash is sent, so the server never answers
     /// `not-modified`) and the result does not populate the group cache.
+    ///
+    /// **Concurrent calls for one group share a round trip.** A call that
+    /// arrives while another is in flight is answered by that one instead of
+    /// sending its own, so the metadata it returns can describe an instant
+    /// slightly before the call was made — bounded by how long the query in
+    /// flight has been running. Sequential calls are unaffected: each sends its
+    /// own query. If you need a read that is strictly ordered after the moment
+    /// you asked, wait for the outstanding call rather than issuing a second
+    /// one alongside it.
     ///
     /// This is the right call for displaying or auditing a group. When you only
     /// need the participant list to send a message, prefer the cached
     /// [`Groups::query_info`].
     pub async fn get_metadata(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
+        // Coalesced, because this is the one metadata entry point with no cache
+        // in front of it: an offline-sync drain puts a burst of callers on the
+        // same group at once, and each would otherwise send its own query. WA
+        // Web never gets there, since its `queryGroup` runs through a job queue
+        // with `maxConcurrency: 1`; ours is called directly, so the
+        // deduplication has to live here.
+        // A leader that produced nothing has answered for nobody, so its waiters
+        // try again — but by re-entering the registry, never by querying around
+        // it. An escape hatch here would let a run of failures release several
+        // waiters at once, which is this fix in reverse and lands hardest
+        // against the `rate-overlimit` that motivated it.
+        //
+        // Unbounded on purpose, and it terminates: each turn either makes this
+        // caller the leader, or waits on one that will finish. Only a leader
+        // queries, so however long a run of failures lasts, the wire carries one
+        // query for this group at a time.
+        loop {
+            match self.client.group_metadata_inflight.claim(jid) {
+                MetadataClaim::Leader(lease) => {
+                    let queried = self.query_metadata_uncoalesced(jid).await;
+                    match &queried {
+                        Ok(metadata) => {
+                            lease.finish(|| FlightOutcome::Answered(Box::new(metadata.clone())))
+                        }
+                        // Every completed outcome is passed on, failures
+                        // included: the leader asked and got an answer, even
+                        // when the answer is that it did not work. An empty
+                        // flight is reserved for a leader that never got that
+                        // far — cancelled or panicking — where nobody has asked
+                        // yet and a waiter is right to take a turn.
+                        Err(error) => {
+                            let outcome = match server_refusal(error) {
+                                Some(refusal) => FlightOutcome::Refused(refusal),
+                                None => FlightOutcome::Failed {
+                                    kind: FailureKind::of(error),
+                                    message: error.to_string(),
+                                },
+                            };
+                            lease.finish(|| outcome);
+                        }
+                    }
+                    return queried;
+                }
+                MetadataClaim::Joined(flight) => match flight.wait().await.as_deref() {
+                    // Derived here, with no lock held.
+                    Some(FlightOutcome::Answered(metadata)) => return Ok((**metadata).clone()),
+                    // The server just told us to stop asking. Querying again
+                    // inside the cooldown it asked for is what produced the
+                    // refusal in the first place, and the error is rebuilt whole
+                    // so a caller can read its `backoff` as the leader could.
+                    Some(FlightOutcome::Refused(refusal)) => {
+                        return Err(refusal.clone().into_error());
+                    }
+                    Some(FlightOutcome::Failed { kind, message }) => {
+                        return Err(kind.into_error(message));
+                    }
+                    None => {}
+                },
+            }
+        }
+    }
+
+    /// The query itself, with no coalescing. Only a leader reaches it.
+    async fn query_metadata_uncoalesced(&self, jid: &Jid) -> Result<GroupMetadata, GroupError> {
         // No phash is sent, so the server always returns the full group.
         match self.client.execute(GroupQueryIq::new(jid)).await? {
             GroupInfoOutcome::Full(group) => {
@@ -1088,6 +1449,35 @@ impl<'a> Groups<'a> {
         Ok(self
             .client
             .execute(GetMembershipRequestsIq::new(jid))
+            .await?)
+    }
+
+    /// Report messages to the group's admins.
+    ///
+    /// Reports to the group's own admins, not to WhatsApp; the group has to
+    /// allow admin reports for the server to accept it. The result is empty on
+    /// success and says nothing about which ids were accepted.
+    pub async fn report_messages_to_admins(
+        &self,
+        jid: impl Into<Jid>,
+        message_ids: &[String],
+    ) -> Result<(), GroupError> {
+        let jid = &jid.into();
+        Ok(self
+            .client
+            .execute(ReportGroupMessagesIq::new(jid, message_ids))
+            .await?)
+    }
+
+    /// Fetch the messages reported to this group's admins.
+    pub async fn get_reported_messages(
+        &self,
+        jid: impl Into<Jid>,
+    ) -> Result<ReportedGroupMessages, GroupError> {
+        let jid = &jid.into();
+        Ok(self
+            .client
+            .execute(GetReportedGroupMessagesIq::new(jid))
             .await?)
     }
 
@@ -1751,7 +2141,7 @@ mod tests {
             ],
             AddressingMode::Pn,
         );
-        let cache = client.get_group_cache().await;
+        let cache = client.get_group_cache();
         cache.insert(group_jid.clone(), Arc::new(info)).await;
 
         let a = cache.get(&group_jid).await.expect("warm hit");
@@ -1771,7 +2161,7 @@ mod tests {
             vec!["12025550101@s.whatsapp.net".parse().unwrap()],
             AddressingMode::Pn,
         ));
-        let cache = client.get_group_cache().await;
+        let cache = client.get_group_cache();
         cache.insert(group.clone(), Arc::clone(&previous)).await;
 
         let result = client
@@ -1799,7 +2189,7 @@ mod tests {
         let parent: Jid = "120363000000000001@g.us".parse().unwrap();
         let unrelated: Jid = "120363000000000002@g.us".parse().unwrap();
         let removed: Jid = "12025550103@s.whatsapp.net".parse().unwrap();
-        let cache = client.get_group_cache().await;
+        let cache = client.get_group_cache();
         for jid in [&parent, &unrelated] {
             cache
                 .insert(
@@ -2383,6 +2773,302 @@ mod tests {
             PreviousDescription::from(None),
             PreviousDescription::Absent,
             "a group with no description resolves to no token, not to a query"
+        );
+    }
+
+    /// Concurrent `get_metadata` for one group must reach the server once.
+    #[tokio::test]
+    async fn concurrent_get_metadata_queries_the_group_once() {
+        const CONCURRENT_CALLS: usize = 6;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::with_capacity(CONCURRENT_CALLS);
+        for _ in 0..CONCURRENT_CALLS {
+            let client = client.clone();
+            let group = group.clone();
+            let done = done.clone();
+            tasks.push(tokio::spawn(async move {
+                let result = client.groups().get_metadata(&group).await;
+                done.fetch_add(1, std::sync::atomic::Ordering::Release);
+                result
+            }));
+        }
+
+        // Every other caller has to have joined before the response goes in:
+        // one that had not yet claimed would become a leader and send its own
+        // query, and the count below would be asserting the scheduler.
+        pending_group_query(&transport, 0).await;
+        wait_for_joiners(&client, &group, CONCURRENT_CALLS - 1).await;
+
+        // Answer whatever reaches the wire until the callers are done, counting
+        // the group queries. Frames are read by index because `decode_sent_iq`
+        // decrypts each one under the counter its position implies.
+        let mut next_frame = 0usize;
+        let mut queried = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut timed_out = false;
+        while done.load(std::sync::atomic::Ordering::Acquire) < CONCURRENT_CALLS {
+            if tokio::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
+            if transport.sent().len() <= next_frame {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let node = crate::test_utils::decode_sent_iq(&transport, next_frame).await;
+            next_frame += 1;
+            let node_ref = node.get();
+            if node_ref.tag != "iq"
+                || node_ref.attrs().optional_string("xmlns").as_deref() != Some("w:g2")
+            {
+                continue;
+            }
+            let request_id = node_ref
+                .attrs()
+                .optional_string("id")
+                .expect("an IQ carries an id")
+                .to_string();
+            queried += 1;
+            let response = group_result_with_description(&request_id, &group, None);
+            crate::test_utils::answer_iq(&client, &request_id, &response).await;
+        }
+
+        // Reported before the results: a timeout would otherwise surface as a
+        // query count of zero, which reads like coalescing rather than a hang.
+        assert!(
+            !timed_out,
+            "the metadata callers did not finish in time; served {queried} query/queries"
+        );
+
+        for task in tasks {
+            task.await
+                .expect("metadata task should not panic")
+                .expect("every caller must get the group's metadata");
+        }
+
+        assert_eq!(
+            queried, 1,
+            "concurrent metadata callers for one group must share a single query, \
+             not send one each"
+        );
+    }
+
+    /// A refusal is passed on, not re-asked.
+    ///
+    /// The server telling us to back off is exactly the moment not to send the
+    /// same query again, so waiters report the refusal rather than each taking
+    /// a turn at re-provoking it.
+    #[tokio::test]
+    async fn waiters_of_a_refused_metadata_query_do_not_ask_again() {
+        const WAITERS: usize = 3;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let leader = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+        };
+        let first_id = pending_group_query(&transport, 0).await;
+
+        let mut waiters = Vec::with_capacity(WAITERS);
+        for _ in 0..WAITERS {
+            let client = client.clone();
+            let group = group.clone();
+            waiters.push(tokio::spawn(async move {
+                client.groups().get_metadata(&group).await
+            }));
+        }
+        wait_for_joiners(&client, &group, WAITERS).await;
+        assert_eq!(
+            transport.sent().len(),
+            1,
+            "the waiters must defer, not send their own queries"
+        );
+
+        let refusal = iq_error(&first_id, &group, "429", "rate-overlimit");
+        crate::test_utils::answer_iq(&client, &first_id, &refusal).await;
+
+        assert!(
+            leader.await.expect("leader task").is_err(),
+            "the leader reports the refusal"
+        );
+        for waiter in waiters {
+            assert!(
+                waiter.await.expect("waiter task").is_err(),
+                "a waiter inherits the refusal instead of re-asking"
+            );
+        }
+        assert_eq!(
+            transport.sent().len(),
+            1,
+            "a refusal must not produce a second query for the same group"
+        );
+    }
+
+    /// A leader that died without an answer says nothing about the group, so a
+    /// waiter asks for itself — one at a time, by re-entering the registry.
+    #[tokio::test]
+    async fn waiters_of_a_cancelled_metadata_leader_retry_one_at_a_time() {
+        const WAITERS: usize = 3;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let leader = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+        };
+        pending_group_query(&transport, 0).await;
+
+        let mut waiters = Vec::with_capacity(WAITERS);
+        for _ in 0..WAITERS {
+            let client = client.clone();
+            let group = group.clone();
+            waiters.push(tokio::spawn(async move {
+                client.groups().get_metadata(&group).await
+            }));
+        }
+        wait_for_joiners(&client, &group, WAITERS).await;
+        assert_eq!(transport.sent().len(), 1, "the waiters must defer");
+
+        leader.abort();
+        let _ = leader.await;
+
+        // Exactly one retry, not one per waiter: one of them took the lease and
+        // the others joined it, which is what waiting for those joins proves.
+        let retry_id = pending_group_query(&transport, 1).await;
+        wait_for_joiners(&client, &group, WAITERS - 1).await;
+        assert_eq!(
+            transport.sent().len(),
+            2,
+            "a dead leader must leave one retry in flight, not one per waiter"
+        );
+
+        let response = group_result_with_description(&retry_id, &group, None);
+        crate::test_utils::answer_iq(&client, &retry_id, &response).await;
+        for waiter in waiters {
+            waiter
+                .await
+                .expect("waiter task")
+                .expect("the retry answers every waiter");
+        }
+    }
+
+    /// A cancelled leader releases its claim, so the group is not locked out of
+    /// every future query.
+    #[tokio::test]
+    async fn a_cancelled_metadata_leader_frees_the_group() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let leader = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+        };
+        pending_group_query(&transport, 0).await;
+        leader.abort();
+        let _ = leader.await;
+
+        let next = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+        };
+        let next_id = pending_group_query(&transport, 1).await;
+        let response = group_result_with_description(&next_id, &group, None);
+        crate::test_utils::answer_iq(&client, &next_id, &response).await;
+        next.await
+            .expect("next task")
+            .expect("a cancelled leader must not lock the group out");
+    }
+
+    /// Block until `count` callers have joined the group's in-flight query.
+    ///
+    /// Polls the registry rather than yielding a fixed number of times, so the
+    /// test waits for the admission it depends on instead of assuming the
+    /// scheduler got there.
+    async fn wait_for_joiners(client: &Arc<Client>, group: &Jid, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if client.group_metadata_inflight.waiters_for(group) >= Some(count) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} caller(s) should join the flight"));
+    }
+
+    /// The request id of the group query at `index`, once it reaches the wire.
+    async fn pending_group_query(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        index: usize,
+    ) -> String {
+        let node = crate::test_utils::decode_sent_iq(transport, index).await;
+        let node_ref = node.get();
+        assert!(
+            node_ref.tag == "iq"
+                && node_ref.attrs().optional_string("xmlns").as_deref() == Some("w:g2"),
+            "frame {index} should be a group query"
+        );
+        node_ref
+            .attrs()
+            .optional_string("id")
+            .expect("an IQ carries an id")
+            .to_string()
+    }
+
+    /// A caller that joined a successful flight is answered by it.
+    ///
+    /// Holds down the observable half of publishing under the registry lock —
+    /// that a joiner is answered rather than left to query again. The race the
+    /// lock closes (a caller admitted between the leader's decision and the
+    /// close) cannot be staged deterministically, so this does not claim to
+    /// prove it.
+    ///
+    /// Replaces a test that aborted `callers[0]` expecting it to be the leader:
+    /// Tokio does not promise spawn order, so it asserted the scheduler rather
+    /// than the invariant.
+    #[tokio::test]
+    async fn a_late_joiner_is_answered_rather_than_left_to_query_again() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let group = description_test_group();
+
+        let leader = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+        };
+        let request_id = pending_group_query(&transport, 0).await;
+
+        let joiner = {
+            let client = client.clone();
+            let group = group.clone();
+            tokio::spawn(async move { client.groups().get_metadata(&group).await })
+        };
+        wait_for_joiners(&client, &group, 1).await;
+
+        let response = group_result_with_description(&request_id, &group, None);
+        crate::test_utils::answer_iq(&client, &request_id, &response).await;
+
+        leader.await.expect("leader task").expect("leader query");
+        joiner
+            .await
+            .expect("joiner task")
+            .expect("a joined caller takes the leader's answer");
+        assert_eq!(
+            transport.sent().len(),
+            1,
+            "a caller that joined a successful flight must not query again"
         );
     }
 }

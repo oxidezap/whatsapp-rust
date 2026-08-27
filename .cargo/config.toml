@@ -24,10 +24,12 @@ rustflags = [
 
 [env]
 # Trim bundled-SQLite subsystems the workspace never touches. FTS5 stays:
-# chat-store's `search` feature builds its index on it. Shared cache stays:
-# sqlite-storage's in-memory mode shares one DB across the pool via
-# `cache=shared` URIs. JSON and extension loading are unused by
-# diesel/sqlite-storage/chat-store (checked: no json_* SQL, no
+# nothing here builds an index on it today, but it is the one subsystem an
+# embedder is likely to want from this crate's bundled SQLite, and this file
+# is not inherited by consumers — so keeping it is what proves it still
+# compiles. Shared cache stays: sqlite-storage's in-memory mode shares one DB
+# across the pool via `cache=shared` URIs. JSON and extension loading are
+# unused by diesel/sqlite-storage (checked: no json_* SQL, no
 # load_extension callers); dropping loadable extensions also removes a
 # dlopen surface. STAT4/DBSTAT/RTREE/FTS3/SOUNDEX are upstream-default-off
 # features libsqlite3-sys turns on; none are exercised here.

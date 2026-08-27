@@ -17,6 +17,10 @@ const AUTO_ATTR_ESTIMATE: usize = 24;
 const AUTO_CHILD_ESTIMATE: usize = 96;
 const AUTO_GRANDCHILD_ESTIMATE: usize = 40;
 
+/// Decode node bytes: the buffer without the format byte, which is what the
+/// receive path holds after [`unpack`](crate::util::unpack) and what
+/// `OwnedNodeRef` stores. For a buffer that still carries the format byte, as
+/// [`marshal`] writes it, use [`unmarshal_packed_ref`].
 pub fn unmarshal_ref(data: &[u8]) -> Result<NodeRef<'_>> {
     let mut decoder = Decoder::new(data);
     let node = decoder.read_node_ref()?;
@@ -26,6 +30,17 @@ pub fn unmarshal_ref(data: &[u8]) -> Result<NodeRef<'_>> {
     } else {
         Err(BinaryError::LeftoverData(decoder.bytes_left()))
     }
+}
+
+/// Decode a packed payload: the format byte plus node bytes, exactly what
+/// [`marshal`] produces and what a frame carries before `unpack`.
+///
+/// Only the uncompressed form is accepted: the returned node borrows from
+/// `data`, and decompressed bytes would have nowhere to live; reach for
+/// [`unpack`](crate::util::unpack) plus [`unmarshal_ref`] there.
+pub fn unmarshal_packed_ref(data: &[u8]) -> Result<NodeRef<'_>> {
+    crate::util::check_plain_payload(data)?;
+    unmarshal_ref(&data[1..])
 }
 
 pub fn marshal_to(node: &Node, writer: &mut impl Write) -> Result<()> {
@@ -66,14 +81,22 @@ pub fn marshal_auto(node: &Node) -> Result<Vec<u8>> {
 /// This avoids output buffer growth/copies and can be beneficial for large/variable payloads.
 pub fn marshal_exact(node: &Node) -> Result<Vec<u8>> {
     let plan = build_marshaled_node_plan(node);
-    let mut payload = vec![0; plan.size];
-    let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
-    encoder.write_node(node)?;
-    let written = encoder.bytes_written();
+    // Reserved, not zero-filled. `vec![0; plan.size]` memset every byte the
+    // encoder is about to overwrite, which for the large payloads this path
+    // exists for is a second full pass over the output. Appending into a `Vec`
+    // reserved to the exact plan size writes each byte once; the plan is still
+    // what decides the buffer's size, so a plan that undershoots grows the
+    // `Vec` and is caught by the length check below rather than silently
+    // truncating.
+    let mut payload = Vec::with_capacity(plan.size);
+    {
+        let mut encoder = Encoder::new_vec_with_hints(&mut payload, Some(&plan.hints))?;
+        encoder.write_node(node)?;
+    }
     // Real checks, not debug_asserts: replayed hints are trusted in release,
     // so a plan/encode traversal divergence must fail the marshal instead of
     // shipping corrupt bytes. Two integer compares per stanza.
-    if written != payload.len() || !plan.hints.fully_consumed() {
+    if payload.len() != plan.size || !plan.hints.fully_consumed() {
         return Err(BinaryError::PlanMismatch);
     }
     Ok(payload)
@@ -116,12 +139,14 @@ pub fn marshal_ref_auto(node: &NodeRef<'_>) -> Result<Vec<u8>> {
 /// This avoids output buffer growth/copies and preserves zero-copy input semantics.
 pub fn marshal_ref_exact(node: &NodeRef<'_>) -> Result<Vec<u8>> {
     let plan = build_marshaled_node_ref_plan(node);
-    let mut payload = vec![0; plan.size];
-    let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
-    encoder.write_node(node)?;
-    let written = encoder.bytes_written();
+    // Reserved rather than zero-filled, for the reason marshal_exact gives.
+    let mut payload = Vec::with_capacity(plan.size);
+    {
+        let mut encoder = Encoder::new_vec_with_hints(&mut payload, Some(&plan.hints))?;
+        encoder.write_node(node)?;
+    }
     // Same invariant enforcement as marshal_exact.
-    if written != payload.len() || !plan.hints.fully_consumed() {
+    if payload.len() != plan.size || !plan.hints.fully_consumed() {
         return Err(BinaryError::PlanMismatch);
     }
     Ok(payload)
@@ -169,7 +194,7 @@ fn should_auto_reserve_node_ref(node: &NodeRef<'_>) -> bool {
         return true;
     }
 
-    match node.content.as_deref() {
+    match node.content.as_ref() {
         Some(NodeContentRef::Bytes(bytes)) => bytes.len() >= AUTO_RESERVE_SCALAR_THRESHOLD,
         Some(NodeContentRef::String(text)) => text.len() >= AUTO_RESERVE_SCALAR_THRESHOLD,
         Some(NodeContentRef::Nodes(children)) => {
@@ -178,7 +203,7 @@ fn should_auto_reserve_node_ref(node: &NodeRef<'_>) -> bool {
             }
             // Check one level deeper for large nested lists (e.g., <iq> -> <list> -> 812 keys)
             children.iter().any(|child| {
-                matches!(child.content.as_deref(), Some(NodeContentRef::Nodes(gc)) if gc.len() >= AUTO_RESERVE_CHILDREN_THRESHOLD)
+                matches!(child.content.as_ref(), Some(NodeContentRef::Nodes(gc)) if gc.len() >= AUTO_RESERVE_CHILDREN_THRESHOLD)
             })
         }
         None => false,
@@ -227,7 +252,7 @@ fn estimate_capacity_node_ref(node: &NodeRef<'_>) -> usize {
     estimate += node.tag.len();
     estimate += node.attrs.len() * AUTO_ATTR_ESTIMATE;
 
-    match node.content.as_deref() {
+    match node.content.as_ref() {
         Some(NodeContentRef::Bytes(bytes)) => {
             estimate += bytes.len() + 8;
         }
@@ -238,7 +263,7 @@ fn estimate_capacity_node_ref(node: &NodeRef<'_>) -> usize {
             estimate += children.len() * AUTO_CHILD_ESTIMATE;
             for child in children.iter().take(AUTO_CHILD_SAMPLE_LIMIT) {
                 estimate += child.tag.len() + child.attrs.len() * AUTO_ATTR_ESTIMATE;
-                match child.content.as_deref() {
+                match child.content.as_ref() {
                     Some(NodeContentRef::Bytes(bytes)) => estimate += bytes.len() + 8,
                     Some(NodeContentRef::String(text)) => estimate += text.len() + 8,
                     Some(NodeContentRef::Nodes(grand_children)) => {
@@ -275,8 +300,8 @@ mod tests {
     /// here — the two directions of this token genuinely differ.
     ///
     /// Every encoder path is covered because `marshal_exact` sizes its output
-    /// slice from the size estimator before writing into it: an estimator that
-    /// disagrees with the writer surfaces as `UnexpectedEof`, not as wrong bytes,
+    /// buffer from the size estimator before writing into it: an estimator that
+    /// disagrees with the writer surfaces as `PlanMismatch`, not as wrong bytes,
     /// and `marshal_exact` is what production sends through.
     #[test]
     fn interop_jid_carries_its_integrator_onto_the_wire() -> TestResult {
@@ -349,7 +374,7 @@ mod tests {
             !bytes.contains(&crate::token::INTEROP_JID),
             "no integrator, no INTEROP_JID token"
         );
-        let decoded = unmarshal_ref(&bytes[1..])?;
+        let decoded = unmarshal_packed_ref(&bytes)?;
         let back = decoded
             .attrs
             .iter()
@@ -384,9 +409,8 @@ mod tests {
             attrs.push("jid".to_string(), NodeValue::Jid(original.clone()));
             let node = Node::new("iq", attrs, None);
 
-            // marshal writes a leading format byte that unmarshal_ref does not expect.
             let bytes = marshal(&node)?;
-            let decoded = unmarshal_ref(&bytes[1..])?;
+            let decoded = unmarshal_packed_ref(&bytes)?;
             let from_wire = decoded
                 .attrs
                 .iter()
@@ -584,6 +608,48 @@ mod tests {
         marshal_to(&node, &mut payload_writer)?;
 
         assert_eq!(payload_exact, payload_writer);
+        Ok(())
+    }
+
+    /// The exact-size paths reserve their output instead of zero-filling it, so
+    /// nothing initializes the bytes the encoder does not reach: a plan that
+    /// overshoots can no longer leave a tail of zeros that happens to look like
+    /// a valid encoding, and one that undershoots grows the buffer instead of
+    /// erroring inside the writer. Both now surface only through the length
+    /// check, which the other exact tests exercise on a small fixture; this one
+    /// runs a payload past every growth step a `Vec` would take on the way to
+    /// it, where a divergence has room to show up as wrong bytes.
+    #[test]
+    fn exact_paths_match_the_streaming_writer_on_a_large_payload() -> TestResult {
+        let mut attrs = Attrs::with_capacity(2);
+        attrs.push("id".to_string(), "ABC123");
+        attrs.push(
+            "to".to_string(),
+            NodeValue::Jid("15551234567@s.whatsapp.net".parse::<Jid>().unwrap()),
+        );
+        let children: Vec<Node> = (0..512)
+            .map(|i| {
+                let mut child_attrs = Attrs::with_capacity(1);
+                child_attrs.push("i".to_string(), i.to_string());
+                Node::new(
+                    "item",
+                    child_attrs,
+                    Some(NodeContent::Bytes(vec![(i % 251) as u8; 64])),
+                )
+            })
+            .collect();
+        let node = Node::new("message", attrs, Some(NodeContent::Nodes(children)));
+        let node_ref = node.as_node_ref();
+
+        let mut streamed = Vec::new();
+        marshal_to(&node, &mut streamed)?;
+        assert!(
+            streamed.len() > 32 * 1024,
+            "fixture must outgrow the small-payload paths"
+        );
+
+        assert_eq!(marshal_exact(&node)?, streamed, "marshal_exact");
+        assert_eq!(marshal_ref_exact(&node_ref)?, streamed, "marshal_ref_exact");
         Ok(())
     }
 

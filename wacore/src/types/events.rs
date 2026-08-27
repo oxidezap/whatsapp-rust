@@ -6,6 +6,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use portable_atomic::{AtomicU64, Ordering};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, OnceLock, RwLock};
 use wacore_binary::Node;
@@ -240,7 +241,11 @@ pub enum EventKind {
     IncomingCall,
     MissedCall,
     CallEndedElsewhere,
-    PushNameUpdate,
+    /// Retired: the payload promised an old-name/new-name comparison this
+    /// client has no contact store to make, and nothing ever dispatched it.
+    /// The slot stays because the discriminant is an `EventInterest` bit index
+    /// a consumer persists, so removing it would re-point every mask past it.
+    RetiredPushNameUpdate,
     SelfPushNameUpdated,
     PinUpdate,
     MuteUpdate,
@@ -274,6 +279,16 @@ pub enum EventKind {
     ServerAck,
     PairingQrCodesExhausted,
     PairingCodeError,
+    AppStateSyncFailed,
+    DecryptedPayload,
+    SentFrame,
+    MessageLabelAssociationUpdate,
+    QuickReplyUpdate,
+    DisableLinkPreviewsUpdate,
+    ContactRemoved,
+    EncDecryptFailed,
+    CallLogSync,
+    ClientExpirationChanged,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -287,7 +302,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::PairingCodeError as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::ClientExpirationChanged as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -620,12 +635,56 @@ impl CoreEventBus {
     }
 }
 
+/// Payload of the retired [`Event::RetiredPushNameUpdate`], kept only so that
+/// variant can keep its position in an index-based `Serialize` format.
+///
+/// Deliberately empty: the fields it used to carry named a comparison this
+/// repository cannot make, and leaving them would keep promising it. Nothing
+/// constructs this and nothing dispatches the variant it fills.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct RetiredPushNameUpdate {}
+
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct SelfPushNameUpdated {
     pub from_server: bool,
     pub old_name: String,
     pub new_name: String,
+}
+
+/// A batched app-state sync finished without leaving every collection synced.
+///
+/// Collections are named as they appear on the wire (`critical_block`,
+/// `regular_high`, …) rather than as an enum, so the payload stays stable if the
+/// set of collections changes.
+///
+/// `fatal` is the one a consumer usually has to act on: the server refused the
+/// collection, and repeating the request gets the same answer. WhatsApp Web
+/// treats that as grounds to notify the primary device and log out; this
+/// library will not end a session on its own, so it reports the refusal and
+/// keeps the connection. When `connected` is true the client dispatched
+/// [`Event::Connected`] anyway and is usable, minus whatever those collections
+/// carry — for `critical_block` that includes the push name, so presence stays
+/// unavailable until it syncs.
+///
+/// The initial sync that follows pairing normally connects, so its report
+/// normally carries `connected: true`. A `false` means no [`Event::Connected`]
+/// accompanied this report: a sync that ran before the connection was ready,
+/// such as one a `syncd_app_state` dirty bit started while the offline backlog
+/// was still being processed, or an initial sync whose connection was paused,
+/// superseded or rejected by the server as it finished.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct AppStateSyncFailed {
+    /// Refused outright by the server (400/404). Terminal for this connection.
+    pub fatal: Vec<String>,
+    /// Did not sync, but a later attempt can.
+    pub retryable: Vec<String>,
+    /// Another writer held the collection, so this sync did nothing for it.
+    pub skipped: Vec<String>,
+    /// Whether the client went on to dispatch [`Event::Connected`].
+    pub connected: bool,
 }
 
 /// Type of device list update notification.
@@ -837,6 +896,16 @@ pub enum Event {
     /// messages (plaintext, acked on their own path, never redelivered) and
     /// PDO placeholder recoveries (identified by
     /// `info.unavailable_request_id`) dispatch event-only.
+    ///
+    /// A sender retrying its own outbox resends one message re-encrypted, which
+    /// no ratchet can see as a duplicate. Such a resend collapses to a single
+    /// dispatch, keyed by chat, id and sender, for as long as the
+    /// `dispatched_messages` window holds;
+    /// `stats().messages_suppressed_duplicate` counts them. The collapse covers
+    /// what arrives as a decrypted payload for this device, so a message
+    /// delivered in several `msmsg` parts under one stanza id is out of scope:
+    /// suppressing there could drop a part, and a lost part is worse than a
+    /// duplicate event.
     Messages(MessageBatch),
     Receipt(Receipt),
     /// The server `<ack>`-ed (or nack-ed) an outgoing stanza.
@@ -877,7 +946,17 @@ pub enum Event {
     /// Rejected call-log outcomes (`<terminate reason="accepted_elsewhere"|"rejected_elsewhere">`).
     CallEndedElsewhere(CallEndedElsewhere),
 
-    PushNameUpdate(PushNameUpdate),
+    /// Retired: nothing dispatches this, and nothing can. The payload promised
+    /// an old-name/new-name comparison, and this repository holds no contact
+    /// store to source the previous name from. Read the current name from
+    /// [`crate::types::message::MessageInfo::push_name`] instead.
+    ///
+    /// The variant stays because its *position* is load-bearing, for the same
+    /// reason new variants are appended rather than inserted: an index-based
+    /// `Serialize` format keys variants by position, so dropping one renumbers
+    /// every variant after it and changes how already-stored events decode.
+    RetiredPushNameUpdate(RetiredPushNameUpdate),
+
     SelfPushNameUpdated(SelfPushNameUpdated),
     PinUpdate(PinUpdate),
     MuteUpdate(MuteUpdate),
@@ -943,6 +1022,67 @@ pub enum Event {
     /// SHORTCAKE_PASSKEY: the passkey link failed. `continuation` distinguishes a
     /// failure during the continuation/verification stage from the initial request.
     PairPasskeyError(PairPasskeyError),
+
+    /// A batched app-state sync left one or more collections unsynced. See
+    /// [`AppStateSyncFailed`] for what each bucket means and when the client
+    /// connected anyway.
+    ///
+    /// Appended, not inserted: `Event` derives `Serialize`, and an index-based
+    /// format (bincode, postcard) keys variants by position, so slotting one in
+    /// beside its relatives would renumber every variant after it and change how
+    /// already-stored events decode.
+    AppStateSyncFailed(AppStateSyncFailed),
+
+    /// One decrypted `<enc>` payload, emitted before it is decoded.
+    ///
+    /// Library extension — no WA Web equivalent. Gated by
+    /// `Client::acquire_decrypted_payload_forwarding()` so nothing is cloned
+    /// while unused.
+    ///
+    /// Last, like every new variant: a binary `Serialize` format writes the
+    /// variant index, so inserting in the middle renumbers everything after it.
+    DecryptedPayload(DecryptedPayload),
+
+    /// One marshaled stanza that reached the transport, emitted after the write.
+    ///
+    /// The outbound counterpart of [`Event::RawNode`]. Library extension — no WA
+    /// Web equivalent. Gated by `Client::acquire_sent_frame_forwarding()` so
+    /// nothing is cloned while unused.
+    SentFrame(SentFrame),
+
+    /// A label was associated with or removed from a single *message* on a
+    /// linked device (`label_message`), as opposed to a whole chat
+    /// ([`LabelAssociationUpdate`]).
+    MessageLabelAssociationUpdate(MessageLabelAssociationUpdate),
+
+    /// A quick reply was created, edited, or deleted on a linked device.
+    QuickReplyUpdate(QuickReplyUpdate),
+
+    /// The account-wide "disable link previews" privacy setting changed on a
+    /// linked device.
+    DisableLinkPreviewsUpdate(DisableLinkPreviewsUpdate),
+
+    /// A saved contact was deleted on a linked device. Distinct from
+    /// [`ContactUpdate`]: the mutation arrives as a syncd `Remove`, carries no
+    /// meaningful action payload, and means the contact left the address book.
+    ContactRemoved(ContactRemoved),
+
+    /// One `<enc>` that produced no plaintext, and why.
+    ///
+    /// The per-`<enc>` counterpart of [`Event::DecryptedPayload`]. Library
+    /// extension — no WA Web equivalent. Gated by
+    /// `Client::acquire_enc_decrypt_failed_forwarding()` so nothing is built
+    /// while unused.
+    ///
+    /// Last, like every new variant: a binary `Serialize` format writes the
+    /// variant index, so inserting in the middle renumbers everything after it.
+    EncDecryptFailed(EncDecryptFailed),
+
+    /// A call-history record synced from the primary device.
+    CallLogSync(CallLogSync),
+
+    /// The server pushed (or withdrew) a retirement deadline for this build.
+    ClientExpirationChanged(ClientExpirationChanged),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1017,8 +1157,9 @@ impl Event {
             Event::IncomingCall(_) => EventKind::IncomingCall,
             Event::MissedCall(_) => EventKind::MissedCall,
             Event::CallEndedElsewhere(_) => EventKind::CallEndedElsewhere,
-            Event::PushNameUpdate(_) => EventKind::PushNameUpdate,
+            Event::RetiredPushNameUpdate(_) => EventKind::RetiredPushNameUpdate,
             Event::SelfPushNameUpdated(_) => EventKind::SelfPushNameUpdated,
+            Event::AppStateSyncFailed(_) => EventKind::AppStateSyncFailed,
             Event::PinUpdate(_) => EventKind::PinUpdate,
             Event::MuteUpdate(_) => EventKind::MuteUpdate,
             Event::ArchiveUpdate(_) => EventKind::ArchiveUpdate,
@@ -1030,6 +1171,13 @@ impl Event {
             Event::DeleteMessageForMeUpdate(_) => EventKind::DeleteMessageForMeUpdate,
             Event::LabelEditUpdate(_) => EventKind::LabelEditUpdate,
             Event::LabelAssociationUpdate(_) => EventKind::LabelAssociationUpdate,
+            Event::MessageLabelAssociationUpdate(_) => EventKind::MessageLabelAssociationUpdate,
+            Event::QuickReplyUpdate(_) => EventKind::QuickReplyUpdate,
+            Event::DisableLinkPreviewsUpdate(_) => EventKind::DisableLinkPreviewsUpdate,
+            Event::ContactRemoved(_) => EventKind::ContactRemoved,
+            Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
+            Event::CallLogSync(_) => EventKind::CallLogSync,
+            Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -1044,6 +1192,8 @@ impl Event {
             Event::DisappearingModeChanged(_) => EventKind::DisappearingModeChanged,
             Event::NewsletterLiveUpdate(_) => EventKind::NewsletterLiveUpdate,
             Event::RawNode(_) => EventKind::RawNode,
+            Event::DecryptedPayload(_) => EventKind::DecryptedPayload,
+            Event::SentFrame(_) => EventKind::SentFrame,
             Event::MexNotification(_) => EventKind::MexNotification,
             Event::PairPasskeyRequest(_) => EventKind::PairPasskeyRequest,
             Event::PairPasskeyConfirmation(_) => EventKind::PairPasskeyConfirmation,
@@ -1240,7 +1390,7 @@ pub struct PairingCodeRefresh {
     pub force_manual: bool,
 }
 
-/// A phone-number pair-code request failed, so no code will be shown.
+/// A phone-number pair-code flow failed, so no linking will come of it.
 ///
 /// The counterpart to [`PairingCode`] on the failure path, and the only surface
 /// that reports it when pairing is driven by `BotBuilder::with_pair_code` —
@@ -1248,6 +1398,13 @@ pub struct PairingCodeRefresh {
 /// caller. `Client::pair_with_code` dispatches this in addition to returning
 /// `Err`, matching how the success path both returns the code and emits
 /// [`PairingCode`].
+///
+/// Both of the flow's server round trips report here, and the consumer's move
+/// is the same either way — this code is finished, request another or fall back
+/// to the QR. The later one arrives after a code was already displayed and
+/// entered: the phone answered, but the server refused the key bundle that
+/// answer produced. Silence at that stage is not this event, because nothing
+/// was refused; it surfaces as [`PairingCodeRefresh`] once the timer runs out.
 ///
 /// Fires for every failure, including local validation (a phone number that is
 /// too short never reaches the server): a consumer waiting on a code needs to
@@ -1323,6 +1480,20 @@ pub struct ClientOutdated {
     pub raw: Option<Node>,
 }
 
+/// The session is authenticated and has asked the server to leave passive mode.
+///
+/// That request is best effort: a failure to go active is logged and the
+/// connection is announced anyway, on the same reasoning as below, so treat this
+/// as "the client believes stanzas should be flowing" rather than a guarantee
+/// that the server agrees.
+///
+/// After a fresh pairing the client waits for the critical app-state
+/// collections before publishing this, so the push name and blocklist are
+/// normally in place by now. It waits, but it does not withhold: a critical
+/// collection the server refused or could not deliver is reported as
+/// [`AppStateSyncFailed`] and the connection is announced regardless, because a
+/// session already delivering messages is not one a consumer should be left
+/// believing never opened.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct Connected {}
@@ -1536,13 +1707,32 @@ pub struct DirtyState {
     pub timestamp: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
-pub enum DecryptFailMode {
-    #[wire = "show"]
-    Show,
-    #[wire = "hide"]
-    Hide,
+/// The server pushed a retirement deadline for the running client build, via
+/// `<ib><client_expiration>`.
+///
+/// Dispatched only when the deadline actually changed, so a repeated stanza is
+/// silent. `expires_at` is the deadline as recorded, which is never sooner than
+/// three days out even when the server's own answer is; `withdrawn` marks the
+/// stanza that carries no deadline at all, retracting whatever was held.
+///
+/// Consumers own the response. This client keeps connecting until the server
+/// refuses it -- the deadline is notice, not an instruction to stop -- so a
+/// consumer that cares about uptime should treat this as the cue to move to a
+/// newer build before the date arrives.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct ClientExpirationChanged {
+    /// Unix seconds after which the server expects to stop accepting this
+    /// build. `None` when the deadline was withdrawn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// The build the deadline was issued against.
+    pub version: (u32, u32, u32),
+    /// `true` when the server retracted a deadline it had previously set.
+    pub withdrawn: bool,
 }
+
+pub use crate::types::wire_enums::DecryptFailMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum UnavailableType {
@@ -1581,6 +1771,302 @@ impl UnavailableType {
     pub fn is_unrecoverable_fanout(&self) -> bool {
         matches!(self, Self::ViewOnce | Self::Hosted | Self::Bot)
     }
+}
+
+/// Payload of [`Event::DecryptedPayload`]: what Signal produced for one
+/// `<enc>`, before this build tried to make sense of it.
+///
+/// The client decodes a plaintext into [`wa::Message`] and dispatches that. A
+/// payload it cannot decode — a field this build predates, a message type it
+/// does not model — is logged and dropped, and with it goes something that cost
+/// a real decryption and advanced the ratchet. Nothing can ask for it back:
+/// the ratchet has moved on, so the same ciphertext will never decrypt again.
+///
+/// This event is that payload, handed over before decoding is attempted. It
+/// arrives whether or not the decode goes on to succeed.
+///
+/// Reasons to want it: recording traffic for faithful replay (re-encoding a
+/// decoded `Message` does not reproduce the original bytes), decoding with a
+/// newer protobuf than this build carries, and looking at a payload that failed
+/// to decode instead of only reading that it did.
+///
+/// Gated by `Client::acquire_decrypted_payload_forwarding()`: nothing is
+/// emitted, and nothing is cloned, while no consumer holds a lease.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct DecryptedPayload {
+    /// Which message this came from.
+    pub info: Arc<MessageInfo>,
+    /// Which `<enc>` of the stanza produced these bytes, counting from zero in
+    /// the order the client enumerates them.
+    ///
+    /// That order is the stanza's direct `<enc>` children first, then the ones
+    /// under `<participants><to>` addressed to this device — the fan-out shape,
+    /// where a single stanza carries a copy per device and only ours is ours to
+    /// decrypt. It is *not* a child index: a consumer resolving this back to a
+    /// node has to walk the same two groups in the same order.
+    pub enc_index: usize,
+    /// The `type` attribute the `<enc>` carried: `msg`, `pkmsg`, `skmsg`, …
+    pub enc_type: &'static str,
+    /// The `state` attribute the `<enc>` carried, verbatim, or `None` when it
+    /// carried none.
+    ///
+    /// The server's own annotation of the session this copy was encrypted
+    /// under. This build does not model the values and does not act on them;
+    /// they are handed over as text so a consumer can.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// The `session_type` attribute the `<enc>` carried, verbatim, or `None`
+    /// when it carried none. Unmodelled and unacted-on, like
+    /// [`state`](Self::state).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_type: Option<String>,
+    /// The plaintext, unpadded, exactly as decoding will receive it.
+    ///
+    /// A `Bytes`, so forwarding it costs a refcount bump rather than a copy.
+    ///
+    /// **Not serialized.** `Serialize` on an event is for diagnostics, and no
+    /// text format carries raw bytes without an encoding choice this type has
+    /// no business making. A consumer recording payloads has the `Bytes` in
+    /// hand and can frame them however its sink expects.
+    #[serde(skip)]
+    pub payload: Bytes,
+}
+
+/// Why one `<enc>` produced no plaintext.
+///
+/// Every variant names a branch the receive path actually takes; there is no
+/// catch-all "other" standing in for code nobody wrote. New branches append new
+/// variants, so this is `#[non_exhaustive]` and a match on it needs a `_` arm.
+///
+/// This is the client's own classification of where *it* stopped, not something
+/// the server sends and not a statement about the sender's copy. Two builds can
+/// classify the same ciphertext differently as branches are refined; the pairing
+/// of a reason with a specific `<enc>` is the stable part, the exact variant is
+/// not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum EncDecryptFailureReason {
+    /// The node is unusable as a node: no `type` attribute, or no content to
+    /// decrypt. Nothing about it named a decryption to attempt.
+    MalformedNode,
+    /// The `type` is one this build does not implement. Recognized as an
+    /// `<enc>`, but no path here could ever decrypt it.
+    UnsupportedEncType,
+    /// A type this build handles, whose body is not a well-formed envelope for
+    /// it — so it never reached a cipher. Distinct from
+    /// [`InvalidMessage`](Self::InvalidMessage), which is the cryptographic
+    /// layer rejecting an envelope it did parse.
+    MalformedCiphertext,
+    /// No Signal session for the sender's address. Usually recoverable: the
+    /// client asks the sender to re-establish one.
+    NoSession,
+    /// No sender-key state for this `(group, sender)` chain — typically an
+    /// `skmsg` whose distribution message was never received or was lost.
+    NoSenderKey,
+    /// The sender encrypted to a one-time or signed pre-key of ours that this
+    /// device no longer holds.
+    UnknownPreKey,
+    /// The sender's identity key is not the one this device trusts for them.
+    ///
+    /// Usually reported after the client cleared the stored identity and
+    /// retried, and the retry still did not produce plaintext — so the identity
+    /// change is what is left explaining it. Also reported where libsignal
+    /// raises the untrusted identity directly and no retry ran, such as the
+    /// decrypt that follows a PN→LID session migration.
+    UntrustedIdentity,
+    /// Authentication failed: the ciphertext did not verify under the key the
+    /// client derived for it. Covers both the Signal MAC and the AES-GCM tag of
+    /// a bot (`msmsg`) payload.
+    BadMac,
+    /// The envelope parsed and the cryptographic layer rejected its contents —
+    /// a version that does not match the state it was decrypted against, a
+    /// signature that did not verify, or a body the cipher would not accept
+    /// under keys that were themselves sound.
+    ///
+    /// Not the same as state that was never sound: a sender-key or session
+    /// record that will not yield usable keys is
+    /// [`StorageFailure`](Self::StorageFailure), because nothing about the
+    /// message was judged.
+    InvalidMessage,
+    /// A bot (`msmsg`) payload whose `messageSecret` this device does not hold,
+    /// or whose `<meta>` does not say which secret to look up. Expected on a
+    /// companion for a group bot invocation the primary device sent.
+    NoMessageSecret,
+    /// The local cryptographic provider failed a key agreement. Ours, like
+    /// [`StorageFailure`](Self::StorageFailure): the peer's ciphertext was never
+    /// judged, so a per-peer health signal should exclude this too.
+    LocalCryptoFailure,
+    /// The cryptographic layer failed for a reason this build does not classify
+    /// further. A reason that shows up in volume here deserves a variant.
+    SignalError,
+    /// Local state was the problem, not the ciphertext: a store that would not
+    /// answer, a row that came back and would not yield what it should hold, or
+    /// state that could not be made durable.
+    ///
+    /// Not confined to Signal state, though that is where most of it comes
+    /// from — a corrupt pre-key, identity, session or sender-key record, or a
+    /// durability failure, in which case the decrypt was abandoned rather than
+    /// advancing a ratchet no crash could recover. A bot (`msmsg`) payload
+    /// reaches it too: a message-secret lookup that *errored* rather than came
+    /// back empty, or a stored `messageSecret` that will not derive a key.
+    /// A secret this device genuinely does not hold is
+    /// [`NoMessageSecret`](Self::NoMessageSecret) instead — that is the
+    /// companion's state, this is ours.
+    ///
+    /// Says nothing about the peer. A per-peer health signal built on this
+    /// event should exclude it.
+    ///
+    /// Says nothing about recovery either. What the client does next is the
+    /// branch's decision, not the reason's: some leave the stanza queued for
+    /// redelivery, others nack it. Like every reason here, this one names where
+    /// the client stopped — see the "not a loss report" note on
+    /// [`EncDecryptFailed`].
+    StorageFailure,
+    /// The `<enc>` decrypted, and the bytes could not be turned into a message:
+    /// padding this build could not strip, or a payload it could not decode.
+    ///
+    /// The one reason that can accompany a [`DecryptedPayload`] for the same
+    /// `<enc>` — when the bytes existed but were unusable, both are emitted.
+    PlaintextUnusable,
+    /// Never attempted. The client recognized the node and did not try it: an
+    /// `skmsg` whose stanza's session `<enc>` failed first (the sender key it
+    /// needed came in that one), a session `<enc>` on a stanza addressed from a
+    /// group, which has no 1:1 session to use, or a stanza abandoned when the
+    /// connection was torn down before its turn to decrypt came.
+    ///
+    /// Says nothing about the ciphertext, which was never read. The last case
+    /// is not even about this stanza — it is about when it arrived.
+    NotAttempted,
+}
+
+impl EncDecryptFailureReason {
+    /// Whether the client entered its decryption path for this `<enc>` at all.
+    ///
+    /// This is the line between *tried and failed* and *recognized and not
+    /// handled*. `false` means the node was set aside before any decryption was
+    /// attempted, so nothing here says whether its ciphertext was good. `true`
+    /// spans everything from an envelope that would not parse to a MAC that
+    /// would not verify — the attempt happened and did not produce plaintext.
+    pub fn decryption_was_attempted(self) -> bool {
+        !matches!(
+            self,
+            Self::MalformedNode | Self::UnsupportedEncType | Self::NotAttempted
+        )
+    }
+}
+
+/// Payload of [`Event::EncDecryptFailed`]: one `<enc>` of a stanza that
+/// produced no plaintext, and why.
+///
+/// The failing half of what [`DecryptedPayload`] reports for the succeeding
+/// half, at the same granularity and under the same numbering. A stanza can
+/// carry one `<enc>` per device; without a per-node signal a consumer watching
+/// decryption can say *this `<enc>` produced these bytes* but not *this `<enc>`
+/// failed for this reason*, and on a fan-out not even which one failed.
+///
+/// Reasons to want it: attributing a failure inside a fan-out, driving a retry
+/// or resync policy off the reason, and measuring session health per peer
+/// rather than per message.
+///
+/// # What it does not say
+///
+/// - **It is not a display signal.** Whether to show the user a placeholder is
+///   [`Event::UndecryptableMessage`], which is per *message*, deduplicated by
+///   `(chat, id)`, and carries the server's `decrypt-fail` hint. This event is
+///   per `<enc>`, is not deduplicated, and answers a different question.
+/// - **It is not a loss report.** Most reasons are recoverable — the client may
+///   already have asked the sender to resend — and this event says nothing
+///   about whether a retry went out or whether one succeeded later.
+/// - **It repeats.** A redelivered stanza that fails again emits it again, once
+///   per `<enc>` per delivery. Correlate on `info.id` if you want at-most-once.
+/// - **A duplicate is not a failure.** An `<enc>` the server redelivered that
+///   this device already processed emits neither this nor [`DecryptedPayload`]:
+///   its plaintext was reported the first time round, and calling that a
+///   failure would put two meanings in one event. The silence covers the
+///   duplicate `<enc>` itself and nothing more: a stanza whose session `<enc>`
+///   were duplicates and nothing else has its `skmsg` decrypted normally, and
+///   one where a duplicate arrives beside an `<enc>` that genuinely failed
+///   skips that `skmsg` on every delivery — so the skip is reported as
+///   [`NotAttempted`](EncDecryptFailureReason::NotAttempted), because no
+///   delivery ever produced its plaintext.
+/// - **Order is `enc_index`, not arrival.** The client decrypts a stanza's
+///   `<enc>` nodes in per-kind passes (session, then group, then bot), so
+///   neither these events nor [`DecryptedPayload`]s arrive in stanza order, and
+///   a failure for a later `<enc>` can precede a success for an earlier one.
+///   Within one stanza both kinds come from the same receive task, so they are
+///   totally ordered relative to each other — just not by position.
+///
+/// Gated by `Client::acquire_enc_decrypt_failed_forwarding()`: nothing is
+/// emitted, and nothing is built, while no consumer holds a lease.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct EncDecryptFailed {
+    /// Which message this `<enc>` belongs to.
+    pub info: Arc<MessageInfo>,
+    /// Which `<enc>` of the stanza this was, counting from zero in the order
+    /// the client enumerates them — the same numbering as
+    /// [`DecryptedPayload::enc_index`], produced by the same enumeration, so
+    /// the two events index one stanza and not two.
+    ///
+    /// That order is the stanza's direct `<enc>` children first, then the ones
+    /// under `<participants><to>` addressed to this device. It is *not* a child
+    /// index.
+    pub enc_index: usize,
+    /// The `type` attribute the `<enc>` carried: `msg`, `pkmsg`, `skmsg`, …
+    ///
+    /// `None` only when the node carried no `type` at all, which is also the
+    /// one thing [`MalformedNode`](EncDecryptFailureReason::MalformedNode) can
+    /// mean here that a present type does not. Borrowed for the types this
+    /// build knows, owned for a `type` it does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enc_type: Option<Cow<'static, str>>,
+    /// Where the client stopped.
+    pub reason: EncDecryptFailureReason,
+}
+
+/// Payload of [`Event::SentFrame`]: one marshaled stanza, exactly as it was
+/// handed to the noise frame encryption.
+///
+/// The send side had no observer at all. [`Event::RawNode`] hands over every
+/// decoded stanza that arrives, but the only thing watching what leaves was a
+/// filtered one-shot waiter for a single expected stanza, and the paths that
+/// never build a `Node` at all (acks, delivery receipts, direct-encoded IQs)
+/// were invisible even to that. So a test could not assert what went to the wire
+/// without wrapping the transport, and a malformed stanza in production could not
+/// be read back without a rebuild.
+///
+/// Reasons to want it: recording a session for replay, asserting the wire form in
+/// an integration test, and diagnosing a stanza the server rejected.
+///
+/// Emitted from the noise sender once the transport accepted the write, which is
+/// the single point every send crosses. A frame that failed to encrypt or to
+/// write never appears here, and neither do the pre-noise handshake frames. It is
+/// dispatched before the send it belongs to resolves, so a caller that awaited a
+/// send can already see its frame.
+///
+/// Gated by `Client::acquire_sent_frame_forwarding()`: nothing is emitted, and
+/// nothing is cloned, while no consumer holds a lease.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct SentFrame {
+    /// The marshaled stanza, keeping the leading format byte the binary
+    /// protocol writes, so decoding it is
+    /// `wacore_binary::marshal::unmarshal_packed_ref(&plaintext)`, which checks
+    /// that byte rather than assuming it.
+    ///
+    /// Plaintext, as the name says, not a transport frame: the length prefix and
+    /// the AEAD tag are added after this, and only
+    /// [`Client::stats`](crate::stats::SessionStats) accounts for those. Replay
+    /// it as a stanza, not as bytes to put on a socket.
+    ///
+    /// A `Bytes`, so forwarding it costs a refcount bump rather than a copy.
+    ///
+    /// **Not serialized**, for the same reason as
+    /// [`DecryptedPayload::payload`]: no text format carries raw bytes without
+    /// an encoding choice this type has no business making.
+    #[serde(skip)]
+    pub plaintext: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
@@ -1781,16 +2267,6 @@ pub struct ContactUpdate {
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
-pub struct PushNameUpdate {
-    /// The contact who changed their push name.
-    pub jid: Jid,
-    pub message: Box<MessageInfo>,
-    pub old_push_name: String,
-    pub new_push_name: String,
-}
-
-#[derive(Debug, Clone, Serialize, bon::Builder)]
-#[non_exhaustive]
 pub struct PinUpdate {
     /// The chat being pinned or unpinned.
     pub jid: Jid,
@@ -1923,6 +2399,104 @@ pub struct LabelAssociationUpdate {
     pub from_full_sync: bool,
 }
 
+/// A label was associated with or removed from a single message on a linked
+/// device (`label_message`). `action.labeled == Some(true)` means the label was
+/// added.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct MessageLabelAssociationUpdate {
+    /// The label identifier.
+    pub label_id: String,
+    /// The chat holding the labelled message.
+    pub chat_jid: Jid,
+    /// The labelled message's id.
+    pub message_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::LabelAssociationAction>,
+    pub from_full_sync: bool,
+}
+
+/// A quick reply was created, edited, or deleted on a linked device.
+///
+/// Deletion is the same mutation with `action.deleted == Some(true)`, not a
+/// syncd `Remove`, so a consumer must check that flag rather than assume the
+/// event always describes a live quick reply.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct QuickReplyUpdate {
+    /// The quick reply's identifier (the index key, not a JID).
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::QuickReplyAction>,
+    pub from_full_sync: bool,
+}
+
+/// The account-wide "disable link previews" privacy setting changed on a linked
+/// device (`setting_disableLinkPreviews`).
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct DisableLinkPreviewsUpdate {
+    /// `true` when link previews are now disabled. Only emitted when the wire
+    /// carried the flag; WA Web treats an absent one as a malformed mutation.
+    pub previews_disabled: bool,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::PrivacySettingDisableLinkPreviewsAction>,
+    pub from_full_sync: bool,
+}
+
+/// A saved contact was deleted on a linked device.
+///
+/// Carries no action payload: the mutation is a syncd `Remove`, and WA Web's
+/// `WAWebContactSync` ignores the value on that branch and simply drops the
+/// contact from the address book.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct ContactRemoved {
+    /// The contact that is no longer saved.
+    pub jid: Jid,
+    pub timestamp: DateTime<Utc>,
+    pub from_full_sync: bool,
+}
+
+/// A call placed or received on the primary device, synced through app state.
+///
+/// The only channel that carries a call the companion never saw signalling for:
+/// a call placed on the phone puts nothing on this socket, so
+/// [`Event::IncomingCall`] and friends cannot see it.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct CallLogSync {
+    /// Who started the call, from the mutation's index.
+    ///
+    /// The index rather than the record: `record.call_creator_jid` is optional
+    /// and WA Web leaves it unset for calls it received none for, while it fills
+    /// the index in either way — falling back to this account for a call it
+    /// placed, or to the peer for one it took.
+    pub call_creator_jid: Jid,
+    /// The call's identifier, from the mutation's index (the same value
+    /// `record.call_id` carries when the record carries one).
+    pub call_id: String,
+    /// Whether *this account* placed the call, from
+    /// [`call_creator_jid`](Self::call_creator_jid) compared against this
+    /// account.
+    ///
+    /// Read this rather than `record.is_incoming`, which is not reliable in
+    /// either direction: it means the opposite of its name in mutations WA Web
+    /// wrote and exactly its name in ones the phone wrote, so a consumer taking
+    /// it at its word files some calls backwards.
+    pub from_me: bool,
+    /// When the mutation was written, not when the call happened — the call's
+    /// own time is `record.start_time`.
+    ///
+    /// This is the field WA Web measures against the pairing timestamp to decide
+    /// whether a record predates the device, so it is worth having; it is not a
+    /// time to file the call under. A mutation that arrives without one falls
+    /// back to the moment it was received, as every other app-state event does.
+    pub timestamp: DateTime<Utc>,
+    pub record: Box<wa::CallLogRecord>,
+    pub from_full_sync: bool,
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
@@ -1954,6 +2528,9 @@ mod tests {
         assert_eq!(EventKind::ServerAck as u8, 57);
         assert_eq!(EventKind::PairingQrCodesExhausted as u8, 58);
         assert_eq!(EventKind::PairingCodeError as u8, 59);
+        assert_eq!(EventKind::AppStateSyncFailed as u8, 60);
+        assert_eq!(EventKind::EncDecryptFailed as u8, 67);
+        assert_eq!(EventKind::CallLogSync as u8, 68);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted

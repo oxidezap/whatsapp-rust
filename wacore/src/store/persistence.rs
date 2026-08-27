@@ -45,10 +45,7 @@ impl PersistenceManager {
         let device_data_opt = backend.load().await?;
 
         let device = if let Some(serializable_device) = device_data_opt {
-            debug!(
-                "PersistenceManager: Loaded existing device data (PushName: '{}'). Initializing Device.",
-                serializable_device.push_name
-            );
+            debug!("PersistenceManager: Loaded existing device data. Initializing Device.");
             serializable_device
         } else {
             debug!("PersistenceManager: No data yet; initializing default Device in memory.");

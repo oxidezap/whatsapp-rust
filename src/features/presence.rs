@@ -73,10 +73,7 @@ impl<'a> Presence<'a> {
     pub async fn set(&self, status: PresenceStatus) -> Result<(), PresenceError> {
         let device_snapshot = self.client.persistence_manager().get_device_snapshot();
 
-        debug!(
-            "send_presence called with push_name: '{}'",
-            device_snapshot.push_name
-        );
+        debug!("send_presence called");
 
         if device_snapshot.push_name.is_empty() {
             warn!("Cannot send presence: push_name is empty!");
@@ -100,15 +97,10 @@ impl<'a> Presence<'a> {
             .attr("name", &device_snapshot.push_name)
             .build();
 
-        debug!(
-            "Sending presence stanza: <presence type=\"{}\" name=\"{}\"/>",
-            presence_type,
-            node.attrs
-                .get("name")
-                .map(|s| s.as_str())
-                .as_deref()
-                .unwrap_or("")
-        );
+        // The stanza carries the push name, so log the type alone: reprinting
+        // the attribute puts the user's display name back in the log this
+        // module just took it out of.
+        debug!("Sending presence stanza: type={presence_type}");
 
         self.client.send_node(node).await?;
         Ok(())
@@ -140,24 +132,30 @@ impl<'a> Presence<'a> {
         debug!("presence subscribe: subscribing to {}", jid);
         let node = self.build_subscription_node(jid).await;
         self.client.send_node(node).await?;
-        self.client.track_presence_subscription(jid.clone()).await;
+        self.client.track_presence_subscription(jid.clone());
         Ok(())
     }
 
     /// Re-subscribe presence if the JID has an active subscription.
     /// Does not modify the tracking set.
+    ///
+    /// The check is re-read per JID rather than taken from the resubscribe
+    /// snapshot: an `unsubscribe` landing mid-resubscribe must not be undone.
     pub(crate) async fn re_subscribe_when_active(&self, jid: &Jid) -> Result<(), PresenceError> {
-        if !self
-            .client
-            .presence_subscriptions
-            .lock()
-            .await
-            .contains(jid)
-        {
+        if !self.client.is_presence_subscription_tracked(jid) {
             return Ok(());
         }
 
         let node = self.build_subscription_node(jid).await;
+        // Re-read after the token lookup, which awaits. An `unsubscribe` landing
+        // in that window has already sent its own stanza, so subscribing now
+        // would leave the peer subscribed while we no longer track it. This
+        // narrows the window rather than closing it — `send_node` awaits too —
+        // but the lookup is the wide half and the re-read costs an uncontended
+        // lock.
+        if !self.client.is_presence_subscription_tracked(jid) {
+            return Ok(());
+        }
         self.client.send_node(node).await?;
         Ok(())
     }
@@ -174,31 +172,38 @@ impl<'a> Presence<'a> {
         debug!("presence unsubscribe: unsubscribing from {}", jid);
         let node = self.build_unsubscription_node(jid);
         self.client.send_node(node).await?;
-        self.client.untrack_presence_subscription(jid).await;
+        self.client.untrack_presence_subscription(jid);
         Ok(())
     }
 }
 
 impl Client {
-    pub(crate) async fn track_presence_subscription(&self, jid: Jid) {
-        self.presence_subscriptions.lock().await.insert(jid);
-    }
-
-    pub(crate) async fn untrack_presence_subscription(&self, jid: &Jid) {
-        self.presence_subscriptions.lock().await.remove(jid);
-    }
-
-    pub(crate) async fn tracked_presence_subscriptions(&self) -> Vec<Jid> {
+    fn lock_presence_subscriptions(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashSet<Jid>> {
         self.presence_subscriptions
             .lock()
-            .await
-            .iter()
-            .cloned()
-            .collect()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub(crate) fn track_presence_subscription(&self, jid: Jid) {
+        self.lock_presence_subscriptions().insert(jid);
+    }
+
+    pub(crate) fn untrack_presence_subscription(&self, jid: &Jid) {
+        self.lock_presence_subscriptions().remove(jid);
+    }
+
+    pub(crate) fn is_presence_subscription_tracked(&self, jid: &Jid) -> bool {
+        self.lock_presence_subscriptions().contains(jid)
+    }
+
+    pub(crate) fn tracked_presence_subscriptions(&self) -> Vec<Jid> {
+        self.lock_presence_subscriptions().iter().cloned().collect()
     }
 
     pub(crate) async fn resubscribe_presence_subscriptions(&self, expected_generation: u64) {
-        let subscribed_jids = self.tracked_presence_subscriptions().await;
+        let subscribed_jids = self.tracked_presence_subscriptions();
         if subscribed_jids.is_empty() {
             return;
         }
@@ -413,10 +418,10 @@ mod tests {
         let client = bot.client();
         let jid = Jid::from_str("1234567890@s.whatsapp.net").expect("valid jid");
 
-        client.track_presence_subscription(jid.clone()).await;
-        client.track_presence_subscription(jid.clone()).await;
+        client.track_presence_subscription(jid.clone());
+        client.track_presence_subscription(jid.clone());
 
-        let tracked = client.tracked_presence_subscriptions().await;
+        let tracked = client.tracked_presence_subscriptions();
         assert_eq!(tracked, vec![jid]);
     }
 
@@ -437,11 +442,11 @@ mod tests {
         let client = bot.client();
         let jid = Jid::from_str("1234567890@s.whatsapp.net").expect("valid jid");
 
-        client.track_presence_subscription(jid.clone()).await;
-        client.untrack_presence_subscription(&jid).await;
+        client.track_presence_subscription(jid.clone());
+        client.untrack_presence_subscription(&jid);
 
         assert!(
-            client.tracked_presence_subscriptions().await.is_empty(),
+            client.tracked_presence_subscriptions().is_empty(),
             "unsubscribe tracking should remove the jid"
         );
     }
@@ -473,6 +478,109 @@ mod tests {
         assert!(
             node.content.is_none(),
             "unsubscribe stanza should not have children"
+        );
+    }
+
+    /// The resubscribe loop snapshots the tracked set, then re-checks each JID
+    /// before sending. This gates the send so an `unsubscribe` lands after the
+    /// snapshot was taken but before the loop reaches that JID.
+    #[tokio::test]
+    async fn resubscribe_skips_a_jid_unsubscribed_mid_loop() {
+        use crate::client::NodeFilter;
+        use bytes::Bytes;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct GatedTransport {
+            started: async_channel::Sender<()>,
+            release: async_channel::Receiver<()>,
+            gate_next_send: AtomicBool,
+            sends: Arc<AtomicUsize>,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        impl crate::transport::Transport for GatedTransport {
+            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
+                self.sends.fetch_add(1, Ordering::AcqRel);
+                if self.gate_next_send.swap(false, Ordering::AcqRel) {
+                    self.started
+                        .send(())
+                        .await
+                        .map_err(|_| anyhow::anyhow!("gate observer closed"))?;
+                    self.release
+                        .recv()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("gate closed"))?;
+                }
+                Ok(())
+            }
+
+            async fn disconnect(&self) {}
+        }
+
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+
+        let (started_tx, started_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let gated = crate::socket::NoiseSocket::new(
+            Arc::new(TokioRuntime),
+            Arc::new(GatedTransport {
+                started: started_tx,
+                release: release_rx,
+                gate_next_send: AtomicBool::new(true),
+                sends: sends.clone(),
+            }),
+            wacore::handshake::NoiseCipher::new(&[0u8; 32]).expect("valid key"),
+            wacore::handshake::NoiseCipher::new(&[0u8; 32]).expect("valid key"),
+        );
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(gated));
+
+        let first: Jid = "12025550111@s.whatsapp.net".parse().expect("valid jid");
+        let second: Jid = "12025550122@s.whatsapp.net".parse().expect("valid jid");
+        client.track_presence_subscription(first.clone());
+        client.track_presence_subscription(second.clone());
+
+        // Which JID the set yields first is not fixed, so learn it from the
+        // stanza rather than assuming an iteration order.
+        let sent = client.wait_for_sent_node(NodeFilter::tag("presence"));
+        let generation = client.connection_generation.load(Ordering::SeqCst);
+        let resubscribe = {
+            let client = client.clone();
+            tokio::spawn(async move { client.resubscribe_presence_subscriptions(generation).await })
+        };
+
+        let node = sent.await.expect("the loop sends the first subscribe");
+        let sent_to = node
+            .attrs
+            .get("to")
+            .cloned()
+            .expect("subscribe carries a target");
+        started_rx.recv().await.expect("the first send is gated");
+
+        let unsubscribed = if sent_to == first.to_string() {
+            second
+        } else {
+            first
+        };
+        client.untrack_presence_subscription(&unsubscribed);
+
+        release_tx.send(()).await.expect("gate released");
+        resubscribe
+            .await
+            .expect("resubscribe task should not panic");
+
+        assert_eq!(
+            sends.load(Ordering::Acquire),
+            1,
+            "only the JID still tracked when the loop reached it may be re-subscribed"
+        );
+        assert!(
+            !client
+                .tracked_presence_subscriptions()
+                .contains(&unsubscribed),
+            "and the unsubscribe must stand"
         );
     }
 }

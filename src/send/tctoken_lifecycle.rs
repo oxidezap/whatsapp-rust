@@ -1,19 +1,27 @@
 use super::*;
 
+/// Whether `jid` addresses this account, given its two identities.
+///
+/// Both, because a JID reaches us as a phone number or a LID depending on the
+/// thread's migration state, and only one of the two ever matches.
+///
+/// Addressing mode is part of the answer, not noise: WA Web's `isMeAccount`
+/// keys on `isSameAccountAndAddressingMode`, so a peer LID whose digits happen
+/// to spell our phone number is not us. `is_same_user_as` compares only the
+/// user and would say it is — the same looseness `is_same_chat_as` exists to
+/// guard, and the same rule `is_self_dm_recipient` already follows.
+pub(crate) fn is_own_identity(own_pn: Option<&Jid>, own_lid: Option<&Jid>, jid: &Jid) -> bool {
+    own_pn.is_some_and(|pn| pn.is_same_chat_as(jid))
+        || own_lid.is_some_and(|lid| lid.is_same_chat_as(jid))
+}
+
 impl Client {
     /// Whether `jid` is our own account (PN or LID). The privacy-token paths
     /// never attach to or issue for ourselves; a single source of truth keeps
     /// the message and call paths from drifting apart.
-    fn is_own_jid(&self, jid: &Jid) -> bool {
+    pub(crate) fn is_own_jid(&self, jid: &Jid) -> bool {
         let snapshot = self.persistence_manager.get_device_snapshot();
-        snapshot
-            .pn
-            .as_ref()
-            .is_some_and(|pn| pn.is_same_user_as(jid))
-            || snapshot
-                .lid
-                .as_ref()
-                .is_some_and(|lid| lid.is_same_user_as(jid))
+        is_own_identity(snapshot.pn.as_ref(), snapshot.lid.as_ref(), jid)
     }
 
     /// Look up and include a privacy token in outgoing 1:1 message stanza nodes.
@@ -412,9 +420,41 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use super::is_own_identity;
     use crate::test_utils::create_test_client;
     use wacore::store::traits::TcTokenEntry;
     use wacore_binary::{Jid, Server};
+
+    /// Self-detection keys on the addressing mode, not just the digits. A LID
+    /// is an assigned number in its own namespace, so one can spell a phone
+    /// number that belongs to somebody else — and a user-only comparison would
+    /// hand that peer our own identity: no privacy token where one is due, and
+    /// a call they placed filed as one we placed.
+    #[test]
+    fn a_peer_addressed_in_the_other_namespace_is_not_us() {
+        let own_pn = Jid::new("5511888880000", Server::Pn);
+        let own_lid = Jid::new("111122223333444", Server::Lid);
+
+        // Each identity matches itself, device suffix and all.
+        assert!(is_own_identity(Some(&own_pn), Some(&own_lid), &own_pn));
+        assert!(is_own_identity(Some(&own_pn), Some(&own_lid), &own_lid));
+        assert!(is_own_identity(
+            Some(&own_pn),
+            Some(&own_lid),
+            &own_pn.with_device(12)
+        ));
+
+        // Same digits, other namespace: a different account, both ways round.
+        let peer_lid = Jid::new("5511888880000", Server::Lid);
+        let peer_pn = Jid::new("111122223333444", Server::Pn);
+        assert!(!is_own_identity(Some(&own_pn), Some(&own_lid), &peer_lid));
+        assert!(!is_own_identity(Some(&own_pn), Some(&own_lid), &peer_pn));
+
+        // And with no LID known, our PN's digits in the LID namespace are still
+        // not us — the case `lid_recipient_without_own_lid_is_not_self_dm`
+        // pins for self-DM detection, which follows the same rule.
+        assert!(!is_own_identity(Some(&own_pn), None, &peer_lid));
+    }
 
     #[tokio::test]
     async fn record_sender_timestamp_creates_byteless_placeholder() {

@@ -58,7 +58,9 @@ use whatsapp_rust::voip::audio::{WaOpusDecoder, WaOpusEncoder};
 use whatsapp_rust::voip::session::{MediaPipeline, MediaPipelineParams};
 #[cfg(feature = "voip-opus")]
 use whatsapp_rust::voip::{AudioCodec, EncodedAudioFrame};
-use whatsapp_rust::voip::{AudioFormat, CallHandle, VideoState, VideoUpgradeToken};
+use whatsapp_rust::voip::{
+    AudioFormat, CallHandle, CallTermination, VideoState, VideoUpgradeToken,
+};
 
 mod video;
 use video::VideoOpts;
@@ -1012,7 +1014,7 @@ fn mark_call_most_recent(order: &mut Vec<String>, call_id: &str) {
 async fn register_handle(state: &Arc<Mutex<CallState>>, cid: String, handle: Arc<CallHandle>) {
     if complete_call_startup(state, &cid) {
         // The library also sees the terminate, but this closes a handle created after that teardown.
-        handle.hangup().await;
+        handle.hangup_local().await;
         info!("◾ discarded media startup for already-ended call {cid}");
         return;
     }
@@ -1494,7 +1496,7 @@ async fn respond_to_offer(
 /// Single-key commands on stdin during a live call: `v` toggles video (start an upgrade / accept a
 /// pending peer request / downgrade), `q` hangs up. Skipped when stdin is not a terminal (CI /
 /// piped input would EOF-spin).
-fn spawn_stdin_ui(client: Arc<Client>, state: Arc<Mutex<CallState>>) {
+fn spawn_stdin_ui(state: Arc<Mutex<CallState>>) {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return;
@@ -1568,16 +1570,17 @@ fn spawn_stdin_ui(client: Arc<Client>, state: Arc<Mutex<CallState>>) {
                 },
                 "q" => {
                     info!("⌨  hanging up {cid}");
-                    // Signal the peer with a <terminate> (which also tears our media down), so it
-                    // sees a normal hangup instead of waiting for the transport to time out. Fall
-                    // back to a local-only hangup if the send fails.
-                    if let Err(e) = client
-                        .voip()
-                        .terminate(&cid, &handle.peer_jid(), handle.call_creator())
-                        .await
-                    {
-                        warn!("⌨  terminate failed ({e}); tearing down locally");
-                        handle.hangup().await;
+                    match handle.terminate().await {
+                        CallTermination::LocalOnly(e) => {
+                            warn!("⌨  terminate to the peer is unconfirmed ({e}); ended locally")
+                        }
+                        CallTermination::PartlyNotified {
+                            notified,
+                            unconfirmed,
+                        } => warn!(
+                            "⌨  terminate reached {notified} device(s), {unconfirmed} unconfirmed"
+                        ),
+                        _ => {}
                     }
                 }
                 "" => {}
@@ -1653,7 +1656,7 @@ async fn run_bot(mode: Mode) -> Result<()> {
     }
 
     if manages_media {
-        spawn_stdin_ui(client.clone(), observer.state.clone());
+        spawn_stdin_ui(observer.state.clone());
     }
 
     tokio::select! {

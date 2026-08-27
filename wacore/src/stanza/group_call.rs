@@ -52,6 +52,8 @@ pub struct GroupInviteOfferParams<'a> {
     pub target_devices: &'a [Jid],
     pub participants: &'a [GroupCallParticipant],
     pub video: bool,
+    /// The rotation this side announces, in `0..=3`. Out of range is an error.
+    pub device_orientation: u8,
 }
 
 /// Direct delivery of one shared keygen-v2 epoch.
@@ -130,7 +132,9 @@ pub fn build_initial_group_offer(params: &InitialGroupOfferParams<'_>) -> Result
     let audio_rate = params.audio_rate.to_string();
     let mut children = vec![audio_opus(&audio_rate)];
     if params.video {
-        children.push(video_offer_node());
+        // No handle exists for a call still being offered, so no rotation can
+        // have been set for it yet.
+        children.push(video_offer_node(0));
     }
     children.push(NodeBuilder::new("net").attr("medium", "3").build());
     children.push(NodeBuilder::new("group_info").children(users).build());
@@ -163,9 +167,13 @@ pub fn build_group_invite_offer(params: &GroupInviteOfferParams<'_>) -> Result<N
         bail!("group invite requires an active roster");
     }
 
+    if params.device_orientation > 3 {
+        bail!("group invite device orientation must be quarter turns in 0..=3");
+    }
+
     let mut children = vec![audio_opus("16000")];
     if params.video {
-        children.push(video_offer_node());
+        children.push(video_offer_node(params.device_orientation));
     }
     children.push(NodeBuilder::new("net").attr("medium", "2").build());
     children.push(destination_to(params.target_devices));
@@ -696,6 +704,7 @@ pub fn build_call_link_join_with_capability(
         children.push(
             NodeBuilder::new("video")
                 .attr("dec", "H264")
+                // No handle exists yet for the call being joined.
                 .attr("device_orientation", "0")
                 .build(),
         );
@@ -1241,14 +1250,14 @@ fn audio_opus(rate: &str) -> Node {
 
 #[cold]
 #[inline(never)]
-fn video_offer_node() -> Node {
+fn video_offer_node(device_orientation: u8) -> Node {
     NodeBuilder::new("video")
         .attr("enc", "h264")
         .attr("dec", "h264")
         .attr("orientation", "0")
         .attr("screen_width", "1920")
         .attr("screen_height", "1080")
-        .attr("device_orientation", "0")
+        .attr("device_orientation", device_orientation.to_string())
         .build()
 }
 
@@ -1543,11 +1552,23 @@ mod tests {
             target_devices: &target_devices,
             participants: &roster,
             video: true,
+            device_orientation: 2,
         })
         .expect("valid invite");
         assert_eq!(
             child_tags(action(&node)),
             ["audio", "video", "net", "destination", "group_info"]
+        );
+        assert_eq!(
+            action(&node)
+                .children()
+                .into_iter()
+                .flatten()
+                .find(|child| child.tag == "video")
+                .and_then(|video| video.attrs().optional_string("device_orientation"))
+                .as_deref(),
+            Some("2"),
+            "an invitation sent from a rotated camera has to describe that camera"
         );
         let action_node = action(&node);
         let action_ref = action_node.as_node_ref();

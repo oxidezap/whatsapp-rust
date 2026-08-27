@@ -61,18 +61,7 @@ pub struct GroupNotification {
     pub actions: Vec<GroupNotificationAction>,
 }
 
-/// Admin tier from `<participant type="...">`. Mirrors
-/// `GROUP_PARTICIPANT_TYPES` in `WAWebGroupApiConst`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum GroupParticipantType {
-    #[wire_default]
-    #[wire = "participant"]
-    Participant,
-    #[wire = "admin"]
-    Admin,
-    #[wire = "superadmin"]
-    SuperAdmin,
-}
+pub use crate::types::wire_enums::GroupParticipantType;
 
 /// Delivery state for history shared with a newly joined participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -548,7 +537,7 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
             GroupNotificationAction::RevokedMembershipRequests { participants }
         }
         T::MemberAddMode => {
-            let mode = match node.content.as_deref() {
+            let mode = match node.content.as_ref() {
                 Some(NodeContentRef::String(s)) => s.to_string(),
                 Some(NodeContentRef::Bytes(b)) => String::from_utf8_lossy(b.as_ref()).into_owned(),
                 _ => String::new(),

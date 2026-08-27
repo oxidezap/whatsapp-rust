@@ -18,6 +18,7 @@
 #![deny(unsafe_code)]
 
 pub mod consts;
+mod counter_lease;
 mod crypto;
 pub mod error;
 mod group_cipher;
@@ -37,10 +38,7 @@ mod storage;
 mod stores;
 mod timestamp;
 pub use crate::core::curve::{CurveError, KeyPair, PreparedVerifyingKey, PrivateKey, PublicKey};
-pub use crate::core::{
-    Aci, AddressBuf, DeviceId, Pni, ProtocolAddress, ServiceId, ServiceIdFixedWidthBinaryBytes,
-    ServiceIdKind,
-};
+pub use crate::core::{AddressBuf, DeviceId, ProtocolAddress};
 pub use crate::protocol::protocol::SENDERKEY_MESSAGE_CURRENT_VERSION;
 pub use crate::protocol::sender_keys::InvalidSenderKeySessionError;
 pub use crate::store::sender_key_name::SenderKeyName;

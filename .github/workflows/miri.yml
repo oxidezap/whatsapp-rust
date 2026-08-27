@@ -9,6 +9,12 @@ on:
     branches: [main]
   workflow_call:
 
+concurrency:
+  # Grouped and scoped exactly as main.yml's concurrency block, for the reasons
+  # given there.
+  group: miri-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # Keep in sync with PROTOC_VERSION in main.yml — env is per-workflow, so the
@@ -40,15 +46,14 @@ jobs:
           # inflate's uninitialized spare capacity in `zlib_pool`. Both are
           # invisible to clippy and to native tests — nothing observes the
           # aliasing violation or the uninit read until it miscompiles.
+          #
+          # One leg, not two: the crate used to carry portable-SIMD scanners in
+          # the decoder/encoder alongside scalar fallbacks, so `--no-default-
+          # features` reached a genuinely different code path. The packed codec
+          # is table-driven scalar now and there is only one path to check.
           - name: wacore-binary
-            cache-key: binary-simd
+            cache-key: binary
             args: -p wacore-binary --lib
-          # The portable-SIMD scanners in the decoder/encoder and their scalar
-          # fallbacks are separate code paths, and `--no-default-features` is the
-          # only way to reach the latter.
-          - name: wacore-binary (no simd)
-            cache-key: binary-scalar
-            args: -p wacore-binary --no-default-features --lib
           # No `unsafe` of its own, but it drives wacore-binary's zero-copy
           # decode over real Noise frames and pulls the crypto stack
           # (aes/sha2/curve25519), whose unsafe backends this exercises.

@@ -147,28 +147,29 @@ async fn test_send_aborts_before_wire_when_lease_persist_fails() -> anyhow::Resu
     );
 
     // End-to-end corroboration: the stanza never went out, so B never sees it.
+    // The recovery send is the barrier. Both messages are in one chat, so they
+    // share a lane, and B's channel is FIFO: if the aborted send had reached the
+    // wire after all, B would have it before this one. Recovering here also
+    // proves the failure aborted cleanly rather than wedging the session.
+    client_a.backend.set_fail_session_writes(false);
+    client_a
+        .client
+        .send_message(jid_b.clone(), e2e_tests::text_msg("after recovery"))
+        .await?;
     client_b
-        .assert_no_event(
-            3,
+        .assert_no_event_before(
+            30,
             |e| {
                 e.messages()
                     .any(|m| m.message.conversation.as_deref() == Some("must not reach the wire"))
             },
+            |e| {
+                e.messages()
+                    .any(|m| m.message.conversation.as_deref() == Some("after recovery"))
+            },
             "a send that failed to persist must not deliver",
         )
         .await?;
-
-    // Recovery: once persistence works again, sends deliver normally, proving
-    // the failure aborted cleanly rather than wedging the session.
-    client_a.backend.set_fail_session_writes(false);
-    send_and_expect_text(
-        &client_a.client,
-        &mut client_b,
-        &jid_b,
-        "after recovery",
-        30,
-    )
-    .await?;
 
     client_a.disconnect().await;
     client_b.disconnect().await;

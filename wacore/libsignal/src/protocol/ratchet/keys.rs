@@ -6,8 +6,6 @@
 use std::fmt;
 use std::sync::LazyLock;
 
-use arrayref::array_ref;
-
 use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::Sha256;
 
@@ -20,8 +18,6 @@ use crate::protocol::{PrivateKey, PublicKey, Result, crypto, stores::session_str
 /// 2. **Zero-cost round-trip**: Keys loaded from protobuf are kept in serialized form and
 ///    returned as-is when saving, avoiding unnecessary deserialization and re-serialization
 pub enum MessageKeyGenerator {
-    /// Native computed keys - from encryption operations
-    Keys(MessageKeys),
     /// Seed for lazy derivation - keys derived on demand
     Seed(([u8; 32], u32)),
     /// Original protobuf - zero-cost pass-through on save
@@ -39,7 +35,6 @@ impl MessageKeyGenerator {
     pub fn generate_keys(self) -> MessageKeys {
         match self {
             Self::Seed((seed, counter)) => MessageKeys::derive_keys(&seed, None, counter),
-            Self::Keys(k) => k,
             Self::Serialized(pb) => {
                 // Parse on demand - only when keys are actually needed.
                 // Note: from_pb() validates field lengths before creating Serialized,
@@ -72,22 +67,31 @@ impl MessageKeyGenerator {
     }
 
     /// Convert to protobuf format for storage.
-    /// Zero-cost for Serialized variant (pass-through), allocates for others.
+    /// Zero-cost for Serialized variant (pass-through), one 32-byte copy for a seed.
+    ///
+    /// A seed is stored as a seed alone. The cipher/mac/iv triple is derived
+    /// from it one way, so writing both stores one secret twice and pays an
+    /// HKDF expansion to 80 bytes for a key that may never be asked for: a
+    /// forward jump buffers one entry per skipped message and consumes at most
+    /// one of them, and the buffer is capped, so most entries are evicted
+    /// having never been read. `from_pb` re-derives on the way out, at the one
+    /// moment the material is actually needed, and
+    /// `SessionMessageKeyComponents` already treats a stored seed as the
+    /// authoritative material when a record carries both.
+    ///
+    /// Records written before this carry the triple and keep round-tripping
+    /// through the `Serialized` arm untouched.
     pub fn into_pb(self) -> session_structure::chain::MessageKey {
         match self {
             // Zero-cost pass-through: return original protobuf unchanged
             Self::Serialized(pb) => pb,
-            // Need to serialize: derive keys and convert
-            Self::Seed(_) | Self::Keys(_) => {
-                use bytes::Bytes;
-                let keys = self.generate_keys();
-                session_structure::chain::MessageKey {
-                    cipher_key: Some(Bytes::copy_from_slice(keys.cipher_key())),
-                    mac_key: Some(Bytes::copy_from_slice(keys.mac_key())),
-                    iv: Some(Bytes::copy_from_slice(keys.iv())),
-                    index: Some(keys.counter()),
-                }
-            }
+            Self::Seed((seed, counter)) => session_structure::chain::MessageKey {
+                cipher_key: None,
+                mac_key: None,
+                iv: None,
+                index: Some(counter),
+                seed: Some(bytes::Bytes::copy_from_slice(&seed)),
+            },
         }
     }
 
@@ -101,17 +105,25 @@ impl MessageKeyGenerator {
             && pb.iv.as_ref().is_some_and(|b| b.len() == 16)
         {
             // Keep as Serialized for zero-cost round-trip
-            Ok(Self::Serialized(pb))
-        } else {
-            Err("invalid message key format")
+            return Ok(Self::Serialized(pb));
         }
+        // A key buffered by the skip loop, or imported from a seed-based
+        // external record: the derivation runs now instead of when it was
+        // stored.
+        if let Some(seed) = pb
+            .seed
+            .as_deref()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        {
+            return Ok(Self::Seed((seed, pb.index.unwrap_or(0))));
+        }
+        Err("invalid message key format")
     }
 
     /// Get the counter/index without fully parsing the keys.
     #[inline]
     pub fn counter(&self) -> u32 {
         match self {
-            Self::Keys(k) => k.counter(),
             Self::Seed((_, counter)) => *counter,
             Self::Serialized(pb) => pb.index.unwrap_or(0),
         }
@@ -156,10 +168,17 @@ impl MessageKeys {
             }
         }
 
+        // `split_first_chunk` carries the window lengths in the type, so the
+        // 32/32/16 split of the 80-byte OKM is checked at compile time and the
+        // `Option` folds away against the fixed-size array.
+        let (cipher_key, rest) = okm.split_first_chunk::<32>().expect("80-byte OKM");
+        let (mac_key, rest) = rest.split_first_chunk::<32>().expect("80-byte OKM");
+        let (iv, _) = rest.split_first_chunk::<16>().expect("80-byte OKM");
+
         MessageKeys {
-            cipher_key: *array_ref![okm, 0, 32],
-            mac_key: *array_ref![okm, 32, 32],
-            iv: *array_ref![okm, 64, 16],
+            cipher_key: *cipher_key,
+            mac_key: *mac_key,
+            iv: *iv,
             counter,
         }
     }
@@ -284,12 +303,15 @@ impl RootKey {
             .expand(b"WhisperRatchet", &mut derived_secret_bytes)
             .expect("valid output length");
 
+        let (root_key, chain_key) = derived_secret_bytes
+            .split_first_chunk::<32>()
+            .expect("64-byte OKM");
+        let (chain_key, _) = chain_key.split_first_chunk::<32>().expect("64-byte OKM");
+
         Ok((
-            RootKey {
-                key: *array_ref![derived_secret_bytes, 0, 32],
-            },
+            RootKey { key: *root_key },
             ChainKey {
-                key: *array_ref![derived_secret_bytes, 32, 32],
+                key: *chain_key,
                 index: 0,
             },
         ))
@@ -326,9 +348,9 @@ mod tests {
                 .expand(b"WhisperMessageKeys", &mut okm)
                 .expect("valid output length");
 
-            assert_eq!(keys.cipher_key(), array_ref![okm, 0, 32]);
-            assert_eq!(keys.mac_key(), array_ref![okm, 32, 32]);
-            assert_eq!(keys.iv(), array_ref![okm, 64, 16]);
+            assert_eq!(&keys.cipher_key()[..], &okm[0..32]);
+            assert_eq!(&keys.mac_key()[..], &okm[32..64]);
+            assert_eq!(&keys.iv()[..], &okm[64..80]);
             assert_eq!(keys.counter(), i as u32);
         }
     }
@@ -453,6 +475,118 @@ mod tests {
         let generator2 = MessageKeyGenerator::new_from_seed(&seed, counter);
         let keys2 = generator2.generate_keys();
         assert_eq!(keys.cipher_key(), keys2.cipher_key());
+    }
+
+    /// A record as `into_pb` wrote it before the derived triple stopped being
+    /// persisted: seed and triple side by side. Every "keys persisted before"
+    /// fixture below starts from this, because `into_pb` no longer produces it.
+    fn legacy_pb(seed: &[u8; 32], counter: u32) -> session_structure::chain::MessageKey {
+        use bytes::Bytes;
+        let keys = MessageKeys::derive_keys(seed, None, counter);
+        session_structure::chain::MessageKey {
+            cipher_key: Some(Bytes::copy_from_slice(keys.cipher_key())),
+            mac_key: Some(Bytes::copy_from_slice(keys.mac_key())),
+            iv: Some(Bytes::copy_from_slice(keys.iv())),
+            index: Some(counter),
+            seed: Some(Bytes::copy_from_slice(seed)),
+        }
+    }
+
+    /// The seed is the whole stored key: the triple beside it was redundant
+    /// with it, and deriving it cost an HKDF expansion per skipped message.
+    #[test]
+    fn into_pb_persists_the_seed_alone() {
+        let seed = [0x3Cu8; 32];
+        let pb = MessageKeyGenerator::new_from_seed(&seed, 11).into_pb();
+
+        assert_eq!(pb.index, Some(11));
+        assert_eq!(pb.seed.as_deref(), Some(&seed[..]));
+        assert_eq!(pb.cipher_key, None);
+        assert_eq!(pb.mac_key, None);
+        assert_eq!(pb.iv, None);
+    }
+
+    /// ...and the material it stands for is unchanged: what a seed-only entry
+    /// loads back as is bit-for-bit what the eagerly derived triple held.
+    #[test]
+    fn a_seed_only_key_reloads_as_the_keys_the_seed_derives() {
+        let seed = [0x3Cu8; 32];
+        let expected = MessageKeys::derive_keys(&seed, None, 11);
+
+        let reloaded =
+            MessageKeyGenerator::from_pb(MessageKeyGenerator::new_from_seed(&seed, 11).into_pb())
+                .expect("seed-only key stays loadable")
+                .generate_keys();
+
+        assert_eq!(reloaded.cipher_key(), expected.cipher_key());
+        assert_eq!(reloaded.mac_key(), expected.mac_key());
+        assert_eq!(reloaded.iv(), expected.iv());
+        assert_eq!(reloaded.counter(), 11);
+    }
+
+    /// Reloading a persisted key must keep using the stored derived material,
+    /// not re-derive from the seed: a decrypt that changed keys here would
+    /// silently fail the MAC. Only material the seed does *not* produce can
+    /// tell the two apart, so the fixture stores a deliberately unrelated
+    /// triple next to it.
+    #[test]
+    fn reloaded_keys_come_from_the_persisted_derived_material() {
+        use bytes::Bytes;
+
+        let seed = [0x9Eu8; 32];
+        let mut pb = legacy_pb(&seed, 4);
+        pb.cipher_key = Some(Bytes::from_static(&[0x11; 32]));
+        pb.mac_key = Some(Bytes::from_static(&[0x22; 32]));
+        pb.iv = Some(Bytes::from_static(&[0x33; 16]));
+        let from_seed = MessageKeys::derive_keys(&seed, None, 4);
+
+        let reloaded = MessageKeyGenerator::from_pb(pb)
+            .expect("key stays loadable")
+            .generate_keys();
+
+        assert_eq!(reloaded.cipher_key(), &[0x11; 32]);
+        assert_eq!(reloaded.mac_key(), &[0x22; 32]);
+        assert_eq!(reloaded.iv(), &[0x33; 16]);
+        assert_eq!(reloaded.counter(), 4);
+        assert_ne!(reloaded.cipher_key(), from_seed.cipher_key());
+    }
+
+    /// Keys persisted before the seed was retained must still load and produce
+    /// exactly what was stored.
+    #[test]
+    fn seedless_persisted_keys_still_load() {
+        let seed = [0x9Eu8; 32];
+        let mut pb = legacy_pb(&seed, 4);
+        let expected = MessageKeys::derive_keys(&seed, None, 4);
+        pb.seed = None;
+
+        let reloaded = MessageKeyGenerator::from_pb(pb)
+            .expect("seedless key stays loadable")
+            .generate_keys();
+
+        assert_eq!(reloaded.cipher_key(), expected.cipher_key());
+        assert_eq!(reloaded.mac_key(), expected.mac_key());
+        assert_eq!(reloaded.iv(), expected.iv());
+        assert_eq!(reloaded.counter(), 4);
+    }
+
+    /// A key that carries neither the seed nor a complete triple describes no
+    /// material at all, and must not load as one silently defaulted to zeros.
+    #[test]
+    fn from_pb_rejects_a_key_with_neither_seed_nor_derived_material() {
+        let mut pb = legacy_pb(&[0x2Bu8; 32], 0);
+        pb.cipher_key = None;
+        pb.seed = None;
+
+        assert!(MessageKeyGenerator::from_pb(pb).is_err());
+
+        // A partial triple is no better than none: an entry missing one of the
+        // three is as unusable as an empty one.
+        let mut pb = legacy_pb(&[0x2Bu8; 32], 0);
+        pb.iv = None;
+        pb.seed = None;
+
+        assert!(MessageKeyGenerator::from_pb(pb).is_err());
     }
 
     /// Test MessageKeys derive_keys with known inputs

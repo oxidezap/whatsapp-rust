@@ -176,7 +176,7 @@ impl IqSpec for MexQuerySpec {
             .ok_or_else(|| anyhow!("Missing <result> node in MEX response"))?;
 
         // Handle both binary and string content from the server
-        let mex_response: MexResponse = match result_node.content.as_deref() {
+        let mex_response: MexResponse = match result_node.content.as_ref() {
             Some(NodeContentRef::Bytes(bytes)) => serde_json::from_slice(bytes)?,
             Some(NodeContentRef::String(s)) => serde_json::from_str(s)?,
             _ => return Err(anyhow!("MEX result node content is not binary or string")),

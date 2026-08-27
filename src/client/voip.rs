@@ -10,6 +10,8 @@ use std::time::Duration;
 
 #[cfg(feature = "voip-runtime")]
 use log::warn;
+#[cfg(feature = "voip-runtime")]
+use wacore::stanza::call::build_mute_v2;
 use wacore::stanza::call::{TerminateParams, build_reject, build_terminate};
 #[cfg(feature = "voip-runtime")]
 use wacore::stanza::group_call::{
@@ -158,7 +160,7 @@ impl PendingCallLinkTransition {
 
 #[cfg(feature = "voip-runtime")]
 #[derive(Default)]
-pub(super) struct PendingCallLinkJoins {
+pub(crate) struct PendingCallLinkJoins {
     active: usize,
     bound_call_id: Option<String>,
     transitions: std::collections::HashMap<String, Vec<PendingCallLinkTransition>>,
@@ -267,7 +269,7 @@ impl PendingCallLinkJoins {
         }
     }
 
-    pub(super) fn memory_stats(&self) -> wacore::stats::CollectionStats {
+    pub(crate) fn memory_stats(&self) -> wacore::stats::CollectionStats {
         use wacore::stats::HeapSize;
 
         let transition_bytes = self
@@ -398,12 +400,13 @@ impl Client {
     /// facade and the connection-cleanup teardown share one instance.
     #[cfg(feature = "voip-runtime")]
     pub(crate) fn call_registry(&self) -> Arc<wacore::voip::CallRegistry> {
-        self.call_registry.clone()
+        self.voip_state().call_registry.clone()
     }
 
     #[cfg(feature = "voip-runtime")]
     fn begin_call_link_join(&self) -> PendingCallLinkJoinGuard {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -416,7 +419,7 @@ impl Client {
         state.active = state.active.saturating_add(1);
         drop(state);
         PendingCallLinkJoinGuard {
-            state: self.pending_call_link_joins.clone(),
+            state: self.voip_state().pending_call_link_joins.clone(),
         }
     }
 
@@ -428,6 +431,7 @@ impl Client {
         sender: &Jid,
     ) -> bool {
         let state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -435,7 +439,11 @@ impl Client {
             && !call_id.is_empty()
             && state.accepts(call_id)
             && sender.to_non_ad() == call_creator.to_non_ad()
-            && self.call_registry.generation_of(call_id).is_none()
+            && self
+                .voip_state()
+                .call_registry
+                .generation_of(call_id)
+                .is_none()
     }
 
     /// Bind the one serialized pending link join to the ACK's exact call id before the read loop
@@ -447,6 +455,7 @@ impl Client {
             return;
         };
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -458,6 +467,7 @@ impl Client {
     #[cfg(feature = "voip-runtime")]
     fn prepare_pending_call_link_join_retry(&self, call_id: &str) -> bool {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -474,6 +484,7 @@ impl Client {
         sender: &Jid,
     ) -> PendingCallLinkBuffer {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -481,7 +492,11 @@ impl Client {
             || update.call_id.is_empty()
             || !state.accepts(&update.call_id)
             || sender.to_non_ad() != update.call_creator.to_non_ad()
-            || self.call_registry.generation_of(&update.call_id).is_some()
+            || self
+                .voip_state()
+                .call_registry
+                .generation_of(&update.call_id)
+                .is_some()
         {
             return PendingCallLinkBuffer::NotPending;
         }
@@ -531,6 +546,7 @@ impl Client {
         raw_epoch: &[u8],
     ) -> PendingCallLinkBuffer {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -538,7 +554,11 @@ impl Client {
             || call_id.is_empty()
             || !state.accepts(call_id)
             || sender.to_non_ad() != call_creator.to_non_ad()
-            || self.call_registry.generation_of(call_id).is_some()
+            || self
+                .voip_state()
+                .call_registry
+                .generation_of(call_id)
+                .is_some()
         {
             return PendingCallLinkBuffer::NotPending;
         }
@@ -592,6 +612,7 @@ impl Client {
         sender: &Jid,
     ) -> PendingCallLinkBuffer {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -599,7 +620,11 @@ impl Client {
             || call_id.is_empty()
             || !state.accepts(call_id)
             || sender.to_non_ad() != call_creator.to_non_ad()
-            || self.call_registry.generation_of(call_id).is_some()
+            || self
+                .voip_state()
+                .call_registry
+                .generation_of(call_id)
+                .is_some()
         {
             return PendingCallLinkBuffer::NotPending;
         }
@@ -651,18 +676,19 @@ impl Client {
         if buffered.suppresses_dispatch() {
             return true;
         }
-        let Some(generation) = self.call_registry.generation_of(call_id) else {
+        let Some(generation) = self.voip_state().call_registry.generation_of(call_id) else {
             return false;
         };
-        if !self.call_registry.group_creator_authorized_if_current(
-            call_id,
-            generation,
-            call_creator,
-            sender,
-        ) {
+        if !self
+            .voip_state()
+            .call_registry
+            .group_creator_authorized_if_current(call_id, generation, call_creator, sender)
+        {
             return false;
         }
-        self.call_registry.remove_if_current(call_id, generation)
+        self.voip_state()
+            .call_registry
+            .remove_if_current(call_id, generation)
     }
 
     /// Buffer a creator-authenticated waiting-room snapshot in the same ordered call-link
@@ -674,10 +700,15 @@ impl Client {
         sender: &Jid,
     ) -> PendingCallLinkBuffer {
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.call_registry.generation_of(&room.call_id).is_some()
+        if self
+            .voip_state()
+            .call_registry
+            .generation_of(&room.call_id)
+            .is_some()
             || state.active == 0
             || room.call_id.is_empty()
             || !state.accepts(&room.call_id)
@@ -712,6 +743,7 @@ impl Client {
         expected_media: CallLinkMedia,
         expected_token: &str,
     ) -> Result<u64, wacore::voip::GroupStateApply> {
+        let voip = self.voip_state();
         let call_id = session.call_id.clone();
         let call_creator = session.call_creator.clone();
         let mut rekey_pending = session
@@ -723,6 +755,7 @@ impl Client {
         // either committed to that generation or caused registration to fail.
         let _answer_transition = self.lock_answer_transition(&call_id).await;
         let mut state = self
+            .voip_state()
             .pending_call_link_joins
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -732,13 +765,17 @@ impl Client {
         if saturated {
             return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
         }
-        let generation = self.call_registry.insert_call_link_checked(session)?;
+        let generation = self
+            .voip_state()
+            .call_registry
+            .insert_call_link_checked(session)?;
         if let Some(room) = waiting_room {
             let applied = self
+                .voip_state()
                 .call_registry
                 .apply_waiting_room_if_current(room, generation);
             if applied != wacore::voip::GroupStateApply::Applied {
-                self.call_registry.remove_if_current(&call_id, generation);
+                voip.call_registry.remove_if_current(&call_id, generation);
                 return Err(applied);
             }
         }
@@ -757,7 +794,7 @@ impl Client {
                         }
                         wacore::voip::GroupStateApply::Stale => {}
                         rejected => {
-                            self.call_registry.remove_if_current(&call_id, generation);
+                            voip.call_registry.remove_if_current(&call_id, generation);
                             return Err(rejected);
                         }
                     }
@@ -768,6 +805,7 @@ impl Client {
                         && room.link_token == expected_token =>
                 {
                     let applied = self
+                        .voip_state()
                         .call_registry
                         .apply_waiting_room_if_current(room, generation);
                     if !matches!(
@@ -775,7 +813,7 @@ impl Client {
                         wacore::voip::GroupStateApply::Applied
                             | wacore::voip::GroupStateApply::Stale
                     ) {
-                        self.call_registry.remove_if_current(&call_id, generation);
+                        voip.call_registry.remove_if_current(&call_id, generation);
                         return Err(applied);
                     }
                 }
@@ -785,21 +823,25 @@ impl Client {
                     transaction_id,
                     raw_epoch,
                 } => {
-                    if !self.call_registry.group_sender_authorized_if_current(
-                        &call_id,
-                        generation,
-                        &staged_creator,
-                        &sender,
-                    ) {
+                    if !self
+                        .voip_state()
+                        .call_registry
+                        .group_sender_authorized_if_current(
+                            &call_id,
+                            generation,
+                            &staged_creator,
+                            &sender,
+                        )
+                    {
                         continue;
                     }
-                    if !self.call_registry.send_group_epoch_if_current(
+                    if !voip.call_registry.send_group_epoch_if_current(
                         &call_id,
                         generation,
                         transaction_id,
                         raw_epoch.to_vec(),
                     ) {
-                        self.call_registry.remove_if_current(&call_id, generation);
+                        voip.call_registry.remove_if_current(&call_id, generation);
                         return Err(wacore::voip::GroupStateApply::UnknownCall);
                     }
                 }
@@ -807,19 +849,23 @@ impl Client {
                     call_creator: staged_creator,
                     sender,
                 } => {
-                    if !self.call_registry.group_creator_authorized_if_current(
-                        &call_id,
-                        generation,
-                        &staged_creator,
-                        &sender,
-                    ) {
+                    if !self
+                        .voip_state()
+                        .call_registry
+                        .group_creator_authorized_if_current(
+                            &call_id,
+                            generation,
+                            &staged_creator,
+                            &sender,
+                        )
+                    {
                         continue;
                     }
-                    self.call_registry.remove_if_current(&call_id, generation);
+                    voip.call_registry.remove_if_current(&call_id, generation);
                     return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
                 }
                 PendingCallLinkTransition::Saturated => {
-                    self.call_registry.remove_if_current(&call_id, generation);
+                    voip.call_registry.remove_if_current(&call_id, generation);
                     return Err(wacore::voip::GroupStateApply::InvalidSnapshot);
                 }
                 _ => {}
@@ -834,7 +880,8 @@ impl Client {
         update: GroupCallUpdate,
         generation: u64,
     ) -> wacore::voip::GroupStateApply {
-        self.call_registry
+        self.voip_state()
+            .call_registry
             .apply_group_update_if_current(update, generation)
     }
 
@@ -847,8 +894,8 @@ impl Client {
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         call_id.hash(&mut hasher);
-        let lane = hasher.finish() as usize % self.answer_transition_locks.len();
-        self.answer_transition_locks[lane].clone()
+        let lane = hasher.finish() as usize % self.voip_state().answer_transition_locks.len();
+        self.voip_state().answer_transition_locks[lane].clone()
     }
 
     #[cfg(feature = "voip-runtime")]
@@ -1198,7 +1245,12 @@ impl Voip<'_> {
         // to associate with this request. Keep one such request active at a time so bounded-buffer
         // saturation can fail only its owning join; other joins wait here and start with clean
         // staging state.
-        let pending_join_lane = self.client.pending_call_link_join_lane.lock().await;
+        let pending_join_lane = self
+            .client
+            .voip_state()
+            .pending_call_link_join_lane
+            .lock()
+            .await;
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
         let token = normalize_call_link_token(token_or_url, media)?;
         let capability =
@@ -1543,6 +1595,61 @@ impl Voip<'_> {
         }
     }
 
+    /// Announce this side's microphone state, as `<mute_v2 mute-state>`.
+    ///
+    /// `peer` is where the state is published: the call scope for a group or call-link call, whose
+    /// roster shows who is muted, and the peer device for a direct call, the same address the rest of
+    /// its signaling uses. From a `CallHandle` prefer its own `set_muted()`, which applies the local
+    /// mute and resolves `peer` for both shapes.
+    #[cfg(feature = "voip-runtime")]
+    pub async fn announce_muted(
+        &self,
+        call_id: &str,
+        peer: &Jid,
+        call_creator: &Jid,
+        muted: bool,
+    ) -> Result<(), CallError> {
+        let generation = self
+            .client
+            .call_registry()
+            .generation_of(call_id)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        // The answer-transition lane is the lock a replacement generation is installed under; a
+        // per-entry lock belongs to the entry being replaced and so cannot close that window.
+        let _transition = self.client.lock_answer_transition(call_id).await;
+        self.announce_muted_locked(call_id, peer, call_creator, generation, muted)
+            .await
+    }
+
+    /// [`announce_muted`](Self::announce_muted) for a caller that already holds the call's
+    /// answer-transition lane and its own generation.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn announce_muted_locked(
+        &self,
+        call_id: &str,
+        peer: &Jid,
+        call_creator: &Jid,
+        generation: u64,
+        muted: bool,
+    ) -> Result<(), CallError> {
+        // A handle superseded while it waited must not announce a state for the replacement that now
+        // owns this call-id.
+        if self.client.call_registry().generation_of(call_id) != Some(generation) {
+            return Err(CallError::Media("call is no longer active"));
+        }
+        self.send_group_control(
+            call_id,
+            build_mute_v2(
+                call_id,
+                peer,
+                call_creator,
+                &self.client.generate_request_id(),
+                muted,
+            ),
+        )
+        .await
+    }
+
     /// Publish the local persistent raise/lower-hand state.
     #[cfg(feature = "voip-runtime")]
     pub async fn set_hand_raised(
@@ -1811,33 +1918,136 @@ impl Voip<'_> {
             .set_waiting_room_task(&call_id, generation, task);
     }
 
-    /// Terminate an active call.
+    /// Terminate an active call: `<terminate>` to `peer`, then the local teardown.
+    ///
+    /// Holding a `CallHandle`, prefer its own `terminate()`: it knows all three identifiers, resolves
+    /// `peer` to the device that answered, and reaches every device a still-ringing call rang.
     pub async fn terminate(
         &self,
         call_id: &str,
         peer: &Jid,
         call_creator: &Jid,
     ) -> Result<(), CallError> {
-        if call_id.is_empty() {
-            return Err(CallError::EmptyCallId);
-        }
-        let id = self.client.generate_request_id();
-        let stanza = build_terminate(&TerminateParams {
-            call_id,
-            to: peer,
-            id: Some(&id),
-            call_creator,
-            reason: None,
-        });
-        let sent = self.client.send_node(stanza).await;
-        // Tear the local call down regardless of whether the stanza reached the peer: the app asked to
-        // hang up, and a failed signaling send must not leave the media task capturing/sending (or a
-        // dormant outgoing call free to attach on a late relay ack). Reuse the same teardown the peer's
-        // `<terminate>` triggers so the public hangup actually ends our side too.
         #[cfg(feature = "voip-runtime")]
-        crate::voip::facade::terminate_call(self.client, call_id);
-        sent?;
-        Ok(())
+        {
+            let pinned = self.client.call_registry().generation_of(call_id);
+            // Armed before the lane, since waiting for it is cancellable too, and pinned so it can
+            // only ever end the call this terminate started on. Nothing registered under this call-id
+            // means there is no local call of ours to end, so this path stays teardown-free.
+            let _teardown = pinned.map(|generation| LocalTeardown {
+                client: self.client,
+                call_id,
+                generation,
+            });
+            // Held across the send: a replacement installed in that window would be ended by a
+            // `<terminate>` the peer cannot tell apart from ours, since both carry the same call-id.
+            let _transition = self.client.lock_answer_transition(call_id).await;
+            // Any change since entry -- a replacement, a removal, or a first registration under a
+            // call-id that had none -- belongs to a different call than the one asked to end.
+            if self.client.call_registry().generation_of(call_id) != pinned {
+                return Err(CallError::Media("call is no longer active"));
+            }
+            return self
+                .terminate_inner(call_id, std::slice::from_ref(peer), call_creator, pinned)
+                .await
+                .1;
+        }
+        #[cfg(not(feature = "voip-runtime"))]
+        self.terminate_inner(call_id, std::slice::from_ref(peer), call_creator, None)
+            .await
+            .1
+    }
+
+    /// [`terminate`](Self::terminate) restricted to one registry generation and addressed at every
+    /// device that must be told, so a handle superseded by a same-call-id replacement tears down its
+    /// own call instead of the replacement's.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn terminate_for_generation(
+        &self,
+        call_id: &str,
+        peers: &[Jid],
+        call_creator: &Jid,
+        generation: u64,
+    ) -> TerminateDelivery {
+        let (notified, result) = self
+            .terminate_inner(call_id, peers, call_creator, Some(generation))
+            .await;
+        TerminateDelivery {
+            notified,
+            failure: result.err(),
+        }
+    }
+
+    async fn terminate_inner(
+        &self,
+        call_id: &str,
+        peers: &[Jid],
+        call_creator: &Jid,
+        _generation: Option<u64>,
+    ) -> (usize, Result<(), CallError>) {
+        if call_id.is_empty() {
+            return (0, Err(CallError::EmptyCallId));
+        }
+        // Tear the local call down whatever happens to the stanzas: the app asked to hang up, and
+        // neither a failed send nor a caller that drops this future mid-send (a timeout, a `select!`)
+        // may leave the media task capturing or a dormant outgoing call free to attach on a late
+        // relay ack. A drop guard is what survives the cancellation; it reuses the same teardown the
+        // peer's `<terminate>` triggers.
+        // Pinned by the caller, never resolved here: a teardown that read the registry at drop time
+        // would find a same-call-id replacement and end that instead of the call the caller asked to
+        // hang up. `None` is a call-id with nothing of ours registered under it, which has no local
+        // side to tear down.
+        #[cfg(feature = "voip-runtime")]
+        let _teardown = _generation.map(|generation| LocalTeardown {
+            client: self.client,
+            call_id,
+            generation,
+        });
+        let mut notified = 0usize;
+        let mut result = Ok(());
+        for peer in peers {
+            let id = self.client.generate_request_id();
+            let stanza = build_terminate(&TerminateParams {
+                call_id,
+                to: peer,
+                id: Some(&id),
+                call_creator,
+                reason: None,
+            });
+            match self.client.send_node(stanza).await {
+                Ok(()) => notified += 1,
+                Err(error) if result.is_ok() => result = Err(error.into()),
+                Err(_) => {}
+            }
+        }
+        (notified, result)
+    }
+}
+
+/// How much of a multi-target `<terminate>` fan-out was confirmed sent. A still-ringing call is told
+/// per device, so "some devices, not all" is a real outcome and not the same as telling nobody. A
+/// send that errors is unconfirmed rather than known-undelivered: the transport can fail after
+/// putting bytes on the wire.
+#[cfg(feature = "voip-runtime")]
+pub(crate) struct TerminateDelivery {
+    pub(crate) notified: usize,
+    pub(crate) failure: Option<CallError>,
+}
+
+/// Local call teardown that runs even when the terminate future is cancelled mid-send.
+#[cfg(feature = "voip-runtime")]
+pub(crate) struct LocalTeardown<'a> {
+    pub(crate) client: &'a Client,
+    pub(crate) call_id: &'a str,
+    /// The generation this teardown owns, pinned when the terminate started, so it can only ever end
+    /// that call and never a replacement registered under the same call-id afterwards.
+    pub(crate) generation: u64,
+}
+
+#[cfg(feature = "voip-runtime")]
+impl Drop for LocalTeardown<'_> {
+    fn drop(&mut self) {
+        crate::voip::facade::terminate_call_if_current(self.client, self.call_id, self.generation);
     }
 }
 
@@ -1923,6 +2133,16 @@ async fn execute_call_service_request<T>(
 
 #[cfg(test)]
 mod tests {
+    /// The admission snapshots the report attributes to this subsystem.
+    #[cfg(feature = "voip-runtime")]
+    async fn pending_link_updates(client: &Client) -> wacore::stats::CollectionStats {
+        client
+            .memory_report()
+            .await
+            .subsystem(crate::voip::collections::PENDING_LINK_UPDATES)
+            .expect("the voip subsystem is attached in this build")
+    }
+
     #[cfg(feature = "voip-runtime")]
     use super::PendingCallLinkBuffer;
     use std::sync::Arc;
@@ -2011,7 +2231,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
         (client, count)
     }
 
@@ -2039,7 +2259,7 @@ mod tests {
             NoiseCipher::new(&key).expect("valid key"),
             NoiseCipher::new(&key).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
         client
     }
 
@@ -3253,7 +3473,7 @@ mod tests {
             PendingCallLinkBuffer::NotPending,
             "an unrelated sender cannot populate the pre-registration buffer"
         );
-        let pending_memory = client.memory_report().await.pending_call_link_updates;
+        let pending_memory = pending_link_updates(&client).await;
         assert_eq!(pending_memory.entries, 1);
         assert!(pending_memory.bytes > 0);
 
@@ -3282,14 +3502,7 @@ mod tests {
                 .and_then(|state| { state.snapshot().map(|snapshot| snapshot.transaction_id) }),
             Some(8)
         );
-        assert_eq!(
-            client
-                .memory_report()
-                .await
-                .pending_call_link_updates
-                .entries,
-            0
-        );
+        assert_eq!(pending_link_updates(&client).await.entries, 0);
         let mut later = update;
         later.transaction_id = 9;
         assert_eq!(
@@ -3590,7 +3803,7 @@ mod tests {
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(gated_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(gated_socket));
         crate::test_utils::answer_iq(
             &client,
             &request_id,
@@ -3697,7 +3910,7 @@ mod tests {
                     == PendingCallLinkBuffer::Buffered,
             );
         }
-        let stats = client.memory_report().await.pending_call_link_updates;
+        let stats = pending_link_updates(&client).await;
         assert!(
             accepted < 4,
             "the aggregate byte budget must reject excess staged snapshots"
@@ -3892,11 +4105,7 @@ mod tests {
             "exhausted pre-ACK identity metadata requires one exact-call refresh"
         );
         assert_eq!(
-            client
-                .memory_report()
-                .await
-                .pending_call_link_updates
-                .entries,
+            pending_link_updates(&client).await.entries,
             0,
             "binding the ACK must discard every unrelated candidate bucket"
         );
@@ -4134,11 +4343,7 @@ mod tests {
             };
             assert!(handled, "the ACK must resolve its registered waiter");
             assert_eq!(
-                client
-                    .memory_report()
-                    .await
-                    .pending_call_link_updates
-                    .entries,
+                pending_link_updates(&client).await.entries,
                 0,
                 "the ACK call id must be bound before the waiter can observe the response"
             );
@@ -4252,14 +4457,7 @@ mod tests {
             client.buffer_pending_call_link_update(&second, &sender),
             PendingCallLinkBuffer::Buffered
         );
-        assert_eq!(
-            client
-                .memory_report()
-                .await
-                .pending_call_link_updates
-                .entries,
-            3
-        );
+        assert_eq!(pending_link_updates(&client).await.entries, 3);
 
         let mut session =
             CallSession::new_outgoing(call_id, Jid::new(call_id, Server::Call), creator);
@@ -4313,14 +4511,7 @@ mod tests {
             client.call_registry().phase_if_current(call_id, generation),
             Some(CallPhase::Connecting)
         );
-        assert_eq!(
-            client
-                .memory_report()
-                .await
-                .pending_call_link_updates
-                .entries,
-            0
-        );
+        assert_eq!(pending_link_updates(&client).await.entries, 0);
 
         drop(pending);
         client
@@ -4731,7 +4922,7 @@ mod tests {
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
 
         let accept = tokio::spawn({
             let client = client.clone();
@@ -4854,7 +5045,7 @@ mod tests {
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(blocking_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(blocking_socket));
         crate::test_utils::answer_iq(
             &client,
             &request_id,
@@ -4997,7 +5188,7 @@ mod tests {
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
             NoiseCipher::new(&[0u8; 32]).expect("valid key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(gated_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(gated_socket));
         crate::test_utils::answer_iq(
             &client,
             &request_id,

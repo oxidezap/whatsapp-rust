@@ -15,6 +15,12 @@ pub const GROUP_CALL_MAX_PARTICIPANTS: usize = 32;
 pub const GROUP_CALL_MAX_REMOTE_PARTICIPANTS: usize = GROUP_CALL_MAX_PARTICIPANTS - 1;
 
 /// Audio/video mode of a reusable call link.
+///
+/// Hand-written rather than generated. The enum catalog holds exactly one
+/// `audio`/`video` pair, `MediaType` in the status composer's module, and two
+/// two-valued media enums agreeing on their values is not evidence that one
+/// owns the other's wire format. Binding it would let a kind added for status
+/// composition arrive here, in the type that builds and parses `<call_link>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum CallLinkMedia {
     #[wire = "audio"]

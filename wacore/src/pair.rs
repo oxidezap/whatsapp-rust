@@ -69,16 +69,22 @@ impl PairUtils {
     }
 
     /// Builds acknowledgment node for a pairing request
+    ///
+    /// The attributes are carried over by value rather than through
+    /// `to_string()`: a `NodeValue` already holds either an inline
+    /// `CompactString` or a structured `Jid`, so cloning it copies what is
+    /// there, while rendering it to a `String` first heap-allocates a buffer
+    /// per attribute only to hand the bytes straight back to a `CompactString`.
+    /// `"result"` is short enough to live inline, so it needs no owned `String`
+    /// either.
     pub fn build_ack_node(request_node: &Node) -> Option<Node> {
         if let (Some(to), Some(id)) = (request_node.attrs.get("from"), request_node.attrs.get("id"))
         {
             Some(
                 NodeBuilder::new("iq")
-                    .attrs([
-                        ("to", to.to_string()),
-                        ("id", id.to_string()),
-                        ("type", "result".to_string()),
-                    ])
+                    .attr("to", to.clone())
+                    .attr("id", id.clone())
+                    .attr("type", "result")
                     .build(),
             )
         } else {
@@ -87,16 +93,20 @@ impl PairUtils {
     }
 
     /// Builds acknowledgment node for a pairing request from a NodeRef.
+    ///
+    /// `to_node_value` keeps a decoded JID attribute a JID instead of routing
+    /// it through its rendered form. The encoder classifies a JID-shaped string
+    /// back into a JID token, so the `from` a pairing IQ carries -- the server,
+    /// with no device and no integrator -- encodes to the same bytes either
+    /// way; this only drops the round trip. See [`Self::build_ack_node`].
     pub fn build_ack_node_ref(request_node: &NodeRef<'_>) -> Option<Node> {
-        let to = request_node.get_attr("from").map(|v| v.as_str())?;
-        let id = request_node.get_attr("id").map(|v| v.as_str())?;
+        let to = request_node.get_attr("from")?.to_node_value();
+        let id = request_node.get_attr("id")?.to_node_value();
         Some(
             NodeBuilder::new("iq")
-                .attrs([
-                    ("to", to.to_string()),
-                    ("id", id.to_string()),
-                    ("type", "result".to_string()),
-                ])
+                .attr("to", to)
+                .attr("id", id)
+                .attr("type", "result")
                 .build(),
         )
     }

@@ -73,7 +73,7 @@ impl IqSpec for SpamReportSpec {
         // Extract report_id from response if present
         let report_id = response
             .get_optional_child_by_tag(&["report_id"])
-            .and_then(|n| match n.content.as_deref() {
+            .and_then(|n| match n.content.as_ref() {
                 Some(NodeContentRef::String(s)) => Some(s.to_string()),
                 _ => None,
             });

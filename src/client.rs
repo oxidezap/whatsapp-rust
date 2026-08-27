@@ -1,12 +1,17 @@
 mod accessors;
 mod adapters;
 mod app_state;
+pub(crate) use app_state::{BatchedSyncOutcome, BatchedSyncRequest, CriticalSyncPlan, SyncSettles};
+#[cfg(test)]
+pub(crate) use app_state::{SyncHolder, batched_sync_outcome_tests::batch_result};
 mod builder;
 mod context_impl;
+mod device_memo_stats;
 mod device_registry;
 pub(crate) mod device_topology;
 #[cfg(feature = "client-lifecycle")]
 mod extension_lifecycle;
+pub mod interceptor;
 mod iq_ops;
 mod lid_pn;
 mod lifecycle;
@@ -15,14 +20,20 @@ mod node_io;
 pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;
-mod voip;
+pub(crate) mod subsystem;
+pub(crate) mod voip;
 use builder::{ClientAssembly, ClientExtensions};
 pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
+pub(crate) use device_memo_stats::{
+    DeviceMemoCounters, GroupDevicesMemoOutcome, SkdmTargetsMemoOutcome,
+};
+pub use device_memo_stats::{DeviceMemoStats, GroupDevicesMemoStats, SkdmTargetsMemoStats};
 #[cfg(feature = "client-lifecycle")]
 use extension_lifecycle::LifecycleRegistration;
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
+pub use lifecycle::{Connection, Reachability};
 pub use voip::{CallError, Voip};
 
 use crate::cache::Cache;
@@ -60,6 +71,52 @@ use wacore_binary::Jid;
 use portable_atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use wacore::stanza::wire_tags::{NotificationType, StanzaTag};
+
+/// Lease that keeps decrypted-payload events enabled for one consumer.
+///
+/// Dropping the final lease disables forwarding. The lease holds only a weak
+/// client reference, so it cannot keep the client alive.
+#[must_use = "dropping the lease immediately releases decrypted-payload forwarding"]
+pub struct DecryptedPayloadLease {
+    client: std::sync::Weak<Client>,
+}
+
+impl Drop for DecryptedPayloadLease {
+    fn drop(&mut self) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        let previous = client
+            .decrypted_payload_forwarding
+            .fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "decrypted-payload forwarding lease underflow");
+    }
+}
+
+/// Lease that keeps per-`<enc>` decrypt-failure events enabled for one consumer.
+///
+/// Dropping the final lease disables forwarding. The lease holds only a weak
+/// client reference, so it cannot keep the client alive.
+#[must_use = "dropping the lease immediately releases enc-decrypt-failure forwarding"]
+pub struct EncDecryptFailedLease {
+    client: std::sync::Weak<Client>,
+}
+
+impl Drop for EncDecryptFailedLease {
+    fn drop(&mut self) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        let previous = client
+            .enc_decrypt_failed_forwarding
+            .fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(
+            previous > 0,
+            "enc-decrypt-failure forwarding lease underflow"
+        );
+    }
+}
 
 /// Lease that keeps raw decoded stanza events enabled for one consumer.
 ///
@@ -77,6 +134,113 @@ impl Drop for RawNodeLease {
         };
         let previous = client.raw_node_forwarding.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(previous > 0, "raw-node forwarding lease underflow");
+    }
+}
+
+/// Lease that keeps sent-frame events enabled for one consumer.
+///
+/// Dropping the final lease disables forwarding. The lease holds only a weak
+/// client reference, so it cannot keep the client alive.
+///
+/// It gates, it does not fence, and one aggregate count gates them all rather
+/// than one per lease: a frame captured while any lease was alive can still
+/// arrive just after this one drops, and which handlers receive it is a matter of
+/// subscription, not of who holds a lease. Every gated kind works this way.
+/// Making the drop wait for in-flight dispatches to drain would instead deadlock
+/// an observer that drops its lease from inside its own handler, which is the
+/// natural way to record one frame and stop.
+#[must_use = "dropping the lease immediately releases sent-frame forwarding"]
+pub struct SentFrameLease {
+    client: std::sync::Weak<Client>,
+}
+
+impl Drop for SentFrameLease {
+    fn drop(&mut self) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        client.sent_frame_tap.release();
+    }
+}
+
+/// Publishes the plaintext frames that reached the transport as
+/// [`Event::SentFrame`](wacore::types::events::Event::SentFrame).
+///
+/// The client owns it and hands the noise sender a clone of the `Arc`, the same
+/// way it hands over [`SessionStats`](wacore::stats::SessionStats): the gate has
+/// to be readable from the one point every send crosses, and that task cannot
+/// hold the client without keeping it alive.
+pub(crate) struct SentFrameTap {
+    /// Number of consumers currently requesting the event.
+    forwarding: AtomicUsize,
+    bus: wacore::types::events::CoreEventBus,
+    /// Proves the no-lease path builds nothing, rather than only that it
+    /// dispatches nothing.
+    #[cfg(test)]
+    published: AtomicUsize,
+}
+
+impl SentFrameTap {
+    pub(crate) fn new(bus: wacore::types::events::CoreEventBus) -> Self {
+        Self {
+            forwarding: AtomicUsize::new(0),
+            bus,
+            #[cfg(test)]
+            published: AtomicUsize::new(0),
+        }
+    }
+
+    /// Enable forwarding for one consumer. The public door is
+    /// [`Client::acquire_sent_frame_forwarding`], which pairs this with a lease
+    /// that releases it on drop; a caller here owns that pairing itself.
+    pub(crate) fn acquire(&self) {
+        let incremented = self
+            .forwarding
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            })
+            .is_ok();
+        assert!(incremented, "sent-frame forwarding lease counter overflow");
+    }
+
+    pub(crate) fn release(&self) {
+        let previous = self.forwarding.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0, "sent-frame forwarding lease underflow");
+    }
+
+    #[inline]
+    pub(crate) fn enabled(&self) -> bool {
+        self.forwarding.load(Ordering::Relaxed) != 0
+    }
+
+    /// Hand one frame to the observers.
+    ///
+    /// The dispatch is caught: a consumer that only watches must not be able to
+    /// take the send pipeline down with it, and this runs on the noise sender
+    /// task, whose death would end every send on the connection. Containment is
+    /// per dispatch, not per handler, so a panicking observer costs this frame
+    /// for the observers behind it — the bus offers no per-handler isolation for
+    /// any kind, and plugins already wrap their own handlers. A handler that
+    /// *blocks* still stalls sends, the contract every handler has on the read
+    /// loop.
+    pub(crate) fn publish(&self, plaintext: bytes::Bytes) {
+        #[cfg(test)]
+        self.published.fetch_add(1, Ordering::Relaxed);
+        let dispatch = std::panic::AssertUnwindSafe(|| {
+            self.bus.dispatch(Event::SentFrame(
+                wacore::types::events::SentFrame::builder()
+                    .plaintext(plaintext)
+                    .build(),
+            ));
+        });
+        if std::panic::catch_unwind(dispatch).is_err() {
+            warn!("A sent-frame observer panicked; the send pipeline is unaffected.");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn published(&self) -> usize {
+        self.published.load(Ordering::Relaxed)
     }
 }
 
@@ -268,6 +432,8 @@ pub struct MemoryReport {
     pub dm_devices_memo: CollectionStats,
     pub message_retry_counts: u64,
     pub undecryptable_dispatched: u64,
+    /// Entries in the dispatch-once gate for decrypted messages.
+    pub dispatched_messages: u64,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
     /// Queued/running history-sync tasks and their logical compressed-payload
@@ -278,8 +444,41 @@ pub struct MemoryReport {
     pub history_sync_tasks_peak: u64,
     /// Lifetime high-water mark of logical compressed-payload bytes.
     pub history_sync_payload_bytes_peak: u64,
+    // -- Transient retention (accumulated, not yet handed on) --
+    /// Inbound messages accumulated for the next per-batch commit, and the
+    /// encoded-byte sum compared against the 4 MiB flush threshold. The decoded
+    /// protos this holds are the largest per-client allocation in this report by
+    /// two orders of magnitude.
+    ///
+    /// "Accumulated", not "resident": a batch already handed to its commit is
+    /// still in memory but no longer counted here (see
+    /// `InboundCommitBatcher::pending_stats`). Live traffic commits
+    /// immediately, so outside an offline drain this is normally zero.
+    pub inbound_commit_batch: CollectionStats,
+    /// `messageSecret` captures buffered for write-behind persistence — from
+    /// live receives and sends as well as an offline drain, so a slow backend
+    /// can saturate this with no drain in progress.
+    ///
+    /// A producer that would exceed the 4096-entry limit waits for an in-flight
+    /// write rather than the buffer growing. That limit is not a hard ceiling:
+    /// a queueing future cancelled while backpressured force-buffers what it
+    /// still holds rather than losing it, so this can read above the limit
+    /// during teardown.
+    pub msg_secret_buffer: usize,
+    /// Users awaiting a device-list refresh, and the dedup that suppresses a
+    /// second refresh for the same user while one is outstanding.
+    ///
+    /// Offline entries are drained by `doPendingDeviceSync` at the end of the
+    /// backlog. Entries added by the *online* path are removed only by that
+    /// same drain or by teardown, so on a connection with no offline drain this
+    /// grows with the distinct users seen with an unknown device.
+    pub pending_device_sync: usize,
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
+    /// Addresses with a session establishment in flight; normally zero.
+    pub ensure_inflight: u64,
+    /// Groups with a metadata query in flight; normally zero.
+    pub group_metadata_inflight: u64,
     pub chat_lanes: u64,
     pub group_distribution_locks: u64,
     /// Cumulative capacity evictions; poll successive reports to derive a rate.
@@ -287,6 +486,11 @@ pub struct MemoryReport {
     /// Cumulative attempts that kept a live lane and temporarily exceeded capacity.
     pub group_distribution_lock_eviction_blocks: u64,
     pub resend_rate_limiter_chats: u64,
+    /// Peers whose session was recently recreated, keyed to rate-limit the next
+    /// recreate. Counts only: the entries are a JID and an instant.
+    pub session_recreate_history: u64,
+    /// Groups whose sender-key distribution is memoised as already warm.
+    pub skdm_warm_memo: u64,
     // -- Unbounded collections --
     /// Deferred acks queued for the transport-ack worker. Unbounded, and each
     /// entry retains the full inbound node plus a flush guard, so a stalled
@@ -296,19 +500,30 @@ pub struct MemoryReport {
     pub delivery_receipt_queue: usize,
     pub response_waiters: usize,
     pub node_waiters: usize,
+    /// Waiters parked on outgoing nodes, the pre-encryption counterpart of
+    /// [`Self::node_waiters`]. Each retains a filter and a oneshot sender.
+    pub sent_node_waiters: usize,
     pub pending_retries: usize,
+    /// Numbers with a `refresh_lid` re-resolve in flight. Bounded by the
+    /// number of distinct peers acked at once; a value that stays high
+    /// means refreshes are not completing, not that many were requested.
+    pub pending_lid_refreshes: usize,
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
+    /// Expanded app-state keys the processor holds in memory. No capacity cap
+    /// and no TTL — one entry per distinct key id the server's patches
+    /// reference, emptied only on reconnect. Zero until the first app-state
+    /// sync builds the processor.
+    pub app_state_key_cache: usize,
     pub app_state_syncing: usize,
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
-    /// Admission snapshots retained while a call-link join ACK is in flight.
-    #[cfg(feature = "voip-runtime")]
-    pub pending_call_link_updates: CollectionStats,
-    /// Active/ringing calls and bounded pre-offer group controls, including their snapshots/queues.
-    #[cfg(feature = "voip-runtime")]
-    pub active_calls: CollectionStats,
+    /// What the optional subsystems attached to this build retain. Empty when
+    /// none is attached. One field rather than a `cfg`'d field per subsystem,
+    /// so the report has one shape whatever was compiled; see
+    /// `agent_docs/subsystem_boundary.md`.
+    pub subsystems: Vec<SubsystemMemory>,
     #[cfg(feature = "plugins")]
     pub plugins: u64,
     #[cfg(feature = "plugins")]
@@ -320,6 +535,8 @@ pub struct MemoryReport {
     #[cfg(feature = "plugins")]
     pub plugin_core_event_subscriptions: u64,
     #[cfg(feature = "plugins")]
+    pub plugin_stanza_interceptors: u64,
+    #[cfg(feature = "plugins")]
     pub plugin_event_endpoints: u64,
     #[cfg(feature = "plugins")]
     pub plugin_event_endpoint_capacity: u64,
@@ -329,12 +546,54 @@ pub struct MemoryReport {
     // -- Misc --
     pub chatstate_handlers: usize,
     pub custom_enc_handlers: usize,
+    /// Interceptors currently registered.
+    ///
+    /// A handle that outlives its interest leaves one registered, and a leak
+    /// here costs a walk on every stanza — which the count is what makes
+    /// visible.
+    pub stanza_interceptors: usize,
+}
+
+/// Names one collection an attached subsystem reports.
+///
+/// A subsystem exports these as constants (see `voip::collections`), so looking
+/// a figure up in [`MemoryReport`] is a name the compiler checks rather than two
+/// string literals a caller has to spell the way the report happens to print
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubsystemCollection {
+    pub subsystem: &'static str,
+    pub collection: &'static str,
+}
+
+impl SubsystemCollection {
+    pub const fn new(subsystem: &'static str, collection: &'static str) -> Self {
+        Self {
+            subsystem,
+            collection,
+        }
+    }
+}
+
+/// One collection an attached subsystem retains, as `MemoryReport` carries it.
+///
+/// The subsystem and the collection stay separate fields rather than one fused
+/// display string, so a caller looks a figure up by what it is instead of by
+/// how the report happens to print it.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct SubsystemMemory {
+    /// The subsystem that reported it, e.g. `"voip"`.
+    pub subsystem: &'static str,
+    /// The collection within that subsystem, e.g. `"active_calls"`.
+    pub collection: &'static str,
+    pub stats: CollectionStats,
 }
 
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 12] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 13] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -348,16 +607,27 @@ impl MemoryReport {
             ("signal_identities:", &self.signal_identities),
             ("signal_sender_keys:", &self.signal_sender_keys),
             ("history_sync_tasks:", &self.history_sync_tasks),
+            ("inbound_commit_batch:", &self.inbound_commit_batch),
         ]
+    }
+
+    /// One collection of one attached subsystem. `None` when that subsystem is
+    /// not attached to this build, or does not report that collection.
+    pub fn subsystem(&self, which: SubsystemCollection) -> Option<CollectionStats> {
+        self.subsystems
+            .iter()
+            .find(|retained| {
+                retained.subsystem == which.subsystem && retained.collection == which.collection
+            })
+            .map(|retained| retained.stats)
     }
 
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
-        #[cfg(feature = "voip-runtime")]
-        let total = total
-            .saturating_add(self.pending_call_link_updates.bytes)
-            .saturating_add(self.active_calls.bytes);
+        let total = self.subsystems.iter().fold(total, |sum, retained| {
+            sum.saturating_add(retained.stats.bytes)
+        });
         #[cfg(feature = "plugins")]
         let total = total.saturating_add(self.plugin_event_queue.bytes);
         total
@@ -374,11 +644,14 @@ impl std::fmt::Display for MemoryReport {
             writeln!(f, "  {name:<22} {:>7} entries {:>10} B", c.entries, c.bytes)
         }
         // First TTL_BOUNDED entries of collections() are the TTL-bounded
-        // caches; the next SIGNAL_CACHES are Signal store caches. The final
-        // entry is transient history-sync retention. Adding a cache to
-        // collections() means moving this boundary, or the sections shift.
+        // caches; the next SIGNAL_CACHES are Signal store caches. The last two
+        // are transient retention: history sync, then the inbound commit batch.
+        // Adding a cache to collections() means moving this boundary, or the
+        // sections shift.
         const TTL_BOUNDED: usize = 8;
         const SIGNAL_CACHES: usize = 3;
+        const HISTORY_SYNC: usize = TTL_BOUNDED + SIGNAL_CACHES;
+        const COMMIT_BATCH: usize = HISTORY_SYNC + 1;
         let collections = self.collections();
         writeln!(f, "=== Memory Report ===")?;
         writeln!(f, "--- TTL-bounded caches ---")?;
@@ -391,10 +664,17 @@ impl std::fmt::Display for MemoryReport {
             "  undec_dispatched:       {}",
             self.undecryptable_dispatched
         )?;
+        writeln!(f, "  dispatched_messages:    {}", self.dispatched_messages)?;
         writeln!(f, "  pdo_pending_requests:   {}", self.pdo_pending_requests)?;
         writeln!(f, "  pdo_requested:          {}", self.pdo_requested)?;
         writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
+        writeln!(f, "  ensure_inflight:        {}", self.ensure_inflight)?;
+        writeln!(
+            f,
+            "  group_metadata_inflight:{}",
+            self.group_metadata_inflight
+        )?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
         writeln!(
             f,
@@ -408,6 +688,12 @@ impl std::fmt::Display for MemoryReport {
             "  resend_rl_chats:        {}",
             self.resend_rate_limiter_chats
         )?;
+        writeln!(
+            f,
+            "  session_recreate_hist:  {}",
+            self.session_recreate_history
+        )?;
+        writeln!(f, "  skdm_warm_memo:         {}", self.skdm_warm_memo)?;
         writeln!(f, "--- Unbounded collections ---")?;
         writeln!(f, "  transport_ack_queue:    {}", self.transport_ack_queue)?;
         writeln!(
@@ -417,7 +703,13 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  response_waiters:       {}", self.response_waiters)?;
         writeln!(f, "  node_waiters:           {}", self.node_waiters)?;
+        writeln!(f, "  sent_node_waiters:      {}", self.sent_node_waiters)?;
         writeln!(f, "  pending_retries:        {}", self.pending_retries)?;
+        writeln!(
+            f,
+            "  pending_lid_refreshes:  {}",
+            self.pending_lid_refreshes
+        )?;
         writeln!(
             f,
             "  presence_subscriptions: {}",
@@ -428,23 +720,21 @@ impl std::fmt::Display for MemoryReport {
             "  app_state_key_requests: {}",
             self.app_state_key_requests
         )?;
+        writeln!(f, "  app_state_key_cache:    {}", self.app_state_key_cache)?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
         writeln!(f, "--- Signal store caches ---")?;
         for (name, c) in &collections[TTL_BOUNDED..TTL_BOUNDED + SIGNAL_CACHES] {
             line(f, name, c)?;
         }
-        #[cfg(feature = "voip-runtime")]
-        {
-            writeln!(f, "--- VoIP state ---")?;
-            line(f, "pending_link_updates:", &self.pending_call_link_updates)?;
-            line(f, "active_calls:", &self.active_calls)?;
+        if !self.subsystems.is_empty() {
+            writeln!(f, "--- Optional subsystems ---")?;
+            for retained in &self.subsystems {
+                let name = format!("{} {}:", retained.subsystem, retained.collection);
+                line(f, &name, &retained.stats)?;
+            }
         }
         writeln!(f, "--- In-flight history sync ---")?;
-        line(
-            f,
-            collections[TTL_BOUNDED + SIGNAL_CACHES].0,
-            &self.history_sync_tasks,
-        )?;
+        line(f, collections[HISTORY_SYNC].0, &self.history_sync_tasks)?;
         writeln!(
             f,
             "  peak tasks:             {}",
@@ -455,6 +745,10 @@ impl std::fmt::Display for MemoryReport {
             "  peak payload storage:   {} B",
             self.history_sync_payload_bytes_peak
         )?;
+        writeln!(f, "--- Transient retention ---")?;
+        line(f, collections[COMMIT_BATCH].0, &self.inbound_commit_batch)?;
+        writeln!(f, "  msg_secret_buffer:      {}", self.msg_secret_buffer)?;
+        writeln!(f, "  pending_device_sync:    {}", self.pending_device_sync)?;
         #[cfg(feature = "plugins")]
         {
             writeln!(f, "--- Plugins ---")?;
@@ -472,6 +766,11 @@ impl std::fmt::Display for MemoryReport {
             )?;
             writeln!(
                 f,
+                "  stanza interceptors:    {}",
+                self.plugin_stanza_interceptors
+            )?;
+            writeln!(
+                f,
                 "  event endpoints:        {} (capacity: {})",
                 self.plugin_event_endpoints, self.plugin_event_endpoint_capacity
             )?;
@@ -480,6 +779,7 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "--- Misc ---")?;
         writeln!(f, "  chatstate_handlers:     {}", self.chatstate_handlers)?;
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
+        writeln!(f, "  stanza_interceptors:    {}", self.stanza_interceptors)?;
         writeln!(
             f,
             "  total estimated:        {} B",
@@ -643,6 +943,14 @@ pub enum ConnectError {
     /// Construction never completed, so the attempt was rejected before any I/O.
     #[error("client construction did not activate")]
     NotActivated,
+    /// The client was shut down. Shutdown is final, so build a new client
+    /// rather than reconnecting this one.
+    #[error("client has been shut down")]
+    Shutdown,
+    /// [`Client::pause`] is in effect. Unlike [`Self::Shutdown`] this is not
+    /// final: [`Client::resume`] lifts it and connecting works again.
+    #[error("client is paused")]
+    Paused,
     /// A step of the connect flow ran out of time.
     #[error("{stage} timed out after {timeout:?}")]
     Timeout {
@@ -706,6 +1014,8 @@ impl ConnectError {
             ConnectError::Handshake(handshake) => handshake.is_timeout(),
             ConnectError::AlreadyConnected
             | ConnectError::NotActivated
+            | ConnectError::Shutdown
+            | ConnectError::Paused
             | ConnectError::Version(_)
             | ConnectError::Transport(_) => false,
         }
@@ -972,7 +1282,10 @@ pub struct Client {
     pub(crate) transport_events:
         Arc<Mutex<Option<async_channel::Receiver<crate::transport::TransportEvent>>>>,
     pub(crate) transport_factory: Arc<dyn crate::transport::TransportFactory>,
-    pub(crate) noise_socket: Arc<Mutex<Option<Arc<NoiseSocket>>>>,
+    /// Replaced per connection, so not a `OnceLock` — but every critical section
+    /// is a clone or a store, so a sync lock makes holding it across an `.await`
+    /// a compile error on the send path rather than a review question.
+    pub(crate) noise_socket: Arc<std::sync::Mutex<Option<Arc<NoiseSocket>>>>,
 
     /// Pending IQ/ack response waiters keyed by request id.
     ///
@@ -1015,6 +1328,29 @@ pub struct Client {
     /// to match the SignalProtocolStoreAdapter's internal locking.
     pub(crate) session_locks: Cache<String, Arc<Mutex<()>>>,
 
+    /// Addresses whose session establishment is already in flight, so a
+    /// concurrent caller waits on it instead of fetching the same bundle again.
+    ///
+    /// An existence probe before the fetch cannot do this on its own: it answers
+    /// before the IQ goes out, so every caller in a burst reads the same "no
+    /// session" and every one of them fetches. Each answered bundle is then
+    /// installed over the last, retiring a session the peer may still be
+    /// encrypting under, and each fetch burns one of the peer's one-time
+    /// prekeys. WA Web keeps the same registration in
+    /// `WAWebManageE2ESessionsJob` (a module-level wid -> promise map, cleared
+    /// in a `finally`).
+    ///
+    /// Holds only what is in flight — normally empty — so it is a plain map
+    /// rather than a capacity-bounded cache.
+    pub(crate) ensure_inflight: Arc<sessions::EnsureRegistry>,
+
+    /// Group-metadata queries in flight, so a burst of callers for one group
+    /// shares a single round trip. See [`GroupMetadataRegistry`] for why only
+    /// `get_metadata` needs it.
+    ///
+    /// [`GroupMetadataRegistry`]: crate::features::GroupMetadataRegistry
+    pub(crate) group_metadata_inflight: Arc<crate::features::GroupMetadataRegistry>,
+
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.
     pub(crate) chat_lanes: Cache<Jid, ChatLane>,
@@ -1026,7 +1362,9 @@ pub struct Client {
     pub(crate) lid_pn_cache: Arc<LidPnCache>,
     pub(crate) ab_props: Arc<wacore::store::ab_props::AbPropsCache>,
 
-    pub group_cache: Mutex<Option<Arc<GroupCache>>>,
+    /// Lazily built on the first group send and never replaced afterwards, so a
+    /// `OnceLock` keeps the read on that path down to an atomic load.
+    pub group_cache: std::sync::OnceLock<Arc<GroupCache>>,
 
     pub(crate) expected_disconnect: Arc<AtomicBool>,
     /// Set by `reconnect()` to suppress the "Message loop exited with an error" warning.
@@ -1046,6 +1384,15 @@ pub struct Client {
     pub(crate) pending_device_sync: crate::pending_device_sync::PendingDeviceSync,
 
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
+
+    /// Identities with a `refresh_lid` re-resolve in flight, keyed by
+    /// `(connection_generation, PN-side JID)`. A burst of sends to one stale
+    /// peer is acked one message at a time, and every one of those acks carries
+    /// the flag, so without this the same query would go out once per ack while
+    /// the first is still pending. The generation scopes a reservation to the
+    /// connection that took it, so a refresh left parked on a dead socket
+    /// cannot suppress the next connection's.
+    pub(crate) pending_lid_refreshes: Arc<std::sync::Mutex<HashSet<(u64, String)>>>,
 
     /// Track retry attempts per message to prevent infinite retry loops.
     /// Key: "{chat}:{msg_id}:{sender}", Value: retry count plus the most
@@ -1076,9 +1423,46 @@ pub struct Client {
     /// failed id re-enters the failure path and would otherwise fire a
     /// duplicate event. Mirrors WA Web's DB-level placeholder uniqueness
     /// in `WAWebMessageProcessPlaceholder`.
-    pub(crate) undecryptable_dispatched: Cache<ChatMessageId, ()>,
+    pub(crate) undecryptable_dispatched: Cache<wacore::types::message::SenderMessageId, ()>,
+
+    /// Dispatch-once gate for a decrypted message. A sender retrying its own
+    /// outbox resends one id as fresh ciphertext on a new ratchet iteration,
+    /// which decrypts as new traffic, so only message identity can collapse it.
+    pub(crate) dispatched_messages: Cache<wacore::types::message::SenderMessageId, ()>,
+
+    /// Lifetime count of resent messages this gate kept from reaching
+    /// consumers. Client-level, so it survives reconnects: the sender's retry
+    /// window does not end because our socket did.
+    pub(crate) duplicate_dispatch_suppressed: AtomicU64,
 
     pub enable_auto_reconnect: Arc<AtomicBool>,
+    /// Set by [`Client::pause`] and cleared by [`Client::resume`]: the run loop
+    /// parks instead of connecting for as long as it holds.
+    ///
+    /// Deliberately not part of `is_terminal`: a paused client is between
+    /// connections, not finished, and the application means to come back.
+    pub(crate) paused: AtomicBool,
+    /// Fired by [`Client::pause`] and [`Client::resume`], and by nothing else,
+    /// so the run loop's reconnect backoff can watch it without the spurious
+    /// wakes that would collapse the delay it exists to serve.
+    pub(crate) pause_state_notifier: Arc<event_listener::Event>,
+    /// Set by [`Client::pause`] for the connection it tears down, consumed by
+    /// the run loop's post-connection branch. A one-shot fact rather than a
+    /// re-read of `paused`, because a [`Client::resume`] can land between the
+    /// two and the backoff a pause does not owe must not turn on that timing.
+    pub(crate) pause_teardown_pending: AtomicBool,
+    /// Bumped by every [`Client::pause`]. A connection attempt reads it once at
+    /// the start and is refused if it has moved, so an attempt that spanned a
+    /// pause is never published — even when a [`Client::resume`] landed while it
+    /// was still handshaking and left the flag reading `false` throughout.
+    pub(crate) pause_generation: AtomicU64,
+    /// Held across the connect graph's final refusal-check-and-publish and
+    /// across [`Client::pause`]'s capture of what it is tearing down, so a pause
+    /// cannot read "no connection" from an attempt one statement short of
+    /// publishing one. Deliberately covers flag and slot writes only — never
+    /// network I/O — so it cannot become the kind of wait that parks a caller
+    /// behind an unresponsive socket.
+    pub(crate) connection_publish: Mutex<()>,
     /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
     /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
     pub(crate) auto_reconnect_errors: Arc<AtomicU32>,
@@ -1090,9 +1474,11 @@ pub struct Client {
     /// the stability reset from erasing a deliberate penalty (WA Web `cancelReset`).
     pub(crate) backoff_reset_suppressed: Arc<AtomicBool>,
 
-    pub(crate) needs_initial_full_sync: Arc<AtomicBool>,
+    pub(crate) needs_initial_full_sync: Arc<app_state::BootstrapGate>,
 
-    pub(crate) app_state_processor: Mutex<Option<Arc<AppStateProcessor>>>,
+    /// Built on first app-state use and never replaced: reconnect clears the
+    /// processor's key cache in place rather than swapping the processor.
+    pub(crate) app_state_processor: std::sync::OnceLock<Arc<AppStateProcessor>>,
     pub(crate) app_state_key_requests: Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>,
     /// Tracks collections currently being synced to prevent duplicate sync tasks.
     /// Matches WA Web's in-flight tracking set in WAWebSyncdCollectionsStateMachine.
@@ -1158,7 +1544,7 @@ pub struct Client {
         )>,
     >,
     /// Contacts with active presence subscriptions that must be re-subscribed on reconnect.
-    pub(crate) presence_subscriptions: Arc<Mutex<HashSet<Jid>>>,
+    pub(crate) presence_subscriptions: Arc<std::sync::Mutex<HashSet<Jid>>>,
     /// Metrics for granular offline sync logging
     pub(crate) offline_sync_metrics: Arc<OfflineSyncMetrics>,
     /// Drives the WA Web pull-batch loop for offline backlog delivery.
@@ -1166,14 +1552,38 @@ pub struct Client {
     /// Notifier for when the noise socket is established (before login).
     /// Use this to wait for the socket to be ready for sending messages.
     pub(crate) socket_ready_notifier: Arc<event_listener::Event>,
-    /// Set to `true` only when `dispatch_connected()` fires (after critical sync
-    /// completes). Reset on each new connection attempt. Used by
-    /// `wait_for_connected()` to avoid a false-positive fast path when the
-    /// client is logged in but critical app state hasn't synced yet.
+    /// Set to `true` only when `dispatch_connected()` fires (once the critical
+    /// sync has an answer, clean or not). Reset on each new connection attempt.
+    /// Used by `wait_for_connected()` to avoid a false-positive fast path when
+    /// the client is logged in but critical app state hasn't been asked for yet.
     pub(crate) is_ready: Arc<AtomicBool>,
     /// Notifier for when the client is fully connected and logged in.
     /// Triggered after Event::Connected is dispatched.
     pub(crate) connected_notifier: Arc<event_listener::Event>,
+    /// The `connection_generation` that `<success>` finished publishing.
+    ///
+    /// `is_logged_in` is set by the dedup swap that has to come *before* the
+    /// generation is incremented, so between those two stores a reader sees an
+    /// authenticated client whose generation is about to change underneath it.
+    /// Work that bound a scope in that window had every attempt rejected as
+    /// retired. This lags `connection_generation` by exactly that window, so
+    /// equality means the generation a caller is about to bind is the final one.
+    pub(crate) authenticated_generation: Arc<AtomicU64>,
+    /// Fired whenever the answer to *can work reach the server, and is it still
+    /// worth waiting* may have changed: the session authenticated, or the client
+    /// became terminal.
+    ///
+    /// Neither of the other two notifiers answers that. `socket_ready_notifier`
+    /// fires before login, so a waiter released by it can send an IQ the server
+    /// will not answer and whose generation `<success>` then retires;
+    /// `connected_notifier` fires only after the critical sync, which app-state
+    /// work must not sit through because it may *be* that sync. And nothing at
+    /// all announces a client that stops without a replacement socket ever
+    /// arriving — the case that leaves a detached retry parked forever, holding
+    /// the `Arc<Client>` whose drop would have been the only other way out.
+    ///
+    /// Every terminal transition must fire this. See [`Client::is_terminal`].
+    pub(crate) session_state_notifier: Arc<event_listener::Event>,
     pub(crate) major_sync_task_sender: async_channel::Sender<MajorSyncTask>,
     pub(crate) pairing_cancellation_tx: Arc<Mutex<Option<async_channel::Sender<()>>>>,
     /// Asks the QR rotation task to re-render the ref it is already showing.
@@ -1185,14 +1595,11 @@ pub struct Client {
     /// Tracks the pending pair code request and ephemeral keys.
     pub(crate) pair_code_state: Arc<Mutex<wacore::pair_code::PairCodeState>>,
 
-    /// SHORTCAKE_PASSKEY linking flow state: the pending handoff key, the
-    /// per-attempt ephemeral linking cache, and the optional host authenticator.
-    pub(crate) passkey_state: Arc<Mutex<crate::passkey::flow::PasskeyFlowState>>,
-
-    /// Wait-free "an open is in flight" reservation for the passkey flow. Kept
-    /// outside `passkey_state` so it can be released synchronously on drop (a
-    /// cancelled open can't leave it stuck), unlike a flag behind the async lock.
-    pub(crate) passkey_opening: AtomicBool,
+    /// Per-client state of every optional subsystem attached to this build,
+    /// each under its own type, in one field rather than one field per
+    /// subsystem. Empty, and zero-sized, in a build with none attached; see
+    /// `agent_docs/subsystem_boundary.md`.
+    pub(crate) subsystems: subsystem::Subsystems,
 
     /// Custom handlers for encrypted message types. Set once at `Bot::build` and
     /// immutable afterward, so the receive hot path reads it with a plain
@@ -1216,7 +1623,12 @@ pub struct Client {
 
     /// Chat state (typing indicator) handlers registered by external consumers.
     /// Each handler receives a `ChatStateEvent` describing the chat, optional participant and state.
-    pub(crate) chatstate_handlers: Arc<RwLock<Vec<ChatStateHandler>>>,
+    ///
+    /// Copy-on-write behind a sync lock, guarded by `chatstate_handler_count` so
+    /// the default (no handler registered) never takes the lock nor builds the
+    /// event that only a handler would read.
+    pub(crate) chatstate_handlers: Arc<std::sync::RwLock<Arc<[ChatStateHandler]>>>,
+    pub(crate) chatstate_handler_count: AtomicUsize,
 
     pub(crate) pdo_pending_requests: Cache<ChatMessageId, crate::pdo::PendingPdoRequest>,
 
@@ -1226,7 +1638,12 @@ pub struct Client {
     /// request per message, no matter how many times the server redelivers
     /// the undecryptable original. Entries are dropped on send failure so a
     /// transient error does not block the next attempt.
-    pub(crate) pdo_requested: Cache<ChatMessageId, ()>,
+    ///
+    /// Keyed with the sender, unlike [`Self::pdo_pending_requests`]. This one
+    /// is a purely local gate that never has to agree with anything the phone
+    /// sends back, so it can name the message precisely; the pending map has
+    /// to match a response and keeps the key the phone answers with.
+    pub(crate) pdo_requested: Cache<wacore::types::message::SenderMessageId, ()>,
 
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.
@@ -1258,6 +1675,13 @@ pub struct Client {
     /// repeat send really served the memo instead of redoing the resolution.
     #[cfg(test)]
     pub(crate) dm_devices_memo_recomputes: AtomicU64,
+
+    /// Per-term hit/miss counts for the two group-path device memos above,
+    /// read through [`Client::device_memo_stats`]. Which term invalidated is
+    /// the only thing that distinguishes "this memo is doing its job" from
+    /// "this memo has never hit", and no benchmark can observe it: a fixture
+    /// that forces the outcome measures the cost of the outcome it forced.
+    pub(crate) device_memo_counters: DeviceMemoCounters,
 
     /// Single-flight for cold SKDM distribution, keyed per group. Concurrent
     /// cold sends each re-ran the full per-member fan-out before any of them
@@ -1333,6 +1757,10 @@ pub struct Client {
     /// Keeps retry regressions deterministic without corrupting the test database.
     #[cfg(test)]
     pub(crate) app_state_key_share_prepare_test_failures: AtomicU32,
+    /// Counts `ChatStateEvent` constructions, so a test can prove the
+    /// no-handler fast path skips the build rather than just the invoke.
+    #[cfg(test)]
+    pub(crate) chatstate_events_built: AtomicU32,
 
     /// Holds the background saver's AbortHandle so the task lifetime follows
     /// `Arc<Client>` ref count instead of the Bot wrapper's. Set once by
@@ -1348,37 +1776,28 @@ pub struct Client {
     /// Number of consumers currently requesting `Event::RawNode` forwarding.
     raw_node_forwarding: AtomicUsize,
 
-    /// Active VoIP calls and their media-task abort handles. `abort_all` runs from the
-    /// connection-cleanup path so a disconnect/reconnect tears down every in-flight call. Behind the
-    /// `voip` feature: it is populated only by the `voip` media facade.
-    #[cfg(feature = "voip-runtime")]
-    pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
+    /// Number of consumers currently requesting `Event::DecryptedPayload`
+    /// forwarding.
+    decrypted_payload_forwarding: AtomicUsize,
 
-    /// Admission snapshots that can race a call-link join ACK before its call id is registered.
-    /// Kept beside the client-side join lifecycle so `wacore` does not authorize unknown calls.
-    #[cfg(feature = "voip-runtime")]
-    pending_call_link_joins: Arc<std::sync::Mutex<voip::PendingCallLinkJoins>>,
+    /// Number of consumers currently requesting `Event::EncDecryptFailed`
+    /// forwarding. Counted apart from `decrypted_payload_forwarding` so a
+    /// consumer that only watches failures does not turn on payload cloning,
+    /// and one that only watches successes pays nothing on the failure paths.
+    enc_decrypt_failed_forwarding: AtomicUsize,
 
-    /// Serializes call-link joins until the ACK reveals which call id owns any admission state
-    /// buffered during the request. This keeps a bounded overflow tied to one join instead of
-    /// letting it reject an unrelated concurrent join.
-    #[cfg(feature = "voip-runtime")]
-    pending_call_link_join_lane: Arc<Mutex<()>>,
+    /// Gate and publisher for `Event::SentFrame`. Behind an `Arc` because the
+    /// noise sender task reads it; see [`SentFrameTap`].
+    pub(crate) sent_frame_tap: Arc<SentFrameTap>,
 
-    /// Serializes incoming-answer registration with generation-aware teardown. A failed answer holds
-    /// its call-id lane until `<terminate>` has been written, so a same-call-id re-offer cannot become
-    /// current in the removal-before-send window. Stripes bound storage while allowing independent
-    /// lanes to progress concurrently.
-    #[cfg(feature = "voip-runtime")]
-    pub(crate) answer_transition_locks: [Arc<Mutex<()>>; 16],
-
-    /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
-    /// from the server AFTER the offer (live-only), so each `voip().call()` parks the material needed
-    /// to spawn the engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id
-    /// arrives. Behind the `voip` feature; populated only by the media facade.
-    #[cfg(feature = "voip-runtime")]
-    pub(crate) pending_outgoing_calls:
-        Arc<std::sync::Mutex<HashMap<String, crate::voip::facade::PendingOutgoing>>>,
+    /// Stanza interceptors, behind the same copy-on-write snapshot the event
+    /// bus uses: reading one costs a refcount bump, so the read loop allocates
+    /// nothing per stanza. Registering is the rare side, and pays the copy.
+    stanza_interceptors: std::sync::RwLock<Arc<Vec<interceptor::Registration>>>,
+    /// Kept alongside so the read loop can skip the lock entirely while none
+    /// are registered.
+    stanza_interceptor_count: AtomicUsize,
+    next_interceptor_id: AtomicU64,
 }
 
 /// Builds a pong response node for a server-initiated ping.
@@ -1425,7 +1844,8 @@ fn ack_participant<'node, 'data>(
         .filter(|participant| match policy {
             AckParticipantPolicy::Preserve => true,
             AckParticipantPolicy::OmitReceiptDestinationDuplicate => {
-                node.tag != "receipt" || !value_refs_display_equal(participant, from)
+                node.tag != StanzaTag::Receipt.as_str()
+                    || !value_refs_display_equal(participant, from)
             }
         })
 }
@@ -1469,7 +1889,7 @@ fn encode_ack_bytes(
     };
 
     // WA Web stamps the own device JID for both classes.
-    let own_device_pn = if tag == "message" || tag == "status" {
+    let own_device_pn = if tag == StanzaTag::Message.as_str() || tag == StanzaTag::Status.as_str() {
         Some(own_device_pn.ok_or(crate::features::StanzaResponseError::MissingLocalIdentity)?)
     } else {
         None
@@ -1602,7 +2022,7 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
     attrs.insert("class", NodeValue::from(tag));
     attrs.insert("id", id);
     attrs.insert("to", from);
-    if tag == "message"
+    if tag == StanzaTag::Message.as_str()
         && let Some(own_device_pn) = own_device_pn
     {
         attrs.insert("from", NodeValue::Jid(own_device_pn.clone()));
@@ -1625,10 +2045,10 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
 
 /// WA Web omits `type` when ACKing `<notification type="encrypt"><identity/></notification>`.
 fn is_encrypt_identity_notification(node: &wacore_binary::NodeRef<'_>) -> bool {
-    node.tag == "notification"
+    node.tag == StanzaTag::Notification.as_str()
         && node
             .get_attr("type")
-            .is_some_and(|value| value == "encrypt")
+            .is_some_and(|value| value == NotificationType::Encrypt.as_str())
         && node.get_optional_child("identity").is_some()
 }
 

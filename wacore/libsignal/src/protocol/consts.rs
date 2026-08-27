@@ -33,6 +33,9 @@ pub const MESSAGE_KEY_PRUNE_THRESHOLD: usize = 50;
 /// reloaded snapshot fast-forwards past them. Bounds both the sync-flush
 /// amortization (one per this many sends) and the worst-case counter gap a
 /// receiver sees after a crash — keep it well under MAX_FORWARD_JUMPS.
+///
+/// None of this applies to a record whose consumer waived the lease: it
+/// reserves nothing, so there is no batch to fast-forward past and no gap.
 pub const SENDER_CHAIN_RESERVATION_BATCH: u32 = 64;
 
 /// Upper bound for the reservation fast-forward on load. A legitimate lease

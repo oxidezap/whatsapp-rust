@@ -1201,6 +1201,31 @@ mod tests {
     }
 
     #[test]
+    fn buffered_body_is_decrypted_in_its_own_allocation() {
+        // Every buffered download funnels through this helper, so a copy here
+        // would mean holding two full copies of a multi-megabyte file at once.
+        let plaintext = vec![0x5Eu8; 512 * 1024];
+        let enc = wacore::upload::encrypt_media(&plaintext, MediaType::Video)
+            .expect("encryption should succeed");
+        let mut body = enc.data_to_upload;
+        let allocation = body.as_ptr();
+        let capacity = body.capacity();
+
+        decrypt_or_validate_buffered_body(
+            &mut body,
+            &MediaDecryption::Encrypted {
+                media_key: enc.media_key.to_vec(),
+                media_type: MediaType::Video,
+            },
+        )
+        .expect("decryption should succeed");
+
+        assert_eq!(body, plaintext);
+        assert_eq!(body.as_ptr(), allocation, "allocation must be reused");
+        assert_eq!(body.capacity(), capacity, "capacity must be reused");
+    }
+
+    #[test]
     fn download_statuses_have_one_shared_classification() {
         use crate::http::{HTTP_STATUS_FORBIDDEN, HTTP_STATUS_UNAUTHORIZED};
 

@@ -1,0 +1,19 @@
+[package]
+name = "whatsapp-rust-wam-catalog"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+description = "Generated WhatsApp Metrics (WAM) event catalog and buffer codec"
+
+[features]
+# The call-site table extracted from WA Web. Evidence about the official client,
+# not part of the catalog a client links, so it is off by default and enabled
+# only by the conformance test that checks an emitter against it.
+parity = []
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

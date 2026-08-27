@@ -74,6 +74,17 @@ pub fn hmac_sha256_two_part(key: &[u8], first: &[u8], second: &[u8]) -> [u8; 32]
     provider::provider().hmac_sha256_two_part(key, first, second)
 }
 
+/// X25519 key agreement over raw 32-byte keys. Delegates to the active
+/// [`SignalCryptoProvider`], whose default is this crate's own implementation
+/// and never fails; only a substituted backend can return an error.
+#[inline]
+pub fn x25519_agreement(
+    private_key: &[u8; 32],
+    their_public_key: &[u8; 32],
+) -> std::result::Result<[u8; 32], CryptoProviderError> {
+    provider::provider().x25519_agreement(private_key, their_public_key)
+}
+
 /// In-place AES-256-GCM seal. On entry `buffer` holds the plaintext; on return
 /// it holds `ciphertext || tag` (length grown by 16). Zero allocations with
 /// the default [`RustCryptoProvider`].

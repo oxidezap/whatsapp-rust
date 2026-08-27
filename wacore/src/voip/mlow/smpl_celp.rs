@@ -173,9 +173,11 @@ const SMPL_INTERPOL_KERNEL: [f32; 2 * SMPL_LTP_INTERPOL_DELAY] = [
 
 #[inline]
 fn smpl_dot_prod(a: &[f32], b: &[f32], l: usize) -> f32 {
+    // Slicing once and zipping hoists both bounds checks out of the loop. The accumulation stays a
+    // strict left fold in the same order, so the f32 rounding sequence is unchanged.
     let mut ret = 0.0f32;
-    for i in 0..l {
-        ret += a[i] * b[i];
+    for (x, y) in a[..l].iter().zip(&b[..l]) {
+        ret += x * y;
     }
     ret
 }
@@ -183,8 +185,8 @@ fn smpl_dot_prod(a: &[f32], b: &[f32], l: usize) -> f32 {
 #[inline]
 fn smpl_nrg(x: &[f32], n: usize) -> f32 {
     let mut nrg = 0.0f32;
-    for k in 0..n {
-        nrg += x[k] * x[k];
+    for v in &x[..n] {
+        nrg += v * v;
     }
     nrg
 }
@@ -259,8 +261,8 @@ fn smpl_mul_vec_inplace(x: &[f32], y: &mut [f32], l: usize) {
 
 #[inline]
 fn smpl_celp_q(num: &[f32], den: &[f32], l: usize, q: &mut [f32]) {
-    for i in 0..l {
-        q[i] = (num[i] * num[i]) / den[i];
+    for ((qv, nv), dv) in q[..l].iter_mut().zip(&num[..l]).zip(&den[..l]) {
+        *qv = (nv * nv) / dv;
     }
 }
 
@@ -306,22 +308,37 @@ fn smpl_filt_ar16(x: &[f32], n: usize, coef: &[f32], y_base: usize, y: &mut [f32
 
 /// MA filter: the `(coef_len-1)` history samples sit before `x[0]` (caller passes an offset). `x != y`.
 fn smpl_filt_ma(x: &[f32], x_base: usize, n: usize, coef: &[f32], coef_len: usize, y: &mut [f32]) {
+    // The caller's contract, spelled out because the tap windows below depend on it: `coef_len - 1`
+    // history samples sit before `x[0]`, so every `x[x_base - i ..]` starts in bounds; and the
+    // `coef[0] == 1.0` branch needs a `coef[1]` to read. Both hold at the only call site
+    // (`perc_filt_ma`, where n == coef_len == perc_resp_len, which is 32 whenever it routes here --
+    // perc_resp_len == 10 goes to `smpl_filt_ma9`).
+    debug_assert!(x_base + 1 >= coef_len);
+    debug_assert!(coef[0] != 1.0 || coef.len() >= 2);
+    // Each tap reads a fixed-offset window of `x`, so one slice per tap replaces the per-element
+    // `x_base + k - i` bounds check. Taps are still applied in ascending order into the same
+    // accumulator, so the sum order -- and the output bits -- are unchanged.
     let mut i;
     if coef[0] == 1.0 {
         // y[k] = x[k] + coef[1]*x[k-1]
-        for k in 0..n {
-            y[k] = x[x_base + k] + coef[1] * x[x_base + k - 1];
+        let c1 = coef[1];
+        let x0 = &x[x_base..x_base + n];
+        let xm1 = &x[x_base - 1..x_base - 1 + n];
+        for ((yv, a), b) in y[..n].iter_mut().zip(x0).zip(xm1) {
+            *yv = a + c1 * b;
         }
         i = 2;
     } else {
-        for k in 0..n {
-            y[k] = coef[0] * x[x_base + k];
+        let c0 = coef[0];
+        for (yv, xv) in y[..n].iter_mut().zip(&x[x_base..x_base + n]) {
+            *yv = c0 * xv;
         }
         i = 1;
     }
     while i < coef_len {
-        for k in 0..n {
-            y[k] += coef[i] * x[x_base + k - i];
+        let ci = coef[i];
+        for (yv, xv) in y[..n].iter_mut().zip(&x[x_base - i..x_base - i + n]) {
+            *yv += ci * xv;
         }
         i += 1;
     }
@@ -384,10 +401,12 @@ fn smpl_cmf_to_bits(cmf: &[u16], cmf_len: usize, bits: &mut [f32]) {
 fn smpl_get_maxi(x: &[f32], x_len: usize) -> usize {
     let mut i = 0usize;
     let mut maxtmp = x[0];
-    for n in 1..x_len {
-        if x[n] > maxtmp {
-            maxtmp = x[n];
-            i = n;
+    // `x_len.max(1)` keeps the empty-range case a no-op returning 0, as the `1..x_len` loop this
+    // replaced was: slicing would panic on `x[1..0]` where the range simply did not iterate.
+    for (n, v) in x[1..x_len.max(1)].iter().enumerate() {
+        if *v > maxtmp {
+            maxtmp = *v;
+            i = n + 1;
         }
     }
     i
@@ -408,9 +427,9 @@ fn smpl_get_maxi_k(x: &[f32], idx: &mut [i32], x_len: usize, k: usize) {
         let mut best = -f32::MAX;
         let mut bi = 0usize;
         let mut found = false;
-        for n in 0..x_len {
-            if !taken[n] && (!found || x[n] > best) {
-                best = x[n];
+        for (n, (t, v)) in taken.iter().zip(&x[..x_len]).enumerate() {
+            if !*t && (!found || *v > best) {
+                best = *v;
                 bi = n;
                 found = true;
             }
@@ -789,6 +808,7 @@ struct SubframeScratch {
     wtgt_tmp: Vec<f32>,
     wtgt: Vec<f32>,
     exc_fcb: Vec<f32>,
+    exc_fcb_raw: Vec<f32>,
 }
 
 impl SubframeScratch {
@@ -909,11 +929,14 @@ impl CelpEncoder {
 // search then pays no per-call allocation.
 #[derive(Default)]
 struct FcbSearchScratch {
-    // Double-buffered candidate states (read/write ping-pong).
-    fcb_states: [Vec<FcbState>; 2], // each SMPL_CELP_MAX_NUMSURV
-    read_idx: usize,
-    write_idx: usize,
-    fcbs: Vec<Fcb>, // SMPL_CELP_MAX_NUMSURV
+    // Double-buffered candidate states (read/write ping-pong). Two named fields rather than
+    // `[Vec<FcbState>; 2]` plus a pair of indices: swapping the `Vec` headers costs what swapping
+    // the indices did, and it lets `add_pulse` split-borrow the read and the write state as
+    // disjoint fields. Its inner loops then walk plain slices instead of re-evaluating
+    // `fcb_states[buf][cand]` -- two bounds checks -- once per element.
+    states_read: Vec<FcbState>,  // SMPL_CELP_MAX_NUMSURV
+    states_write: Vec<FcbState>, // SMPL_CELP_MAX_NUMSURV
+    fcbs: Vec<Fcb>,              // SMPL_CELP_MAX_NUMSURV
     fcbs_size: usize,
     fcb_candidates: Vec<Fcb>, // up to NUMSURV*NUMSURV
     fcb_candidates_size: usize,
@@ -938,9 +961,8 @@ impl FcbSearchScratch {
                 .collect::<Vec<_>>()
         };
         FcbSearchScratch {
-            fcb_states: [mk(), mk()],
-            read_idx: 0,
-            write_idx: 1,
+            states_read: mk(),
+            states_write: mk(),
             fcbs: vec![Fcb::default(); SMPL_CELP_MAX_NUMSURV],
             fcbs_size: 0,
             fcb_candidates: vec![Fcb::default(); SMPL_CELP_MAX_NUMSURV * SMPL_CELP_MAX_NUMSURV],
@@ -954,17 +976,18 @@ impl FcbSearchScratch {
     }
 
     /// Reset the bookkeeping to a fresh-search state (the buffers are overwritten before they are
-    /// read, so only the indices/sizes need clearing). Lets one pooled instance serve every search.
+    /// read, so only the sizes need clearing). Lets one pooled instance serve every search.
     fn reset(&mut self) {
-        self.read_idx = 0;
-        self.write_idx = 1;
+        // The read/write roles are not reset: which of the two buffers plays which role at the
+        // start of a search cannot be observed, because every live element is written before it is
+        // read (`num`/`den` over `..fcb_subfrlen`, the pulse arrays over `..n_pulses`).
         self.fcbs_size = 0;
         self.fcb_candidates_size = 0;
         self.unique_sgntr_size = 0;
     }
 
     fn swap_rw(&mut self) {
-        std::mem::swap(&mut self.read_idx, &mut self.write_idx);
+        std::mem::swap(&mut self.states_read, &mut self.states_write);
     }
 
     fn is_unique(&self, sgntr: u64) -> bool {
@@ -1130,130 +1153,158 @@ impl CelpEncoder {
         let fcb_state_idx = sc.fcbs[fcb_idx_in].fcb_state_idx;
         let fcb_sgntr_base = sc.fcbs[fcb_idx_in].sgntr;
 
-        let read_idx = sc.read_idx;
-        let write_idx = sc.write_idx;
+        // Split-borrow the read state, the write state and `dd_den` -- three disjoint fields -- for
+        // the whole state-building phase. Every loop below then walks a slice whose bound is checked
+        // once, instead of re-resolving `buffer[candidate].field[i]` on each element. The arithmetic
+        // is untouched: same operands, same order, same associativity, so the bitstream is identical.
+        {
+            let FcbSearchScratch {
+                states_read,
+                states_write,
+                dd_den,
+                ..
+            } = &mut *sc;
+            let read_st = &states_read[fcb_state_idx];
+            let write_st = &mut states_write[idx];
+            let n = fcb_subfrlen;
+            let n_i = n as i32;
+            let np = fcb_n_pulses as usize;
 
-        // num_w[i] = num_r[i] + d_abs[pos_new]
-        let add = d_abs[fcb_pos_new as usize];
-        for i in 0..fcb_subfrlen {
-            let v = sc.fcb_states[read_idx][fcb_state_idx].num[i] + add;
-            sc.fcb_states[write_idx][idx].num[i] = v;
-        }
-        // den_w = copy(den_r)
-        for i in 0..fcb_subfrlen {
-            sc.fcb_states[write_idx][idx].den[i] = sc.fcb_states[read_idx][fcb_state_idx].den[i];
-        }
+            // num_w[i] = num_r[i] + d_abs[pos_new]
+            let add = d_abs[fcb_pos_new as usize];
+            for (w, r) in write_st.num[..n].iter_mut().zip(&read_st.num[..n]) {
+                *w = r + add;
+            }
+            // den_w = copy(den_r)
+            write_st.den[..n].copy_from_slice(&read_st.den[..n]);
 
-        if pitch_sharp == 0.0 {
-            let (nz0, nz1) = non_zero_range(fcb_pos_new, perc_resp_len, fcb_subfrlen);
-            let col_off = phi_col_offset(fcb_pos_new);
-            let mut d_den = 0.0f32;
-            for i in 0..fcb_n_pulses as usize {
-                let pos = sc.fcb_states[read_idx][fcb_state_idx].pulse_positions[i];
-                let sgn = sc.fcb_states[read_idx][fcb_state_idx].pulse_signs[i];
-                d_den += self.phi_flip[(col_off + pos) as usize] * sgn;
-            }
-            d_den *= 2.0 * fcb_sign_new;
-            d_den += self.phi_flip[(col_off + fcb_pos_new) as usize];
-            for i in 0..fcb_subfrlen {
-                sc.fcb_states[write_idx][idx].den[i] += d_den;
-            }
-            for i in nz0..nz1 {
-                sc.fcb_states[write_idx][idx].den[i] +=
-                    2.0 * fcb_sign_new * d_sign[i] * self.phi_flip[(col_off + i as i32) as usize];
-            }
-        } else {
-            // Pitch-sharpened cross terms.
-            let mut g1;
-            let mut d_den = 0.0f32;
-            // cross term: new pulse train vs each previous pulse train
-            {
+            if pitch_sharp == 0.0 {
+                let (nz0, nz1) = non_zero_range(fcb_pos_new, perc_resp_len, n);
+                let col_off = phi_col_offset(fcb_pos_new);
+                let mut d_den = 0.0f32;
+                for (pos, sgn) in read_st.pulse_positions[..np]
+                    .iter()
+                    .zip(&read_st.pulse_signs[..np])
+                {
+                    d_den += self.phi_flip[(col_off + pos) as usize] * sgn;
+                }
+                d_den *= 2.0 * fcb_sign_new;
+                d_den += self.phi_flip[(col_off + fcb_pos_new) as usize];
+                for v in &mut write_st.den[..n] {
+                    *v += d_den;
+                }
+                if nz0 < nz1 {
+                    // `phi_flip` is walked at a fixed offset from the den index, so one slice of
+                    // the same length replaces the per-element `(col_off + i)` recomputation.
+                    let base = (col_off + nz0 as i32) as usize;
+                    for ((v, s), p) in write_st.den[nz0..nz1]
+                        .iter_mut()
+                        .zip(&d_sign[nz0..nz1])
+                        .zip(&self.phi_flip[base..base + (nz1 - nz0)])
+                    {
+                        *v += 2.0 * fcb_sign_new * s * p;
+                    }
+                }
+            } else {
+                // Pitch-sharpened cross terms.
+                let mut g1;
+                let mut d_den = 0.0f32;
+                // cross term: new pulse train vs each previous pulse train
+                {
+                    g1 = 1.0f32;
+                    let mut pos = fcb_pos_new;
+                    while pos < n_i {
+                        let col_off = phi_col_offset(pos);
+                        for (&pulse_pos, &pulse_sgn) in read_st.pulse_positions[..np]
+                            .iter()
+                            .zip(&read_st.pulse_signs[..np])
+                        {
+                            let mut g2 = g1;
+                            let mut pos_ = pulse_pos;
+                            while pos_ < n_i {
+                                d_den += g2 * self.phi_flip[(col_off + pos_) as usize] * pulse_sgn;
+                                g2 *= pitch_sharp;
+                                pos_ += lag;
+                            }
+                        }
+                        g1 *= pitch_sharp;
+                        pos += lag;
+                    }
+                }
+                d_den *= 2.0 * fcb_sign_new;
+                // self term: new pulse train vs itself
+                {
+                    g1 = 1.0f32;
+                    let mut pos1 = fcb_pos_new;
+                    while pos1 < n_i {
+                        let col_off = phi_col_offset(pos1);
+                        let mut g2 = g1;
+                        let mut pos2 = fcb_pos_new;
+                        while pos2 < n_i {
+                            d_den += g2 * self.phi_flip[(col_off + pos2) as usize];
+                            g2 *= pitch_sharp;
+                            pos2 += lag;
+                        }
+                        g1 *= pitch_sharp;
+                        pos1 += lag;
+                    }
+                }
+                for v in &mut write_st.den[..n] {
+                    *v += d_den;
+                }
+                // dd_den (accumulated, so zero the live region first).
+                dd_den[..n].fill(0.0);
                 g1 = 1.0f32;
                 let mut pos = fcb_pos_new;
-                while pos < fcb_subfrlen as i32 {
+                while pos < n_i {
+                    let (nz0, nz1) = non_zero_range(pos, perc_resp_len, n);
                     let col_off = phi_col_offset(pos);
-                    for i in 0..fcb_n_pulses as usize {
-                        let mut g2 = g1;
-                        let pulse_pos = sc.fcb_states[read_idx][fcb_state_idx].pulse_positions[i];
-                        let pulse_sgn = sc.fcb_states[read_idx][fcb_state_idx].pulse_signs[i];
-                        let mut pos_ = pulse_pos;
-                        while pos_ < fcb_subfrlen as i32 {
-                            d_den += g2 * self.phi_flip[(col_off + pos_) as usize] * pulse_sgn;
-                            g2 *= pitch_sharp;
-                            pos_ += lag;
+                    let mut g2 = g1;
+                    let mut k = 0i32;
+                    while k < n_i {
+                        let start_i = (nz0 as i32 - k).max(0);
+                        let end_i = (n_i - k).min(nz1 as i32 - k);
+                        if start_i < end_i {
+                            let base = (col_off + start_i + k) as usize;
+                            let len = (end_i - start_i) as usize;
+                            for (v, p) in dd_den[start_i as usize..end_i as usize]
+                                .iter_mut()
+                                .zip(&self.phi_flip[base..base + len])
+                            {
+                                *v += g2 * p;
+                            }
                         }
+                        g2 *= pitch_sharp;
+                        k += lag;
                     }
                     g1 *= pitch_sharp;
                     pos += lag;
                 }
-            }
-            d_den *= 2.0 * fcb_sign_new;
-            // self term: new pulse train vs itself
-            {
-                g1 = 1.0f32;
-                let mut pos1 = fcb_pos_new;
-                while pos1 < fcb_subfrlen as i32 {
-                    let col_off = phi_col_offset(pos1);
-                    let mut g2 = g1;
-                    let mut pos2 = fcb_pos_new;
-                    while pos2 < fcb_subfrlen as i32 {
-                        d_den += g2 * self.phi_flip[(col_off + pos2) as usize];
-                        g2 *= pitch_sharp;
-                        pos2 += lag;
-                    }
-                    g1 *= pitch_sharp;
-                    pos1 += lag;
+                for ((v, s), dd) in write_st.den[..n]
+                    .iter_mut()
+                    .zip(&d_sign[..n])
+                    .zip(&dd_den[..n])
+                {
+                    *v += 2.0 * fcb_sign_new * s * dd;
                 }
             }
-            for i in 0..fcb_subfrlen {
-                sc.fcb_states[write_idx][idx].den[i] += d_den;
-            }
-            // dd_den (accumulated, so zero the live region first).
-            sc.dd_den[..fcb_subfrlen].fill(0.0);
-            g1 = 1.0f32;
-            let mut pos = fcb_pos_new;
-            while pos < fcb_subfrlen as i32 {
-                let (nz0, nz1) = non_zero_range(pos, perc_resp_len, fcb_subfrlen);
-                let col_off = phi_col_offset(pos);
-                let mut g2 = g1;
-                let mut k = 0i32;
-                while k < fcb_subfrlen as i32 {
-                    let start_i = (nz0 as i32 - k).max(0);
-                    let end_i = (fcb_subfrlen as i32 - k).min(nz1 as i32 - k);
-                    let mut i = start_i;
-                    while i < end_i {
-                        sc.dd_den[i as usize] += g2 * self.phi_flip[(col_off + i + k) as usize];
-                        i += 1;
-                    }
-                    g2 *= pitch_sharp;
-                    k += lag;
-                }
-                g1 *= pitch_sharp;
-                pos += lag;
-            }
-            for i in 0..fcb_subfrlen {
-                sc.fcb_states[write_idx][idx].den[i] +=
-                    2.0 * fcb_sign_new * d_sign[i] * sc.dd_den[i];
-            }
+
+            // Append the new pulse to the state.
+            write_st.pulse_positions[..np].copy_from_slice(&read_st.pulse_positions[..np]);
+            write_st.pulse_signs[..np].copy_from_slice(&read_st.pulse_signs[..np]);
+            write_st.pulse_positions[np] = fcb_pos_new;
+            write_st.pulse_signs[np] = fcb_sign_new;
         }
 
-        // Append the new pulse to the state.
-        for i in 0..fcb_n_pulses as usize {
-            sc.fcb_states[write_idx][idx].pulse_positions[i] =
-                sc.fcb_states[read_idx][fcb_state_idx].pulse_positions[i];
-            sc.fcb_states[write_idx][idx].pulse_signs[i] =
-                sc.fcb_states[read_idx][fcb_state_idx].pulse_signs[i];
-        }
-        sc.fcb_states[write_idx][idx].pulse_positions[fcb_n_pulses as usize] = fcb_pos_new;
-        sc.fcb_states[write_idx][idx].pulse_signs[fcb_n_pulses as usize] = fcb_sign_new;
-
-        // fcb->n_pulses++, fcb->fcb_state_idx = idx (mutate the read copy)
+        // The upstream C bumped `fcb->n_pulses` and set `fcb->fcb_state_idx` in place. Here the
+        // read-side `sc.fcbs[fcb_idx_in]` is left alone: both values go straight into each candidate
+        // emitted below, and the caller rebuilds `sc.fcbs` from the candidates after `swap_rw`.
         let new_n_pulses = fcb_n_pulses + 1;
 
         // Q = num^2/den; top-numsurv -> candidates with unique-signature dedup.
         smpl_celp_q(
-            &sc.fcb_states[write_idx][idx].num,
-            &sc.fcb_states[write_idx][idx].den,
+            &sc.states_write[idx].num,
+            &sc.states_write[idx].den,
             fcb_subfrlen,
             &mut sc.q,
         );
@@ -1323,20 +1374,17 @@ impl CelpEncoder {
             pitch_sharp = 0.0;
         }
 
-        // (read_idx/write_idx already set by `sc.reset()` above.)
         let mut best_fcb: [Fcb; SMPL_CELP_MAX_RATES] = [Fcb::default(), Fcb::default()];
         let mut best_fcb_state: [FcbState; SMPL_CELP_MAX_RATES] =
             [FcbState::new(), FcbState::new()];
         let mut nrg_thr = [0.0f32; SMPL_CELP_MAX_RATES];
 
-        // Initialize the first state buffer (write_idx slot 0).
+        // Initialize the first state buffer (write slot 0).
         {
-            let wi = sc.write_idx;
-            sc.fcb_states[wi][0].num[..fcb_subfrlen].copy_from_slice(&d_abs[..fcb_subfrlen]);
+            let st = &mut sc.states_write[0];
+            st.num[..fcb_subfrlen].copy_from_slice(&d_abs[..fcb_subfrlen]);
             if pitch_sharp == 0.0 {
-                for i in 0..fcb_subfrlen {
-                    sc.fcb_states[wi][0].den[i] = phi0 + 1e-16;
-                }
+                st.den[..fcb_subfrlen].fill(phi0 + 1e-16);
             } else {
                 let mut offset = fcb_subfrlen as i32 - 1;
                 let mut i = fcb_subfrlen as i32 - 1;
@@ -1358,7 +1406,7 @@ impl CelpEncoder {
                     }
                     let len = lag.min(offset + 1);
                     for jj in 0..len {
-                        sc.fcb_states[wi][0].den[(offset - jj) as usize] = res;
+                        st.den[(offset - jj) as usize] = res;
                     }
                     offset -= len;
                     i -= lag;
@@ -1368,12 +1416,10 @@ impl CelpEncoder {
 
         sc.swap_rw();
         {
-            // fcb_state is the slot just written: after the swap, read_idx points back at
-            // fcb_states[old write_idx][0].
-            let ri = sc.read_idx; // after swap, this equals old write_idx
+            // fcb_state is the slot just written: after the swap it is `states_read[0]`.
             // Split-borrow the read-side state and `q` (disjoint fields) so the copy/Q stays alloc-free.
-            let FcbSearchScratch { fcb_states, q, .. } = &mut *sc;
-            let st = &fcb_states[ri][0];
+            let FcbSearchScratch { states_read, q, .. } = &mut *sc;
+            let st = &states_read[0];
             if pitch_sharp == 0.0 {
                 q[..fcb_subfrlen].copy_from_slice(&st.num[..fcb_subfrlen]);
             } else {
@@ -1385,15 +1431,14 @@ impl CelpEncoder {
         smpl_get_maxi_k(&sc.q, &mut sort_ix, fcb_subfrlen, surv[0] as usize);
         sc.fcbs_size = 0;
         {
-            let ri = sc.read_idx;
             for i in 0..surv[0] as usize {
                 let pos = sort_ix[i] as usize;
                 let fcb = Fcb {
                     sgntr: self.sgntrs[pos],
                     pos_new: pos as i32,
                     sign_new: d_sign[pos],
-                    wnrg: (sc.fcb_states[ri][0].num[pos] * sc.fcb_states[ri][0].num[pos])
-                        / sc.fcb_states[ri][0].den[pos],
+                    wnrg: (sc.states_read[0].num[pos] * sc.states_read[0].num[pos])
+                        / sc.states_read[0].den[pos],
                     n_pulses: 0,
                     fcb_state_idx: 0,
                 };
@@ -1545,7 +1590,7 @@ impl CelpEncoder {
         if fcb.wnrg > *nrg_thr {
             *nrg_thr = fcb.wnrg;
             *best_fcb = fcb.clone();
-            best_fcb_state.clone_from(&sc.fcb_states[sc.read_idx][fcb.fcb_state_idx]);
+            best_fcb_state.clone_from(&sc.states_read[fcb.fcb_state_idx]);
         }
     }
 
@@ -1564,7 +1609,7 @@ impl CelpEncoder {
         if fcb.wnrg > *nrg_thr {
             *nrg_thr = fcb.wnrg;
             *best_fcb = fcb.clone();
-            best_fcb_state.clone_from(&sc.fcb_states[sc.read_idx][fcb.fcb_state_idx]);
+            best_fcb_state.clone_from(&sc.states_read[fcb.fcb_state_idx]);
         }
     }
 }
@@ -2088,9 +2133,17 @@ impl CelpEncoder {
         let mut gain_idx = [-1i16; SMPL_CELP_MAX_RATES];
         let mut fcbgain = 0.0f32;
         let mut exc_fcb = SubframeScratch::zeroed(&mut self.sf.exc_fcb, SMPL_MAX_SF_LEN);
+        // Pooled twin of `exc_fcb`, hoisted out of the rate loop below, which used to allocate a
+        // fresh `vec![0.0f32; SMPL_MAX_SF_LEN]` per rate. It stays a SEPARATE buffer rather than
+        // having `fcb_synthesize` write into `exc_fcb` directly: `fcb_synthesize` does fully define
+        // the region it writes, so writing in place is bit-identical and drops a copy, but it also
+        // puts the synthesis on the same memory the rest of the iteration reads and rewrites
+        // (`smpl_pitch_sharp`, `smpl_scale_vec_inplace`, `calc_gains_v`), and that loop-carried
+        // dependency measured 12.6% SLOWER on `celp_subframes_frame` at 0.36% FEWER instructions.
+        // Keeping the buffers apart preserves the codegen and still removes the allocation.
+        let mut exc_fcb_raw = SubframeScratch::zeroed(&mut self.sf.exc_fcb_raw, SMPL_MAX_SF_LEN);
         let tbl = celp_tables();
         for r in 0..SMPL_CELP_MAX_RATES {
-            let mut exc_fcb_raw = vec![0.0f32; SMPL_MAX_SF_LEN];
             fcb_synthesize(
                 fcb_subfrlen,
                 &pulses[r],
@@ -2203,6 +2256,7 @@ impl CelpEncoder {
         self.sf.wtgt_tmp = wtgt_tmp;
         self.sf.wtgt = wtgt;
         self.sf.exc_fcb = exc_fcb;
+        self.sf.exc_fcb_raw = exc_fcb_raw;
 
         CelpSubframeOut {
             pulses: [pulses_fec, pulses_main],

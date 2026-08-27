@@ -24,6 +24,60 @@ const GCM_TAG_SIZE: usize = 16;
 const KEY_SIZE: usize = 32;
 const BOT_MESSAGE_INFO: &[u8] = b"Bot Message";
 
+/// Why [`decrypt_bot_message`] refused a bot payload.
+///
+/// Typed rather than a flat message because "the envelope was the wrong shape"
+/// and "the tag did not verify" are different events: only the second says
+/// anything about keys. Reporting both as an authentication failure would let
+/// malformed wire data count against a peer's session health. Read
+/// [`stage`](Self::stage) rather than matching variants when all a caller needs
+/// is which of the two happened.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum BotMessageError {
+    /// Our stored `messageSecret` is not a 32-byte key.
+    #[error("invalid messageSecret length: expected {expected}, got {got}")]
+    InvalidSecretLength { expected: usize, got: usize },
+    /// `enc_iv` is not a 12-byte GCM nonce.
+    #[error("invalid enc_iv length: expected {expected}, got {got}")]
+    InvalidIvLength { expected: usize, got: usize },
+    /// `enc_payload` cannot even hold the 16-byte tag, let alone a ciphertext.
+    #[error("enc_payload too short: need at least {need} bytes for tag, got {got}")]
+    PayloadTooShort { need: usize, got: usize },
+    /// HKDF failed while deriving the per-message key.
+    #[error("HKDF expand failed: {0}")]
+    KeyDerivation(String),
+    /// The GCM tag did not verify: wrong secret, wrong context, or tampering.
+    #[error("bot message GCM tag verification failed")]
+    AuthenticationFailed,
+}
+
+/// Which stage of [`decrypt_bot_message`] rejected the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotMessageFailure {
+    /// The wire inputs were rejected on shape, before any key was derived.
+    Envelope,
+    /// The secret this device holds could not produce a key.
+    Secret,
+    /// A key was derived and the ciphertext did not authenticate under it.
+    Authentication,
+}
+
+impl BotMessageError {
+    /// Classify the failure for a caller that reports causes rather than
+    /// rendering messages. Kept here, beside the code that produces each
+    /// variant, so a new variant cannot be silently misfiled at a call site.
+    pub fn stage(&self) -> BotMessageFailure {
+        match self {
+            Self::InvalidIvLength { .. } | Self::PayloadTooShort { .. } => {
+                BotMessageFailure::Envelope
+            }
+            Self::InvalidSecretLength { .. } | Self::KeyDerivation(_) => BotMessageFailure::Secret,
+            Self::AuthenticationFailed => BotMessageFailure::Authentication,
+        }
+    }
+}
+
 /// Inputs needed to derive the per-message bot key + AAD.
 ///
 /// `msg_id` is the wire `id` of the bot reply, OR `bot_info.edit_target_id`
@@ -41,16 +95,16 @@ pub struct BotMessageContext<'a> {
 }
 
 /// Pass 1: base bot key.
-fn derive_base_bot_key(message_secret: &[u8]) -> Result<[u8; KEY_SIZE]> {
+fn derive_base_bot_key(message_secret: &[u8]) -> Result<[u8; KEY_SIZE], BotMessageError> {
     if message_secret.len() != KEY_SIZE {
-        return Err(anyhow!(
-            "invalid messageSecret length: expected {KEY_SIZE}, got {}",
-            message_secret.len()
-        ));
+        return Err(BotMessageError::InvalidSecretLength {
+            expected: KEY_SIZE,
+            got: message_secret.len(),
+        });
     }
     let mut out = [0u8; KEY_SIZE];
     crate::crypto::hkdf_sha256_into(message_secret, None, BOT_MESSAGE_INFO, &mut out)
-        .map_err(|e| anyhow!("HKDF expand failed: {e}"))?;
+        .map_err(|e| BotMessageError::KeyDerivation(e.to_string()))?;
     Ok(out)
 }
 
@@ -89,18 +143,19 @@ pub fn decrypt_bot_message(
     enc_iv: &[u8],
     enc_payload: &[u8],
     ctx: &BotMessageContext<'_>,
-) -> Result<Vec<u8>> {
-    let nonce: &[u8; GCM_IV_SIZE] = enc_iv.try_into().map_err(|_| {
-        anyhow!(
-            "invalid enc_iv length: expected {GCM_IV_SIZE}, got {}",
-            enc_iv.len()
-        )
-    })?;
+) -> Result<Vec<u8>, BotMessageError> {
+    let nonce: &[u8; GCM_IV_SIZE] =
+        enc_iv
+            .try_into()
+            .map_err(|_| BotMessageError::InvalidIvLength {
+                expected: GCM_IV_SIZE,
+                got: enc_iv.len(),
+            })?;
     if enc_payload.len() < GCM_TAG_SIZE {
-        return Err(anyhow!(
-            "enc_payload too short: need at least {GCM_TAG_SIZE} bytes for tag, got {}",
-            enc_payload.len()
-        ));
+        return Err(BotMessageError::PayloadTooShort {
+            need: GCM_TAG_SIZE,
+            got: enc_payload.len(),
+        });
     }
     let base = derive_base_bot_key(message_secret)?;
     let key = derive_per_message_key(&base, ctx);
@@ -108,7 +163,7 @@ pub fn decrypt_bot_message(
 
     let mut out = Vec::with_capacity(enc_payload.len().saturating_sub(GCM_TAG_SIZE));
     aes_256_gcm_decrypt(&key, nonce, &aad, enc_payload, &mut out)
-        .map_err(|_| anyhow!("bot message GCM tag verification failed"))?;
+        .map_err(|_| BotMessageError::AuthenticationFailed)?;
     Ok(out)
 }
 

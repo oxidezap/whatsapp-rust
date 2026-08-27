@@ -1,7 +1,5 @@
-#[cfg(feature = "simd")]
-use core::simd::u16x8;
 use hkdf::Hkdf;
-use hmac::digest::KeyInit;
+use hmac::digest::{FixedOutput, KeyInit};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::LazyLock;
@@ -57,62 +55,47 @@ impl LTHash {
     }
 }
 
+/// Lane-parallel over `u64` words: four little-endian `u16` lanes per
+/// iteration, with the carry between lanes isolated by SWAR masking, then a
+/// scalar tail for a base that is not a whole number of words.
 fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool) {
     assert_eq!(base.len(), input.len(), "length mismatch");
-    // Use `% 2` instead of `.is_multiple_of(2)` for stable Rust compatibility.
-    #[allow(clippy::manual_is_multiple_of)]
-    {
-        assert!(base.len() % 2 == 0, "slice lengths must be even");
-    }
-
-    #[allow(unused_mut, unused_assignments)]
-    let (mut base_remaining, mut input_remaining): (&mut [u8], &[u8]) = (base, input);
+    assert!(base.len().is_multiple_of(2), "slice lengths must be even");
 
     // WA Web treats the accumulator as little-endian u16 lanes
     // (`new DataView(...).getUint16(off, true)` in WA/Crypto/LtHash.js).
     // Snapshot/patch MACs are HMACs over the accumulator bytes, so the lane
-    // endianness is part of the wire spec.
-    #[cfg(feature = "simd")]
+    // endianness is part of the wire spec. Reading the word as little-endian
+    // puts those same lanes at fixed bit positions on either byte order.
+    const LOW: u64 = 0x7FFF_7FFF_7FFF_7FFF;
+    const WORD: usize = size_of::<u64>();
+
+    let words = base.len() / WORD;
+    let (base_words, base_tail) = base.split_at_mut(words * WORD);
+    let (input_words, input_tail) = input.split_at(words * WORD);
+
+    for (base_word, input_word) in base_words
+        .chunks_exact_mut(WORD)
+        .zip(input_words.chunks_exact(WORD))
     {
-        let (base_chunks, base_rem) = base_remaining.as_chunks_mut::<16>();
-        let (input_chunks, input_rem) = input_remaining.as_chunks::<16>();
+        let x = u64::from_le_bytes(base_word.try_into().expect("word-sized chunk"));
+        let y = u64::from_le_bytes(input_word.try_into().expect("word-sized chunk"));
 
-        for (base_chunk, input_chunk) in base_chunks.iter_mut().zip(input_chunks) {
-            let mut base_arr: [u16; 8] = bytemuck::cast(*base_chunk);
-            let mut input_arr: [u16; 8] = bytemuck::cast(*input_chunk);
-            if cfg!(target_endian = "big") {
-                for v in &mut base_arr {
-                    *v = v.swap_bytes();
-                }
-                for v in &mut input_arr {
-                    *v = v.swap_bytes();
-                }
-            }
-            let base_simd = u16x8::from_array(base_arr);
-            let input_simd = u16x8::from_array(input_arr);
-
-            let result_simd = if subtract {
-                base_simd - input_simd
-            } else {
-                base_simd + input_simd
-            };
-
-            let mut out = result_simd.to_array();
-            if cfg!(target_endian = "big") {
-                for v in &mut out {
-                    *v = v.swap_bytes();
-                }
-            }
-            *base_chunk = bytemuck::cast(out);
-        }
-
-        base_remaining = base_rem;
-        input_remaining = input_rem;
+        // Add/subtract the low 15 bits of every lane in one word operation,
+        // where no carry can escape into the next lane, then restore each
+        // lane's top bit from the operands' XOR. Same answer as four
+        // independent `u16::wrapping_*`, a quarter of the iterations.
+        let result = if subtract {
+            ((x | !LOW).wrapping_sub(y & LOW)) ^ ((x ^ !y) & !LOW)
+        } else {
+            ((x & LOW).wrapping_add(y & LOW)) ^ ((x ^ y) & !LOW)
+        };
+        base_word.copy_from_slice(&result.to_le_bytes());
     }
 
-    for (base_pair, input_pair) in base_remaining
+    for (base_pair, input_pair) in base_tail
         .chunks_exact_mut(2)
-        .zip(input_remaining.chunks_exact(2))
+        .zip(input_tail.chunks_exact(2))
     {
         let x = u16::from_le_bytes([base_pair[0], base_pair[1]]);
         let y = u16::from_le_bytes([input_pair[0], input_pair[1]]);
@@ -122,18 +105,47 @@ fn perform_pointwise_with_overflow(base: &mut [u8], input: &[u8], subtract: bool
         } else {
             x.wrapping_add(y)
         };
-        let bytes = result.to_le_bytes();
-        base_pair[0] = bytes[0];
-        base_pair[1] = bytes[1];
+        base_pair.copy_from_slice(&result.to_le_bytes());
     }
 }
 
+/// HKDF-SHA256 over a whole-block output, expanded in place.
+///
+/// `Hkdf::expand` is generic over the digest and re-derives its bounds per
+/// call; the batch path here runs it once per mutation with the same 24-byte
+/// `info` and a 128-byte (4-block) output every time. Driving the RFC 5869
+/// T(n) chain directly lets each block be written straight into `out` and read
+/// back as T(n-1), which drops the per-block `Output<Sha256>` copy the generic
+/// loop keeps, and skips its length check and chunk bookkeeping.
+///
+/// Restricted to whole SHA-256 blocks so the "previous block is the last 32
+/// bytes written" shortcut holds; anything else falls back to the crate.
 fn hkdf_sha256_into(key: &[u8], info: &[u8], out: &mut [u8]) {
+    const BLOCK: usize = 32;
+
     let mut extract = EXTRACT_HMAC.clone();
     extract.update(key);
     let prk = extract.finalize().into_bytes();
-    let hk = Hkdf::<Sha256>::from_prk(&prk).expect("PRK is hash-sized");
-    hk.expand(info, out).expect("hkdf expand");
+
+    if !out.len().is_multiple_of(BLOCK) || out.is_empty() || out.len() > BLOCK * 255 {
+        let hk = Hkdf::<Sha256>::from_prk(&prk).expect("PRK is hash-sized");
+        hk.expand(info, out).expect("hkdf expand");
+        return;
+    }
+
+    let expand = Hmac::<Sha256>::new_from_slice(&prk).expect("PRK is a valid HMAC key");
+    for block in 0..out.len() / BLOCK {
+        let (written, rest) = out.split_at_mut(block * BLOCK);
+        let mut round = expand.clone();
+        // T(0) is empty; every later round feeds back the block just written.
+        if let Some(previous) = written.last_chunk::<BLOCK>() {
+            round.update(previous);
+        }
+        round.update(info);
+        round.update(&[block as u8 + 1]);
+        let target: &mut [u8; BLOCK] = (&mut rest[..BLOCK]).try_into().expect("whole block");
+        round.finalize_into(target.into());
+    }
 }
 
 #[cfg(test)]
@@ -174,27 +186,73 @@ mod tests {
     }
 
     #[test]
-    fn test_simd_determinism_and_consistency() {
+    fn add_then_subtract_returns_to_zero_across_sizes() {
         let test_sizes = [2, 4, 8, 16, 18, 32, 64, 128, 256];
 
         for &size in &test_sizes {
-            let mut base_simd = vec![0u8; size];
-            let mut base_scalar = vec![0u8; size];
+            let mut base = vec![0u8; size];
             let input = vec![1u8; size];
 
-            perform_pointwise_with_overflow(&mut base_simd, &input, false);
-            perform_pointwise_with_overflow(&mut base_scalar, &input, false);
-            assert_eq!(base_simd, base_scalar, "Add failed for size {}", size);
+            perform_pointwise_with_overflow(&mut base, &input, false);
+            perform_pointwise_with_overflow(&mut base, &input, true);
+            assert_eq!(base, vec![0u8; size], "size {size}");
+        }
+    }
 
-            perform_pointwise_with_overflow(&mut base_simd, &input, true);
-            perform_pointwise_with_overflow(&mut base_scalar, &input, true);
-            assert_eq!(base_simd, base_scalar, "Subtract failed for size {}", size);
-            assert_eq!(
-                base_simd,
-                vec![0u8; size],
-                "Subtract result incorrect for size {}",
-                size
-            );
+    /// Reference for the test below. It reaches the same answer by a
+    /// different route than the implementation: lanes are assembled by hand
+    /// from byte positions and the arithmetic is done in `u32` and masked, so
+    /// it shares neither `from_le_bytes` nor `wrapping_*` with the code under
+    /// test. A reference that mirrors the implementation proves nothing.
+    fn reference_pointwise(base: &mut [u8], input: &[u8], subtract: bool) {
+        for i in (0..base.len()).step_by(2) {
+            let x = base[i] as u32 | ((base[i + 1] as u32) << 8);
+            let y = input[i] as u32 | ((input[i + 1] as u32) << 8);
+            let r = if subtract {
+                x.wrapping_sub(y) & 0xFFFF
+            } else {
+                (x + y) & 0xFFFF
+            };
+            base[i] = (r & 0xFF) as u8;
+            base[i + 1] = (r >> 8) as u8;
+        }
+    }
+
+    /// Sizes straddle the 16-byte boundary a vectorised implementation would
+    /// chunk on, so the coverage still holds if one ever comes back. Inputs
+    /// are seeded onto the wrap boundaries in both directions, which is where
+    /// a lane-width or endianness mistake shows up rather than in round data.
+    #[test]
+    fn pointwise_matches_independent_reference() {
+        let sizes = [0usize, 2, 14, 16, 18, 32, 34, 128, 130, 256];
+        // Deterministic LCG: reproducible failures, no dev-dependency.
+        let mut seed = 0x2545_F491u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+
+        for size in sizes {
+            for subtract in [false, true] {
+                for edge in [0u8, 0xFF, 0x01] {
+                    let base: Vec<u8> = (0..size)
+                        .map(|i| if i % 3 == 0 { edge } else { next() })
+                        .collect();
+                    let input: Vec<u8> = (0..size)
+                        .map(|i| if i % 5 == 0 { edge } else { next() })
+                        .collect();
+
+                    let mut actual = base.clone();
+                    let mut expected = base.clone();
+                    perform_pointwise_with_overflow(&mut actual, &input, subtract);
+                    reference_pointwise(&mut expected, &input, subtract);
+
+                    assert_eq!(
+                        actual, expected,
+                        "size {size}, subtract {subtract}, edge {edge:#04x}"
+                    );
+                }
+            }
         }
     }
 

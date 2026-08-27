@@ -57,6 +57,79 @@ impl GcmInPlaceBuffer for FrameBody<'_> {
 const MAX_BATCH_FRAMES: usize = 16;
 const MAX_BATCH_WIRE_BYTES: usize = 64 * 1024;
 
+/// What the batch buffer holds between bursts: a few small stanzas coalesced.
+///
+/// One large stanza grows the buffer to its own size, and the allocation then
+/// outlives the burst that needed it, so a single media-sized send costs the
+/// session tens of KiB for the rest of the connection. Measured at 60 KiB
+/// resident per socket after one 60 KiB frame, against 8 KiB for a socket that
+/// only ever sends small ones.
+///
+/// Login alone gets there: an 812-key pre-key upload marshals to 40 799 wire
+/// bytes, ten times this capacity, before the session has sent a single
+/// message.
+const OUT_BUF_IDLE_CAPACITY: usize = 4096;
+
+/// Consecutive small batches that mark a burst as finished. Only then is the
+/// grown buffer released, so a burst spread over several batches is never
+/// interrupted to reallocate mid-flight.
+const SMALL_BATCHES_BEFORE_SHRINK: usize = 32;
+
+/// Whether the batch buffer should be swapped for an idle-sized one, advancing
+/// the burst-tracking state.
+///
+/// A free function because the buffer lives inside the sender task, where no
+/// test can reach it: the decision is only checkable if it is separable from
+/// the loop that acts on it.
+///
+/// Two conditions end a burst, and they cover opposite shapes of traffic.
+/// `queue_drained` is the sender with nothing left to write, about to block in
+/// `recv`; it is the only signal a session that grows the buffer at login and
+/// then falls silent ever emits, since it produces no further batch for a
+/// countdown over batches to advance on. The countdown covers the other shape:
+/// traffic continuous enough that the queue is never observed empty, but whose
+/// batches have shrunk back to stanza-sized.
+///
+/// `buffer_capacity` is read as well as the wire length because a frame that
+/// fails mid-encrypt is truncated back out of the buffer, leaving the
+/// allocation it grew with no wire bytes to notice it by. Only large traffic
+/// counts as the burst still running, though — a merely large buffer must not
+/// keep resetting the countdown that releases it.
+fn should_release_batch_buffer(
+    batch_wire_len: usize,
+    buffer_capacity: usize,
+    queue_drained: bool,
+    grown: &mut bool,
+    small_batches: &mut usize,
+) -> bool {
+    if batch_wire_len > OUT_BUF_IDLE_CAPACITY || buffer_capacity > OUT_BUF_IDLE_CAPACITY {
+        *grown = true;
+    }
+    // Checked ahead of the size of the batch just written: one large frame
+    // followed by silence is precisely the case to release on, and testing the
+    // size first would send it down the "burst still running" path forever.
+    if *grown && queue_drained {
+        *grown = false;
+        *small_batches = 0;
+        return true;
+    }
+    if batch_wire_len > OUT_BUF_IDLE_CAPACITY {
+        *small_batches = 0;
+        return false;
+    }
+    // An empty batch wrote nothing, so it is not evidence of anything.
+    if !*grown || batch_wire_len == 0 {
+        return false;
+    }
+    *small_batches += 1;
+    if *small_batches < SMALL_BATCHES_BEFORE_SHRINK {
+        return false;
+    }
+    *grown = false;
+    *small_batches = 0;
+    true
+}
+
 /// Result type for send operations.
 type SendResult = std::result::Result<(), EncryptSendError>;
 
@@ -92,6 +165,36 @@ struct SendJob {
     response_tx: oneshot::Sender<SendResult>,
 }
 
+/// What a socket reports its sends to. Both halves belong to the `Client`; a
+/// VoIP relay socket and most tests pass [`Default`], reporting to neither.
+///
+/// One struct rather than one parameter each: the observation point is shared,
+/// so the next thing that wants to watch sends plugs in here instead of widening
+/// every constructor between here and `connect()` again.
+#[derive(Default, Clone)]
+pub struct SendObservers {
+    /// Wire-byte accounting, recorded after the transport write.
+    stats: Option<Arc<wacore::stats::SessionStats>>,
+    /// Publisher for the plaintext of each frame that reached the transport.
+    sent_frames: Option<Arc<crate::client::SentFrameTap>>,
+}
+
+impl SendObservers {
+    /// Report wire bytes into `stats` and nothing else.
+    pub fn with_stats(stats: Arc<wacore::stats::SessionStats>) -> Self {
+        Self {
+            stats: Some(stats),
+            sent_frames: None,
+        }
+    }
+
+    /// Also publish each sent frame's plaintext through `tap`.
+    pub(crate) fn with_sent_frames(mut self, tap: Arc<crate::client::SentFrameTap>) -> Self {
+        self.sent_frames = Some(tap);
+        self
+    }
+}
+
 pub struct NoiseSocket {
     read_key: Arc<NoiseCipher>,
     read_counter: Arc<AtomicU32>,
@@ -112,18 +215,24 @@ impl NoiseSocket {
         write_key: NoiseCipher,
         read_key: NoiseCipher,
     ) -> Self {
-        Self::with_stats(runtime, transport, write_key, read_key, None)
+        Self::with_observers(
+            runtime,
+            transport,
+            write_key,
+            read_key,
+            SendObservers::default(),
+        )
     }
 
-    /// Like [`Self::new`], recording sent frames into `stats` (the main WA
-    /// session socket passes the client's [`SessionStats`](wacore::stats::SessionStats); VoIP relay
-    /// sockets and tests pass `None`).
-    pub fn with_stats(
+    /// Like [`Self::new`], reporting each send to `observers` (the main WA
+    /// session socket passes the client's; VoIP relay sockets and most tests
+    /// report to nothing).
+    pub fn with_observers(
         runtime: Arc<dyn Runtime>,
         transport: Arc<dyn Transport>,
         write_key: NoiseCipher,
         read_key: NoiseCipher,
-        stats: Option<Arc<wacore::stats::SessionStats>>,
+        observers: SendObservers,
     ) -> Self {
         let write_key = Arc::new(write_key);
         let read_key = Arc::new(read_key);
@@ -142,7 +251,7 @@ impl NoiseSocket {
             transport_clone,
             write_key_clone,
             send_job_rx,
-            stats,
+            observers,
         )));
 
         Self {
@@ -161,12 +270,17 @@ impl NoiseSocket {
         transport: Arc<dyn Transport>,
         write_key: Arc<NoiseCipher>,
         send_job_rx: async_channel::Receiver<SendJob>,
-        stats: Option<Arc<wacore::stats::SessionStats>>,
+        observers: SendObservers,
     ) {
+        let SendObservers { stats, sent_frames } = observers;
         let mut write_counter: u32 = 0;
         // BytesMut: split().freeze() yields a zero-copy Bytes while retaining
         // the underlying allocation for the next frame.
-        let mut out_buf = BytesMut::with_capacity(4096);
+        let mut out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
+        // Whether `out_buf` is still holding an allocation a burst grew, and how
+        // many small batches have gone out since.
+        let mut out_buf_grown = false;
+        let mut small_batches: usize = 0;
         // A failed transport write says nothing about how much of the frame the
         // peer received, so the counter that frame consumed can neither be
         // reused (nonce reuse under the same write key) nor confidently skipped
@@ -182,6 +296,12 @@ impl NoiseSocket {
         // drops its response channel, which the caller sees as a closed sender:
         // a held-over job can be lost, but it can never hang its caller.
         let mut carry_over: Option<SendJob> = None;
+        // Plaintexts of this batch's frames, held only while a consumer is
+        // watching: each entry is a refcount bump on the buffer the caller
+        // marshalled, and the whole `Vec` stays empty (unallocated) otherwise.
+        // They are kept until after the write so what is published is what the
+        // transport actually accepted.
+        let mut observed: Vec<bytes::Bytes> = Vec::new();
 
         loop {
             let job = match carry_over.take() {
@@ -207,6 +327,12 @@ impl NoiseSocket {
             let mut job = job;
             loop {
                 let response_tx = job.response_tx;
+                // Cloned before the plaintext is consumed, dropped again if the
+                // frame never makes it into the buffer.
+                let to_observe = match sent_frames.as_deref() {
+                    Some(tap) if tap.enabled() => Some(job.plaintext.clone()),
+                    _ => None,
+                };
                 match Self::encrypt_frame_into(
                     &runtime,
                     &write_key,
@@ -216,7 +342,12 @@ impl NoiseSocket {
                 )
                 .await
                 {
-                    Ok(wire_bytes) => waiters.push((response_tx, wire_bytes)),
+                    Ok(wire_bytes) => {
+                        waiters.push((response_tx, wire_bytes));
+                        if let Some(plaintext) = to_observe {
+                            observed.push(plaintext);
+                        }
+                    }
                     Err(e) => {
                         // The counter is untouched on this frame, and every
                         // frame already in the buffer must still go out so the
@@ -245,12 +376,14 @@ impl NoiseSocket {
                 }
             }
 
+            let mut batch_wire_len = 0usize;
             let outcome = if out_buf.is_empty() {
                 Ok(())
             } else {
                 // Zero-copy: split() hands the written bytes over and out_buf
                 // keeps its capacity for the next batch.
                 let wire = out_buf.split().freeze();
+                batch_wire_len = wire.len();
                 if waiters.len() > 1 {
                     // The only externally visible sign that a batch happened.
                     // Without it, "does the peer accept several frames in one
@@ -268,11 +401,25 @@ impl NoiseSocket {
                                 stats.record_frame_sent(*wire_bytes);
                             }
                         }
+                        // Re-read the gate rather than trusting the read at
+                        // capture time, so a batch that outlived its last lease
+                        // stays quiet. A release racing this instant may still
+                        // lose: the lease gates, it does not fence.
+                        if let Some(tap) = sent_frames.as_deref()
+                            && tap.enabled()
+                        {
+                            for plaintext in observed.drain(..) {
+                                tap.publish(plaintext);
+                            }
+                        }
                         Ok(())
                     }
                     Err(e) => Err(EncryptSendError::transport(e)),
                 }
             };
+            // A write that failed says nothing about what the peer received, so
+            // its frames are not reported as sent.
+            observed.clear();
 
             {
                 // Crypto and framing failures are rejected before any byte
@@ -328,6 +475,29 @@ impl NoiseSocket {
             }
             if let Some((response_tx, err)) = encrypt_failure {
                 let _ = response_tx.send(Err(err));
+            }
+
+            // Release the grown allocation once the burst is over. Nothing above
+            // reads `out_buf` across iterations — `split()` left it empty — so
+            // replacing it here cannot affect a batching decision.
+            //
+            // An empty channel with nothing carried over is the end of the
+            // burst: the loop is one statement from blocking in `recv`, so no
+            // frame is in flight and no batch is pending, and releasing here
+            // interrupts nothing. `is_empty` is an instantaneous read and a
+            // producer may enqueue immediately after it — that costs one 4 KiB
+            // allocation the next batch would regrow, which is the side this
+            // trade favours: a burst that was about to continue pays once,
+            // while every session that goes quiet stops paying at all.
+            let queue_drained = carry_over.is_none() && send_job_rx.is_empty();
+            if should_release_batch_buffer(
+                batch_wire_len,
+                out_buf.capacity(),
+                queue_drained,
+                &mut out_buf_grown,
+                &mut small_batches,
+            ) {
+                out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
             }
         }
     }
@@ -1122,6 +1292,10 @@ mod tests {
     struct GatedTransport {
         writes: std::sync::Mutex<Vec<bytes::Bytes>>,
         gate: tokio::sync::Semaphore,
+        /// Writes that have reached the gate, counted before it is awaited: the
+        /// only way a test can tell "the sender is parked mid-write" from "the
+        /// sender has not started yet".
+        arrivals: std::sync::atomic::AtomicUsize,
     }
 
     impl GatedTransport {
@@ -1129,11 +1303,16 @@ mod tests {
             Arc::new(Self {
                 writes: std::sync::Mutex::new(Vec::new()),
                 gate: tokio::sync::Semaphore::new(0),
+                arrivals: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
         fn writes(&self) -> Vec<bytes::Bytes> {
             self.writes.lock().expect("writes mutex").clone()
+        }
+
+        fn arrivals(&self) -> usize {
+            self.arrivals.load(Ordering::SeqCst)
         }
     }
 
@@ -1141,12 +1320,344 @@ mod tests {
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl Transport for GatedTransport {
         async fn send(&self, data: bytes::Bytes) -> std::result::Result<(), anyhow::Error> {
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
             let permit = self.gate.acquire().await.expect("gate open");
             permit.forget();
             self.writes.lock().expect("writes mutex").push(data);
             Ok(())
         }
         async fn disconnect(&self) {}
+    }
+
+    /// The wire-level test below cannot see the buffer, so the release decision
+    /// is checked here directly: without this, deleting the whole shrink would
+    /// leave every other assertion in this file green.
+    mod releasing_the_batch_buffer {
+        use super::super::{
+            OUT_BUF_IDLE_CAPACITY, SMALL_BATCHES_BEFORE_SHRINK, should_release_batch_buffer,
+        };
+
+        const BIG: usize = OUT_BUF_IDLE_CAPACITY + 1;
+        const SMALL: usize = 64;
+        /// A capacity a burst plausibly grew the buffer to, tied to the
+        /// threshold so it cannot drift under it.
+        const GROWN_CAPACITY: usize = OUT_BUF_IDLE_CAPACITY * 16;
+        /// The countdown cases all run with jobs still queued behind the
+        /// batch: a drained queue releases outright, so it would answer every
+        /// one of them before the countdown was ever reached.
+        const BUSY: bool = false;
+        const DRAINED: bool = true;
+
+        /// Drives `count` small batches and returns how many asked for a release.
+        fn quiet(count: usize, capacity: usize, grown: &mut bool, small: &mut usize) -> usize {
+            (0..count)
+                .filter(|_| should_release_batch_buffer(SMALL, capacity, BUSY, grown, small))
+                .count()
+        }
+
+        #[test]
+        fn a_grown_buffer_is_released_once_the_burst_has_been_quiet() {
+            let (mut grown, mut small) = (false, 0);
+            assert!(!should_release_batch_buffer(
+                BIG, 0, BUSY, &mut grown, &mut small
+            ));
+            assert!(grown, "a large batch must mark the buffer grown");
+
+            assert_eq!(
+                quiet(SMALL_BATCHES_BEFORE_SHRINK - 1, 0, &mut grown, &mut small),
+                0,
+                "released before the burst was over"
+            );
+            assert!(should_release_batch_buffer(
+                SMALL, 0, BUSY, &mut grown, &mut small
+            ));
+            assert!(!grown, "the release must clear the grown flag");
+        }
+
+        /// The countdown is consecutive: traffic that is still large restarts it.
+        #[test]
+        fn a_large_batch_restarts_the_countdown() {
+            let (mut grown, mut small) = (false, 0);
+            should_release_batch_buffer(BIG, 0, BUSY, &mut grown, &mut small);
+            quiet(SMALL_BATCHES_BEFORE_SHRINK - 1, 0, &mut grown, &mut small);
+
+            should_release_batch_buffer(BIG, 0, BUSY, &mut grown, &mut small);
+
+            assert_eq!(
+                quiet(SMALL_BATCHES_BEFORE_SHRINK - 1, 0, &mut grown, &mut small),
+                0,
+                "the countdown carried over across a large batch"
+            );
+        }
+
+        /// The case the countdown cannot reach: one large batch, then nothing.
+        /// A session that grows the buffer at login and falls silent sends no
+        /// second batch, so a rule that only counts batches holds the
+        /// allocation until the connection drops.
+        #[test]
+        fn a_drained_queue_releases_a_buffer_no_further_batch_would() {
+            let (mut grown, mut small) = (false, 0);
+            assert!(
+                should_release_batch_buffer(BIG, 0, DRAINED, &mut grown, &mut small),
+                "a large batch with nothing queued behind it ends the burst"
+            );
+            assert!(!grown, "the release must clear the grown flag");
+
+            // And the countdown starts clean, rather than carrying a partial
+            // count into whatever the next burst turns out to be.
+            assert_eq!(small, 0);
+        }
+
+        /// The same silence after a frame that failed mid-encrypt: it was
+        /// truncated back out, so the batch has no wire bytes and only the
+        /// capacity names the allocation it grew.
+        #[test]
+        fn a_drained_queue_releases_a_buffer_grown_by_a_truncated_frame() {
+            let (mut grown, mut small) = (false, 0);
+            assert!(should_release_batch_buffer(
+                0,
+                GROWN_CAPACITY,
+                DRAINED,
+                &mut grown,
+                &mut small
+            ));
+        }
+
+        /// A drained queue must not cost a socket that never sent anything
+        /// large: with no allocation to give back, replacing the buffer would
+        /// be a fresh allocation for nothing, on every batch it ever writes.
+        #[test]
+        fn a_drained_queue_does_not_release_a_buffer_that_never_grew() {
+            let (mut grown, mut small) = (false, 0);
+            for _ in 0..SMALL_BATCHES_BEFORE_SHRINK * 4 {
+                assert!(!should_release_batch_buffer(
+                    SMALL,
+                    OUT_BUF_IDLE_CAPACITY,
+                    DRAINED,
+                    &mut grown,
+                    &mut small
+                ));
+            }
+            assert!(!grown);
+        }
+
+        /// A frame that fails mid-encrypt is truncated out of the buffer, so the
+        /// allocation it grew is left with no wire bytes naming it. Capacity is
+        /// the only remaining evidence, and it must not itself keep resetting
+        /// the countdown or the buffer would never be released at all.
+        #[test]
+        fn a_buffer_grown_by_a_truncated_frame_is_still_released() {
+            let (mut grown, mut small) = (false, 0);
+            assert!(!should_release_batch_buffer(
+                0,
+                GROWN_CAPACITY,
+                BUSY,
+                &mut grown,
+                &mut small
+            ));
+            assert!(grown, "capacity alone must mark the buffer grown");
+
+            assert_eq!(
+                quiet(
+                    SMALL_BATCHES_BEFORE_SHRINK - 1,
+                    GROWN_CAPACITY,
+                    &mut grown,
+                    &mut small
+                ),
+                0
+            );
+            assert!(should_release_batch_buffer(
+                SMALL,
+                GROWN_CAPACITY,
+                BUSY,
+                &mut grown,
+                &mut small
+            ));
+        }
+
+        /// A socket that never sent anything large must never pay a realloc.
+        #[test]
+        fn a_buffer_that_never_grew_is_never_released() {
+            let (mut grown, mut small) = (false, 0);
+            assert_eq!(
+                quiet(
+                    SMALL_BATCHES_BEFORE_SHRINK * 4,
+                    OUT_BUF_IDLE_CAPACITY,
+                    &mut grown,
+                    &mut small
+                ),
+                0
+            );
+            assert!(!grown);
+        }
+    }
+
+    /// The bytes an idle socket keeps, asserted on a real `BytesMut`.
+    ///
+    /// A login-sized stanza — an 812-key pre-key upload marshals to 40 799 wire
+    /// bytes — grows the batch buffer past ten times its idle size, and
+    /// `split()` hands the wire bytes to the transport while leaving the
+    /// allocation behind: the next frame reclaims it whole rather than
+    /// allocating. A session that then goes quiet writes no second batch, so
+    /// the batch countdown alone can never give those bytes back.
+    ///
+    /// Driven through the primitives the sender loop uses, in the order it uses
+    /// them, because the loop's own buffer is a local no test can reach.
+    #[tokio::test]
+    async fn an_idle_socket_does_not_keep_the_buffer_its_login_grew() {
+        /// Wire size of the pre-key upload the client sends at login.
+        const LOGIN_STANZA: usize = 40_799;
+
+        /// One turn of the sender loop's buffer lifecycle: encrypt a frame,
+        /// write the batch out, decide on the allocation, then probe what the
+        /// next frame finds waiting. The probe is what makes retention visible
+        /// — `capacity()` reads 0 straight after a `split()`, and the retained
+        /// allocation only reappears when the next write reclaims it.
+        async fn retained_after(queue_drained: bool, stanza_len: usize) -> usize {
+            let key = [0x6bu8; 32];
+            let runtime: Arc<dyn Runtime> = Arc::new(crate::runtime_impl::TokioRuntime);
+            let write_key = Arc::new(NoiseCipher::new(&key).expect("32-byte key"));
+            let mut write_counter = 0u32;
+            let mut out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
+            let (mut grown, mut small_batches) = (false, 0usize);
+
+            NoiseSocket::encrypt_frame_into(
+                &runtime,
+                &write_key,
+                &mut write_counter,
+                bytes::Bytes::from(vec![0x11u8; stanza_len]),
+                &mut out_buf,
+            )
+            .await
+            .expect("the login stanza must encrypt");
+
+            // The write: the wire bytes leave, and the allocation would not.
+            let batch_wire_len = out_buf.split().freeze().len();
+            if should_release_batch_buffer(
+                batch_wire_len,
+                out_buf.capacity(),
+                queue_drained,
+                &mut grown,
+                &mut small_batches,
+            ) {
+                out_buf = BytesMut::with_capacity(OUT_BUF_IDLE_CAPACITY);
+            }
+
+            NoiseSocket::encrypt_frame_into(
+                &runtime,
+                &write_key,
+                &mut write_counter,
+                bytes::Bytes::from(vec![0x22u8; 64]),
+                &mut out_buf,
+            )
+            .await
+            .expect("the next frame must encrypt");
+            out_buf.capacity()
+        }
+
+        assert_eq!(
+            retained_after(true, LOGIN_STANZA).await,
+            OUT_BUF_IDLE_CAPACITY,
+            "a socket that goes quiet after login must keep an idle-sized buffer"
+        );
+
+        // The other half of the trade, so a release that fired unconditionally
+        // would not pass either: while work is still queued the burst is not
+        // over, and the allocation it needs stays.
+        assert!(
+            retained_after(false, LOGIN_STANZA).await > LOGIN_STANZA,
+            "a burst still in progress must keep the buffer it grew"
+        );
+
+        // And a socket whose traffic never exceeded the idle capacity pays for
+        // none of this: nothing to release, so nothing to reallocate. It reads
+        // as slightly under the idle capacity rather than at it, because the
+        // probe frame lands in what the batch before it left of the same
+        // allocation instead of reclaiming it.
+        assert!(
+            retained_after(true, 64).await <= OUT_BUF_IDLE_CAPACITY,
+            "a small-frame socket must never have grown in the first place"
+        );
+    }
+
+    /// Releasing the grown buffer must be invisible on the wire: a burst after
+    /// the shrink has to regrow, coalesce and decrypt exactly as the first one
+    /// did, with counter order intact across the whole connection.
+    #[tokio::test]
+    async fn a_burst_after_the_buffer_shrinks_still_batches_and_round_trips() {
+        let key = [0x5au8; 32];
+        let transport = GatedTransport::closed();
+        let socket = Arc::new(NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            transport.clone(),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+        ));
+
+        // A frame big enough to grow the buffer well past its idle capacity.
+        const BIG: usize = 40 * 1024;
+        const SMALL: usize = 64;
+        let mut expected: Vec<Vec<u8>> = Vec::new();
+
+        // Grow, then quieten past the shrink threshold. Sent one at a time so
+        // each is its own batch, which is what the threshold counts — and so
+        // the order is the send order, which concurrent sends past the
+        // channel's capacity would not guarantee.
+        transport.gate.add_permits(SMALL_BATCHES_BEFORE_SHRINK + 1);
+        for payload in std::iter::once(vec![0xAAu8; BIG])
+            .chain((0..SMALL_BATCHES_BEFORE_SHRINK).map(|i| vec![i as u8; SMALL]))
+        {
+            expected.push(payload.clone());
+            socket
+                .encrypt_and_send(bytes::Bytes::from(payload))
+                .await
+                .expect("warm-up send must succeed");
+        }
+
+        // The buffer is back to idle size; this burst has to regrow it.
+        const BURST: usize = 5;
+        const BURST_BYTES: usize = 20 * 1024;
+        let payloads: Vec<Vec<u8>> = (0..BURST)
+            .map(|i| vec![0xB0 | i as u8; BURST_BYTES])
+            .collect();
+        expected.extend(payloads.iter().cloned());
+        let mut sends = queue_all(&socket, payloads.into_iter().map(bytes::Bytes::from));
+        transport.gate.add_permits(BURST);
+        for result in (&mut sends).await {
+            result.expect("post-shrink send must succeed");
+        }
+
+        let writes = transport.writes();
+        for write in &writes {
+            let frames = split_frames(write);
+            assert!(
+                frames.len() == 1 || write.len() <= MAX_BATCH_WIRE_BYTES,
+                "the ceiling must still hold after a shrink: {} bytes in {} frames",
+                write.len(),
+                frames.len()
+            );
+        }
+        assert!(
+            writes
+                .iter()
+                .skip_while(|w| split_frames(w).len() <= 1)
+                .any(|w| split_frames(w).len() > 1),
+            "the regrown buffer must still coalesce, otherwise the shrink cost batching"
+        );
+
+        let read_key = NoiseCipher::new(&key).expect("32-byte key");
+        let bodies: Vec<Vec<u8>> = writes.iter().flat_map(|w| split_frames(w)).collect();
+        assert_eq!(
+            bodies.len(),
+            expected.len(),
+            "every frame must reach the wire"
+        );
+        for (counter, (mut body, want)) in bodies.into_iter().zip(expected).enumerate() {
+            read_key
+                .decrypt_in_place_with_counter(counter as u32, &mut body)
+                .expect("a shrink must not disturb counter order");
+            assert_eq!(body, want, "frame {counter} did not round-trip");
+        }
     }
 
     /// Queues every payload on `socket` and returns the joined sends, still
@@ -1436,12 +1947,12 @@ mod tests {
         let key = [0u8; 32];
         let stats = Arc::new(wacore::stats::SessionStats::new());
 
-        let socket = NoiseSocket::with_stats(
+        let socket = NoiseSocket::with_observers(
             Arc::new(crate::runtime_impl::TokioRuntime),
             transport.clone(),
             NoiseCipher::new(&key).expect("32-byte key"),
             NoiseCipher::new(&key).expect("32-byte key"),
-            Some(stats.clone()),
+            SendObservers::with_stats(stats.clone()),
         );
 
         for size in [0usize, 100, 5000] {
@@ -1506,6 +2017,236 @@ mod tests {
         assert!(
             result.is_ok(),
             "Payload above inline threshold should encrypt successfully"
+        );
+    }
+
+    use crate::test_utils::SentFrameRecorder;
+
+    /// A tap wired to a fresh bus, forwarding enabled, plus the observer behind
+    /// it and the subscription that has to outlive the test.
+    fn watched_tap() -> (
+        Arc<crate::client::SentFrameTap>,
+        Arc<SentFrameRecorder>,
+        wacore::types::events::Subscription,
+    ) {
+        let bus = wacore::types::events::CoreEventBus::new();
+        let observer = Arc::new(SentFrameRecorder::default());
+        let subscription = bus.subscribe_handler(observer.clone());
+        let tap = Arc::new(crate::client::SentFrameTap::new(bus));
+        tap.acquire();
+        (tap, observer, subscription)
+    }
+
+    fn socket_watched_by(
+        transport: Arc<dyn Transport>,
+        tap: Arc<crate::client::SentFrameTap>,
+    ) -> NoiseSocket {
+        let key = [0x9Cu8; 32];
+        NoiseSocket::with_observers(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            transport,
+            NoiseCipher::new(&key).expect("32-byte key"),
+            NoiseCipher::new(&key).expect("32-byte key"),
+            SendObservers::default().with_sent_frames(tap),
+        )
+    }
+
+    /// The observer receives the caller's own buffer. Handing over a copy would
+    /// double the cost of every send the moment anyone watched, which is the
+    /// difference between a recorder a consumer can leave on and one it cannot.
+    #[tokio::test]
+    async fn an_observed_frame_is_the_buffer_the_caller_handed_over() {
+        let (tap, observer, _subscription) = watched_tap();
+        let socket =
+            socket_watched_by(Arc::new(crate::transport::mock::MockTransport), tap.clone());
+
+        let payload = bytes::Bytes::from(vec![0x5Au8; 4096]);
+        let payload_ptr = payload.as_ptr();
+        socket
+            .encrypt_and_send(payload.clone())
+            .await
+            .expect("send must succeed");
+
+        let observed = observer.frames();
+        assert_eq!(observed.len(), 1, "the frame must be observed exactly once");
+        assert_eq!(
+            observed[0].as_ptr(),
+            payload_ptr,
+            "the observer must receive the sent buffer itself, not a copy of it"
+        );
+        assert_eq!(&observed[0][..], &payload[..]);
+    }
+
+    /// Nothing is observed while no consumer holds forwarding, and nothing is
+    /// built either: the tap counts its publications, so this also fails on a
+    /// build that is merely thrown away.
+    #[tokio::test]
+    async fn an_unwatched_send_publishes_nothing() {
+        let bus = wacore::types::events::CoreEventBus::new();
+        let observer = Arc::new(SentFrameRecorder::default());
+        let _subscription = bus.subscribe_handler(observer.clone());
+        let tap = Arc::new(crate::client::SentFrameTap::new(bus));
+        let socket =
+            socket_watched_by(Arc::new(crate::transport::mock::MockTransport), tap.clone());
+
+        assert!(!tap.enabled(), "no lease has been acquired");
+        for _ in 0..4 {
+            socket
+                .encrypt_and_send(bytes::Bytes::from(vec![1u8; 64]))
+                .await
+                .expect("send must succeed");
+        }
+
+        assert_eq!(
+            tap.published(),
+            0,
+            "nothing may be built without a consumer"
+        );
+        assert!(observer.frames().is_empty());
+    }
+
+    /// A frame the transport refused is not reported as sent: observing after
+    /// the write is what makes what arrives equal what left.
+    #[tokio::test]
+    async fn a_refused_write_is_not_observed() {
+        let (tap, observer, _subscription) = watched_tap();
+        let transport = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+        transport.fail_next_sends(1);
+        let socket = socket_watched_by(transport.clone(), tap.clone());
+
+        socket
+            .encrypt_and_send(bytes::Bytes::from(vec![2u8; 64]))
+            .await
+            .expect_err("injected transport failure");
+
+        assert_eq!(tap.published(), 0);
+        assert!(observer.frames().is_empty());
+    }
+
+    /// A lease released while a frame is already encrypted and waiting on the
+    /// transport must still turn the frame away: the gate is read at capture
+    /// time, so without the second read at publish time a consumer that stopped
+    /// watching would get one more frame after it let go. The gated transport
+    /// holds the write open across the release, which is the whole window.
+    #[tokio::test]
+    async fn a_lease_released_mid_write_turns_its_frame_away() {
+        let (tap, observer, _subscription) = watched_tap();
+        let transport = GatedTransport::closed();
+        let socket = Arc::new(socket_watched_by(transport.clone(), tap.clone()));
+
+        let mut send = queue_all(&socket, [bytes::Bytes::from(vec![4u8; 64])].into_iter());
+        // Parked inside the write, which is past capture and past encryption:
+        // releasing before this point would prove nothing, since the frame
+        // would never have been captured at all.
+        crate::test_utils::poll_until("the write to reach the gate", || transport.arrivals() == 1)
+            .await;
+        tap.release();
+        transport.gate.add_permits(1);
+        for result in (&mut send).await {
+            result.expect("the send itself must still succeed");
+        }
+
+        assert_eq!(
+            transport.writes().len(),
+            1,
+            "the frame must still reach the wire"
+        );
+        assert_eq!(
+            tap.published(),
+            0,
+            "a frame must not be published after the last lease is released"
+        );
+        assert!(observer.frames().is_empty());
+    }
+
+    /// An observer that panics must not take the sender task with it, or one
+    /// consumer watching would end every send on the connection.
+    #[tokio::test]
+    async fn a_panicking_observer_does_not_break_the_send() {
+        struct PanickingObserver;
+        impl wacore::types::events::EventHandler for PanickingObserver {
+            fn handle_event(&self, _event: Arc<wacore::types::events::Event>) {
+                panic!("observer panics on every frame");
+            }
+            fn interest(&self) -> wacore::types::events::EventInterest {
+                wacore::types::events::EventInterest::of(&[
+                    wacore::types::events::EventKind::SentFrame,
+                ])
+            }
+        }
+
+        let bus = wacore::types::events::CoreEventBus::new();
+        let _subscription = bus.subscribe_handler(Arc::new(PanickingObserver));
+        let tap = Arc::new(crate::client::SentFrameTap::new(bus));
+        tap.acquire();
+        let transport = Arc::new(crate::transport::mock::CapturingMockTransport::new());
+        let socket = socket_watched_by(transport.clone(), tap);
+
+        for attempt in 0..3u8 {
+            socket
+                .encrypt_and_send(bytes::Bytes::from(vec![attempt; 32]))
+                .await
+                .unwrap_or_else(|e| panic!("send {attempt} must survive the observer: {e:?}"));
+        }
+        assert_eq!(
+            transport.sent_count(),
+            3,
+            "every frame must still reach the transport"
+        );
+    }
+
+    /// What watching costs per frame, measured rather than argued. The idle path
+    /// must not move at all, and a watched send must not copy the payload: the
+    /// delta is the `Bytes` promotion to a shared handle plus the `Arc<Event>`
+    /// the bus dispatches, neither of which scales with the stanza.
+    #[tokio::test]
+    async fn watching_costs_a_constant_per_frame_and_idling_costs_nothing() {
+        async fn min_allocs_per_send(socket: &NoiseSocket, payload_len: usize) -> u64 {
+            let mut min = u64::MAX;
+            // Enough windows that one lands without a sibling test thread
+            // allocating inside it; the buffers the sender reuses have long
+            // stopped growing by then.
+            for _ in 0..2_000 {
+                let before = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
+                socket
+                    .encrypt_and_send(bytes::Bytes::from(vec![3u8; payload_len]))
+                    .await
+                    .expect("send must succeed");
+                let after = crate::test_alloc::ALLOCS.load(Ordering::Relaxed);
+                min = min.min(after - before);
+            }
+            min
+        }
+
+        let (tap, _observer, _subscription) = watched_tap();
+        let idle_tap = Arc::new(crate::client::SentFrameTap::new(
+            wacore::types::events::CoreEventBus::new(),
+        ));
+
+        let idle = min_allocs_per_send(
+            &socket_watched_by(Arc::new(crate::transport::mock::MockTransport), idle_tap),
+            256,
+        )
+        .await;
+        let watched = min_allocs_per_send(
+            &socket_watched_by(Arc::new(crate::transport::mock::MockTransport), tap),
+            256,
+        )
+        .await;
+
+        // 4 = the payload each window allocates for itself, plus the three the
+        // send path already cost before any of this existed. A ceiling rather
+        // than an equality: this must fail on a regression, not on a saving.
+        assert!(
+            idle <= 4,
+            "an unwatched send must cost what it always did, got {idle}"
+        );
+        // Signed: both are empirical minima off a process-global counter, and an
+        // inversion has to report the numbers rather than panic on underflow.
+        assert_eq!(
+            watched as i64 - idle as i64,
+            2,
+            "watching must cost a constant per frame (idle {idle}, watched {watched})"
         );
     }
 }

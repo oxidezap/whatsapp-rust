@@ -1,6 +1,7 @@
 //! App-state collection sync and mutation dispatch.
 
 use super::*;
+use crate::request::DEFAULT_IQ_TIMEOUT;
 
 /// Concurrency cap for pre-downloading app-state external blobs (independent CDN
 /// GETs, keyed by directPath — LTHash ordering is in patch application, not blob
@@ -15,6 +16,470 @@ const APP_STATE_KEY_RETRY_MAX: Duration = Duration::from_secs(60);
 /// send gives up. WA Web's `serverSync` runs the same resolve-and-retry loop
 /// with `y = 5` (`WAWebSyncdServerSync`).
 const APP_STATE_PATCH_SEND_ATTEMPTS: usize = 5;
+/// How long a sync waits for another writer to release a collection.
+///
+/// A holder's honest worst case is not derivable: a patch send keeps the
+/// reservation across `fetch_app_state_with_retry_inner`, which may page up to
+/// `MAX_PAGINATION_ITERATIONS` IQs, so any bound short enough to be useful can
+/// expire on healthy work. What makes the bound safe is not its size but that
+/// running out is never lossy — the collection comes back `retryable` and the
+/// retry scheduler picks it up. This value covers the common case
+/// ([`APP_STATE_PATCH_SEND_ATTEMPTS`] attempts of [`DEFAULT_IQ_TIMEOUT`], plus
+/// one) so the scheduler is the exception rather than the rule. The bound exists
+/// because the sync worker's intake loop runs non-history tasks inline, so a
+/// reservation that never releases would stall everything queued behind it.
+const APP_STATE_RESERVATION_WAIT: Duration =
+    Duration::from_secs(DEFAULT_IQ_TIMEOUT.as_secs() * (APP_STATE_PATCH_SEND_ATTEMPTS as u64 + 1));
+/// Spacing between re-syncs of a collection a run left retryable, mirroring the
+/// syncd backoff WA Web applies to exactly this case (`WASyncdConst`:
+/// `BACKOFF_MIN_TIMEOUT` 1s, `BACKOFF_BASE` 2, `BACKOFF_MAX_TIMEOUT` 1h).
+const APP_STATE_RETRY_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const APP_STATE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
+/// How many spaced attempts one connection makes before leaving the collection
+/// to the next sync trigger. WA Web keeps retrying against a persisted
+/// first-failure timestamp and only gives up after two days; without that column
+/// this is what a single connection can promise, and the doubling already puts
+/// the last wait minutes out.
+const APP_STATE_RETRY_MAX_ROUNDS: u32 = 8;
+/// How many extra rounds the loop may burn waiting for a writer to release a
+/// collection before the attempt budget is spent.
+const APP_STATE_RETRY_ROUND_SLACK: u32 = 4;
+
+/// Delay before the attempt after `attempts` failures, doubling from
+/// [`APP_STATE_RETRY_BACKOFF_MIN`] and clamped at
+/// [`APP_STATE_RETRY_BACKOFF_MAX`].
+///
+/// Indexed by failed attempts rather than by loop iterations: rounds also pass
+/// while waiting for a socket or for another writer, and those are not failures
+/// to back off from. Letting them advance the exponent would put the next real
+/// attempt an hour away once the clamp is reached.
+fn app_state_retry_backoff(attempts: u32) -> Duration {
+    APP_STATE_RETRY_BACKOFF_MIN
+        .saturating_mul(2u32.saturating_pow(attempts))
+        .min(APP_STATE_RETRY_BACKOFF_MAX)
+}
+
+/// What a sync run actually achieved.
+///
+/// `Result<()>` could not tell "the collection is current" from "the connection
+/// went away before anything was asked", so every caller re-derived the
+/// difference from lifecycle flags — each with its own approximation, each
+/// missing a case the next one caught. The 429 and 503 stream errors are the
+/// ones they all missed: those clear `is_logged_in` without setting
+/// `expected_disconnect` or retiring the generation, so a run cut short there
+/// answered `Ok(())` and every proxy read it as done. The trigger is consumed
+/// by then, and nothing asks again.
+///
+/// Skipping is not a variant of finishing, so it is not a variant of `Ok(())`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncOutcome {
+    /// The server was asked, and answered until it had nothing more to send.
+    Completed,
+    /// Nothing was asked, or the run stopped with pages outstanding. Whatever
+    /// arrived is persisted, but the trigger has not been honoured and the work
+    /// is still owed.
+    Deferred,
+}
+
+/// Whether an attempt that ended this way leaves the collection still owed a
+/// sync.
+///
+/// One function rather than a condition rewritten at each caller, and phrased
+/// so that only [`SyncOutcome::Completed`] discharges the request: a deferral,
+/// an error, a variant added later — all keep it. The alternative is to
+/// enumerate the ways to fail, and the ways to fail is exactly the list that
+/// kept turning out to be one short.
+fn sync_still_owed(outcome: &Result<SyncOutcome>) -> bool {
+    !matches!(outcome, Ok(SyncOutcome::Completed))
+}
+
+/// The connection a piece of app-state work belongs to, and the clock it runs
+/// against.
+///
+/// Every sync path awaits round trips, and between them the socket can retire
+/// or the bootstrap's watchdog can fire. Checking that by hand at each await
+/// boundary is what this replaces: the checks drifted apart, some paths grew a
+/// check the next one forgot, and the same load answered two different
+/// questions. A scope makes the question single — [`Client::admits`] — and the
+/// answer typed, so a new boundary that forgets to ask is a boundary that
+/// cannot compile against the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SyncScope {
+    /// The connection this work was started for.
+    generation: u64,
+    /// When the work stops being worth doing. Only the initial bootstrap sets
+    /// one, because only it runs under a watchdog that reconnects underneath.
+    deadline: Option<wacore::time::Instant>,
+}
+
+/// Why a scope no longer admits its work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopeLost {
+    /// The connection was replaced. Anything this work would publish or persist
+    /// belongs to a socket that is gone.
+    Retired,
+    /// The deadline passed. The watchdog either has reconnected or is about to,
+    /// so finishing would race it.
+    Expired,
+}
+
+impl SyncScope {
+    /// The generation this scope is pinned to. Used by logs and by tests that
+    /// need to retire a connection out from under a scope.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+
+    /// How long the work has left, or `None` when it is not on a clock.
+    pub(crate) fn remaining(self) -> Option<Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(wacore::time::Instant::now()))
+    }
+
+    /// Whether this scope is bound to a deadline at all, which is what
+    /// distinguishes the bootstrap from every background trigger.
+    pub(crate) fn is_bootstrap(self) -> bool {
+        self.deadline.is_some()
+    }
+
+    /// Move to the live connection, for work that must outlive a reconnect.
+    ///
+    /// Returns whether it moved. The caller decides what that costs: an outcome
+    /// computed for the old socket must not be published, and a retry that
+    /// rebinds can no longer settle the bootstrap it was scheduled by.
+    pub(crate) fn rebind(&mut self, to: u64) -> bool {
+        let moved = self.generation != to;
+        self.generation = to;
+        moved
+    }
+}
+
+/// The initial-bootstrap flag, tagged with the connection that last wrote it.
+///
+/// A plain flag cannot be settled safely. Deciding whether the writer still owns
+/// the connection and then writing are two operations, and every attempt to
+/// bridge them failed a different way: checking first missed a retirement in the
+/// gap, and rolling back afterwards clobbered whatever the replacement had
+/// written in the meantime. Packing the generation into the same word makes the
+/// pair a single compare-and-swap, so a writer from a retired connection simply
+/// loses — there is no window left to lose in.
+#[derive(Debug)]
+pub(crate) struct BootstrapGate(AtomicU64);
+
+impl BootstrapGate {
+    /// Armed by pairing before any connection exists, so generation zero owns
+    /// the first write and every later connection outranks it.
+    pub(crate) fn new(outstanding: bool) -> Self {
+        Self(AtomicU64::new(Self::encode(0, outstanding)))
+    }
+
+    const fn encode(generation: u64, outstanding: bool) -> u64 {
+        (generation << 1) | outstanding as u64
+    }
+
+    /// Whether the bootstrap still owes work, whoever last said so.
+    pub(crate) fn is_armed(&self) -> bool {
+        self.0.load(Ordering::Acquire) & 1 == 1
+    }
+
+    /// Arm for a fresh pairing, above every connection that already exists.
+    ///
+    /// Both bounds matter, and each was wrong on its own:
+    ///
+    /// Tagging above *every* generation made the gate unclearable. A freshly
+    /// paired client re-ran the 180s critical bootstrap on every connect for the
+    /// life of the session, however many times that bootstrap succeeded.
+    ///
+    /// Tagging at zero made it clearable by anything, including a scope opened
+    /// on the connection that is live when `pair-success` arrives. Its
+    /// `settle_bootstrap(scope, false)` would clear the arm before the pairing
+    /// reconnect ever happens, and the replacement connection would find nothing
+    /// owed and skip the sync pairing exists to request.
+    ///
+    /// One past the current generation is the bound that says what is meant:
+    /// nothing already in flight can clear this, and the next connection — the
+    /// one the forced 515 brings up — can.
+    ///
+    /// A floor rather than an assignment, because `current_generation` is a
+    /// sample and the tag is shared with [`Self::settle`]. An unconditional
+    /// store can lower a tag a newer connection already set — the one case where
+    /// arming would make the gate *easier* to clear — and it broke the rule
+    /// `settle_bootstrap` relies on, that the tag only ever moves forward. Both
+    /// writers now obey it.
+    pub(crate) fn arm_for_pairing(&self, current_generation: u64) {
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            // One past *both*, not just past the sample. `settle` admits an
+            // equal generation — that is a connection revising its own answer,
+            // which it is entitled to do — so a tag merely level with an
+            // existing one still lets that connection clear the arm.
+            let generation = (current >> 1).max(current_generation).saturating_add(1);
+            match self.0.compare_exchange_weak(
+                current,
+                Self::encode(generation, true),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Record `outstanding` on behalf of `generation`, unless a newer connection
+    /// has already had its say.
+    ///
+    /// Returns whether the write took. A stale writer losing here is the point,
+    /// not a failure.
+    pub(crate) fn settle(&self, generation: u64, outstanding: bool) -> bool {
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            // Strictly newer wins. Equal is the same connection revising its own
+            // answer, which it is entitled to do.
+            if (current >> 1) > generation {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                current,
+                Self::encode(generation, outstanding),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+/// What kind of work holds a collection's reservation.
+///
+/// Skipping behind a holder is only sound when that holder is doing the same
+/// fetch. A patch send takes the same reservation and never fetches, so a sync
+/// that skipped behind one would silently drop the work its caller asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncHolder {
+    /// A collection sync: fetches from the server, then writes the collection's
+    /// version and mutation MACs.
+    Sync,
+    /// A patch send: writes the same rows, but never fetches.
+    PatchSend,
+}
+
+/// Why a sync did not get the collection reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservationSkip {
+    /// An equivalent sync already holds it, so it is already doing this work.
+    EquivalentSyncInFlight,
+    /// Nobody else is covering the collection and this call did not get it: the
+    /// holder outlasted the bound, or the caller was not willing to wait.
+    WaitTimedOut,
+}
+
+/// What finishing a sync, or the retries it schedules, settles beyond the
+/// collections themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncSettles {
+    /// Only the collections. Every trigger except the initial bootstrap: a
+    /// `server_sync` or a dirty bit says nothing about whether the first full
+    /// sync ever finished.
+    JustTheCollections,
+    /// The initial bootstrap too. Its gate stays armed while anything it asked
+    /// for is still outstanding, so recovering the last of them — even rounds
+    /// later — is what stands it down.
+    InitialSync,
+}
+
+/// What a sync should do when the collection is already reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservationWait {
+    /// Skip when an equivalent sync holds it. The batched sync asks for whatever
+    /// the server has for a set of collections, so another sync of the same
+    /// collection does this call's work and dropping it costs nothing.
+    SkipBehindSync,
+    /// Wait for whoever holds it. A consumer asking for one specific collection
+    /// is not made redundant by a sync already in flight: a full sync asks for
+    /// the snapshot while an incremental one asks for patches after the
+    /// persisted version, so skipping would turn the request into a no-op.
+    Always,
+    /// Take it if it is free, and report it otherwise. For a caller that has
+    /// already waited out the holders separately — waiting again here would be
+    /// waiting while holding the collections reserved before this one, which is
+    /// what that earlier wait exists to avoid.
+    TryOnce,
+}
+
+/// The two choices a batched sync makes for itself unless a caller overrides
+/// them.
+///
+/// Both defaults are right for a trigger the server raised — a `server_sync`
+/// notification, a dirty bit, the bootstrap — and wrong for a consumer that
+/// asked for a named collection by hand. Such a caller wants the collection
+/// re-read *now*: an equivalent sync in flight does not discharge its request
+/// (see [`ReservationWait`]), and a collection it has declared untrustworthy is
+/// not repaired by resuming from where it was. Overriding is deliberately not
+/// the default — a background trigger that waited on every holder would queue
+/// behind patch sends it has no reason to outrank, and one that rebuilt would
+/// re-download whole collections on every dirty bit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchedSyncRequest {
+    /// Stand each collection down to unsynced before asking, so the round that
+    /// follows rebuilds it from a snapshot instead of resuming from where it
+    /// was.
+    pub(crate) rebuild: bool,
+    /// Wait for whoever holds the collection rather than skipping behind an
+    /// equivalent sync. The bootstrap already does this on account of its
+    /// deadline; this is how a non-bootstrap caller asks for the same.
+    pub(crate) wait_for_holder: bool,
+}
+
+/// Whether a collection was stood down for a rebuild, or left alone because the
+/// connection it was being stood down for is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandDown {
+    /// The collection is unsynced now — either it was already, or both halves of
+    /// the reset landed.
+    Done,
+    /// Nothing was written. The collection is exactly as it was, and the caller
+    /// should treat it as one this run did not cover.
+    Declined(ScopeLost),
+}
+
+/// What a batched sync achieved, collection by collection.
+///
+/// A single `Ok`/`Err` for the whole batch cannot carry this. The initial
+/// bootstrap must not read "one collection was refused" as permission to
+/// dispatch Connected, while a background `server_sync` only wants to log it,
+/// and both read the same return value. So the call reports what happened and
+/// each caller decides what a partial result means for it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct BatchedSyncOutcome {
+    /// Applied and persisted.
+    pub(crate) synced: Vec<WAPatchName>,
+    /// The server refused the collection outright (400/404). Repeating the same
+    /// request gets the same answer, so retrying on its own never clears this.
+    pub(crate) fatal: Vec<WAPatchName>,
+    /// Did not sync, but a later attempt can: a retryable server error, a decode
+    /// key that never landed, or the iteration cap.
+    pub(crate) retryable: Vec<WAPatchName>,
+    /// Another holder had it reserved, so this call did nothing for it.
+    pub(crate) skipped: Vec<WAPatchName>,
+    /// Whether a collection IQ actually went out.
+    ///
+    /// Recorded at the send, not inferred from the buckets above. Inferring it
+    /// was wrong in a way that is worth keeping written down: `retryable` looks
+    /// like it means "the server was asked and the answer was retryable", and it
+    /// does hold those — but it also holds the collections a scope loss or a
+    /// reservation timeout dropped *before* the wire. A batch of nothing but
+    /// those reads as a real attempt under any bucket-based test.
+    reached_server: bool,
+}
+
+impl BatchedSyncOutcome {
+    /// Whether this call got as far as asking the server about anything.
+    ///
+    /// A round that reserved nothing sent no IQ and learned nothing. A retry
+    /// that charges an attempt for it spends its budget on whoever is holding
+    /// the collection — waiting again, dressed as trying.
+    pub(crate) fn reached_server(&self) -> bool {
+        self.reached_server
+    }
+
+    /// Record that a collection IQ went out. The single place that decides it.
+    fn note_reached_server(&mut self) {
+        self.reached_server = true;
+    }
+
+    /// Every collection this call did not leave synced, whatever the reason.
+    pub(crate) fn unsynced(&self) -> impl Iterator<Item = WAPatchName> + '_ {
+        self.fatal
+            .iter()
+            .chain(&self.retryable)
+            .chain(&self.skipped)
+            .copied()
+    }
+
+    /// True when every collection asked for came back synced.
+    pub(crate) fn all_synced(&self) -> bool {
+        self.unsynced().next().is_none()
+    }
+
+    /// Everything the batch asked for, reported as retryable.
+    ///
+    /// Deliberately imprecise: a batch can fail after a collection was already
+    /// applied, and the `?` on the inner call takes the partial outcome with it,
+    /// so nothing downstream can tell which of them landed. Over-reporting costs
+    /// an incremental re-sync that resumes from the persisted version, which is
+    /// what the retry scheduler already spends on a global failure. Silence
+    /// costs more, because next to a `Connected` it reads as a clean startup on
+    /// a session that may have no push name.
+    pub(crate) fn all_retryable(requested: &[WAPatchName]) -> Self {
+        Self {
+            retryable: requested.to_vec(),
+            ..Default::default()
+        }
+    }
+}
+
+/// What the critical bootstrap does with the answer its batched sync produced.
+///
+/// Pure, and deliberately apart from the I/O that carries it out: the decision
+/// used to live inside a detached post-login task with a socket behind it, which
+/// is why nothing tested it and why two of its four branches left an
+/// authenticated, no-longer-passive connection announced to nobody.
+///
+/// Every answer announces. A connection that has left passive mode is already
+/// delivering stanzas, so withholding [`Event::Connected`] hides a working
+/// session rather than protecting anyone from it; what did not sync is reported
+/// and retried instead.
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+pub(crate) struct CriticalSyncPlan {
+    /// Collections to hand to the background sync that follows the bootstrap.
+    pub(crate) retry: Vec<WAPatchName>,
+    /// Something the bootstrap owes is not in `retry` and never will be, so a
+    /// later clean round must not stand the gate down on its behalf.
+    pub(crate) stranded: bool,
+}
+
+impl CriticalSyncPlan {
+    /// The plan for a batch that ran to an outcome.
+    pub(crate) fn from_outcome(outcome: &BatchedSyncOutcome) -> Self {
+        // Destructured rather than read field by field: a bucket added to
+        // `BatchedSyncOutcome` breaks this line, which is the only place that
+        // decides what a bucket costs the bootstrap.
+        //
+        // `reached_server` is read and deliberately changes nothing. How far the
+        // attempt got is already reflected in which bucket each collection
+        // landed in, and a round that sent no IQ leaves those collections in
+        // `retry` exactly like one that did.
+        let BatchedSyncOutcome {
+            synced: _,
+            fatal,
+            retryable,
+            skipped,
+            reached_server: _,
+        } = outcome;
+        // A refusal is not retried, since the same request gets the same
+        // answer, but the batch's other misses are no less recoverable for it
+        // having happened, and the watchdog is no longer there to ask again.
+        let retry: Vec<WAPatchName> = retryable.iter().chain(skipped).copied().collect();
+        Self {
+            retry,
+            stranded: !fatal.is_empty(),
+        }
+    }
+
+    /// Whether the bootstrap still owes work, which is also what makes the
+    /// outcome worth publishing: a consumer needs to hear about a sync that left
+    /// a gap, and about nothing else.
+    ///
+    /// Derived rather than stored so the two can never disagree.
+    pub(crate) fn outstanding(&self) -> bool {
+        self.stranded || !self.retry.is_empty()
+    }
+}
 
 /// In-flight dedup registry for app-state collection syncs.
 ///
@@ -25,11 +490,11 @@ const APP_STATE_PATCH_SEND_ATTEMPTS: usize = 5;
 /// (timeout, abort, teardown) can never strand a collection as "in flight".
 /// The mutex is synchronous and never held across an await.
 pub(crate) struct SyncInFlight {
-    entries: std::sync::Mutex<HashMap<WAPatchName, u64>>,
+    entries: std::sync::Mutex<HashMap<WAPatchName, (u64, SyncHolder)>>,
     next_token: AtomicU64,
     /// Notified whenever a reservation is released, so [`SyncInFlight::begin`]
     /// can wait for one instead of spinning.
-    released: event_listener::Event,
+    pub(crate) released: event_listener::Event,
 }
 
 impl SyncInFlight {
@@ -41,35 +506,66 @@ impl SyncInFlight {
         })
     }
 
-    /// Reserve `name`, or `None` when a sync for it is already in flight.
-    pub(crate) fn try_begin(self: &Arc<Self>, name: WAPatchName) -> Option<SyncInFlightGuard> {
+    /// Whether anything holds `name` right now.
+    ///
+    /// A question, not a claim: reserving in order to find out would make this
+    /// briefly the holder, and a concurrent [`ReservationWait::SkipBehindSync`]
+    /// sync that looked in that window would stand down and report a collection
+    /// skipped that nothing was actually doing.
+    pub(crate) fn is_held(&self, name: WAPatchName) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&name)
+    }
+
+    /// Reserve `name` for `holder`, or report what already holds it.
+    pub(crate) fn try_begin_as(
+        self: &Arc<Self>,
+        name: WAPatchName,
+        holder: SyncHolder,
+    ) -> Result<SyncInFlightGuard, SyncHolder> {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        if entries.contains_key(&name) {
-            return None;
+        if let Some(&(_, current)) = entries.get(&name) {
+            return Err(current);
         }
-        entries.insert(name, token);
-        Some(SyncInFlightGuard {
+        entries.insert(name, (token, holder));
+        Ok(SyncInFlightGuard {
             registry: Arc::clone(self),
             name,
             token,
         })
     }
 
+    /// Reserve `name` for a sync, or `None` when anything already holds it.
+    ///
+    /// Test-only: production callers go through
+    /// [`Client::reserve_for_sync`](crate::client::Client::reserve_for_sync),
+    /// which has to tell an equivalent sync apart from a patch send. Keeping the
+    /// shorthand here lets the registry's own tests stay about the token and
+    /// wake-up rules rather than repeating a holder kind they do not exercise.
+    #[cfg(test)]
+    pub(crate) fn try_begin(self: &Arc<Self>, name: WAPatchName) -> Option<SyncInFlightGuard> {
+        self.try_begin_as(name, SyncHolder::Sync).ok()
+    }
+
     /// Reserve `name`, waiting for the current holder to finish.
     ///
-    /// [`try_begin`](Self::try_begin) is right for a sync, where an in-flight
-    /// one already does the work and skipping is free. A patch send cannot
-    /// skip: it must not write the collection's version and mutation MACs while
-    /// a sync is writing them, and it needs the base a concurrent sync is about
-    /// to move. Cancelling this future simply stops waiting; nothing is
-    /// reserved until the guard is returned.
-    pub(crate) async fn begin(self: &Arc<Self>, name: WAPatchName) -> SyncInFlightGuard {
+    /// A patch send cannot skip: it must not write the collection's version and
+    /// mutation MACs while a sync is writing them, and it needs the base a
+    /// concurrent sync is about to move. Cancelling this future simply stops
+    /// waiting; nothing is reserved until the guard is returned.
+    pub(crate) async fn begin(
+        self: &Arc<Self>,
+        name: WAPatchName,
+        holder: SyncHolder,
+    ) -> SyncInFlightGuard {
         loop {
             // Register the listener before re-checking, so a release landing
             // between the check and the wait cannot be missed.
             let released = self.released.listen();
-            if let Some(guard) = self.try_begin(name) {
+            if let Ok(guard) = self.try_begin_as(name, holder) {
                 return guard;
             }
             released.await;
@@ -101,7 +597,10 @@ impl Drop for SyncInFlightGuard {
             .entries
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        if entries.get(&self.name) == Some(&self.token) {
+        if entries
+            .get(&self.name)
+            .is_some_and(|&(t, _)| t == self.token)
+        {
             entries.remove(&self.name);
         }
         drop(entries);
@@ -273,18 +772,14 @@ fn finalize_app_state_key_request_peers(
 }
 
 impl Client {
-    pub(crate) async fn get_app_state_processor(&self) -> Arc<AppStateProcessor> {
-        let mut guard = self.app_state_processor.lock().await;
-        if let Some(proc) = guard.as_ref() {
-            return proc.clone();
-        }
-        debug!("Initializing AppStateProcessor for the first time.");
-        let proc = Arc::new(AppStateProcessor::new(
-            self.persistence_manager.backend(),
-            self.runtime.clone(),
-        ));
-        *guard = Some(proc.clone());
-        proc
+    pub(crate) fn get_app_state_processor(&self) -> &Arc<AppStateProcessor> {
+        self.app_state_processor.get_or_init(|| {
+            debug!("Initializing AppStateProcessor for the first time.");
+            Arc::new(AppStateProcessor::new(
+                self.persistence_manager.backend(),
+                self.runtime.clone(),
+            ))
+        })
     }
 
     /// Pre-download every external blob (snapshots + patch external mutations)
@@ -427,8 +922,52 @@ impl Client {
                     .await;
             }
             MajorSyncTask::AppStateSync { name, full_sync } => {
-                if let Err(e) = self.process_app_state_sync_task(name, full_sync).await {
-                    log::warn!("App state sync task for {name:?} failed: {e}");
+                // Reserve the collection like every other sync path does.
+                // Unreserved, this writes the same version and mutation-MAC
+                // rows as a concurrent `sync_collections_batched`, leaving the
+                // ltHash disagreeing with the MAC store.
+                //
+                // Waits for any holder: this is a consumer asking for one named
+                // collection, and a sync already in flight is not necessarily
+                // fetching what it asked for.
+                let _guard = match self
+                    .reserve_for_sync(name, ReservationWait::Always, self.sync_scope(None))
+                    .await
+                {
+                    Ok(guard) => guard,
+                    Err(ReservationSkip::EquivalentSyncInFlight) => {
+                        debug!(target: "Client/AppState", "Skipping app state sync task {name:?}: an equivalent sync holds it");
+                        return;
+                    }
+                    // The bound ran out, so nobody is covering this collection
+                    // and the consumer asked for it. Retried as the task it was,
+                    // not as a plain collection sync: the batched path asks for a
+                    // snapshot only when the persisted version is zero, so
+                    // rescheduling a `full_sync` request that way would quietly
+                    // downgrade it to incremental and the snapshot would never
+                    // happen.
+                    Err(ReservationSkip::WaitTimedOut) => {
+                        warn!(target: "Client/AppState", "Gave up waiting to sync {name:?}; scheduling a retry");
+                        self.schedule_app_state_task_retry(name, full_sync);
+                        return;
+                    }
+                };
+                // The consumer asked once and nothing else will ask again, so
+                // this is the point that has to keep the request alive — for
+                // every way of not having synced, not just the ones the guards
+                // catch. A connection lost while the collection IQ is in flight
+                // is reported by `send_iq` as an error rather than as a
+                // deferral, and an error here used to be logged and dropped.
+                let outcome = self.process_app_state_sync_task(name, full_sync).await;
+                match &outcome {
+                    Err(e) => self.log_sync_error(&format!("app state sync for {name:?}"), e),
+                    Ok(SyncOutcome::Deferred) => {
+                        debug!(target: "Client/AppState", "App state sync for {name:?} was deferred")
+                    }
+                    Ok(SyncOutcome::Completed) => {}
+                }
+                if sync_still_owed(&outcome) {
+                    self.schedule_app_state_task_retry(name, full_sync);
                 }
             }
         }
@@ -452,8 +991,20 @@ impl Client {
             // Matches WA Web which only requests snapshot when version is undefined.
             let res = self.process_app_state_sync_task(name, false).await;
             match res {
-                Ok(()) => {
+                Ok(SyncOutcome::Completed) => {
                     wacore::telemetry::appstate_sync("ok");
+                    return Ok(());
+                }
+                // The send succeeded and the collection is now behind its own
+                // head, which is precisely the state this re-sync exists to
+                // repair. Counting it as `ok` reported a repair that did not
+                // happen; the retry is what actually carries it to the
+                // replacement connection.
+                Ok(SyncOutcome::Deferred) => {
+                    wacore::telemetry::appstate_sync("deferred");
+                    if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+                        client.schedule_app_state_task_retry(name, false);
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -501,59 +1052,880 @@ impl Client {
         }
     }
 
-    /// Sync multiple collections in a single IQ request, re-fetching those with `has_more_patches`.
-    /// Matches WA Web's `serverSync()` outer loop (`3JJWKHeu5-P.js:54278-54305`).
-    /// Max 5 iterations (WA Web's `C=5` constant).
+    /// Log and surface a sync whose caller has no decision to make.
     ///
-    /// `key_wait_deadline` bounds how long a missing app-state decode key may be
-    /// awaited. The initial critical bootstrap passes the shared 180s critical-sync
-    /// deadline so the explicit `AppStateSyncKeyRequest` fallback can recover a
-    /// late/never-auto-shared key on the same connection; other callers pass `None`
-    /// for the fixed short default.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len()), err(Debug)))]
+    /// The initial bootstrap is the only path that changes what it does based on
+    /// the outcome. Every other caller just needs an incomplete sync to be
+    /// visible instead of swallowed, which is how a collection could stop
+    /// syncing without anything saying so.
+    ///
+    /// Readiness is read, not assumed: a `syncd_app_state` dirty bit can start a
+    /// sync while offline stanzas are still being processed, so this can run
+    /// before the connection ever reaches `Connected`.
+    ///
+    /// `generation` is the connection the sync was started on. Checking it here
+    /// rather than at each call site is deliberate: every caller awaits a round
+    /// trip before reporting, and one that forgot would publish a retired
+    /// socket's refusal to a consumer whose documented response is to log out or
+    /// force a recovery — on the live session.
+    ///
+    /// `requested` is what the sync was asked to cover. It is only needed for
+    /// the failure arm: a top-level error produces no outcome at all, so there
+    /// are no per-collection buckets to retry from, and for a dirty-bit request
+    /// the trigger is already consumed — nothing would ask again.
+    pub(crate) fn report_background_sync(
+        self: &Arc<Self>,
+        label: &str,
+        scope: SyncScope,
+        settles: SyncSettles,
+        requested: &[WAPatchName],
+        result: Result<BatchedSyncOutcome>,
+    ) {
+        self.report_background_sync_stranded(label, scope, settles, requested, false, result)
+    }
+
+    /// [`report_background_sync`](Self::report_background_sync) for a caller that
+    /// already knows something is unrecoverable outside this result.
+    ///
+    /// A collection the server refused is not in `requested` — retrying it is
+    /// pointless — but it is still why the bootstrap is unfinished, and a later
+    /// clean round would otherwise settle the gate on its behalf.
+    pub(crate) fn report_background_sync_stranded(
+        self: &Arc<Self>,
+        label: &str,
+        scope: SyncScope,
+        settles: SyncSettles,
+        requested: &[WAPatchName],
+        stranded_elsewhere: bool,
+        result: Result<BatchedSyncOutcome>,
+    ) {
+        if let Err(lost) = self.admits(scope) {
+            debug!(target: "Client/AppState", "{label}: outcome dropped ({lost:?})");
+            return;
+        }
+        match result {
+            Ok(outcome) if outcome.all_synced() => {}
+            Ok(outcome) => {
+                warn!(
+                    target: "Client/AppState",
+                    "{label}: incomplete (fatal={:?} retryable={:?} skipped={:?})",
+                    outcome.fatal, outcome.retryable, outcome.skipped
+                );
+                self.dispatch_app_state_sync_failed(
+                    &outcome,
+                    self.is_ready.load(Ordering::Relaxed),
+                );
+                // Seeded with what this outcome already stranded. A fatal or
+                // skipped collection here is not in the retryable list the
+                // scheduler carries, so without this the scheduler would start
+                // clean and let a later successful round settle the bootstrap
+                // for collections that never synced and will not be retried.
+                let already_stranded =
+                    stranded_elsewhere || !outcome.fatal.is_empty() || !outcome.skipped.is_empty();
+                self.schedule_app_state_retry(outcome.retryable, scope, settles, already_stranded);
+            }
+            Err(e) => {
+                self.log_sync_error(label, &e);
+                // An IQ timeout, a malformed response, a failed blob fetch or a
+                // store error takes the whole batch down without producing
+                // buckets, so nothing above reaches the scheduler. Retry what
+                // was asked for: the collections are no less stale for the
+                // failure having been global, and the request that prompted it
+                // is not coming back.
+                //
+                // Unasserted: the observable is a detached task that sleeps
+                // before doing anything, and the two probes tried for it both
+                // passed with the requeue removed.
+                self.schedule_app_state_retry(
+                    requested.to_vec(),
+                    scope,
+                    settles,
+                    stranded_elsewhere,
+                );
+            }
+        }
+    }
+
+    /// Wait until there is a connection to work on, or the client is finished.
+    ///
+    /// Returns whether one arrived. The internal half of
+    /// [`Client::wait_until_reachable`], differing only in sitting through a
+    /// pause: nothing on the next connection re-issues a consumer's task, so
+    /// giving up there would drop a full-sync request outright rather than
+    /// defer it, and a pause is the same shape as the backoff this already
+    /// waits out — offline now, connected later.
+    ///
+    /// Waits for `can_reach_server`, not for `Connected`: the caller's question
+    /// is whether its IQ can be sent and answered, and the `Connected` notifier
+    /// additionally waits for the critical sync, so a retry would sit through a
+    /// bootstrap it may itself be part of.
+    pub(crate) async fn await_connection(&self) -> bool {
+        self.wait_for_reachability(true).await.is_reachable()
+    }
+
+    /// Open a scope for work starting now on the live connection.
+    pub(crate) fn sync_scope(&self, deadline: Option<wacore::time::Instant>) -> SyncScope {
+        SyncScope {
+            generation: self.connection_generation.load(Ordering::SeqCst),
+            deadline,
+        }
+    }
+
+    /// Whether `scope`'s work may still proceed.
+    ///
+    /// The single place either question is asked. Call it at every boundary that
+    /// follows an await and precedes something observable — a write, a dispatch,
+    /// a scheduled retry — and nowhere else, so there is one answer per boundary
+    /// rather than one per author.
+    pub(crate) fn admits(&self, scope: SyncScope) -> Result<(), ScopeLost> {
+        if self.connection_generation.load(Ordering::SeqCst) != scope.generation {
+            return Err(ScopeLost::Retired);
+        }
+        if let Some(deadline) = scope.deadline
+            && wacore::time::Instant::now() >= deadline
+        {
+            return Err(ScopeLost::Expired);
+        }
+        Ok(())
+    }
+
+    /// Record whether the initial bootstrap still has work outstanding.
+    ///
+    /// The gate is shared across connections, so a task from a retired one must
+    /// not touch it: clearing would let the live connection skip a bootstrap it
+    /// still needs, and arming would cost it one it does not. Routing every
+    /// write through here is what keeps that check from being the caller's job —
+    /// it was forgotten twice when it was.
+    pub(crate) fn settle_bootstrap(&self, scope: SyncScope, outstanding: bool) {
+        // Two guards, closing two different holes, which is why neither alone
+        // was enough on the previous attempts.
+        //
+        // The admission check keeps a writer whose connection is already gone
+        // from having a say at all. The compare-and-swap keeps any write from
+        // clobbering one made on behalf of a newer connection. Between them the
+        // worst case is a stale write that slips through the check and lands
+        // before the replacement settles — and the replacement's own settle then
+        // outranks it permanently, because the tag only ever moves forward.
+        //
+        // Expiry is deliberately not consulted: running out of time is exactly
+        // when the bootstrap has to stay armed, and that is a write this
+        // connection is still entitled to make.
+        if self.admits(scope) == Err(ScopeLost::Retired) {
+            debug!(
+                target: "Client/AppState",
+                "Bootstrap gate left alone: connection {} retired", scope.generation
+            );
+            return;
+        }
+        if !self
+            .needs_initial_full_sync
+            .settle(scope.generation, outstanding)
+        {
+            debug!(
+                target: "Client/AppState",
+                "Bootstrap gate left to a newer connection than {}", scope.generation
+            );
+            return;
+        }
+        if outstanding {
+            warn!(target: "Client/AppState", "Initial App State Sync incomplete; bootstrap stays armed");
+        } else {
+            debug!(target: "Client/AppState", "Initial App State Sync completed.");
+        }
+    }
+
+    /// Whether `scope`'s connection is still the live one, ignoring its deadline.
+    ///
+    /// Distinct from [`admits`](Self::admits), which the bootstrap cannot use
+    /// past the sync itself: the critical scope carries the watchdog's deadline,
+    /// and running out of it is not a reason to withhold what the connection has
+    /// already earned.
+    fn scope_is_current(&self, scope: SyncScope) -> bool {
+        self.admits(scope) != Err(ScopeLost::Retired)
+    }
+
+    /// Announce a connection whose critical bootstrap has an answer, and report
+    /// what the answer left unsynced.
+    ///
+    /// Returns whether the generation survived, which is not the same question as
+    /// whether `Connected` went out: [`dispatch_connected`](Self::dispatch_connected)
+    /// also declines for a paused or lifecycle-cancelled connection, and this
+    /// still returns true for those. Deliberately, because the caller uses the
+    /// answer to decide whether to hand the leftovers to the background sync, and
+    /// a pause is precisely when that work must survive: the sync parks until the
+    /// client resumes rather than being dropped. The report stays honest either
+    /// way, since its `connected` flag is read from `is_ready`, which only the
+    /// publication sets.
+    pub(crate) async fn finish_critical_bootstrap(
+        self: &Arc<Self>,
+        scope: SyncScope,
+        plan: &CriticalSyncPlan,
+        outcome: &BatchedSyncOutcome,
+    ) -> bool {
+        // Armed first, before anything a consumer handler can interrupt.
+        // Everything below (resubscribe, `Connected`, the failure report) can
+        // retire this generation and take the decision with it, leaving the gate
+        // clear with the push name already populated so the replacement connection
+        // skips what it still owes. Clearing is never done here: on the happy path
+        // the bootstrap still owes the non-critical collections, and the background
+        // sync that fetches them is what stands the gate down.
+        if plan.outstanding() {
+            self.settle_bootstrap(scope, true);
+        }
+        if !self.scope_is_current(scope) {
+            return false;
+        }
+        self.resubscribe_presence_subscriptions(scope.generation)
+            .await;
+        if !self.scope_is_current(scope) {
+            return false;
+        }
+        // Presence is NOT sent here. WhatsApp Web sends presence from the
+        // setting_pushName mutation handler (WAWebPushNameSync), not from
+        // criticalSyncDone. Our setting_pushName handler already does this.
+        //
+        // Whether the connection is still worth announcing is asked inside, at
+        // the point of publication, and not duplicated here: this scope check
+        // sits on the near side of a lifecycle readiness hook it would be
+        // answering across.
+        self.dispatch_connected(scope.generation).await;
+        // After the readiness transition, not before: the report claims the
+        // session is usable, and until `Connected` is actually published that
+        // claim can still be falsified by a disconnect during the resubscribe
+        // above. Re-checked once more because publishing runs consumer handlers,
+        // and one of them disconnecting would retire this generation between the
+        // two dispatches, long enough to hand the next session a failure it never
+        // earned.
+        if !self.scope_is_current(scope) {
+            return false;
+        }
+        if plan.outstanding() {
+            self.dispatch_app_state_sync_failed(outcome, self.is_ready.load(Ordering::Relaxed));
+        }
+        true
+    }
+
+    /// Report an incomplete batched sync to consumers.
+    ///
+    /// `connected` says whether the client went on to dispatch `Connected`
+    /// anyway, which is the difference between "degraded but usable" and "still
+    /// retrying", and is the only part a consumer cannot infer from the buckets.
+    pub(crate) fn dispatch_app_state_sync_failed(
+        &self,
+        outcome: &BatchedSyncOutcome,
+        connected: bool,
+    ) {
+        let names = |v: &[WAPatchName]| v.iter().map(|n| n.as_str().to_string()).collect();
+        self.core.event_bus.dispatch(Event::AppStateSyncFailed(
+            crate::types::events::AppStateSyncFailed::builder()
+                .fatal(names(&outcome.fatal))
+                .retryable(names(&outcome.retryable))
+                .skipped(names(&outcome.skipped))
+                .connected(connected)
+                .build(),
+        ));
+    }
+
+    /// Retry one consumer-issued sync task, preserving the mode it asked for.
+    ///
+    /// Separate from [`schedule_app_state_retry`](Self::schedule_app_state_retry)
+    /// because a task carries `full_sync`, and the batched path cannot express
+    /// it: that one requests a snapshot only when the persisted version is zero,
+    /// so a full sync routed through it becomes incremental and the caller's
+    /// snapshot silently never happens.
+    fn schedule_app_state_task_retry(self: &Arc<Self>, name: WAPatchName, full_sync: bool) {
+        let mut scope = self.sync_scope(None);
+        let client = self.clone();
+        self.runtime.spawn_detached(Box::pin(async move {
+            // Attempts and rounds are counted separately: a wait that ran out
+            // never reached the server, so spending an attempt on it would let a
+            // long-lived holder burn the budget without the sync being tried
+            // once. Rounds still bound the loop overall.
+            let mut attempts = 0u32;
+            for _ in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
+                if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
+                    break;
+                }
+                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
+                if client.is_terminal() {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
+                    return;
+                }
+                // Wait the planned reconnect out rather than spending an attempt
+                // on it. `process_app_state_sync_task` defers at its own guard
+                // without contacting the server, so attempting here would burn
+                // the budget on rounds that never asked anything.
+                //
+                // Waited on rather than polled, and on the connection itself
+                // rather than on any particular reason there is not one:
+                // `reconnect()` tears down without setting `expected_disconnect`,
+                // so asking about the reason misses the ordinary case.
+                if !client.await_connection().await {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
+                    return;
+                }
+
+                // Rebound after the wait, not before: the generation is only
+                // final once `<success>` has landed, which is what the wait
+                // waits for. Binding first pinned the outgoing connection's
+                // generation, and `admits` then rejected every attempt made on
+                // the replacement — rounds spent without one request being sent.
+                //
+                // Rebound rather than discarded, because nothing on the new
+                // connection re-issues a consumer's task, and a `full_sync` one
+                // is the snapshot request this scheduler exists to keep alive.
+                scope.rebind(client.connection_generation.load(Ordering::SeqCst));
+
+                let guard = match client
+                    .reserve_for_sync(name, ReservationWait::Always, scope)
+                    .await
+                {
+                    Ok(guard) => guard,
+                    // Someone equivalent picked it up, so the request is covered.
+                    Err(ReservationSkip::EquivalentSyncInFlight) => return,
+                    Err(ReservationSkip::WaitTimedOut) => {
+                        warn!(target: "Client/AppState", "Still waiting on the writer holding {name:?}");
+                        continue;
+                    }
+                };
+                // The reservation wait is itself an await, so the connection can
+                // go inside it and the answer above is already stale. Asked
+                // again before an attempt is counted, so a round spent waiting
+                // is not charged as one spent asking.
+                if !client.can_reach_server() || client.admits(scope).is_err() {
+                    debug!(target: "Client/AppState", "Dropping the {name:?} attempt: state moved while reserving");
+                    drop(guard);
+                    continue;
+                }
+                attempts += 1;
+                let outcome = client.process_app_state_sync_task(name, full_sync).await;
+                if let Err(e) = &outcome {
+                    drop(guard);
+                    client.log_sync_error("app state task retry", e);
+                }
+                // The callee says which happened, so this no longer
+                // reconstructs it from lifecycle flags. That proxy read `Ok(())`
+                // as done for every cut-short run whose reason it did not model
+                // — a 429 or 503 clears `is_logged_in` without setting
+                // `expected_disconnect` — and the request was lost with the
+                // `full_sync` snapshot it carried.
+                //
+                // `admits` still gates it: a run that completed against a
+                // retired socket completed for somebody else.
+                if !sync_still_owed(&outcome) && client.admits(scope).is_ok() {
+                    return;
+                }
+                debug!(target: "Client/AppState", "The {name:?} attempt did not settle it; keeping it queued");
+            }
+            warn!(
+                target: "Client/AppState",
+                "App state task for {name:?} still unsynced after {attempts} attempts"
+            );
+        }));
+    }
+
+    /// Re-sync collections a run left retryable, spaced the way WA Web spaces
+    /// the same case (`WASyncdConst`: 1s base, doubling, capped at an hour).
+    ///
+    /// A transient error takes the collection out of the batched loop rather
+    /// than being re-asked inside it, which is what WA Web does — but WA Web
+    /// hands it to a retry state machine afterwards, and without one a single
+    /// 500 would leave the collection stale until some unrelated trigger came
+    /// along. This is that machine, minus the persisted two-day expiry.
+    ///
+    /// The scope is taken from the caller, which has already validated it, so
+    /// dispatching the failure event in between — consumer handlers run
+    /// synchronously and may disconnect — cannot silently rebind these retries
+    /// to whatever replaced the connection.
+    ///
+    /// `already_stranded` carries forward what the originating outcome left
+    /// behind but did not hand over: a refusal, or a collection another writer
+    /// held. Those are not in `collections`, so without it a later clean round
+    /// would look like everything recovered.
+    pub(crate) fn schedule_app_state_retry(
+        self: &Arc<Self>,
+        collections: Vec<WAPatchName>,
+        scope: SyncScope,
+        settles: SyncSettles,
+        already_stranded: bool,
+    ) {
+        if collections.is_empty() {
+            return;
+        }
+        let client = self.clone();
+        self.runtime.spawn_detached(Box::pin(async move {
+            let mut scope = scope;
+            let mut settles = settles;
+            let mut pending = collections;
+            // Sticky, and only for misses that do not come back. A round can
+            // strand one collection as fatal or skipped while another stays
+            // retryable; if that last one then succeeds, its own `all_synced()`
+            // is true even though the first never synced. Retryable ones are
+            // exactly what the next round carries, so counting them would keep
+            // the gate armed forever after any transient round.
+            let mut left_unresolved = already_stranded;
+            // Attempts and rounds are counted separately. A round spent waiting
+            // for a socket never reached the server, and the reconnect backoff
+            // runs far longer than these delays do, so charging it as an attempt
+            // would exhaust the budget before the replacement connection exists
+            // and drop a trigger that is already consumed.
+            let mut attempts = 0u32;
+            for _ in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
+                if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
+                    break;
+                }
+                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
+                // Waited for, not charged for. Without this the loop spends an
+                // attempt on every offline round, and the whole budget is gone
+                // long before a reconnect that backs off in minutes returns —
+                // taking a trigger the server already considers handled.
+                if !client.await_connection().await {
+                    debug!(target: "Client/AppState", "App state retry cancelled: client is finished");
+                    return;
+                }
+
+                // Rebound after the wait, not before: the connection that
+                // arrives is the one this attempt belongs to.
+                if scope.rebind(client.connection_generation.load(Ordering::SeqCst)) {
+                    // The work carries over; the authority to settle does not.
+                    // This run no longer belongs to the bootstrap that scheduled
+                    // it, so it must never stand that gate down.
+                    settles = SyncSettles::JustTheCollections;
+                }
+
+                // The same guard the task retry makes, and for the same reason:
+                // the wait can resolve just as a planned reconnect begins, and
+                // the generation does not bump until cleanup. `admits(scope)` is
+                // fresh from the rebind above and would say yes to that retiring
+                // socket, so reachability is the question that catches it.
+                if !client.can_reach_server() {
+                    debug!(target: "Client/AppState", "Dropping the batched {pending:?} attempt: the connection is retiring");
+                    continue;
+                }
+
+                debug!(
+                    target: "Client/AppState",
+                    "Retrying app state {pending:?} (attempt {}/{APP_STATE_RETRY_MAX_ROUNDS})",
+                    attempts + 1
+                );
+                let result = client
+                    .sync_collections_batched(pending.clone(), scope)
+                    .await;
+                // Charged after the call, for what reached the server. A round
+                // where every collection was held by another writer sent no IQ;
+                // eight of those in a row would otherwise spend the whole budget
+                // on someone else's patch send and drop a consumed trigger.
+                let reached_server = match &result {
+                    Ok(outcome) => outcome.reached_server(),
+                    Err(_) => true,
+                };
+                if reached_server {
+                    attempts += 1;
+                }
+
+                // Rebinding here drops the outcome, not the work: publishing a
+                // retired socket's refusal could have a consumer log out the
+                // live session, while abandoning the names would strand them.
+                if scope.rebind(client.connection_generation.load(Ordering::SeqCst)) {
+                    debug!(target: "Client/AppState", "App state retry outcome dropped; rebound");
+                    settles = SyncSettles::JustTheCollections;
+                    continue;
+                }
+
+                match result {
+                    Ok(outcome) => {
+                        if !outcome.all_synced() {
+                            client.dispatch_app_state_sync_failed(
+                                &outcome,
+                                client.is_ready.load(Ordering::Relaxed),
+                            );
+                        }
+                        if !outcome.fatal.is_empty() || !outcome.skipped.is_empty() {
+                            left_unresolved = true;
+                        }
+                        pending = outcome.retryable;
+                        if pending.is_empty() {
+                            if settles == SyncSettles::InitialSync {
+                                client.settle_bootstrap(scope, left_unresolved);
+                            }
+                            return;
+                        }
+                    }
+                    Err(e) => client.log_sync_error("app state retry", &e),
+                }
+            }
+            warn!(
+                target: "Client/AppState",
+                "App state {pending:?} still unsynced after {attempts} attempts; \
+                 leaving them to the next sync trigger"
+            );
+            // Consumers heard about every round that produced buckets, but a
+            // sequence that ends here — or one whose rounds all failed before
+            // producing any — would otherwise finish in silence, with the
+            // collections still stale. `retryable` is exactly what these are:
+            // not synced, and a later trigger can still fix them.
+            if client.admits(scope).is_ok() {
+                let exhausted = BatchedSyncOutcome {
+                    retryable: pending,
+                    ..Default::default()
+                };
+                client.dispatch_app_state_sync_failed(
+                    &exhausted,
+                    client.is_ready.load(Ordering::Relaxed),
+                );
+            }
+        }));
+    }
+
+    /// Reserve `name` for a sync.
+    ///
+    /// Skipping is only ever sound behind an equivalent sync, and only for a
+    /// caller whose request that sync subsumes — see [`ReservationWait`]. A
+    /// patch send is never equivalent: it takes the same reservation and never
+    /// fetches, so a sync that skipped behind one would be dropped silently and
+    /// the patches that prompted it would go unfetched. Every wait is bounded by
+    /// [`APP_STATE_RESERVATION_WAIT`], because the sync worker's intake loop
+    /// runs non-history tasks inline and a wedged holder would otherwise stall
+    /// everything queued behind it.
+    /// The scope caps the wait further: the bootstrap runs under a watchdog that
+    /// reconnects on wall-clock, so waiting past its deadline only guarantees the
+    /// work lands on a socket that is already gone.
+    async fn reserve_for_sync(
+        &self,
+        name: WAPatchName,
+        wait: ReservationWait,
+        scope: SyncScope,
+    ) -> Result<SyncInFlightGuard, ReservationSkip> {
+        match self.app_state_syncing.try_begin_as(name, SyncHolder::Sync) {
+            Ok(guard) => return Ok(guard),
+            Err(SyncHolder::Sync) if wait == ReservationWait::SkipBehindSync => {
+                return Err(ReservationSkip::EquivalentSyncInFlight);
+            }
+            Err(holder) if wait == ReservationWait::TryOnce => {
+                debug!(target: "Client/AppState", "Not waiting for the {holder:?} holding {name:?}");
+                return Err(ReservationSkip::WaitTimedOut);
+            }
+            Err(holder) => {
+                debug!(target: "Client/AppState", "Waiting for the {holder:?} holding {name:?}");
+            }
+        }
+        let bound = match scope.remaining() {
+            Some(remaining) => APP_STATE_RESERVATION_WAIT.min(remaining),
+            None => APP_STATE_RESERVATION_WAIT,
+        };
+        rt_timeout(
+            &*self.runtime,
+            bound,
+            self.app_state_syncing.begin(name, SyncHolder::Sync),
+        )
+        .await
+        .map_err(|_| ReservationSkip::WaitTimedOut)
+    }
+
+    /// Stand `name` down to the state of a collection that has never synced.
+    ///
+    /// The only way to ask the server to replay a collection: it sends a
+    /// snapshot when the request carries no version, and the processor applies
+    /// one only over a version older than its own — so a rebuild is expressed by
+    /// having nothing rather than by asking for something. That also keeps this
+    /// on the path the first sync already takes, instead of teaching the
+    /// snapshot rules a second shape to recognise.
+    ///
+    /// The version goes first. Either write can be the last one a cancelled or
+    /// failed rebuild completes, and of the two halves it can stop at, `v0` with
+    /// stale MACs is the recoverable one: `process_patch_list` clears them
+    /// itself before applying anything to an empty baseline. The other order
+    /// leaves the collection claiming a version whose MACs are gone, which
+    /// nothing downstream is looking for.
+    ///
+    /// Callers hold the collection's reservation across this, so no other writer
+    /// can observe the half-stood-down state while the rebuild runs — while the
+    /// scope holds. A reconnect clears the reservation registry out from under
+    /// live tasks, so the scope is re-asked before each write, and a rebuild
+    /// that has lost it leaves the collection exactly as it was rather than half
+    /// reset.
+    ///
+    /// Those checks narrow the window; they do not close it. A connection that
+    /// retires while one of these writes is in flight is not seen, so the write
+    /// still lands — the same shape as the apply itself, whose three writes sit
+    /// behind one admission check in
+    /// [`sync_collections_batched_inner`](Self::sync_collections_batched_inner).
+    /// What remains is bounded by how long a local store write takes, against a
+    /// replacement connection that would have to handshake, reserve and apply
+    /// inside it. Closing it properly means a store that refuses writes from a
+    /// retired generation, which is the same change the apply wants and does not
+    /// belong to one caller.
+    async fn stand_collection_down(
+        &self,
+        backend: &dyn wacore::store::traits::Backend,
+        name: WAPatchName,
+        scope: SyncScope,
+    ) -> Result<StandDown> {
+        let state = backend.get_version(name.as_str()).await?;
+        if state.version == 0 {
+            return Ok(StandDown::Done);
+        }
+        if let Err(lost) = self.admits(scope) {
+            return Ok(StandDown::Declined(lost));
+        }
+        debug!(
+            target: "Client/AppState",
+            "Batched sync: standing {name:?} down from v{} to rebuild it",
+            state.version
+        );
+        backend
+            .set_version(name.as_str(), wacore::appstate::hash::HashState::default())
+            .await?;
+        if let Err(lost) = self.admits(scope) {
+            // The version is already down, and that half is the recoverable one:
+            // the next sync sees an unsynced collection and rebuilds it, clearing
+            // the MACs on the way. Stopping here is still better than writing on,
+            // because by now another generation may own the collection.
+            return Ok(StandDown::Declined(lost));
+        }
+        backend.clear_mutation_macs(name.as_str()).await?;
+        Ok(StandDown::Done)
+    }
+
+    /// Wait out whoever holds any of `collections`, taking nothing.
+    ///
+    /// Only useful before a batch that waits: it moves the waiting to a point
+    /// where this call holds no reservation, so a slow holder of one collection
+    /// cannot block writers to the others through us. Each collection is waited
+    /// for and released immediately — the reservation is not the point, the
+    /// holder being gone is.
+    ///
+    /// Best effort by construction. A holder that outlasts the bound, or a
+    /// collection taken again before the caller reserves it, is left to the
+    /// caller's own pass to report.
+    async fn wait_for_contended(&self, collections: &[WAPatchName], scope: SyncScope) {
+        for &name in collections {
+            if !self.app_state_syncing.is_held(name) {
+                continue;
+            }
+            if self.admits(scope).is_err() {
+                return;
+            }
+            debug!(target: "Client/AppState", "Waiting out the holder of {name:?} before reserving the batch");
+            let _ = self
+                .reserve_for_sync(name, ReservationWait::Always, scope)
+                .await;
+        }
+    }
+
+    /// Sync multiple collections in a single IQ request, re-fetching those with `has_more_patches`.
+    /// Mirrors WA Web's `serverSync()` outer loop (`WAWebSyncdServerSync`).
+    ///
+    /// `scope` pins the work to the connection that asked for it and, for the
+    /// initial bootstrap, to the 180s critical-sync deadline. Everything that
+    /// follows an await re-asks [`Client::admits`] before writing, publishing or
+    /// scheduling, so a batch cannot outlive the socket it belongs to. The
+    /// deadline also bounds the missing-key wait, letting the explicit
+    /// `AppStateSyncKeyRequest` fallback recover a late key on this connection
+    /// without running past the watchdog.
+    ///
+    /// Not instrumented itself: it forwards to
+    /// [`Self::sync_collections_batched_with`], whose span would otherwise nest
+    /// inside an identical one.
     pub(crate) async fn sync_collections_batched(
         &self,
         collections: Vec<WAPatchName>,
-        key_wait_deadline: Option<wacore::time::Instant>,
-    ) -> Result<()> {
+        scope: SyncScope,
+    ) -> Result<BatchedSyncOutcome> {
+        self.sync_collections_batched_with(collections, scope, BatchedSyncRequest::default())
+            .await
+    }
+
+    /// [`Self::sync_collections_batched`] with the two decisions a background
+    /// trigger takes for granted spelled out — see [`BatchedSyncRequest`].
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.sync_batched", level = "debug", skip_all, fields(count = collections.len(), rebuild = request.rebuild), err(Debug)))]
+    pub(crate) async fn sync_collections_batched_with(
+        &self,
+        collections: Vec<WAPatchName>,
+        scope: SyncScope,
+        request: BatchedSyncRequest,
+    ) -> Result<BatchedSyncOutcome> {
+        let mut outcome = BatchedSyncOutcome::default();
         if collections.is_empty() {
-            return Ok(());
+            return Ok(outcome);
         }
 
-        // In-flight dedup: filter out collections already being synced. The
-        // guards release on every exit path, including cancellation.
+        // In-flight dedup. The guards release on every exit path, including
+        // cancellation. A collection we could not reserve is reported skipped
+        // rather than silently dropped: this call did nothing for it, and only
+        // the caller knows whether that is acceptable.
+        // A caller can name the same collection twice — a `server_sync`
+        // notification may repeat a `<collection>` child. Reserving it once and
+        // then hitting our own reservation on the second pass would file one
+        // collection under both `synced` and `skipped`, making `all_synced()`
+        // false and publishing a failure that blames a writer who never existed.
+        let mut seen = HashSet::with_capacity(collections.len());
+        let collections: Vec<WAPatchName> = collections
+            .into_iter()
+            .filter(|name| seen.insert(*name))
+            .collect();
+
+        // Reserved in a fixed order, because the loop below holds every guard it
+        // has taken while waiting for the next one. Two batches that wait —
+        // `ReservationWait::Always` — and name overlapping collections in
+        // opposite orders would otherwise each hold the other's next collection
+        // and make no progress until both waits time out, minutes later, for
+        // work neither was slow at. A single order over a shared set is what
+        // makes that cycle unconstructible, and `reservation_rank` is where that
+        // order lives, as a property of the collection rather than a list a new
+        // variant can be left out of. Placed one by one rather than sorted,
+        // because the set is at most six elements and a generic sort over them
+        // monomorphizes to kilobytes of code.
+        let mut ordered: Vec<WAPatchName> = Vec::with_capacity(collections.len());
+        for name in collections {
+            let at = ordered
+                .iter()
+                .position(|placed| placed.reservation_rank() > name.reservation_rank())
+                .unwrap_or(ordered.len());
+            ordered.insert(at, name);
+        }
+        let collections = ordered;
+
+        // The bootstrap cannot skip: it has to know the collection is synced
+        // before it dispatches Connected, and an equivalent sync in flight only
+        // tells it someone else is trying. So when a deadline is supplied — which
+        // is what marks the critical path — it waits for whoever holds it, and
+        // finding the collection already synced afterwards is the fast case.
+        // Background callers still skip, because for them the in-flight sync
+        // genuinely does the work.
+        let wait = if request.wait_for_holder {
+            // The waiting already happened, above, holding nothing. Waiting again
+            // here would do it holding every collection reserved before this one
+            // — and a collection taken back in the gap between the two passes is
+            // the one case that gap can produce, so it is reported rather than
+            // waited on.
+            ReservationWait::TryOnce
+        } else if scope.is_bootstrap() {
+            ReservationWait::Always
+        } else {
+            ReservationWait::SkipBehindSync
+        };
+
+        // A caller that waits does not wait *holding*. The loop below keeps every
+        // guard it has taken while it waits for the next collection, which for a
+        // wait of [`APP_STATE_RESERVATION_WAIT`] blocks writers to a collection
+        // this call is not even asking about yet — and `send_app_state_patch`
+        // takes the global send lock before it waits for its own reservation, so
+        // one held collection stalls patch sends to all of them. Clearing the way
+        // first costs a pass over an at-most-five-element set and leaves the wait
+        // holding nothing. It is not atomic — a collection can be taken again in
+        // the gap between the two passes — which is why the pass below does not
+        // wait: it reports what it cannot get, so the gap costs a retry rather
+        // than reopening the blocking this exists to prevent.
+        if request.wait_for_holder {
+            self.wait_for_contended(&collections, scope).await;
+        }
+
         let mut guards = Vec::with_capacity(collections.len());
         let mut pending = Vec::with_capacity(collections.len());
         for name in collections {
-            match self.app_state_syncing.try_begin(name) {
-                Some(guard) => {
+            // Asked per reservation, not once for the batch: each wait can burn
+            // the remaining deadline, and the watchdog fires on wall-clock
+            // regardless of which collection the batch is stuck on.
+            if let Err(lost) = self.admits(scope) {
+                warn!(target: "Client/AppState", "Not reserving {name:?}: {lost:?}");
+                outcome.retryable.push(name);
+                continue;
+            }
+            match self.reserve_for_sync(name, wait, scope).await {
+                Ok(guard) => {
                     guards.push(guard);
                     pending.push(name);
                 }
-                None => {
-                    debug!(target: "Client/AppState", "Skipping {:?} in batch: already in flight", name);
+                // An equivalent sync in flight is doing this work, so the
+                // collection is covered and only worth reporting. A wait that ran
+                // out is not covered by anyone, so it belongs with the misses
+                // that deserve another attempt.
+                Err(ReservationSkip::EquivalentSyncInFlight) => {
+                    debug!(target: "Client/AppState", "Skipping {name:?} in batch: an equivalent sync holds it");
+                    outcome.skipped.push(name);
+                }
+                Err(ReservationSkip::WaitTimedOut) => {
+                    warn!(target: "Client/AppState", "Gave up waiting for the writer holding {name:?}");
+                    outcome.retryable.push(name);
                 }
             }
         }
 
         if pending.is_empty() {
-            return Ok(());
+            return Ok(outcome);
         }
 
-        self.sync_collections_batched_inner(pending, key_wait_deadline)
-            .await
+        self.sync_collections_batched_inner(pending, scope, request, &mut outcome)
+            .await?;
+
+        // A run that crossed its deadline is not a clean one, even if every
+        // collection it touched came back applied. Reporting it as fully synced
+        // would let the bootstrap abort its watchdog and dispatch Connected on a
+        // scope that has already expired, which is the outcome the deadline
+        // exists to prevent. Moving the synced names to `retryable` sends it
+        // down the retry path instead; the versions are persisted, so the next
+        // attempt resumes rather than repeats.
+        if !outcome.synced.is_empty()
+            && let Err(lost @ ScopeLost::Expired) = self.admits(scope)
+        {
+            warn!(
+                target: "Client/AppState",
+                "Batched sync: {:?} applied but the run outlived its scope ({lost:?})",
+                outcome.synced
+            );
+            let applied = std::mem::take(&mut outcome.synced);
+            outcome.retryable.extend(applied);
+        }
+
+        Ok(outcome)
     }
 
     async fn sync_collections_batched_inner(
         &self,
         mut pending: Vec<WAPatchName>,
-        key_wait_deadline: Option<wacore::time::Instant>,
+        scope: SyncScope,
+        request: BatchedSyncRequest,
+        outcome: &mut BatchedSyncOutcome,
     ) -> Result<()> {
         use wacore::appstate::patch_decode::CollectionSyncError;
-        const MAX_ITERATIONS: usize = 5;
+        // WA Web's own bound. Its loop reads `(l < y || (i.length > 0 && l < C))`
+        // with `y = 5` and `C = 500`, and since the body only runs while there
+        // is something left to refetch, that collapses to `l < 500` — the `y`
+        // never bites. Rounds are back-to-back there too; the syncd backoff
+        // applies to retrying a *failed* collection later, not to paging one
+        // that is still making progress.
+        const MAX_ITERATIONS: usize = 500;
         let mut iteration = 0;
+        // Spent on the first round: the rebuild is what stands the collection
+        // down, and every round after it is the pagination that follows from
+        // there — re-standing it down would throw away the page just applied and
+        // re-page the collection for as long as the server keeps setting
+        // `has_more_patches`.
+        let mut rebuild = request.rebuild;
+        // Which collections are mid-replay, kept across rounds rather than
+        // rebuilt per round. A snapshot that answers `has_more_patches` is still
+        // being replayed on the pages that follow it, and those pages carry the
+        // same rebuild — `process_app_state_sync_task` holds its own `full_sync`
+        // across pagination for exactly this reason. Rebuilding it per round
+        // dispatched page two onward as live changes, which is what a consumer
+        // reads `from_full_sync` to tell apart.
+        let mut replaying_snapshot: HashSet<WAPatchName> = HashSet::new();
 
         while !pending.is_empty() && iteration < MAX_ITERATIONS {
+            // With the cap at WA Web's 500, a collection paging healthily can
+            // outlast the bootstrap's watchdog and be cut off mid-page on every
+            // attempt, never reaching readiness though every page succeeded.
+            // Stopping here instead keeps the progress: the versions applied so
+            // far are persisted and the reconnect resumes from them.
+            if let Err(lost) = self.admits(scope) {
+                warn!(
+                    target: "Client/AppState",
+                    "Batched sync: stopping with {pending:?} still paging ({lost:?})"
+                );
+                outcome.retryable.extend(pending);
+                return Ok(());
+            }
             iteration += 1;
             debug!(
                 target: "Client/AppState",
@@ -565,12 +1937,21 @@ impl Client {
 
             // Build multi-collection IQ, tracking which collections need a snapshot
             let mut collection_nodes = Vec::with_capacity(pending.len());
-            let mut was_snapshot = HashSet::new();
             for &name in &pending {
+                if rebuild
+                    && let StandDown::Declined(lost) =
+                        self.stand_collection_down(&*backend, name, scope).await?
+                {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: not rebuilding {name:?} ({lost:?})"
+                    );
+                    continue;
+                }
                 let state = backend.get_version(name.as_str()).await?;
                 let want_snapshot = state.version == 0;
                 if want_snapshot {
-                    was_snapshot.insert(name);
+                    replaying_snapshot.insert(name);
                 }
                 let mut builder = NodeBuilder::new("collection")
                     .attr("name", name.as_str())
@@ -582,6 +1963,20 @@ impl Client {
                     builder = builder.attr("version", state.version);
                 }
                 collection_nodes.push(builder.build());
+            }
+            rebuild = false;
+
+            // Every collection declined its rebuild, so there is nothing to ask
+            // about. A collection left out of the request is reconciled as
+            // retryable below, but only once a response comes back — and sending
+            // an empty `<sync>` to get one is a round trip for no work.
+            if collection_nodes.is_empty() {
+                warn!(
+                    target: "Client/AppState",
+                    "Batched sync: nothing left to ask about for {pending:?}"
+                );
+                outcome.retryable.extend(pending);
+                return Ok(());
             }
 
             let sync_node = NodeBuilder::new("sync").children(collection_nodes).build();
@@ -595,14 +1990,89 @@ impl Client {
                 timeout: Some(Duration::from_secs(30)),
             };
 
-            let resp = self.send_iq(iq).await?;
+            // Before the await, not after: the send is what spends an attempt,
+            // and an IQ that errors or times out spent one just as much as one
+            // that answered.
+            outcome.note_reached_server();
+            let resp = match self.send_iq(iq).await {
+                Ok(resp) => resp,
+                // Losing the transport is what the buckets are for, not what an
+                // error is for: the collections this round was carrying are not
+                // covered by anyone, and the rounds before it are already applied
+                // and dispatched into `outcome`. Raising instead would throw that
+                // away and tell the caller nothing about which collections it
+                // still owes. Anything else — a timeout, a server error, a
+                // response that would not parse — is a genuine failure and keeps
+                // travelling as one.
+                //
+                // `retryable` is exact here even if the server did receive the
+                // IQ. This one only ever reads: its `<collection>` carries a name
+                // and a cursor, never a `<patch>` — that is
+                // `send_app_state_patch`, and the difference is why a lost answer
+                // leaves nothing half-done to reason about. Whatever the server
+                // did with it, this side did not advance.
+                Err(e) if e.is_transport_unavailable() => {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: transport went while asking about {pending:?} ({e})"
+                    );
+                    outcome.retryable.extend(pending);
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            // The IQ can outrun the scope, so the round is re-admitted before
+            // any of it is trusted.
+            if let Err(lost) = self.admits(scope) {
+                warn!(
+                    target: "Client/AppState",
+                    "Batched sync: dropping the response for {pending:?} ({lost:?})"
+                );
+                outcome.retryable.extend(pending);
+                return Ok(());
+            }
 
             // Parse the response once here for pre-download; the same parsed
             // lists are handed to the processor below (no second parse).
             let mut patch_lists =
                 wacore::appstate::patch_decode::parse_patch_lists_ref(resp.get())?;
 
-            let proc = self.get_app_state_processor().await;
+            // Drop a repeated collection before anything is applied. The
+            // processor persists each list it is handed — mutation MACs and the
+            // version — so two entries for one collection would be applied
+            // twice, and the second could advance the MAC store past the version
+            // the first then writes back, leaving the ltHash disagreeing with
+            // the MACs. A collection outside `pending` is worse still: nothing
+            // reserved it, so applying it can interleave with a concurrent sync
+            // or patch send for that collection, and it dispatches mutations
+            // nobody asked for. Checking after the fact only fixes the
+            // bookkeeping.
+            {
+                let requested: HashSet<WAPatchName> = pending.iter().copied().collect();
+                let mut seen: HashSet<WAPatchName> = HashSet::new();
+                patch_lists.retain(|pl| {
+                    if !requested.contains(&pl.name) {
+                        warn!(
+                            target: "Client/AppState",
+                            "Batched sync: response carried unrequested collection {:?}; dropping it",
+                            pl.name
+                        );
+                        return false;
+                    }
+                    if seen.insert(pl.name) {
+                        return true;
+                    }
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: response repeated collection {:?}; dropping the duplicate",
+                        pl.name
+                    );
+                    false
+                });
+            }
+
+            let proc = self.get_app_state_processor();
             // Pre-download all external blobs for all collections in the response,
             // concurrently (independent CDN GETs, keyed by directPath).
             let pre_downloaded = self.pre_download_external_blobs(&patch_lists).await;
@@ -637,31 +2107,87 @@ impl Client {
             // Bound the key wait by the critical-sync deadline when one was given
             // (initial bootstrap), so a late/never-auto-shared key still recovers via
             // the explicit request on this connection; otherwise a fixed short wait.
-            let key_wait = match key_wait_deadline {
-                Some(deadline) => deadline.saturating_duration_since(wacore::time::Instant::now()),
-                None => APP_STATE_KEY_REQUEST_TIMEOUT,
-            };
+            let key_wait = scope.remaining().unwrap_or(APP_STATE_KEY_REQUEST_TIMEOUT);
             if !missing_all.is_empty() && !self.request_keys_and_wait(missing_all, key_wait).await {
-                // The re-shared key didn't land in time. Report failure rather than a
-                // false success: the initial critical-sync path treats Ok as permission
-                // to cancel its retry watchdog and dispatch Connected, which would leave
-                // CriticalBlock/CriticalUnblockLow unsynced with no scheduled retry. The
-                // collections re-sync on the retry (or a later server_sync) once the
-                // share arrives; the keys we DID repair are already persisted.
-                return Err(anyhow::anyhow!(
-                    "app-state decode key(s) still missing after re-request; deferring batched sync"
-                ));
+                // The re-shared key didn't land in time. Nothing in this round can
+                // be decoded, so report every collection still pending as
+                // retryable rather than as synced: they re-sync on a later cycle
+                // once the share arrives, and the keys we DID repair are already
+                // persisted.
+                warn!(
+                    target: "Client/AppState",
+                    "Batched sync: decode key(s) still missing after re-request, deferring {pending:?}"
+                );
+                outcome.retryable.extend(pending);
+                return Ok(());
             }
 
-            // Process the already-parsed (and inlined) collections; keys are present.
-            let results = proc
-                .process_patch_lists(patch_lists, &download, true)
-                .await?;
+            // The last gate before anything is written. Blob downloads and the
+            // key wait both sit between the previous check and here, and neither
+            // is bounded by the scope, so this is where a response that is no
+            // longer ours stops being applied.
+            if let Err(lost) = self.admits(scope) {
+                warn!(
+                    target: "Client/AppState",
+                    "Batched sync: not applying {pending:?} ({lost:?})"
+                );
+                outcome.retryable.extend(pending);
+                return Ok(());
+            }
+
+            // Applied one collection at a time rather than handing the whole
+            // batch over, because the processor persists each list as it goes:
+            // a batch that starts inside the scope can still be writing its
+            // third collection well outside it. Per-list is the finest boundary
+            // available without teaching `wacore` about connections, and it caps
+            // what a retired scope can commit at one collection instead of five.
+            let mut results = Vec::with_capacity(patch_lists.len());
+            // Held rather than raised with `?`, for the same reason the dispatch
+            // loop below refuses to drop a collection: each list this loop
+            // finished is already persisted, so failing out from here would strand
+            // its mutations behind an advanced cursor that no later sync re-reads.
+            // The error still ends the run — after what was applied has been
+            // dispatched.
+            let mut apply_error = None;
+            for pl in patch_lists {
+                if let Err(lost) = self.admits(scope) {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: stopping before {:?} ({lost:?})", pl.name
+                    );
+                    break;
+                }
+                match proc.process_one_patch_list(pl, &download, true).await {
+                    Ok(applied) => results.push(applied),
+                    Err(e) => {
+                        apply_error = Some(e);
+                        break;
+                    }
+                }
+            }
 
             let mut needs_refetch = Vec::new();
+            // A `<sync>` that simply omits a requested `<collection>` parses
+            // fine, so without this the collection lands in no bucket at all and
+            // `all_synced()` reports a batch that never covered it. Track what
+            // the response actually accounted for and reconcile below.
+            // Duplicates are already gone, dropped above before anything applied
+            // them.
+            let mut answered: HashSet<WAPatchName> = HashSet::new();
 
             for (mutations, new_state, list) in results {
                 let name = list.name;
+                answered.insert(name);
+
+                // No admission check here, deliberately. `process_one_patch_list`
+                // persists the collection's version and mutation MACs before it
+                // returns, so by this point the cursor has already moved. A
+                // collection dropped here would never be re-sent — the retry
+                // asks from the advanced version — and its mutations would be
+                // lost for good, `setting_pushName` and the NCT salt included.
+                // The scope is checked before the apply, which is the last
+                // moment a collection can still be declined; after it,
+                // dispatching is not optional.
 
                 // Handle per-collection errors
                 if let Some(ref err) = list.error {
@@ -676,16 +2202,24 @@ impl Client {
                                 // when there are no pending mutations to push (which is
                                 // always the case for us since we don't push app state).
                                 debug!(target: "Client/AppState", "Collection {:?} conflict (has_more=false), treating as success (no pending mutations)", name);
+                                outcome.synced.push(name);
                             }
                             continue;
                         }
                         CollectionSyncError::Fatal { code, text } => {
                             warn!(target: "Client/AppState", "Collection {:?} fatal error {}: {}", name, code, text);
+                            outcome.fatal.push(name);
                             continue;
                         }
                         CollectionSyncError::Retry { code, text } => {
-                            warn!(target: "Client/AppState", "Collection {:?} retryable error {}: {}, will refetch", name, code, text);
-                            needs_refetch.push(name);
+                            // Done for this run, not refetched inside it. WA Web
+                            // routes ErrorRetry to `doneCollections` and leaves
+                            // the next attempt to its retry state machine, which
+                            // spaces them; refetching here would instead hammer
+                            // the same failing collection for every iteration
+                            // the cap allows.
+                            warn!(target: "Client/AppState", "Collection {:?} retryable error {}: {}", name, code, text);
+                            outcome.retryable.push(name);
                             continue;
                         }
                     }
@@ -702,23 +2236,31 @@ impl Client {
                 self.request_missing_keys_with_dedup(&missing, APP_STATE_KEY_REQUEST_DEDUP)
                     .await;
 
-                // full_sync is true only when this collection had a snapshot
-                // (version was 0 before sync). This prevents server_sync-triggered
-                // incremental syncs from being incorrectly marked as full syncs.
-                let full_sync = was_snapshot.contains(&name);
+                // full_sync marks a rebuild rather than a live change, so it is
+                // true for every page of a replay a snapshot started — not only
+                // the page the snapshot itself arrived on. A `server_sync`
+                // fetching patches for an already-synced collection never enters
+                // the set, which is what keeps it from reading as a full sync.
+                let full_sync = replaying_snapshot.contains(&name);
                 wacore::telemetry::appstate_mutations(mutations.len() as u64);
                 for m in mutations {
                     self.dispatch_app_state_mutation(&m, full_sync).await;
                 }
 
-                // Save version
-                backend
-                    .set_version(name.as_str(), new_state.clone())
-                    .await?;
+                // No version write here. `process_one_patch_list` already
+                // persisted this exact state — alongside the mutation MACs it
+                // belongs with, which is what makes the pair agree — so rewriting
+                // it only widened the window in which it could be wrong. A
+                // reconnect between the apply and here clears the reservation
+                // registry, so the replacement connection can reserve the same
+                // collection and move it on; this write would then land after it
+                // and put the older version back, next to the newer MACs.
 
                 // Check if this collection needs more patches
                 if list.has_more_patches {
                     needs_refetch.push(name);
+                } else {
+                    outcome.synced.push(name);
                 }
 
                 debug!(
@@ -728,15 +2270,43 @@ impl Client {
                 );
             }
 
+            // Anything asked for that the response did not mention is not synced
+            // and did not fail either; treat it as retryable so it is neither
+            // reported as done nor re-asked immediately in this loop.
+            for name in pending {
+                if !answered.contains(&name) {
+                    warn!(
+                        target: "Client/AppState",
+                        "Batched sync: response omitted collection {name:?}"
+                    );
+                    outcome.retryable.push(name);
+                }
+            }
+
+            // Raised only now, so that everything this round did apply has been
+            // dispatched and reconciled first. The buckets do not survive the
+            // trip — the caller gets `Err` and `outcome` is dropped with it — so
+            // what the deferral buys is not a report but the dispatch itself:
+            // mutations already persisted reach their consumer instead of being
+            // stranded behind a cursor that has moved past them.
+            if let Some(e) = apply_error {
+                return Err(e);
+            }
+
             pending = needs_refetch;
         }
 
         if !pending.is_empty() {
+            // Still paging when the cap ran out. Retryable, not fatal: the
+            // versions applied so far are persisted, so a later sync resumes
+            // where this one stopped. WA Web classifies the same exhaustion as
+            // `ErrorRetry`.
             warn!(
                 target: "Client/AppState",
                 "Batched sync: max iterations ({}) reached for {:?}",
                 MAX_ITERATIONS, pending
             );
+            outcome.retryable.extend(pending);
         }
 
         Ok(())
@@ -747,10 +2317,17 @@ impl Client {
         &self,
         name: WAPatchName,
         full_sync: bool,
-    ) -> Result<()> {
-        if self.is_shutting_down() {
-            debug!(target: "Client/AppState", "Skipping app state sync task {:?}: client is shutting down", name);
-            return Ok(());
+    ) -> Result<SyncOutcome> {
+        // Two questions, where `is_shutting_down()` answered a blend of them: is
+        // the client finished, and can a request reach the server at all. A
+        // planned reconnect is neither — it clears `is_connected` and leaves
+        // everything else alone — so the work waits instead of stopping.
+        if self.is_terminal() || !self.can_reach_server() {
+            debug!(
+                target: "Client/AppState",
+                "Skipping app state sync task {name:?}: no usable connection"
+            );
+            return Ok(SyncOutcome::Deferred);
         }
 
         let backend = self.persistence_manager.backend();
@@ -767,15 +2344,31 @@ impl Client {
         // has_more_patches=true without advancing the version (WA Web uses 500).
         const MAX_PAGINATION_ITERATIONS: u32 = 500;
         let mut iteration = 0u32;
+        // Every exit below still falls through to `set_version`: the pages
+        // already applied are durable whether or not the rest arrived. Only
+        // what the caller is told changes.
+        let mut outcome = SyncOutcome::Completed;
 
         while has_more {
-            if self.is_shutting_down() {
-                debug!(target: "Client/AppState", "Stopping app state sync task {:?}: shutdown detected", name);
+            if self.is_terminal() || !self.can_reach_server() {
+                debug!(target: "Client/AppState", "Stopping app state sync task {name:?}: no usable connection");
+                outcome = SyncOutcome::Deferred;
                 break;
             }
             iteration += 1;
             if iteration > MAX_PAGINATION_ITERATIONS {
                 warn!(target: "Client/AppState", "App state sync for {:?} exceeded {} iterations, aborting", name, MAX_PAGINATION_ITERATIONS);
+                // `has_more` is still set, so the persisted version is below the
+                // server's head — which is the definition of deferred, whatever
+                // the reason for stopping. Reporting completion here would have
+                // callers drop the trigger and leave it there for good.
+                //
+                // The cost is a retry that may re-page against the same
+                // non-progress, bounded by the attempt budget and its backoff.
+                // That is the cheaper mistake: this cap is a should-never-happen
+                // guard, and if it fires because the server was briefly wedged,
+                // a later attempt is the only thing that ever fixes it.
+                outcome = SyncOutcome::Deferred;
                 break;
             }
             debug!(target: "Client/AppState", "Fetching app state patch batch: name={:?} want_snapshot={want_snapshot} version={} full_sync={} has_more_previous={}", name, state.version, full_sync, has_more);
@@ -803,8 +2396,9 @@ impl Client {
             };
 
             let resp = self.send_iq(iq).await?;
-            if self.is_shutting_down() {
-                debug!(target: "Client/AppState", "Discarding app state sync response for {:?}: shutdown detected", name);
+            if self.is_terminal() || !self.can_reach_server() {
+                debug!(target: "Client/AppState", "Discarding app state sync response for {name:?}: no usable connection");
+                outcome = SyncOutcome::Deferred;
                 break;
             }
             debug!(target: "Client/AppState", "Received IQ response for {:?}; decoding patches", name);
@@ -817,7 +2411,7 @@ impl Client {
             debug!(target: "Client/AppState", "Parsed patch list for {:?}: has_snapshot_ref={} has_more_patches={} patches_count={}",
                 name, pl.snapshot_ref.is_some(), pl.has_more_patches, pl.patches.len());
 
-            let proc = self.get_app_state_processor().await;
+            let proc = self.get_app_state_processor();
 
             // Pre-download all external blobs (snapshot and patch mutations),
             // concurrently, keyed by directPath.
@@ -894,8 +2488,8 @@ impl Client {
 
         backend.set_version(name.as_str(), state.clone()).await?;
 
-        debug!(target: "Client/AppState", "Completed and saved app state sync for {:?} (final version={})", name, state.version);
-        Ok(())
+        debug!(target: "Client/AppState", "Finished app state sync for {name:?} as {outcome:?} (final version={})", state.version);
+        Ok(outcome)
     }
 
     /// Request the missing decode keys, wait up to `timeout` for the re-share, then
@@ -1196,10 +2790,14 @@ impl Client {
         // re-syncs below go through `_inner` because this task already holds
         // the reservation they would otherwise take.
         let _collection_guard = match patch_name {
-            Some(name) => Some(self.app_state_syncing.begin(name).await),
+            Some(name) => Some(
+                self.app_state_syncing
+                    .begin(name, SyncHolder::PatchSend)
+                    .await,
+            ),
             None => None,
         };
-        let proc = self.get_app_state_processor().await;
+        let proc = self.get_app_state_processor();
 
         for attempt in 1..=APP_STATE_PATCH_SEND_ATTEMPTS {
             // Cloned per attempt because a conflict rebuilds the patch against
@@ -1336,7 +2934,7 @@ impl Client {
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("external blob not pre-downloaded: {path}"))
             };
-            let proc = self.get_app_state_processor().await;
+            let proc = self.get_app_state_processor();
             match proc.process_parsed_patch_list(list, &download, true).await {
                 Ok((mutations, _, _)) => {
                     wacore::telemetry::appstate_mutations(mutations.len() as u64);
@@ -1405,20 +3003,51 @@ impl Client {
             return;
         }
 
+        // Delegate chat-related mutations (mute, pin, archive, star, contact, etc.).
+        // Runs before the Set-only gate below because contact deletion arrives as
+        // a `Remove`; the handler claims nothing else on that operation.
+        if crate::features::chat_actions::dispatch_chat_mutation(&self.core.event_bus, m, full_sync)
+        {
+            return;
+        }
+
         // All remaining mutations only care about Set operations
         if m.operation != wa::syncd_mutation::SyncdOperation::Set {
             return;
         }
 
-        // Delegate chat-related mutations (mute, pin, archive, star, contact, etc.)
-        if crate::features::chat_actions::dispatch_chat_mutation(&self.core.event_bus, m, full_sync)
-        {
+        // A call's direction is its creator compared against this account; the
+        // predicate is only consulted once the mutation is known to be a call
+        // log, so the other mutation kinds do not pay for the snapshot.
+        if crate::features::call_log::dispatch_call_log_mutation(
+            &self.core.event_bus,
+            m,
+            full_sync,
+            |jid| self.is_own_jid(jid),
+        ) {
             return;
         }
 
         // Label mutations have their own index shape (labelId, not a chat JID at
         // index[1]), so they are dispatched separately from chat actions.
         if crate::features::labels::dispatch_label_mutation(&self.core.event_bus, m, full_sync) {
+            return;
+        }
+
+        // Quick replies and account-level syncd settings key on their own index
+        // shapes (an opaque id, or no argument at all).
+        if crate::features::quick_replies::dispatch_quick_reply_mutation(
+            &self.core.event_bus,
+            m,
+            full_sync,
+        ) {
+            return;
+        }
+        if crate::features::app_state_settings::dispatch_app_state_setting_mutation(
+            &self.core.event_bus,
+            m,
+            full_sync,
+        ) {
             return;
         }
 
@@ -1434,7 +3063,7 @@ impl Client {
             let snapshot = self.persistence_manager.get_device_snapshot();
             let old = snapshot.push_name.clone();
             if old != new_name {
-                debug!(target: "Client/AppState", "Persisting push name from app state mutation: '{}' (old='{}')", new_name, old);
+                debug!(target: "Client/AppState", "Persisting changed push name from app state mutation");
                 self.persistence_manager
                     .process_command(DeviceCommand::SetPushName(new_name.clone()))
                     .await;
@@ -1454,7 +3083,7 @@ impl Client {
                     }
                 }
             } else {
-                debug!(target: "Client/AppState", "Push name mutation received but name unchanged: '{}'", new_name);
+                debug!(target: "Client/AppState", "Push name mutation received but name unchanged");
             }
         }
     }
@@ -1965,6 +3594,95 @@ mod send_patch_response_tests {
 mod sync_in_flight_tests {
     use super::*;
 
+    /// A consumer-issued full sync must not run alongside a sync already
+    /// writing the collection's version and mutation MACs — and must not be
+    /// dropped either, since the snapshot it asks for is not what an
+    /// incremental sync in flight is fetching.
+    #[tokio::test]
+    async fn a_full_sync_task_waits_for_the_collection() {
+        let client = crate::test_utils::create_test_client_with_name("appstate-task-wait").await;
+        let held = client
+            .app_state_syncing
+            .try_begin(WAPatchName::CriticalBlock)
+            .expect("reserve the collection first");
+
+        let task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .process_sync_task(MajorSyncTask::AppStateSync {
+                        name: WAPatchName::CriticalBlock,
+                        full_sync: true,
+                    })
+                    .await;
+            }
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the task ran while the collection was reserved"
+        );
+        assert_eq!(
+            client.app_state_syncing.len(),
+            1,
+            "only the held reservation"
+        );
+
+        drop(held);
+        // The client has no socket, so the sync itself fails fast with
+        // NotConnected; what matters is that it got to run and released.
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("released collection must let the task proceed")
+            .expect("task panicked");
+        assert_eq!(
+            client.app_state_syncing.len(),
+            0,
+            "the task's own reservation must be released"
+        );
+    }
+
+    /// An incremental task waits too: the holder may be a patch send, which
+    /// never fetches, so skipping would drop the requested sync entirely.
+    #[tokio::test]
+    async fn an_incremental_sync_task_also_waits() {
+        let client = crate::test_utils::create_test_client_with_name("appstate-task-skip").await;
+        let held = client
+            .app_state_syncing
+            .try_begin(WAPatchName::Regular)
+            .expect("reserve the collection first");
+
+        let task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .process_sync_task(MajorSyncTask::AppStateSync {
+                        name: WAPatchName::Regular,
+                        full_sync: false,
+                    })
+                    .await;
+            }
+        });
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "the task ran while the collection was reserved"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("released collection must let the task proceed")
+            .expect("task panicked");
+        assert_eq!(client.app_state_syncing.len(), 0, "reservation released");
+    }
+
     #[test]
     fn second_begin_blocked_until_release() {
         let registry = SyncInFlight::new();
@@ -2025,7 +3743,7 @@ mod sync_in_flight_tests {
         let waiter = {
             let registry = Arc::clone(&registry);
             tokio::spawn(async move {
-                let guard = registry.begin(WAPatchName::Regular).await;
+                let guard = registry.begin(WAPatchName::Regular, SyncHolder::Sync).await;
                 let _ = reserved_tx.send(());
                 guard
             })
@@ -2051,5 +3769,2231 @@ mod sync_in_flight_tests {
 
         drop(guard);
         assert!(registry.try_begin(WAPatchName::Regular).is_some());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod batched_sync_outcome_tests {
+    use super::*;
+    use wacore_binary::node::Node;
+
+    /// One `<iq result>` answering a whole batch, with each collection either
+    /// clean or carrying an `<error code>` — the shape
+    /// `WAWebSyncdResponseParser` reads.
+    pub(crate) fn batch_result(request_id: &str, collections: &[(&str, Option<&str>)]) -> Node {
+        let children: Vec<Node> = collections
+            .iter()
+            .map(|(name, error)| {
+                let builder = NodeBuilder::new("collection").attr("name", *name);
+                match error {
+                    Some(code) => builder
+                        .attr("type", "error")
+                        .children([NodeBuilder::new("error")
+                            .attr("code", *code)
+                            .attr("text", "")
+                            .build()])
+                        .build(),
+                    None => builder.build(),
+                }
+            })
+            .collect();
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", request_id)
+            .attr("from", "s.whatsapp.net")
+            .children([NodeBuilder::new("sync").children(children).build()])
+            .build()
+    }
+
+    /// Runs one batched sync against a server that answers every IQ with
+    /// `collections`, and reports the outcome plus how many IQs reached the
+    /// wire. The responder never completes, so it is raced against the sync.
+    pub(crate) async fn sync_against(
+        request: Vec<WAPatchName>,
+        collections: &'static [(&'static str, Option<&'static str>)],
+    ) -> (BatchedSyncOutcome, usize) {
+        use futures::FutureExt;
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+        let mut sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let scope = client.sync_scope(None);
+                client.sync_collections_batched(request, scope).await
+            })
+        };
+
+        let sent = AtomicU64::new(0);
+        let server = async {
+            let mut frame = 0usize;
+            loop {
+                let node = crate::test_utils::decode_sent_iq(&transport, frame).await;
+                let node = node.get().to_owned();
+                let id = node
+                    .attrs()
+                    .optional_string("id")
+                    .expect("every IQ carries an id")
+                    .into_owned();
+                sent.fetch_add(1, Ordering::Relaxed);
+                let response = batch_result(&id, collections);
+                crate::test_utils::answer_iq(&client, &id, &response).await;
+                frame += 1;
+            }
+        };
+        futures::pin_mut!(server);
+        let outcome = futures::select! {
+            result = (&mut sync).fuse() => result
+                .expect("the sync task should not panic")
+                .expect("a per-collection error is an outcome, not a transport failure"),
+            () = server.as_mut().fuse() => unreachable!("the responder never completes"),
+        };
+
+        (outcome, sent.load(Ordering::Relaxed) as usize)
+    }
+
+    /// A refused collection used to be logged and dropped, and the batch still
+    /// reported success — which the initial bootstrap reads as permission to
+    /// dispatch Connected.
+    #[tokio::test]
+    async fn a_refused_collection_is_reported_fatal_not_synced() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            &[
+                ("critical_block", Some("404")),
+                ("critical_unblock_low", None),
+            ],
+        )
+        .await;
+
+        assert_eq!(outcome.fatal, vec![WAPatchName::CriticalBlock]);
+        assert_eq!(outcome.synced, vec![WAPatchName::CriticalUnblockLow]);
+        assert!(!outcome.all_synced(), "the batch did not fully sync");
+    }
+
+    /// A retryable collection is done for this run. WA Web routes ErrorRetry to
+    /// `doneCollections`, never to `refetchCollections`, so it must not be
+    /// re-asked inside the same loop — with a 500-iteration cap that would mean
+    /// hammering a failing collection 500 times.
+    #[tokio::test]
+    async fn a_retryable_collection_is_not_refetched_in_the_same_run() {
+        let (outcome, iqs) =
+            sync_against(vec![WAPatchName::Regular], &[("regular", Some("500"))]).await;
+
+        assert_eq!(outcome.retryable, vec![WAPatchName::Regular]);
+        assert!(outcome.fatal.is_empty(), "500 is not terminal");
+        assert_eq!(iqs, 1, "a retryable error must not be re-asked in this run");
+    }
+
+    /// The batch reported `Ok(())` when every collection was already in flight,
+    /// which reads identically to "all synced" at the call site.
+    #[tokio::test]
+    async fn collections_held_by_another_sync_are_reported_skipped() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let _held = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::CriticalBlock, SyncHolder::Sync)
+            .expect("reserve the collection first");
+
+        let outcome = client
+            .sync_collections_batched(vec![WAPatchName::CriticalBlock], client.sync_scope(None))
+            .await
+            .expect("skipping is an outcome, not an error");
+
+        assert_eq!(outcome.skipped, vec![WAPatchName::CriticalBlock]);
+        assert!(outcome.synced.is_empty());
+        assert!(!outcome.all_synced(), "a skipped collection did not sync");
+        assert!(
+            transport.sent().is_empty(),
+            "a skipped batch must not reach the wire"
+        );
+    }
+
+    /// A caller that waited out the holders separately must not wait again while
+    /// reserving: by then it holds the collections it got first, and waiting on
+    /// top of them is the head-of-line blocking the earlier wait exists to
+    /// avoid. A collection taken back in the gap between the two passes is
+    /// reported instead, costing a retry.
+    #[tokio::test]
+    async fn a_second_pass_reservation_reports_rather_than_waits() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let _held = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::Regular, SyncHolder::PatchSend)
+            .expect("reserve the collection first");
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.reserve_for_sync(
+                WAPatchName::Regular,
+                ReservationWait::TryOnce,
+                client.sync_scope(None),
+            ),
+        )
+        .await
+        .expect("the second pass must not wait on the holder");
+
+        assert_eq!(
+            refused.map(drop),
+            Err(ReservationSkip::WaitTimedOut),
+            "a collection nobody is covering, that this call could not take"
+        );
+    }
+
+    /// A patch send holds the same reservation and never fetches, so a sync
+    /// that skipped behind one would be dropped and the patches that prompted
+    /// it would go unfetched.
+    #[tokio::test]
+    async fn a_patch_send_holder_is_waited_out_not_skipped() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let held = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::Regular, SyncHolder::PatchSend)
+            .expect("reserve the collection first");
+
+        let reserve = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .reserve_for_sync(
+                        WAPatchName::Regular,
+                        ReservationWait::SkipBehindSync,
+                        client.sync_scope(None),
+                    )
+                    .await
+                    .map(drop)
+            })
+        };
+
+        crate::test_utils::poll_until("the sync to park behind the patch send", || {
+            client.app_state_syncing.released.total_listeners() >= 1
+        })
+        .await;
+        assert!(
+            !reserve.is_finished(),
+            "a sync must wait for a patch send, not skip it"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), reserve)
+            .await
+            .expect("releasing the send must let the sync proceed")
+            .expect("the reserve task should not panic")
+            .expect("the sync must get the reservation, not time out");
+    }
+
+    #[test]
+    fn all_synced_is_false_for_every_kind_of_miss() {
+        let mut outcome = BatchedSyncOutcome::default();
+        assert!(outcome.all_synced(), "an empty batch missed nothing");
+
+        outcome.synced.push(WAPatchName::Regular);
+        assert!(outcome.all_synced());
+
+        let buckets: [fn(&mut BatchedSyncOutcome) -> &mut Vec<WAPatchName>; 3] =
+            [|o| &mut o.fatal, |o| &mut o.retryable, |o| &mut o.skipped];
+        for bucket in buckets {
+            bucket(&mut outcome).push(WAPatchName::CriticalBlock);
+            assert!(!outcome.all_synced());
+            bucket(&mut outcome).clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod batched_sync_reconciliation_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::{batch_result, sync_against};
+
+    /// A `<sync>` that simply leaves a requested collection out parses fine, so
+    /// nothing used to record it and `all_synced()` reported a batch that never
+    /// covered it — the same false success this module exists to stop.
+    #[tokio::test]
+    async fn a_collection_the_response_omits_is_not_reported_synced() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            &[("critical_unblock_low", None)],
+        )
+        .await;
+
+        assert_eq!(outcome.synced, vec![WAPatchName::CriticalUnblockLow]);
+        assert_eq!(
+            outcome.retryable,
+            vec![WAPatchName::CriticalBlock],
+            "an omitted collection is a miss, not a success"
+        );
+        assert!(!outcome.all_synced());
+    }
+
+    /// An empty `<sync/>` accounts for nothing at all.
+    #[tokio::test]
+    async fn an_empty_response_leaves_every_collection_unsynced() {
+        let (outcome, _) = sync_against(vec![WAPatchName::Regular], &[]).await;
+
+        assert!(outcome.synced.is_empty());
+        assert_eq!(outcome.retryable, vec![WAPatchName::Regular]);
+        assert!(!outcome.all_synced());
+    }
+
+    /// A repeated collection must be applied once, not twice.
+    #[tokio::test]
+    async fn a_repeated_collection_is_counted_once() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::Regular],
+            &[("regular", None), ("regular", None)],
+        )
+        .await;
+
+        assert_eq!(outcome.synced, vec![WAPatchName::Regular]);
+        assert!(outcome.all_synced());
+    }
+
+    /// A wait that runs out leaves the collection uncovered by anyone, so it is
+    /// a miss worth retrying rather than a skip someone else is handling.
+    ///
+    /// Paused time so the bound actually elapses instead of the test sitting
+    /// there for [`APP_STATE_RESERVATION_WAIT`]; the holder never releases, so
+    /// the timeout is the only way out.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_runs_out_reports_the_collection_retryable() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        // A patch send is never equivalent work, so the batched sync waits for
+        // it rather than skipping — which is what puts the bound in play.
+        let _held = client
+            .app_state_syncing
+            .try_begin_as(WAPatchName::Regular, SyncHolder::PatchSend)
+            .expect("reserve the collection first");
+
+        let outcome = client
+            .sync_collections_batched(vec![WAPatchName::Regular], client.sync_scope(None))
+            .await
+            .expect("a wait that ran out is an outcome, not a transport failure");
+
+        assert_eq!(
+            outcome.retryable,
+            vec![WAPatchName::Regular],
+            "nobody is covering it, so it has to come back around"
+        );
+        assert!(
+            outcome.skipped.is_empty(),
+            "skipped means an equivalent sync has it, which is not the case here"
+        );
+        assert!(
+            transport.sent().is_empty(),
+            "the sync never got its turn, so nothing should reach the wire"
+        );
+    }
+
+    /// `batch_result` is shared with the outcome tests; this keeps the helper
+    /// honest about the shape it builds.
+    #[test]
+    fn batch_result_marks_errors_on_the_named_collection() {
+        let node = batch_result("id-1", &[("regular", Some("500"))]);
+        let collection = node
+            .get_optional_child_by_tag(&["sync", "collection"])
+            .expect("the helper builds sync/collection");
+        assert_eq!(
+            collection.attrs().optional_string("type").as_deref(),
+            Some("error")
+        );
+    }
+}
+
+#[cfg(test)]
+mod duplicate_collection_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::sync_against;
+
+    /// The processor persists every list it is handed, so a repeated collection
+    /// has to be dropped before it is processed, not reconciled afterwards.
+    /// Reconciling late still applies the collection twice, and the second
+    /// application can move the MAC store past the version the first writes
+    /// back.
+    #[tokio::test]
+    async fn a_duplicate_collection_is_dropped_before_it_is_applied() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::Regular],
+            &[("regular", None), ("regular", None)],
+        )
+        .await;
+
+        assert_eq!(
+            outcome.synced,
+            vec![WAPatchName::Regular],
+            "the collection is accounted for exactly once"
+        );
+        assert!(outcome.all_synced());
+    }
+
+    /// A duplicate must not make the batch look incomplete either: it is the
+    /// same collection, already answered.
+    #[tokio::test]
+    async fn a_duplicate_does_not_leave_the_batch_unsynced() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            &[
+                ("critical_block", None),
+                ("critical_block", None),
+                ("critical_unblock_low", None),
+            ],
+        )
+        .await;
+
+        assert!(outcome.retryable.is_empty(), "both were answered");
+        assert!(outcome.all_synced());
+    }
+}
+
+#[cfg(test)]
+mod background_report_tests {
+    use super::*;
+    use crate::types::events::{EventHandler, EventInterest, EventKind};
+
+    struct FailureCounter(Arc<AtomicU64>);
+
+    impl EventHandler for FailureCounter {
+        fn handle_event(&self, event: Arc<Event>) {
+            if matches!(&*event, Event::AppStateSyncFailed(_)) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A background sync awaits a round trip before it reports, so its outcome
+    /// can belong to a socket that has since been replaced. Publishing it would
+    /// hand a consumer a refusal whose documented response — logout, or forcing
+    /// a recovery — would land on the healthy session that took its place.
+    #[tokio::test]
+    async fn an_outcome_from_a_retired_connection_is_not_published() {
+        let client = crate::test_utils::create_test_client_with_name("bg-report-gen").await;
+        let retired_scope = client.sync_scope(None);
+
+        let seen = Arc::new(AtomicU64::new(0));
+        let _subscription = client.subscribe(
+            EventInterest::of(&[EventKind::AppStateSyncFailed]),
+            Arc::new(FailureCounter(Arc::clone(&seen))),
+        );
+
+        let mut outcome = BatchedSyncOutcome::default();
+        outcome.fatal.push(WAPatchName::CriticalBlock);
+
+        // The connection this sync belonged to is gone.
+        client
+            .connection_generation
+            .store(retired_scope.generation() + 1, Ordering::SeqCst);
+        client.report_background_sync(
+            "test",
+            retired_scope,
+            SyncSettles::JustTheCollections,
+            &[],
+            Ok(outcome.clone()),
+        );
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            0,
+            "a retired connection's refusal must not reach consumers"
+        );
+
+        // The live one still reports.
+        client.report_background_sync(
+            "test",
+            client.sync_scope(None),
+            SyncSettles::JustTheCollections,
+            &[],
+            Ok(outcome),
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod retry_gate_tests {
+    use super::*;
+
+    /// The bootstrap gate stands down on proof of sync, not on an empty
+    /// retryable bucket. A round that ends in a refusal, or behind another sync,
+    /// also leaves nothing to retry while the collection is still not synced,
+    /// and clearing there lets the next connection skip the only thing that
+    /// guarantees another attempt.
+    #[test]
+    fn only_a_fully_synced_outcome_settles_the_bootstrap() {
+        let mut fatal = BatchedSyncOutcome::default();
+        fatal.fatal.push(WAPatchName::CriticalBlock);
+        assert!(fatal.retryable.is_empty(), "nothing left to retry");
+        assert!(
+            !fatal.all_synced(),
+            "but the collection is not synced, so the gate must stay armed"
+        );
+
+        let mut skipped = BatchedSyncOutcome::default();
+        skipped.skipped.push(WAPatchName::CriticalBlock);
+        assert!(skipped.retryable.is_empty());
+        assert!(
+            !skipped.all_synced(),
+            "another sync holding it is not proof it succeeded"
+        );
+
+        let mut synced = BatchedSyncOutcome::default();
+        synced.synced.push(WAPatchName::CriticalBlock);
+        assert!(synced.all_synced(), "this is the only case that settles it");
+    }
+
+    // Not covered: that the scheduler refuses to run for a retired generation.
+    // Two attempts at it passed with the guard removed — the gate stays armed
+    // because the wrongly-attempted sync fails anyway on a socketless client,
+    // and the attempt never reaches the capturing transport either. Asserting
+    // on the gate or on the wire both hold for the wrong reason, and a test
+    // that passes without the fix is worse than none. It needs a connected
+    // fixture that can complete a sync, which the report-path test below
+    // already has for its own case.
+
+    /// The backoff doubles from the minimum and clamps, matching the syncd
+    /// spacing WA Web applies to the same case.
+    #[test]
+    fn retry_backoff_doubles_then_clamps() {
+        assert_eq!(app_state_retry_backoff(0), APP_STATE_RETRY_BACKOFF_MIN);
+        assert_eq!(app_state_retry_backoff(1), APP_STATE_RETRY_BACKOFF_MIN * 2);
+        assert_eq!(app_state_retry_backoff(3), APP_STATE_RETRY_BACKOFF_MIN * 8);
+        assert_eq!(
+            app_state_retry_backoff(u32::MAX),
+            APP_STATE_RETRY_BACKOFF_MAX,
+            "an absurd round must clamp, not overflow"
+        );
+    }
+}
+
+#[cfg(test)]
+mod collection_order_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::batch_result;
+
+    /// The order the batch reserves in is the order the `<collection>` children
+    /// go out in, so it is pinned on the wire rather than on the vector: a
+    /// change here is a change the server sees.
+    #[tokio::test]
+    async fn a_shuffled_batch_reaches_the_wire_in_reservation_order() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let scope = client.sync_scope(None);
+                client
+                    .sync_collections_batched(
+                        vec![
+                            WAPatchName::RegularLow,
+                            WAPatchName::Regular,
+                            WAPatchName::CriticalUnblockLow,
+                            WAPatchName::RegularHigh,
+                            WAPatchName::CriticalBlock,
+                        ],
+                        scope,
+                    )
+                    .await
+            })
+        };
+
+        let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request = request.get().to_owned();
+        let sync_node = request
+            .get_optional_child("sync")
+            .expect("the batch is a `<sync>` IQ");
+        let asked: Vec<String> = sync_node
+            .get_children_by_tag("collection")
+            .map(|collection| {
+                collection
+                    .attrs()
+                    .optional_string("name")
+                    .expect("every `<collection>` is named")
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(
+            asked,
+            [
+                "critical_block",
+                "critical_unblock_low",
+                "regular",
+                "regular_high",
+                "regular_low",
+            ]
+        );
+
+        let id = request
+            .attrs()
+            .optional_string("id")
+            .expect("every IQ carries an id")
+            .into_owned();
+        let response = batch_result(
+            &id,
+            &[
+                ("critical_block", None),
+                ("critical_unblock_low", None),
+                ("regular", None),
+                ("regular_high", None),
+                ("regular_low", None),
+            ],
+        );
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let outcome = sync
+            .await
+            .expect("the sync task should not panic")
+            .expect("a clean batch is not a transport failure");
+
+        assert_eq!(
+            outcome.synced,
+            vec![
+                WAPatchName::CriticalBlock,
+                WAPatchName::CriticalUnblockLow,
+                WAPatchName::Regular,
+                WAPatchName::RegularHigh,
+                WAPatchName::RegularLow,
+            ]
+        );
+    }
+
+    /// The dedup runs before the ordering, so a repeated collection must not
+    /// reach the wire twice or push the rest out of order.
+    #[tokio::test]
+    async fn a_repeated_collection_is_asked_for_once_and_still_in_order() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let scope = client.sync_scope(None);
+                client
+                    .sync_collections_batched(
+                        vec![
+                            WAPatchName::Regular,
+                            WAPatchName::CriticalBlock,
+                            WAPatchName::Regular,
+                        ],
+                        scope,
+                    )
+                    .await
+            })
+        };
+
+        let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request = request.get().to_owned();
+        let asked: Vec<String> = request
+            .get_optional_child("sync")
+            .expect("the batch is a `<sync>` IQ")
+            .get_children_by_tag("collection")
+            .map(|collection| {
+                collection
+                    .attrs()
+                    .optional_string("name")
+                    .expect("every `<collection>` is named")
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(asked, ["critical_block", "regular"]);
+
+        sync.abort();
+    }
+}
+
+#[cfg(test)]
+mod request_hygiene_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::sync_against;
+
+    /// A `server_sync` notification can repeat a `<collection>` child. Reserving
+    /// the name once and then tripping over our own reservation on the second
+    /// pass filed one collection under both `synced` and `skipped`, which made
+    /// `all_synced()` false and published a failure blaming a writer that never
+    /// existed.
+    #[tokio::test]
+    async fn a_collection_requested_twice_is_reserved_once() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::Regular, WAPatchName::Regular],
+            &[("regular", None)],
+        )
+        .await;
+
+        assert_eq!(outcome.synced, vec![WAPatchName::Regular]);
+        assert!(
+            outcome.skipped.is_empty(),
+            "the only holder was this same call"
+        );
+        assert!(outcome.all_synced());
+    }
+
+    /// Nothing reserved a collection we did not ask for, so applying it can
+    /// interleave with a concurrent writer for that collection — and it would
+    /// dispatch mutations nobody requested.
+    #[tokio::test]
+    async fn an_unrequested_collection_in_the_response_is_dropped() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::Regular],
+            &[("regular", None), ("critical_block", None)],
+        )
+        .await;
+
+        assert_eq!(outcome.synced, vec![WAPatchName::Regular]);
+        assert!(
+            !outcome.synced.contains(&WAPatchName::CriticalBlock),
+            "an unrequested collection must not be applied or reported"
+        );
+        assert!(outcome.all_synced());
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    /// An expired deadline stops the batch before it reserves anything, so no
+    /// collection is reported synced and nothing reaches the wire.
+    ///
+    /// Covers the pre-reservation check only. The second check — after the IQ
+    /// returns and before the response is applied — needs a deadline that
+    /// expires mid-round, which takes a responder driving a paused clock; that
+    /// path is unasserted.
+    #[tokio::test]
+    async fn an_expired_deadline_stops_the_batch_before_it_reserves() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+        let sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let scope = client.sync_scope(Some(wacore::time::Instant::now()));
+                client
+                    .sync_collections_batched(vec![WAPatchName::Regular], scope)
+                    .await
+            })
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), sync)
+            .await
+            .expect("an expired deadline must not block")
+            .expect("the sync task should not panic")
+            .expect("a deadline is an outcome, not a transport failure");
+
+        assert_eq!(outcome.retryable, vec![WAPatchName::Regular]);
+        assert!(outcome.synced.is_empty());
+        assert!(
+            transport.sent().is_empty(),
+            "nothing may reach the wire past the deadline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sync_scope_tests {
+    use super::*;
+
+    /// The predicate every boundary asks. Both answers matter and they are not
+    /// interchangeable: a retired scope must never write or publish, while an
+    /// expired one is simply out of time on a connection that is still live.
+    #[tokio::test]
+    async fn a_scope_stops_admitting_when_its_connection_or_clock_goes() {
+        let client = crate::test_utils::create_test_client_with_name("scope-admits").await;
+
+        let live = client.sync_scope(None);
+        assert_eq!(client.admits(live), Ok(()));
+
+        let expired = client.sync_scope(Some(wacore::time::Instant::now()));
+        assert_eq!(client.admits(expired), Err(ScopeLost::Expired));
+
+        let generous = client.sync_scope(Some(
+            wacore::time::Instant::now() + Duration::from_secs(600),
+        ));
+        assert_eq!(client.admits(generous), Ok(()));
+
+        client
+            .connection_generation
+            .store(live.generation() + 1, Ordering::SeqCst);
+        assert_eq!(client.admits(live), Err(ScopeLost::Retired));
+        assert_eq!(
+            client.admits(generous),
+            Err(ScopeLost::Retired),
+            "a retired connection outranks having time left"
+        );
+    }
+
+    /// The bootstrap gate is shared across connections, so a task from a retired
+    /// one must not touch it in either direction: clearing lets the live
+    /// connection skip a bootstrap it still needs, arming costs it one it does
+    /// not. Routing every write through `settle_bootstrap` is what makes that
+    /// check impossible to forget — it was forgotten twice when it was the
+    /// caller's job.
+    #[tokio::test]
+    async fn a_retired_scope_cannot_move_the_bootstrap_gate() {
+        let client = crate::test_utils::create_test_client_with_name("scope-gate").await;
+        let retired = client.sync_scope(None);
+        client
+            .connection_generation
+            .store(retired.generation() + 1, Ordering::SeqCst);
+
+        for armed in [true, false] {
+            // Seeded as the connection that is live at seeding time, so the
+            // retired scope below is genuinely outranked rather than merely
+            // equal to the tag it left behind.
+            client
+                .needs_initial_full_sync
+                .settle(client.connection_generation.load(Ordering::SeqCst), armed);
+            client.settle_bootstrap(retired, !armed);
+            assert_eq!(
+                client.needs_initial_full_sync.is_armed(),
+                armed,
+                "a retired scope must leave the gate exactly as it found it"
+            );
+        }
+
+        // The live connection still owns it, both ways.
+        let live = client.sync_scope(None);
+        client.settle_bootstrap(live, true);
+        assert!(client.needs_initial_full_sync.is_armed());
+        client.settle_bootstrap(live, false);
+        assert!(!client.needs_initial_full_sync.is_armed());
+    }
+
+    /// An expired scope still owns its connection, so it may settle the gate —
+    /// running out of time is exactly when the bootstrap needs to stay armed.
+    #[tokio::test]
+    async fn an_expired_scope_may_still_arm_the_gate() {
+        let client = crate::test_utils::create_test_client_with_name("scope-expired-gate").await;
+        let expired = client.sync_scope(Some(wacore::time::Instant::now()));
+        client
+            .needs_initial_full_sync
+            .settle(expired.generation(), false);
+
+        client.settle_bootstrap(expired, true);
+        assert!(
+            client.needs_initial_full_sync.is_armed(),
+            "an expired bootstrap is unfinished, and must say so"
+        );
+    }
+
+    /// Rebinding is what lets work outlive a planned reconnect, and it reports
+    /// whether it moved so the caller can drop the authority that does not
+    /// carry over with it.
+    #[tokio::test]
+    async fn rebinding_reports_whether_the_connection_moved() {
+        let client = crate::test_utils::create_test_client_with_name("scope-rebind").await;
+        let mut scope = client.sync_scope(None);
+        let original = scope.generation();
+
+        assert!(!scope.rebind(original), "same connection is not a move");
+        assert_eq!(client.admits(scope), Ok(()));
+
+        assert!(scope.rebind(original + 1), "a different connection is");
+        assert_eq!(scope.generation(), original + 1);
+    }
+
+    /// A scope with no deadline is a background trigger; one with a deadline is
+    /// the bootstrap. That distinction decides whether the batch waits behind an
+    /// equivalent sync or skips it, so it has to be readable from the scope
+    /// alone rather than re-derived at each call site.
+    #[tokio::test]
+    async fn only_a_deadline_marks_the_bootstrap() {
+        let client = crate::test_utils::create_test_client_with_name("scope-kind").await;
+        assert!(!client.sync_scope(None).is_bootstrap());
+        assert!(
+            client
+                .sync_scope(Some(wacore::time::Instant::now()))
+                .is_bootstrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod task_retry_tests {
+    use super::*;
+
+    /// `process_app_state_sync_task` answers `Ok(())` at its own shutdown guard
+    /// without contacting the server, and `expected_disconnect` makes that guard
+    /// true for an ordinary reconnect as well as a stop. A retry that attempted
+    /// there would read the no-op as a completed sync and drop the consumer's
+    /// request — a `full_sync` snapshot included — without ever asking for it.
+    #[tokio::test]
+    async fn a_planned_reconnect_is_not_a_completed_sync() {
+        let client = crate::test_utils::create_test_client_with_name("task-retry-reconnect").await;
+
+        // A live client with a planned reconnect in flight: the run loop is up,
+        // and only `expected_disconnect` is set. This is the state
+        // `reconnect_immediately()` leaves behind, and the one the retry loop
+        // used to walk straight through.
+        client.is_running.store(true, Ordering::Relaxed);
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        assert!(
+            client.is_running.load(Ordering::Relaxed),
+            "the retry loop's own guard still admits this state"
+        );
+        assert!(
+            client.is_shutting_down(),
+            "but it does make the callee's shutdown guard true"
+        );
+        assert!(
+            client
+                .process_app_state_sync_task(WAPatchName::Regular, true)
+                .await
+                .is_ok(),
+            "the callee reports Ok without doing anything, which is the trap"
+        );
+
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+        assert!(
+            !client.is_shutting_down(),
+            "and the hold lifts once the reconnect settles"
+        );
+    }
+}
+
+#[cfg(test)]
+mod apply_boundary_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::sync_against;
+
+    /// `process_one_patch_list` persists the version and mutation MACs before it
+    /// returns, so once a collection is applied its cursor has moved and the
+    /// server will not send those mutations again. Declining it after that point
+    /// loses them for good — `setting_pushName` and the NCT salt included — so
+    /// the admission check has to sit before the apply, and dispatching after it
+    /// is not optional.
+    ///
+    /// Asserted as the property that matters: a collection the batch applied is
+    /// reported synced, never retryable, because "retry" cannot recover it.
+    ///
+    /// This pins the invariant, not the race that violated it. Reproducing that
+    /// needs the scope to be lost between two collections' applies, and the only
+    /// hook for it would be inside the loop; a scope retired any earlier is
+    /// caught by the pre-apply check and nothing is applied at all.
+    #[tokio::test]
+    async fn an_applied_collection_is_never_reported_retryable() {
+        let (outcome, _) = sync_against(
+            vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            &[
+                ("critical_block", None),
+                ("critical_unblock_low", Some("500")),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            outcome.synced,
+            vec![WAPatchName::CriticalBlock],
+            "an applied collection is synced"
+        );
+        assert!(
+            !outcome.retryable.contains(&WAPatchName::CriticalBlock),
+            "and must never also be queued for a retry that cannot re-fetch it"
+        );
+        assert_eq!(outcome.retryable, vec![WAPatchName::CriticalUnblockLow]);
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_gate_tests {
+    use super::*;
+
+    /// The tag only moves forward, so a write on behalf of an older connection
+    /// can never overwrite one made for a newer. This is the half that the
+    /// admission check cannot provide: by the time a stale writer is inside
+    /// `settle`, the replacement may already have had its say.
+    #[test]
+    fn an_older_connection_cannot_overwrite_a_newer_one() {
+        let gate = BootstrapGate::new(false);
+
+        assert!(gate.settle(7, true), "the newest writer wins");
+        assert!(gate.is_armed());
+
+        assert!(
+            !gate.settle(6, false),
+            "an older connection is refused outright"
+        );
+        assert!(gate.is_armed(), "and leaves the newer answer standing");
+
+        assert!(
+            gate.settle(7, false),
+            "the same connection may revise itself"
+        );
+        assert!(!gate.is_armed());
+
+        assert!(gate.settle(8, true), "and a newer one always may");
+        assert!(gate.is_armed());
+    }
+
+    /// A fresh pairing owes a bootstrap whatever the live connection concluded,
+    /// and only the connection that comes *after* it may say otherwise.
+    ///
+    /// Both halves have been wrong here. Arming above every generation left the
+    /// gate unclearable and re-ran the 180s critical bootstrap on every connect
+    /// forever; arming at zero let a scope already in flight on the pairing
+    /// connection clear it before the forced reconnect, so the connection that
+    /// was supposed to run the sync found nothing owed.
+    #[test]
+    fn pairing_arms_over_live_connections_but_not_the_next_one() {
+        let gate = BootstrapGate::new(false);
+        assert!(gate.settle(9, false));
+        assert!(!gate.is_armed());
+
+        // `pair-success` arrives while connection 9 is live.
+        gate.arm_for_pairing(9);
+        assert!(gate.is_armed());
+
+        assert!(
+            !gate.settle(9, false),
+            "a bootstrap already in flight on the pairing connection must not \
+             answer for the sync pairing just asked for"
+        );
+        assert!(gate.is_armed(), "so the arm survives it");
+
+        assert!(
+            gate.settle(10, false),
+            "and the connection the forced 515 brings up can clear it"
+        );
+        assert!(
+            !gate.is_armed(),
+            "a pairing that outranked every connection would never clear, and the \
+             client would re-run the critical bootstrap forever"
+        );
+    }
+
+    /// The arm is a floor, never an assignment.
+    ///
+    /// `current_generation` is a sample, and the tag is shared with `settle`. An
+    /// unconditional store could lower a tag a newer connection had already set,
+    /// which is the one way arming could make the gate *easier* to clear than it
+    /// was. It also broke the rule `settle_bootstrap` leans on — that the tag
+    /// only ever moves forward — for one of the two writers.
+    #[test]
+    fn pairing_never_lowers_the_gate() {
+        let gate = BootstrapGate::new(false);
+        assert!(gate.settle(20, false));
+
+        // A `pair-success` carrying a sample from well before that.
+        gate.arm_for_pairing(3);
+
+        assert!(gate.is_armed(), "pairing always owes a bootstrap");
+        assert!(
+            !gate.settle(20, false),
+            "and connection 20 still cannot answer for it"
+        );
+        assert!(gate.settle(21, false), "only something newer can");
+        assert!(!gate.is_armed());
+    }
+
+    /// The flag survives the round trip through the tag, which is the only part
+    /// readers see.
+    #[test]
+    fn the_armed_bit_round_trips() {
+        let gate = BootstrapGate::new(true);
+        assert!(gate.is_armed());
+        let gate = BootstrapGate::new(false);
+        assert!(!gate.is_armed());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_signal_tests {
+    use super::*;
+
+    /// The predicate app-state retries end on. It has to mean "finished", not
+    /// "not currently connected": a planned reconnect, or a direct-connect
+    /// client that never starts the supervision loop, must not look terminal or
+    /// the retries throw away work nothing else will redo.
+    #[tokio::test]
+    async fn only_a_finished_client_looks_terminal() {
+        let client = crate::test_utils::create_test_client_with_name("lifecycle-terminal").await;
+
+        // A direct-connect client never runs the supervision loop. Reading
+        // `is_running` here would call a perfectly healthy client stopped.
+        assert!(
+            !client.is_running.load(Ordering::Relaxed),
+            "the fixture models a client that never called run()"
+        );
+        assert!(!client.is_terminal(), "which is not the same as finished");
+
+        // A planned reconnect is not the end either.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        assert!(
+            client.is_shutting_down(),
+            "the old predicate cannot tell this apart"
+        );
+        assert!(!client.is_terminal(), "the new one can");
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+
+        // Turning auto-reconnect off is a preference an application may express
+        // on a healthy connection — "do not come back after this one ends" — and
+        // the run loop does not act on it until the socket exits. On its own it
+        // says nothing about the session being over, so the supervision loop has
+        // to be up for the scenario to be the one described.
+        client.is_running.store(true, Ordering::Relaxed);
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        assert!(
+            !client.is_terminal(),
+            "a reconnect preference is not a verdict on the current session"
+        );
+
+        // The stream errors that really do end one — conflict, 516, an
+        // unrecoverable connect failure — set both, and the pair is what
+        // separates them from the preference above.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        assert!(client.is_terminal());
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+
+        // And the run loop's own exit: it stops by clearing `is_running` alone,
+        // without firing the notifier or setting `expected_disconnect`, so that
+        // pairing has to count too or retries wait for a connection that is
+        // never coming. `cleanup_connection_state` has already run by then, which
+        // is why the socket is down here.
+        client.is_running.store(false, Ordering::Relaxed);
+        client.set_connected_for_test(false);
+        assert!(
+            client.is_terminal(),
+            "the supervision loop ending with auto-reconnect off is terminal"
+        );
+
+        // But `is_running` is false for a direct-connect client too, which never
+        // had a loop to end. One of those with a live socket is not finished, and
+        // reading it as finished is what the first version of this predicate did.
+        client.set_connected_for_test(true);
+        assert!(
+            !client.is_terminal(),
+            "a live direct-connect client never started the loop that would have ended"
+        );
+        client.set_connected_for_test(false);
+
+        client.enable_auto_reconnect.store(true, Ordering::Relaxed);
+        client.is_running.store(true, Ordering::Relaxed);
+        assert!(!client.is_terminal());
+
+        // And an explicit shutdown, which reconnects deliberately leave alone.
+        client.signal_shutdown_sync();
+        assert!(client.is_terminal());
+    }
+}
+
+#[cfg(test)]
+mod connection_guard_tests {
+    use super::*;
+
+    /// The guards ask whether the client is finished and whether there is a
+    /// socket, rather than `is_shutting_down()`.
+    ///
+    /// The point is the reconnect: `is_shutting_down()` is true for a planned
+    /// one, so a task reading it stops for a connection that is coming back.
+    ///
+    /// Not a claim about direct-connect clients. `connect()` without `run()`
+    /// leaves `is_running` false, and `send_and_wait_iq` rejects every IQ in
+    /// that state (`request.rs`), so no such client can reach the server at all
+    /// — for app state or anything else. An earlier version of this test
+    /// asserted the sync errored and called that support; it errored one layer
+    /// down, for that reason, and proved nothing.
+    #[tokio::test]
+    async fn a_planned_reconnect_does_not_look_like_a_stop() {
+        let client = crate::test_utils::create_test_client_with_name("conn-guard").await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+
+        assert!(!client.is_terminal() && client.is_connected());
+
+        // The state `reconnect_immediately()` leaves behind.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        assert!(
+            client.is_shutting_down(),
+            "which the old guard could not tell from a stop"
+        );
+        assert!(
+            !client.is_terminal(),
+            "so work that outlives a connection stays alive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod await_connection_tests {
+    use super::*;
+
+    /// A notification that does not leave a live connection must not end the
+    /// wait. The socket can be announced and gone again before the check reads
+    /// it, and treating that as an answer dropped the retry while the client was
+    /// still perfectly able to reconnect.
+    #[tokio::test]
+    async fn a_stale_notification_does_not_end_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-stale").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // Announced, but nothing is connected: the wait has to carry on.
+        client.socket_ready_notifier.notify(usize::MAX);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "an event without a connection is not an answer"
+        );
+
+        // Nor is a socket on its own. `connect()` announces one before login, and
+        // an IQ sent in that gap is answered by nobody and retired by the
+        // `<success>` that follows.
+        client.set_connected_for_test(true);
+        client.socket_ready_notifier.notify(usize::MAX);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "a socket without an authenticated session is not one either"
+        );
+
+        // Both stores that `handle_success` makes, in that order: the session,
+        // then the generation it is authenticated under. Only the pair is an
+        // answer — the marker alone would leave the wait on a socket that has
+        // not authenticated, which is the state above.
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        client.notify_session_state();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a usable connection must end the wait")
+                .expect("the waiter should not panic"),
+            "and it reports that one arrived"
+        );
+    }
+
+    /// The wait has no duration bound, so the terminal state is the only thing
+    /// that ends it when no connection is coming. Every duration tried here was
+    /// wrong in one direction or the other.
+    ///
+    /// Shutdown alone has to end it. An earlier version of this test nudged
+    /// `socket_ready_notifier` afterwards and passed on that nudge, hiding a wait
+    /// that in production had nothing left to wake it — no socket is ever
+    /// announced again after a shutdown, and the parked task holds the
+    /// `Arc<Client>` whose drop would otherwise have been the way out.
+    #[tokio::test]
+    async fn a_finished_client_ends_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-terminal").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        client.signal_shutdown_sync();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a finished client must end the wait, with nothing else nudging it")
+                .expect("the waiter should not panic"),
+            "and it reports that none arrived"
+        );
+    }
+
+    /// A pause must not end the wait: nothing on the next connection re-issues a
+    /// consumer's task, so giving up would drop a full-sync request rather than
+    /// defer it. It must not read as a live connection either, or the retry
+    /// sends on a socket the application has just asked to have closed. Waiting,
+    /// and reporting unreachable while it waits, is the pair that holds.
+    #[tokio::test]
+    async fn a_paused_client_keeps_the_wait_but_is_not_reachable() {
+        let client = crate::test_utils::create_test_client_with_name("await-paused").await;
+        client.is_running.store(true, Ordering::Relaxed);
+        // Everything a reachable connection needs, so only the pause can be
+        // what makes the answer no.
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        assert!(client.can_reach_server(), "reachable before the pause");
+
+        client.pause().await;
+
+        assert!(
+            !client.can_reach_server(),
+            "a paused client must not answer as reachable, teardown window included"
+        );
+        assert!(
+            !client.is_terminal(),
+            "which is not the same as the client being finished"
+        );
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+        assert!(
+            !waiter.is_finished(),
+            "and the wait carries on, because the pause is meant to end"
+        );
+        waiter.abort();
+    }
+
+    /// The run loop's own exit is the terminal transition with no signal of its
+    /// own: it fires no notifier and announces no socket, so a wait parked
+    /// through it is parked for good unless that branch says so itself.
+    #[tokio::test]
+    async fn the_run_loop_giving_up_ends_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-runloop").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // The branch itself, not a re-enactment of it: `run()` reads this flag
+        // and calls exactly this, and a version of the transition that forgets
+        // to announce itself fails here.
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.stop_supervision_loop();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the supervision loop ending must end the wait")
+                .expect("the waiter should not panic"),
+            "and it reports that none arrived"
+        );
+    }
+
+    /// A direct-connect client is not finished — its connection is fine and its
+    /// application may still use it — but no `<success>` will ever arrive without
+    /// a reader, so waiting for one is waiting forever.
+    #[tokio::test]
+    async fn a_client_without_a_reader_is_not_worth_waiting_for() {
+        let client = crate::test_utils::create_test_client_with_name("await-direct").await;
+        client.set_connected_for_test(true);
+
+        assert!(
+            !client.is_terminal(),
+            "a live direct-connect client is fine"
+        );
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), client.await_connection())
+                .await
+                .expect("the wait must not park on a connection that cannot answer"),
+            "it just cannot carry the work"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sync_outcome_tests {
+    use super::*;
+
+    /// Sets up a client that can reach the server, so a test can then take one
+    /// signal away and see what the guard makes of it.
+    async fn reachable_client(name: &str) -> Arc<Client> {
+        let client = crate::test_utils::create_test_client_with_name(name).await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        assert!(client.can_reach_server(), "the fixture itself is usable");
+        client
+    }
+
+    /// The case every lifecycle-flag proxy missed, because it is the one state
+    /// none of them modelled: rate-limited, still connected, still supervised,
+    /// no `expected_disconnect` and no generation change — and no session.
+    ///
+    /// `Ok(())` here read as a completed sync, and the caller returned. The
+    /// trigger was consumed by then and nothing asks a second time.
+    #[tokio::test]
+    async fn a_rate_limited_session_defers_rather_than_completes() {
+        let client = reachable_client("outcome-429").await;
+
+        // Exactly what `handle_stream_error` does for 429 and 503.
+        client.is_logged_in.store(false, Ordering::Relaxed);
+
+        assert!(
+            !client.is_terminal(),
+            "a rate limit is not the client being finished"
+        );
+        assert!(
+            !client.is_shutting_down(),
+            "nor is it anything the old proxy could see"
+        );
+        assert_eq!(
+            client
+                .process_app_state_sync_task(WAPatchName::Regular, true)
+                .await
+                .expect("skipping is not an error"),
+            SyncOutcome::Deferred,
+            "nothing was asked, so nothing was completed"
+        );
+    }
+
+    /// A planned reconnect reaches the same guard by a different route, and has
+    /// to answer the same way.
+    #[tokio::test]
+    async fn a_reconnect_defers_rather_than_completes() {
+        let client = reachable_client("outcome-reconnect").await;
+        client.set_connected_for_test(false);
+
+        assert_eq!(
+            client
+                .process_app_state_sync_task(WAPatchName::Regular, false)
+                .await
+                .expect("skipping is not an error"),
+            SyncOutcome::Deferred
+        );
+    }
+
+    /// Terminal and reachable are not mutually exclusive: the stream-error paths
+    /// set the terminal flags before they clear the session and close the
+    /// socket. Asking about reachability first hands out that window.
+    #[tokio::test]
+    async fn a_terminal_client_is_not_a_usable_one() {
+        let client = reachable_client("verdict-order").await;
+
+        // A conflict or 516: both flags set together, and the socket not yet
+        // torn down. This used to be a window where `is_terminal()` and
+        // `can_reach_server()` were both true, which is why the verdict checks
+        // terminal first.
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+
+        assert!(client.is_terminal());
+        assert_eq!(client.reachability(), Reachability::Finished);
+
+        // The window is now closed at the source rather than ordered around:
+        // `can_reach_server()` rejects a socket marked for retirement, and every
+        // route into `is_terminal()` marks one — `expected_disconnect` here,
+        // `is_running` cleared by shutdown, a dead socket for the run loop's
+        // exit. The ordering stays as belt and braces; this is what makes it
+        // moot, and what fails if the retirement check is dropped.
+        assert!(
+            !client.can_reach_server(),
+            "a finished client is never a reachable one"
+        );
+
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.signal_shutdown_sync();
+        assert!(client.is_terminal() && !client.can_reach_server());
+    }
+
+    /// `<success>` sets `is_logged_in` one step before it increments the
+    /// generation, because that store is the duplicate guard. A caller that
+    /// binds a scope in between binds a generation the next instruction retires,
+    /// and every attempt it then makes is rejected.
+    #[tokio::test]
+    async fn the_gap_inside_success_is_not_an_authenticated_connection() {
+        let client = crate::test_utils::create_test_client_with_name("auth-window").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        client.set_connected_for_test(true);
+
+        // First half of the window: `handle_success` has set `is_logged_in` and
+        // has not yet incremented the generation. The marker here is whatever
+        // the constructor left, unretouched — and a marker that starts at a real
+        // generation equals the one a fresh client is on, so equality alone
+        // admits the window on the very first connection.
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        assert!(
+            client.is_logged_in() && client.is_connected(),
+            "which is why the flags alone said yes"
+        );
+        assert!(
+            !client.can_reach_server(),
+            "this connection has not authenticated anything yet"
+        );
+
+        // Second half: generation incremented, marker not yet stored.
+        let current = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(!client.can_reach_server());
+        assert_eq!(
+            client.reachability(),
+            Reachability::Reconnecting,
+            "the wait carries on"
+        );
+
+        // And once `<success>` finishes publishing, it is a real connection.
+        client
+            .authenticated_generation
+            .store(current, Ordering::SeqCst);
+        assert_eq!(client.reachability(), Reachability::Reachable);
+    }
+}
+
+#[cfg(test)]
+mod sync_owed_tests {
+    use super::*;
+
+    /// Only a completed sync discharges the request.
+    ///
+    /// The first version of this seam listed the ways to fail and requeued for
+    /// those — which put the deferral next to an `Err` branch that still only
+    /// logged, so a connection lost while the collection IQ was in flight was
+    /// reported by `send_iq` as an error and dropped there. Every list of
+    /// failure modes written so far has been one short; this asks the other
+    /// question, which has one answer.
+    #[test]
+    fn everything_that_is_not_a_completed_sync_is_still_owed() {
+        assert!(!sync_still_owed(&Ok(SyncOutcome::Completed)));
+        assert!(sync_still_owed(&Ok(SyncOutcome::Deferred)));
+        assert!(sync_still_owed(&Err(anyhow::anyhow!(
+            "the socket died under the collection IQ"
+        ))));
+    }
+}
+
+#[cfg(test)]
+mod terminal_wake_tests {
+    use super::*;
+
+    /// A fatal stream error — conflict, 516, 401, 409 — makes the client
+    /// terminal by setting two flags and then firing only the per-connection
+    /// shutdown. Nothing else on that path announces anything.
+    ///
+    /// The wait must end there, not when the run loop eventually unwinds far
+    /// enough to notice. The invariant on `is_terminal` is that every transition
+    /// into it announces itself; "some other loop gets there first" is not that,
+    /// and if that loop is what is wedged, it never gets there at all.
+    #[tokio::test]
+    async fn a_fatal_stream_error_ends_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-fatal").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // Exactly what `handle_stream_error` does, in its order.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.notify_connection_shutdown();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a fatal stream error must end the wait where it happens")
+                .expect("the waiter should not panic"),
+            "and it reports that no connection arrived"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reconnect_wake_tests {
+    use super::*;
+
+    /// A teardown that a reconnect follows wakes the wait and must not end it.
+    ///
+    /// The wake carries no verdict: it only says the state is worth re-reading.
+    /// A parked waiter is parked *because* `can_reach_server()` was false, and
+    /// nothing about a teardown makes it true — so the re-read parks it again.
+    ///
+    /// The reverse case cannot arise either. For the wake to release a waiter
+    /// onto a dying socket, the state would have to go unusable → usable while
+    /// it was parked; every transition that does that announces itself, and the
+    /// waiter would have left on that announcement, when the connection really
+    /// was usable.
+    #[tokio::test]
+    async fn a_planned_reconnect_teardown_does_not_end_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-replan").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.session_state_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // What `reconnect_immediately()` does: a planned teardown, auto-reconnect
+        // still on, so the client is not finished and a socket is coming back.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.notify_connection_shutdown();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "a teardown is not a connection, however loudly it is announced"
+        );
+
+        // And the replacement still ends it.
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        client.notify_session_state();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the replacement connection must end the wait")
+                .expect("the waiter should not panic")
+        );
+    }
+}
+
+#[cfg(test)]
+mod retiring_socket_tests {
+    use super::*;
+
+    /// A socket already marked for retirement is not one work can be sent on.
+    ///
+    /// `reconnect_immediately()` sets `expected_disconnect` before its bounded
+    /// flushes and closes the transport only afterwards. Every other signal
+    /// still reads healthy through that window — socket up, session
+    /// authenticated, generation final — so a wait released there hands its IQ
+    /// to a connection the run loop has already decided to retire. The server
+    /// answers, `handle_success` on the replacement retires the scope, the
+    /// answer is dropped and the attempt is charged anyway.
+    #[tokio::test]
+    async fn a_socket_marked_for_reconnect_cannot_carry_work() {
+        let client = crate::test_utils::create_test_client_with_name("retiring").await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        assert!(client.can_reach_server(), "healthy to begin with");
+
+        // The first thing `reconnect_immediately()` does, before any teardown.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+
+        assert!(
+            client.is_connected() && client.is_logged_in(),
+            "and every other signal still says the socket is fine"
+        );
+        assert!(
+            !client.can_reach_server(),
+            "but it is going away, so nothing sent on it comes back"
+        );
+        assert!(
+            !client.is_terminal(),
+            "which is not the same as the client being finished"
+        );
+        assert_eq!(
+            client.reachability(),
+            Reachability::Reconnecting,
+            "so the wait carries on to the replacement"
+        );
+    }
+}
+
+#[cfg(test)]
+mod batched_attempt_tests {
+    use super::*;
+
+    /// Only a round that sent a collection IQ may spend an attempt.
+    ///
+    /// The first version of this asked the outcome buckets — "anything in
+    /// `synced`, `fatal` or `retryable` means the wire was reached" — and that
+    /// is false. `retryable` also collects the collections a scope loss or a
+    /// `ReservationSkip::WaitTimedOut` dropped *before* the send, and the
+    /// timeout is exactly the case this predicate exists for: a long patch send
+    /// holding the collection. The bucket test called that a real attempt and
+    /// burned the budget anyway.
+    ///
+    /// So the flag is recorded at the send and nowhere else. Buckets describe
+    /// what happened to each collection; only the send knows whether anything
+    /// was asked.
+    #[test]
+    fn only_a_sent_iq_counts_as_reaching_the_server() {
+        // What a batch whose every reservation timed out looks like. Under the
+        // bucket test this said true.
+        let timed_out = BatchedSyncOutcome {
+            retryable: vec![WAPatchName::Regular, WAPatchName::RegularHigh],
+            ..Default::default()
+        };
+        assert!(
+            !timed_out.reached_server(),
+            "a reservation timeout never reached the wire, whatever bucket it lands in"
+        );
+
+        // Nor does a scope lost before reserving, which lands in the same one.
+        let scope_lost = BatchedSyncOutcome {
+            retryable: vec![WAPatchName::Regular],
+            ..Default::default()
+        };
+        assert!(!scope_lost.reached_server());
+
+        // And an equivalent sync holding it, which lands in `skipped`.
+        let held = BatchedSyncOutcome {
+            skipped: vec![WAPatchName::Regular],
+            ..Default::default()
+        };
+        assert!(!held.reached_server());
+        assert!(!BatchedSyncOutcome::default().reached_server());
+
+        // The send is the only thing that sets it, and it survives whatever the
+        // response turns out to be — including an error, which spent the
+        // attempt just as much as an answer did.
+        let mut sent = BatchedSyncOutcome {
+            retryable: vec![WAPatchName::Regular],
+            ..Default::default()
+        };
+        sent.note_reached_server();
+        assert!(sent.reached_server());
+    }
+}
+
+#[cfg(test)]
+mod critical_bootstrap_tests {
+    use super::batched_sync_outcome_tests::batch_result;
+    use super::*;
+    use crate::types::events::{EventHandler, EventInterest, EventKind};
+
+    /// Retires the connection from inside the `Connected` handler, the way a
+    /// consumer that disconnects the moment it connects does.
+    struct RetireOnConnected(Arc<AtomicU64>);
+
+    impl EventHandler for RetireOnConnected {
+        fn handle_event(&self, event: Arc<Event>) {
+            if matches!(&*event, Event::Connected(_)) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn interest(&self) -> EventInterest {
+            EventInterest::of(&[EventKind::Connected])
+        }
+    }
+
+    #[derive(Default)]
+    struct BootstrapRecorder {
+        connected: AtomicU64,
+        /// The `connected` flag of every `AppStateSyncFailed`, in order.
+        failures: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl EventHandler for BootstrapRecorder {
+        fn handle_event(&self, event: Arc<Event>) {
+            match &*event {
+                Event::Connected(_) => {
+                    self.connected.fetch_add(1, Ordering::Relaxed);
+                }
+                Event::AppStateSyncFailed(failed) => self
+                    .failures
+                    .lock()
+                    .expect("recorded failures mutex")
+                    .push(failed.connected),
+                _ => {}
+            }
+        }
+
+        fn interest(&self) -> EventInterest {
+            EventInterest::of(&[EventKind::Connected, EventKind::AppStateSyncFailed])
+        }
+    }
+
+    /// A client with a recorder attached, holding the subscription alive.
+    ///
+    /// Reachable, because the bootstrap only announces a connection that still
+    /// is: a fixture that skipped the flags would have passed no matter what the
+    /// announce guard asked.
+    async fn recording_client(
+        name: &str,
+    ) -> (
+        Arc<Client>,
+        Arc<BootstrapRecorder>,
+        crate::types::events::Subscription,
+    ) {
+        let client = crate::test_utils::create_test_client_with_name(name).await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        assert!(
+            client.can_reach_server(),
+            "the fixture itself is announceable"
+        );
+        let recorder = Arc::new(BootstrapRecorder::default());
+        let subscription = client.subscribe(recorder.interest(), Arc::clone(&recorder) as _);
+        (client, recorder, subscription)
+    }
+
+    fn outcome(
+        synced: &[WAPatchName],
+        fatal: &[WAPatchName],
+        retryable: &[WAPatchName],
+        skipped: &[WAPatchName],
+        reached_server: bool,
+    ) -> BatchedSyncOutcome {
+        BatchedSyncOutcome {
+            synced: synced.to_vec(),
+            fatal: fatal.to_vec(),
+            retryable: retryable.to_vec(),
+            skipped: skipped.to_vec(),
+            reached_server,
+        }
+    }
+
+    struct Case {
+        what: &'static str,
+        outcome: BatchedSyncOutcome,
+        expected: CriticalSyncPlan,
+    }
+
+    fn plan(retry: &[WAPatchName], stranded: bool) -> CriticalSyncPlan {
+        CriticalSyncPlan {
+            retry: retry.to_vec(),
+            stranded,
+        }
+    }
+
+    /// Every shape a batched sync can come back in, and what each one costs the
+    /// bootstrap. The buckets are the whole surface, so a bucket added to
+    /// `BatchedSyncOutcome` without a decision fails to compile in
+    /// `CriticalSyncPlan::from_outcome` before it reaches this table. A third
+    /// collection appears where all three buckets have to be non-empty at once,
+    /// which two names cannot express.
+    fn cases() -> Vec<Case> {
+        use WAPatchName::{CriticalBlock as CB, CriticalUnblockLow as CUL, Regular};
+        vec![
+            Case {
+                what: "everything synced",
+                outcome: outcome(&[CB, CUL], &[], &[], &[], true),
+                expected: plan(&[], false),
+            },
+            Case {
+                what: "one collection refused",
+                outcome: outcome(&[CUL], &[CB], &[], &[], true),
+                expected: plan(&[], true),
+            },
+            Case {
+                what: "one collection retryable",
+                outcome: outcome(&[CUL], &[], &[CB], &[], true),
+                expected: plan(&[CB], false),
+            },
+            Case {
+                what: "one collection held by another writer",
+                outcome: outcome(&[CUL], &[], &[], &[CB], true),
+                expected: plan(&[CB], false),
+            },
+            Case {
+                what: "refused alongside a retryable",
+                outcome: outcome(&[], &[CB], &[CUL], &[], true),
+                expected: plan(&[CUL], true),
+            },
+            Case {
+                what: "refused alongside a held one",
+                outcome: outcome(&[], &[CB], &[], &[CUL], true),
+                expected: plan(&[CUL], true),
+            },
+            Case {
+                what: "retryable alongside a held one",
+                outcome: outcome(&[], &[], &[CB], &[CUL], true),
+                expected: plan(&[CB, CUL], false),
+            },
+            Case {
+                what: "every bucket at once",
+                outcome: outcome(&[], &[CB], &[CUL], &[Regular], true),
+                expected: plan(&[CUL, Regular], true),
+            },
+            Case {
+                what: "nothing reached the server",
+                outcome: outcome(&[], &[], &[], &[CB, CUL], false),
+                expected: plan(&[CB, CUL], false),
+            },
+        ]
+    }
+
+    /// The invariant the bootstrap owes a connection that has already left
+    /// passive mode: whatever the sync came back with, the session is announced.
+    /// Two of these shapes used to return in silence with the socket still
+    /// delivering stanzas.
+    #[tokio::test]
+    async fn every_sync_outcome_announces_the_connection() {
+        for (index, case) in cases().into_iter().enumerate() {
+            let (client, recorder, _subscription) =
+                recording_client(&format!("critical-plan-{index}")).await;
+            let scope = client.sync_scope(None);
+
+            let plan = CriticalSyncPlan::from_outcome(&case.outcome);
+            assert_eq!(plan, case.expected, "plan for {}", case.what);
+
+            assert!(
+                client
+                    .finish_critical_bootstrap(scope, &plan, &case.outcome)
+                    .await,
+                "the generation is live for {}",
+                case.what
+            );
+
+            assert_eq!(
+                recorder.connected.load(Ordering::Relaxed),
+                1,
+                "{} must still announce the connection",
+                case.what
+            );
+            assert_eq!(
+                recorder
+                    .failures
+                    .lock()
+                    .expect("recorded failures mutex")
+                    .as_slice(),
+                if plan.outstanding() {
+                    [true].as_slice()
+                } else {
+                    &[]
+                },
+                "failure report for {}",
+                case.what
+            );
+            assert_eq!(
+                client.needs_initial_full_sync.is_armed(),
+                plan.outstanding(),
+                "bootstrap gate for {}",
+                case.what
+            );
+        }
+    }
+
+    /// A batch that blew up before producing buckets still has to say so.
+    /// Announcing without the report would read as a clean startup to a consumer
+    /// whose session may be missing the push name and the blocklist.
+    #[tokio::test]
+    async fn a_failed_batch_reports_everything_it_asked_for() {
+        let requested = [WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow];
+        let synthesized = BatchedSyncOutcome::all_retryable(&requested);
+        assert_eq!(synthesized.retryable, requested);
+        assert!(
+            !synthesized.reached_server(),
+            "a batch that failed outright must not charge an attempt"
+        );
+
+        let plan = CriticalSyncPlan::from_outcome(&synthesized);
+        assert_eq!(plan, self::plan(&requested, false));
+
+        let (client, recorder, _subscription) = recording_client("critical-plan-error").await;
+        let scope = client.sync_scope(None);
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &synthesized)
+                .await
+        );
+
+        assert_eq!(recorder.connected.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .as_slice(),
+            [true].as_slice(),
+            "the gap has to reach the consumer, not just the log"
+        );
+        assert!(client.needs_initial_full_sync.is_armed());
+    }
+
+    /// The symptom: a fresh pairing whose critical sync came back retryable left
+    /// the consumer with no connection event at all, while the socket, already
+    /// out of passive mode, kept delivering stanzas. The outcome here comes
+    /// from a server answering the real collection IQ with a 500.
+    #[tokio::test]
+    async fn a_retryable_critical_sync_still_announces_the_connection() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        let recorder = Arc::new(BootstrapRecorder::default());
+        let _subscription = client.subscribe(recorder.interest(), Arc::clone(&recorder) as _);
+
+        let scope = client.sync_scope(None);
+        let mut sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .sync_collections_batched(
+                        vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+                        scope,
+                    )
+                    .await
+            })
+        };
+
+        let server = async {
+            let mut frame = 0usize;
+            loop {
+                let node = crate::test_utils::decode_sent_iq(&transport, frame).await;
+                let node = node.get().to_owned();
+                let id = node
+                    .attrs()
+                    .optional_string("id")
+                    .expect("every IQ carries an id")
+                    .into_owned();
+                let response = batch_result(
+                    &id,
+                    &[
+                        ("critical_block", Some("500")),
+                        ("critical_unblock_low", Some("500")),
+                    ],
+                );
+                crate::test_utils::answer_iq(&client, &id, &response).await;
+                frame += 1;
+            }
+        };
+        futures::pin_mut!(server);
+        let outcome = {
+            use futures::FutureExt;
+            futures::select! {
+                result = (&mut sync).fuse() => result
+                    .expect("the sync task should not panic")
+                    .expect("a per-collection error is an outcome, not a transport failure"),
+                () = server.as_mut().fuse() => unreachable!("the responder never completes"),
+            }
+        };
+        assert_eq!(
+            outcome.retryable,
+            vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            "a 500 is retryable, which is the shape that used to stay silent"
+        );
+
+        let plan = CriticalSyncPlan::from_outcome(&outcome);
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &outcome)
+                .await
+        );
+
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            1,
+            "the connection must be announced even though the sync did not close"
+        );
+        assert_eq!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .as_slice(),
+            [true].as_slice(),
+            "and reported as degraded-but-usable, not as still-retrying"
+        );
+    }
+
+    /// A `Connected` from a dead connection is worse than none: the consumer
+    /// would mark itself open on a socket that is already gone.
+    #[tokio::test]
+    async fn a_retired_generation_announces_nothing() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-retired").await;
+        let scope = client.sync_scope(None);
+        let stranded = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stranded);
+
+        client
+            .connection_generation
+            .store(scope.generation() + 1, Ordering::SeqCst);
+
+        assert!(
+            !client
+                .finish_critical_bootstrap(scope, &plan, &stranded)
+                .await,
+            "the caller must be told to stop"
+        );
+        assert_eq!(recorder.connected.load(Ordering::Relaxed), 0);
+        assert!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .is_empty()
+        );
+        assert!(
+            !client.needs_initial_full_sync.is_armed(),
+            "and it must not touch a gate that now belongs to the replacement"
+        );
+    }
+
+    /// The bootstrap is not finished when the critical collections land: the
+    /// non-critical ones are still owed, and the background sync that fetches
+    /// them is what stands the gate down. Clearing it here would let a reconnect
+    /// in that window skip the rest of the initial sync.
+    #[tokio::test]
+    async fn a_clean_critical_sync_leaves_the_gate_to_the_background_sync() {
+        let (client, _recorder, _subscription) = recording_client("critical-plan-clean").await;
+        client
+            .needs_initial_full_sync
+            .arm_for_pairing(client.connection_generation.load(Ordering::SeqCst));
+        let scope = client.sync_scope(None);
+
+        let clean = outcome(
+            &[WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            &[],
+            &[],
+            &[],
+            true,
+        );
+        let plan = CriticalSyncPlan::from_outcome(&clean);
+        assert!(client.finish_critical_bootstrap(scope, &plan, &clean).await);
+
+        assert!(
+            client.needs_initial_full_sync.is_armed(),
+            "the critical half closing is not the bootstrap closing"
+        );
+    }
+
+    /// A 429 or 503 clears `is_logged_in` inline and falls through without
+    /// retiring the connection, so the generation check alone still admits it.
+    /// Announcing there would set `is_ready` on a session the client has already
+    /// stopped treating as authenticated, and the reconnect that follows is what
+    /// gets to announce. The gap is still reported and still retried, because
+    /// the collections are no less owed for the socket having gone bad.
+    #[tokio::test]
+    async fn a_de_authenticated_connection_announces_nothing() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-429").await;
+        let scope = client.sync_scope(None);
+        let stalled = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stalled);
+
+        // Exactly what `handle_stream_error` does for 429 and 503.
+        client.is_logged_in.store(false, Ordering::Relaxed);
+
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &stalled)
+                .await,
+            "the generation is intact, so the leftovers still go to the background sync"
+        );
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            0,
+            "an unauthenticated session must not be announced"
+        );
+        assert_eq!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .as_slice(),
+            [false].as_slice(),
+            "and the report has to say the connection never happened"
+        );
+        assert!(client.needs_initial_full_sync.is_armed());
+    }
+
+    /// A pause does not retire the generation, so the bootstrap runs to the end
+    /// on a connection the application has just asked to have closed. It must
+    /// not announce that, and it must still hand the leftovers over: the sync
+    /// parks on `await_connection` and picks them up after the resume, which is
+    /// the whole reason the return value tracks retirement rather than
+    /// publication.
+    #[tokio::test]
+    async fn a_paused_connection_announces_nothing_but_keeps_its_retries() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-paused").await;
+        let scope = client.sync_scope(None);
+        let stalled = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stalled);
+
+        client.pause().await;
+        assert_eq!(
+            client.sync_scope(None).generation(),
+            scope.generation(),
+            "a pause must not retire the generation, or this proves nothing"
+        );
+
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &stalled)
+                .await,
+            "the leftovers still belong to the background sync"
+        );
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            0,
+            "a session being taken offline must not be announced"
+        );
+        assert_eq!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .as_slice(),
+            [false].as_slice()
+        );
+        assert!(client.needs_initial_full_sync.is_armed());
+    }
+
+    /// Publishing runs consumer handlers synchronously, so one that disconnects
+    /// retires the generation between the announcement and the report. The
+    /// report is deliberately withheld there rather than published to whatever
+    /// took the connection's place: a consumer's documented response to a
+    /// refusal is to log out or force a recovery, and that would land on the
+    /// wrong session. Nothing is lost, because the gate was armed before the
+    /// announcement and the replacement connection runs the bootstrap again.
+    #[tokio::test]
+    async fn a_handler_that_disconnects_takes_the_report_with_it() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-reentrant").await;
+        let retire = Arc::new(RetireOnConnected(Arc::clone(&client.connection_generation)));
+        let _retire_subscription = client.subscribe(retire.interest(), retire as _);
+
+        let scope = client.sync_scope(None);
+        let stalled = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stalled);
+
+        assert!(
+            !client
+                .finish_critical_bootstrap(scope, &plan, &stalled)
+                .await,
+            "the caller must not start background work for a retired connection"
+        );
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            1,
+            "the announcement is what ran the handler"
+        );
+        assert!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .is_empty(),
+            "the outcome belongs to a connection that no longer exists"
+        );
+        assert!(
+            client.needs_initial_full_sync.is_armed(),
+            "and the replacement inherits the work through the gate"
+        );
     }
 }

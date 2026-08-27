@@ -74,10 +74,11 @@ impl AddressSink for AddressBuf {
     }
 }
 
-/// Write the signal address name (`{user}[:device]@{server}`) into `buf`,
-/// clearing it first. All other address helpers delegate to this.
-pub fn write_signal_address_to<W: AddressSink + ?Sized>(jid: &Jid, buf: &mut W) {
-    buf.clear();
+/// Append the signal address name (`{user}[:device]@{server}`) to `buf`,
+/// keeping whatever is already there. All other address helpers delegate to
+/// this; the appending form exists so an address can be written into the middle
+/// of a larger buffer (a `SenderKeyName`) without a temporary to copy out of.
+pub fn push_signal_address_to<W: AddressSink + ?Sized>(jid: &Jid, buf: &mut W) {
     let server = mapped_server(jid.server.as_str());
     buf.push_str(&jid.user);
     if jid.device != 0 {
@@ -88,10 +89,32 @@ pub fn write_signal_address_to<W: AddressSink + ?Sized>(jid: &Jid, buf: &mut W) 
     buf.push_str(server);
 }
 
+/// Append the full protocol address (`{signal_address}.0`) to `buf`.
+pub fn push_protocol_address_to<W: AddressSink + ?Sized>(jid: &Jid, buf: &mut W) {
+    push_signal_address_to(jid, buf);
+    buf.push_str(".0");
+}
+
+/// Upper bound on the rendered protocol address of `jid`, for sizing a buffer
+/// in one allocation. The device adds at most six bytes (a `:` and five
+/// digits), the `@` one more and the `.0` suffix two; `mapped_server` only ever
+/// shortens the server, never lengthens it.
+#[inline]
+pub fn protocol_address_len_hint(jid: &Jid) -> usize {
+    jid.user.len() + jid.server.as_str().len() + 9
+}
+
+/// Write the signal address name (`{user}[:device]@{server}`) into `buf`,
+/// clearing it first.
+pub fn write_signal_address_to<W: AddressSink + ?Sized>(jid: &Jid, buf: &mut W) {
+    buf.clear();
+    push_signal_address_to(jid, buf);
+}
+
 /// Write the full protocol address (`{signal_address}.0`) into `buf`.
 pub fn write_protocol_address_to<W: AddressSink + ?Sized>(jid: &Jid, buf: &mut W) {
-    write_signal_address_to(jid, buf);
-    buf.push_str(".0");
+    buf.clear();
+    push_protocol_address_to(jid, buf);
 }
 
 /// Consistent ordering for deadlock-free multi-lock acquisition.
@@ -130,6 +153,25 @@ pub fn sort_dedup_by_device(jids: &mut Vec<Jid>) {
     }
     jids.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
     jids.dedup_by(|a, b| key(a) == key(b));
+}
+
+/// Build a `SenderKeyName` from the group JID and the sender's JID in a single
+/// allocation, rendering the sender's Signal address straight into the final
+/// buffer.
+///
+/// The `ProtocolAddress` overload below has to render the address into the
+/// address's own buffer first and then copy it across; here there is nothing to
+/// copy, so a caller holding the sender as a JID should use this one. The
+/// result is byte-identical: the sender half is the full protocol address,
+/// device suffix included.
+pub fn make_sender_key_name_for_jid(group_jid: &Jid, sender: &Jid) -> SenderKeyName {
+    let mut buf =
+        String::with_capacity(group_jid.user.len() + 20 + 1 + protocol_address_len_hint(sender));
+    group_jid.push_to(&mut buf);
+    let group_len = buf.len();
+    buf.push(':');
+    push_protocol_address_to(sender, &mut buf);
+    SenderKeyName::from_buf(buf, group_len)
 }
 
 /// Build a `SenderKeyName` from a `&Jid` + `&ProtocolAddress` in a single
@@ -333,6 +375,28 @@ mod tests {
 
         write_protocol_address_to(&jid, &mut buf);
         assert_eq!(buf, "15550000001@c.us.0");
+    }
+
+    /// The JID route and the `ProtocolAddress` route name the same chain, or a
+    /// send and the receive that follows it would key their sender keys
+    /// differently and the chain would look missing.
+    #[test]
+    fn sender_key_name_from_jid_matches_the_address_route() {
+        let group = Jid::from_str("120363000000000001@g.us").unwrap();
+        let senders = [
+            "15550000001@s.whatsapp.net",
+            "15550000001:33@s.whatsapp.net",
+            "123456789@lid",
+            "100000000000001.1:75@lid",
+        ];
+        for sender_str in senders {
+            let sender = Jid::from_str(sender_str).unwrap();
+            let direct = make_sender_key_name_for_jid(&group, &sender);
+            let via_address = make_sender_key_name(&group, &sender.to_protocol_address());
+            assert_eq!(direct.cache_key(), via_address.cache_key());
+            assert_eq!(direct.group_id(), via_address.group_id());
+            assert_eq!(direct.sender_id(), via_address.sender_id());
+        }
     }
 
     /// The writer's "clears it first" contract holds for the inline sink too:

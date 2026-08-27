@@ -9,9 +9,9 @@
 
 use aes_gcm::aes::Aes128;
 use aes_gcm::aes::cipher::consts::U16;
-use aes_gcm::{AesGcm, KeyInit, Nonce, aead::Aead};
+use aes_gcm::{AesGcm, KeyInit, Nonce, aead::Aead, aead::AeadInOut};
 
-use crate::voip::{encode_varint, hkdf_sha256};
+use crate::voip::hkdf_sha256;
 
 /// AES-128-GCM with WhatsApp's non-standard 16-byte nonce.
 type Aes128Gcm16 = AesGcm<Aes128, U16>;
@@ -80,13 +80,33 @@ fn counter_to_iv(counter: u64) -> [u8; 16] {
     iv
 }
 
-fn build_sframe_header(counter: u64, key_id: u64) -> Vec<u8> {
-    let mut header = Vec::new();
-    encode_varint(&mut header, counter);
-    encode_varint(&mut header, key_id);
-    let total_len = header.len() + 1;
-    header.push(total_len as u8);
-    header
+/// Two LEB128 varints plus the trailing length byte. A live header is 3 bytes (a small
+/// counter, key id 0, the length); this is the worst case two `u64` varints can produce, so
+/// the stack buffer can never be the thing that truncates a header.
+const SFRAME_HEADER_MAX: usize = 2 * 10 + 1;
+
+/// LEB128 varint into a fixed buffer, returning what it wrote. The `Vec` sibling in
+/// `voip::encode_varint` is for the STUN builders, which are assembling one anyway; the
+/// SFrame header is five bytes on a per-frame path and has no reason to touch the heap.
+fn encode_varint_into(out: &mut [u8], value: u64) -> usize {
+    let mut v = value;
+    let mut n = 0;
+    while v > 0x7f {
+        out[n] = ((v & 0x7f) | 0x80) as u8;
+        v >>= 7;
+        n += 1;
+    }
+    out[n] = (v & 0xff) as u8;
+    n + 1
+}
+
+/// Fill `buf` with the trailing SFrame header (counter varint, key-id varint, total length)
+/// and return the bytes written.
+fn build_sframe_header(counter: u64, key_id: u64, buf: &mut [u8; SFRAME_HEADER_MAX]) -> &[u8] {
+    let mut n = encode_varint_into(buf, counter);
+    n += encode_varint_into(&mut buf[n..], key_id);
+    buf[n] = (n + 1) as u8;
+    &buf[..n + 1]
 }
 
 fn parse_sframe_header(header: &[u8]) -> Option<(u64, u64)> {
@@ -103,12 +123,21 @@ fn parse_sframe_header(header: &[u8]) -> Option<(u64, u64)> {
     Some((counter, key_id))
 }
 
-fn gcm_encrypt(key: &[u8], nonce16: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+/// Encrypt `plaintext` into one buffer that already has room for the trailing header, so a
+/// frame costs a single allocation. `Aead::encrypt` would instead size its own `Vec` to
+/// exactly ciphertext + tag, and appending the header to that reallocates the whole frame.
+fn gcm_encrypt_framed(key: &[u8], nonce16: &[u8; 16], plaintext: &[u8], header: &[u8]) -> Vec<u8> {
     let cipher = Aes128Gcm16::new_from_slice(&key[..AES_KEY_LEN]).expect("16-byte key");
     let nonce = Nonce::<U16>::from(*nonce16);
+    let mut out = Vec::with_capacity(plaintext.len() + GCM_TAG_LEN + header.len());
+    out.extend_from_slice(plaintext);
+    // AES-GCM is a postfix-tag AEAD, so this appends the tag after the ciphertext -- the same
+    // `[ciphertext || tag]` layout `Aead::encrypt` produces.
     cipher
-        .encrypt(&nonce, plaintext)
-        .expect("AES-GCM encrypt is infallible for valid key/nonce")
+        .encrypt_in_place(&nonce, b"", &mut out)
+        .expect("AES-GCM encrypt is infallible for valid key/nonce");
+    out.extend_from_slice(header);
+    out
 }
 
 fn gcm_decrypt(key: &[u8], nonce16: &[u8; 16], ciphertext_with_tag: &[u8]) -> Option<Vec<u8>> {
@@ -165,13 +194,10 @@ impl SframeSession {
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
         let counter = self.tx_counter;
         self.tx_counter += 1;
-        let header = build_sframe_header(counter, 0);
+        let mut header_buf = [0u8; SFRAME_HEADER_MAX];
+        let header = build_sframe_header(counter, 0, &mut header_buf);
         let iv = counter_to_iv(counter);
-        let encrypted = gcm_encrypt(&self.encrypt_key, &iv, plaintext);
-        let mut out = Vec::with_capacity(encrypted.len() + header.len());
-        out.extend_from_slice(&encrypted);
-        out.extend_from_slice(&header);
-        out
+        gcm_encrypt_framed(&self.encrypt_key, &iv, plaintext, header)
     }
 
     /// Decrypt one frame. Returns [`SframeIn::Decrypted`] only when the trailing SFrame header parses
@@ -233,14 +259,41 @@ mod tests {
             hex::encode(counter_to_iv(5)),
             k["sframe"]["counterToIv_5"].as_str().unwrap()
         );
+        let mut buf = [0u8; SFRAME_HEADER_MAX];
         assert_eq!(
-            hex::encode(build_sframe_header(5, 0)),
+            hex::encode(build_sframe_header(5, 0, &mut buf)),
             k["sframe"]["header_5_0"].as_str().unwrap()
         );
         // Header round-trips.
+        let mut buf = [0u8; SFRAME_HEADER_MAX];
         assert_eq!(
-            parse_sframe_header(&build_sframe_header(5, 0)),
+            parse_sframe_header(build_sframe_header(5, 0, &mut buf)),
             Some((5, 0))
+        );
+    }
+
+    /// The stack buffer is sized for the worst case two `u64` varints can produce, and
+    /// `build_sframe_header` indexes it without bounds-checking the write. Pin that bound
+    /// with the largest header that can exist: anything narrower would panic here rather
+    /// than silently truncate a frame's counter.
+    #[test]
+    fn max_varint_header_fits_the_stack_bound_and_round_trips() {
+        let mut buf = [0u8; SFRAME_HEADER_MAX];
+        let header = build_sframe_header(u64::MAX, u64::MAX, &mut buf);
+        assert_eq!(
+            header.len(),
+            SFRAME_HEADER_MAX,
+            "two 10-byte varints plus the length byte is the worst case"
+        );
+        assert_eq!(
+            *header.last().unwrap() as usize,
+            SFRAME_HEADER_MAX,
+            "the trailing byte counts itself"
+        );
+        assert_eq!(
+            parse_sframe_header(header),
+            Some((u64::MAX, u64::MAX)),
+            "a maximal header must still round-trip"
         );
     }
 

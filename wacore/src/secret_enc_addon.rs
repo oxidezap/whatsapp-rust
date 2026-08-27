@@ -22,12 +22,27 @@
 //! - everything else (edits, reactions, comments, poll add option) → empty
 
 use anyhow::{Result, anyhow};
+use smallvec::SmallVec;
 
 use crate::libsignal::crypto::{aes_256_gcm_decrypt, aes_256_gcm_encrypt};
 
 const GCM_IV_SIZE: usize = 12;
 const GCM_TAG_SIZE: usize = 16;
 pub(crate) const MESSAGE_SECRET_SIZE: usize = 32;
+
+/// Stack-backed staging buffer for the HKDF `info` string.
+///
+/// `info` is `stanzaId || parentSender || modificationSender || <usecase>`: a
+/// 32-char stanza id plus two addressed JIDs plus the longest use-case literal
+/// lands near 110 bytes, so 128 covers the real shapes and the derivation runs
+/// without touching the heap. A longer JID pair still works, it just spills.
+type InfoBuffer = SmallVec<[u8; 128]>;
+
+/// Stack-backed AAD buffer, sized for `stanzaId || 0x00 || senderJid`.
+///
+/// Only `AadMode::StanzaAndSender` writes anything; `AadMode::Empty` yields an
+/// empty buffer that never allocates either way.
+pub(crate) type AadBuffer = SmallVec<[u8; 96]>;
 
 /// Use-case literal that goes into the HKDF `info` buffer.
 ///
@@ -103,7 +118,7 @@ pub fn derive_use_case_secret(
         message_secret.len()
     );
 
-    let mut info = Vec::with_capacity(
+    let mut info = InfoBuffer::with_capacity(
         ctx.stanza_id.len()
             + ctx.parent_msg_original_sender.len()
             + ctx.modification_sender.len()
@@ -120,12 +135,12 @@ pub fn derive_use_case_secret(
     Ok(key)
 }
 
-pub(crate) fn build_aad(ctx: &AddonContext<'_>) -> Vec<u8> {
+pub(crate) fn build_aad(ctx: &AddonContext<'_>) -> AadBuffer {
     match ctx.modification_type.aad_mode() {
-        AadMode::Empty => Vec::new(),
+        AadMode::Empty => AadBuffer::new(),
         AadMode::StanzaAndSender => {
             let mut aad =
-                Vec::with_capacity(ctx.stanza_id.len() + 1 + ctx.modification_sender.len());
+                AadBuffer::with_capacity(ctx.stanza_id.len() + 1 + ctx.modification_sender.len());
             aad.extend_from_slice(ctx.stanza_id.as_bytes());
             aad.push(0);
             aad.extend_from_slice(ctx.modification_sender.as_bytes());

@@ -4,11 +4,11 @@
 
 use super::audio::AudioFormat;
 use super::e2e_srtp::{
-    E2eSrtpKeys, RecvRocTracker, RocTracker, append_warp_mi_tag, crypt_payload, derive_e2e_keys,
-    derive_e2e_keys_from_raw, derive_srtcp_keys, derive_srtcp_keys_from_raw, protect_srtcp,
-    unprotect_srtcp, verify_warp_mi_tag,
+    E2eSrtpKeys, RecvRocTracker, RocTracker, append_warp_mi_tag_in_place, crypt_payload,
+    crypt_payload_in_place, derive_e2e_keys, derive_e2e_keys_from_raw, derive_srtcp_keys,
+    derive_srtcp_keys_from_raw, protect_srtcp, unprotect_srtcp, verify_warp_mi_tag,
 };
-use super::h264::{H264_MAX_AU_BYTES, H264Depacketizer, au_has_idr, packetize_au};
+use super::h264::{H264_MAX_AU_BYTES, H264Depacketizer, PacketizedAu, au_has_idr, packetize_au};
 use super::rtcp::{
     RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN, build_whatsapp_rtcp_cname,
     build_whatsapp_sender_report_with_sdes, build_whatsapp_source_description,
@@ -544,21 +544,14 @@ impl MediaPipeline {
     pub fn protect_audio(&mut self, opus_payload: &[u8]) -> Vec<u8> {
         let header = self.rtp.next_packet(opus_payload, false);
         let roc = self.send_roc.advance(header.sequence_number);
-        let encrypted = crypt_payload(
-            &self.send_keys,
-            header.ssrc,
-            header.sequence_number,
-            roc,
-            opus_payload,
-        );
-        // One buffer sized for header + ciphertext: the header writes straight
-        // into it (no throwaway Vec), and the exact capacity avoids the growth
-        // realloc the extend would otherwise trigger.
-        let mut packet = Vec::with_capacity(header.byte_size() + encrypted.len());
-        encode_rtp_header_into(&header, &mut packet);
-        packet.extend_from_slice(&encrypted);
         self.srtcp.record(1, opus_payload.len());
-        append_warp_mi_tag(&self.send_keys.auth_key, &packet, roc, self.warp_mi_tag_len)
+        protect_srtp_packet(
+            &self.send_keys,
+            &header,
+            roc,
+            self.warp_mi_tag_len,
+            opus_payload,
+        )
     }
 
     /// Inbound: verify the WARP MI tag, parse the header, decrypt the payload.
@@ -587,6 +580,33 @@ impl MediaPipeline {
             .accept(sender_ssrc, index)
             .then_some(plain)
     }
+}
+
+/// Shared outbound SRTP step for the audio and video pipelines: build the whole
+/// protected packet -- RTP header, AES-CTR ciphertext, WARP MI tag -- inside one
+/// allocation sized exactly for it. The payload is copied in once and encrypted where
+/// it lands, so a send costs one `Vec` per packet rather than one per stage, which is
+/// what the video path (~40 packets per frame, ~1200/s at 30 fps) actually pays.
+fn protect_srtp_packet(
+    send_keys: &E2eSrtpKeys,
+    header: &RtpHeader,
+    roc: u32,
+    warp_mi_tag_len: usize,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(header.byte_size() + payload.len() + warp_mi_tag_len);
+    encode_rtp_header_into(header, &mut packet);
+    let payload_start = packet.len();
+    packet.extend_from_slice(payload);
+    crypt_payload_in_place(
+        send_keys,
+        header.ssrc,
+        header.sequence_number,
+        roc,
+        &mut packet[payload_start..],
+    );
+    append_warp_mi_tag_in_place(&send_keys.auth_key, &mut packet, roc, warp_mi_tag_len);
+    packet
 }
 
 /// Shared inbound SRTP step for the audio and video pipelines: verify the WARP
@@ -646,7 +666,7 @@ pub struct VideoPipeline {
     recv_roc: RecvRocTracker,
     recv_rtp_replay: SrtpReplayWindow,
     depacketizer: H264Depacketizer,
-    pkt_scratch: Vec<Vec<u8>>,
+    pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
 }
 
@@ -690,7 +710,7 @@ impl VideoPipeline {
             recv_roc: RecvRocTracker::default(),
             recv_rtp_replay: SrtpReplayWindow::default(),
             depacketizer: H264Depacketizer::default(),
-            pkt_scratch: Vec::new(),
+            pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
         })
     }
@@ -778,6 +798,8 @@ impl VideoPipeline {
         if au.len() > H264_MAX_AU_BYTES {
             return Vec::new();
         }
+        // Taken out and put back so the fragment buffer's allocation lives for the whole
+        // call while the loop below still has `&mut self` for the sequencer.
         let mut payloads = std::mem::take(&mut self.pkt_scratch);
         packetize_au(au, &mut payloads);
         let media_frame_info = if au_has_idr(au) {
@@ -790,22 +812,13 @@ impl VideoPipeline {
         for (i, payload) in payloads.iter().enumerate() {
             let header = self.rtp.next_video_packet(i == last, media_frame_info);
             let roc = self.send_roc.advance(header.sequence_number);
-            let encrypted = crypt_payload(
-                &self.send_keys,
-                header.ssrc,
-                header.sequence_number,
-                roc,
-                payload,
-            );
-            let mut packet = Vec::with_capacity(header.byte_size() + encrypted.len());
-            encode_rtp_header_into(&header, &mut packet);
-            packet.extend_from_slice(&encrypted);
             self.srtcp.record(1, payload.len());
-            packets.push(append_warp_mi_tag(
-                &self.send_keys.auth_key,
-                &packet,
+            packets.push(protect_srtp_packet(
+                &self.send_keys,
+                &header,
                 roc,
                 self.warp_mi_tag_len,
+                payload,
             ));
         }
         self.pkt_scratch = payloads;
@@ -1262,11 +1275,24 @@ mod tests {
             samples_per_packet: 960,
             warp_mi_tag_len: tag_len,
         };
-        // Above the 20-byte HMAC digest (or zero) would panic when slicing the tag, so reject it.
+        // The tag is a prefix of a 20-byte HMAC-SHA1 digest, so a longer one cannot exist and a
+        // zero-length one would authenticate every packet. Rejecting both here is what keeps
+        // `append_warp_mi_tag_in_place`'s clamp unreachable from a built pipeline.
         assert!(MediaPipeline::new(&params(21)).is_none());
         assert!(MediaPipeline::new(&params(0)).is_none());
         assert!(MediaPipeline::new(&params(WARP_MI_TAG_LEN)).is_some());
         assert!(MediaPipeline::new(&params(20)).is_some());
+
+        // The video pipeline shares the tag helpers, so it has to reject the same range --
+        // otherwise the audio guard alone would leave the send-side clamp reachable.
+        let video = |tag_len| VideoPipelineParams {
+            warp_mi_tag_len: tag_len,
+            ..video_params(&call_key, lid, lid)
+        };
+        assert!(VideoPipeline::new(&video(21)).is_none());
+        assert!(VideoPipeline::new(&video(0)).is_none());
+        assert!(VideoPipeline::new(&video(WARP_MI_TAG_LEN)).is_some());
+        assert!(VideoPipeline::new(&video(20)).is_some());
     }
 
     #[test]

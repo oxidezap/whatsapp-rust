@@ -325,10 +325,19 @@ pub struct IncomingCall {
     /// Media material from an `<offer>` (the encrypted callKey + parsed relay), captured by the
     /// parser so the `voip` media facade can drive the call. `None` for non-offer actions or an
     /// offer with no `<enc>` for us. Boxed so the large `RelayData` doesn't bloat every `Event`
-    /// (the no-media common case stays one pointer). Skipped on the `serde` shape (binary-only).
+    /// (the no-media common case stays one pointer).
+    ///
+    /// Reached through [`Self::media`] rather than as a public field. The gate does not go away:
+    /// the accessor is gated too. What changes is where it lands. A field that comes and goes with
+    /// a feature changes how the type is built and matched; a method that does cannot, so code
+    /// that constructs or destructures an `IncomingCall` compiles the same either way. That is the
+    /// half `agent_docs/subsystem_boundary.md` test 4 is about. Unconditional is not the
+    /// alternative -- the type carries a parsed `RelayData`, so making it always present would
+    /// link the relay parser into every build.
     #[cfg(feature = "voip")]
     #[serde(skip)]
-    pub media: Option<Box<MediaOffer>>,
+    #[builder(skip)]
+    pub(crate) media: Option<Box<MediaOffer>>,
 }
 
 /// A call that must NOT ring: surfaced instead of [`IncomingCall`] so a consumer cannot auto-accept
@@ -426,6 +435,21 @@ impl IncomingCall {
     #[doc(hidden)]
     pub fn ringing_generation(&self) -> Option<u64> {
         self.ringing_generation
+    }
+
+    /// Attach the media material the parser captured from an `<offer>`. Not
+    /// `pub`: the parser below is the only caller, unlike the sibling setters
+    /// this crate exposes for `whatsapp-rust` to call.
+    #[cfg(feature = "voip")]
+    pub(crate) fn with_media(mut self, media: Option<Box<MediaOffer>>) -> Self {
+        self.media = media;
+        self
+    }
+
+    /// The offer's media material, when this is an `<offer>` that carried an `<enc>` for us.
+    #[cfg(feature = "voip")]
+    pub fn media(&self) -> Option<&MediaOffer> {
+        self.media.as_deref()
     }
 
     /// Minimal constructor for in-tree tests in dependent crates; `#[non_exhaustive]` blocks the

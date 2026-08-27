@@ -12,10 +12,12 @@
 //! sequence is unit-testable with a scripted stand-in.
 
 use crate::client::Client;
+use crate::client::subsystem::Subsystem;
 use crate::passkey::{Assertion, PasskeyAuthenticator, PasskeyError, parse_request_options};
 use crate::request::InfoQuery;
 use crate::store::commands::DeviceCommand;
 use crate::types::events::{Event, PairPasskeyConfirmation, PairPasskeyError, PairPasskeyRequest};
+use async_lock::Mutex;
 use async_trait::async_trait;
 use log::warn;
 use rand::RngExt;
@@ -23,14 +25,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wacore::libsignal::protocol::KeyPair;
 use wacore::shortcake::ShortcakeUtils;
+use wacore::stanza::wire_tags::NotificationType;
 use wacore::sync_marker::MaybeSendSync;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Node, NodeContent, NodeRef, OwnedNodeRef, SERVER_JID, Server};
 use waproto::whatsapp as wa;
-
-/// `<notification type=...>` routing keys, consumed by the notification dispatcher.
-pub(crate) const NOTIF_PASSKEY_REQUEST: &str = "passkey_prologue_request";
-pub(crate) const NOTIF_PASSKEY_CONTINUATION: &str = "crsc_continuation";
 
 const MD_NAMESPACE: &str = "md";
 const TAG_REF: &str = "ref";
@@ -239,14 +238,55 @@ impl ShortcakeSession {
     }
 }
 
-/// SHORTCAKE_PASSKEY flow state held on the [`Client`].
+/// What this subsystem parks on the core, as `Subsystem::State`.
 #[derive(Default)]
-pub(crate) struct PasskeyFlowState {
+pub(crate) struct PasskeyState {
+    flow: Mutex<PasskeyFlowState>,
+    /// Wait-free "an open is in flight" reservation. Outside `flow` so it can be
+    /// released synchronously on drop, which a flag behind the async lock could
+    /// not: an open cancelled at any await must not leave it stuck.
+    opening: AtomicBool,
+}
+
+/// SHORTCAKE_PASSKEY flow state.
+#[derive(Default)]
+struct PasskeyFlowState {
     /// HMAC key from the pre-rotation ADV secret; presence marks the re-link path
     /// that lets the server skip the verification-code UX. Consumed once.
     handoff_key: Option<[u8; 32]>,
     session: Option<ShortcakeSession>,
     authenticator: Option<Arc<dyn PasskeyAuthenticator>>,
+}
+
+/// This subsystem's attachment to the core (`src/client/subsystem.rs`).
+/// Claiming a notification type here is what routes it; the core holds no
+/// passkey state and runs no passkey branch.
+pub(crate) struct Passkey;
+
+impl Subsystem for Passkey {
+    type State = PasskeyState;
+
+    const NAME: &'static str = "passkey";
+
+    const NOTIFICATIONS: &'static [NotificationType] = &[
+        NotificationType::PasskeyPrologueRequest,
+        NotificationType::CrscContinuation,
+    ];
+
+    async fn handle_notification(
+        client: &Arc<Client>,
+        notification_type: NotificationType,
+        node: Arc<OwnedNodeRef>,
+    ) {
+        match notification_type {
+            NotificationType::PasskeyPrologueRequest => {
+                handle_passkey_notification(client, node).await
+            }
+            NotificationType::CrscContinuation => handle_passkey_continuation(client, node).await,
+            // The core routes only the types NOTIFICATIONS listed.
+            _ => {}
+        }
+    }
 }
 
 /// Holds the wait-free open reservation and releases it on drop. Because it clears
@@ -379,16 +419,21 @@ impl ShortcakeIo for Client {
 }
 
 impl Client {
+    /// The state this subsystem parked during client assembly.
+    fn passkey(&self) -> &PasskeyState {
+        self.subsystem::<Passkey>()
+    }
+
     /// Register a passkey authenticator. When set, the client auto-drives the
     /// assertion step and auto-confirms a re-link (where the handoff proof skips the
     /// verification-code UX). Leave it unset to drive the steps manually via the
     /// `Event::PairPasskey*` events.
     pub async fn set_passkey_authenticator(&self, authenticator: Arc<dyn PasskeyAuthenticator>) {
-        self.passkey_state.lock().await.authenticator = Some(authenticator);
+        self.passkey().flow.lock().await.authenticator = Some(authenticator);
     }
 
     async fn passkey_authenticator(&self) -> Option<Arc<dyn PasskeyAuthenticator>> {
-        self.passkey_state.lock().await.authenticator.clone()
+        self.passkey().flow.lock().await.authenticator.clone()
     }
 
     /// Send the WebAuthn assertion as `<passkey_prologue>` and open the handshake.
@@ -398,8 +443,9 @@ impl Client {
         // can't open a second overlapping handshake and clobber this one's nonce/ref
         // (which would then commit the wrong ADV rotation). The guard releases the
         // reservation on every exit, including cancellation mid-open.
-        if self
-            .passkey_opening
+        let passkey = self.passkey();
+        if passkey
+            .opening
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
@@ -408,11 +454,11 @@ impl Client {
             ));
         }
         let _guard = OpeningGuard {
-            flag: &self.passkey_opening,
+            flag: &passkey.opening,
         };
 
         let handoff_key = {
-            let mut state = self.passkey_state.lock().await;
+            let mut state = passkey.flow.lock().await;
             if state.session.is_some() {
                 return Err(PasskeyError::Flow(
                     "a passkey link is already in progress".into(),
@@ -422,7 +468,7 @@ impl Client {
         };
 
         let session = ShortcakeSession::open(self, assertion, handoff_key).await?;
-        self.passkey_state.lock().await.session = Some(session);
+        passkey.flow.lock().await.session = Some(session);
         Ok(())
     }
 
@@ -431,8 +477,9 @@ impl Client {
     pub async fn send_passkey_confirmation(&self) -> Result<(), PasskeyError> {
         // Only consume the session once it's actually at the confirmation stage — a
         // premature call must NOT drop the in-flight attempt.
+        let passkey = self.passkey();
         let mut session = {
-            let mut state = self.passkey_state.lock().await;
+            let mut state = passkey.flow.lock().await;
             match state.session.take() {
                 Some(s) if s.stage == Stage::AwaitingConfirmation => s,
                 Some(s) => {
@@ -452,19 +499,17 @@ impl Client {
     }
 
     async fn drive_continuation(&self, primary_bytes: Vec<u8>) -> Result<(), PasskeyError> {
-        let mut session = self
-            .passkey_state
-            .lock()
-            .await
-            .session
-            .take()
-            .ok_or_else(|| PasskeyError::Flow("continuation without an active session".into()))?;
+        let passkey = self.passkey();
+        let mut session =
+            passkey.flow.lock().await.session.take().ok_or_else(|| {
+                PasskeyError::Flow("continuation without an active session".into())
+            })?;
         let confirmation = session.on_primary_identity(self, &primary_bytes).await?;
         let skip = confirmation.skip_handoff_ux;
 
         // Restore the session BEFORE publishing the event, so a synchronous listener
         // that confirms from it sees an active session.
-        self.passkey_state.lock().await.session = Some(session);
+        passkey.flow.lock().await.session = Some(session);
         self.core
             .event_bus
             .dispatch(Event::PairPasskeyConfirmation(confirmation));
@@ -530,7 +575,7 @@ async fn drive_passkey_request(client: &Arc<Client>, options_json: String) {
     } else {
         None
     };
-    client.passkey_state.lock().await.handoff_key = handoff_key;
+    client.passkey().flow.lock().await.handoff_key = handoff_key;
 
     client.core.event_bus.dispatch(Event::PairPasskeyRequest(
         PairPasskeyRequest::builder()
@@ -618,6 +663,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
     use wacore::libsignal::protocol::PublicKey;
+    use wacore::stanza::wire_tags::NotificationType;
     use waproto::whatsapp as wa;
 
     fn server_notification(notif_type: &'static str, child: Option<Node>) -> Arc<OwnedNodeRef> {
@@ -841,7 +887,7 @@ mod tests {
     async fn premature_confirmation_keeps_the_session() {
         let client = create_test_client().await;
         // A session that hasn't reached the confirmation stage yet.
-        client.passkey_state.lock().await.session = Some(ShortcakeSession {
+        client.passkey().flow.lock().await.session = Some(ShortcakeSession {
             keypair: KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>()),
             companion_nonce: [0; 32],
             pairing_ref: "r".into(),
@@ -857,7 +903,7 @@ mod tests {
             "confirming before the verification stage errors"
         );
         assert!(
-            client.passkey_state.lock().await.session.is_some(),
+            client.passkey().flow.lock().await.session.is_some(),
             "a premature confirmation must not drop the in-flight attempt"
         );
     }
@@ -865,14 +911,14 @@ mod tests {
     #[tokio::test]
     async fn cancelled_open_releases_the_reservation() {
         let client = create_test_client().await;
-        client.passkey_opening.store(true, Ordering::Release);
+        client.passkey().opening.store(true, Ordering::Release);
         // A dropped guard stands in for a send_passkey_response cancelled mid-open;
         // the release is a sync store, so it holds even under lock contention.
         drop(OpeningGuard {
-            flag: &client.passkey_opening,
+            flag: &client.passkey().opening,
         });
         assert!(
-            !client.passkey_opening.load(Ordering::Acquire),
+            !client.passkey().opening.load(Ordering::Acquire),
             "a cancelled open must release the reservation"
         );
     }
@@ -895,7 +941,10 @@ mod tests {
             .bytes(options.as_bytes().to_vec())
             .build();
         client
-            .process_node(server_notification(NOTIF_PASSKEY_REQUEST, Some(child)))
+            .process_node(server_notification(
+                NotificationType::PasskeyPrologueRequest.as_str(),
+                Some(child),
+            ))
             .await;
 
         // The rotation is deferred to confirmation, so the stored secret is unchanged.
@@ -928,7 +977,7 @@ mod tests {
             .bytes(b"{}".to_vec())
             .build();
         let node = NodeBuilder::new("notification")
-            .attr("type", NOTIF_PASSKEY_REQUEST)
+            .attr("type", NotificationType::PasskeyPrologueRequest.as_str())
             .attr("from", "12345@s.whatsapp.net")
             .children([child])
             .build();
@@ -954,7 +1003,10 @@ mod tests {
         // No inline options: the handler falls back to an IQ fetch. The test client
         // isn't connected, so the fetch fails and surfaces a non-continuation error.
         client
-            .process_node(server_notification(NOTIF_PASSKEY_REQUEST, None))
+            .process_node(server_notification(
+                NotificationType::PasskeyPrologueRequest.as_str(),
+                None,
+            ))
             .await;
 
         wait_for(&collector, |e| {
@@ -983,7 +1035,10 @@ mod tests {
             .bytes(buffa::Message::encode_to_vec(&primary))
             .build();
         client
-            .process_node(server_notification(NOTIF_PASSKEY_CONTINUATION, Some(child)))
+            .process_node(server_notification(
+                NotificationType::CrscContinuation.as_str(),
+                Some(child),
+            ))
             .await;
 
         wait_for(
@@ -1030,7 +1085,7 @@ mod tests {
         let client = create_test_client().await;
         drive_passkey_request(&client, "{}".to_string()).await;
         assert!(
-            client.passkey_state.lock().await.handoff_key.is_none(),
+            client.passkey().flow.lock().await.handoff_key.is_none(),
             "a fresh link must leave handoff_key None (verification-code UX stays on)"
         );
     }
@@ -1047,7 +1102,7 @@ mod tests {
             .await;
         drive_passkey_request(&client, "{}".to_string()).await;
         assert!(
-            client.passkey_state.lock().await.handoff_key.is_some(),
+            client.passkey().flow.lock().await.handoff_key.is_some(),
             "a re-link with a prior identity must derive the handoff key"
         );
     }

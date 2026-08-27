@@ -1,0 +1,64 @@
+# cargo-nextest configuration — https://nexte.st/docs/configuration/
+#
+# nextest gives each test its own process, so a test that aborts, installs a
+# process-wide signal handler, or leaks a global (dhat's allocator, env_logger's
+# once-init, the SIGINT/SIGTERM cases in tests/shutdown_signal.rs) can no longer
+# perturb the rest of its binary. It also schedules across binaries instead of
+# one binary at a time, which is where the workspace's wall-clock win comes from.
+#
+# Doctests are the one thing it cannot run (nextest-rs/nextest#16), so CI keeps a
+# separate `cargo test --doc` step. An example asserted only in a doc comment is
+# covered by that step and nothing else — do not drop it.
+
+# The `e2e` profile below uses `terminate-after`, which older releases parse but
+# ignore; fail loudly instead of silently losing the hang guard.
+nextest-version = { required = "0.9.70" }
+
+[profile.default]
+# Warn, don't kill: a unit test past a minute is a hang or an accidental network
+# call, and naming it in the log is enough — the local loop is where you want the
+# process left alive to attach to.
+slow-timeout = { period = "60s" }
+
+[profile.ci]
+# CI logs are read after the fact, not watched. Run everything so one broken test
+# doesn't hide the other twenty, and repeat the failures at the end so the verdict
+# is the last thing in the log rather than something to scroll back for.
+fail-fast = false
+failure-output = "immediate-final"
+# The report below is what makes cost visible now, so this line is only an alarm
+# for something new: 60s sits above the slowest test measured on a CI runner (a
+# MLow fuzz shard at 54s, with 5116 tests contending for four vCPUs). What the
+# profile never had is the ceiling: 3 periods puts it at 180s, so a hang costs
+# one test's wall clock instead of the job's.
+slow-timeout = { period = "60s", terminate-after = 3 }
+# A PASS line per test is thousands of lines of nothing; the summary carries the
+# count and the report below carries the times. `slow` rather than `fail` because
+# the levels nest: this is what names the tests that trip the slow-timeout, where
+# `fail` reports "1 slow" and never says which one.
+status-level = "slow"
+final-status-level = "flaky"
+
+# What every test cost, every run. `status-level` only names what crosses its
+# threshold, so on its own it cannot say whether the suite is 5000 cheap tests or
+# 4999 cheap ones and a fuzz, which is the question asked whenever a job slows
+# down. Written to target/nextest/ci/junit.xml, which CI publishes.
+[profile.ci.junit]
+path = "junit.xml"
+
+[profile.e2e]
+# The e2e suite talks to the bartender mock server, so its failure mode is a wait
+# that never ends (a stanza that never arrives), not a panic. In-test waits top out
+# at 60s, so warn at 60s and terminate at 4 minutes: a hung test then costs one
+# test's wall clock and reports as a timeout, instead of sitting on the job until
+# GitHub's 6-hour ceiling with no verdict.
+slow-timeout = { period = "60s", terminate-after = 4 }
+fail-fast = false
+failure-output = "immediate-final"
+final-status-level = "flaky"
+
+# Same report as `ci`. This profile does print a PASS line per test, but adding
+# 166 of them up by hand is how this suite was last audited; the report makes the
+# same numbers something a script can read.
+[profile.e2e.junit]
+path = "junit.xml"

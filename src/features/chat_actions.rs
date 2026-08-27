@@ -12,14 +12,16 @@ use thiserror::Error;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::appstate::schemas::{self, IndexPart, Schema};
 use wacore::types::events::{
-    ArchiveUpdate, ClearChatUpdate, ContactUpdate, DeleteChatUpdate, DeleteMessageForMeUpdate,
-    Event, MarkChatAsReadUpdate, MuteUpdate, PinUpdate, StarUpdate, UserStatusMuteUpdate,
+    ArchiveUpdate, ClearChatUpdate, ContactRemoved, ContactUpdate, DeleteChatUpdate,
+    DeleteMessageForMeUpdate, Event, MarkChatAsReadUpdate, MuteUpdate, PinUpdate, StarUpdate,
+    UserStatusMuteUpdate,
 };
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
-/// Error returned by app-state (syncd) mutations — the shared failure domain
-/// of chat actions ([`ChatActions`]) and labels ([`crate::Labels`]).
+/// Error returned by app-state (syncd) requests — the shared failure domain of
+/// chat actions ([`ChatActions`]), labels ([`crate::Labels`]) and re-syncs
+/// ([`crate::Client::resync_app_state`]).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AppStateError {
@@ -28,6 +30,11 @@ pub enum AppStateError {
     /// label id).
     #[error("invalid app-state request: {0}")]
     InvalidRequest(String),
+    /// The transport, not the request, is what stopped it: the client is
+    /// shutting down, was never started, or lost the socket before the request
+    /// could be sent or answered.
+    #[error("no usable connection for the app-state request")]
+    NotConnected,
     /// Encoding, key lookup, or sending the app-state patch failed.
     #[error("{0}")]
     Internal(#[from] anyhow::Error),
@@ -78,11 +85,22 @@ pub(crate) fn dispatch_chat_mutation(
     m: &Mutation,
     full_sync: bool,
 ) -> bool {
-    if m.operation != wa::syncd_mutation::SyncdOperation::SET || m.index.is_empty() {
+    if m.index.is_empty() {
         return false;
     }
 
     let kind = &m.index[0];
+
+    // `contact` is the one chat action whose deletion arrives as a syncd
+    // `Remove` (WAWebContactSync branches on `operation === "remove"`); every
+    // other kind here encodes its "off" state inside a `Set` value, so a
+    // non-`Set` operation on one of them is not ours to interpret.
+    let is_contact_remove = m.operation == wa::syncd_mutation::SyncdOperation::REMOVE
+        && kind == "contact"
+        && m.index.len() > 1;
+    if m.operation != wa::syncd_mutation::SyncdOperation::SET && !is_contact_remove {
+        return false;
+    }
 
     if !matches!(
         kind.as_str(),
@@ -189,6 +207,16 @@ pub(crate) fn dispatch_chat_mutation(
                         .build(),
                 ));
             }
+            true
+        }
+        "contact" if is_contact_remove => {
+            event_bus.dispatch(Event::ContactRemoved(
+                ContactRemoved::builder()
+                    .jid(jid)
+                    .timestamp(time)
+                    .from_full_sync(full_sync)
+                    .build(),
+            ));
             true
         }
         "contact" => {
@@ -671,6 +699,40 @@ impl<'a> ChatActions<'a> {
             .await
     }
 
+    /// Delete a saved contact, syncing the removal to the user's other linked
+    /// devices.
+    ///
+    /// Writes the same `["contact", jid]` index as
+    /// [`save_contact`](Self::save_contact) on `critical_unblock_low`, but as a
+    /// syncd **`Remove`** — WA Web's `WAWebContactSync.getContactSyncMutation`
+    /// selects the operation from its `isDelete` flag
+    /// (`isDelete ? SyncdOperation.REMOVE : SyncdOperation.SET`) and its
+    /// receiving side branches on `operation === "remove"` to drop the contact
+    /// from the address book. A `Set` carrying an empty `ContactAction` would
+    /// instead be applied as a rename to the empty string.
+    ///
+    /// The value is still sent: WA Web builds its `contactAction` before
+    /// choosing the operation, so a removal carries an all-absent action.
+    pub async fn remove_contact(&self, jid: &Jid) -> Result<(), AppStateError> {
+        if !is_valid_contact_id(jid) {
+            return Err(AppStateError::InvalidRequest(
+                "remove_contact: contact id must be a bare phone-number JID (not a LID, group, or device-specific JID)".into(),
+            ));
+        }
+        debug!("Removing contact {jid}");
+        let value = wa::SyncActionValue {
+            contact_action: buffa::MessageField::some(
+                wa::sync_action_value::ContactAction::default(),
+            ),
+            timestamp: Some(wacore::time::now_millis()),
+            ..Default::default()
+        };
+        let jid_str = jid.to_string();
+        self.client
+            .remove_app_state_action(&schemas::CONTACT, &[jid_str.as_str()], &value)
+            .await
+    }
+
     async fn send_archive_mutation(
         &self,
         jid: &Jid,
@@ -770,7 +832,7 @@ impl Client {
         ChatActions::new(self)
     }
 
-    /// Encode a single `Set` app-state mutation (stamped with the action schema
+    /// Encode a single app-state mutation (stamped with the action schema
     /// `version`) and send it as a patch on `collection`. Shared by the
     /// chat-action and label features.
     pub(crate) async fn send_app_state_mutation(
@@ -779,11 +841,12 @@ impl Client {
         index: &[u8],
         value: &wa::SyncActionValue,
         version: i32,
+        operation: wa::syncd_mutation::SyncdOperation,
     ) -> Result<(), AppStateError> {
         use rand::Rng;
         use wacore::appstate::encode::encode_record;
 
-        let proc = self.get_app_state_processor().await;
+        let proc = self.get_app_state_processor();
         let key_id = proc
             .backend
             .get_latest_sync_key_id()
@@ -800,15 +863,7 @@ impl Client {
         let mut iv = [0u8; 16];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
 
-        let (mutation, _) = encode_record(
-            wa::syncd_mutation::SyncdOperation::SET,
-            index,
-            value,
-            &keys,
-            &key_id,
-            &iv,
-            version,
-        );
+        let (mutation, _) = encode_record(operation, index, value, &keys, &key_id, &iv, version);
 
         self.send_app_state_patch(collection.as_str(), vec![mutation])
             .await?;
@@ -852,11 +907,127 @@ impl Client {
         index_args: &[&str],
         value: &wa::SyncActionValue,
     ) -> Result<(), AppStateError> {
+        self.send_app_state_action_op(
+            schema,
+            index_args,
+            value,
+            wa::syncd_mutation::SyncdOperation::SET,
+        )
+        .await
+    }
+
+    /// Send an app-state action as a syncd `Remove` rather than a `Set`.
+    ///
+    /// Only a few actions model deletion this way — most (labels, quick
+    /// replies) carry a `deleted` flag inside a `Set` value instead, and sending
+    /// a `Remove` for one of those would drop the record from the collection
+    /// without the linked devices ever seeing the deletion. Check the action's
+    /// WA Web builder before reaching for this;
+    /// [`ChatActions::remove_contact`] is the one wrapped helper.
+    ///
+    /// `value` is still encoded and MAC'd (WA Web builds the same value struct
+    /// for both branches of `getContactSyncMutation`), so pass the action's
+    /// value type with the fields it would carry, plus a `timestamp`.
+    pub async fn remove_app_state_action(
+        &self,
+        schema: &Schema,
+        index_args: &[&str],
+        value: &wa::SyncActionValue,
+    ) -> Result<(), AppStateError> {
+        self.send_app_state_action_op(
+            schema,
+            index_args,
+            value,
+            wa::syncd_mutation::SyncdOperation::REMOVE,
+        )
+        .await
+    }
+
+    async fn send_app_state_action_op(
+        &self,
+        schema: &Schema,
+        index_args: &[&str],
+        value: &wa::SyncActionValue,
+        operation: wa::syncd_mutation::SyncdOperation,
+    ) -> Result<(), AppStateError> {
         let index = build_action_index(schema, index_args)?;
         let collection = collection_patch_name(schema.collection);
-        self.send_app_state_mutation(collection, &index, value, schema.version as i32)
+        self.send_app_state_mutation(collection, &index, value, schema.version as i32, operation)
             .await
     }
+}
+
+/// Capture what an app-state verb actually puts on the wire.
+///
+/// Runs `send` against a mock transport with a seeded sync key, takes the
+/// `<sync><collection><patch>` blob out of the first IQ it writes, and decodes
+/// the single mutation inside it. The result is the same [`Mutation`] the
+/// receiving device would see — operation, index and `SyncActionValue` — so a
+/// test can assert on the wire form rather than on the builder that produced it.
+#[cfg(test)]
+pub(crate) async fn capture_app_state_mutation<F, Fut>(collection: &str, send: F) -> Mutation
+where
+    F: FnOnce(std::sync::Arc<Client>) -> Fut,
+    Fut: Future<Output = Result<(), AppStateError>> + Send + 'static,
+{
+    use wacore::appstate::{decode_record, expand_app_state_keys};
+
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    let key_id = b"capture-key".to_vec();
+    let backend = client.persistence_manager.backend();
+    backend
+        .set_sync_key(
+            &key_id,
+            crate::store::traits::AppStateSyncKey {
+                key_data: vec![5u8; 32],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("test backend should accept a sync key");
+    backend
+        .set_version(
+            collection,
+            wacore::appstate::hash::HashState {
+                version: 7,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("test backend should accept a version");
+
+    // The verb blocks on the server's answer, which never comes; the patch it
+    // wrote first is all this needs.
+    let sending = tokio::spawn(send(std::sync::Arc::clone(&client)));
+    let iq = crate::test_utils::decode_sent_iq(&transport, 0).await;
+    sending.abort();
+
+    let iq = iq.get().to_owned();
+    let patch = iq
+        .get_optional_child_by_tag(&["sync", "collection", "patch"])
+        .expect("the verb should send a <patch>");
+    let wacore_binary::NodeContent::Bytes(bytes) = patch.content.as_ref().expect("patch has bytes")
+    else {
+        panic!("a <patch> carries bytes");
+    };
+    let patch = waproto::codec::syncd_patch_decode(bytes).expect("the patch should decode");
+    assert_eq!(patch.mutations.len(), 1, "verbs send one mutation each");
+    let mutation = &patch.mutations[0];
+    let operation = mutation
+        .operation
+        .expect("every mutation states its operation")
+        .as_known()
+        .expect("and it is a known one");
+    let keys = expand_app_state_keys(&[5u8; 32]);
+    let (decoded, _) = decode_record(
+        operation,
+        mutation.record.as_option().expect("mutation has a record"),
+        &keys,
+        &key_id,
+        true,
+    )
+    .expect("the record we just wrote should decode and verify");
+    decoded
 }
 
 #[cfg(test)]
@@ -976,6 +1147,179 @@ mod registry_tests {
             collection_patch_name(schemas::CONTACT.collection),
             WAPatchName::CriticalUnblockLow
         );
+    }
+
+    /// The question this feature turns on: deleting a contact is a syncd
+    /// `Remove`, not a `Set` carrying an empty `ContactAction`.
+    ///
+    /// WA Web's `WAWebContactSync.getContactSyncMutation` selects
+    /// `isDelete ? SyncdOperation.REMOVE : SyncdOperation.SET` over the same
+    /// `["contact", jid]` index, and its receiving side branches on
+    /// `operation === "remove"` to drop the contact from the address book — a
+    /// `Set` with empty names would be applied as a rename instead.
+    #[tokio::test]
+    async fn remove_contact_sends_a_remove_and_save_contact_a_set() {
+        let jid: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
+        let collection = collection_patch_name(schemas::CONTACT.collection);
+
+        let removed = capture_app_state_mutation(collection.as_str(), {
+            let jid = jid.clone();
+            move |client| async move { client.chat_actions().remove_contact(&jid).await }
+        })
+        .await;
+        assert_eq!(
+            removed.operation,
+            wa::syncd_mutation::SyncdOperation::REMOVE,
+            "contact deletion must be a Remove, not a Set with an empty action"
+        );
+        assert_eq!(removed.index, vec!["contact", "12025550111@s.whatsapp.net"]);
+
+        let saved = capture_app_state_mutation(collection.as_str(), {
+            let jid = jid.clone();
+            move |client| async move {
+                client
+                    .chat_actions()
+                    .save_contact(&jid, Some("Alex Doe".into()), Some("Alex".into()), true)
+                    .await
+            }
+        })
+        .await;
+        assert_eq!(
+            saved.operation,
+            wa::syncd_mutation::SyncdOperation::SET,
+            "saving must stay a Set — the two verbs differ by operation, not just by payload"
+        );
+        assert_eq!(saved.index, removed.index, "both key the same index");
+        let action = saved
+            .action_value
+            .as_ref()
+            .and_then(|v| v.contact_action.as_option())
+            .expect("a save carries contactAction");
+        assert_eq!(action.full_name.as_deref(), Some("Alex Doe"));
+        assert_eq!(action.first_name.as_deref(), Some("Alex"));
+        assert_eq!(action.save_on_primary_addressbook, Some(true));
+    }
+
+    /// A removal that comes back from a linked device must reach the consumer.
+    /// Before this feature the Set-only gate in `dispatch_app_state_mutation`
+    /// silently dropped it.
+    #[tokio::test]
+    async fn contact_removal_round_trips_to_an_event() {
+        let jid: Jid = "12025550111@s.whatsapp.net".parse().expect("test JID");
+        let mutation = capture_app_state_mutation(
+            collection_patch_name(schemas::CONTACT.collection).as_str(),
+            {
+                let jid = jid.clone();
+                move |client| async move { client.chat_actions().remove_contact(&jid).await }
+            },
+        )
+        .await;
+
+        let sent_at = mutation
+            .action_value
+            .as_ref()
+            .and_then(|v| v.timestamp)
+            .expect("the removal stamps its value with a timestamp");
+
+        let (handled, events) = dispatch_into_recorder(&mutation);
+        assert!(handled);
+        assert_eq!(events.len(), 1);
+        match &*events[0] {
+            Event::ContactRemoved(u) => {
+                assert_eq!(u.jid, jid);
+                // The whole payload, not just the JID: the event carries the
+                // mutation's own timestamp, not the moment it was dispatched.
+                assert_eq!(u.timestamp, wacore::time::from_millis_or_now(sent_at));
+                assert!(!u.from_full_sync, "this arrived as an incremental patch");
+            }
+            other => panic!("expected ContactRemoved, got {other:?}"),
+        }
+
+        // ...and a full-sync replay is marked as one.
+        let (_, events) = dispatch_into_recorder_with(&mutation, true);
+        match &*events[0] {
+            Event::ContactRemoved(u) => assert!(u.from_full_sync),
+            other => panic!("expected ContactRemoved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_contact_set_still_dispatches_an_update_not_a_removal() {
+        // The Remove arm must not swallow the Set one.
+        let m = Mutation {
+            index: vec!["contact".into(), "12025550111@s.whatsapp.net".into()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue {
+                contact_action: buffa::MessageField::some(wa::sync_action_value::ContactAction {
+                    full_name: Some("Alex Doe".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let (handled, events) = dispatch_into_recorder(&m);
+        assert!(handled);
+        assert!(matches!(&*events[0], Event::ContactUpdate(_)));
+    }
+
+    #[test]
+    fn a_remove_on_another_kind_is_not_claimed() {
+        // Only `contact` models deletion as a Remove; a Remove on anything else
+        // must fall through untouched rather than be read as its Set.
+        for kind in ["mute", "pin", "archive", "star"] {
+            let m = Mutation {
+                index: vec![kind.into(), "12025550111@s.whatsapp.net".into()],
+                operation: wa::syncd_mutation::SyncdOperation::REMOVE,
+                action_value: Some(wa::SyncActionValue::default()),
+            };
+            let (handled, events) = dispatch_into_recorder(&m);
+            assert!(!handled, "a Remove on '{kind}' must not be claimed");
+            assert!(events.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn contact_verbs_reject_a_non_phone_number_id() {
+        let client = crate::test_utils::create_test_client().await;
+        let lid: Jid = "100000012345678@lid".parse().expect("test JID");
+        assert!(client.chat_actions().remove_contact(&lid).await.is_err());
+        assert!(
+            client
+                .chat_actions()
+                .save_contact(&lid, None, None, false)
+                .await
+                .is_err()
+        );
+    }
+
+    fn dispatch_into_recorder(m: &Mutation) -> (bool, Vec<std::sync::Arc<Event>>) {
+        dispatch_into_recorder_with(m, false)
+    }
+
+    fn dispatch_into_recorder_with(
+        m: &Mutation,
+        full_sync: bool,
+    ) -> (bool, Vec<std::sync::Arc<Event>>) {
+        use std::sync::{Arc, Mutex};
+        use wacore::types::events::{CoreEventBus, EventHandler, EventInterest};
+
+        struct Recorder(Arc<Mutex<Vec<Arc<Event>>>>);
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: Arc<Event>) {
+                self.0.lock().unwrap().push(event);
+            }
+            fn interest(&self) -> EventInterest {
+                EventInterest::ALL
+            }
+        }
+
+        let bus = CoreEventBus::new();
+        let seen: Arc<Mutex<Vec<Arc<Event>>>> = Arc::new(Mutex::new(Vec::new()));
+        bus.subscribe_handler(Arc::new(Recorder(seen.clone())))
+            .detach();
+        let handled = dispatch_chat_mutation(&bus, m, full_sync);
+        let events = seen.lock().unwrap().clone();
+        (handled, events)
     }
 
     #[test]

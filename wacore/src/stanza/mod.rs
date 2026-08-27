@@ -8,9 +8,11 @@ pub mod connect_failure;
 pub mod devices;
 pub mod group_call;
 pub mod groups;
+pub mod ib;
 pub mod message;
 pub mod notification;
 pub mod receipt;
+pub mod wire_tags;
 
 pub use business::*;
 pub use devices::*;

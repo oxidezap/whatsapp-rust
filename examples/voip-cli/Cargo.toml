@@ -5,7 +5,7 @@
 # it explicitly with `cargo run -p whatsapp-rust-voip-cli`.
 [package]
 name = "whatsapp-rust-voip-cli"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 license = "MIT"

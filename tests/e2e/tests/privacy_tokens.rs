@@ -1046,22 +1046,25 @@ async fn test_restricted_presence_subscribe_requires_tctoken() -> anyhow::Result
     assert!(!has_child(&denied_node, "cstoken"));
 
     client_a.client.presence().set_unavailable().await?;
+    // The tc-token seeding message doubles as the barrier. A presence update is
+    // dispatched inline off the read loop while a message goes through its chat
+    // lane first, so a presence B was not entitled to would be in B's channel
+    // before this text is.
+    client_a
+        .client
+        .send_message(jid_b.clone(), text_msg("seed presence tc token"))
+        .await?;
     client_b
-        .assert_no_event(
-            5,
+        .assert_no_event_before(
+            30,
             |e| matches!(e, Event::Presence(update) if update.from == jid_a && update.unavailable),
+            |e| {
+                e.messages()
+                    .any(|m| m.message.conversation.as_deref() == Some("seed presence tc token"))
+            },
             "restricted presence subscribe without tctoken should not deliver updates",
         )
         .await?;
-
-    send_and_expect_text(
-        &client_a.client,
-        &mut client_b,
-        &jid_b,
-        "seed presence tc token",
-        30,
-    )
-    .await?;
     let key_a = client_a.tc_token_key().await?;
     client_b.wait_for_tc_token(&key_a, 10).await?;
 

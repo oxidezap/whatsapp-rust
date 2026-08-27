@@ -39,6 +39,29 @@ fn synth_input() -> Vec<f32> {
     out
 }
 
+/// `synth_input` with the low mantissa bit of about half the samples flipped: the smallest change
+/// an f32 signal can carry. Which samples are hit is a pure function of `(index, seed)`, so each
+/// seed is a different, reproducible one-ULP neighbour of the same signal.
+///
+/// One quarter of the corpus is exact-zero silence, so about an eighth of it goes from `0.0` to the
+/// smallest subnormal rather than taking an ordinary mantissa step. That is still one ULP, and it
+/// is not what drives the divergence the test measures: the silence frames are the ones that stay
+/// closest to the unperturbed output (70-86 dB), while the frames that move are tone and noise,
+/// where every flip is a mantissa step on a normal float.
+fn perturb_one_ulp(x: &[f32], seed: u32) -> Vec<f32> {
+    x.iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let mut h = (i as u32).wrapping_mul(0x9e37_79b9) ^ seed.wrapping_mul(0x85eb_ca6b);
+            h ^= h >> 15;
+            h = h.wrapping_mul(0xc2b2_ae35);
+            h ^= h >> 13;
+            let bits = v.to_bits();
+            f32::from_bits(if h & 1 == 0 { bits ^ 1 } else { bits })
+        })
+        .collect()
+}
+
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -83,17 +106,22 @@ fn digest(out: &[i16]) -> Digest {
 // Golden digest of the validated codec (regenerate with VOIP_GOLDEN=1; see module docs). The
 // scalars are tolerant and platform-robust; the checksum is exact and stable on the CI target.
 const GOLDEN_SAMPLES: usize = 23040;
-const GOLDEN_RMS: f32 = 0.154699;
-const GOLDEN_PEAK: f32 = 0.458405;
 const GOLDEN_CLIP: f32 = 0.0;
-const GOLDEN_CHECKSUM: u64 = 0x8782_cb8c_d7b5_f262;
+
+// The scalars are tolerant and platform-robust; the checksums are exact, and exact means exact for
+// one build: the encoder resolves ties on f32 comparisons, so the bitstream is a function of the
+// arithmetic the compiler emits, not only of the source. Changing `-C target-cpu` alone moves these
+// constants. They are a drift tripwire on the CI target, not a portable identity of the codec.
+const GOLDEN_RMS: f32 = 0.156401;
+const GOLDEN_PEAK: f32 = 0.524200;
+const GOLDEN_CHECKSUM: u64 = 0x4302_cced_6791_52b4;
 // Pins the ENCODER bitstream independently of the decoder: fnv1a over the concatenation of every
 // emitted packet's wire bytes. Drift here means the encoder changed even if decode output did not.
-const GOLDEN_FRAMES_CHECKSUM: u64 = 0xb179_3f10_72d1_5a7d;
+const GOLDEN_FRAMES_CHECKSUM: u64 = 0x5583_7f25_b89a_0621;
 
-#[test]
-fn golden_roundtrip_no_regression() {
-    let input = synth_input();
+/// Encode then decode the whole corpus, returning the decoded i16 output and the concatenated
+/// packet bytes.
+fn roundtrip(input: &[f32]) -> (Vec<i16>, Vec<u8>) {
     let mut enc = MlowEncoder::new();
     let mut dec = MlowDecoder::new();
     let mut out: Vec<i16> = Vec::new();
@@ -113,6 +141,28 @@ fn golden_roundtrip_no_regression() {
             "clean corpus raised the range decoder error flag"
         );
     }
+    (out, pkt_bytes)
+}
+
+/// Signal-to-difference ratio in dB, treating `a` as the signal and `a - b` as the error.
+fn snr_db(a: &[i16], b: &[i16]) -> f64 {
+    let mut sig = 0.0f64;
+    let mut err = 0.0f64;
+    for (x, y) in a.iter().zip(b) {
+        sig += (*x as f64) * (*x as f64);
+        let d = (*x as f64) - (*y as f64);
+        err += d * d;
+    }
+    if err == 0.0 {
+        return f64::INFINITY;
+    }
+    10.0 * (sig / err).log10()
+}
+
+#[test]
+fn golden_roundtrip_no_regression() {
+    let input = synth_input();
+    let (out, pkt_bytes) = roundtrip(&input);
     let d = digest(&out);
     let frames_checksum = fnv1a(&pkt_bytes);
 
@@ -152,4 +202,35 @@ fn golden_roundtrip_no_regression() {
         frames_checksum, GOLDEN_FRAMES_CHECKSUM,
         "encoder bitstream drifted (encoder regression). If intentional, regenerate the golden with VOIP_GOLDEN=1.",
     );
+}
+
+/// The encoder resolves discrete choices -- pulse positions, codebook indices, voicing -- on f32
+/// comparisons that routinely sit on ties, so the last bit of any intermediate decides which branch
+/// wins for a whole subframe. Perturbing the INPUT by one ULP, with the encoder byte-for-byte
+/// unchanged, is enough: the decoded output then lands 21-27 dB from the unperturbed one, with
+/// individual frames as low as ~10 dB, while still being a valid encoding of the same signal.
+///
+/// This is what the exact checksums above do and do not mean. They pin one arithmetic path
+/// exactly, which is what makes them a useful tripwire; they say nothing about whether a different
+/// path is worse. Two encodings that land far apart on this measure can be equally good encodings
+/// of the same signal -- which is why a change of arithmetic is judged against the SOURCE, by
+/// perceptual measurement, and not against the previous bitstream.
+///
+/// Asserting an upper bound on the SNR looks backwards, but it is the load-bearing half: if a
+/// one-ULP input change ever stopped moving the output, the tie-breaking would have changed and
+/// the reasoning above would no longer hold.
+#[test]
+fn encoder_output_is_last_bit_chaotic() {
+    let input = synth_input();
+    let (base, _) = roundtrip(&input);
+    for seed in 1..=4u32 {
+        let (near, _) = roundtrip(&perturb_one_ulp(&input, seed));
+        assert_eq!(near.len(), base.len(), "seed {seed}: output length drifted");
+        let snr = snr_db(&base, &near);
+        assert!(
+            (10.0..40.0).contains(&snr),
+            "seed {seed}: one-ULP input change gave {snr:.2} dB against the unperturbed output; \
+             outside 10-40 dB the encoder is either no longer tie-sensitive or genuinely broken"
+        );
+    }
 }

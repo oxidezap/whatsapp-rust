@@ -21,7 +21,12 @@ pub struct Mutation {
 #[derive(Debug, Clone)]
 pub struct RecordMacs {
     pub index_mac: Vec<u8>,
-    pub value_mac: Vec<u8>,
+    /// The value blob's trailing MAC. Fixed-size because the length is already
+    /// guaranteed: a blob shorter than `iv(16) + mac(32)` is rejected above, and
+    /// the MAC is exactly the last 32 bytes of what is left. A `Vec` here meant a
+    /// 32-byte heap allocation per decoded record, including for the REMOVE
+    /// mutations that discard the value MAC without ever reading it.
+    pub value_mac: [u8; 32],
 }
 
 /// Decode a single encrypted record into a mutation.
@@ -71,7 +76,12 @@ pub fn decode_record(
         }
     }
 
-    let mut plaintext = Vec::new();
+    // Sized up front from the ciphertext, which is the plaintext's exact upper
+    // bound (CBC output length minus PKCS7 padding). The bundled provider
+    // reserves this itself, but the trait only promises to clear and fill `out`,
+    // so an external provider that appends block by block reallocates its way up
+    // from an empty buffer on every mutation of every patch.
+    let mut plaintext = Vec::with_capacity(ciphertext.len());
     aes_256_cbc_decrypt_into(ciphertext, &keys.value_encryption, iv, &mut plaintext)
         .map_err(|_| AppStateError::DecryptionFailed)?;
 
@@ -116,7 +126,9 @@ pub fn decode_record(
         },
         RecordMacs {
             index_mac,
-            value_mac: value_mac.to_vec(),
+            value_mac: value_mac
+                .try_into()
+                .expect("split_at leaves exactly the trailing 32 bytes"),
         },
     ))
 }

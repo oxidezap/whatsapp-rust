@@ -179,6 +179,13 @@ pub struct CacheConfig {
     /// the same id does not surface a second notification. Default: 5m TTL,
     /// 1000 entries.
     pub undecryptable_dispatched: CacheEntryConfig,
+    /// Dispatch-once gate for a decrypted message: a sender whose outbox
+    /// retries resends the same id re-encrypted, which the ratchet cannot see
+    /// as a duplicate. Default: 5m TTL, 1000 entries. The TTL covers the
+    /// observed resend window (production logs: median 12s between attempts,
+    /// p90 189s, longest plausible resend 285s) and the capacity ~3.6x the
+    /// busiest 5-minute burst measured (278 messages). Capacity 0 disables it.
+    pub dispatched_messages: CacheEntryConfig,
     /// PDO pending requests (time_to_live). Default: 30s TTL, 200 entries.
     pub pdo_pending_requests: CacheEntryConfig,
     /// Messages already covered by a placeholder-resend PDO request
@@ -280,6 +287,7 @@ impl std::fmt::Debug for CacheConfig {
             .field("recent_messages", &self.recent_messages)
             .field("message_retry_counts", &self.message_retry_counts)
             .field("undecryptable_dispatched", &self.undecryptable_dispatched)
+            .field("dispatched_messages", &self.dispatched_messages)
             .field("pdo_pending_requests", &self.pdo_pending_requests)
             .field("pdo_requested", &self.pdo_requested)
             .field("sender_key_devices_cache", &self.sender_key_devices_cache)
@@ -341,6 +349,7 @@ impl Default for CacheConfig {
             // 5m TTL expired between reconnects so the count never reached the cap.
             message_retry_counts: CacheEntryConfig::new(one_hour, 500),
             undecryptable_dispatched: CacheEntryConfig::new(five_min, 1_000),
+            dispatched_messages: CacheEntryConfig::new(five_min, 1_000),
             pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 200),
             pdo_requested: CacheEntryConfig::new(Some(Duration::from_secs(24 * 3600)), 512),
             sender_key_devices_cache: CacheEntryConfig::new(one_hour, 500),

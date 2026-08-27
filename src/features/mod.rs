@@ -1,4 +1,9 @@
+mod app_state_resync;
+pub(crate) mod app_state_settings;
 mod blocking;
+mod bots;
+mod business;
+pub(crate) mod call_log;
 pub(crate) mod chat_actions;
 mod chatstate;
 mod comments;
@@ -6,6 +11,7 @@ mod community;
 mod contacts;
 mod events;
 mod groups;
+pub(crate) use groups::GroupMetadataRegistry;
 pub(crate) mod labels;
 mod media_reupload;
 pub mod message_edit;
@@ -14,6 +20,7 @@ pub(crate) mod newsletter;
 mod polls;
 mod presence;
 mod profile;
+pub(crate) mod quick_replies;
 mod reaction;
 mod rotate_key;
 mod signal;
@@ -21,7 +28,25 @@ mod stanza;
 pub(crate) mod status;
 mod tctoken;
 
+pub use app_state_resync::{AppStateResyncMode, AppStateResyncReport};
+
+pub use app_state_settings::AppStateSettings;
+
 pub use blocking::{Blocking, BlockingError, BlocklistEntry};
+
+pub use bots::{
+    BotDefault, BotList, BotListEntry, BotListSection, BotListVersion, BotSectionDisplayType,
+    BotSectionType, BotTheme, BotThemeMode, Bots,
+};
+
+pub use business::{
+    BUSINESS_PROFILE_MAX_WEBSITES, Business, BusinessCategory, BusinessError, BusinessHourMode,
+    BusinessHours, BusinessHoursConfig, BusinessHoursUpdate, BusinessProfile,
+    BusinessProfileUpdate, BusinessProfileUpdateError, Catalog, CatalogOptions, Collection,
+    CollectionOptions, Collections, CoverPhotoUpload, DayOfWeek, ImporterAddress, Order,
+    OrderPriceDetails, OrderProduct, Price, Product, ProductAvailability, ProductImage,
+    ProductVideo, SalePrice, VariantProperty,
+};
 
 pub use chat_actions::{
     AppStateError, ChatActions, SyncActionMessageRange, message_key, message_range,
@@ -45,11 +70,12 @@ pub use events::{EventCreationParams, EventResponseType, Events};
 
 pub use groups::{
     BatchGroupResult, CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
-    GroupEphemeralSettings, GroupError, GroupJoinError, GroupMetadata, GroupParticipant,
-    GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture, GroupSubject, Groups,
-    GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode, MemberLinkMode,
-    MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, ParticipantChangeResponse,
-    ParticipantType, PictureType, PreviousDescription,
+    GroupEphemeralSettings, GroupError, GroupJoinError, GroupMessageReporter, GroupMetadata,
+    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture,
+    GroupSubject, Groups, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode,
+    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
+    ParticipantChangeResponse, ParticipantType, PictureType, PreviousDescription,
+    ReportedGroupMessage, ReportedGroupMessages,
 };
 
 pub use labels::Labels;
@@ -61,12 +87,14 @@ pub use media_reupload::{
 pub use message_edit::{EncryptedEdit, MessageEditError, SecretEncKind, SecretEncrypted};
 
 pub use mex::{
-    Mex, MexError, MexErrorExtensions, MexGraphQLError, MexRequest, MexResponse, ReachoutTimelock,
+    CappingMvStatus, CappingOteStatus, CappingStatus, Mex, MexError, MexErrorExtensions,
+    MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, ReachoutTimelock,
 };
 
 pub use newsletter::{
-    Newsletter, NewsletterError, NewsletterMessage, NewsletterMessageType, NewsletterMetadata,
-    NewsletterReactionCount, NewsletterRole, NewsletterState, NewsletterVerification,
+    Newsletter, NewsletterAdminInfo, NewsletterAdminProfile, NewsletterError, NewsletterFollower,
+    NewsletterMessage, NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount,
+    NewsletterRole, NewsletterState, NewsletterVerification,
 };
 
 pub use polls::{PollError, PollOptionResult, PollVoteCiphertext, Polls};
@@ -74,6 +102,8 @@ pub use polls::{PollError, PollOptionResult, PollVoteCiphertext, Polls};
 pub use presence::{Presence, PresenceError, PresenceStatus};
 
 pub use profile::{Profile, ProfileError, SetProfilePictureResponse};
+
+pub use quick_replies::QuickReplies;
 
 pub use status::{Status, StatusPrivacySetting, StatusSendOptions};
 

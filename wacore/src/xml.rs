@@ -74,7 +74,7 @@ impl<'a> XmlFormattable for NodeRef<'a> {
     }
 
     fn format_content_lines(&self, indent: bool) -> Vec<String> {
-        match self.content.as_deref() {
+        match self.content.as_ref() {
             Some(NodeContentRef::Nodes(nodes)) => nodes
                 .iter()
                 .flat_map(|n| {

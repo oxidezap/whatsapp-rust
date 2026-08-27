@@ -37,6 +37,9 @@ pub struct PreparedGroupStanza {
     /// so msmsg bot replies referencing this msg_id hit the same row that
     /// `<meta target_sender_jid>` echoes back at lookup time.
     pub sender_identity: Jid,
+    /// The phash on the stanza, so the caller can compare it against the one the
+    /// server echoes on the ack without re-reading the built node.
+    pub phash: Option<CompactString>,
 }
 
 /// A required sender-key distribution that could not reach every target.
@@ -304,7 +307,7 @@ pub async fn prepare_group_stanza(
         } else if let Some(src) = distribution_list.as_deref() {
             let phash_set = build_group_phash_set(src, &own_sending_jid);
             match MessageUtils::participant_list_hash(&phash_set) {
-                Ok(phash) => phash_for_stanza = Some(CompactString::new(&phash)),
+                Ok(phash) => phash_for_stanza = Some(phash),
                 Err(e) => {
                     log::warn!(
                         "Failed to compute group phash for {}: {:?}",
@@ -320,7 +323,7 @@ pub async fn prepare_group_stanza(
     // Empty when the failure was batch-wide; see `stale_users_for`.
     let mut skdm_rejected_devices: Vec<Jid> = Vec::new();
 
-    let sender_key_name = make_sender_key_name(to_jid, &own_sending_jid.to_protocol_address());
+    let sender_key_name = make_sender_key_name_for_jid(to_jid, &own_sending_jid);
 
     // Hold the per-device session locks the DM path uses across BOTH the X3DH setup
     // and the SKDM fan-out below, so a concurrent DM or group send sharing a device
@@ -398,16 +401,8 @@ pub async fn prepare_group_stanza(
         .await?;
 
         if let Some(plan) = session_plan {
-            let skdm_wrapper_msg = wa::Message {
-                sender_key_distribution_message: buffa::MessageField::some(
-                    wa::message::SenderKeyDistributionMessage {
-                        group_id: Some(to_jid.to_string()),
-                        axolotl_sender_key_distribution_message: Some(axolotl_skdm_bytes),
-                    },
-                ),
-                ..Default::default()
-            };
-            let skdm_plaintext_to_encrypt = MessageUtils::encode_and_pad(&skdm_wrapper_msg);
+            let skdm_plaintext_to_encrypt =
+                MessageUtils::encode_and_pad_skdm_wrapper(to_jid, &axolotl_skdm_bytes);
 
             // SKDM distribution failure must not prevent the group message from
             // being sent. Only successfully encrypted devices are tracked.
@@ -429,7 +424,12 @@ pub async fn prepare_group_stanza(
                 Ok(EncryptAttempt {
                     result,
                     first_error,
+                    unkeyed_at_encrypt,
                 }) => {
+                    // The SKDM fan-out is the last place a group member can be
+                    // dropped, and it happens before the Required check below
+                    // can turn the send into an error.
+                    report_encrypt_drops(resolver, unkeyed_at_encrypt);
                     let EncryptResult {
                         participant_nodes,
                         includes_prekey_message: result_includes_prekey,
@@ -572,9 +572,9 @@ pub async fn prepare_group_stanza(
         message_children.push(build_reporting_node(result));
     }
 
-    // Add phash if we distributed keys in this message
-    if let Some(phash) = phash_for_stanza {
-        stanza_builder = stanza_builder.attr("phash", phash);
+    // Groups carry a phash on every send, distribution or not (see above).
+    if let Some(phash) = phash_for_stanza.as_ref() {
+        stanza_builder = stanza_builder.attr("phash", phash.as_str());
     }
 
     // Add any extra stanza nodes provided by the caller
@@ -590,16 +590,38 @@ pub async fn prepare_group_stanza(
         group_info,
     );
 
+    let mut skdm_devices = distribution_list.unwrap_or_default();
+    retain_reportable_sender_key_devices(&mut skdm_devices, &skdm_encrypted_devices);
+
     Ok(PreparedGroupStanza {
         node: stanza,
-        // Mark the full target set (matches WA Web `markHasSenderKey(x, M)`), not
-        // just `skdm_encrypted_devices`. `stale_users` above already used the
-        // encrypted subset to find which devices to re-resolve.
-        skdm_devices: distribution_list.unwrap_or_default(),
+        skdm_devices,
         stale_device_users: stale_users,
         message_secret: reporting_result.map(|r| r.message_secret),
         sender_identity: own_sending_jid,
+        phash: phash_for_stanza,
     })
+}
+
+/// Reduce a distribution list to the devices a send may report as keyed.
+///
+/// The whole target set is reported rather than the encrypted subset, matching
+/// WA Web `markHasSenderKey(x, M)`, so a companion with no bundle is not
+/// re-targeted every send. WA Web can afford that only because it never reaches
+/// the marking with a failed primary: `getKeyDistributionMsg` rejects the whole
+/// send on `isPrimaryDevice(e)` and swallows companions alone. A best-effort
+/// send here carries on instead of failing a group over one member, so it holds
+/// the same guarantee directly. A primary reported keyed without its
+/// distribution hides its user behind the `device_and_primary_warm` gate until
+/// that member's own retry receipt arrives, which in a closed group is never.
+///
+/// Costs one length comparison on a send that keyed everyone.
+fn retain_reportable_sender_key_devices(devices: &mut Vec<Jid>, encrypted: &[Jid]) {
+    if devices.len() == encrypted.len() {
+        return;
+    }
+    let encrypted: HashSet<&Jid> = encrypted.iter().collect();
+    devices.retain(|device| device.device != 0 || encrypted.contains(device));
 }
 
 /// Build the device set hashed into a group `phash`, matching WA Web

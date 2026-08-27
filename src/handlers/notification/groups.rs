@@ -93,12 +93,16 @@ pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef
                         log::debug!(target: "Client/AppState", "server_sync task cancelled: connection generation changed during version check");
                         return;
                     }
-                    if let Err(e) = client_clone.sync_collections_batched(to_sync, None).await
-                        && !client_clone.is_shutting_down()
-                    {
-                        warn!(
-                            target: "Client/AppState",
-                            "Failed to batch sync app state from server_sync: {e}"
+                    let requested = to_sync.clone();
+                    let scope = client_clone.sync_scope(None);
+                    let result = client_clone.sync_collections_batched(to_sync, scope).await;
+                    if !client_clone.is_shutting_down() {
+                        client_clone.report_background_sync(
+                            "app state sync from server_sync",
+                            scope,
+                            crate::client::SyncSettles::JustTheCollections,
+                            &requested,
+                            result,
                         );
                     }
                 }
@@ -366,7 +370,7 @@ pub(crate) fn handle_mex_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
 
     // `from_str` skips the redundant UTF-8 validation `from_slice` would
     // do on a `&str`.
-    let parsed = match update_node.content.as_deref() {
+    let parsed = match update_node.content.as_ref() {
         Some(NodeContentRef::String(s)) => serde_json::from_str(s),
         Some(NodeContentRef::Bytes(b)) => serde_json::from_slice(b.as_ref()),
         _ => {

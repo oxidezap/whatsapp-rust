@@ -33,17 +33,18 @@ impl KeyType {
     }
 }
 
-#[derive(Debug, displaydoc::Display)]
+#[derive(Debug, thiserror::Error)]
 pub enum CurveError {
-    /// no key type identifier
+    #[error("no key type identifier")]
     NoKeyTypeIdentifier,
-    /// bad key type <{0:#04x}>
+    #[error("bad key type <{0:#04x}>")]
     BadKeyType(u8),
-    /// bad key length <{1}> for key with type <{0}>
+    #[error("bad key length <{1}> for key with type <{0}>")]
     BadKeyLength(KeyType, usize),
+    /// Only a substituted agreement can produce this: the default never fails.
+    #[error("the active crypto provider failed the key agreement")]
+    AgreementFailed(#[from] crate::crypto::CryptoProviderError),
 }
-
-impl std::error::Error for CurveError {}
 
 impl TryFrom<u8> for KeyType {
     type Error = CurveError;
@@ -61,9 +62,16 @@ enum PublicKeyData {
     DjbPublicKey([u8; curve25519::PUBLIC_KEY_LENGTH]),
 }
 
-#[derive(Clone, Copy, Eq, derive_more::From)]
+#[derive(Clone, Copy, Eq)]
 pub struct PublicKey {
     key: PublicKeyData,
+}
+
+impl From<PublicKeyData> for PublicKey {
+    #[inline]
+    fn from(key: PublicKeyData) -> Self {
+        Self { key }
+    }
 }
 
 impl PublicKey {
@@ -289,6 +297,23 @@ impl PreparedVerifyingKey {
         }
     }
 
+    /// Whether this verifier was built for `key`.
+    ///
+    /// Comparing the Montgomery bytes it already holds is the whole check, so a
+    /// holder can accept a pre-derived verifier without redoing the derivation
+    /// it is trying to skip.
+    pub fn is_for(&self, key: &PublicKey) -> bool {
+        let PublicKeyData::DjbPublicKey(mont) = key.key;
+        self.mont == mont
+    }
+
+    /// Test-only visibility into the lazy entries, mirroring the signing-key
+    /// hook so both prewarm paths can be pinned the same way.
+    #[cfg(test)]
+    pub(crate) fn is_precomputed(&self) -> bool {
+        self.cached.iter().all(|entry| entry.get().is_some())
+    }
+
     /// Derives both sign-bit entries now. The signature's sign bit is fixed
     /// per signer but unknowable from the Montgomery key alone, so a
     /// receive-side holder warms both once instead of paying the derivation
@@ -494,13 +519,26 @@ impl PrivateKey {
 
     pub fn calculate_agreement(&self, their_key: &PublicKey) -> Result<[u8; 32], CurveError> {
         match (&self.key, their_key.key) {
+            // The single place the agreement is decided, so a consumer that
+            // supplies the primitive replaces it for every caller at once.
             (PrivateKeyData::DjbPrivateKey { key, .. }, PublicKeyData::DjbPublicKey(pub_key)) => {
-                // Use from_bytes_without_cache since agreement doesn't need the Edwards cache
-                let private_key = curve25519::PrivateKey::from_bytes_without_cache(*key);
-                Ok(private_key.calculate_agreement(&pub_key))
+                Ok(crate::crypto::x25519_agreement(key, &pub_key)?)
             }
         }
     }
+}
+
+/// This crate's own X25519 agreement, and the only copy of that path: it is
+/// what [`SignalCryptoProvider::x25519_agreement`] runs by default.
+///
+/// [`SignalCryptoProvider::x25519_agreement`]: crate::crypto::SignalCryptoProvider::x25519_agreement
+pub(crate) fn x25519_agreement(
+    private_key: &[u8; curve25519::PRIVATE_KEY_LENGTH],
+    their_public_key: &[u8; curve25519::PUBLIC_KEY_LENGTH],
+) -> [u8; 32] {
+    // from_bytes_without_cache because agreement never reads the Edwards cache.
+    curve25519::PrivateKey::from_bytes_without_cache(*private_key)
+        .calculate_agreement(their_public_key)
 }
 
 impl TryFrom<&[u8]> for PrivateKey {
@@ -775,6 +813,75 @@ mod tests {
                 i
             );
         }
+    }
+
+    fn key_bytes(hex_key: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        hex::decode_to_slice(hex_key, &mut out).expect("32 hex-encoded bytes");
+        out
+    }
+
+    /// RFC 7748 section 6.1. With no provider installed the agreement runs the
+    /// library's own path, so this pins the bytes that routing must preserve.
+    #[test]
+    fn rfc7748_agreement_vector() {
+        let alice_private = PrivateKey::deserialize(&key_bytes(
+            "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+        ))
+        .expect("alice private key");
+        let bob_private = PrivateKey::deserialize(&key_bytes(
+            "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+        ))
+        .expect("bob private key");
+        let alice_public = PublicKey::from_djb_public_key_bytes(&key_bytes(
+            "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        ))
+        .expect("alice public key");
+        let bob_public = PublicKey::from_djb_public_key_bytes(&key_bytes(
+            "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        ))
+        .expect("bob public key");
+        let expected =
+            key_bytes("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+
+        assert_eq!(alice_private.public_key().expect("derive"), alice_public);
+        assert_eq!(bob_private.public_key().expect("derive"), bob_public);
+        assert_eq!(
+            alice_private.calculate_agreement(&bob_public).expect("dh"),
+            expected
+        );
+        assert_eq!(
+            bob_private.calculate_agreement(&alice_public).expect("dh"),
+            expected
+        );
+    }
+
+    /// A key of the wrong length never reaches the agreement at all.
+    #[test]
+    fn agreement_rejects_wrong_length_keys() {
+        assert!(matches!(
+            PrivateKey::deserialize(&[0x42; 31]),
+            Err(CurveError::BadKeyLength(KeyType::Djb, 31))
+        ));
+        assert!(matches!(
+            PublicKey::from_djb_public_key_bytes(&[0x42; 33]),
+            Err(CurveError::BadKeyLength(KeyType::Djb, 33))
+        ));
+    }
+
+    /// Signing state is expensive and the agreement has no use for it; routing
+    /// must not start building it behind our back.
+    #[test]
+    fn agreement_leaves_the_signing_cache_cold() {
+        let mut csprng = rng();
+        let alice = KeyPair::generate(&mut csprng);
+        let bob = KeyPair::generate(&mut csprng);
+
+        alice
+            .calculate_agreement(&bob.public_key)
+            .expect("agreement");
+
+        assert!(!alice.private_key.has_warm_signing_cache());
     }
 
     #[test]

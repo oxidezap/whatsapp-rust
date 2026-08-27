@@ -1,7 +1,7 @@
 use crate::download::{DownloadUtils, MediaType};
 use crate::libsignal::crypto::{CryptographicHash, CryptographicMac};
 use aes::Aes256;
-use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
+use aes::cipher::{Block, BlockModeEncrypt, KeyIvInit};
 use anyhow::Result;
 use rand::RngExt;
 use rand::rng;
@@ -10,6 +10,30 @@ use std::io::{Read, Write};
 const BLOCK: usize = 16;
 /// Length of the truncated HMAC-SHA256 appended to the ciphertext.
 const MEDIA_MAC_LEN: usize = 10;
+
+/// How many bytes of ciphertext are produced before the MAC, the ciphertext
+/// hash and the sidecar are each touched once.
+///
+/// Driving them one 16-byte AES block at a time cost ~6.25M calls per 100 MiB,
+/// each one entering a block-buffer state machine for a fraction of its 64-byte
+/// compression block. Batching amortises that away — but only up to a point:
+/// the batch is written by AES-CBC and then read back twice (HMAC, SHA-256), so
+/// a batch that outgrows L1 turns those re-reads into cache misses. Measured on
+/// `media_benchmark`, throughput peaks between 32 and 128 bytes and falls off
+/// steadily above ~256; 128 is inside the plateau and is exactly two SHA-256
+/// compression blocks, so no consumer has to buffer a partial one.
+///
+/// Delivery to a `Write` destination wants the opposite (one syscall per many
+/// KiB) and is batched separately, at [`WRITE_FLUSH`].
+const ENCRYPT_BATCH: usize = 128;
+
+/// How much ciphertext accumulates before it is handed to a `Write` destination.
+///
+/// A `write_all` on an unbuffered `File` is a syscall, so the writer wants far
+/// larger runs than [`ENCRYPT_BATCH`] does. Matches the read chunk of
+/// [`encrypt_media_streaming`], so a streaming encrypt trades one read syscall
+/// for one write syscall.
+const WRITE_FLUSH: usize = 8 * 1024;
 
 /// Streaming sidecar chunk size: one HMAC per 64 KiB of ciphertext.
 const SIDECAR_CHUNK: usize = 64 * 1024;
@@ -43,17 +67,34 @@ pub struct EncryptedMediaInfo {
 /// use with async streams, network sources, or any chunk-at-a-time producer.
 ///
 /// Two output modes (zero duplicated crypto logic):
-/// - `update()` / `finalize()` — append to a `Vec<u8>`
-/// - `update_to_writer()` / `finalize_to_writer()` — write directly, zero intermediate buffer
+/// - `update()` / `finalize()` — append to a `Vec<u8>`, encrypted in place in
+///   its tail so the ciphertext is written exactly once
+/// - `update_to_writer()` / `finalize_to_writer()` — write out in whole
+///   flush-sized runs, holding at most one run at a time
+///
+/// Every call delivers all of its own ciphertext to the destination it was
+/// given before returning, so the modes may be interleaved: concatenating the
+/// destinations in call order reproduces the stream. Handing two calls the
+/// *same* `Vec` with a writer call between them does not — the writer's bytes
+/// belong between them, and no concatenation of the two destinations can put
+/// them there. Give each call its own destination if you interleave.
 #[must_use = "call finalize() or finalize_to_writer() to complete encryption"]
 pub struct MediaEncryptor {
-    cipher: Aes256,
+    /// Owns both the AES key schedule and the CBC chaining block, so a batch
+    /// runs through the mode's own loop with the chaining state in a register
+    /// instead of being re-read from `self` once per 16 bytes.
+    cbc: cbc::Encryptor<Aes256>,
     hmac: CryptographicMac,
     sha256_plain: CryptographicHash,
     sha256_enc: CryptographicHash,
-    prev_block: [u8; BLOCK],
     /// Partial plaintext that didn't fill a complete AES block (≤15 bytes).
     remainder: Vec<u8>,
+    /// Staging buffer for the writer output mode, which has no destination
+    /// buffer of its own. Holds ciphertext awaiting a flush (<[`WRITE_FLUSH`]
+    /// plus one batch) and is empty between calls; it lives on the encryptor
+    /// only so a streaming encrypt allocates it once for the whole file rather
+    /// than once per chunk.
+    scratch: Vec<u8>,
     media_key: [u8; 32],
     file_length: u64,
     /// Present when a streaming sidecar is being accumulated over the ciphertext.
@@ -87,18 +128,16 @@ impl MediaEncryptor {
         sidecar: bool,
     ) -> Result<Self> {
         let (iv, cipher_key, mac_key) = DownloadUtils::get_media_keys(&media_key, media_type)?;
-        let cipher =
-            Aes256::new_from_slice(&cipher_key).map_err(|_| anyhow::anyhow!("Bad AES key"))?;
         let mut hmac = CryptographicMac::new("HmacSha256", &mac_key)?;
         hmac.update(&iv);
 
         Ok(Self {
-            cipher,
+            cbc: cbc::Encryptor::<Aes256>::new(&cipher_key.into(), &iv.into()),
             hmac,
             sha256_plain: CryptographicHash::new("SHA-256")?,
             sha256_enc: CryptographicHash::new("SHA-256")?,
-            prev_block: iv,
             remainder: Vec::with_capacity(BLOCK),
+            scratch: Vec::new(),
             media_key,
             file_length: 0,
             sidecar: sidecar.then(|| SidecarAccumulator::new(mac_key)),
@@ -107,10 +146,12 @@ impl MediaEncryptor {
 
     /// Feed plaintext, append encrypted blocks to `out`.
     pub fn update(&mut self, plaintext: &[u8], out: &mut Vec<u8>) {
-        self.feed(plaintext, |block| out.extend_from_slice(block));
+        self.feed(plaintext, out, &mut keep_in_place)
+            .expect("a Vec destination performs no I/O");
     }
 
-    /// Feed plaintext, write encrypted blocks directly to `writer`.
+    /// Feed plaintext, writing its ciphertext to `writer` in whole flush-sized
+    /// runs. Everything this call produces reaches `writer` before it returns.
     ///
     /// On error the encryptor state is unspecified — discard it.
     pub fn update_to_writer<W: Write>(
@@ -118,32 +159,32 @@ impl MediaEncryptor {
         plaintext: &[u8],
         writer: &mut W,
     ) -> std::io::Result<()> {
-        let mut err = Ok(());
-        self.feed(plaintext, |block| {
-            if err.is_ok() {
-                err = writer.write_all(block);
-            }
-        });
-        err
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let result = self
+            .feed(plaintext, &mut scratch, &mut |staging, _start| {
+                flush_full(staging, writer)
+            })
+            .and_then(|()| flush_rest(&mut scratch, writer));
+        self.scratch = scratch;
+        result
     }
 
     /// PKCS7 pad + 10-byte MAC. Appends final bytes to `out`.
     pub fn finalize(mut self, out: &mut Vec<u8>) -> Result<EncryptedMediaInfo> {
-        self.pad_and_encrypt(|block| out.extend_from_slice(block));
+        self.pad_and_encrypt(out, &mut keep_in_place)
+            .expect("a Vec destination performs no I/O");
         let mac = self.compute_mac()?;
         out.extend_from_slice(&mac);
         self.finish_hashes(&mac)
     }
 
-    /// PKCS7 pad + 10-byte MAC. Writes directly to `writer`.
+    /// PKCS7 pad + 10-byte MAC. Writes the last of the ciphertext to `writer`.
     pub fn finalize_to_writer<W: Write>(mut self, writer: &mut W) -> Result<EncryptedMediaInfo> {
-        let mut io_err: std::io::Result<()> = Ok(());
-        self.pad_and_encrypt(|block| {
-            if io_err.is_ok() {
-                io_err = writer.write_all(block);
-            }
-        });
-        io_err?;
+        let mut scratch = std::mem::take(&mut self.scratch);
+        self.pad_and_encrypt(&mut scratch, &mut |staging, _start| {
+            flush_full(staging, writer)
+        })?;
+        flush_rest(&mut scratch, writer)?;
 
         let mac = self.compute_mac()?;
         writer.write_all(&mac)?;
@@ -153,7 +194,12 @@ impl MediaEncryptor {
     /// Hash plaintext, then encrypt complete blocks directly from the input
     /// without copying everything into `remainder` first. Only the trailing
     /// partial block (≤15 bytes) is buffered.
-    fn feed(&mut self, plaintext: &[u8], mut emit: impl FnMut(&[u8; BLOCK])) {
+    fn feed(
+        &mut self,
+        plaintext: &[u8],
+        staging: &mut Vec<u8>,
+        deliver: &mut Deliver<'_>,
+    ) -> std::io::Result<()> {
         self.sha256_plain.update(plaintext);
         self.file_length += plaintext.len() as u64;
 
@@ -163,12 +209,12 @@ impl MediaEncryptor {
             if plaintext.len() < need {
                 // Not enough to complete a block — just buffer.
                 self.remainder.extend_from_slice(plaintext);
-                return;
+                return Ok(());
             }
             // Complete the partial block from remainder + head of plaintext.
             self.remainder.extend_from_slice(&plaintext[..need]);
             let completed = std::mem::take(&mut self.remainder);
-            self.encrypt_and_emit(&completed, &mut emit);
+            self.encrypt_batches(&completed, staging, deliver)?;
             &plaintext[need..]
         } else {
             plaintext
@@ -177,7 +223,7 @@ impl MediaEncryptor {
         // Process full blocks directly from input (no copy).
         let full = (input.len() / BLOCK) * BLOCK;
         if full > 0 {
-            self.encrypt_and_emit(&input[..full], &mut emit);
+            self.encrypt_batches(&input[..full], staging, deliver)?;
         }
 
         // Buffer the leftover tail.
@@ -185,38 +231,47 @@ impl MediaEncryptor {
         if !tail.is_empty() {
             self.remainder.extend_from_slice(tail);
         }
+        Ok(())
     }
 
-    /// Encrypt one or more complete blocks from `data` and emit each.
-    fn encrypt_and_emit(&mut self, data: &[u8], emit: &mut impl FnMut(&[u8; BLOCK])) {
+    /// Encrypt one or more complete blocks from `data` in [`ENCRYPT_BATCH`]-sized
+    /// runs, staging each run at the end of `staging` and handing it to `deliver`.
+    ///
+    /// The MAC, ciphertext hash, sidecar and destination each see one contiguous
+    /// slice per batch instead of one 16-byte array per block.
+    fn encrypt_batches(
+        &mut self,
+        data: &[u8],
+        staging: &mut Vec<u8>,
+        deliver: &mut Deliver<'_>,
+    ) -> std::io::Result<()> {
         debug_assert!(data.len().is_multiple_of(BLOCK));
-        for chunk in data.chunks_exact(BLOCK) {
-            self.cbc_encrypt(chunk.try_into().unwrap());
-            emit(&self.prev_block);
-            self.hmac.update(&self.prev_block);
-            self.sha256_enc.update(&self.prev_block);
+        // `ENCRYPT_BATCH` is a multiple of BLOCK, so every batch stays aligned.
+        for batch in data.chunks(ENCRYPT_BATCH) {
+            let start = staging.len();
+            staging.extend_from_slice(batch);
+            let staged = &mut staging[start..];
+            cbc_encrypt_blocks(&mut self.cbc, staged);
+            self.hmac.update(staged);
+            self.sha256_enc.update(staged);
             if let Some(sc) = &mut self.sidecar {
-                sc.push(&self.prev_block);
+                sc.push(staged);
             }
+            deliver(staging, start)?;
         }
+        Ok(())
     }
 
-    fn pad_and_encrypt(&mut self, mut emit: impl FnMut(&[u8; BLOCK])) {
+    fn pad_and_encrypt(
+        &mut self,
+        staging: &mut Vec<u8>,
+        deliver: &mut Deliver<'_>,
+    ) -> std::io::Result<()> {
         let pad_len = BLOCK - (self.remainder.len() % BLOCK);
         self.remainder
             .extend(std::iter::repeat_n(pad_len as u8, pad_len));
         let rem = std::mem::take(&mut self.remainder);
-        self.encrypt_and_emit(&rem, &mut emit);
-    }
-
-    fn cbc_encrypt(&mut self, block_data: &[u8; BLOCK]) {
-        let mut data = *block_data;
-        for (b, &p) in data.iter_mut().zip(self.prev_block.iter()) {
-            *b ^= p;
-        }
-        let mut block: Block<Aes256> = data.into();
-        self.cipher.encrypt_block(&mut block);
-        self.prev_block = block.into();
+        self.encrypt_batches(&rem, staging, deliver)
     }
 
     fn compute_mac(&mut self) -> Result<[u8; 10]> {
@@ -247,29 +302,83 @@ impl MediaEncryptor {
     }
 }
 
+/// Hands one encrypted batch, `staging[start..]`, to its destination.
+///
+/// Both output modes stage a batch at the end of a `Vec` and encrypt it there,
+/// so the ciphertext is written exactly once. `update`/`finalize` pass the
+/// caller's destination `Vec` and [`keep_in_place`], leaving the batch where it
+/// already belongs; `update_to_writer`/`finalize_to_writer` pass the encryptor's
+/// scratch buffer and [`flush_full`], which drains it a [`WRITE_FLUSH`] run at
+/// a time; the call then flushes whatever tail is left before returning.
+type Deliver<'a> = dyn FnMut(&mut Vec<u8>, usize) -> std::io::Result<()> + 'a;
+
+/// The [`Deliver`] of a `Vec` destination: the batch is already in it.
+fn keep_in_place(_staging: &mut Vec<u8>, _start: usize) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// The [`Deliver`] of a writer destination: hand the writer one whole
+/// [`WRITE_FLUSH`]-sized run at a time, so a single large `update_to_writer`
+/// still writes in bounded runs and never stages the whole input.
+fn flush_full<W: Write>(staging: &mut Vec<u8>, writer: &mut W) -> std::io::Result<()> {
+    if staging.len() >= WRITE_FLUSH {
+        writer.write_all(staging)?;
+        staging.clear();
+    }
+    Ok(())
+}
+
+/// Write the sub-run tail a call ends on, so nothing is staged across calls.
+fn flush_rest<W: Write>(staging: &mut Vec<u8>, writer: &mut W) -> std::io::Result<()> {
+    if !staging.is_empty() {
+        writer.write_all(staging)?;
+        staging.clear();
+    }
+    Ok(())
+}
+
+/// Encrypt `buf` — a whole number of AES blocks — in place, advancing the CBC
+/// chaining state held by `cbc`. Kept out of `MediaEncryptor` so the batch loop
+/// can hold the scratch buffer and the cipher borrowed at once.
+fn cbc_encrypt_blocks(cbc: &mut cbc::Encryptor<Aes256>, buf: &mut [u8]) {
+    let (blocks, rest) = Block::<Aes256>::slice_as_chunks_mut(buf);
+    debug_assert!(rest.is_empty(), "batches are whole AES blocks");
+    cbc.encrypt_blocks(blocks);
+}
+
 /// Accumulates a WhatsApp streaming sidecar: one 10-byte truncated HMAC-SHA256
 /// per 64 KiB window of ciphertext, each window overlapping the next by one AES
 /// block (16 bytes) to preserve CBC chaining. Fed incrementally with the
 /// encrypted blocks (and the trailing MAC) so it never holds the whole file.
+///
+/// Ciphertext is hashed straight into a running HMAC rather than staged in a
+/// 64 KiB window buffer: the only state a window boundary needs from its
+/// predecessor is the 16-byte overlap, which is cheap to carry on its own. The
+/// HMAC is `finalize_reset`-ed per window, so the key schedule is derived once
+/// for the whole file instead of once per 64 KiB.
 struct SidecarAccumulator {
-    mac_key: [u8; 32],
-    /// Bytes buffered for the window currently being hashed.
-    window: Vec<u8>,
+    /// Running HMAC over the window currently being consumed.
+    mac: CryptographicMac,
+    /// The last [`SIDECAR_OVERLAP`] bytes pushed. At a window boundary these are
+    /// exactly the bytes the next window replays first.
+    overlap: [u8; SIDECAR_OVERLAP],
     /// Concatenated 10-byte HMACs produced so far.
     result: Vec<u8>,
     /// Absolute offset where the current window logically starts.
     next_chunk_start: u64,
     /// Total bytes pushed so far.
     total_pushed: u64,
-    /// First HMAC construction error, surfaced by `finish`.
+    /// First HMAC finalization error, surfaced by `finish`.
     err: Option<anyhow::Error>,
 }
 
 impl SidecarAccumulator {
     fn new(mac_key: [u8; 32]) -> Self {
         Self {
-            mac_key,
-            window: Vec::with_capacity(SIDECAR_OVERLAP + SIDECAR_CHUNK),
+            // `CryptographicMac::new` only fails on an unknown algorithm name.
+            mac: CryptographicMac::new("HmacSha256", &mac_key)
+                .expect("HmacSha256 is a known MAC algorithm"),
+            overlap: [0u8; SIDECAR_OVERLAP],
             result: Vec::new(),
             next_chunk_start: 0,
             total_pushed: 0,
@@ -282,51 +391,56 @@ impl SidecarAccumulator {
         while src < data.len() {
             let window_end = self.next_chunk_start + (SIDECAR_OVERLAP + SIDECAR_CHUNK) as u64;
             let remaining = (window_end - self.total_pushed) as usize;
-            let to_copy = remaining.min(data.len() - src);
-            self.window.extend_from_slice(&data[src..src + to_copy]);
-            self.total_pushed += to_copy as u64;
-            src += to_copy;
+            let take = remaining.min(data.len() - src);
+            let slice = &data[src..src + take];
+            self.mac.update(slice);
+            self.remember_overlap(slice);
+            self.total_pushed += take as u64;
+            src += take;
             if self.total_pushed == window_end {
                 self.flush();
             }
         }
     }
 
-    /// Emit the HMAC of the current window, then retain only the trailing
-    /// 16-byte overlap as the start of the next window.
+    /// Keep the trailing [`SIDECAR_OVERLAP`] bytes of the stream in a rolling
+    /// buffer, shifting in at most 16 bytes per call.
+    fn remember_overlap(&mut self, slice: &[u8]) {
+        let take = slice.len().min(SIDECAR_OVERLAP);
+        self.overlap.copy_within(take.., 0);
+        self.overlap[SIDECAR_OVERLAP - take..].copy_from_slice(&slice[slice.len() - take..]);
+    }
+
+    /// Emit the HMAC of the current window, then reseed the (reset) HMAC with
+    /// the 16-byte overlap that opens the next window.
     fn flush(&mut self) {
-        if self.window.is_empty() {
+        // Nothing has been pushed into the window that is being closed.
+        if self.total_pushed <= self.next_chunk_start {
             return;
         }
-        match hmac_sha256_trunc10(&self.mac_key, &self.window) {
-            Ok(mac) => self.result.extend_from_slice(&mac),
+        match self.mac.finalize_sha256_array() {
+            Ok(full) => self.result.extend_from_slice(&full[..SIDECAR_MAC_LEN]),
             Err(e) => {
-                self.err.get_or_insert(e);
+                self.err.get_or_insert(e.into());
             }
         }
         self.next_chunk_start += SIDECAR_CHUNK as u64;
-        let keep_from = self.window.len().saturating_sub(SIDECAR_OVERLAP);
-        self.window.drain(0..keep_from);
+        // A boundary flush leaves the stream 16 bytes past the next window's
+        // start, so replay them; a final flush from `finish` has no successor.
+        let replay =
+            (self.total_pushed.saturating_sub(self.next_chunk_start) as usize).min(SIDECAR_OVERLAP);
+        if replay > 0 {
+            self.mac.update(&self.overlap[SIDECAR_OVERLAP - replay..]);
+        }
     }
 
     fn finish(mut self) -> Result<Vec<u8>> {
-        if !self.window.is_empty() {
-            self.flush();
-        }
+        self.flush();
         match self.err {
             Some(e) => Err(e),
             None => Ok(self.result),
         }
     }
-}
-
-fn hmac_sha256_trunc10(mac_key: &[u8], data: &[u8]) -> Result<[u8; SIDECAR_MAC_LEN]> {
-    let mut hmac = CryptographicMac::new("HmacSha256", mac_key)?;
-    hmac.update(data);
-    let full = hmac.finalize_sha256_array()?;
-    let mut out = [0u8; SIDECAR_MAC_LEN];
-    out.copy_from_slice(&full[..SIDECAR_MAC_LEN]);
-    Ok(out)
 }
 
 /// Audio and video are the only media types that benefit from a streaming
@@ -745,6 +859,17 @@ mod tests {
         v
     }
 
+    /// One-shot truncated HMAC, used by the reference implementations below.
+    /// The accumulator itself keeps a single running HMAC instead.
+    fn hmac_sha256_trunc10(mac_key: &[u8], data: &[u8]) -> Result<[u8; SIDECAR_MAC_LEN]> {
+        let mut hmac = CryptographicMac::new("HmacSha256", mac_key)?;
+        hmac.update(data);
+        let full = hmac.finalize_sha256_array()?;
+        let mut out = [0u8; SIDECAR_MAC_LEN];
+        out.copy_from_slice(&full[..SIDECAR_MAC_LEN]);
+        Ok(out)
+    }
+
     /// Independent ("naive") reimplementation of the sidecar straight from the
     /// full encrypted blob, used to pin the incremental accumulator's behaviour.
     fn naive_sidecar(enc_full: &[u8], mac_key: &[u8; 32]) -> Vec<u8> {
@@ -766,6 +891,90 @@ mod tests {
     fn mac_key_for(media_key: &[u8; 32], media_type: MediaType) -> [u8; 32] {
         let (_, _, mac_key) = DownloadUtils::get_media_keys(media_key, media_type).unwrap();
         mac_key
+    }
+
+    /// A `Write` that records how many calls it received.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn streaming_encrypt_writes_whole_runs_not_single_blocks() {
+        // Pins the write batching: an unbuffered writer (a `File`) pays one
+        // syscall per write, so a 16-byte-per-block loop would be ~64k writes
+        // here — and `ENCRYPT_BATCH` is deliberately far smaller than a flush,
+        // so a run must cover many crypto batches.
+        let data = payload(1024 * 1024, 0x2D);
+        let mut writer = CountingWriter::default();
+        let info = encrypt_media_streaming_with_key(
+            Cursor::new(data.as_slice()),
+            &mut writer,
+            MediaType::Image,
+            Some(&[0x6Bu8; 32]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(writer.bytes.len(), encrypted_len(data.len()));
+        assert_eq!(info.file_length, data.len() as u64);
+        // One flush per `WRITE_FLUSH`, plus the final tail and the MAC.
+        let max_writes = writer.bytes.len().div_ceil(WRITE_FLUSH) + 2;
+        assert!(
+            writer.writes <= max_writes,
+            "expected at most {max_writes} batched writes, got {}",
+            writer.writes
+        );
+    }
+
+    #[test]
+    fn interleaved_output_modes_concatenate_in_call_order() {
+        // Every call must deliver all of its own ciphertext before returning. A
+        // call that staged a sub-run tail for later would strand those bytes
+        // behind whatever the *next* destination receives, and no concatenation
+        // of the destinations could reproduce the stream. The cuts straddle a
+        // flush so each writer call ends mid-run, where a tail would be held.
+        let key = [0x5Du8; 32];
+        let data = payload(3 * WRITE_FLUSH + 777, 0x3E);
+        let cuts = [WRITE_FLUSH + 300, 2 * WRITE_FLUSH + 91, 3 * WRITE_FLUSH + 5];
+
+        let mut enc = MediaEncryptor::with_key(key, MediaType::Document).unwrap();
+        // Vec -> writer -> Vec -> writer, each call with its own destination.
+        let mut first = Vec::new();
+        enc.update(&data[..cuts[0]], &mut first);
+        let mut second = Vec::new();
+        enc.update_to_writer(&data[cuts[0]..cuts[1]], &mut second)
+            .unwrap();
+        let mut third = Vec::new();
+        enc.update(&data[cuts[1]..cuts[2]], &mut third);
+        let mut fourth = Vec::new();
+        enc.update_to_writer(&data[cuts[2]..], &mut fourth).unwrap();
+        let mut last = Vec::new();
+        enc.finalize(&mut last).unwrap();
+
+        let blob: Vec<u8> = [first, second, third, fourth, last].concat();
+
+        let expected = encrypt_media_with_key(&data, MediaType::Document, Some(&key)).unwrap();
+        assert_eq!(
+            blob, expected.data_to_upload,
+            "ciphertext must be identical"
+        );
+
+        let plain =
+            DownloadUtils::decrypt_stream(Cursor::new(&blob), &key, MediaType::Document).unwrap();
+        assert_eq!(plain, data, "the blob must still decrypt");
     }
 
     #[test]

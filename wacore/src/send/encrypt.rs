@@ -1,7 +1,10 @@
 //! Per-device Signal encryption fanout and the bounded spawn helper.
 
 use super::*;
+use crate::stats::UnkeyableDevice;
 use anyhow::Context;
+use std::borrow::Cow;
+use wacore_binary::node::{Attrs, AttrsVec, NodeContent};
 
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
 /// across the surrounding SKDM creation + this encrypt, so a concurrent send
@@ -99,6 +102,9 @@ pub struct EncryptResult {
 pub(crate) struct EncryptAttempt {
     pub result: EncryptResult,
     pub first_error: Option<anyhow::Error>,
+    /// Devices the encrypt fan-out itself dropped, excluding the ones already
+    /// accounted for during session setup. See [`unkeyed_at_encrypt`].
+    pub unkeyed_at_encrypt: u64,
 }
 
 /// One device's encrypted ciphertext, node-agnostic. The DM/peer paths map this
@@ -120,6 +126,13 @@ pub struct EncryptForDevicesRaw {
     pub had_unregistered_device: bool,
     /// See [`EncryptResult::rejected_devices`].
     pub rejected_devices: Vec<Jid>,
+    /// Devices this fan-out dropped that session setup had not already given up
+    /// on — a stored session that exists and cannot be used, or a whole chunk
+    /// whose task died. A device that reached here with no session at all is
+    /// excluded: setup counted it. Report it through
+    /// [`SendContextResolver::on_unkeyable_devices`] with
+    /// [`UnkeyableDevice::Encrypt`], or it goes unobserved.
+    pub unkeyed_at_encrypt: u64,
 }
 
 struct RawEncryptAttempt {
@@ -150,6 +163,21 @@ pub fn needs_device_identity(
 /// fan-out. Picked from the `perf-audit` benchmark: speedup plateaus around
 /// 16 on Oracle ARM64; 32 gives only ~10% more for double the task overhead.
 const ENCRYPT_FANOUT_CONCURRENCY: usize = 16;
+
+/// What one session-establishment task did with its device, shipped back to the
+/// orchestrator because a spawned task holds no borrow of the resolver.
+enum SessionOutcome {
+    /// Session ready; `Some` when establishing it replaced a stored identity.
+    Established(Option<Jid>),
+    /// Dropped here, so the encrypt fan-out must not count it a second time.
+    /// `reason` is `None` when the prekey fetch already counted the drop, which
+    /// is the case for a device the server named.
+    Dropped {
+        jid: Jid,
+        reason: Option<UnkeyableDevice>,
+        error: Option<anyhow::Error>,
+    },
+}
 
 /// Per-task encrypt result, shipped from a spawned task back to the orchestrator.
 struct EncryptOneResult {
@@ -298,6 +326,8 @@ fn push_raw_result(
     devices: &mut Vec<EncryptedDevice>,
     includes_prekey_message: &mut bool,
     first_error: &mut Option<anyhow::Error>,
+    already_counted: &[Jid],
+    unkeyed_at_encrypt: &mut u64,
 ) {
     match res {
         Ok(Some(one)) => {
@@ -312,6 +342,12 @@ fn push_raw_result(
         Ok(None) => {}
         Err(error) => {
             log::warn!("Failed to encrypt for device: {error:#}. Skipping.");
+            // A device session setup already gave up on was counted there;
+            // counting it again here would report one drop as two. The list is
+            // empty on every send that keyed everyone, so this is a no-op scan.
+            if !already_counted.contains(&device_jid) {
+                *unkeyed_at_encrypt += 1;
+            }
             if first_error.is_none() {
                 *first_error = Some(error);
             }
@@ -327,22 +363,40 @@ fn encrypted_device_to_participant_node(
     mediatype: Option<&str>,
     hide_decrypt_fail: bool,
 ) -> Node {
-    let mut enc_builder = NodeBuilder::new("enc")
-        .attr("v", stanza::ENC_VERSION)
-        .attr("type", one.enc_type);
+    // Built without `NodeBuilder` because the keys here are four distinct
+    // literals fixed at compile time, and `attr` cannot know that: every
+    // insert string-compares each key already present to reject a duplicate,
+    // which for `<enc>` is six comparisons per device. `<enc>` also carries one
+    // attr more than `AttrsVec` holds inline whenever a media send hides
+    // decrypt failures, so the builder's empty default spilled to the heap
+    // mid-insert; the count is known here, so the one allocation that case
+    // still needs is made once, at the right size.
+    let mut enc_attrs = AttrsVec::with_capacity(
+        2 + usize::from(mediatype.is_some()) + usize::from(hide_decrypt_fail),
+    );
+    enc_attrs.push((Cow::Borrowed("v"), stanza::ENC_VERSION.into()));
+    enc_attrs.push((Cow::Borrowed("type"), one.enc_type.into()));
     // `mediatype` is batch-level (same for every device) and originates as
     // a `&'static str`, so it's threaded here instead of cloned per result.
     if let Some(mt) = mediatype {
-        enc_builder = enc_builder.attr("mediatype", mt);
+        enc_attrs.push((Cow::Borrowed("mediatype"), mt.into()));
     }
     if hide_decrypt_fail {
-        enc_builder = enc_builder.attr("decrypt-fail", "hide");
+        enc_attrs.push((Cow::Borrowed("decrypt-fail"), "hide".into()));
     }
-    let enc_node = enc_builder.bytes(one.ciphertext).build();
-    NodeBuilder::new("to")
-        .attr("jid", one.device_jid)
-        .children([enc_node])
-        .build()
+    let enc_node = Node {
+        tag: Cow::Borrowed("enc"),
+        attrs: Attrs(enc_attrs),
+        content: Some(NodeContent::Bytes(one.ciphertext)),
+    };
+
+    let mut to_attrs = AttrsVec::with_capacity(1);
+    to_attrs.push((Cow::Borrowed("jid"), one.device_jid.into()));
+    Node {
+        tag: Cow::Borrowed("to"),
+        attrs: Attrs(to_attrs),
+        content: Some(NodeContent::Nodes(vec![enc_node])),
+    }
 }
 
 /// Per-device Signal sessions are independent (different ratchet state per
@@ -368,7 +422,7 @@ pub async fn encrypt_for_devices(
     mediatype: Option<&str>,
 ) -> Result<EncryptResult> {
     let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
-    encrypt_for_devices_with_sessions(
+    let attempt = encrypt_for_devices_with_sessions_detailed(
         runtime,
         stores,
         devices,
@@ -377,7 +431,21 @@ pub async fn encrypt_for_devices(
         mediatype,
         plan,
     )
-    .await
+    .await?;
+    report_encrypt_drops(resolver, attempt.unkeyed_at_encrypt);
+    Ok(attempt.result)
+}
+
+/// Report the devices an encrypt fan-out dropped on its own, for callers that
+/// hold a resolver. Session-setup drops are reported where they happen, so this
+/// covers only the ones the fan-out is the first to see.
+///
+/// The "nothing to report" case lives here rather than at each call site, so a
+/// resolver only ever sees a call that means something.
+pub(crate) fn report_encrypt_drops(resolver: &dyn SendContextResolver, unkeyed_at_encrypt: u64) {
+    if unkeyed_at_encrypt > 0 {
+        resolver.on_unkeyable_devices(UnkeyableDevice::Encrypt, unkeyed_at_encrypt);
+    }
 }
 
 /// What a fan-out reports back when its `<to><enc>` nodes went straight into
@@ -386,6 +454,11 @@ pub struct EncryptFanoutSummary {
     pub includes_prekey_message: bool,
     /// True if any device returned 406 (unregistered) during prekey fetch.
     pub had_unregistered_device: bool,
+    /// First failure of the fan-out (session, prekey fetch or spawn), or `None`
+    /// when every device produced a node. Already collected for the group
+    /// path's detailed attempt, so a caller that turns "nothing encrypted"
+    /// into an error can name the cause instead of reporting a bare count.
+    pub first_error: Option<anyhow::Error>,
 }
 
 /// [`encrypt_for_devices`] for a caller that already owns the buffer the nodes
@@ -409,9 +482,10 @@ pub async fn encrypt_for_devices_into(
     participant_nodes: &mut Vec<Node>,
 ) -> Result<EncryptFanoutSummary> {
     let plan = ensure_sessions_for_devices(runtime, stores, resolver, devices).await?;
-    // `first_error` is dropped here exactly as `encrypt_for_devices` drops it:
-    // a DM reports failure through the empty-participants check, not per device.
-    let RawEncryptAttempt { result: raw, .. } = encrypt_for_devices_with_sessions_raw_detailed(
+    let RawEncryptAttempt {
+        result: raw,
+        first_error,
+    } = encrypt_for_devices_with_sessions_raw_detailed(
         runtime,
         stores,
         devices,
@@ -419,6 +493,7 @@ pub async fn encrypt_for_devices_into(
         plan,
     )
     .await?;
+    report_encrypt_drops(resolver, raw.unkeyed_at_encrypt);
 
     participant_nodes.reserve(raw.devices.len());
     for one in raw.devices {
@@ -432,6 +507,7 @@ pub async fn encrypt_for_devices_into(
     Ok(EncryptFanoutSummary {
         includes_prekey_message: raw.includes_prekey_message,
         had_unregistered_device: raw.had_unregistered_device,
+        first_error,
     })
 }
 
@@ -460,6 +536,16 @@ pub struct SessionPlan {
     /// unrelated users for no reason.
     pub rejected_devices: Vec<Jid>,
     first_error: Option<anyhow::Error>,
+    /// Devices this plan already gave up on, and already counted. The encrypt
+    /// fan-out skips them when tallying its own drops, so one dropped device is
+    /// never reported as both a session-setup drop and an encrypt drop.
+    ///
+    /// Named devices rather than a flag, because "no session at encrypt" is not
+    /// a usable proxy: libsignal reports a *degenerate stored* session as
+    /// `SessionNotFound` too, and that one is the unusable-session case this
+    /// batch exists to surface. Empty on the warm path and on
+    /// [`SessionPlan::assume_ready`], so it costs no allocation there.
+    unkeyed_devices: Vec<Jid>,
 }
 
 impl SessionPlan {
@@ -474,6 +560,30 @@ impl SessionPlan {
             had_unregistered_device: false,
             rejected_devices: Vec::new(),
             first_error: None,
+            unkeyed_devices: Vec::new(),
+        }
+    }
+}
+
+/// `has_session`, counting the whole fan-out as unkeyable if the store cannot
+/// answer.
+///
+/// A store failure abandons the plan before any device is keyed, and a
+/// best-effort group send then carries on distributing to nobody, so without
+/// this the loudest local fault a send can hit would move no counter at all.
+/// Every device is affected, not just the one being probed: the error takes the
+/// plan with it.
+async fn has_session_or_report(
+    session_store: &(dyn CloneableSessionStore + Send + Sync),
+    addr: &ProtocolAddress,
+    resolver: &dyn SendContextResolver,
+    devices: &[Jid],
+) -> Result<bool> {
+    match wacore_libsignal::protocol::has_session(session_store, addr).await {
+        Ok(present) => Ok(present),
+        Err(error) => {
+            resolver.on_unkeyable_devices(UnkeyableDevice::SessionLookup, devices.len() as u64);
+            Err(error.into())
         }
     }
 }
@@ -525,6 +635,8 @@ pub async fn ensure_sessions_for_devices(
     let mut indices_needing_prekeys: Vec<usize> = Vec::new();
     let mut had_406 = false;
     let mut rejected_devices: Vec<Jid> = Vec::new();
+    // Stays unallocated unless a device is actually dropped.
+    let mut unkeyed_devices: Vec<Jid> = Vec::new();
     let mut first_error = None;
 
     let mut reusable_addr = crate::types::jid::make_reusable_protocol_address();
@@ -540,7 +652,8 @@ pub async fn ensure_sessions_for_devices(
             let lid_jid = Jid::lid_device(lid_user, device_jid.device);
             lid_jid.reset_protocol_address(&mut reusable_addr);
 
-            if wacore_libsignal::protocol::has_session(stores.session_store, &reusable_addr).await?
+            if has_session_or_report(stores.session_store, &reusable_addr, resolver, devices)
+                .await?
             {
                 log::debug!(
                     "Using LID session {} for PN {} (LID-first lookup)",
@@ -553,7 +666,7 @@ pub async fn ensure_sessions_for_devices(
         }
 
         device_jid.reset_protocol_address(&mut reusable_addr);
-        if wacore_libsignal::protocol::has_session(stores.session_store, &reusable_addr).await? {
+        if has_session_or_report(stores.session_store, &reusable_addr, resolver, devices).await? {
             continue;
         }
 
@@ -586,6 +699,11 @@ pub async fn ensure_sessions_for_devices(
             .iter()
             .map(|&i| devices[i].clone())
             .collect();
+        // Devices whose drop the fetch already counted, so the per-device
+        // branch below does not report one drop twice: a rejection *is* the
+        // reason that device's bundle is missing.
+        let mut server_named: Vec<crate::prekeys::RejectedDevice> = Vec::new();
+        let mut batch_refused = false;
         // A batch-wide 406 is all-or-nothing — per-device retries just wasted
         // N·RTT with the same failure. Mark `had_406` so the caller invalidates
         // the users and the next send re-fetches. Matches WA Web's
@@ -599,6 +717,9 @@ pub async fn ensure_sessions_for_devices(
             .await
         {
             Ok(outcome) => {
+                for device in &outcome.rejected {
+                    resolver.on_unkeyable_devices(UnkeyableDevice::Rejected(device.code), 1);
+                }
                 rejected_devices.extend(
                     outcome
                         .rejected
@@ -614,6 +735,7 @@ pub async fn ensure_sessions_for_devices(
                     );
                     had_406 = true;
                 }
+                server_named = outcome.rejected;
                 outcome.bundles
             }
             Err(e) if is_device_unregistered_error(&e) => {
@@ -624,13 +746,33 @@ pub async fn ensure_sessions_for_devices(
                     jids_for_fetch.len()
                 );
                 had_406 = true;
+                // The refusal answers for the whole batch, so every device in it
+                // is unkeyable for that reason rather than for an absent bundle.
+                // Its own reason, not `Rejected`: the batch names nobody, so
+                // this is an attribution and must not read as a per-device fact.
+                batch_refused = true;
+                resolver.on_unkeyable_devices(
+                    UnkeyableDevice::BatchRefused,
+                    jids_for_fetch.len() as u64,
+                );
                 // Best-effort callers still skip these devices, while a required
                 // distribution can surface the typed server failure without
                 // reconstructing it or reducing the source chain to a string.
                 first_error = Some(e);
                 std::collections::HashMap::new()
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // A timeout, a transport failure or a 429/5xx leaves the same
+                // devices unkeyed as a refusal does, and a best-effort group
+                // send swallows this error and distributes to nobody. Counting
+                // only the refusal would make the signal go quiet during the
+                // outage that needs it loudest.
+                resolver.on_unkeyable_devices(
+                    UnkeyableDevice::FetchFailed,
+                    jids_for_fetch.len() as u64,
+                );
+                return Err(e);
+            }
         };
 
         // Parallel session establishment via process_prekey_bundle. Each
@@ -650,6 +792,8 @@ pub async fn ensure_sessions_for_devices(
             let encryption_jid = encryption_override_at(&encryption_overrides, idx)
                 .cloned()
                 .unwrap_or_else(|| lookup_jid.clone());
+            let counted_at_fetch =
+                batch_refused || server_named.iter().any(|device| device.jid == lookup_jid);
 
             let bundles = prekey_bundles.clone();
             let mut session_store = stores.session_store.clone_box();
@@ -666,7 +810,11 @@ pub async fn ensure_sessions_for_devices(
                         "No pre-key bundle returned for device {}. This device will be skipped for encryption.",
                         addr
                     );
-                    return Ok::<Option<Jid>, anyhow::Error>(None);
+                    return SessionOutcome::Dropped {
+                        jid: lookup_jid,
+                        reason: (!counted_at_fetch).then_some(UnkeyableDevice::NoBundle),
+                        error: None,
+                    };
                 };
 
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
@@ -685,10 +833,18 @@ pub async fn ensure_sessions_for_devices(
                 {
                     // Surface a replaced identity so the caller can react
                     // (resolver has no 'static handle into this spawned task).
-                    Ok(IdentityChange::ReplacedExisting) => Ok(Some(encryption_jid)),
-                    Ok(IdentityChange::NewOrUnchanged) => Ok(None),
-                    Err(error) => Err(anyhow::Error::new(error)
-                        .context(format!("failed to process pre-key bundle for {addr}"))),
+                    Ok(IdentityChange::ReplacedExisting) => {
+                        SessionOutcome::Established(Some(encryption_jid))
+                    }
+                    Ok(IdentityChange::NewOrUnchanged) => SessionOutcome::Established(None),
+                    Err(error) => SessionOutcome::Dropped {
+                        jid: lookup_jid,
+                        reason: Some(UnkeyableDevice::SessionSetup),
+                        error: Some(
+                            anyhow::Error::new(error)
+                                .context(format!("failed to process pre-key bundle for {addr}")),
+                        ),
+                    },
                 }
             })
         };
@@ -702,19 +858,31 @@ pub async fn ensure_sessions_for_devices(
             match spawn_result {
                 // Some(jid) => establishing this session replaced a stored
                 // identity; notify the client so it can react off-path.
-                Ok(Ok(Some(changed_jid))) => resolver.on_local_identity_change(&changed_jid),
-                Ok(Ok(None)) => {}
+                Ok(SessionOutcome::Established(Some(changed_jid))) => {
+                    resolver.on_local_identity_change(&changed_jid)
+                }
+                Ok(SessionOutcome::Established(None)) => {}
                 // Isolate the failure to this device so one participant can't abort
                 // the cohort's SKDM (matching WA Web GroupKeyDistributionMsg's
                 // per-device try/catch). The sessionless device is dropped by the
-                // fan-out below.
-                Ok(Err(e)) => {
-                    log::warn!("Group session setup failed for a device, skipping it: {e}");
-                    if first_error.is_none() {
-                        first_error = Some(e);
+                // fan-out below, which skips it when tallying its own drops.
+                Ok(SessionOutcome::Dropped { jid, reason, error }) => {
+                    if let Some(reason) = reason {
+                        resolver.on_unkeyable_devices(reason, 1);
+                    }
+                    unkeyed_devices.push(jid);
+                    if let Some(error) = error {
+                        log::warn!("Group session setup failed for a device, skipping it: {error}");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
                     }
                 }
                 Err(error) => {
+                    // The task took the device's identity with it, so this drop
+                    // cannot join `unkeyed_devices` — and must not be counted
+                    // here either, or the encrypt fan-out (which will fail for
+                    // the same device) would count it a second time.
                     log::warn!(
                         "Session-establishment task did not deliver a result; skipping device."
                     );
@@ -736,6 +904,7 @@ pub async fn ensure_sessions_for_devices(
         had_unregistered_device: had_406,
         rejected_devices,
         first_error,
+        unkeyed_devices,
     })
 }
 
@@ -745,6 +914,11 @@ pub async fn ensure_sessions_for_devices(
 /// under locks that must not span I/O. A device whose session is still
 /// missing (e.g. its bundle was absent) fails its encrypt and is skipped,
 /// matching the combined path's behavior.
+///
+/// Holding no resolver, this cannot report the devices it skipped. Every
+/// in-tree path goes through [`encrypt_for_devices`], [`encrypt_for_devices_into`]
+/// or the raw variant instead; a caller that wants the tally wants
+/// [`encrypt_for_devices_with_sessions_raw`], whose result carries it.
 pub async fn encrypt_for_devices_with_sessions(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'_>,
@@ -788,6 +962,7 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
         plan,
     )
     .await?;
+    let unkeyed_at_encrypt = raw.unkeyed_at_encrypt;
 
     // Map each ciphertext to the message path's `<to><enc>` node, preserving the
     // raw fan-out order so the wire output is identical to the pre-split path.
@@ -795,6 +970,10 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
     let mut participant_nodes = Vec::with_capacity(raw.devices.len());
     let mut encrypted_devices = Vec::with_capacity(raw.devices.len());
     for one in raw.devices {
+        // Both lists need the JID by value (`NodeValue::Jid` owns one), so one
+        // copy is the floor. It is a `CompactString` that holds every phone and
+        // LID user inline, so the copy is a move of the struct, not a heap
+        // round trip.
         encrypted_devices.push(one.device_jid.clone());
         participant_nodes.push(encrypted_device_to_participant_node(
             one,
@@ -809,9 +988,12 @@ pub(crate) async fn encrypt_for_devices_with_sessions_detailed(
             includes_prekey_message: raw.includes_prekey_message,
             encrypted_devices,
             had_unregistered_device: raw.had_unregistered_device,
-            rejected_devices: raw.rejected_devices.clone(),
+            // The raw result is consumed here, so its rejection list can be
+            // handed over rather than duplicated.
+            rejected_devices: raw.rejected_devices,
         },
         first_error,
+        unkeyed_at_encrypt,
     })
 }
 
@@ -859,10 +1041,12 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         had_unregistered_device,
         rejected_devices,
         mut first_error,
+        unkeyed_devices,
     } = plan;
 
     let mut encrypted = Vec::with_capacity(devices.len());
     let mut includes_prekey_message = false;
+    let mut unkeyed_at_encrypt = 0u64;
 
     // The wire-order of `<to>` participants does not need to match the input
     // device order: WA Web's `phash` (computed both client and server side)
@@ -889,6 +1073,8 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             &mut encrypted,
             &mut includes_prekey_message,
             &mut first_error,
+            &unkeyed_devices,
+            &mut unkeyed_at_encrypt,
         );
     } else {
         // One task per chunk, not per device: the per-device fan-out allocated a
@@ -921,7 +1107,16 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             let mut session_store = stores.session_store.clone_box();
             let mut identity_store = stores.identity_store.clone_box();
 
-            in_flight.push(spawn_oneshot(runtime, async move {
+            // The chunk's countable size rides along so a chunk that never
+            // delivers reports exactly how many devices it took down with it,
+            // instead of leaving the count to an estimate. Devices session setup
+            // already gave up on are excluded here for the same reason the
+            // per-device branch excludes them: they are counted once, there.
+            let chunk_countable = jobs
+                .iter()
+                .filter(|(_, device_jid)| !unkeyed_devices.contains(device_jid))
+                .count() as u64;
+            let task = spawn_oneshot(runtime, async move {
                 let mut out = Vec::with_capacity(jobs.len());
                 for (addr, device_jid) in jobs {
                     out.push(
@@ -936,9 +1131,10 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                     );
                 }
                 out
-            }));
+            });
+            in_flight.push(async move { (chunk_countable, task.await) });
         }
-        while let Some(spawn_result) = in_flight.next().await {
+        while let Some((chunk_countable, spawn_result)) = in_flight.next().await {
             match spawn_result {
                 Ok(results) => {
                     for res in results {
@@ -947,6 +1143,8 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                             &mut encrypted,
                             &mut includes_prekey_message,
                             &mut first_error,
+                            &unkeyed_devices,
+                            &mut unkeyed_at_encrypt,
                         );
                     }
                 }
@@ -954,9 +1152,9 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
                     // A whole chunk drops (not one device); its members stay
                     // un-warm and are re-targeted next send.
                     log::warn!(
-                        "Encrypt chunk did not deliver a result; up to ~{} device(s) skipped this send.",
-                        total.div_ceil(num_chunks)
+                        "Encrypt chunk did not deliver a result; {chunk_countable} further device(s) skipped this send."
                     );
+                    unkeyed_at_encrypt += chunk_countable;
                     if first_error.is_none() {
                         first_error = Some(anyhow::Error::new(error));
                     }
@@ -971,9 +1169,43 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             includes_prekey_message,
             had_unregistered_device,
             rejected_devices,
+            unkeyed_at_encrypt,
         },
         first_error,
     })
+}
+
+#[cfg(test)]
+mod participant_node_tests {
+    use super::{EncryptedDevice, encrypted_device_to_participant_node};
+    use wacore_binary::Jid;
+    use wacore_binary::node::NodeContent;
+
+    /// The per-device ciphertext is the largest buffer the fan-out touches, and
+    /// it is handed straight to the `<enc>` node. `NodeBuilder::bytes` takes an
+    /// `impl Into<Vec<u8>>`, which is a no-op for the `Vec<u8>` it is given.
+    /// Pass a slice instead and every device silently pays a full copy, so
+    /// pointer identity is the only thing that catches the regression.
+    #[test]
+    fn the_ciphertext_reaches_the_enc_node_without_being_copied() {
+        let ciphertext = vec![0xAB; 4096];
+        let expected_ptr = ciphertext.as_ptr();
+        let one = EncryptedDevice {
+            device_jid: Jid::lid_device("100000000000001".to_owned(), 3),
+            enc_type: "msg",
+            is_prekey: false,
+            ciphertext,
+        };
+
+        let to_node = encrypted_device_to_participant_node(one, None, false);
+        let Some(NodeContent::Nodes(children)) = to_node.content else {
+            panic!("a `<to>` node carries its `<enc>` child");
+        };
+        let Some(NodeContent::Bytes(bytes)) = &children[0].content else {
+            panic!("an `<enc>` node carries the ciphertext as bytes");
+        };
+        assert_eq!(bytes.as_ptr(), expected_ptr, "the ciphertext was copied");
+    }
 }
 
 #[cfg(test)]

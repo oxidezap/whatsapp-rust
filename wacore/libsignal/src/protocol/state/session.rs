@@ -11,6 +11,7 @@ use buffa::{Message, MessageField};
 use subtle::ConstantTimeEq;
 
 use crate::core::curve::KeyType;
+use crate::protocol::counter_lease::CounterLease;
 use crate::protocol::ratchet::keys::MessageKeyGenerator;
 use crate::protocol::ratchet::{ChainKey, RootKey};
 use crate::protocol::record_components::{
@@ -732,9 +733,11 @@ impl From<&SessionState> for SessionStructure {
 
 /// Record-level field number carrying the sender-chain counter reservation in
 /// the serialized `RecordStructure`. The upstream (whatspec) proto cannot be
-/// edited to add local fields, so the record encoder — already hand-rolled in
-/// [`SessionRecord::serialize_into`] — writes it directly; the number sits far
-/// above RecordStructure's fields (1, 2) so a future upstream addition cannot
+/// edited to add local fields — `waproto/build.rs` splices those into the
+/// descriptor instead, via `LOCAL_FIELDS` — but this one is written directly
+/// by the record encoder, already hand-rolled in
+/// [`SessionRecord::serialize_into`]; the number sits far above
+/// RecordStructure's fields (1, 2) so a future upstream addition cannot
 /// collide. Standard unknown-field skipping keeps old readers compatible.
 ///
 /// That compatibility is one-way: a build without lease support silently
@@ -750,17 +753,13 @@ const RESERVED_SENDER_CHAIN_INDEX_FIELD: u32 =
 pub struct SessionRecord {
     current_session: Option<SessionState>,
     previous_sessions: Arc<Vec<SessionStructure>>,
-    /// Durability lease: ceiling (exclusive) of sender-chain counters this
-    /// record's durable snapshots may already have spent on the wire. Any
-    /// state entering service from such a snapshot must fast-forward its
-    /// sender chain here first — message keys and IVs are derived
-    /// deterministically from the counter, so re-deriving a spent counter
-    /// reuses a (key, IV) pair.
-    reserved_sender_chain_index: u32,
-    /// A reservation was raised but not yet durably flushed. While set, the
-    /// owning ciphertext must not reach the wire; the store layer transfers
-    /// this into its flush gating. Transient — never serialized.
-    pending_reservation: bool,
+    /// Durability lease over sender-chain counters, or the consumer's
+    /// declaration that it persists before the wire and needs none. Any state
+    /// entering service from a snapshot must fast-forward past a live lease
+    /// first — message keys and IVs are derived deterministically from the
+    /// counter, so re-deriving a spent counter reuses a (key, IV) pair. The
+    /// pending flag it carries is transient and never serialized.
+    lease: CounterLease,
 }
 
 impl SessionRecord {
@@ -768,8 +767,7 @@ impl SessionRecord {
         Self {
             current_session: None,
             previous_sessions: Arc::new(Vec::new()),
-            reserved_sender_chain_index: 0,
-            pending_reservation: false,
+            lease: CounterLease::default(),
         }
     }
 
@@ -777,8 +775,7 @@ impl SessionRecord {
         Self {
             current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
-            reserved_sender_chain_index: 0,
-            pending_reservation: false,
+            lease: CounterLease::default(),
         }
     }
 
@@ -803,8 +800,7 @@ impl SessionRecord {
         Ok(Self {
             current_session,
             previous_sessions: Arc::new(previous_sessions),
-            reserved_sender_chain_index: 0,
-            pending_reservation: false,
+            lease: CounterLease::default(),
         })
     }
 
@@ -813,9 +809,10 @@ impl SessionRecord {
     /// Any durably reserved sender range is advanced to its exclusive ceiling
     /// before export so rebuilding the record cannot derive a possibly spent
     /// message key again. A chain too stale to advance is dropped fail-closed
-    /// without discarding the rest of the record.
+    /// without discarding the rest of the record. A waived lease reserves
+    /// nothing, so there is nothing to advance past.
     pub fn into_components(mut self) -> Result<SessionRecordComponents, SignalProtocolError> {
-        let reserved_sender_chain_index = self.reserved_sender_chain_index;
+        let reserved_sender_chain_index = self.lease.ceiling();
         if reserved_sender_chain_index > 0
             && let Some(state) = self.current_session.as_mut()
         {
@@ -845,17 +842,58 @@ impl SessionRecord {
     }
 
     pub fn reserved_sender_chain_index(&self) -> u32 {
-        self.reserved_sender_chain_index
+        self.lease.ceiling()
+    }
+
+    /// Waive counter leasing on this record, declaring that the consumer's
+    /// persistence is synchronous and durable before the ciphertext reaches
+    /// the wire.
+    ///
+    /// By default the record leases outbound counters in batches, so the send
+    /// path needs a durable flush only when a batch runs out and any reload
+    /// fast-forwards past the whole lease. A consumer that persists before the
+    /// wire gets nothing from that and pays for it, since every export has to
+    /// burn the reserved range.
+    ///
+    /// **This gives up a real guarantee.** Message keys and IVs are derived
+    /// deterministically from the counter, so without the lease a crash between
+    /// the encrypt and the write can reissue a counter and with it the
+    /// (key, IV) pair. Only a consumer whose writes are durable before the wire
+    /// can make that trade.
+    ///
+    /// Apply this to every record loaded; nothing is inferred from the stored
+    /// representation, because the same representation can be persisted by a
+    /// consumer that wants the lease and by one that does not. A snapshot
+    /// written while the lease was in force still carries a reservation that
+    /// may already have been published, so it is materialized once here before
+    /// the lease goes away.
+    pub fn waive_counter_lease(&mut self) {
+        let ceiling = self.lease.ceiling();
+        if ceiling == 0 {
+            self.lease.waive();
+            return;
+        }
+        // Every state the lease covered has to burn it, archived ones included:
+        // once the ceiling is gone, a later promotion has nothing left to tell
+        // it those counters may already be on the wire.
+        if let Some(state) = self.current_session.as_mut() {
+            state.fast_forward_sender_chain_or_drop(ceiling);
+        }
+        for session in Arc::make_mut(&mut self.previous_sessions) {
+            let mut state = SessionState::from_session_structure(std::mem::take(session));
+            state.fast_forward_sender_chain_or_drop(ceiling);
+            *session = state.session;
+        }
+        self.lease.waive();
     }
 
     /// Lease a fresh batch of sender-chain counters after `spent_counter` was
     /// issued past the current reservation. Marks the record pending: the
     /// caller's ciphertext must not hit the wire until a flush persists the
-    /// raised ceiling.
+    /// raised ceiling. A counter still inside the batch, or a waived lease,
+    /// leaves both untouched.
     pub fn reserve_sender_chain_counters(&mut self, spent_counter: u32) {
-        self.reserved_sender_chain_index =
-            spent_counter.saturating_add(consts::SENDER_CHAIN_RESERVATION_BATCH);
-        self.pending_reservation = true;
+        self.lease.reserve(spent_counter);
     }
 
     /// Rebase the lease after a DH ratchet replaced the leased sender chain
@@ -881,19 +919,17 @@ impl SessionRecord {
         // Never raises: a counter must not be published under a ceiling that
         // is not yet durable. An in-chain lease is always within one batch of
         // the live index, so this is a no-op outside a chain replacement.
-        self.reserved_sender_chain_index = self
-            .reserved_sender_chain_index
-            .min(consts::SENDER_CHAIN_RESERVATION_BATCH);
+        self.lease.rebase();
     }
 
     pub fn has_pending_reservation(&self) -> bool {
-        self.pending_reservation
+        self.lease.is_pending_flush()
     }
 
     /// The store layer takes ownership of the wire gate (it tracks the address
     /// until a successful flush), so the transient flag is dropped here.
     pub fn clear_pending_reservation(&mut self) {
-        self.pending_reservation = false;
+        self.lease.set_pending_flush(false);
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self, SignalProtocolError> {
@@ -945,8 +981,7 @@ impl SessionRecord {
                 .map_err(|_| InvalidSessionError("failed to decode current session protobuf"))?
                 .map(Into::into),
             previous_sessions: Arc::new(previous_sessions),
-            reserved_sender_chain_index: local_fields.reservation,
-            pending_reservation: false,
+            lease: CounterLease::from_persisted_ceiling(local_fields.reservation),
         };
 
         let trusted_reload =
@@ -954,10 +989,10 @@ impl SessionRecord {
 
         // An untrusted snapshot may predate sends covered by its lease.
         if !trusted_reload
-            && record.reserved_sender_chain_index > 0
+            && record.lease.ceiling() > 0
             && let Some(state) = record.current_session.as_mut()
         {
-            state.fast_forward_sender_chain(record.reserved_sender_chain_index)?;
+            state.fast_forward_sender_chain(record.lease.ceiling())?;
         }
 
         Ok(record)
@@ -1103,8 +1138,8 @@ impl SessionRecord {
     pub fn promote_state(&mut self, new_state: SessionState) {
         self.archive_current_state_inner();
         let mut state = new_state;
-        if self.reserved_sender_chain_index > 0 {
-            state.fast_forward_sender_chain_or_drop(self.reserved_sender_chain_index);
+        if self.lease.ceiling() > 0 {
+            state.fast_forward_sender_chain_or_drop(self.lease.ceiling());
         }
         self.current_session = Some(state);
     }
@@ -1115,14 +1150,14 @@ impl SessionRecord {
     /// archived before resetting it for the fresh chain; otherwise the archive
     /// could later reissue a counter covered by the discarded lease.
     pub fn promote_fresh_state(&mut self, new_state: SessionState) {
-        if self.reserved_sender_chain_index > 0
+        if self.lease.ceiling() > 0
             && let Some(state) = self.current_session.as_mut()
         {
-            state.fast_forward_sender_chain_or_drop(self.reserved_sender_chain_index);
+            state.fast_forward_sender_chain_or_drop(self.lease.ceiling());
         }
         self.archive_current_state_inner();
         self.current_session = Some(new_state);
-        self.reserved_sender_chain_index = 0;
+        self.lease.clear_reservation();
     }
 
     fn archive_current_state_inner(&mut self) -> bool {
@@ -1190,18 +1225,25 @@ impl SessionRecord {
             .map(|msg_len| 1 + varint_len(msg_len as u64) + msg_len)
             .unwrap_or(0);
 
-        let mut previous_msg_lens = Vec::with_capacity(self.previous_sessions.len());
-        let previous_len: usize = self
-            .previous_sessions
-            .iter()
-            .map(|s| {
-                let msg_len = s.compute_size(&mut cache) as usize;
-                previous_msg_lens.push(msg_len);
-                1 + varint_len(msg_len as u64) + msg_len
-            })
-            .sum();
+        // Sizing pass for the archived states. Their encoded lengths are needed
+        // twice (to reserve, then to write each length prefix), and a scratch
+        // `Vec` for them allocated on every flush. `previous_sessions` holds 0
+        // to 3 states in the common case, so the lengths land in a stack array
+        // and only a deep archive falls back to the heap.
+        const INLINE_PREVIOUS_LENS: usize = 8;
+        let mut inline_msg_lens = [0usize; INLINE_PREVIOUS_LENS];
+        let mut spilled_msg_lens: Vec<usize> = Vec::new();
+        let mut previous_len = 0usize;
+        for (i, session) in self.previous_sessions.iter().enumerate() {
+            let msg_len = session.compute_size(&mut cache) as usize;
+            previous_len += 1 + varint_len(msg_len as u64) + msg_len;
+            match inline_msg_lens.get_mut(i) {
+                Some(slot) => *slot = msg_len,
+                None => spilled_msg_lens.push(msg_len),
+            }
+        }
 
-        let reserved = self.reserved_sender_chain_index;
+        let reserved = self.lease.ceiling();
         let incarnation = incarnation.filter(|_| reserved > 0);
         let reserved_len = if reserved > 0 {
             2 + varint_len(reserved as u64)
@@ -1220,7 +1262,11 @@ impl SessionRecord {
         {
             write_len_delimited(1, &state.session, msg_len, &mut cache, buf);
         }
-        for (session, msg_len) in self.previous_sessions.iter().zip(previous_msg_lens) {
+        for (i, session) in self.previous_sessions.iter().enumerate() {
+            let msg_len = match inline_msg_lens.get(i) {
+                Some(msg_len) => *msg_len,
+                None => spilled_msg_lens[i - INLINE_PREVIOUS_LENS],
+            };
             write_len_delimited(2, session, msg_len, &mut cache, buf);
         }
         if reserved > 0 {
@@ -1651,6 +1697,7 @@ mod tests {
                     cipher_key: Some(vec![seed.wrapping_add(idx); 32].into()),
                     mac_key: Some(vec![seed.wrapping_add(idx).wrapping_add(1); 32].into()),
                     iv: Some(vec![seed.wrapping_add(idx).wrapping_add(2); 16].into()),
+                    seed: Some(vec![seed.wrapping_add(idx).wrapping_add(3); 32].into()),
                 }
             })
             .collect();
@@ -1886,6 +1933,47 @@ mod tests {
         MessageKeyGenerator::new_from_seed(&seed, counter)
     }
 
+    /// The seed is additive: a record written before it existed must still
+    /// deserialize and hand back exactly the keys it stored.
+    #[test]
+    fn seedless_persisted_message_keys_still_load_and_decrypt() {
+        let base_key = KeyPair::generate(&mut rng()).public_key;
+        let mut state = create_test_session_state(3, &base_key);
+        let sender_key = KeyPair::generate(&mut rng()).public_key;
+        state.add_receiver_chain(&sender_key, &ChainKey::new([7u8; 32], 0));
+        state
+            .set_message_keys(&sender_key, create_test_message_key_generator(5))
+            .expect("skipped key stored");
+        let expected = create_test_message_key_generator(5).generate_keys();
+
+        // Rebuild the shape those records had: the derived triple written out,
+        // no seed beside it. The skip loop stores the seed alone now, so the
+        // fixture has to put the triple back before stripping the seed.
+        let mut structure = SessionStructure::from(&state);
+        let stored = &mut structure.receiver_chains[0].message_keys[0];
+        assert!(stored.seed.is_some());
+        stored.cipher_key = Some(bytes::Bytes::copy_from_slice(expected.cipher_key()));
+        stored.mac_key = Some(bytes::Bytes::copy_from_slice(expected.mac_key()));
+        stored.iv = Some(bytes::Bytes::copy_from_slice(expected.iv()));
+        stored.seed = None;
+        let bytes = SessionRecord::new(SessionState::from(structure))
+            .serialize()
+            .expect("serialize");
+
+        let mut record = SessionRecord::deserialize(&bytes).expect("deserialize");
+        let keys = record
+            .session_state_mut()
+            .expect("current state")
+            .get_message_keys(&sender_key, 5)
+            .expect("valid session")
+            .expect("skipped key survives")
+            .generate_keys();
+
+        assert_eq!(keys.cipher_key(), expected.cipher_key());
+        assert_eq!(keys.mac_key(), expected.mac_key());
+        assert_eq!(keys.iv(), expected.iv());
+    }
+
     #[test]
     fn test_receiver_chain_lookup_by_bytes() {
         let base_key = KeyPair::generate(&mut rng()).public_key;
@@ -2038,8 +2126,7 @@ mod tests {
         let record = SessionRecord {
             current_session: Some(SessionState::from_session_structure(current.clone())),
             previous_sessions: Arc::new(previous_sessions.clone()),
-            reserved_sender_chain_index: 0,
-            pending_reservation: false,
+            lease: CounterLease::default(),
         };
         let expected = waproto::whatsapp::RecordStructure {
             current_session: MessageField::some(current),
@@ -2048,6 +2135,55 @@ mod tests {
         .encode_to_vec();
 
         assert_eq!(record.serialize().unwrap(), expected);
+    }
+
+    /// `serialize_into_inner` keeps the first few archived lengths in a stack
+    /// array and puts the rest in a heap spill indexed off that capacity, so an
+    /// archive deep enough to spill can emit a length prefix belonging to a
+    /// different session. The sizes have to differ per session for that to show
+    /// up in the bytes at all: a list of equal-sized sessions encodes
+    /// identically no matter which length each prefix is taken from.
+    #[test]
+    fn test_session_record_manual_encoding_matches_generated_past_inline_lengths() {
+        let current = make_cache_shape_session(1, 3, 2);
+        let previous_sessions: Vec<SessionStructure> = (0..20u8)
+            .map(|idx| {
+                make_cache_shape_session(
+                    7u8.wrapping_mul(idx).wrapping_add(11),
+                    (idx % 4) as usize,
+                    (idx % 5) as usize,
+                )
+            })
+            .collect();
+
+        // Guard the premise: neighbouring sessions must encode to different
+        // lengths, or this test cannot fail on a mis-indexed spill.
+        let lengths: Vec<usize> = previous_sessions
+            .iter()
+            .map(|s| s.encode_to_vec().len())
+            .collect();
+        assert!(
+            lengths.windows(2).any(|w| w[0] != w[1]),
+            "sessions must vary in encoded length: {lengths:?}"
+        );
+
+        let record = SessionRecord {
+            current_session: Some(SessionState::from_session_structure(current.clone())),
+            previous_sessions: Arc::new(previous_sessions.clone()),
+            lease: CounterLease::default(),
+        };
+        let expected = waproto::whatsapp::RecordStructure {
+            current_session: MessageField::some(current),
+            previous_sessions,
+        }
+        .encode_to_vec();
+
+        assert_eq!(record.serialize().unwrap(), expected);
+
+        // Round-trip too, so a length prefix that is self-consistent but wrong
+        // still surfaces as reordered or corrupted sessions.
+        let restored = SessionRecord::deserialize(&expected).unwrap();
+        assert_eq!(restored.previous_session_count(), 20);
     }
 
     #[test]

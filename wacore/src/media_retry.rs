@@ -46,7 +46,7 @@ fn derive_media_retry_key(media_key: &[u8]) -> Result<[u8; 32]> {
 
 /// Extract byte content from a NodeRef.
 fn get_bytes_content_ref<'a>(node: &'a NodeRef<'_>) -> Option<&'a [u8]> {
-    match node.content.as_deref() {
+    match node.content.as_ref() {
         Some(NodeContentRef::Bytes(b)) => Some(b.as_ref()),
         _ => None,
     }

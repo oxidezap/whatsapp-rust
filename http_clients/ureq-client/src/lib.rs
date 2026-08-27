@@ -4,6 +4,8 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wacore::net::{HttpClient, HttpRequest, HttpResponse, StreamingHttpResponse, UploadBody};
 use wacore::stats::HttpResourceReport;
 
@@ -30,16 +32,62 @@ pub struct UreqHttpClient {
     /// Best-effort pool footprint for `resource_report`. `None` when a custom
     /// agent is supplied (its buffer/pool config is opaque to us).
     pool_report: Option<HttpResourceReport>,
+    /// Set by the first request. Shared, because cloning shares the agent and
+    /// therefore the pool. Read by [`UreqHttpClient::resource_report`].
+    requested: Arc<AtomicBool>,
 }
 
-/// Pool footprint of the default agent: each idle connection keeps an input and
-/// an output buffer. ureq exposes neither the live pool size nor in-flight
-/// buffering, so this is an upper-bound estimate, not a measurement.
+/// Pool footprint of the default agent once it has connected: each idle
+/// connection keeps an input and an output buffer. ureq exposes neither the live
+/// pool size nor in-flight buffering, so this is an upper-bound estimate, not a
+/// measurement.
 fn default_pool_report() -> HttpResourceReport {
     HttpResourceReport {
         pool_connections: Some(MAX_IDLE_CONNECTIONS),
         pool_buffer_bytes: Some(MAX_IDLE_CONNECTIONS * (INPUT_BUFFER_BYTES + OUTPUT_BUFFER_BYTES)),
         inflight_bytes: None,
+    }
+}
+
+/// What the pool holds before the first request: nothing.
+const EMPTY_POOL_REPORT: HttpResourceReport = HttpResourceReport {
+    pool_connections: Some(0),
+    pool_buffer_bytes: Some(0),
+    inflight_bytes: None,
+};
+
+/// Latches that ureq is about to be handed a request it can actually send.
+///
+/// Decided before dispatch rather than from the error afterwards, because the
+/// two are not the same question: a redirect to a malformed `Location` fails
+/// with the same `BadUri` as a malformed request, long after the first one
+/// reached the wire. Anything ureq refuses to build never opens a socket, so
+/// the pool stays provably empty; everything past this point is its business.
+///
+/// The three refusals: `headers_ref` reports a builder carrying a bad header
+/// name or value, ureq rejects a URI with no host or no known scheme, and a
+/// request carrying `Connection: close` returns its socket to nobody. Erring
+/// towards "not dispatchable" if those rules ever widen keeps the estimate a
+/// lower bound, which is the direction that stays honest.
+///
+/// Relaxed: the flag feeds an on-demand estimate, not a happens-before.
+fn mark_if_dispatchable<Any>(requested: &AtomicBool, req: &ureq::RequestBuilder<Any>, url: &str) {
+    let Some(headers) = req.headers_ref() else {
+        return;
+    };
+    // Mirrors ureq's own rule byte for byte (`ureq_proto`'s `Call::new` compares
+    // the whole header value to `close`), because the question here is what ureq
+    // will do with the socket, not what the RFC lets a caller write.
+    let pools = !headers
+        .get_all(ureq::http::header::CONNECTION)
+        .iter()
+        .any(|value| value.as_bytes() == b"close");
+    let dispatchable = pools
+        && ureq::http::Uri::try_from(url).is_ok_and(|uri| {
+            uri.authority().is_some() && matches!(uri.scheme_str(), Some("http" | "https"))
+        });
+    if dispatchable {
+        requested.store(true, Ordering::Relaxed);
     }
 }
 
@@ -49,6 +97,7 @@ impl UreqHttpClient {
             agent: build_agent(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             pool_report: Some(default_pool_report()),
+            requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -62,6 +111,7 @@ impl UreqHttpClient {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             // A custom agent's buffer/pool sizes are opaque — don't guess.
             pool_report: None,
+            requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -164,6 +214,7 @@ impl HttpClient for UreqHttpClient {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
         let agent = self.agent.clone();
         let max_body_bytes = self.max_body_bytes;
+        let requested = self.requested.clone();
         // Since ureq is blocking, we must use spawn_blocking
         tokio::task::spawn_blocking(move || {
             let response = match request.method.as_str() {
@@ -172,6 +223,7 @@ impl HttpClient for UreqHttpClient {
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
                     }
+                    mark_if_dispatchable(&requested, &req, &request.url);
                     req.call()?
                 }
                 "POST" => {
@@ -179,6 +231,7 @@ impl HttpClient for UreqHttpClient {
                     for (key, value) in &request.headers {
                         req = req.header(key, value);
                     }
+                    mark_if_dispatchable(&requested, &req, &request.url);
                     if let Some(body) = request.body {
                         req.send(&body[..])?
                     } else {
@@ -212,6 +265,7 @@ impl HttpClient for UreqHttpClient {
                 for (key, value) in &request.headers {
                     req = req.header(key, value);
                 }
+                mark_if_dispatchable(&self.requested, &req, &request.url);
                 req.call()?
             }
             method => {
@@ -265,6 +319,7 @@ impl HttpClient for UreqHttpClient {
         let content_length = content_length.to_string();
         req = req.header("content-length", content_length.as_str());
 
+        mark_if_dispatchable(&self.requested, &req, &request.url);
         let response = req.send(ureq::SendBody::from_owned_reader(body))?;
 
         let status_code = response.status().as_u16();
@@ -273,8 +328,32 @@ impl HttpClient for UreqHttpClient {
         Ok(HttpResponse { status_code, body })
     }
 
+    /// An empty pool before the first request, the configured cap after it.
+    ///
+    /// ureq allocates per connection, not per agent, so an agent that has never
+    /// connected holds no buffers at all: 2.8 KiB of measured RSS against the
+    /// 96 KiB the cap advertises. Reporting the cap there put a quarter of a
+    /// session's estimate on memory that was not resident, and the client's
+    /// `resource_report()` total promises a lower bound.
+    ///
+    /// A latch, not a timer, even though ureq does expire idle connections
+    /// (`max_idle_age`, 15s): it expires them lazily, from `connect` and
+    /// `reuse`, so the buffers of an aged-out connection stay resident until
+    /// some later request touches the pool. Residency is what this reports, so
+    /// dropping the estimate on a clock would understate it for as long as
+    /// nothing asks ureq for a connection — the one direction a lower bound
+    /// must never take.
+    ///
+    /// Both answers need an agent we built. A caller-supplied one
+    /// ([`UreqHttpClient::with_agent`]) may already have connected before it
+    /// reached us, since agents share their pool with every clone, so its pool
+    /// is as opaque as its buffer sizes and stays unreported.
     fn resource_report(&self) -> Option<HttpResourceReport> {
-        self.pool_report
+        let pool_report = self.pool_report?;
+        if !self.requested.load(Ordering::Relaxed) {
+            return Some(EMPTY_POOL_REPORT);
+        }
+        Some(pool_report)
     }
 }
 
@@ -284,6 +363,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+    use std::time::Duration;
 
     fn spawn_fixed_size_server(body_size: usize) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -456,7 +536,7 @@ mod tests {
         assert_eq!(resp.status_code, 200);
 
         let (headers, body) = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(5))
             .expect("server should capture the request");
         assert_eq!(
             parsed_content_length(&headers),
@@ -493,17 +573,21 @@ mod tests {
         assert_eq!(resp.status_code, 200);
 
         let (headers, body) = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(10))
             .expect("server should capture the request");
         assert_eq!(parsed_content_length(&headers), Some(payload.len()));
         assert_eq!(body, payload);
     }
 
-    /// Workstream D: the default agent reports its idle-pool buffer estimate;
-    /// a custom agent (opaque config) reports nothing.
-    #[test]
-    fn resource_report_estimates_default_pool() {
-        let report = UreqHttpClient::new()
+    /// Workstream D: once it has connected, the default agent reports its
+    /// idle-pool buffer estimate; a custom agent (opaque config) reports nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resource_report_estimates_default_pool_after_a_request() {
+        let url = spawn_status_server(200, "OK");
+        let client = UreqHttpClient::new();
+        client.execute(get(url)).await.expect("request should run");
+
+        let report = client
             .resource_report()
             .expect("default agent reports a pool estimate");
         assert_eq!(report.pool_connections, Some(MAX_IDLE_CONNECTIONS));
@@ -515,19 +599,281 @@ mod tests {
         assert!(report.total_bytes() > 0);
 
         // A custom agent's buffer/pool config is opaque — don't guess.
+        let custom = UreqHttpClient::with_agent(build_agent());
+        custom
+            .execute(get(spawn_status_server(200, "OK")))
+            .await
+            .expect("request should run");
         assert!(
-            UreqHttpClient::with_agent(build_agent())
-                .resource_report()
-                .is_none(),
+            custom.resource_report().is_none(),
             "custom-agent client reports no estimate"
         );
 
         // with_max_body_bytes preserves the pool estimate.
-        assert!(
-            UreqHttpClient::new()
-                .with_max_body_bytes(1024)
+        let capped = UreqHttpClient::new().with_max_body_bytes(1024);
+        capped
+            .execute(get(spawn_status_server(200, "OK")))
+            .await
+            .expect("request should run");
+        assert!(capped.resource_report().is_some());
+    }
+
+    /// An agent we built and never used holds no pool buffers, so it reports
+    /// the measured `Some(0)` rather than the cap. `Some(0)` and not `None`
+    /// because an empty pool is knowable here, unlike a component that cannot
+    /// introspect itself at all.
+    #[test]
+    fn resource_report_is_empty_before_the_first_request() {
+        for client in [
+            UreqHttpClient::new(),
+            UreqHttpClient::new().with_max_body_bytes(1024),
+        ] {
+            let report = client
                 .resource_report()
-                .is_some()
+                .expect("an empty pool is a fact, not an absence");
+            assert_eq!(report.pool_connections, Some(0));
+            assert_eq!(report.pool_buffer_bytes, Some(0));
+            assert_eq!(report.total_bytes(), 0);
+        }
+    }
+
+    /// A caller-supplied agent is opaque in both directions: its buffer sizes
+    /// are unknown, and it may already have connected before it reached us,
+    /// because every clone of an agent shares one pool. Answering `Some(0)`
+    /// there would understate a pool we cannot see.
+    #[test]
+    fn a_custom_agent_reports_nothing_even_before_the_first_request() {
+        let shared = build_agent();
+        assert!(
+            UreqHttpClient::with_agent(shared.clone())
+                .resource_report()
+                .is_none(),
+            "a pool this client did not create is not knowably empty"
+        );
+
+        // The case that makes it unknowable: the agent connected before we
+        // wrapped it. Two requests answered over one accepted connection is the
+        // proof that the first one is sitting in the pool, and draining each
+        // body is what makes it poolable at all.
+        let (url, accepted) = spawn_keep_alive_server();
+        for _ in 0..2 {
+            let response = shared
+                .get(&url)
+                .call()
+                .expect("the warm-up request must reach the fixture");
+            assert_eq!(
+                response
+                    .into_body()
+                    .read_to_vec()
+                    .expect("draining leaves a poolable connection"),
+                b"ok"
+            );
+        }
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "the second request must have reused a pooled connection"
+        );
+
+        assert!(
+            UreqHttpClient::with_agent(shared)
+                .resource_report()
+                .is_none()
+        );
+    }
+
+    /// Cloning shares the agent and therefore the pool, so it has to share the
+    /// latch too. Otherwise the original keeps reporting an empty pool while a
+    /// clone fills it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clone_that_requests_marks_the_original() {
+        let client = UreqHttpClient::new();
+        let clone = client.clone();
+        clone
+            .execute(get(spawn_status_server(200, "OK")))
+            .await
+            .expect("request should run");
+
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_connections),
+            Some(MAX_IDLE_CONNECTIONS),
+            "the original shares the clone's pool, so it must share its estimate"
+        );
+    }
+
+    /// A request that never reaches the wire must not move the report: an
+    /// unsupported method is rejected before any connection is attempted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejected_request_leaves_the_pool_reported_empty() {
+        let client = UreqHttpClient::new();
+        client
+            .execute(HttpRequest {
+                method: "PATCH".into(),
+                url: "http://127.0.0.1:0/never".into(),
+                headers: std::collections::HashMap::new(),
+                body: None,
+            })
+            .await
+            .expect_err("PATCH is not supported");
+        client
+            .execute_upload(
+                HttpRequest {
+                    method: "GET".into(),
+                    url: "http://127.0.0.1:0/never".into(),
+                    headers: std::collections::HashMap::new(),
+                    body: None,
+                },
+                Box::new(std::io::Cursor::new(vec![1u8])),
+                1,
+            )
+            .expect_err("upload streaming is POST-only");
+
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_buffer_bytes),
+            Some(0),
+            "nothing connected, so nothing is pooled"
+        );
+    }
+
+    /// A supported method is not enough: a request ureq rejects while building
+    /// it never reaches a socket either, so the pool stays reported empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_rejected_before_the_wire_leaves_the_pool_reported_empty() {
+        let client = UreqHttpClient::new();
+        client
+            .execute(get("not-a-uri".into()))
+            .await
+            .expect_err("a URI with no scheme or host cannot be sent");
+        client
+            .execute(
+                HttpRequest::post("http://127.0.0.1:1/never")
+                    .with_header("bad header name", "v")
+                    .with_body(b"x".to_vec()),
+            )
+            .await
+            .expect_err("an invalid header name cannot be sent");
+
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_buffer_bytes),
+            Some(0),
+            "nothing was built, so nothing connected"
+        );
+    }
+
+    /// An ordinary request keeps landing on the connection the last one left.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ordinary_request_reuses_the_pooled_connection() {
+        let (url, accepted) = spawn_keep_alive_server();
+        let client = UreqHttpClient::new();
+        for _ in 0..2 {
+            client
+                .execute(get(url.clone()))
+                .await
+                .expect("the request to answer");
+        }
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "the second request opened its own connection instead of reusing the pooled one"
+        );
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_connections),
+            Some(MAX_IDLE_CONNECTIONS)
+        );
+    }
+
+    /// A closing request opens its own connection, and the estimate must not
+    /// then claim a pool the agent does not hold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connection_close_request_pools_nothing_and_reports_nothing() {
+        let (url, accepted) = spawn_keep_alive_server();
+        let client = UreqHttpClient::new();
+        for _ in 0..2 {
+            client
+                .execute(get(url.clone()).with_header("connection", "close"))
+                .await
+                .expect("the request to answer");
+        }
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            2,
+            "a connection the caller asked to close was pooled and reused"
+        );
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_buffer_bytes),
+            Some(0),
+            "nothing was pooled, so the estimate must not claim the cap"
+        );
+    }
+
+    /// RFC 9110 lets `Connection` carry a token list, and ureq does not read one
+    /// — it compares the whole value to `close`. The estimate deliberately
+    /// follows ureq rather than the RFC, so this pins the pair together: widen
+    /// one and this fails until the other widens too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_token_list_close_is_pooled_by_ureq_and_reported_as_pooled() {
+        let (url, accepted) = spawn_keep_alive_server();
+        let client = UreqHttpClient::new();
+        for _ in 0..2 {
+            client
+                .execute(get(url.clone()).with_header("connection", "keep-alive, close"))
+                .await
+                .expect("the request to answer");
+        }
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "ureq pooled a token-list close; the estimate below assumes it did"
+        );
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_connections),
+            Some(MAX_IDLE_CONNECTIONS),
+            "a pooled connection must not be reported as an empty pool"
+        );
+    }
+
+    /// A redirect to a malformed `Location` fails with the same error a
+    /// malformed request does, but the first hop already reached the wire. The
+    /// latch is decided before dispatch precisely so this case is not read as a
+    /// request that never left.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redirect_to_a_bad_location_still_counts_as_dispatched() {
+        let url = spawn_status_server_with_headers(
+            302,
+            "Found",
+            &[("location", "://not-a-uri")],
+            Vec::new(),
+        );
+        let client = UreqHttpClient::new();
+        client
+            .execute(get(url))
+            .await
+            .expect_err("a redirect to a malformed location cannot be followed");
+
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_connections),
+            Some(MAX_IDLE_CONNECTIONS),
+            "the first hop connected, so the pool is no longer provably empty"
+        );
+    }
+
+    /// A transport failure still attempts a connection, so the estimate must
+    /// switch on: what the pool holds after a failed connect is ureq's business,
+    /// not something this client can rule out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_request_still_switches_the_estimate_on() {
+        let client = UreqHttpClient::new();
+        client
+            .execute(get(spawn_disconnecting_server()))
+            .await
+            .expect_err("the peer hangs up before answering");
+
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_connections),
+            Some(MAX_IDLE_CONNECTIONS)
         );
     }
 
@@ -535,12 +881,74 @@ mod tests {
         spawn_status_server_with_body(status, reason, b"denied".to_vec())
     }
 
+    /// Answers every request with a small 200 and leaves the connection open,
+    /// so a drained response goes back into the agent's pool. The counter is
+    /// how a test tells a reused connection from a fresh one.
+    fn spawn_keep_alive_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::Relaxed);
+                thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut tmp) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                        while let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            buf.drain(..pos + 4);
+                            if stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), accepted)
+    }
+
+    /// Accepts one connection and hangs up without answering. An owned port
+    /// rather than a well-known one nothing is expected to use, so the failure
+    /// is the fixture's doing and not the machine's.
+    fn spawn_disconnecting_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        format!("http://{addr}")
+    }
+
     /// Answers one request with `status` and `body`. The request body is drained
     /// first so a rejected upload never races a broken pipe against the response.
     fn spawn_status_server_with_body(status: u16, reason: &str, body: Vec<u8>) -> String {
+        spawn_status_server_with_headers(status, reason, &[], body)
+    }
+
+    fn spawn_status_server_with_headers(
+        status: u16,
+        reason: &str,
+        extra_headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().unwrap();
         let reason = reason.to_string();
+        let extra: String = extra_headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\r\n"))
+            .collect();
         thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
@@ -567,7 +975,7 @@ mod tests {
                 }
             }
             let header = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status} {reason}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             // Either write can fail: the client is free to hang up once it has
@@ -699,6 +1107,174 @@ mod tests {
             .await
             .expect("403 must arrive as a response even with a custom agent");
         assert_eq!(resp.status_code, 403);
+    }
+
+    /// How long the gate below waits for its peers before giving up. Long
+    /// enough that a loaded runner never trips it, short enough that the whole
+    /// failure still lands inside nextest's 60s slow warning.
+    const GATE_DEADLINE: Duration = Duration::from_secs(20);
+
+    /// A [`std::sync::Barrier`] that gives up instead of waiting forever.
+    ///
+    /// `Barrier::wait` is the natural fit — release only once `n` callers have
+    /// arrived — but a barrier that is one caller short blocks every thread on
+    /// it for good. That turns the regression this fixture exists to catch into
+    /// a hung CI job rather than a verdict: nextest's default profile
+    /// deliberately warns on a slow test without killing it
+    /// (`.config/nextest.toml`), so nothing upstream would cut the wait short.
+    ///
+    /// So the release is sticky and has a deadline. Sticky because a serialized
+    /// client arrives one request at a time: without it, each of the `n`
+    /// stragglers would serve its own full deadline and the failure would take
+    /// `n` times longer than the diagnosis needs. Whoever trips the deadline
+    /// records it, and the test asserts on that — a named failure instead of a
+    /// wait with no end.
+    #[derive(Default)]
+    struct Gate {
+        state: std::sync::Mutex<GateState>,
+        released: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct GateState {
+        arrived: usize,
+        open: bool,
+        starved: bool,
+    }
+
+    impl Gate {
+        fn wait(&self, n: usize, deadline: Duration) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.arrived += 1;
+            if state.arrived >= n || state.open {
+                state.open = true;
+                self.released.notify_all();
+                return;
+            }
+            let (mut state, timeout) = self
+                .released
+                .wait_timeout_while(state, deadline, |state| !state.open)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if timeout.timed_out() {
+                state.starved = true;
+                state.open = true;
+                self.released.notify_all();
+            }
+        }
+
+        fn starved(&self) -> bool {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .starved
+        }
+    }
+
+    /// The escape hatch itself: a peer that never arrives ends the wait at the
+    /// deadline and records it, which is what turns the regression below into a
+    /// failure instead of a hang. Worth its own test because nothing else
+    /// exercises it — the concurrency test only ever takes the happy path.
+    #[test]
+    fn the_gate_gives_up_instead_of_waiting_forever() {
+        let gate = Gate::default();
+        gate.wait(2, Duration::from_millis(50));
+        assert!(
+            gate.starved(),
+            "a peer that never arrives must end the wait"
+        );
+    }
+
+    /// And the other side of it: real peers release the gate without tripping
+    /// the deadline, so the assertion above cannot pass vacuously.
+    #[test]
+    fn the_gate_releases_once_its_peers_arrive() {
+        let gate = Arc::new(Gate::default());
+        let peer = Arc::clone(&gate);
+        let joined = thread::spawn(move || peer.wait(2, GATE_DEADLINE));
+        gate.wait(2, GATE_DEADLINE);
+        joined.join().expect("peer thread");
+
+        assert!(
+            !gate.starved(),
+            "both arrived, so nothing should have starved"
+        );
+    }
+
+    /// Answers nothing until `n` requests have arrived, so the test can only
+    /// pass if all `n` were in flight at the same time.
+    fn spawn_barrier_server(n: usize) -> (String, Arc<Gate>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        let gate = Arc::new(Gate::default());
+        let server_gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let gate = Arc::clone(&server_gate);
+                thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut tmp) {
+                            Ok(0) | Err(_) => return,
+                            Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                        }
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    gate.wait(n, GATE_DEADLINE);
+                    // Answered even when the gate timed out, so the client side
+                    // finishes and the assertion — not the wait — is what fails.
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                });
+            }
+        });
+        (format!("http://{addr}"), gate)
+    }
+
+    /// One client shared by a fleet must not become a fleet-wide lock.
+    ///
+    /// `BotBuilder::with_http_client_arc` invites exactly that sharing, so what
+    /// `ureq::Agent` does with concurrent callers is part of this crate's
+    /// contract rather than an implementation detail: it holds the pool lock
+    /// across checkout only, never across the request. The barrier server is
+    /// what makes a regression fail rather than merely run slower — if the
+    /// agent ever serialized, request 1 would block forever waiting for a
+    /// response the server only sends once request N has arrived.
+    ///
+    /// `N` is deliberately far above the agent's 3-connection idle pool: that
+    /// cap bounds what is *retained* between requests, and reading it as a
+    /// concurrency limit is the mistake this pins down. It is also the figure
+    /// `BotBuilder::with_http_client_arc` quotes, so the doc there is only ever
+    /// claiming what this test actually holds — raise one and raise the other.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shared_client_runs_concurrent_requests_concurrently() {
+        const N: usize = 64;
+        let (url, gate) = spawn_barrier_server(N);
+        let client = Arc::new(UreqHttpClient::new());
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let client = Arc::clone(&client);
+            let url = url.clone();
+            handles.push(tokio::spawn(async move { client.execute(get(url)).await }));
+        }
+        for handle in handles {
+            let response = handle
+                .await
+                .expect("request task")
+                .expect("every request should reach the fixture");
+            assert_eq!(response.status_code, 200);
+        }
+
+        assert!(
+            !gate.starved(),
+            "the gate timed out: fewer than {N} requests were ever in flight at once, \
+             so the shared agent serialized them"
+        );
     }
 
     #[test]

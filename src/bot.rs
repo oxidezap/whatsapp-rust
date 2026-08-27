@@ -439,7 +439,9 @@ async fn run_metered<F: std::future::Future<Output = ()>>(
     instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
 ) {
     match instrument {
-        Some(i) => wacore::stats::MeteredFuture::new(Box::pin(fut), i).await,
+        // Stack-pinned, not boxed: `MeteredFuture` only needs an `Unpin` inner,
+        // and `Pin<&mut F>` is one without an allocation.
+        Some(i) => wacore::stats::MeteredFuture::new(core::pin::pin!(fut), i).await,
         None => fut.await,
     }
 }
@@ -789,11 +791,92 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
 
     /// Set the HTTP client used for media operations and version fetching,
     /// replacing the `ureq-client` default when that feature is enabled.
-    pub fn with_http_client<C>(mut self, client: C) -> BotBuilder<B, T, Provided, R>
+    ///
+    /// The client is wrapped in an `Arc` internally; use
+    /// [`BotBuilder::with_http_client_arc`] to give several bots one client.
+    pub fn with_http_client<C>(self, client: C) -> BotBuilder<B, T, Provided, R>
     where
         C: crate::http::HttpClient + 'static,
     {
-        self.http_client = Some(Arc::new(client));
+        self.with_http_client_arc(Arc::new(client))
+    }
+
+    /// [`BotBuilder::with_http_client`] for an already-shared
+    /// `Arc<dyn HttpClient>`, so a process running several bots can give them
+    /// all one client instead of one apiece.
+    ///
+    /// Reach for it when one client has to reach several builders and cloning
+    /// is not on the table. [`with_http_client`](Self::with_http_client) carries
+    /// no `Clone` bound, so a non-`Clone` client is perfectly welcome there —
+    /// but by value it moves into one builder and no further. A client already
+    /// erased to `Arc<dyn HttpClient>`, because the host chooses it at runtime,
+    /// needs this setter for a second reason: nothing implements
+    /// [`HttpClient`](crate::http::HttpClient) for `Arc<dyn HttpClient>`, so it
+    /// cannot reach the by-value setter at all.
+    ///
+    /// A concrete `Clone` client can already share without either: cloning
+    /// [`UreqHttpClient`](crate::http::UreqHttpClient) shares its `ureq::Agent`
+    /// and therefore its pool, so `with_http_client(shared.clone())` shares
+    /// today (see `agent_docs/observability.md`). What this setter adds there is
+    /// one instance rather than N clones of one, and parity with
+    /// [`ClientBuilder::with_http_client_arc`](crate::client::ClientBuilder::with_http_client_arc).
+    ///
+    /// Sharing by either route is worth it because the *default* is per-bot:
+    /// every builder calls its own `UreqHttpClient::new()`, and each retains a
+    /// connection pool once it has transferred media — ~36 KiB of live heap per
+    /// bot over plain HTTP and more over TLS, paid again for every session in
+    /// the process. (An idle session pays nothing: the version fetch sends
+    /// `Connection: close`, so it pools nothing.)
+    ///
+    /// # What sharing implies
+    ///
+    /// A shared client means a shared connection pool, and for `UreqHttpClient`
+    /// that is a trade, not a free win:
+    ///
+    /// - **It does not serialize.** `ureq::Agent` holds its pool lock only
+    ///   across checkout, so concurrent requests through one client overlap.
+    ///   `whatsapp-rust-ureq-http-client`'s
+    ///   `a_shared_client_runs_concurrent_requests_concurrently` holds 64 of
+    ///   them in flight at once against a server that answers none until all 64
+    ///   have arrived. Each request still occupies one `spawn_blocking` thread,
+    ///   exactly as it does with a client per bot.
+    /// - **The idle pool is capped per agent, not per bot.** `UreqHttpClient`'s
+    ///   default agent retains 3 idle connections and 2 per host, which one bot
+    ///   fills and a fleet contends over: 8 concurrent workers sharing the
+    ///   default agent reused 79% of their connections where a client each
+    ///   reused 95%. Size the pool for the fleet — build a `ureq::Agent` with
+    ///   **both** `max_idle_connections` and `max_idle_connections_per_host` at
+    ///   the intended concurrency, and pass `UreqHttpClient::with_agent(agent)`.
+    ///   Both, because a fleet's media requests converge on the same CDN
+    ///   authority, so the per-host cap binds first and raising only the global
+    ///   one changes nothing. Sized that way the reuse rate comes back to 95%
+    ///   while the per-bot retention stays collapsed into one pool.
+    /// - **Sessions stop being isolated at the TLS layer.** Media URLs carry
+    ///   their auth per request and the client sends no cookies, so a shared
+    ///   connection carries nothing between sessions that the shared source IP
+    ///   does not already carry — except TLS session resumption, which lets a
+    ///   server link two sessions even across a source-IP change. That is why
+    ///   sharing is opt-in rather than the default, and it is the reason to
+    ///   weigh before opting in for the memory alone.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let http = Arc::new(UreqHttpClient::new());
+    /// for db in session_databases {
+    ///     bots.push(
+    ///         Bot::builder()
+    ///             .with_backend(SqliteStore::new(db).await?)
+    ///             .with_http_client_arc(http.clone())
+    ///             .build()
+    ///             .await?,
+    ///     );
+    /// }
+    /// ```
+    pub fn with_http_client_arc(
+        mut self,
+        client: Arc<dyn crate::http::HttpClient>,
+    ) -> BotBuilder<B, T, Provided, R> {
+        self.http_client = Some(client);
         self.cast()
     }
 
@@ -1720,6 +1803,63 @@ mod tests {
         );
     }
 
+    /// The whole point of `with_http_client_arc`: two bots end up pointing at
+    /// one client, not at two clones of one. `with_http_client` would wrap the
+    /// `Arc` in a second `Arc` per bot, giving each its own connection pool
+    /// again — which is the per-session cost this setter exists to collapse.
+    #[tokio::test]
+    async fn shared_http_client_is_one_client_across_bots() {
+        let http: Arc<dyn HttpClient> = Arc::new(MockHttpClient);
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            clients.push(
+                Bot::builder()
+                    .with_backend_arc(create_test_sqlite_backend().await)
+                    .with_transport_factory(TokioWebSocketTransportFactory::new())
+                    .with_http_client_arc(Arc::clone(&http))
+                    .with_runtime(TokioRuntime)
+                    .build()
+                    .await
+                    .expect("build")
+                    .client(),
+            );
+        }
+
+        assert!(
+            Arc::ptr_eq(&clients[0].http_client, &clients[1].http_client),
+            "both bots must hold the same HTTP client, not a copy each"
+        );
+        assert!(
+            Arc::ptr_eq(&clients[0].http_client, &http),
+            "the client the bots hold must be the one the caller passed in"
+        );
+    }
+
+    /// The other half of the contract: passing by value still gives each bot
+    /// its own client, so nothing changes for callers who do not opt in.
+    #[tokio::test]
+    async fn by_value_http_clients_stay_independent() {
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            clients.push(
+                Bot::builder()
+                    .with_backend_arc(create_test_sqlite_backend().await)
+                    .with_transport_factory(TokioWebSocketTransportFactory::new())
+                    .with_http_client(MockHttpClient)
+                    .with_runtime(TokioRuntime)
+                    .build()
+                    .await
+                    .expect("build")
+                    .client(),
+            );
+        }
+
+        assert!(
+            !Arc::ptr_eq(&clients[0].http_client, &clients[1].http_client),
+            "with_http_client must keep giving each bot its own client"
+        );
+    }
+
     #[tokio::test]
     async fn test_bot_builder_single_device() {
         let backend = create_test_sqlite_backend().await;
@@ -2244,5 +2384,37 @@ mod tests {
 
         // No instrument: plain passthrough must still drive to completion.
         run_metered(async {}, None).await;
+    }
+
+    /// Cancellation: a `Bot::run` future dropped mid-flight (the caller's task
+    /// went away) must not leave a metering scope open, which would charge every
+    /// later allocation on that thread to the dead session's meter.
+    #[tokio::test]
+    async fn cancelling_run_metered_leaves_no_open_scope() {
+        use wacore::stats::{AllocMeter, TaskInstrument};
+
+        let meter = AllocMeter::new();
+        let instrument: Arc<dyn TaskInstrument> = Arc::new(meter.clone());
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut running = Box::pin(run_metered(
+            async move {
+                let _ = rx.await;
+            },
+            Some(instrument),
+        ));
+        assert!(
+            futures::poll!(running.as_mut()).is_pending(),
+            "the run loop parks on the channel"
+        );
+        drop(running);
+        drop(tx);
+
+        AllocMeter::on_alloc(4096);
+        assert_eq!(
+            meter.snapshot().allocations,
+            0,
+            "the cancelled run loop must not still be the active scope"
+        );
     }
 }

@@ -54,6 +54,13 @@ pub enum SendError {
     /// (e.g. a newsletter JID on the E2E path, an empty status recipient list).
     #[error("invalid send request: {0}")]
     InvalidRequest(String),
+    /// A DM could not be encrypted for a single device of the recipient, so
+    /// nothing was sent. Distinct from a transport failure: the connection is
+    /// fine and the message id was never on the wire, so the useful retry is
+    /// one that resolves the device list again
+    /// ([`crate::cache::Freshness::Refresh`]) rather than an immediate resend.
+    #[error("{0}")]
+    NoRecipientDevice(#[source] wacore::send::NoRecipientDeviceError),
     /// Catch-all for internal send failures (Signal encrypt, protobuf, group
     /// resolution) that have no dedicated variant yet. `Display` forwards to
     /// the inner error while `source()` still exposes it for downcast.
@@ -73,6 +80,13 @@ impl SendError {
         // stays matchable instead of collapsing into `Internal`.
         let err = match err.downcast::<SendError>() {
             Ok(send) => return send,
+            Err(other) => other,
+        };
+        // A DM that reached no device of its recipient is not an internal
+        // failure: the caller decides whether to refresh devices and retry, so
+        // it must be able to match on it instead of parsing a message.
+        let err = match err.downcast::<wacore::send::NoRecipientDeviceError>() {
+            Ok(no_recipient) => return SendError::NoRecipientDevice(no_recipient),
             Err(other) => other,
         };
         // A group-metadata IQ in the send path (e.g. query_info) bubbles up as
@@ -138,6 +152,45 @@ fn ensure_self_in_group(
     }
 }
 
+/// Whether a loaded `skdm_warm_memo` entry still describes this send, and if
+/// not, which term ruled it out.
+///
+/// Its own function so the check has exactly one definition. The tests that
+/// pin the memo's behaviour need the same predicate, and a second copy of it
+/// would keep answering "valid" if a fifth term were ever added here — the
+/// tests would pass while every send missed the memo, with nothing reporting
+/// it. Pure comparison over an already-loaded tuple, so it adds nothing to the
+/// send path.
+///
+/// The terms are checked in the same order the original `&&` chain
+/// short-circuited them, and the answer names the FIRST one that failed rather
+/// than "some term failed": with four terms, an aggregate miss count cannot
+/// tell a cascading device-set change from an in-place cold flip, and those
+/// two have opposite implications.
+pub(crate) fn skdm_memo_entry_stale_term(
+    memo: &crate::client::SkdmWarmMemoEntry,
+    devices: &std::sync::Arc<wacore::send::ResolvedGroupDevices>,
+    cached_map: &std::sync::Arc<crate::sender_key_device_cache::SenderKeyDeviceMap>,
+    cached_map_generation: u64,
+    own_sending_jid: &Jid,
+) -> Option<crate::client::SkdmTargetsMemoOutcome> {
+    use crate::client::SkdmTargetsMemoOutcome as Term;
+    let (memo_devices, memo_map, memo_generation, memo_sender, _) = memo;
+    if !std::ptr::eq(memo_devices.as_ptr(), std::sync::Arc::as_ptr(devices)) {
+        return Some(Term::MissDevices);
+    }
+    if !std::ptr::eq(memo_map.as_ptr(), std::sync::Arc::as_ptr(cached_map)) {
+        return Some(Term::MissMap);
+    }
+    if *memo_generation != cached_map_generation {
+        return Some(Term::MissMapGeneration);
+    }
+    if memo_sender != own_sending_jid {
+        return Some(Term::MissSender);
+    }
+    None
+}
+
 /// SKDM update data — only populated for group sends, deferred until after
 /// send_node(). This matches WhatsApp Web which only calls markHasSenderKey()
 /// after server ACK.
@@ -163,14 +216,16 @@ struct SendBranchOutput {
     /// cold send re-resolves against the winner's warm marking.
     distribution_guard: Option<async_lock::MutexGuardArc<()>>,
     issue_tc_token_after_send: bool,
-    dm_phash: Option<wacore_binary::CompactString>,
+    /// The phash this stanza carries, when it carries one. The server echoes
+    /// its own on the ack and a disagreement is the only signal a send gets
+    /// that its participant device set is stale.
+    ack_phash: Option<wacore_binary::CompactString>,
 }
 
 struct GroupBranchRequest<'a> {
     to: Jid,
     message: &'a wa::Message,
     request_id: &'a str,
-    force_key_distribution: bool,
     edit: Option<EditAttribute>,
     extra_stanza_nodes: &'a [Node],
     group_metadata_freshness: crate::cache::Freshness,
@@ -262,7 +317,7 @@ impl SendBranchOutput {
             skdm_update: None,
             distribution_guard: None,
             issue_tc_token_after_send: false,
-            dm_phash: None,
+            ack_phash: None,
         }
     }
 }
@@ -283,7 +338,10 @@ pub struct SendOptions {
     /// Override the auto-generated message ID.
     /// Useful for resending a failed message with the same ID or idempotency.
     pub message_id: Option<String>,
-    /// Extra XML child nodes on the message stanza.
+    /// Extra XML child nodes on the message stanza. A node the send already
+    /// derives from the message content — `<biz>`, and `<bot>` on a DM — is
+    /// refused with [`SendError::InvalidRequest`] rather than stacked next to
+    /// the derived one, which the receiving client renders as nothing.
     pub extra_stanza_nodes: Vec<Node>,
     /// Ephemeral duration in seconds. Sets `contextInfo.expiration` on the
     /// message (WA Web `EProtoGenerator.js:183` parity).
@@ -405,7 +463,6 @@ pub(crate) struct SendPipelineOptions<'a> {
     /// instead of handing over a copy.
     pub(crate) request_id: Option<&'a str>,
     pub(crate) peer: bool,
-    pub(crate) force_key_distribution: bool,
     pub(crate) edit: Option<EditAttribute>,
     pub(crate) extra_stanza_nodes: Vec<Node>,
     pub(crate) stanza_type: Option<StanzaType>,
@@ -718,21 +775,49 @@ fn extract_interactive_message(msg: &wa::Message) -> Option<&wa::message::Intera
     msg.interactive_message.as_option()
 }
 
+/// Refuse a caller node that repeats one this send already derives.
+///
+/// A `<message>` carries at most one `<biz>` and one `<bot>`: WA Web's outgoing
+/// builders declare both non-repeating and its message parser reads them with a
+/// single-child accessor, so a second copy is a shape no client produces and
+/// none of them agrees on how to read. Which one the server honours is not
+/// observable from here, so neither side silently wins the other's slot; the
+/// caller hears about the conflict instead of watching a message get acked,
+/// delivered and then rendered as nothing.
+fn reject_duplicate_extra_stanza_node(tag: &str, user_nodes: &[Node]) -> Result<(), SendError> {
+    if user_nodes.iter().any(|node| node.tag == tag) {
+        return Err(SendError::InvalidRequest(format!(
+            "extra stanza child <{tag}> conflicts with the one this send derives from the message"
+        )));
+    }
+    Ok(())
+}
+
 /// Assemble the `extra_stanza_nodes` vector for a non-newsletter send.
 ///
 /// Order: `inferred_meta`, optional `<bot biz_bot="1"/>` (DM only), `<biz>`,
 /// then any user-provided extra nodes. Pure so the caller stays trivial and
 /// the assembly logic is unit-testable.
+///
+/// `<meta>` is deliberately not covered by the duplicate check: WA Web's own
+/// fanout builder emits two of them in one message, so a caller adding a second
+/// is asking for a shape the protocol already carries.
 fn build_extra_stanza_nodes(
     to: &Jid,
     inferred_meta: Option<Node>,
     biz: Option<Node>,
     user_nodes: Vec<Node>,
-) -> Vec<Node> {
+) -> Result<Vec<Node>, SendError> {
     if inferred_meta.is_none() && biz.is_none() {
-        return user_nodes;
+        return Ok(user_nodes);
     }
     let bot_emitted = biz.is_some() && !to.is_group();
+    if biz.is_some() {
+        reject_duplicate_extra_stanza_node("biz", &user_nodes)?;
+        if bot_emitted {
+            reject_duplicate_extra_stanza_node("bot", &user_nodes)?;
+        }
+    }
     let extra = inferred_meta.is_some() as usize + biz.is_some() as usize + bot_emitted as usize;
     let mut nodes = Vec::with_capacity(user_nodes.len() + extra);
     nodes.extend(inferred_meta);
@@ -743,7 +828,7 @@ fn build_extra_stanza_nodes(
         nodes.push(node);
     }
     nodes.extend(user_nodes);
-    nodes
+    Ok(nodes)
 }
 
 fn build_revoke_message(
@@ -1008,7 +1093,7 @@ impl Client {
         let biz = infer_biz_node(&message, sent_at.unix_secs_u64());
 
         let extra_nodes =
-            build_extra_stanza_nodes(&to, inferred_meta, biz, options.extra_stanza_nodes);
+            build_extra_stanza_nodes(&to, inferred_meta, biz, options.extra_stanza_nodes)?;
         // send_message_impl now boxes each branch future itself, so its own
         // frame (prologue + epilogue) embeds here without a second box; the
         // shim's Box::pin above still keeps `send_message`'s future
@@ -1137,7 +1222,7 @@ impl Client {
         self.add_recent_message(&to, &request_id, &message, shared_content.clone())
             .await;
 
-        let device_store_arc = self.persistence_manager.get_device_arc().await;
+        let device_store_arc = self.persistence_manager.clone();
         let to_str = to.to_string();
         let distribution_guard = self.group_distribution_lock(&to).await;
 
@@ -1325,7 +1410,7 @@ impl Client {
     /// Atomic get-or-init: if another task invalidated the cache during our
     /// DB read, get_or_init's single-flight guarantee means the stale data
     /// won't be inserted — the invalidation wins and the next caller re-inits.
-    async fn skdm_device_map(
+    pub(crate) async fn skdm_device_map(
         &self,
         group_jid: &str,
     ) -> std::sync::Arc<crate::sender_key_device_cache::SenderKeyDeviceMap> {
@@ -1353,7 +1438,7 @@ impl Client {
     ///
     /// No empty-cache early-exit: WA Web iterates an empty `senderKey` Map
     /// as `false` per participant, so the filter must run unconditionally.
-    fn filter_skdm_targets(
+    pub(crate) fn filter_skdm_targets(
         &self,
         group_jid: &str,
         all_devices: &[Jid],
@@ -1466,13 +1551,14 @@ impl Client {
     /// comes from the per-group memo (`resolve_group_devices_memoized`), so a
     /// warm repeat send skips the per-member registry fan-out entirely.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets_memoized", level = "debug", skip_all, fields(group = %group_jid)))]
-    async fn resolve_skdm_targets_memoized(
+    pub(crate) async fn resolve_skdm_targets_memoized(
         &self,
         group: &Jid,
         group_jid: &str,
         group_info: &std::sync::Arc<wacore::client::context::GroupInfo>,
         own_sending_jid: &Jid,
     ) -> Option<(std::sync::Arc<wacore::send::ResolvedGroupDevices>, Vec<Jid>)> {
+        use crate::client::SkdmTargetsMemoOutcome as Outcome;
         let cached_map = self.skdm_device_map(group_jid).await;
         match self
             .resolve_group_devices_memoized(group, group_info, own_sending_jid)
@@ -1496,15 +1582,34 @@ impl Client {
                 // generation catches an in-place cold flip that keeps the
                 // same Arc; the memoized needs are a pure function of that
                 // identity.
-                if self.device_memos_enabled
-                    && let Some((dw, cw, memo_gen, memo_sender, memo_needs)) =
-                        self.skdm_warm_memo.get(group).await
-                    && std::ptr::eq(dw.as_ptr(), std::sync::Arc::as_ptr(&all_devices))
-                    && std::ptr::eq(cw.as_ptr(), std::sync::Arc::as_ptr(&cached_map))
-                    && memo_gen == cached_map_gen
-                    && &memo_sender == own_sending_jid
-                {
-                    return Some((all_devices, memo_needs));
+                if !self.device_memos_enabled {
+                    self.device_memo_counters
+                        .record_skdm_targets(Outcome::Bypassed);
+                } else {
+                    // Recorded on the deciding branch, and the entry is never
+                    // moved out of the `Some` arm: it is an owned clone of a
+                    // five-field tuple carrying a `Jid` and a `Vec<Jid>`, so
+                    // shuffling it around to classify first is not free.
+                    match self.skdm_warm_memo.get(group).await {
+                        Some(memo) => {
+                            match skdm_memo_entry_stale_term(
+                                &memo,
+                                &all_devices,
+                                &cached_map,
+                                cached_map_gen,
+                                own_sending_jid,
+                            ) {
+                                None => {
+                                    self.device_memo_counters.record_skdm_targets(Outcome::Hit);
+                                    return Some((all_devices, memo.4));
+                                }
+                                Some(term) => self.device_memo_counters.record_skdm_targets(term),
+                            }
+                        }
+                        None => self
+                            .device_memo_counters
+                            .record_skdm_targets(Outcome::MissAbsent),
+                    }
                 }
                 let needs_skdm = self.filter_skdm_targets(
                     group_jid,
@@ -1512,32 +1617,50 @@ impl Client {
                     &cached_map,
                     own_sending_jid,
                 );
-                if self.device_memos_enabled
-                    && (needs_skdm.is_empty() || {
+                // Still inside the `device_memos_enabled` guard, and still
+                // short-circuiting: a client with store-backed caches must not
+                // pay the snapshot read for a memo it will never write.
+                if self.device_memos_enabled {
+                    let memoizable = needs_skdm.is_empty() || {
                         let snapshot = self.persistence_manager.get_device_snapshot();
                         skdm_needs_only_own_devices(
                             &needs_skdm,
                             snapshot.pn.as_ref(),
                             snapshot.lid.as_ref(),
                         )
-                    })
-                {
-                    self.skdm_warm_memo
-                        .insert(
-                            group.clone(),
-                            (
-                                std::sync::Arc::downgrade(&all_devices),
-                                std::sync::Arc::downgrade(&cached_map),
-                                cached_map_gen,
-                                own_sending_jid.clone(),
-                                needs_skdm.clone(),
-                            ),
-                        )
-                        .await;
+                    };
+                    if memoizable {
+                        self.skdm_warm_memo
+                            .insert(
+                                group.clone(),
+                                (
+                                    std::sync::Arc::downgrade(&all_devices),
+                                    std::sync::Arc::downgrade(&cached_map),
+                                    cached_map_gen,
+                                    own_sending_jid.clone(),
+                                    needs_skdm.clone(),
+                                ),
+                            )
+                            .await;
+                    } else {
+                        // Nothing stored, so the next call cannot hit. Any
+                        // stale entry is deliberately left in place rather
+                        // than cleared: it can never become valid again (the
+                        // map generation only moves forward, and the `Weak`
+                        // keeps the old device allocation alive so no
+                        // `ptr::eq` can spuriously match), so removing it
+                        // would buy a cache write and change nothing.
+                        self.device_memo_counters.record_skdm_not_stored();
+                    }
                 }
                 Some((all_devices, needs_skdm))
             }
             Err(e) => {
+                // Recorded so `SkdmTargetsMemoStats::calls()` really is one
+                // per call: a client failing here would otherwise report a
+                // healthy hit rate over a denominator that quietly shrank.
+                self.device_memo_counters
+                    .record_skdm_targets(Outcome::ResolveFailed);
                 log::warn!(
                     "Failed to resolve devices for SKDM check in {}: {:?}",
                     group_jid,
@@ -1593,9 +1716,8 @@ impl Client {
     }
 
     /// Cold path of the phash check: the server's phash disagreed with ours, so
-    /// invalidate the relevant device/group caches and (for groups) force
-    /// sender-key redistribution. Spawned only on a mismatch, which is why the
-    /// common path costs a string comparison on the read loop.
+    /// re-resolve whatever produced it. Spawned only on a mismatch, which is why
+    /// the common path costs a string comparison on the read loop.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.phash_mismatch", level = "debug", skip_all, fields(jid = %jid.observe())))]
     pub(crate) async fn handle_phash_mismatch(
         &self,
@@ -1604,8 +1726,12 @@ impl Client {
         server_phash: &str,
         invalidate_group_cache: bool,
     ) {
+        // The one signal a bot gets that its participant device set disagrees
+        // with the server's, whatever the cause. What follows repairs a
+        // participant-level divergence; a device-level one only gets logged
+        // here, so keep the line saying what happened and not what was fixed.
         log::warn!(
-            "Phash mismatch for {}: ours={our_phash}, server={server_phash}. Invalidating caches.",
+            "Phash mismatch for {}: ours={our_phash}, server={server_phash}",
             jid.observe()
         );
         // DM phash covers both recipient + own devices
@@ -1617,13 +1743,13 @@ impl Client {
             }
         }
         let jid_str = jid.to_string();
-        // Cache-only invalidation re-reads the same stale rows on the next send.
-        // Drop the persisted state too so the next send takes the full-
-        // distribution path. If the clear fails, fall back to deleting the bot's
-        // own sender key for the chat — the next send will see `!key_exists` and
-        // force_skdm without depending on the tracker.
+        // A group takes neither arm: `resendGroupMsg` answers a mismatch with
+        // `sendQueryGroup` alone, which is the metadata invalidation below.
+        // Forgetting its sender keys, or its device rows, would cost a full
+        // fan-out or a full re-resolve on every message while the divergence
+        // lasts.
         let mut flush_fallback = false;
-        if jid.is_group() || jid.is_status_broadcast() {
+        if jid.is_status_broadcast() {
             let distribution_guard = self.group_distribution_lock(jid).await;
             if let Err(e) = self.reset_sender_key_device_tracking(&jid_str).await {
                 log::warn!(
@@ -1641,7 +1767,7 @@ impl Client {
                 flush_fallback = true;
             }
             drop(distribution_guard);
-        } else {
+        } else if !jid.is_group() {
             self.sender_key_device_cache.invalidate(&jid_str).await;
         }
         if flush_fallback {
@@ -1678,7 +1804,6 @@ impl Client {
             sent_at,
             request_id: request_id_override,
             peer,
-            force_key_distribution,
             edit,
             extra_stanza_nodes,
             stanza_type: stanza_type_override,
@@ -1755,7 +1880,7 @@ impl Client {
             skdm_update,
             distribution_guard,
             issue_tc_token_after_send: should_issue_tc_token_after_send,
-            dm_phash,
+            ack_phash,
         } = if peer && !to.is_group() {
             box_send_branch(self.send_peer_branch(to, message, request_id)).await?
         } else if to.is_group() {
@@ -1763,7 +1888,6 @@ impl Client {
                 to,
                 message,
                 request_id,
-                force_key_distribution,
                 edit,
                 extra_stanza_nodes: &extra_stanza_nodes,
                 group_metadata_freshness,
@@ -1810,7 +1934,7 @@ impl Client {
             Some(request_id),
             "branch stanza must carry the id this send was named with"
         );
-        let ack_message_id = if !borrowed_message_id && let Some(phash) = dm_phash {
+        let ack_message_id = if !borrowed_message_id && let Some(phash) = ack_phash {
             // Group sends also invalidate group cache on mismatch: the server's
             // participant set diverged, so the next send needs a fresh query.
             let invalidate_group = tc_issue_target.is_group();
@@ -1909,7 +2033,7 @@ impl Client {
             let session_mutex = self.session_lock_for(signal_addr.as_str()).await;
             let _session_guard = session_mutex.lock().await;
 
-            let mut store_adapter = self.signal_adapter().await;
+            let mut store_adapter = self.signal_adapter();
 
             let device_snapshot = self.persistence_manager.get_device_snapshot();
             wacore::send::prepare_peer_stanza(
@@ -1936,17 +2060,22 @@ impl Client {
             to,
             message,
             request_id,
-            force_key_distribution,
             edit,
             extra_stanza_nodes,
             group_metadata_freshness,
             device_freshness,
             borrowed_message_id,
         } = request;
-        // Every arm of the prepare match below assigns these three.
+        // Every arm of the prepare match below assigns these four.
         let outbound_msg_secret: Option<[u8; 32]>;
         let outbound_group_sender_identity: Option<Jid>;
         let skdm_update: Option<SkdmUpdate>;
+        // A group stanza carries a phash on every send, and the server answers
+        // with its own. `WAWebSendGroupSkmsgJob` compares them and, on a
+        // mismatch, re-queries the group and resends to the devices it missed;
+        // this is the only signal a bot gets that its participant device set is
+        // stale without a member sending something first.
+        let group_ack_phash: Option<wacore_binary::CompactString>;
         let mut distribution_guard: Option<async_lock::MutexGuardArc<()>> = None;
         let node = {
             // No send-level lock: encrypt_group_message serializes the
@@ -1981,7 +2110,7 @@ impl Client {
                     .await;
             }
 
-            let device_store_arc = self.persistence_manager.get_device_arc().await;
+            let device_store_arc = self.persistence_manager.clone();
             let to_str = to.to_string();
 
             let (own_sending_jid, _) = match group_info.addressing_mode {
@@ -2040,7 +2169,7 @@ impl Client {
             };
 
             let (key_exists, needs_rotation) = read_sender_key_state().await?;
-            let mut force_skdm = force_key_distribution || !key_exists || needs_rotation;
+            let mut force_skdm = !key_exists || needs_rotation;
             if force_skdm {
                 // Serialize the whole rotation/redistribution under the
                 // per-group guard and RE-CHECK once inside it: a send that
@@ -2049,20 +2178,19 @@ impl Client {
                 // redistributing to every member again.
                 distribution_guard = Some(self.group_distribution_lock(&to).await);
                 let (key_exists, needs_rotation) = read_sender_key_state().await?;
-                force_skdm = force_key_distribution || !key_exists || needs_rotation;
-                if !key_exists || needs_rotation {
+                force_skdm = !key_exists || needs_rotation;
+                if force_skdm {
                     self.reset_sender_key_device_tracking(&to_str).await?;
-                }
-                if needs_rotation {
-                    log::info!(
-                        "Periodic sender-key rotation for {} (chain iteration >= {SENDER_KEY_ROTATION_THRESHOLD})",
-                        to.observe()
-                    );
-                    self.signal_cache
-                        .delete_sender_key(sender_key_name.cache_key())
-                        .await;
-                }
-                if !force_skdm {
+                    if needs_rotation {
+                        log::info!(
+                            "Periodic sender-key rotation for {} (chain iteration >= {SENDER_KEY_ROTATION_THRESHOLD})",
+                            to.observe()
+                        );
+                        self.signal_cache
+                            .delete_sender_key(sender_key_name.cache_key())
+                            .await;
+                    }
+                } else {
                     distribution_guard = None;
                 }
             }
@@ -2207,6 +2335,7 @@ impl Client {
                     });
                     outbound_msg_secret = prepared.message_secret;
                     outbound_group_sender_identity = Some(prepared.sender_identity);
+                    group_ack_phash = prepared.phash;
                     prepared.node
                 }
                 Err(e) => {
@@ -2287,6 +2416,7 @@ impl Client {
                         });
                         outbound_msg_secret = retry_prepared.message_secret;
                         outbound_group_sender_identity = Some(retry_prepared.sender_identity);
+                        group_ack_phash = retry_prepared.phash;
                         retry_prepared.node
                     } else {
                         return Err(e);
@@ -2301,7 +2431,7 @@ impl Client {
             skdm_update,
             distribution_guard,
             issue_tc_token_after_send: false,
-            dm_phash: None,
+            ack_phash: group_ack_phash,
         })
     }
 
@@ -2427,7 +2557,7 @@ impl Client {
             let lock_jids = self.build_session_lock_keys(dm_devices.devices()).await;
             let _session_guards = self.session_guards_for(&lock_jids).await;
 
-            let mut store_adapter = self.signal_adapter().await;
+            let mut store_adapter = self.signal_adapter();
 
             let mut stores = store_adapter.as_signal_stores();
 
@@ -2437,6 +2567,7 @@ impl Client {
                 self,
                 wacore::send::DmStanzaRequest {
                     own_jid,
+                    own_lid: device_snapshot.lid.as_ref(),
                     account: device_snapshot.account.as_deref(),
                     to: &stanza_to,
                     message,
@@ -2456,7 +2587,7 @@ impl Client {
             skdm_update: None,
             distribution_guard: None,
             issue_tc_token_after_send: should_issue_tc_token_after_send,
-            dm_phash: prepared.phash,
+            ack_phash: prepared.phash,
         })
     }
 
@@ -2619,6 +2750,7 @@ mod tests {
     use super::*;
     use crate::test_utils::wait_for_lock_waiter;
     use std::str::FromStr;
+    use wacore::proto_helpers::MessageBuilderExt;
 
     #[test]
     fn status_revoke_requires_a_distinct_outer_stanza_id() {
@@ -2641,6 +2773,40 @@ mod tests {
         ));
         assert!(validate_status_message_id(&revoke, Some("3EB0NEWSTANZAID")).is_ok());
         assert!(validate_status_message_id(&revoke, None).is_ok());
+    }
+
+    /// A DM that reached none of the recipient's devices must arrive at the
+    /// caller as its own variant. Folded into `Internal`, a gateway can only
+    /// tell it from a protobuf bug by matching on a message string.
+    #[test]
+    fn a_dm_with_no_recipient_device_stays_typed_through_the_send_path() {
+        use wacore::send::NoRecipientDeviceError;
+
+        let failed: anyhow::Error = NoRecipientDeviceError::EncryptionFailed {
+            attempted: 2,
+            source: anyhow!("session with 5511900000099:1 not found"),
+        }
+        .into();
+        // Wrapped the way the send path bubbles it: through `?` under context.
+        let mapped = SendError::from_anyhow(failed.context("sending dm"));
+        let SendError::NoRecipientDevice(NoRecipientDeviceError::EncryptionFailed {
+            attempted,
+            ..
+        }) = &mapped
+        else {
+            panic!("expected NoRecipientDevice, got {mapped:?}");
+        };
+        assert_eq!(*attempted, 2);
+
+        let unresolved = SendError::from_anyhow(NoRecipientDeviceError::Unresolved.into());
+        assert!(matches!(
+            unresolved,
+            SendError::NoRecipientDevice(NoRecipientDeviceError::Unresolved)
+        ));
+        assert!(
+            std::error::Error::source(&unresolved).is_some(),
+            "the typed cause must stay in the source chain"
+        );
     }
 
     #[test]
@@ -2935,24 +3101,1160 @@ mod tests {
         assert_eq!(revoke_type, RevokeType::Sender);
     }
 
-    #[test]
-    fn test_force_skdm_only_for_admin_revoke() {
-        // Admin revokes require force_skdm=true to get proper message structure
-        // with phash, <participants>, and <device-identity> that WhatsApp Web uses.
-        // Without this, the server returns error 479.
-        let sender_jid = Jid::from_str("123456@s.whatsapp.net").unwrap();
+    /// A group whose metadata, device lists and pairwise sessions are all
+    /// primed, so a send reaches the wire without a single IQ and the captured
+    /// frames are exactly the message stanzas the test asked for.
+    use wacore::types::message::AddressingMode;
 
-        let sender_revoke = RevokeType::Sender;
-        let admin_revoke = RevokeType::Admin {
-            original_sender: sender_jid,
+    struct GroupSendFixture {
+        client: Arc<Client>,
+        transport: Arc<crate::transport::mock::CapturingMockTransport>,
+        group: Jid,
+        member: Jid,
+        /// The identity this group addresses us by: our LID in a LID group,
+        /// our phone JID otherwise. Companion devices and their sessions have
+        /// to live under it, or a warm send's own-device SKDM target has no
+        /// session and the send blocks on a prekey fetch.
+        own_sending: Jid,
+        /// Every recipient device the group resolves to (own device excluded).
+        recipient_devices: usize,
+    }
+
+    impl GroupSendFixture {
+        async fn new() -> Self {
+            Self::with_addressing(AddressingMode::Pn, 2).await
+        }
+
+        /// A group whose participants are LID-addressed, with the LID↔PN pairs
+        /// both in the group metadata's map and durably in the client's LID-PN
+        /// cache — the state a client that has already synced the group is in.
+        ///
+        /// Not a cosmetic variant of the PN fixture: LID mode is what puts
+        /// `GroupInfo::phone_jid_for_lid_user` on the resolve path (once per
+        /// participant, on the way in and on the way back), so it is the mode
+        /// where a device-memo miss is most expensive. PR #1283 named it as
+        /// the largest gap in its own coverage.
+        async fn new_lid(member_count: usize) -> Self {
+            Self::with_addressing(AddressingMode::Lid, member_count).await
+        }
+
+        async fn with_addressing(addressing_mode: AddressingMode, member_count: usize) -> Self {
+            use wacore::client::context::GroupInfo;
+            use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+            let is_lid = addressing_mode == AddressingMode::Lid;
+            let (client, transport) = crate::test_utils::create_iq_test_client().await;
+            let own = Jid::from_str("5511000000001@s.whatsapp.net").unwrap();
+            let own_lid = Jid::from_str("100000000000001@lid").unwrap();
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetId(Some(own.clone())))
+                .await;
+            client
+                .persistence_manager
+                .process_command(DeviceCommand::SetLid(Some(own_lid.clone())))
+                .await;
+
+            // Deterministic in the index so the same fixture at 2 members is a
+            // prefix of the one at 64: reserved fictional numbers, and LIDs
+            // from a range no real allocation uses.
+            let member_users: Vec<String> = (0..member_count)
+                .map(|index| format!("55110000{:05}", 10 + index))
+                .collect();
+            let member_lids: Vec<String> = (0..member_count)
+                .map(|index| format!("2000000000{:05}", 10 + index))
+                .collect();
+
+            // Registry records go in under the PN key in both modes: the LID
+            // resolve maps each participant back to its PN before querying
+            // (LID usync is unreliable), then converts the answer to LID.
+            // `raw_insert_for_tests` rather than `insert` — a seeded cache fill
+            // must not look like a topology change, or the fixture would start
+            // every memo one generation behind for reasons no client has.
+            for user in [own.user.as_str()]
+                .into_iter()
+                .chain(member_users.iter().map(String::as_str))
+            {
+                let record = DeviceListRecord {
+                    user: user.into(),
+                    devices: vec![DeviceInfo::new(0, None)],
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                };
+                client
+                    .device_registry_cache
+                    .raw_insert_for_tests(user.to_string(), Arc::new(record))
+                    .await;
+            }
+
+            let participants: Vec<Jid> = if is_lid {
+                member_lids
+                    .iter()
+                    .map(|lid| Jid::from_str(&format!("{lid}@lid")).unwrap())
+                    .collect()
+            } else {
+                member_users
+                    .iter()
+                    .map(|user| Jid::from_str(&format!("{user}@s.whatsapp.net")).unwrap())
+                    .collect()
+            };
+            for participant in &participants {
+                crate::test_utils::seed_peer_session(&client, participant).await;
+            }
+
+            let group_info = if is_lid {
+                let lid_to_pn = member_lids
+                    .iter()
+                    .zip(&member_users)
+                    .map(|(lid, pn)| {
+                        (
+                            lid.as_str().into(),
+                            Jid::from_str(&format!("{pn}@s.whatsapp.net")).unwrap(),
+                        )
+                    })
+                    .collect();
+                // Persist the pairs the way a synced client holds them, so the
+                // receive path's `can_skip_relearn` fast exit is reachable.
+                // Without this every inbound message re-learns the mapping and
+                // the fixture would report a topology write that a real warm
+                // client does not perform.
+                for (lid, pn) in member_lids.iter().zip(&member_users) {
+                    client
+                        .add_lid_pn_mapping(lid, pn, crate::lid_pn_cache::LearningSource::Usync)
+                        .await
+                        .expect("seeding a lid-pn pair must succeed against the test backend");
+                }
+                client
+                    .add_lid_pn_mapping(
+                        &own_lid.user,
+                        &own.user,
+                        crate::lid_pn_cache::LearningSource::Usync,
+                    )
+                    .await
+                    .expect("seeding our own lid-pn pair must succeed");
+                GroupInfo::with_lid_to_pn_map(participants.clone(), addressing_mode, lid_to_pn)
+            } else {
+                GroupInfo::new(participants.clone(), addressing_mode)
+            };
+
+            let group = Jid::from_str("120363000000000042@g.us").unwrap();
+            client
+                .get_group_cache()
+                .insert(group.clone(), Arc::new(group_info))
+                .await;
+
+            Self {
+                client,
+                transport,
+                group,
+                member: participants[0].clone(),
+                own_sending: if is_lid { own_lid } else { own },
+                recipient_devices: participants.len(),
+            }
+        }
+
+        /// Give our own account a companion device and a pairwise session for
+        /// it, and return its JID.
+        ///
+        /// The default fixture has only our primary, which `filter_skdm_targets`
+        /// excludes as the sender — so without this the warm steady state has
+        /// nothing to distribute and the own-device half of the partition is
+        /// never exercised. Production almost always has one (the phone plus
+        /// this linked client), and WA Web never marks own devices warm, so a
+        /// warm send re-targets it every time.
+        async fn add_own_companion(&self, device_id: u16) -> Jid {
+            use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+            let own = self
+                .client
+                .persistence_manager
+                .get_device_snapshot()
+                .pn
+                .clone()
+                .expect("own pn");
+            // The registry record stays PN-keyed in both modes, matching how
+            // the fixture seeds every other user; the LID resolve reaches it
+            // through the mapping.
+            let record = DeviceListRecord {
+                user: own.user.as_str().into(),
+                devices: vec![
+                    DeviceInfo::new(0, None),
+                    DeviceInfo::new(u32::from(device_id), None),
+                ],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            };
+            self.client
+                .device_registry_cache
+                .raw_insert_for_tests(own.user.to_string(), Arc::new(record))
+                .await;
+            let companion = self.own_sending.with_device(device_id);
+            crate::test_utils::seed_peer_session(&self.client, &companion).await;
+            companion
+        }
+
+        /// `send_text` under a caller-chosen id, so a test can address the ack
+        /// the send registers its phash waiter under.
+        async fn send_with_id(&self, message_id: &str) {
+            self.client
+                .send_message_with_options(
+                    self.group.clone(),
+                    wa::Message::text("hi"),
+                    SendOptions::default().with_message_id(message_id),
+                )
+                .await
+                .expect("group text send should reach the wire");
+        }
+
+        /// Feed the server's `<ack>` back through the read loop's own entry
+        /// point. Returns whether a waiter claimed it.
+        async fn deliver_ack(&self, message_id: &str, phash: Option<&str>) -> bool {
+            let mut builder = NodeBuilder::new("ack")
+                .attr("id", message_id)
+                .attr("from", "s.whatsapp.net");
+            if let Some(phash) = phash {
+                builder = builder.attr("phash", phash);
+            }
+            let marshaled = wacore_binary::marshal::marshal_ref(&builder.build().as_node_ref())
+                .expect("valid node");
+            let node = wacore_binary::OwnedNodeRef::new(
+                wacore_binary::util::unpack(&marshaled)
+                    .expect("packed payload")
+                    .into_owned(),
+            )
+            .expect("valid node");
+            self.client.handle_ack_response_arc(&Arc::new(node))
+        }
+
+        async fn send_text(&self, text: &str) {
+            self.client
+                .send_message(self.group.clone(), wa::Message::text(text))
+                .await
+                .expect("group text send should reach the wire");
+        }
+
+        /// The topology-visible half of receiving a group message from
+        /// `member`: the LID↔PN pair its stanza carries, fed through the same
+        /// entry point the receive path uses.
+        ///
+        /// LID-mode groups only — a PN-addressed group's messages carry no
+        /// second identifier, so there is nothing for the receive path to
+        /// learn and nothing that could move the topology generation.
+        async fn receive_from_member(&self) {
+            let pn = self
+                .client
+                .get_group_cache()
+                .get(&self.group)
+                .await
+                .expect("group metadata")
+                .phone_jid_for_lid_user(&self.member.user)
+                .cloned()
+                .expect("the LID fixture maps every participant to a phone number");
+            self.client
+                .cache_lid_pn_from_message(&self.member, Some(&pn), false)
+                .await;
+        }
+
+        async fn revoke(&self, message_id: &str, revoke_type: RevokeType) {
+            self.client
+                .revoke_message(self.group.clone(), message_id, revoke_type)
+                .await
+                .expect("revoke should reach the wire");
+        }
+
+        fn admin_revoke(&self) -> RevokeType {
+            RevokeType::Admin {
+                original_sender: self.member.clone(),
+            }
+        }
+
+        async fn stanza(&self, index: usize) -> Arc<wacore_binary::OwnedNodeRef> {
+            crate::test_utils::decode_sent_iq(&self.transport, index).await
+        }
+
+        /// Wire bytes of the `index`-th frame, the number the amplification is
+        /// measured in.
+        fn frame_len(&self, index: usize) -> usize {
+            self.transport.sent()[index].len()
+        }
+    }
+
+    /// Devices the stanza carries a pairwise sender-key copy for. `None` is the
+    /// stronger claim than `Some(0)`: a send with nothing to distribute omits
+    /// the `<participants>` node entirely rather than emitting an empty one.
+    fn skdm_targets(stanza: &wacore_binary::OwnedNodeRef) -> Option<usize> {
+        stanza
+            .get()
+            .get_optional_child_by_tag(&["participants"])
+            .map(|participants| participants.get_children_by_tag("to").count())
+    }
+
+    fn attr_value(stanza: &wacore_binary::OwnedNodeRef, key: &str) -> Option<String> {
+        stanza
+            .get()
+            .get_attr(key)
+            .map(|value| value.as_str().into_owned())
+    }
+
+    /// The regression: an admin revoke in a group whose members already hold the
+    /// sender key re-sent it to every device, turning a 1-recipient stanza into
+    /// one `<enc>` per device.
+    #[tokio::test]
+    async fn admin_revoke_does_not_redistribute_a_warm_sender_key() {
+        let fixture = GroupSendFixture::new().await;
+
+        fixture.send_text("first message warms the group").await;
+        let first = fixture.stanza(0).await;
+        assert_eq!(
+            skdm_targets(&first),
+            Some(fixture.recipient_devices),
+            "the first send is cold and must distribute to every device"
+        );
+
+        fixture
+            .revoke("3EB0FAKEREVOKED01", fixture.admin_revoke())
+            .await;
+        let revoke = fixture.stanza(1).await;
+        assert_eq!(
+            skdm_targets(&revoke),
+            None,
+            "every device is warm, so the revoke has nothing to distribute"
+        );
+        assert!(
+            fixture.frame_len(1) < fixture.frame_len(0),
+            "a revoke that distributes nothing must be smaller than the cold send"
+        );
+    }
+
+    /// Whether the next send would take the memoized path: the entry exists and
+    /// all four of `resolve_skdm_targets_memoized`'s validity conditions still
+    /// hold. Re-derived here rather than counted inside the production path,
+    /// which would mean adding a hit counter to a hot function just to observe
+    /// it.
+    async fn skdm_memo_would_hit(client: &Arc<Client>, group: &Jid) -> Option<Vec<Jid>> {
+        let cached_map = client.skdm_device_map(&group.to_string()).await;
+        let group_info = client
+            .get_group_cache()
+            .get(group)
+            .await
+            .expect("group metadata must be cached");
+        let own = client
+            .persistence_manager
+            .get_device_snapshot()
+            .pn
+            .clone()
+            .expect("own pn");
+        // Panics rather than reading as a miss:
+        // `skdm_warm_memo_misses_after_a_device_is_forgotten` asserts on
+        // `None`, so a resolve failure would satisfy it without ever
+        // exercising the generation term it exists to pin.
+        let devices = client
+            .resolve_group_devices_memoized(group, &group_info, &own)
+            .await
+            .expect("device resolution must succeed against the seeded fixture");
+        let generation = cached_map.generation();
+        let memo = client.skdm_warm_memo.get(group).await?;
+        // The same predicate the send path applies, not a second copy of it.
+        skdm_memo_entry_stale_term(&memo, &devices, &cached_map, generation, &own)
+            .is_none()
+            .then_some(memo.4)
+    }
+
+    /// The premise of every "the warm group send is flat in group size" claim:
+    /// once the group is warm, `resolve_skdm_targets_memoized` really does take
+    /// the memo and skip `filter_skdm_targets`. If it did not, each send would
+    /// pay one hash lookup per device — measured at 655 instructions per member
+    /// by `skdm_target_resolution_memo_cold`, which is the exact shape an
+    /// external profile attributed to this path.
+    ///
+    /// Repeat sends are what has to hold, not just the second one, and the
+    /// memoized `needs` must stay NON-EMPTY: our own companions are never
+    /// marked warm (WA Web `!isMeDevice`), so a warm send re-targets them every
+    /// time and the memo has to survive being re-inserted carrying them. An
+    /// own companion is seeded here for exactly that reason — with only our
+    /// primary device (which the filter excludes as the sender) every send
+    /// would memoize an empty list, and a regression that stopped retaining the
+    /// own-companion memo would still pass.
+    #[tokio::test]
+    async fn skdm_warm_memo_hits_on_every_repeat_send() {
+        let fixture = GroupSendFixture::new().await;
+        let companion = fixture.add_own_companion(1).await;
+
+        // The first send is cold: it distributes to every device, so there is
+        // nothing warm to memoize against yet.
+        fixture.send_text("cold send").await;
+        for round in 0..4 {
+            fixture.send_text("warm send").await;
+            let needs = skdm_memo_would_hit(&fixture.client, &fixture.group)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the warm memo must be live after warm send {round}; a miss here \
+                         puts filter_skdm_targets back on every send"
+                    )
+                });
+            assert_eq!(
+                needs,
+                vec![companion.clone()],
+                "the steady state re-targets our own companion, so the memoized \
+                 targets must carry it (round {round})"
+            );
+        }
+    }
+
+    /// Sends the external `group-send` profile ran inside its window. Matched
+    /// so a hit rate measured here is comparable to the one that profile
+    /// implies, rather than to a number of rounds picked for convenience.
+    const REGIME_SENDS: u64 = 30;
+
+    /// The question two benchmark PRs left open: over a run of ordinary repeat
+    /// sends, which outcome do the two device memos actually take?
+    ///
+    /// `skdm_target_resolution_warm` and `skdm_target_resolution_memo_cold`
+    /// bound the cost of a hit and of a miss, but both force their outcome, so
+    /// neither can say which one a client gets once the group is warm — and an
+    /// external profile of a different client implied "miss, on all 30 of 30".
+    /// This is the missing middle: N consecutive sends through the real
+    /// `send_message`, reading the per-term counters over the window.
+    ///
+    /// Asserted on the terms and not just on a rate, because the two memos are
+    /// chained: `resolve_skdm_targets_memoized` compares the `Arc` the group
+    /// memo returned, so a group-memo recompute forces an SKDM miss whatever
+    /// the other three SKDM terms say. A rate would show two failures where
+    /// there is one cause.
+    #[tokio::test]
+    async fn repeat_group_sends_hit_both_device_memos_on_every_send() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.add_own_companion(1).await;
+        // Two sends before the window, for two different reasons. Send one is
+        // cold: `force_skdm` short-circuits the whole memoized path, so it
+        // never so much as looks the memos up. Send two is the first that
+        // does, and it necessarily misses — there is nothing stored yet. The
+        // steady state starts at send three, which is also where
+        // `bench_support`'s fixture starts measuring.
+        fixture.send_text("cold send").await;
+        fixture
+            .send_text("first warm send, populates both memos")
+            .await;
+        let before = fixture.client.device_memo_stats();
+
+        for _ in 0..REGIME_SENDS {
+            fixture.send_text("warm send").await;
+        }
+
+        let window = fixture.client.device_memo_stats().since(&before);
+        assert_eq!(
+            window.group_devices.hits, REGIME_SENDS,
+            "every warm send must take the group memo outright: {window}"
+        );
+        assert_eq!(
+            window.skdm_targets.hits, REGIME_SENDS,
+            "every warm send must skip filter_skdm_targets: {window}"
+        );
+        // Named individually rather than through the rate: which term fires is
+        // the diagnosis, and a rate assertion would pass a run that swapped
+        // one miss cause for another.
+        assert_eq!(window.group_devices.miss_absent, 0, "{window}");
+        assert_eq!(window.group_devices.miss_group_info, 0, "{window}");
+        assert_eq!(window.group_devices.miss_topology, 0, "{window}");
+        assert_eq!(window.group_devices.restamps, 0, "{window}");
+        assert_eq!(window.skdm_targets.miss_devices, 0, "{window}");
+        assert_eq!(window.skdm_targets.miss_map, 0, "{window}");
+        assert_eq!(window.skdm_targets.miss_map_generation, 0, "{window}");
+        assert_eq!(window.skdm_targets.miss_sender, 0, "{window}");
+        assert_eq!(
+            window.skdm_targets.not_stored, 0,
+            "a target set that cannot be memoized makes the next send miss by \
+             construction: {window}"
+        );
+    }
+
+    /// The same window in a LID-addressed group — the mode the external
+    /// profile ran, and the one PR #1283's PN fixture could not reach.
+    ///
+    /// It matters beyond coverage: LID mode is what puts
+    /// `GroupInfo::phone_jid_for_lid_user` on the resolve path, once per
+    /// participant mapping in and once per resolved device mapping back. That
+    /// function only ever runs inside the uncached resolve, so it is a cost
+    /// the memo either pays in full or removes entirely — never something in
+    /// between, and never a target of its own while the memo hits.
+    #[tokio::test]
+    async fn repeat_lid_group_sends_hit_both_device_memos_on_every_send() {
+        let fixture = GroupSendFixture::new_lid(8).await;
+        fixture.add_own_companion(1).await;
+        fixture.send_text("cold send").await;
+        fixture
+            .send_text("first warm send, populates both memos")
+            .await;
+        let before = fixture.client.device_memo_stats();
+
+        for _ in 0..REGIME_SENDS {
+            fixture.send_text("warm send").await;
+        }
+
+        let window = fixture.client.device_memo_stats().since(&before);
+        assert_eq!(
+            window.group_devices.hits, REGIME_SENDS,
+            "LID addressing must not cost the group memo a single hit: {window}"
+        );
+        assert_eq!(
+            window.skdm_targets.hits, REGIME_SENDS,
+            "LID addressing must not cost the SKDM memo a single hit: {window}"
+        );
+    }
+
+    /// The server-paced shape: the client receives from the group and answers,
+    /// which is what a group bot does and what the external profile's harness
+    /// drove. If handling an inbound message writes device topology, a memo
+    /// keyed on that topology misses once per round by construction, and the
+    /// finding would be about production rather than about any harness.
+    ///
+    /// The inbound side here is the LID↔PN learning an inbound group message
+    /// performs (`cache_lid_pn_from_message`, called from the receive path for
+    /// every message whose sender carries both identifiers) — not a full
+    /// decode. That is the only part of an inbound message that reaches the
+    /// topology tracker on a steady-state receive; decryption, dispatch and
+    /// receipts are not covered, and a regression that made some *other* part
+    /// of the receive path write topology would not be caught here.
+    #[tokio::test]
+    async fn a_send_answering_an_inbound_group_message_still_hits_both_memos() {
+        let fixture = GroupSendFixture::new_lid(8).await;
+        fixture.add_own_companion(1).await;
+        fixture.send_text("cold send").await;
+        fixture
+            .send_text("first warm send, populates both memos")
+            .await;
+        let before = fixture.client.device_memo_stats();
+
+        for _ in 0..REGIME_SENDS {
+            fixture.receive_from_member().await;
+            fixture.send_text("reply").await;
+        }
+
+        let window = fixture.client.device_memo_stats().since(&before);
+        assert_eq!(
+            window.group_devices.hits, REGIME_SENDS,
+            "a mapping the client already holds durably must not be re-learned, \
+             and re-learning it would bump the topology generation once per \
+             inbound message: {window}"
+        );
+        assert_eq!(window.skdm_targets.hits, REGIME_SENDS, "{window}");
+    }
+
+    /// The counters would be worthless if they only ever reported hits, so
+    /// each miss term is driven once and checked to be the one that fires.
+    /// This is also what pins the terms against each other: three of these
+    /// four causes are indistinguishable in an aggregate miss count, and the
+    /// whole point of the instrumentation is telling them apart.
+    #[tokio::test]
+    async fn each_miss_term_is_reported_as_itself() {
+        use wacore::client::context::GroupInfo;
+
+        let fixture = GroupSendFixture::new().await;
+        fixture.add_own_companion(1).await;
+        fixture.send_text("cold send").await;
+        fixture.send_text("warm send").await;
+
+        // 1. An in-place cold flip (a retry receipt's markForgetSenderKey)
+        //    keeps both Arcs and advances the map generation.
+        let before = fixture.client.device_memo_stats();
+        fixture
+            .client
+            .sender_key_device_cache
+            .mark_forgotten(
+                &fixture.group.to_string(),
+                std::iter::once(&fixture.member.with_device(0)),
+            )
+            .await;
+        fixture.send_text("after a forget").await;
+        let window = fixture.client.device_memo_stats().since(&before);
+        assert_eq!(
+            window.skdm_targets.miss_map_generation, 1,
+            "a cold flip is the generation term, and nothing else: {window}"
+        );
+        // Two resolves, not one: the re-cold device puts a non-own target in
+        // the needs set, which takes the single-flight branch — it invalidates
+        // the sender-key map and resolves again. That second resolve is the
+        // MissMap, and the group memo hits both times because none of this
+        // touched the device topology.
+        assert_eq!(window.skdm_targets.miss_map, 1, "{window}");
+        assert_eq!(window.group_devices.hits, 2, "{window}");
+
+        // 2. A group metadata refresh publishes a new Arc, which is the group
+        //    memo's identity term and cascades into the SKDM memo's first.
+        fixture.send_text("re-warm").await;
+        let before = fixture.client.device_memo_stats();
+        let participants = fixture
+            .client
+            .get_group_cache()
+            .get(&fixture.group)
+            .await
+            .expect("group metadata")
+            .participants
+            .clone();
+        fixture
+            .client
+            .get_group_cache()
+            .insert(
+                fixture.group.clone(),
+                Arc::new(GroupInfo::new(participants, AddressingMode::Pn)),
+            )
+            .await;
+        fixture.send_text("after a metadata refresh").await;
+        let window = fixture.client.device_memo_stats().since(&before);
+        assert_eq!(
+            window.group_devices.miss_group_info, 1,
+            "a fresh GroupInfo Arc is the identity term: {window}"
+        );
+        assert_eq!(
+            window.skdm_targets.miss_devices, 1,
+            "and the SKDM memo misses on the device Arc it cascades into, not \
+             on one of its own three terms: {window}"
+        );
+
+        // 3. A registry write touching a member is the topology term. The
+        //    scoped log can only clear a change that provably missed the
+        //    group, and this one does not.
+        //
+        //    Recorded straight on the tracker rather than through
+        //    `invalidate_device_cache`: every registry write funnels into
+        //    `record_registry` by construction (that is the whole design of
+        //    `DeviceRegistryCache`), so this is the same signal — and it
+        //    leaves the member's device record in place, where invalidating
+        //    would delete it and make every later resolve in this test reach
+        //    for a usync the fixture has no server for.
+        fixture.send_text("re-warm").await;
+        let before = fixture.client.device_memo_stats();
+        fixture
+            .client
+            .device_topology
+            .record([&*fixture.member.user]);
+        fixture.send_text("after a member's devices changed").await;
+        let window = fixture.client.device_memo_stats().since(&before);
+        assert_eq!(
+            window.group_devices.miss_topology, 1,
+            "a write touching a member must not be provable as clean: {window}"
+        );
+        assert_eq!(
+            window.skdm_targets.miss_devices, 1,
+            "the recompute hands out a new device Arc, which is the cascade: {window}"
+        );
+
+        // 4. A write touching a stranger is the re-stamp: the generation
+        //    moved, and the log proves the change missed this group.
+        fixture.send_text("re-warm").await;
+        let before = fixture.client.device_memo_stats();
+        fixture.client.device_topology.record(["12025550111"]);
+        fixture.send_text("after an unrelated user changed").await;
+        let window = fixture.client.device_memo_stats().since(&before);
+        assert_eq!(
+            window.group_devices.restamps, 1,
+            "an unrelated write must re-stamp, not recompute: {window}"
+        );
+        assert_eq!(
+            window.group_devices.miss_topology, 0,
+            "and it must not read as a topology miss: {window}"
+        );
+        assert_eq!(
+            window.skdm_targets.hits, 1,
+            "a re-stamp serves the same device Arc, so the SKDM memo still \
+             hits behind it: {window}"
+        );
+    }
+
+    /// The counterpart: a forgotten device (a retry receipt's
+    /// `markForgetSenderKey`) flips the map in place, which keeps the `Arc` but
+    /// advances the generation — the one signal pointer identity cannot carry.
+    /// The memo must miss, or the send would skip a distribution the peer is
+    /// asking for. This is why the generation is part of the key, and why an
+    /// optimization must not drop it.
+    #[tokio::test]
+    async fn skdm_warm_memo_misses_after_a_device_is_forgotten() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("cold send").await;
+        fixture.send_text("warm send").await;
+        assert!(
+            skdm_memo_would_hit(&fixture.client, &fixture.group)
+                .await
+                .is_some()
+        );
+
+        let forgotten = fixture.member.with_device(0);
+        fixture
+            .client
+            .sender_key_device_cache
+            .mark_forgotten(&fixture.group.to_string(), std::iter::once(&forgotten))
+            .await;
+
+        assert!(
+            skdm_memo_would_hit(&fixture.client, &fixture.group)
+                .await
+                .is_none(),
+            "an in-place cold flip must invalidate the memo through the generation"
+        );
+    }
+
+    /// The contrast: removing the force must not remove the distribution. A
+    /// revoke sent before anything warmed the group is still cold and still
+    /// reaches every device.
+    #[tokio::test]
+    async fn admin_revoke_on_a_cold_group_still_distributes_to_every_device() {
+        let fixture = GroupSendFixture::new().await;
+
+        fixture
+            .revoke("3EB0FAKEREVOKED02", fixture.admin_revoke())
+            .await;
+        let revoke = fixture.stanza(0).await;
+        assert_eq!(
+            skdm_targets(&revoke),
+            Some(fixture.recipient_devices),
+            "a cold revoke must still hand the sender key to every device"
+        );
+    }
+
+    /// The operator's report, end to end over the client's own tracker: the bot
+    /// sends into a closed group, a member sits on "waiting for this message",
+    /// and it never clears because nobody in that group ever sends anything.
+    ///
+    /// A cold group send whose pre-key fetch fails distributes no sender key at
+    /// all, yet reports its whole target set as keyed. Every later send then
+    /// filters those devices out (`device_and_primary_warm`) and distributes to
+    /// nobody. The only thing that undoes it is the member's own retry receipt,
+    /// which is what "she sent a message, or even just a reaction" produces.
+    #[tokio::test]
+    async fn a_send_that_distributed_nothing_reports_nobody_as_keyed() {
+        use wacore::client::context::GroupInfo;
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+        let client = crate::test_utils::create_test_client_with_name("unkeyed_group").await;
+        let own = Jid::from_str("5511000000001@s.whatsapp.net").unwrap();
+        let own_lid = Jid::from_str("100000000000001@lid").unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(own.clone())))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(own_lid)))
+            .await;
+        client.enter_live_mode_for_tests();
+
+        let members = ["5511000000010", "5511000000011"];
+        for user in [own.user.as_str()].into_iter().chain(members) {
+            client
+                .device_registry_cache
+                .raw_insert_for_tests(
+                    user.to_string(),
+                    Arc::new(DeviceListRecord {
+                        user: user.into(),
+                        devices: vec![DeviceInfo::new(0, None)],
+                        timestamp: wacore::time::now_secs(),
+                        phash: None,
+                        raw_id: None,
+                    }),
+                )
+                .await;
+        }
+        let participants: Vec<Jid> = members
+            .iter()
+            .map(|user| Jid::from_str(&format!("{user}@s.whatsapp.net")).unwrap())
+            .collect();
+        // Only the first member has a session; establishing the second one's
+        // needs a pre-key fetch, and this client has no socket to fetch over:
+        // the transient failure a real cold send hits on a bad connection.
+        crate::test_utils::seed_peer_session(&client, &participants[0]).await;
+
+        let group = Jid::from_str("120363000000000077@g.us").unwrap();
+        let group_str = group.to_string();
+        let group_info = Arc::new(GroupInfo::new(participants.clone(), AddressingMode::Pn));
+        client
+            .get_group_cache()
+            .insert(group.clone(), Arc::clone(&group_info))
+            .await;
+
+        let prepared = {
+            let device_snapshot = client.persistence_manager.get_device_snapshot();
+            let mut adapter = client.signal_adapter();
+            let mut stores = adapter.as_signal_stores();
+            wacore::send::prepare_group_stanza(
+                &*client.runtime,
+                &mut stores,
+                &*client,
+                wacore::send::GroupStanzaRequest {
+                    group: &group_info,
+                    own_jid: device_snapshot.pn.as_ref().expect("own pn"),
+                    own_lid: device_snapshot.lid.as_ref().expect("own lid"),
+                    account: None,
+                    to: &group,
+                    message: &wa::Message::text("hi"),
+                    message_id: "COLDGROUPSEND1",
+                    force_distribution: true,
+                    distribution_targets: None,
+                    distribution_policy: wacore::send::SenderKeyDistributionPolicy::BestEffort,
+                    phash_devices: None,
+                    edit: None,
+                    extra_nodes: &[],
+                    pre_encoded: None,
+                },
+            )
+            .await
+            .expect("a best-effort group send survives a failed pre-key fetch")
         };
 
-        // This matches the logic in revoke_message()
-        let force_skdm_sender = matches!(sender_revoke, RevokeType::Admin { .. });
-        let force_skdm_admin = matches!(admin_revoke, RevokeType::Admin { .. });
+        assert!(
+            prepared.node.get_optional_child("participants").is_none(),
+            "the fixture's point: this send handed out no sender key at all"
+        );
+        assert!(
+            prepared.skdm_devices.is_empty(),
+            "a send that distributed nothing must report nobody as keyed; it reported {:?}",
+            prepared.skdm_devices
+        );
 
-        assert!(!force_skdm_sender, "Sender revoke should NOT force SKDM");
-        assert!(force_skdm_admin, "Admin revoke MUST force SKDM");
+        // The client half of the loop: what the send reports is what gets
+        // persisted, and what is persisted decides the next send's targets.
+        client
+            .update_sender_key_devices(&group_str, &prepared.skdm_devices)
+            .await;
+        let (_all, needs) = client
+            .resolve_skdm_targets_memoized(&group, &group_str, &group_info, &own)
+            .await
+            .expect("device resolution is cache-backed here");
+        let targeted: std::collections::HashSet<String> =
+            needs.iter().map(Jid::to_string).collect();
+        for participant in &participants {
+            assert!(
+                targeted.contains(&participant.to_string()),
+                "{participant} got no sender key, so the next send must still target it"
+            );
+        }
+    }
+
+    /// The repair the report describes: the member sends anything at all, her
+    /// retry receipt marks her cold again, and the next send hands her the key.
+    /// It is the only repair a closed group ever gets, which is why the group
+    /// stays dark until someone speaks.
+    #[tokio::test]
+    async fn a_retry_receipt_puts_a_keyed_member_back_on_the_distribution_list() {
+        let fixture = GroupSendFixture::new().await;
+        let group_str = fixture.group.to_string();
+        fixture.send_text("cold send").await;
+
+        let group_info = fixture
+            .client
+            .get_group_cache()
+            .get(&fixture.group)
+            .await
+            .expect("group metadata");
+        let warm = fixture
+            .client
+            .resolve_skdm_targets_memoized(
+                &fixture.group,
+                &group_str,
+                &group_info,
+                &fixture.own_sending,
+            )
+            .await
+            .expect("device resolution is cache-backed here")
+            .1;
+        assert!(
+            warm.is_empty(),
+            "after a cold send every member holds the key"
+        );
+
+        // What handle_retry_receipt does for a member that could not decrypt.
+        let member = fixture.member.clone();
+        fixture
+            .client
+            .mark_forget_sender_key(&group_str, std::slice::from_ref(&member))
+            .await
+            .expect("marking a member cold must succeed");
+
+        let needs = fixture
+            .client
+            .resolve_skdm_targets_memoized(
+                &fixture.group,
+                &group_str,
+                &group_info,
+                &fixture.own_sending,
+            )
+            .await
+            .expect("device resolution is cache-backed here")
+            .1;
+        assert!(
+            needs.contains(&member),
+            "the member that spoke must be back on the distribution list"
+        );
+    }
+
+    /// The server answers a group send with its own view of the participant
+    /// device set, and disagreement is the only signal a bot gets that its
+    /// member list is stale without anyone in the group speaking first.
+    /// `WAWebSendGroupSkmsgJob` reads `phash` off the ack and, on a mismatch,
+    /// re-queries the group and resends to the devices it had missed; the group
+    /// branch here dropped the ack's phash on the floor, so
+    /// `handle_phash_mismatch`'s group half could never run.
+    #[tokio::test]
+    async fn a_group_send_registers_its_phash_ack_waiter() {
+        let fixture = GroupSendFixture::new().await;
+        let message_id = "GROUPPHASHWAITER1";
+        fixture.send_with_id(message_id).await;
+
+        let stanza = fixture.stanza(0).await;
+        let on_wire = attr_value(&stanza, "phash").expect("groups carry a phash on every send");
+
+        let mut waiters = fixture.client.response_waiters_guard();
+        let waiter = waiters
+            .remove(message_id)
+            .expect("a group send must wait on the ack's phash");
+        match waiter {
+            crate::client::ResponseWaiter::Phash(waiter) => {
+                assert_eq!(
+                    waiter.expected.as_str(),
+                    on_wire,
+                    "the waiter must expect exactly what went on the wire"
+                );
+                assert_eq!(waiter.jid, fixture.group);
+                assert!(
+                    waiter.invalidate_group_cache,
+                    "a disagreeing server also means our participant list is stale"
+                );
+            }
+            _ => panic!("a group send registers a phash waiter, not an IQ waiter"),
+        }
+    }
+
+    /// The protected path, broken on purpose: the server answers with a phash
+    /// that disagrees with ours. `resendGroupMsg` answers that with
+    /// `sendQueryGroup`, so the group's metadata snapshot has to go and the next
+    /// send resolves its participants from the server.
+    #[tokio::test]
+    async fn a_disagreeing_ack_phash_re_queries_the_group() {
+        let fixture = GroupSendFixture::new().await;
+        let message_id = "GROUPPHASHMISMATCH1";
+        fixture.send_with_id(message_id).await;
+        assert!(
+            fixture
+                .client
+                .get_group_cache()
+                .get(&fixture.group)
+                .await
+                .is_some(),
+            "the send warmed the group snapshot"
+        );
+
+        assert!(
+            fixture
+                .deliver_ack(message_id, Some("2:notwhatwesent"))
+                .await,
+            "the send's waiter must claim its own ack"
+        );
+
+        // handle_phash_mismatch runs detached off the read loop.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fixture
+                .client
+                .get_group_cache()
+                .get(&fixture.group)
+                .await
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a disagreeing phash must drop the group snapshot that produced it");
+    }
+
+    /// The other half, and the reason the repair cannot storm: the members that
+    /// already hold the key keep holding it, and their device rows stay put.
+    /// `resendGroupMsg` sends only to the devices a refreshed fan-out newly
+    /// reveals; it never calls `markForgetSenderKey`, and it never touches the
+    /// device table (`<notification type="devices">` is what keeps that fresh).
+    /// Doing either here would cost a full fan-out, or a full re-resolve, on
+    /// every message for as long as the divergence lasts.
+    ///
+    /// Drives `handle_phash_mismatch` directly rather than through the ack: the
+    /// ack path spawns it detached, and polling for one of its effects would
+    /// read the tracker before a later step could touch it.
+    #[tokio::test]
+    async fn a_group_phash_mismatch_forgets_no_sender_key_and_no_device_row() {
+        let fixture = GroupSendFixture::new().await;
+        let group_str = fixture.group.to_string();
+        fixture.send_text("cold send").await;
+
+        let before = fixture.client.skdm_device_map(&group_str).await;
+        assert_eq!(
+            before.device_has_key(&fixture.member.user, 0),
+            Some(true),
+            "the cold send keyed this member"
+        );
+
+        fixture
+            .client
+            .handle_phash_mismatch(&fixture.group, "2:ours", "2:theirs", true)
+            .await;
+
+        let after = fixture.client.skdm_device_map(&group_str).await;
+        assert_eq!(
+            after.device_has_key(&fixture.member.user, 0),
+            Some(true),
+            "a mismatch must not forget a member that already holds the key: \
+             clearing the tracker costs a full fan-out per message while the \
+             divergence lasts"
+        );
+        assert!(
+            fixture
+                .client
+                .get_devices_from_registry(&fixture.member)
+                .await
+                .is_some(),
+            "nor may it drop device rows: a device notification owns that, and \
+             dropping them costs a full re-resolve per message instead"
+        );
+    }
+
+    /// An ack that agrees is the ordinary case and must cost nothing: no device
+    /// rows dropped, no re-query, no redistribution.
+    #[tokio::test]
+    async fn an_agreeing_ack_phash_leaves_the_group_warm() {
+        let fixture = GroupSendFixture::new().await;
+        let group_str = fixture.group.to_string();
+        let message_id = "GROUPPHASHMATCH1";
+        fixture.send_with_id(message_id).await;
+        let sent = fixture.stanza(0).await;
+        let on_wire = attr_value(&sent, "phash").expect("groups carry a phash");
+
+        assert!(
+            fixture
+                .deliver_ack(message_id, Some(on_wire.as_str()))
+                .await,
+            "the send's waiter must claim its own ack"
+        );
+
+        assert!(
+            fixture
+                .client
+                .get_devices_from_registry(&fixture.member)
+                .await
+                .is_some(),
+            "an agreeing server must not cost a device re-resolve"
+        );
+        let group_info = fixture
+            .client
+            .get_group_cache()
+            .get(&fixture.group)
+            .await
+            .expect("group metadata");
+        assert!(
+            fixture
+                .client
+                .resolve_skdm_targets_memoized(
+                    &fixture.group,
+                    &group_str,
+                    &group_info,
+                    &fixture.own_sending,
+                )
+                .await
+                .expect("device resolution is cache-backed here")
+                .1
+                .is_empty(),
+            "an agreeing server must not cost a redistribution"
+        );
+    }
+
+    /// Non-regression for the group whose members all resolve: the cold send
+    /// hands the key to every device and marks every device, the warm send that
+    /// follows distributes nothing, and both carry a phash.
+    #[tokio::test]
+    async fn a_group_whose_members_all_resolve_sends_and_marks_exactly_as_before() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("cold send").await;
+        fixture.send_text("warm send").await;
+
+        let cold = fixture.stanza(0).await;
+        let warm = fixture.stanza(1).await;
+        assert_eq!(
+            skdm_targets(&cold),
+            Some(fixture.recipient_devices),
+            "a cold send hands the key to every resolvable device"
+        );
+        assert_eq!(
+            skdm_targets(&warm),
+            None,
+            "the warm send distributes nothing"
+        );
+        for stanza in [&cold, &warm] {
+            assert!(
+                attr_value(stanza, "phash").is_some_and(|phash| !phash.is_empty()),
+                "groups carry a phash on every send"
+            );
+        }
+
+        let map = fixture
+            .client
+            .skdm_device_map(&fixture.group.to_string())
+            .await;
+        for index in 0..fixture.recipient_devices {
+            let user = format!("55110000{:05}", 10 + index);
+            assert_eq!(
+                map.device_has_key(&user, 0),
+                Some(true),
+                "{user} received its distribution and stays marked"
+            );
+        }
+    }
+
+    /// `edit`, `phash` and the `skmsg` payload are built by the group path
+    /// itself, with or without a distribution list, so a revoke that hands out
+    /// no sender key still carries the whole structure.
+    #[tokio::test]
+    async fn warm_admin_revoke_keeps_the_full_group_stanza_structure() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("warm the group").await;
+        fixture
+            .revoke("3EB0FAKEREVOKED03", fixture.admin_revoke())
+            .await;
+
+        let revoke = fixture.stanza(1).await;
+        assert_eq!(attr_value(&revoke, "edit").as_deref(), Some("8"));
+        assert!(
+            attr_value(&revoke, "phash").is_some_and(|phash| !phash.is_empty()),
+            "groups carry a phash on every send, distribution or not"
+        );
+        let enc = revoke
+            .get()
+            .get_optional_child_by_tag(&["enc"])
+            .expect("the revoke payload itself is always one skmsg");
+        assert_eq!(
+            enc.get_attr("type")
+                .map(|value| value.as_str().into_owned()),
+            Some("skmsg".to_string())
+        );
+    }
+
+    /// Neither revoke type forces distribution: both go out on the ordinary
+    /// group path, like every other message.
+    #[tokio::test]
+    async fn no_revoke_type_forces_sender_key_redistribution() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("warm the group").await;
+
+        fixture
+            .revoke("3EB0FAKEREVOKED04", RevokeType::Sender)
+            .await;
+        fixture
+            .revoke("3EB0FAKEREVOKED05", fixture.admin_revoke())
+            .await;
+
+        let sender_revoke = fixture.stanza(1).await;
+        let admin_revoke = fixture.stanza(2).await;
+        assert_eq!(attr_value(&sender_revoke, "edit").as_deref(), Some("7"));
+        assert_eq!(attr_value(&admin_revoke, "edit").as_deref(), Some("8"));
+        assert_eq!(skdm_targets(&sender_revoke), None);
+        assert_eq!(skdm_targets(&admin_revoke), None);
     }
 
     #[test]
@@ -4467,11 +5769,21 @@ mod tests {
             Jid::from_str(s).expect("valid jid in test")
         }
 
+        fn assemble(
+            to: &Jid,
+            inferred_meta: Option<Node>,
+            biz: Option<Node>,
+            user_nodes: Vec<Node>,
+        ) -> Vec<Node> {
+            build_extra_stanza_nodes(to, inferred_meta, biz, user_nodes)
+                .expect("no caller node conflicts here")
+        }
+
         /// DM: `<bot biz_bot="1"/>` is prepended before the `<biz>`. The
         /// order matters because it is part of the wire shape.
         #[test]
         fn dm_emits_bot_before_biz() {
-            let nodes = build_extra_stanza_nodes(
+            let nodes = assemble(
                 &jid("5511999999999@s.whatsapp.net"),
                 None,
                 Some(quick_reply_biz()),
@@ -4493,7 +5805,7 @@ mod tests {
         /// Group: `<bot>` is NOT emitted; only `<biz>`.
         #[test]
         fn group_omits_bot() {
-            let nodes = build_extra_stanza_nodes(
+            let nodes = assemble(
                 &jid("120363000000000001@g.us"),
                 None,
                 Some(quick_reply_biz()),
@@ -4506,7 +5818,7 @@ mod tests {
         /// LID DM (non-group): `<bot>` is still emitted.
         #[test]
         fn lid_dm_emits_bot() {
-            let nodes = build_extra_stanza_nodes(
+            let nodes = assemble(
                 &jid("100000000000001@lid"),
                 None,
                 Some(payment_biz()),
@@ -4520,8 +5832,7 @@ mod tests {
         #[test]
         fn no_biz_no_meta_passthrough() {
             let user_nodes = vec![NodeBuilder::new("custom").build()];
-            let nodes =
-                build_extra_stanza_nodes(&jid("X@s.whatsapp.net"), None, None, user_nodes.clone());
+            let nodes = assemble(&jid("X@s.whatsapp.net"), None, None, user_nodes.clone());
             assert_eq!(nodes.len(), 1);
             assert_eq!(nodes[0].tag, "custom");
         }
@@ -4532,7 +5843,7 @@ mod tests {
             let meta = NodeBuilder::new("meta").attr("appdata", "default").build();
             let user_a = NodeBuilder::new("user_a").build();
             let user_b = NodeBuilder::new("user_b").build();
-            let nodes = build_extra_stanza_nodes(
+            let nodes = assemble(
                 &jid("X@s.whatsapp.net"),
                 Some(meta),
                 Some(quick_reply_biz()),
@@ -4551,11 +5862,137 @@ mod tests {
         fn meta_only_preserves_order() {
             let meta = NodeBuilder::new("meta").build();
             let user = NodeBuilder::new("u").build();
-            let nodes =
-                build_extra_stanza_nodes(&jid("X@s.whatsapp.net"), Some(meta), None, vec![user]);
+            let nodes = assemble(&jid("X@s.whatsapp.net"), Some(meta), None, vec![user]);
             assert_eq!(nodes.len(), 2);
             assert_eq!(nodes[0].tag, "meta");
             assert_eq!(nodes[1].tag, "u");
+        }
+
+        fn conflict(to: &str, user_nodes: Vec<Node>) -> SendError {
+            build_extra_stanza_nodes(&jid(to), None, Some(payment_biz()), user_nodes)
+                .expect_err("caller node duplicating a derived one must be refused")
+        }
+
+        /// A caller that hands us its own `<biz>` next to the one we derive
+        /// used to get both on the wire, and the button rendered nowhere.
+        #[test]
+        fn caller_biz_next_to_derived_biz_is_refused() {
+            for to in ["120363000000000001@g.us", "5511999999999@s.whatsapp.net"] {
+                let error = conflict(
+                    to,
+                    vec![
+                        NodeBuilder::new("biz")
+                            .attr("native_flow_name", "payment_info")
+                            .build(),
+                    ],
+                );
+                assert!(matches!(error, SendError::InvalidRequest(_)), "{to}");
+                assert!(error.to_string().contains("<biz>"), "{to}: {error}");
+            }
+        }
+
+        /// A caller asking for a different flow name than the button implies is
+        /// the same conflict: we cannot tell which one the server honours, so
+        /// the send is refused rather than picking a winner.
+        #[test]
+        fn caller_biz_with_a_diverging_flow_name_is_refused() {
+            let error = conflict(
+                "120363000000000001@g.us",
+                vec![
+                    NodeBuilder::new("biz")
+                        .attr("native_flow_name", "review_and_pay")
+                        .build(),
+                ],
+            );
+            assert!(error.to_string().contains("<biz>"), "{error}");
+        }
+
+        /// DM: the derived `<bot biz_bot="1"/>` collides the same way.
+        #[test]
+        fn caller_bot_next_to_derived_bot_is_refused() {
+            let error = conflict(
+                "5511999999999@s.whatsapp.net",
+                vec![NodeBuilder::new("bot").attr("biz_bot", "1").build()],
+            );
+            assert!(error.to_string().contains("<bot>"), "{error}");
+        }
+
+        /// Groups get no `<bot>`, so a caller's own `<bot>` collides with
+        /// nothing and still reaches the stanza.
+        #[test]
+        fn caller_bot_reaches_a_group_stanza() {
+            let nodes = assemble(
+                &jid("120363000000000001@g.us"),
+                None,
+                Some(payment_biz()),
+                vec![NodeBuilder::new("bot").build()],
+            );
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0].tag, "biz");
+            assert_eq!(nodes[1].tag, "bot");
+        }
+
+        /// Nothing derived means nothing to collide with: a caller driving a
+        /// shape we do not infer keeps its escape hatch.
+        #[test]
+        fn caller_biz_alone_passes_through() {
+            let nodes = assemble(
+                &jid("5511999999999@s.whatsapp.net"),
+                None,
+                None,
+                vec![NodeBuilder::new("biz").attr("campaign_id", "x").build()],
+            );
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].tag, "biz");
+        }
+
+        /// The case that already worked: derived `<biz>` alone, attrs intact,
+        /// exactly one on the stanza.
+        #[test]
+        fn derived_biz_alone_is_unchanged() {
+            let nodes = assemble(
+                &jid("120363000000000001@g.us"),
+                None,
+                Some(payment_biz()),
+                vec![],
+            );
+            assert_eq!(nodes.iter().filter(|node| node.tag == "biz").count(), 1);
+            assert_biz_common_attrs(&nodes[0], "derived biz");
+            assert_eq!(
+                nodes[0]
+                    .attrs()
+                    .optional_string("native_flow_name")
+                    .unwrap()
+                    .as_ref(),
+                "payment_info"
+            );
+        }
+
+        /// A caller node on a tag we do not emit keeps its slot after the
+        /// derived ones.
+        #[test]
+        fn non_colliding_caller_node_keeps_its_position() {
+            let nodes = assemble(
+                &jid("5511999999999@s.whatsapp.net"),
+                Some(NodeBuilder::new("meta").build()),
+                Some(payment_biz()),
+                vec![NodeBuilder::new("custom-extension").build()],
+            );
+            assert_eq!(nodes.len(), 4);
+            assert_eq!(nodes[3].tag, "custom-extension");
+        }
+
+        /// `<meta>` is not part of the rule: WA Web itself puts two of them on
+        /// one message, so a caller adding one is not a conflict.
+        #[test]
+        fn caller_meta_is_not_a_conflict() {
+            let nodes = assemble(
+                &jid("120363000000000001@g.us"),
+                Some(NodeBuilder::new("meta").attr("appdata", "default").build()),
+                Some(payment_biz()),
+                vec![NodeBuilder::new("meta").attr("origin", "x").build()],
+            );
+            assert_eq!(nodes.iter().filter(|node| node.tag == "meta").count(), 2);
         }
     }
 
@@ -4899,7 +6336,7 @@ mod tests {
                     Some((1u32.into(), opk.public_key)),
                     1u32.into(),
                     spk.public_key,
-                    sig.to_vec(),
+                    sig,
                     *receiver.identity_key(),
                 )
             })
@@ -4907,7 +6344,7 @@ mod tests {
             .expect("prekey bundle task")
             .expect("prekey bundle");
 
-        let mut adapter = client.signal_adapter().await;
+        let mut adapter = client.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         process_prekey_bundle(
             &peer.to_protocol_address(),
@@ -5116,7 +6553,7 @@ mod tests {
                     Some((1u32.into(), opk.public_key)),
                     1u32.into(),
                     spk.public_key,
-                    sig.to_vec(),
+                    sig,
                     *receiver.identity_key(),
                 )
             })
@@ -5124,7 +6561,7 @@ mod tests {
             .expect("prekey bundle task")
             .expect("prekey bundle");
         {
-            let mut adapter = client.signal_adapter().await;
+            let mut adapter = client.signal_adapter();
             let mut rng = rand::make_rng::<rand::rngs::StdRng>();
             process_prekey_bundle(
                 &lid_addr.to_protocol_address(),

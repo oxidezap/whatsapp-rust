@@ -36,9 +36,12 @@ use syn::{Data, DeriveInput, Fields, parse_macro_input};
 /// # Attributes
 ///
 /// - `#[protocol(tag = "tagname")]` - Required. Specifies the XML tag name.
-/// - `#[attr(name = "attrname")]` - Marks a String field as an XML attribute.
+/// - `#[attr(name = "attrname")]` - Marks a text field as an XML attribute. The
+///   field is built with `Into`, so any type a `Cow<str>` and a `&str` literal
+///   convert into works: `String`, or `CompactString` for the short attributes
+///   (up to 24 bytes) that would otherwise take a heap allocation each.
 /// - `#[attr(name = "attrname", default = "value")]` - Attribute with default value.
-///   For `Option<String>` fields, a default always yields `Some(default)`.
+///   For optional text fields, a default always yields `Some(default)`.
 /// - `#[attr(name = "attrname", jid)]` - Marks a Jid field as a JID attribute (required).
 /// - `#[attr(name = "attrname", jid, optional)]` - Marks an `Option<Jid>` field as optional.
 /// - `#[attr(name = "attrname", string_enum)]` - Marks a field whose type derives `WireEnum` in unit-string mode (uses `as_str()`/`TryFrom`).
@@ -196,25 +199,26 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
                 (AttrType::String, false, Some(default)) => {
                     quote! {
                         #field_ident: node.attrs().optional_string(#attr_name)
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| #default.to_string())
+                            .map(::core::convert::Into::into)
+                            .unwrap_or_else(|| #default.into())
                     }
                 }
                 (AttrType::String, false, None) => {
                     quote! {
-                        #field_ident: node.attrs().required_string(#attr_name)?.to_string()
+                        #field_ident: node.attrs().required_string(#attr_name)?.into()
                     }
                 }
                 (AttrType::String, true, Some(default)) => {
                     quote! {
                         #field_ident: node.attrs().optional_string(#attr_name)
-                            .map(|s| s.to_string())
-                            .or_else(|| Some(#default.to_string()))
+                            .map(::core::convert::Into::into)
+                            .or_else(|| Some(#default.into()))
                     }
                 }
                 (AttrType::String, true, None) => {
                     quote! {
-                        #field_ident: node.attrs().optional_string(#attr_name).map(|s| s.to_string())
+                        #field_ident: node.attrs().optional_string(#attr_name)
+                            .map(::core::convert::Into::into)
                     }
                 }
                 // StringEnum: parse using the `parse_string_enum` helper which tries TryFrom then From.
@@ -284,10 +288,10 @@ pub fn derive_protocol_node(input: TokenStream) -> TokenStream {
             .map(|info| {
                 let field_ident = &info.field_ident;
                 match (&info.attr_type, info.optional, &info.default) {
-                    (_, true, Some(default)) => quote! { #field_ident: Some(#default.to_string()) },
+                    (_, true, Some(default)) => quote! { #field_ident: Some(#default.into()) },
                     (_, true, None) => quote! { #field_ident: None },
                     (AttrType::String, false, Some(default)) => {
-                        quote! { #field_ident: #default.to_string() }
+                        quote! { #field_ident: #default.into() }
                     }
                     (AttrType::StringEnum, false, Some(default)) => {
                         quote! { #field_ident: ::wacore::protocol::parse_string_enum(#default)

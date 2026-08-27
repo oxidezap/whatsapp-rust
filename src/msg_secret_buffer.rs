@@ -431,7 +431,16 @@ impl MsgSecretWriteBuffer {
         }
     }
 
-    #[cfg(test)]
+    /// Captures buffered but not yet persisted. Normally bounded by the pending
+    /// limit (`MAX_PENDING_MSG_SECRETS` in production): a producer that would
+    /// exceed it parks on `capacity_available` rather than the buffer growing,
+    /// so this count is a saturation gauge as much as a memory figure.
+    ///
+    /// The limit is not a hard ceiling on this number. A queueing future
+    /// cancelled while backpressured force-buffers what it still holds (see
+    /// `QueuedEntries::drop`, which inserts with no limit) rather than dropping
+    /// captures, so a reading above the limit during teardown is expected
+    /// rather than impossible.
     pub(crate) fn pending_len(&self) -> usize {
         self.pending.lock().unwrap_or_else(|p| p.into_inner()).len()
     }

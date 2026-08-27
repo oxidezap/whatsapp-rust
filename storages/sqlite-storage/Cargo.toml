@@ -1,6 +1,6 @@
 [package]
 name = "whatsapp-rust-sqlite-storage"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
@@ -23,7 +23,7 @@ buffa = { workspace = true }
 bytes = { workspace = true }
 diesel = { workspace = true }
 diesel_migrations = { workspace = true }
-libsqlite3-sys = { version = "0.37", default-features = false, optional = true }
+libsqlite3-sys = { version = "0.38", default-features = false, optional = true }
 log = { workspace = true }
 # Shared across all r2d2 pools so each per-session store doesn't spawn its own pool of
 # management threads. Already in the tree transitively via r2d2 0.8.
@@ -38,7 +38,6 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 portable-atomic = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 
 [lints]
 workspace = true

@@ -79,7 +79,7 @@ impl ProtocolNode for KeyIndexInfo {
             .ok_or_else(|| anyhow!("key-index-list missing required 'ts' attribute"))?;
         let timestamp = i64::try_from(ts_u64)
             .map_err(|_| anyhow!("key-index-list 'ts' value {} exceeds i64::MAX", ts_u64))?;
-        let signed_bytes = match node.content.as_deref() {
+        let signed_bytes = match node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) if !b.is_empty() => Some(b.to_vec()),
             _ => None,
         };

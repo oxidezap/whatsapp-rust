@@ -223,16 +223,15 @@ async fn test_ack_without_matching_waiter() {
     );
 }
 
-/// Round-trip a built `Node` into the raw-bytes shape `unpack()` produces
-/// from the network (marshal_ref prepends a 0x00 format byte that
-/// `OwnedNodeRef::new` does not expect).
-fn to_owned_node(node: &Node) -> wacore_binary::OwnedNodeRef {
-    wacore_binary::marshal::marshal_ref(&node.as_node_ref())
-        .and_then(|buf| wacore_binary::OwnedNodeRef::new(bytes::Bytes::from(buf).slice(1..)))
-        .expect("valid node")
+/// Round-trip a built `Node` into the shape the receive path holds: node bytes,
+/// as `unpack` hands them over once the format byte is off.
+fn to_owned_node(node: &Node) -> OwnedNodeRef {
+    let marshaled = wacore_binary::marshal::marshal_ref(&node.as_node_ref()).expect("valid node");
+    let node_bytes = wacore_binary::util::unpack(&marshaled).expect("packed payload");
+    OwnedNodeRef::new(node_bytes.into_owned()).expect("valid node")
 }
 
-fn owned_ack_node(id: &str) -> wacore_binary::OwnedNodeRef {
+fn owned_ack_node(id: &str) -> OwnedNodeRef {
     to_owned_node(
         &NodeBuilder::new("ack")
             .attr("id", id)
@@ -397,6 +396,174 @@ async fn test_ack_dispatches_server_ack_event() {
             Event::ServerAck(ack) if ack.id == "ack-evt-3"
         )),
         "Event::ServerAck should fire even when a waiter consumes the ack"
+    );
+}
+
+/// `from` arrives as a JID token, so reading it must take the JID the decoder
+/// already built rather than rendering and re-parsing it. Two things ride on
+/// that: the render is pure churn on every acked message, and it silently drops
+/// the interop `integrator`, which the wire does carry.
+#[tokio::test]
+async fn server_ack_from_preserves_the_wire_jid() {
+    use wacore::types::events::{Event, EventHandler};
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    // An addressed device JID: same value the render-and-reparse produced.
+    let device: Jid = "551199990001:3@s.whatsapp.net".parse().expect("device jid");
+    let ack = NodeBuilder::new("ack")
+        .attr("id", "ack-from-ad")
+        .attr("class", "message")
+        .attr("from", device.clone())
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(a) if a.id == "ack-from-ad" && a.from.as_ref() == Some(&device)
+        )),
+        "an addressed `from` must reach the event unchanged"
+    );
+
+    // A `from` that reached the node as a plain string still parses, so the
+    // switch does not narrow what is accepted.
+    let string_ack = NodeBuilder::new("ack")
+        .attr("id", "ack-from-str")
+        .attr("from", "not-a-phone-user@g.us")
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&string_ack)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(a)
+                if a.id == "ack-from-str"
+                    && a.from.as_ref().is_some_and(|j| j.to_string() == "not-a-phone-user@g.us")
+        )),
+        "a string-form `from` must still parse into the event"
+    );
+}
+
+/// The allocation guard for the same call. `from` reaching the event is not by
+/// itself evidence the display form is gone, since both spellings produce the
+/// same JID for everything our own encoder can emit; the count is.
+///
+/// Baseline three: the event's owned `id` and `class` strings, and the `Arc`
+/// `dispatch` wraps the event in. A user too long to sit inline in its
+/// `CompactString` adds exactly one for that copy, and no more: it is owning the
+/// JID that costs, not rendering it. Re-introducing the render moves both.
+#[tokio::test]
+async fn server_ack_event_build_does_not_render_the_from_jid() {
+    use wacore::types::events::EventHandler;
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    // Both arrive as JID tokens, which is how `from` comes off the wire: that is
+    // the case where rendering it costs a String the parse then throws away. The
+    // long one is a legacy group id, whose `<creator>-<timestamp>` user is the
+    // real shape that outgrows the inline buffer.
+    let ack_with_from = |from: Jid| {
+        let node = Arc::new(to_owned_node(
+            &NodeBuilder::new("ack")
+                .attr("class", "message")
+                .attr("from", from)
+                .attr("id", "3EB0A1B2C3D4E5F60718")
+                .attr("t", "1758000000")
+                .build(),
+        ));
+        assert!(
+            node.get()
+                .get_attr("from")
+                .is_some_and(|v| v.as_jid().is_some()),
+            "the fixture must reach the handler as a JID token, not a string"
+        );
+        node
+    };
+
+    let inline_user = ack_with_from("551199990001@s.whatsapp.net".parse().expect("jid"));
+    let heap_user = ack_with_from("5511999988887-1600000000123456@g.us".parse().expect("jid"));
+
+    let inline_delta = crate::test_alloc::min_allocs(3, || {
+        assert!(!client.handle_ack_response_arc(&inline_user));
+    });
+    assert_eq!(
+        inline_delta, 3,
+        "the ServerAck build must allocate only its two owned strings and the event Arc"
+    );
+
+    let heap_delta = crate::test_alloc::min_allocs(4, || {
+        assert!(!client.handle_ack_response_arc(&heap_user));
+    });
+    assert_eq!(
+        heap_delta,
+        inline_delta + 1,
+        "a heap-backed JID user must cost its own copy and nothing else"
+    );
+}
+
+/// The other half of the reason `from` stopped going through the display form:
+/// an interop JID's `integrator` is carried on the wire but is not part of the
+/// rendered JID, so rendering and re-parsing silently dropped it.
+#[test]
+fn jid_attr_display_round_trip_drops_the_interop_integrator() {
+    use wacore_binary::node::{NodeStr, ValueRef};
+    use wacore_binary::{JidRef, Server};
+
+    let value = ValueRef::Jid(JidRef {
+        user: NodeStr::Borrowed("551199990002"),
+        server: Server::Interop,
+        agent: 0,
+        device: 1,
+        integrator: 7,
+    });
+
+    let via_display: Option<Jid> = value.as_str().parse().ok();
+    assert_eq!(
+        via_display.map(|j| j.integrator),
+        Some(0),
+        "the display form carries no integrator, which is what the old path lost"
+    );
+    assert_eq!(
+        value.to_jid().map(|j| j.integrator),
+        Some(7),
+        "to_jid takes the decoded JID as-is"
+    );
+}
+
+/// Failure shape: a `from` that is not a JID still yields `None` rather than a
+/// partially-parsed value, and the ack is otherwise handled as before.
+#[tokio::test]
+async fn server_ack_from_stays_none_for_a_malformed_jid() {
+    use wacore::types::events::{Event, EventHandler};
+
+    let client = crate::test_utils::create_test_client().await;
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    let ack = NodeBuilder::new("ack")
+        .attr("id", "ack-from-bad")
+        .attr("class", "message")
+        .attr("from", "not a jid at all")
+        .build();
+    client.handle_ack_response_arc(&Arc::new(to_owned_node(&ack)));
+    assert!(
+        collector.events().iter().any(|e| matches!(
+            e.as_ref(),
+            Event::ServerAck(a)
+                if a.id == "ack-from-bad"
+                    && a.from.is_none()
+                    && a.class.as_deref() == Some("message")
+        )),
+        "an unparseable `from` must land as None without disturbing the rest"
     );
 }
 
@@ -1446,7 +1613,7 @@ fn test_unified_session_protocol_node() {
     info!("✅ test_unified_session_protocol_node passed");
 }
 
-fn node_to_owned_ref(node: Node) -> Arc<wacore_binary::OwnedNodeRef> {
+fn node_to_owned_ref(node: Node) -> Arc<OwnedNodeRef> {
     crate::test_utils::node_to_owned_ref(&node)
 }
 
@@ -2519,10 +2686,8 @@ fn test_encode_ack_bytes_roundtrip_recipient() {
         AckParticipantPolicy::Preserve,
     )
     .expect("encode_ack_bytes should produce bytes");
-    // The Encoder prepends a leading format byte (see `marshal`); the
-    // decoder wants raw protocol bytes — same handling as `node_to_owned_ref`.
     let decoded =
-        wacore_binary::marshal::unmarshal_ref(&buf[1..]).expect("encoded ack should decode");
+        wacore_binary::marshal::unmarshal_packed_ref(&buf).expect("encoded ack should decode");
     assert_eq!(decoded.tag, "ack");
     assert!(
         decoded
@@ -2556,7 +2721,7 @@ fn test_encode_ack_bytes_roundtrip_recipient() {
     )
     .expect("encode_ack_bytes should produce bytes");
     let decoded =
-        wacore_binary::marshal::unmarshal_ref(&buf[1..]).expect("encoded ack should decode");
+        wacore_binary::marshal::unmarshal_packed_ref(&buf).expect("encoded ack should decode");
     assert!(
         decoded.get_attr("recipient").is_none(),
         "encode_ack_bytes must not synthesise `recipient` when absent"
@@ -2644,7 +2809,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         AckParticipantPolicy::OmitReceiptDestinationDuplicate,
     )
     .expect("complete receipt should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded receipt ack should decode");
 
     assert!(
@@ -2672,7 +2837,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         AckParticipantPolicy::OmitReceiptDestinationDuplicate,
     )
     .expect("group receipt should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded group receipt ack should decode");
     assert!(
         ack.get_attr("participant")
@@ -2691,7 +2856,7 @@ fn test_encode_ack_bytes_preserves_specialized_receipt_rules() {
         AckParticipantPolicy::Preserve,
     )
     .expect("complete message should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded message ack should decode");
     assert!(
         ack.get_attr("participant")
@@ -2726,7 +2891,7 @@ fn test_encode_ack_bytes_compares_jid_participants_by_display() {
         AckParticipantPolicy::OmitReceiptDestinationDuplicate,
     )
     .expect("complete receipt should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded receipt ack should decode");
 
     assert!(
@@ -2749,7 +2914,7 @@ fn test_encode_ack_bytes_drops_encrypt_identity_notification_type() {
         AckParticipantPolicy::Preserve,
     )
     .expect("complete notification should produce an ack");
-    let ack = wacore_binary::marshal::unmarshal_ref(&bytes[1..])
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
         .expect("encoded notification ack should decode");
 
     assert!(
@@ -2769,8 +2934,8 @@ fn test_encode_ack_bytes_preserves_call_class_and_type() {
         .build();
     let bytes = encode_ack_bytes(&call.as_node_ref(), None, AckParticipantPolicy::Preserve)
         .expect("complete call should produce an ack");
-    let ack =
-        wacore_binary::marshal::unmarshal_ref(&bytes[1..]).expect("encoded call ack should decode");
+    let ack = wacore_binary::marshal::unmarshal_packed_ref(&bytes)
+        .expect("encoded call ack should decode");
 
     assert!(
         ack.get_attr("class")
@@ -3095,6 +3260,95 @@ async fn test_stream_error_429_keeps_reconnect_with_backoff() {
     );
 }
 
+/// A rate-limited session parks the client for minutes; without an event the
+/// only trace is the missing connection. WA Web has no 429 arm to copy here
+/// (only 500..600 is special-cased), so this is our own `StreamError` contract
+/// applied consistently, and the neighbours must keep their own events.
+#[tokio::test]
+async fn test_stream_error_429_dispatches_stream_error_event() {
+    use wacore::types::events::{Event, EventHandler};
+
+    let client = create_offline_sync_test_client().await;
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+    client
+        .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+        .detach();
+
+    let node = NodeBuilder::new("stream:error")
+        .attr("code", "429")
+        .children([NodeBuilder::new("text")
+            .attr("text", "rate-overlimit")
+            .build()])
+        .build();
+    client.handle_stream_error(&node.as_node_ref()).await;
+
+    let events = collector.events();
+    let stream_errors: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &**event {
+            Event::StreamError(stream_error) => Some(stream_error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stream_errors.len(),
+        1,
+        "429 must dispatch exactly one StreamError, got {events:?}"
+    );
+    assert_eq!(stream_errors[0].code, "429");
+    let raw = stream_errors[0]
+        .raw
+        .as_ref()
+        .expect("the stanza must ride along so the reason survives");
+    assert_eq!(raw.tag, "stream:error");
+    assert!(
+        raw.get_optional_child("text").is_some(),
+        "the raw stanza must keep the server's children, not just the code"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(**event, Event::LoggedOut(_) | Event::StreamReplaced(_))),
+        "429 is not a logout or a replacement"
+    );
+}
+
+/// The branches either side of 429 keep dispatching what they always did — a
+/// regression here would look like the 429 event working while 516/409 lost
+/// theirs.
+#[tokio::test]
+async fn test_stream_error_neighbours_keep_their_events() {
+    use wacore::types::events::{Event, EventHandler};
+
+    for (code, expect_logged_out) in [("516", true), ("401", true), ("409", false)] {
+        let client = create_offline_sync_test_client().await;
+        let collector = Arc::new(crate::test_utils::TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+
+        let node = NodeBuilder::new("stream:error").attr("code", code).build();
+        client.handle_stream_error(&node.as_node_ref()).await;
+
+        let events = collector.events();
+        let matched = events.iter().any(|event| {
+            if expect_logged_out {
+                matches!(**event, Event::LoggedOut(_))
+            } else {
+                matches!(**event, Event::StreamReplaced(_))
+            }
+        });
+        assert!(matched, "{code} lost its event, got {events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(**event, Event::StreamError(_))),
+            "{code} must not also report as a generic StreamError"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_stream_error_503_keeps_reconnect() {
     let client = create_offline_sync_test_client().await;
@@ -3358,14 +3612,14 @@ async fn test_is_connected_not_affected_by_mutex_contention() {
         write_key,
         read_key,
     );
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.is_connected.store(true, Ordering::Release);
 
     assert!(client.is_connected(), "should report connected");
 
     // Hold the noise_socket mutex — this used to make is_connected() return
     // false via try_lock() even though the socket was Some(...)
-    let _guard = client.noise_socket.lock().await;
+    let _guard = client.noise_socket.lock().unwrap();
     assert!(
         client.is_connected(),
         "is_connected() must return true even while noise_socket mutex is held"
@@ -3432,7 +3686,7 @@ async fn disconnect_does_not_signal_connection_cleanup_before_outbound_flush() {
     );
 
     *client.transport.lock().await = Some(transport);
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.is_connected.store(true, Ordering::Release);
 
     let cleanup_signal = client.connection_shutdown_signal();
@@ -3506,15 +3760,208 @@ async fn install_test_noise_socket(
     use crate::socket::NoiseSocket;
     use wacore::handshake::NoiseCipher;
 
-    let key = [0u8; 32];
-    let noise_socket = NoiseSocket::new(
+    let key = TEST_NOISE_KEY;
+    // Wired to the client's own observers, like the real socket: a test that
+    // watches its sends needs the same plumbing production has.
+    let noise_socket = NoiseSocket::with_observers(
         runtime,
         transport,
         NoiseCipher::new(&key).expect("valid key"),
         NoiseCipher::new(&key).expect("valid key"),
+        crate::socket::noise_socket::SendObservers::with_stats(client.stats.clone())
+            .with_sent_frames(client.sent_frame_tap.clone()),
     );
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.set_connected_for_test(true);
+}
+
+/// The key `install_test_noise_socket` builds its socket with, so a test can
+/// decrypt what the client wrote.
+const TEST_NOISE_KEY: [u8; 32] = [0u8; 32];
+
+/// Every distinct way a stanza leaves the client, driven end to end, with the
+/// observer's view compared against the transport's.
+///
+/// `send_node` marshals and resolves sent-node waiters; the ack, receipt and
+/// direct-encoded IQ paths hand pre-marshaled bytes straight to the socket and
+/// were invisible to those waiters; the ack and receipt workers reach the wire
+/// only through the burst. All of them cross the noise sender, which is why one
+/// observation point covers the lot.
+#[tokio::test]
+async fn every_send_path_is_observed_exactly_as_it_reached_the_wire() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+    let _lease = client.acquire_sent_frame_forwarding();
+
+    // 1. send_node: the only path that builds a Node the caller could inspect.
+    let presence = NodeBuilder::new("presence")
+        .attr("type", "available")
+        .attr("name", "observer")
+        .build();
+    client
+        .send_node(presence.clone())
+        .await
+        .expect("presence must send");
+
+    // 2. send_raw_bytes, through a real caller of it: the ack path documents
+    //    that it bypasses node logging and sent-node waiters.
+    let incoming = NodeBuilder::new("notification")
+        .attr("id", "OBSERVED-1")
+        .attr("type", "w:gp2")
+        .attr("from", "5550000@g.us")
+        .build();
+    client
+        .send_ack_for(&incoming.as_node_ref())
+        .await
+        .expect("ack must send");
+
+    // 3. send_raw_bytes_burst, the shape the ack and receipt workers use: two
+    //    frames coalesced into a single transport write.
+    let mut frames = vec![
+        wacore_binary::marshal::marshal_exact(
+            &NodeBuilder::new("iq").attr("id", "BURST-1").build(),
+        )
+        .expect("marshal"),
+        wacore_binary::marshal::marshal_exact(
+            &NodeBuilder::new("iq").attr("id", "BURST-2").build(),
+        )
+        .expect("marshal"),
+    ];
+    let mut results = Vec::new();
+    client
+        .send_raw_bytes_burst(&mut frames, &mut results)
+        .await
+        .expect("burst must send");
+    assert!(results.iter().all(|result| result.is_ok()));
+
+    let wire = crate::test_utils::decrypt_wire_frames(&transport.sent(), &TEST_NOISE_KEY);
+    assert_eq!(wire.len(), 4, "four frames must have reached the transport");
+    let observed: Vec<Vec<u8>> = recorder
+        .frames()
+        .iter()
+        .map(|frame| frame.to_vec())
+        .collect();
+    assert_eq!(
+        observed, wire,
+        "every send path must be observed, byte for byte and in wire order"
+    );
+
+    // The bytes are the stanza, not a rendering of it: the first frame decodes
+    // back to the node that was sent.
+    let decoded = wacore_binary::marshal::unmarshal_packed_ref(&observed[0])
+        .expect("an observed frame must decode as the stanza it carried");
+    assert_eq!(decoded.tag.as_ref(), "presence");
+    assert_eq!(
+        decoded.attrs().optional_string("name").as_deref(),
+        Some("observer")
+    );
+}
+
+/// While nobody holds a lease the send path publishes nothing and builds
+/// nothing, and releasing the last lease puts it back to that state.
+#[tokio::test]
+async fn sends_are_unobserved_until_a_consumer_asks() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    let recorder = Arc::new(crate::test_utils::SentFrameRecorder::default());
+    let _subscription = client.subscribe_handler(recorder.clone());
+
+    assert!(
+        !client.sent_frame_forwarding_enabled(),
+        "forwarding must be off until a consumer acquires it"
+    );
+    client
+        .send_node(NodeBuilder::new("presence").build())
+        .await
+        .expect("presence must send");
+    assert_eq!(client.sent_frame_tap.published(), 0);
+    assert!(recorder.frames().is_empty());
+
+    let lease = client.acquire_sent_frame_forwarding();
+    assert!(client.sent_frame_forwarding_enabled());
+    client
+        .send_node(NodeBuilder::new("presence").build())
+        .await
+        .expect("presence must send");
+    assert_eq!(recorder.frames().len(), 1);
+
+    drop(lease);
+    assert!(
+        !client.sent_frame_forwarding_enabled(),
+        "the last lease dropping must disable forwarding again"
+    );
+    client
+        .send_node(NodeBuilder::new("presence").build())
+        .await
+        .expect("presence must send");
+    assert_eq!(
+        recorder.frames().len(),
+        1,
+        "no frame may be observed after the lease is gone"
+    );
+    assert_eq!(client.sent_frame_tap.published(), 1);
+}
+
+/// An observer that panics must not cost the client its send path: the dispatch
+/// runs on the noise sender task, and an unwinding panic there would end every
+/// send on the connection.
+#[tokio::test]
+async fn a_panicking_observer_leaves_the_client_sending() {
+    use crate::transport::mock::CapturingMockTransport;
+
+    struct PanickingObserver;
+    impl wacore::types::events::EventHandler for PanickingObserver {
+        fn handle_event(&self, _event: Arc<Event>) {
+            panic!("observer panics on every frame");
+        }
+        fn interest(&self) -> wacore::types::events::EventInterest {
+            wacore::types::events::EventInterest::of(&[wacore::types::events::EventKind::SentFrame])
+        }
+    }
+
+    let client = crate::test_utils::create_test_client().await;
+    let transport = Arc::new(CapturingMockTransport::new());
+    install_test_noise_socket(
+        &client,
+        transport.clone(),
+        Arc::new(crate::runtime_impl::TokioRuntime),
+    )
+    .await;
+
+    let _subscription = client.subscribe_handler(Arc::new(PanickingObserver));
+    let _lease = client.acquire_sent_frame_forwarding();
+
+    for attempt in 0..3 {
+        client
+            .send_node(NodeBuilder::new("presence").attr("t", attempt).build())
+            .await
+            .unwrap_or_else(|e| panic!("send {attempt} must survive the observer: {e:?}"));
+    }
+    assert_eq!(
+        transport.sent_count(),
+        3,
+        "every stanza must still reach the wire"
+    );
 }
 
 fn receipt_test_info(id: &str) -> Arc<crate::types::message::MessageInfo> {
@@ -3818,7 +4265,7 @@ async fn delivery_receipt_worker_sends_and_releases_flush() {
         NoiseCipher::new(&key).expect("valid key"),
     );
     *client.transport.lock().await = Some(transport);
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.is_connected.store(true, Ordering::Release);
 
     client.ack_received_message(&receipt_test_info("RCPT-WORKER-1"));
@@ -3949,7 +4396,7 @@ async fn flush_waits_for_queued_delivery_receipts() {
         NoiseCipher::new(&key).expect("valid key"),
     );
     *client.transport.lock().await = Some(transport);
-    *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+    *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     client.is_connected.store(true, Ordering::Release);
 
     client.ack_received_message(&receipt_test_info("RCPT-QUEUE-1"));
@@ -4397,6 +4844,62 @@ async fn memory_report_display_sections_stay_aligned() {
             "{name} must render under the Signal heading, got:\n{rendered}"
         );
     }
+
+    // The last two `collections()` entries are transient retention, one section
+    // each. Their order is what the two boundary constants encode, so a cache
+    // appended to `collections()` without moving them lands here.
+    let history_start = rendered
+        .find("--- In-flight history sync ---")
+        .expect("history sync section");
+    let drain_start = rendered
+        .find("--- Transient retention ---")
+        .expect("transient-retention section");
+    assert!(
+        history_start < drain_start,
+        "sections must render in `collections()` order, got:\n{rendered}"
+    );
+    assert!(
+        rendered[history_start..drain_start].contains("history_sync_tasks:"),
+        "history_sync_tasks must render under its own heading, got:\n{rendered}"
+    );
+    // Bounded to the section, not "somewhere after its heading": an unbounded
+    // slice would keep passing if one of these moved into `Plugins` or `Misc`,
+    // which is exactly the drift this test exists to catch.
+    let drain_end = rendered[drain_start + 1..]
+        .find("\n--- ")
+        .map_or(rendered.len(), |at| drain_start + 1 + at);
+    for name in [
+        "inbound_commit_batch:",
+        "msg_secret_buffer:",
+        "pending_device_sync:",
+    ] {
+        assert!(
+            rendered[drain_start..drain_end].contains(name),
+            "{name} must render under the transient-retention heading, got:\n{rendered}"
+        );
+    }
+}
+
+/// The offline unknown-device queue has no capacity cap: its bound is the drain
+/// that empties it, since dropping a user would leave sends to them addressed to
+/// a stale device list. That makes the count the only warning a consumer gets,
+/// so it has to reach the report.
+#[tokio::test]
+async fn memory_report_counts_the_offline_device_sync_queue() {
+    let client =
+        crate::test_utils::create_test_client_with_name("pending_device_sync_report").await;
+    assert_eq!(client.memory_report().await.pending_device_sync, 0);
+
+    let jid: Jid = "559980000002@s.whatsapp.net".parse().expect("a test jid");
+    assert!(client.pending_device_sync.add(&jid));
+    assert!(
+        !client.pending_device_sync.add(&jid),
+        "the queue dedups per user, so a retry storm from one sender adds one entry"
+    );
+    assert_eq!(client.memory_report().await.pending_device_sync, 1);
+
+    client.pending_device_sync.take_all();
+    assert_eq!(client.memory_report().await.pending_device_sync, 0);
 }
 
 #[tokio::test]
@@ -4522,6 +5025,79 @@ async fn instrumented_runtime_reports_to_cpu_meter() {
     assert!(
         after_blocking.polls > after_spawn.polls,
         "blocking work is metered too"
+    );
+}
+
+/// `spawn_detached` is the fire-and-forget path most of the read loop uses. The
+/// decorator forwards it instead of falling back to `spawn`, so it must still
+/// meter every poll of the task.
+#[tokio::test]
+async fn instrumented_runtime_meters_detached_spawns() {
+    use wacore::runtime::Runtime as _;
+    use wacore::stats::{CpuMeter, InstrumentedRuntime};
+
+    let meter = Arc::new(CpuMeter::new());
+    let runtime =
+        InstrumentedRuntime::new(Arc::new(crate::runtime_impl::TokioRuntime), meter.clone());
+
+    let (tx, rx) = oneshot::channel::<()>();
+    runtime.spawn_detached(Box::pin(async move {
+        tokio::task::yield_now().await;
+        let _ = tx.send(());
+    }));
+    rx.await.expect("detached future ran");
+
+    assert!(
+        meter.snapshot().polls >= 2,
+        "a detached task is metered on every poll, got {}",
+        meter.snapshot().polls
+    );
+}
+
+/// Cancellation through the decorator: aborting a metered task mid-flight must
+/// leave the meter balanced, so work that runs afterwards is still attributed
+/// to whoever actually did it.
+#[tokio::test]
+async fn aborting_a_metered_task_keeps_the_meter_balanced() {
+    use wacore::runtime::Runtime as _;
+    use wacore::stats::{AllocMeter, InstrumentedRuntime, TaskInstrument};
+
+    let meter = AllocMeter::new();
+    let instrument: Arc<dyn TaskInstrument> = Arc::new(meter.clone());
+    let runtime = InstrumentedRuntime::new(
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        Arc::clone(&instrument),
+    );
+
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let handle = runtime.spawn(Box::pin(async move {
+        let _ = started_tx.send(());
+        std::future::pending::<()>().await;
+    }));
+    started_rx.await.expect("task started");
+    handle.abort();
+    tokio::task::yield_now().await;
+
+    // `#[tokio::test]` drives a current-thread runtime, so the aborted task ran
+    // on this very thread: a scope it failed to close would charge this probe.
+    let after_abort = meter.snapshot();
+    AllocMeter::on_alloc(4096);
+    assert_eq!(
+        meter.snapshot().allocations,
+        after_abort.allocations,
+        "the aborted task must not still be the active scope"
+    );
+
+    // And the meter still attributes work that follows.
+    let (tx, rx) = oneshot::channel::<()>();
+    runtime.spawn_detached(Box::pin(async move {
+        AllocMeter::on_alloc(512);
+        let _ = tx.send(());
+    }));
+    rx.await.expect("follow-up task ran");
+    assert!(
+        meter.snapshot().allocated_bytes >= after_abort.allocated_bytes + 512,
+        "the follow-up task is still charged"
     );
 }
 
@@ -4704,4 +5280,1878 @@ fn phash_waiter_sweep_drops_only_entries_that_lived_through_a_sweep() {
         map.remove("iq").is_some(),
         "the sweep must never touch IQ waiters, which have their own cleanup"
     );
+}
+
+/// A non-reconnectable connect failure releases work parked in
+/// `await_connection`, having decided the session is over.
+///
+/// What this pins is the outcome, and only that. It does **not** pin the order
+/// of the stores and the notify inside `handle_connect_failure`, and no test at
+/// this level can: nothing awaits between them, so the waiter is never
+/// scheduled into the gap and the assertions below hold either way. Reordering
+/// them keeps this test green.
+///
+/// That order is held by the comment at the notify, not from here. It is worth
+/// holding because the announcement is what wakes the wait, and the wait
+/// answers by reading state — announcing first offers it a client that has not
+/// yet decided. Pinning it would mean a pause hook between the two, in
+/// production code, to catch a race that `cleanup_connection_state` and the run
+/// loop's exit both go on to correct. Not worth the hook.
+#[tokio::test]
+async fn a_terminal_connect_failure_releases_a_parked_wait() {
+    let client = create_offline_sync_test_client().await;
+    client.is_running.store(true, Ordering::Relaxed);
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.await_connection().await })
+    };
+    crate::test_utils::poll_until("the waiter to park on the notifier", || {
+        client.session_state_notifier.total_listeners() >= 1
+    })
+    .await;
+
+    // 403 is REASON_LOCKED: not transient, so no replacement is coming.
+    let failure = NodeBuilder::new("failure").attr("reason", "403").build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    assert!(
+        client.is_terminal(),
+        "the failure decided the session is over"
+    );
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("and the wait must end on that decision")
+            .expect("the waiter should not panic"),
+        "reporting that no connection arrived"
+    );
+}
+
+/// The write-once cells (`group_cache`, `app_state_processor`) are read on the
+/// send and app-state paths on the strength of never being rebuilt. These prove
+/// the three ways that could break: a second call, a reconnect cleanup, and a
+/// racing first call.
+#[tokio::test]
+async fn write_once_cells_return_the_same_instance_across_calls() {
+    let client = crate::test_utils::create_test_client().await;
+
+    let group_cache = client.get_group_cache().clone();
+    let processor = client.get_app_state_processor().clone();
+
+    assert!(
+        Arc::ptr_eq(&group_cache, client.get_group_cache()),
+        "the group cache must not be rebuilt on a second read"
+    );
+    assert!(
+        Arc::ptr_eq(&processor, client.get_app_state_processor()),
+        "the app-state processor must not be rebuilt on a second read"
+    );
+}
+
+#[tokio::test]
+async fn reconnect_cleanup_leaves_the_write_once_cells_installed() {
+    let client = crate::test_utils::create_test_client().await;
+
+    let group_cache = client.get_group_cache().clone();
+    let processor = client.get_app_state_processor().clone();
+
+    client.cleanup_connection_state().await;
+
+    assert!(
+        Arc::ptr_eq(&group_cache, client.get_group_cache()),
+        "cleanup must not drop the group cache"
+    );
+    assert!(
+        Arc::ptr_eq(&processor, client.get_app_state_processor()),
+        "cleanup clears the processor's key cache in place, it does not replace it"
+    );
+    assert!(
+        client.group_cache.get().is_some() && client.app_state_processor.get().is_some(),
+        "and neither cell may fall back to uninitialized"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_readers_agree_on_one_instance() {
+    let client = crate::test_utils::create_test_client().await;
+
+    // OS threads and a blocking barrier, not tasks on a worker pool: the
+    // getters are synchronous now, so every reader can be inside `get_or_init`
+    // at once instead of at most `worker_threads` of them, and none can be
+    // spawned late enough to find the cell already warm.
+    const READERS: usize = 16;
+    let results = tokio::task::spawn_blocking(move || {
+        let start = std::sync::Barrier::new(READERS);
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..READERS)
+                .map(|_| {
+                    let client = &client;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        (
+                            client.get_group_cache().clone(),
+                            client.get_app_state_processor().clone(),
+                        )
+                    })
+                })
+                .collect();
+            readers
+                .into_iter()
+                .map(|reader| reader.join().expect("reader thread should not panic"))
+                .collect::<Vec<_>>()
+        })
+    })
+    .await
+    .expect("blocking scope should not panic");
+
+    let (first_cache, first_processor) = &results[0];
+    for (cache, processor) in &results {
+        assert!(
+            Arc::ptr_eq(first_cache, cache),
+            "every racing reader must observe the same group cache"
+        );
+        assert!(
+            Arc::ptr_eq(first_processor, processor),
+            "every racing reader must observe the same app-state processor"
+        );
+    }
+}
+
+fn test_chatstate_stanza() -> wacore::iq::chatstate::ChatstateStanza {
+    use wacore::iq::chatstate::{ChatstateSource, ChatstateStanza, ReceivedChatState};
+
+    ChatstateStanza {
+        source: ChatstateSource::User {
+            from: "15550001111@s.whatsapp.net".parse().expect("valid jid"),
+        },
+        state: ReceivedChatState::Typing,
+    }
+}
+
+#[tokio::test]
+async fn chatstate_dispatch_skips_the_event_build_with_no_handlers() {
+    let client = crate::test_utils::create_test_client().await;
+
+    client
+        .dispatch_chatstate_event(test_chatstate_stanza())
+        .await;
+
+    assert_eq!(
+        client.chatstate_events_built.load(Ordering::Acquire),
+        0,
+        "the default registers no handler, so nothing should read the event"
+    );
+}
+
+#[tokio::test]
+async fn chatstate_dispatch_reaches_every_registered_handler() {
+    let client = crate::test_utils::create_test_client().await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    for tag in ["first", "second"] {
+        let seen = seen.clone();
+        client.register_chatstate_handler(Arc::new(move |event| {
+            seen.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((tag, event.chat.to_string()));
+        }));
+    }
+
+    client
+        .dispatch_chatstate_event(test_chatstate_stanza())
+        .await;
+
+    crate::test_utils::poll_until("both chatstate handlers ran", || {
+        seen.lock().unwrap_or_else(|p| p.into_inner()).len() == 2
+    })
+    .await;
+
+    let mut seen = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("first", "15550001111@s.whatsapp.net".to_string()),
+            ("second", "15550001111@s.whatsapp.net".to_string()),
+        ]
+    );
+    assert_eq!(
+        client.chatstate_events_built.load(Ordering::Acquire),
+        1,
+        "the event is built once and cloned per handler"
+    );
+}
+
+// --- stanza interceptors ---------------------------------------------------
+
+use crate::client::interceptor::{Interception, StanzaInterceptor};
+use wacore_binary::OwnedNodeRef;
+
+/// Builds a client with no transport, which is enough: interception happens
+/// before anything is sent.
+async fn create_interceptor_test_client() -> Arc<Client> {
+    create_offline_sync_test_client().await
+}
+
+/// Records which stanzas it saw and claims the ones whose tag matches.
+struct Recorder {
+    claim: &'static str,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl StanzaInterceptor for Recorder {
+    fn intercept(&self, node: &OwnedNodeRef) -> Interception {
+        self.seen
+            .lock()
+            .expect("recorder lock")
+            .push(node.tag().to_string());
+        if node.tag() == self.claim {
+            Interception::Handled
+        } else {
+            Interception::Pass
+        }
+    }
+}
+
+fn recorder(claim: &'static str) -> (Arc<Recorder>, Arc<std::sync::Mutex<Vec<String>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    (
+        Arc::new(Recorder {
+            claim,
+            seen: Arc::clone(&seen),
+        }),
+        seen,
+    )
+}
+
+#[tokio::test]
+async fn interceptors_cost_nothing_until_one_is_registered() {
+    let client = create_interceptor_test_client().await;
+    assert!(!client.has_stanza_interceptors());
+
+    let (interceptor, _seen) = recorder("nothing");
+    let handle = client.add_stanza_interceptor(interceptor);
+    assert!(client.has_stanza_interceptors());
+
+    drop(handle);
+    assert!(
+        !client.has_stanza_interceptors(),
+        "dropping the handle unregisters it"
+    );
+}
+
+#[tokio::test]
+async fn an_interceptor_sees_every_decoded_stanza() {
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("nothing-matches");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    for tag in ["ib", "receipt", "notification"] {
+        client
+            .process_node(node_to_owned_ref(NodeBuilder::new(tag).build()))
+            .await;
+    }
+
+    assert_eq!(
+        *seen.lock().expect("recorder lock"),
+        ["ib", "receipt", "notification"]
+    );
+}
+
+/// A `<receipt>` the client dispatches, and the event that proves it did.
+fn receipt_stanza() -> Node {
+    NodeBuilder::new("receipt")
+        .attr("from", "5511999998888@s.whatsapp.net")
+        .attr("id", "RCPT-INTERCEPT")
+        .build()
+}
+
+#[tokio::test]
+async fn passing_leaves_the_stanza_to_the_client() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_interceptor_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let (interceptor, seen) = recorder("nothing-matches");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    client
+        .process_node(node_to_owned_ref(receipt_stanza()))
+        .await;
+
+    assert_eq!(seen.lock().expect("recorder lock").len(), 1, "it ran");
+    assert!(
+        events.try_recv().is_ok(),
+        "and the built-in handler dispatched its event"
+    );
+}
+
+#[tokio::test]
+async fn claiming_a_stanza_skips_the_built_in_pipeline() {
+    use wacore::types::events::ChannelEventHandler;
+    let client = create_interceptor_test_client().await;
+    let (handler, events) = ChannelEventHandler::new();
+    client.subscribe_handler(handler).detach();
+
+    let (interceptor, seen) = recorder("receipt");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    client
+        .process_node(node_to_owned_ref(receipt_stanza()))
+        .await;
+
+    assert_eq!(seen.lock().expect("recorder lock").len(), 1);
+    assert!(
+        events.try_recv().is_err(),
+        "the built-in receipt handler must not have dispatched"
+    );
+}
+
+#[tokio::test]
+async fn interception_does_not_touch_connection_bookkeeping() {
+    // Offline-sync tracking runs before dispatch, and must keep running: it is
+    // what tells the client the drain finished. An interceptor exists to take
+    // over *handling* a stanza, not to opt out of staying connected.
+    let client = create_interceptor_test_client().await;
+    client
+        .offline_sync_metrics
+        .active
+        .store(true, Ordering::Release);
+
+    let (interceptor, seen) = recorder("ib");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    let node = NodeBuilder::new("ib")
+        .children([NodeBuilder::new("offline").attr("count", "0").build()])
+        .build();
+    client.process_node(node_to_owned_ref(node)).await;
+
+    assert_eq!(seen.lock().expect("recorder lock").len(), 1, "it ran");
+    assert!(
+        !client.offline_sync_metrics.active.load(Ordering::Acquire),
+        "offline-sync tracking still ran, claimed or not"
+    );
+}
+
+#[tokio::test]
+async fn the_first_interceptor_to_claim_a_stanza_wins() {
+    let client = create_interceptor_test_client().await;
+    let (first, first_seen) = recorder("receipt");
+    let (second, second_seen) = recorder("receipt");
+
+    let _a = client.add_stanza_interceptor(first);
+    let _b = client.add_stanza_interceptor(second);
+
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("receipt").build()))
+        .await;
+
+    assert_eq!(first_seen.lock().expect("lock").len(), 1);
+    assert!(
+        second_seen.lock().expect("lock").is_empty(),
+        "registration order is priority order"
+    );
+}
+
+#[tokio::test]
+async fn a_passing_interceptor_does_not_stop_the_next_one() {
+    let client = create_interceptor_test_client().await;
+    let (first, first_seen) = recorder("nothing");
+    let (second, second_seen) = recorder("receipt");
+
+    let _a = client.add_stanza_interceptor(first);
+    let _b = client.add_stanza_interceptor(second);
+
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("receipt").build()))
+        .await;
+
+    assert_eq!(first_seen.lock().expect("lock").len(), 1);
+    assert_eq!(second_seen.lock().expect("lock").len(), 1);
+}
+
+#[tokio::test]
+async fn an_unregistered_interceptor_stops_seeing_stanzas() {
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("nothing");
+    let handle = client.add_stanza_interceptor(interceptor);
+
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("receipt").build()))
+        .await;
+    assert_eq!(seen.lock().expect("lock").len(), 1);
+
+    drop(handle);
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("receipt").build()))
+        .await;
+    assert_eq!(
+        seen.lock().expect("lock").len(),
+        1,
+        "no further stanzas after unregistering"
+    );
+}
+
+#[tokio::test]
+async fn a_claimed_unknown_stanza_is_acked_rather_than_nacked() {
+    // The reason this exists. A tag the client does not model is nacked, which
+    // tells the server this client cannot act on it. An interceptor that *can*
+    // act on it says the opposite — but it must still say something: answering
+    // nothing leaves the stanza in the offline queue and keeps the stream
+    // recycling.
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    let (interceptor, seen) = recorder("vendor:thing");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    let node = NodeBuilder::new("vendor:thing")
+        .attr("id", "V-1")
+        .attr("from", "s.whatsapp.net")
+        .build();
+    // `should_ack` covers only the tags the client models, so this stanza takes
+    // the claimed-stanza ack path rather than the deferred one.
+    assert!(
+        !client.should_ack(&node.as_node_ref()),
+        "fixture must exercise the path should_ack does not cover"
+    );
+    client.process_node(node_to_owned_ref(node)).await;
+    assert_eq!(seen.lock().expect("lock").len(), 1, "the interceptor ran");
+
+    // What the server actually receives, which is the whole point: an ack, and
+    // not the nack this tag would otherwise have drawn.
+    let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+    let sent = sent.get();
+    assert_eq!(sent.tag.as_ref(), "ack");
+    assert!(
+        sent.get_attr("class")
+            .is_some_and(|class| *class == "vendor:thing")
+    );
+    assert!(sent.get_attr("id").is_some_and(|id| *id == "V-1"));
+    assert_eq!(
+        transport.sent_count(),
+        1,
+        "one answer, so no nack followed the ack"
+    );
+}
+
+#[tokio::test]
+async fn claiming_a_stanza_the_client_answers_differently_sends_no_generic_ack() {
+    // A direct <message> is answered with a delivery <receipt>, an <iq> with an
+    // <iq type="result">. Neither is an <ack class="…">, so the claimed-stanza
+    // path stays quiet rather than sending the server something it did not ask
+    // for. The interceptor that took the stanza owes the reply.
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+    let (interceptor, seen) = recorder("message");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    let node = NodeBuilder::new("message")
+        .attr("id", "M-1")
+        .attr("from", "5511999998888@s.whatsapp.net")
+        .build();
+    assert!(
+        !client.should_ack(&node.as_node_ref()),
+        "a direct message is not ack-answered"
+    );
+    client.process_node(node_to_owned_ref(node)).await;
+
+    assert_eq!(seen.lock().expect("lock").len(), 1, "it was claimed");
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    assert_eq!(
+        transport.sent_count(),
+        0,
+        "no invented answer for a tag the client models"
+    );
+}
+
+#[tokio::test]
+async fn a_claimed_stanza_without_identity_is_left_alone() {
+    // An ack has nothing to address without `id` and `from`, which is the same
+    // condition the nack path checks.
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("vendor:thing");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("vendor:thing").build()))
+        .await;
+
+    assert_eq!(seen.lock().expect("lock").len(), 1);
+}
+
+#[tokio::test]
+async fn connection_critical_stanzas_are_never_offered_to_an_interceptor() {
+    // An interceptor exists to extend a client, not to leave it
+    // authenticated-but-unaware, never reconnecting, or waiting forever on a
+    // send that already completed. These four settle connection state, so they
+    // do not reach an interceptor at all — an interceptor that tried to claim
+    // one never gets the chance.
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("claims-everything-it-sees");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    for tag in ["success", "failure", "stream:error", "ack"] {
+        client
+            .process_node(node_to_owned_ref(NodeBuilder::new(tag).build()))
+            .await;
+    }
+
+    assert!(
+        seen.lock().expect("lock").is_empty(),
+        "a connection-critical stanza must not reach an interceptor"
+    );
+
+    // A neighbouring tag is still offered, so the guard is a list and not a
+    // switch that turned interception off.
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("notification").build()))
+        .await;
+    assert_eq!(seen.lock().expect("lock").len(), 1);
+}
+
+#[tokio::test]
+async fn a_server_ping_is_never_offered_to_an_interceptor() {
+    // A claimed ping is a pong never sent, and the server closes the connection
+    // over it — the same class of harm as claiming `success` or `ack`, so the
+    // same protection. Every other <iq> stays offered: that is the traffic an
+    // interceptor exists to extend.
+    let client = create_interceptor_test_client().await;
+    let (interceptor, seen) = recorder("claims-everything-it-sees");
+    let _handle = client.add_stanza_interceptor(interceptor);
+
+    for node in [
+        NodeBuilder::new("iq")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "PING-1")
+            .attr("type", "get")
+            .children([NodeBuilder::new("ping").build()])
+            .build(),
+        // WA Web's handleIq is type-agnostic, so an absent type is a ping too.
+        NodeBuilder::new("iq")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "PING-2")
+            .attr("xmlns", "urn:xmpp:ping")
+            .build(),
+    ] {
+        client.process_node(node_to_owned_ref(node)).await;
+    }
+    assert!(
+        seen.lock().expect("lock").is_empty(),
+        "a server ping must not reach an interceptor"
+    );
+
+    // A ping *response* is ours, not the server's, so it carries no pong
+    // obligation and stays offered.
+    let response = NodeBuilder::new("iq")
+        .attr("from", "s.whatsapp.net")
+        .attr("id", "PING-3")
+        .attr("type", "result")
+        .children([NodeBuilder::new("ping").build()])
+        .build();
+    client.process_node(node_to_owned_ref(response)).await;
+
+    let other = NodeBuilder::new("iq")
+        .attr("from", "s.whatsapp.net")
+        .attr("id", "IQ-1")
+        .attr("type", "get")
+        .children([NodeBuilder::new("query").build()])
+        .build();
+    client.process_node(node_to_owned_ref(other)).await;
+    assert_eq!(
+        seen.lock().expect("lock").len(),
+        2,
+        "a ping result and an ordinary <iq> are both still offered"
+    );
+}
+
+#[tokio::test]
+async fn a_closure_can_be_an_interceptor() {
+    let client = create_interceptor_test_client().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+
+    let _handle = client.add_stanza_interceptor(Arc::new(move |_node: &OwnedNodeRef| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Interception::Pass
+    }));
+
+    client
+        .process_node(node_to_owned_ref(NodeBuilder::new("receipt").build()))
+        .await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn a_handle_outliving_its_client_does_not_keep_it_alive() {
+    // The handle holds a weak reference, so a forgotten one cannot pin a
+    // client — and dropping it afterwards must not panic either.
+    let handle = {
+        let client = create_interceptor_test_client().await;
+        let (interceptor, _seen) = recorder("nothing");
+        let owners = Arc::strong_count(&client);
+        let handle = client.add_stanza_interceptor(interceptor);
+        assert_eq!(
+            Arc::strong_count(&client),
+            owners,
+            "registering must not make the handle an owner"
+        );
+        handle
+    };
+    drop(handle);
+}
+
+/// A stanza that arrived can be sent back out as it stands: pack what the
+/// decoder holds and the bytes reaching the transport are the ones the marshal
+/// produced, no re-encode involved. This is the round trip a forwarding or
+/// replay consumer performs, asserted at the point the frame leaves.
+#[tokio::test]
+async fn a_received_stanza_forwards_as_the_bytes_it_arrived_as() {
+    use wacore::handshake::NoiseCipher;
+
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+    let node = NodeBuilder::new("message")
+        .attr("to", "15551234567@s.whatsapp.net")
+        .attr("id", "FORWARD-1")
+        .children([NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .bytes(vec![0xAB; 64])
+            .build()])
+        .build();
+    let marshaled = wacore_binary::marshal::marshal(&node).expect("marshal");
+    let received = to_owned_node(&node);
+
+    client
+        .send_raw_bytes(wacore_binary::util::pack(&received.backing_bytes()))
+        .await
+        .expect("installed socket");
+
+    crate::test_utils::poll_until("the forwarded frame to reach the transport", || {
+        !transport.sent().is_empty()
+    })
+    .await;
+    let cipher = NoiseCipher::new(&[0u8; 32]).expect("32-byte key");
+    let mut sent = transport.sent()[0][3..].to_vec();
+    cipher
+        .decrypt_in_place_with_counter(0, &mut sent)
+        .expect("captured frame should decrypt");
+
+    assert_eq!(
+        sent, marshaled,
+        "the forwarded frame must carry the original marshal output"
+    );
+}
+
+/// The other half: node bytes handed to the send path are refused here rather
+/// than accepted and answered by the server closing the connection.
+#[tokio::test]
+async fn send_raw_bytes_refuses_a_payload_without_its_format_byte() {
+    let (client, transport) = crate::test_utils::create_iq_test_client().await;
+
+    let node = NodeBuilder::new("iq").attr("id", "REJECT-1").build();
+    let node_bytes = to_owned_node(&node).backing_bytes().to_vec();
+
+    let error = client
+        .send_raw_bytes(node_bytes.clone())
+        .await
+        .expect_err("node bytes are not a packed payload");
+    assert!(
+        matches!(
+            error,
+            ClientError::Socket(SocketError::Marshal(
+                wacore_binary::BinaryError::UnexpectedFormatByte(byte)
+            )) if byte == node_bytes[0]
+        ),
+        "unexpected error: {error:?}"
+    );
+    for empty in [Vec::new(), vec![wacore_binary::util::FORMAT_PLAIN]] {
+        assert!(
+            matches!(
+                client.send_raw_bytes(empty).await,
+                Err(ClientError::Socket(SocketError::Marshal(
+                    wacore_binary::BinaryError::EmptyData
+                )))
+            ),
+            "a payload with no stanza in it carries nothing to send"
+        );
+    }
+    assert!(
+        transport.sent().is_empty(),
+        "a refused payload must not reach the transport"
+    );
+
+    // The same stanza, packed, goes out.
+    client
+        .send_raw_bytes(wacore_binary::util::pack(&node_bytes))
+        .await
+        .expect("installed socket");
+    assert_eq!(transport.sent().len(), 1);
+}
+
+/// Concurrent `ensure_e2e_sessions` for one address.
+///
+/// Production shape (offline-sync drain): a burst of undecryptable group
+/// messages from one peer emits one PDO placeholder resend per message, and
+/// each of those ensures a session with that same peer. Nine identical
+/// `<iq><key>` requests went out in 130 ms, and the five bundles that came back
+/// were each installed over the last.
+#[cfg(test)]
+mod ensure_sessions_concurrency {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SessionRecord};
+    use wacore::types::jid::JidExt;
+    use wacore_binary::builder::NodeBuilder;
+    use wacore_binary::{Jid, Node};
+
+    const CONCURRENT_CALLS: usize = 6;
+
+    /// One peer identity, reused across every bundle a test hands out, so each
+    /// response is a legitimate answer for the same address rather than a
+    /// different peer wearing the same jid.
+    struct PeerKeys {
+        identity: IdentityKeyPair,
+        signed: KeyPair,
+        signature: Vec<u8>,
+    }
+
+    impl PeerKeys {
+        fn generate() -> Self {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let identity = IdentityKeyPair::generate(&mut rng);
+            let signed = KeyPair::generate(&mut rng);
+            // `process_prekey_bundle` verifies this signature, so a filler byte
+            // pattern would fail before the behaviour under test is reached.
+            let signature = identity
+                .private_key()
+                .calculate_signature(&signed.public_key.serialize(), &mut rng)
+                .expect("signature over the signed prekey")
+                .to_vec();
+            Self {
+                identity,
+                signed,
+                signature,
+            }
+        }
+
+        /// A `<user>` bundle response. The one-time prekey id varies per call,
+        /// as the server's does: each fetch burns one of the peer's prekeys.
+        fn bundle_response(&self, jid: &Jid, request_id: &str, one_time_id: u32) -> Node {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let one_time = KeyPair::generate(&mut rng);
+            let id_bytes = |id: u32| id.to_be_bytes()[1..].to_vec();
+
+            NodeBuilder::new("iq")
+                .attr("type", "result")
+                .attr("from", "s.whatsapp.net")
+                .attr("id", request_id)
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", jid.to_string())
+                        .children([
+                            NodeBuilder::new("registration")
+                                .bytes(1234u32.to_be_bytes().to_vec())
+                                .build(),
+                            NodeBuilder::new("type").bytes(vec![5]).build(),
+                            NodeBuilder::new("identity")
+                                .bytes(self.identity.public_key().public_key_bytes().to_vec())
+                                .build(),
+                            NodeBuilder::new("skey")
+                                .children([
+                                    NodeBuilder::new("id").bytes(id_bytes(1)).build(),
+                                    NodeBuilder::new("value")
+                                        .bytes(self.signed.public_key.public_key_bytes().to_vec())
+                                        .build(),
+                                    NodeBuilder::new("signature")
+                                        .bytes(self.signature.clone())
+                                        .build(),
+                                ])
+                                .build(),
+                            NodeBuilder::new("key")
+                                .children([
+                                    NodeBuilder::new("id").bytes(id_bytes(one_time_id)).build(),
+                                    NodeBuilder::new("value")
+                                        .bytes(one_time.public_key.public_key_bytes().to_vec())
+                                        .build(),
+                                ])
+                                .build(),
+                        ])
+                        .build()])
+                    .build()])
+                .build()
+        }
+    }
+
+    /// Runs `CONCURRENT_CALLS` ensures for `peer` while answering every prekey
+    /// IQ the client writes, and reports how many it had to answer.
+    ///
+    /// Frames are read by index because `decode_sent_iq` decrypts each one
+    /// under the counter its position implies.
+    async fn ensure_concurrently(
+        client: &Arc<Client>,
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        peer: &Jid,
+    ) -> usize {
+        let keys = PeerKeys::generate();
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::with_capacity(CONCURRENT_CALLS);
+        for _ in 0..CONCURRENT_CALLS {
+            let client = client.clone();
+            let peer = peer.clone();
+            let done = done.clone();
+            tasks.push(tokio::spawn(async move {
+                let result = client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await;
+                done.fetch_add(1, Ordering::Release);
+                result
+            }));
+        }
+
+        let mut next_frame = 0usize;
+        let mut served = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut timed_out = false;
+        while done.load(Ordering::Acquire) < CONCURRENT_CALLS {
+            if tokio::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
+            if transport.sent().len() <= next_frame {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let node = crate::test_utils::decode_sent_iq(transport, next_frame).await;
+            next_frame += 1;
+
+            let node_ref = node.get();
+            if node_ref.tag != "iq" || node_ref.get_optional_child("key").is_none() {
+                continue;
+            }
+            let request_id = node_ref
+                .attrs()
+                .optional_string("id")
+                .expect("an IQ carries an id")
+                .to_string();
+            served += 1;
+            let response = keys.bundle_response(peer, &request_id, 100 + served as u32);
+            crate::test_utils::answer_iq(client, &request_id, &response).await;
+        }
+
+        // Reported before the results are checked: a timeout would otherwise
+        // surface as a fetch count of zero, which reads like a coalescing
+        // regression rather than a hang.
+        assert!(
+            !timed_out,
+            "the ensures did not finish in time; served {served} prekey fetch(es)"
+        );
+        for task in tasks {
+            task.await
+                .expect("ensure task should not panic")
+                .expect("every ensure must succeed once the bundle arrives");
+        }
+        served
+    }
+
+    /// The request id of the prekey IQ at `index`, once it reaches the wire.
+    ///
+    /// Frames are addressed by index because `decode_sent_iq` decrypts each one
+    /// under the counter its position implies.
+    async fn pending_prekey_request(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        index: usize,
+    ) -> String {
+        let node = crate::test_utils::decode_sent_iq(transport, index).await;
+        let node_ref = node.get();
+        assert!(
+            node_ref.tag == "iq" && node_ref.get_optional_child("key").is_some(),
+            "frame {index} should be a prekey fetch"
+        );
+        node_ref
+            .attrs()
+            .optional_string("id")
+            .expect("an IQ carries an id")
+            .to_string()
+    }
+
+    /// The jids a prekey fetch asks for, in wire order.
+    async fn fetch_targets(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        index: usize,
+    ) -> Vec<String> {
+        let node = crate::test_utils::decode_sent_iq(transport, index).await;
+        let node_ref = node.get();
+        node_ref
+            .get_optional_child("key")
+            .expect("a prekey fetch carries <key>")
+            .children()
+            .iter()
+            .flat_map(|children| children.iter())
+            .filter(|child| child.tag == "user")
+            .map(|child| {
+                child
+                    .attrs()
+                    .optional_string("jid")
+                    .expect("a <user> carries a jid")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Give a spawned ensure the chance to reach its claim.
+    ///
+    /// The claim is taken synchronously right after an await that resolves
+    /// immediately on this client, so yielding is enough to get there. What
+    /// makes it observable is the frame count: a caller that failed to defer
+    /// would have put its own fetch on the wire, which the assertion after this
+    /// call catches.
+    async fn let_the_waiter_park(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        expected_frames: usize,
+    ) {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            transport.sent().len(),
+            expected_frames,
+            "the second caller must defer to the claim in flight, not fetch"
+        );
+    }
+
+    /// A device the first chunk actually asked for.
+    ///
+    /// The probe runs `buffer_unordered`, so which devices land in which chunk
+    /// does not follow the order they were passed in. A test that assumed it
+    /// would put its waiter's address in the *second* chunk half the time.
+    async fn first_chunk_member(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        devices: &[Jid],
+    ) -> Jid {
+        let asked = fetch_targets(transport, 0).await;
+        devices
+            .iter()
+            .find(|jid| asked.contains(&jid.to_string()))
+            .cloned()
+            .expect("the first chunk asks for at least one of the devices")
+    }
+
+    /// How many prekey fetches reached the wire so far.
+    async fn prekey_requests(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+    ) -> usize {
+        let total = transport.sent().len();
+        let mut fetches = 0;
+        for index in 0..total {
+            let node = crate::test_utils::decode_sent_iq(transport, index).await;
+            let node_ref = node.get();
+            if node_ref.tag == "iq" && node_ref.get_optional_child("key").is_some() {
+                fetches += 1;
+            }
+        }
+        fetches
+    }
+
+    /// The cause: one address, one fetch, however many callers ask at once.
+    ///
+    /// Every redundant fetch burns one of the peer's one-time prekeys, so the
+    /// cost of getting this wrong is paid on the other side of the wire too.
+    #[tokio::test]
+    async fn concurrent_ensure_for_one_address_fetches_prekeys_once() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("111111111111111".to_string(), 0);
+
+        let served = ensure_concurrently(&client, &transport, &peer).await;
+
+        assert_eq!(
+            served, 1,
+            "concurrent ensures for one address must share a single prekey fetch, \
+             not one per caller"
+        );
+    }
+
+    /// The damage: each installed bundle retires the state before it, so N
+    /// concurrent ensures leave N sessions where one belongs.
+    ///
+    /// Every retired state is a session the peer may still be encrypting under
+    /// and a candidate the decrypt path has to try; in production this is what
+    /// left one peer with five states and no usable one.
+    #[tokio::test]
+    async fn concurrent_ensure_leaves_exactly_one_session_state() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("222222222222222".to_string(), 0);
+
+        ensure_concurrently(&client, &transport, &peer).await;
+        client
+            .flush_signal_cache_batch_safe()
+            .await
+            .expect("flush the established session");
+
+        let address = peer.to_protocol_address();
+        let stored = client
+            .persistence_manager
+            .get_device_snapshot()
+            .backend
+            .get_session(address.as_str())
+            .await
+            .expect("session read")
+            .expect("concurrent ensures must establish a session");
+        let record = SessionRecord::deserialize(&stored).expect("stored session decodes");
+        let archived = record.previous_session_states().count();
+
+        assert_eq!(
+            archived, 0,
+            "concurrent ensures for one address must leave a single session state; \
+             each extra one is a bundle installed over a session that was already good"
+        );
+    }
+
+    /// A waiter whose leader failed must fetch for itself, not report a
+    /// session that was never established.
+    ///
+    /// Sharing the leader's outcome would be wrong here: a timeout on one
+    /// caller is not evidence about the address, and a waiter that swallowed it
+    /// would hand the send an address with no session behind it.
+    #[tokio::test]
+    async fn a_waiter_whose_leader_failed_establishes_the_session_itself() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("333333333333333".to_string(), 0);
+        let keys = PeerKeys::generate();
+
+        let leader = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        // The claim is taken before the leader's first await, so its IQ
+        // reaching the wire means the address is registered.
+        let leader_id = pending_prekey_request(&transport, 0).await;
+
+        let waiter = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+
+        let refusal = NodeBuilder::new("iq")
+            .attr("type", "error")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &leader_id)
+            .children([NodeBuilder::new("error")
+                .attr("code", "500")
+                .attr("text", "internal-server-error")
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &leader_id, &refusal).await;
+        assert!(
+            leader.await.expect("leader task").is_err(),
+            "the leader reports its own fetch failure"
+        );
+
+        // The waiter's own attempt: without it, the failed leader would have
+        // left this caller with nothing and no way to know.
+        let waiter_id = pending_prekey_request(&transport, 1).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &waiter_id,
+            &keys.bundle_response(&peer, &waiter_id, 200),
+        )
+        .await;
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("a waiter must establish the session its leader failed to");
+    }
+
+    /// A batch that overlaps an in-flight address still resolves the rest of
+    /// its devices, and does not re-fetch the one already being established.
+    #[tokio::test]
+    async fn a_batch_overlapping_an_inflight_address_fetches_only_the_rest() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let shared = Jid::lid_device("444444444444444".to_string(), 0);
+        let extra = Jid::lid_device("444444444444444".to_string(), 3);
+        let keys = PeerKeys::generate();
+
+        let leader = {
+            let client = client.clone();
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&shared))
+                    .await
+            })
+        };
+        // Registered only once the leader has claimed it, which it does before
+        // its first await — so waiting for its IQ is waiting for the claim.
+        let leader_id = pending_prekey_request(&transport, 0).await;
+
+        let overlapping = {
+            let client = client.clone();
+            let batch = vec![shared.clone(), extra.clone()];
+            tokio::spawn(async move { client.ensure_e2e_sessions_resolved(&batch).await })
+        };
+
+        let second_id = pending_prekey_request(&transport, 1).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &second_id,
+            &keys.bundle_response(&extra, &second_id, 301),
+        )
+        .await;
+        crate::test_utils::answer_iq(
+            &client,
+            &leader_id,
+            &keys.bundle_response(&shared, &leader_id, 302),
+        )
+        .await;
+
+        leader.await.expect("leader task").expect("leader ensure");
+        overlapping
+            .await
+            .expect("overlapping task")
+            .expect("overlapping ensure");
+
+        // The count alone would not tell the two behaviours apart: without
+        // coalescing the second fetch is still one IQ, it just names the
+        // claimed address again. What it asks for is the discriminating fact.
+        assert_eq!(
+            prekey_requests(&transport).await,
+            2,
+            "one fetch each, with nothing left over"
+        );
+        assert_eq!(
+            fetch_targets(&transport, 1).await,
+            vec![extra.to_string()],
+            "the overlapping batch must ask only for the address nobody claimed"
+        );
+    }
+
+    /// A leader that got an answer with no bundle for the device has asked the
+    /// question. Its waiters must not ask it again.
+    ///
+    /// Without this, coalescing would hold for the happy path and quietly give
+    /// way for exactly the device that is most expensive to keep asking about:
+    /// one the server has no prekeys for.
+    #[tokio::test]
+    async fn a_leader_that_found_no_bundle_is_not_re_fetched_by_its_waiters() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("555555555555555".to_string(), 0);
+
+        let leader = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let leader_id = pending_prekey_request(&transport, 0).await;
+
+        let waiter = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+
+        // A result the server did answer, carrying no user for this device.
+        let empty = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &leader_id)
+            .children([NodeBuilder::new("list").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &leader_id, &empty).await;
+
+        leader
+            .await
+            .expect("leader task")
+            .expect("an answered fetch with no bundle is not an error");
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("the waiter inherits the answered question");
+
+        assert_eq!(
+            prekey_requests(&transport).await,
+            1,
+            "a waiter must not re-ask a question its leader already got an answer to"
+        );
+    }
+
+    /// A fetch is chunked, and a chunk the server answered stays answered even
+    /// if a later one fails. Waiters for an address in the answered chunk must
+    /// not be sent back to re-ask it.
+    #[tokio::test]
+    async fn an_answered_chunk_stays_answered_when_a_later_one_fails() {
+        // Two chunks: one address over the batch size.
+        let batch = crate::session::SESSION_CHECK_BATCH_SIZE;
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let devices: Vec<Jid> = (0..=batch)
+            .map(|i| Jid::lid_device("666666666666666".to_string(), i as u16))
+            .collect();
+        let leader = {
+            let client = client.clone();
+            let devices = devices.clone();
+            tokio::spawn(async move { client.ensure_e2e_sessions_resolved(&devices).await })
+        };
+
+        // First chunk: answered, with no bundle for anyone in it.
+        let first_id = pending_prekey_request(&transport, 0).await;
+        // Taken from the frame rather than assumed: the probe is
+        // `buffer_unordered`, so the chunk split does not follow input order.
+        let answered = first_chunk_member(&transport, &devices).await;
+
+        // A waiter for an address the first chunk covers, joining while the
+        // claim is still held — a completed claim is retired, so a caller
+        // arriving after the answer would rightly become a leader instead.
+        let waiter = {
+            let client = client.clone();
+            let answered = answered.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&answered))
+                    .await
+            })
+        };
+        let_the_waiter_park(&transport, 1).await;
+
+        let empty = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &first_id)
+            .children([NodeBuilder::new("list").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &first_id, &empty).await;
+
+        // Second chunk: refused, which fails the leader as a whole.
+        let second_id = pending_prekey_request(&transport, 1).await;
+        let refusal = NodeBuilder::new("iq")
+            .attr("type", "error")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &second_id)
+            .children([NodeBuilder::new("error")
+                .attr("code", "500")
+                .attr("text", "internal-server-error")
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &second_id, &refusal).await;
+
+        assert!(
+            leader.await.expect("leader task").is_err(),
+            "a failed chunk fails the call that owned it"
+        );
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("the waiter inherits the chunk that was answered");
+
+        assert_eq!(
+            prekey_requests(&transport).await,
+            2,
+            "one fetch per chunk; the waiter must not add a third for an address \
+             the first chunk already covered"
+        );
+    }
+
+    /// A waiter is released by its own address finishing, not by the whole
+    /// batch. A later chunk stalling must not hold it.
+    #[tokio::test]
+    async fn a_waiter_is_released_when_its_own_chunk_lands() {
+        let batch = crate::session::SESSION_CHECK_BATCH_SIZE;
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let devices: Vec<Jid> = (0..=batch)
+            .map(|i| Jid::lid_device("777777777777777".to_string(), i as u16))
+            .collect();
+        let leader = {
+            let client = client.clone();
+            let devices = devices.clone();
+            tokio::spawn(async move { client.ensure_e2e_sessions_resolved(&devices).await })
+        };
+
+        let first_id = pending_prekey_request(&transport, 0).await;
+        let answered = first_chunk_member(&transport, &devices).await;
+        let waiter = {
+            let client = client.clone();
+            let answered = answered.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&answered))
+                    .await
+            })
+        };
+        let_the_waiter_park(&transport, 1).await;
+
+        let empty = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &first_id)
+            .children([NodeBuilder::new("list").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &first_id, &empty).await;
+
+        // The second chunk is deliberately left unanswered: the waiter must
+        // finish anyway, since nothing it asked for is in that chunk.
+        pending_prekey_request(&transport, 1).await;
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("a waiter must not be held by a chunk it has no address in")
+            .expect("waiter task")
+            .expect("the waiter inherits the chunk that answered its address");
+
+        leader.abort();
+    }
+
+    /// A claim is retired the moment its work lands, so a caller arriving
+    /// afterwards leads its own fetch instead of inheriting an answer.
+    ///
+    /// This is what lets retry recovery delete a session and immediately
+    /// re-establish it: joining the finished claim would hand it a verdict
+    /// about the session it had just deleted.
+    #[tokio::test]
+    async fn a_finished_claim_is_retired_so_the_next_caller_leads() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("888888888888888".to_string(), 0);
+        let keys = PeerKeys::generate();
+
+        let first = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let first_id = pending_prekey_request(&transport, 0).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &first_id,
+            &keys.bundle_response(&peer, &first_id, 400),
+        )
+        .await;
+        first.await.expect("first task").expect("first ensure");
+
+        assert_eq!(
+            client.ensure_inflight.len(),
+            0,
+            "a finished claim must not stay registered"
+        );
+
+        // Whatever established that session is gone again: the next ensure has
+        // to do the work itself.
+        client
+            .signal_cache
+            .delete_session(&peer.to_protocol_address())
+            .await;
+        client
+            .flush_signal_cache_batch_safe()
+            .await
+            .expect("flush the deletion");
+
+        let second = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let second_id = pending_prekey_request(&transport, 1).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &second_id,
+            &keys.bundle_response(&peer, &second_id, 401),
+        )
+        .await;
+        second
+            .await
+            .expect("second task")
+            .expect("a caller after the claim retired must establish the session itself");
+    }
+
+    /// The invariant behind the retirement ordering: a caller can never find a
+    /// slot that is registered and already complete.
+    ///
+    /// That state is what lets a caller which just deleted a session join a
+    /// finished claim and inherit a verdict about it, so the registry must
+    /// publish completion and unregister under one lock.
+    #[tokio::test]
+    async fn a_registered_claim_is_never_already_complete() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("999999999999999".to_string(), 0);
+        let keys = PeerKeys::generate();
+
+        let leader = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let request_id = pending_prekey_request(&transport, 0).await;
+
+        // Sampled while the claim is held, and again once it is answered: the
+        // pair (registered, complete) must never both hold.
+        assert!(
+            !client.ensure_inflight.any_completed_still_registered(),
+            "a claim in flight must not be complete"
+        );
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &keys.bundle_response(&peer, &request_id, 500),
+        )
+        .await;
+        leader.await.expect("leader task").expect("leader ensure");
+
+        assert!(
+            !client.ensure_inflight.any_completed_still_registered(),
+            "a completed claim must be unregistered by the same lock that completed it"
+        );
+        assert_eq!(client.ensure_inflight.len(), 0);
+    }
+}
+
+/// Reproduction: a client between connections and a client that is finished
+/// refuse the same public call with the same error, so nothing in what the
+/// caller gets back separates "this comes back on its own" from "stop trying".
+///
+/// The two clients differ only in the state the reconnect loop reads, which is
+/// exactly what [`Client::reachability`] reports and the error does not.
+#[tokio::test]
+async fn a_reconnecting_client_and_a_finished_one_refuse_a_call_identically() {
+    let reconnecting = crate::test_utils::create_test_client().await;
+    reconnecting.is_running.store(true, Ordering::Relaxed);
+
+    let finished = crate::test_utils::create_test_client().await;
+    finished.is_running.store(true, Ordering::Relaxed);
+    finished
+        .enable_auto_reconnect
+        .store(false, Ordering::Relaxed);
+    finished.expected_disconnect.store(true, Ordering::Relaxed);
+
+    let jid = Jid::pn("12025550111");
+    let transient = reconnecting
+        .contacts()
+        .get_user_info(std::slice::from_ref(&jid))
+        .await
+        .expect_err("a client with no socket cannot answer a usync");
+    let terminal = finished
+        .contacts()
+        .get_user_info(std::slice::from_ref(&jid))
+        .await
+        .expect_err("nor can one that is finished");
+
+    assert_eq!(
+        transient.to_string(),
+        terminal.to_string(),
+        "the error is the same on both, which is the gap being closed"
+    );
+
+    assert_eq!(
+        reconnecting.reachability(),
+        Reachability::Reconnecting,
+        "a client whose loop is still trying is worth waiting for"
+    );
+    assert_eq!(
+        finished.reachability(),
+        Reachability::Finished,
+        "a finished one never is"
+    );
+}
+
+/// A client whose flags say `<success>` finished publishing: connected,
+/// authenticated, and with a reader running.
+async fn create_reachable_wait_test_client(name: &str) -> Arc<Client> {
+    let client = crate::test_utils::create_test_client_with_name(name).await;
+    client.is_running.store(true, Ordering::Relaxed);
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    assert_eq!(client.reachability(), Reachability::Reachable);
+    client
+}
+
+/// The other half of the reproduction: the call the reconnecting client refused
+/// is one the caller can wait out, and the wait ends the moment the replacement
+/// connection finishes authenticating.
+#[tokio::test]
+async fn the_wait_ends_when_the_replacement_connection_authenticates() {
+    let client = crate::test_utils::create_test_client_with_name("wait-release").await;
+    client.is_running.store(true, Ordering::Relaxed);
+    assert_eq!(client.reachability(), Reachability::Reconnecting);
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+    // What `handle_success` publishes, in its order: the session, then the
+    // generation it is authenticated under, then the announcement.
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    client.notify_session_state();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the wait must end on the new connection")
+            .expect("the waiter should not panic"),
+        Reachability::Reachable
+    );
+}
+
+/// Terminal beats reachability. Every one of these sets its terminal flags
+/// before it clears the session and closes the transport, so a wait that asked
+/// about the socket first would be handed a connection that is already ending.
+///
+/// The ordering is asserted on a client that is still connected and still
+/// authenticated, because that is the window it exists for. The release is
+/// asserted from a wait that is already parked, so what ends it is the terminal
+/// transition and not the state the waiter happened to start in.
+#[tokio::test]
+async fn a_terminal_session_ends_the_wait_however_it_became_terminal() {
+    for code in ["401", "409", "516"] {
+        let client = create_reachable_wait_test_client(&format!("terminal-{code}")).await;
+        let error = NodeBuilder::new("stream:error").attr("code", code).build();
+        client.handle_stream_error(&error.as_node_ref()).await;
+
+        assert!(client.is_terminal(), "{code} ends the session for good");
+        assert_eq!(
+            client.reachability(),
+            Reachability::Finished,
+            "and that outranks whatever the socket still says"
+        );
+    }
+
+    // Parked first, on a client that is merely between connections, so the only
+    // thing that can end this wait is the transition under test.
+    let client = crate::test_utils::create_test_client_with_name("terminal-parked").await;
+    client.is_running.store(true, Ordering::Relaxed);
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+    assert!(!waiter.is_finished(), "parked, with no verdict yet");
+
+    // A shutdown is terminal without any stream error, and reaches the parked
+    // wait through the same notifier.
+    client.signal_shutdown_sync();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("a shutdown must release the wait")
+            .expect("the waiter should not panic"),
+        Reachability::Finished,
+        "reporting that no connection is coming, rather than that none arrived yet"
+    );
+}
+
+/// A 429 clears the session and leaves everything else standing: the socket is
+/// open, the generation unchanged, `is_connected` still true. Reading it as
+/// ready would send the very traffic the server just penalised straight back
+/// down the same connection.
+#[tokio::test]
+async fn a_rate_limited_session_is_not_a_reachable_one() {
+    let client = create_reachable_wait_test_client("rate-limited").await;
+
+    let error = NodeBuilder::new("stream:error").attr("code", "429").build();
+    client.handle_stream_error(&error.as_node_ref()).await;
+
+    assert!(
+        client.is_connected(),
+        "the socket the rate limit arrived on is still open"
+    );
+    assert!(!client.is_terminal(), "and the session is not over");
+    assert_eq!(
+        client.reachability(),
+        Reachability::Reconnecting,
+        "but nothing sent on it is worth sending"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client.wait_until_reachable())
+            .await
+            .is_err(),
+        "so the wait carries on to the connection that follows the penalty"
+    );
+}
+
+/// A client nothing is reading answers no IQ and reconnects from nothing, so
+/// the wait says that instead of parking for the life of the process. Its
+/// caller holds the `Arc` whose drop would have been the only other way out.
+#[tokio::test]
+async fn a_client_with_no_reader_is_told_rather_than_parked() {
+    let client = crate::test_utils::create_test_client_with_name("no-reader").await;
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+
+    assert!(
+        !client.is_terminal(),
+        "a connection nobody drives is not a finished session"
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client.wait_until_reachable())
+            .await
+            .expect("waiting cannot be what fixes this, so it must not wait"),
+        Reachability::Unsupervised
+    );
+}
+
+/// The two waits differ by exactly one policy. Work the client re-issues for
+/// itself sits through a pause, because nothing on the next connection asks for
+/// it again; a caller waiting on its own behalf is the side that calls
+/// `resume`, so it is told and can decide.
+#[tokio::test]
+async fn a_pause_ends_the_public_wait_and_not_the_internal_one() {
+    let client = create_reachable_wait_test_client("paused").await;
+
+    // Paused before the internal waiter starts, so it parks on the pause rather
+    // than racing the connection this call tears down.
+    client.pause().await;
+    assert_eq!(client.reachability(), Reachability::Paused);
+
+    let internal = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.await_connection().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client.wait_until_reachable())
+            .await
+            .expect("the public wait must not sit through an offline the caller asked for"),
+        Reachability::Paused
+    );
+    assert!(
+        !internal.is_finished(),
+        "while the internal one waits for the connection the resume brings back"
+    );
+
+    client.resume();
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    client.notify_session_state();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), internal)
+            .await
+            .expect("and ends on it")
+            .expect("the waiter should not panic"),
+        "reporting the connection it was waiting for"
+    );
+}
+
+/// The wait ends on the state, never on one event. A notification that does not
+/// settle the question loops, so a wake that lands just before a teardown does
+/// not hand the caller the connection that teardown is taking away.
+#[tokio::test]
+async fn a_wake_that_settles_nothing_leaves_the_wait_parked() {
+    let client = crate::test_utils::create_test_client_with_name("relooping-wait").await;
+    client.is_running.store(true, Ordering::Relaxed);
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+    // The socket is up, which is what `socket_ready_notifier` announces, and
+    // `<success>` has not arrived: a one-shot wait would return here, on a
+    // connection that answers nothing.
+    client.set_connected_for_test(true);
+    client.socket_ready_notifier.notify(usize::MAX);
+    // Yielded rather than polled for a condition, because the condition being
+    // proved is that nothing happens: the waiter has to be given the chance to
+    // run and to have taken it before "still parked" means anything.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !waiter.is_finished(),
+        "a socket with no session behind it is not something to release work onto"
+    );
+
+    // And the teardown that follows is what it ends on.
+    client.signal_shutdown_sync();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the teardown must release the wait")
+            .expect("the waiter should not panic"),
+        Reachability::Finished
+    );
+}
+
+/// The happy path pays nothing: a reachable client resolves the wait on its
+/// first poll, without yielding and without registering the two listeners a
+/// park costs.
+#[tokio::test]
+async fn a_reachable_client_completes_the_wait_without_parking() {
+    use futures::FutureExt;
+
+    let client = create_reachable_wait_test_client("no-park").await;
+
+    let allocations = crate::test_alloc::min_allocs(0, || {
+        assert_eq!(
+            client
+                .wait_until_reachable()
+                .now_or_never()
+                .expect("a ready client must not yield"),
+            Reachability::Reachable
+        );
+    });
+    assert_eq!(
+        allocations, 0,
+        "and must not register a listener on the way through"
+    );
+}
+
+/// Reproduction: the two clients [`Reachability`] does not separate are one
+/// whose first connection has not landed and one restoring a session it lost.
+/// Every marker that could tell them apart is set on the second and not the
+/// first, and both report the same state, so a caller holding work until the
+/// client is reachable holds both the same way.
+#[tokio::test]
+async fn a_first_connection_and_a_restored_one_report_the_same_state() {
+    let first = crate::test_utils::create_test_client_with_name("never-connected").await;
+    first.is_running.store(true, Ordering::Relaxed);
+
+    let restoring = crate::test_utils::create_test_client_with_name("lost-session").await;
+    restoring.is_running.store(true, Ordering::Relaxed);
+    // What one authenticated-then-lost cycle leaves standing: the persistent
+    // record of a login, and the generations `<success>` and the teardown bump.
+    restoring
+        .persistence_manager
+        .process_command(DeviceCommand::IncrementLoginCounter)
+        .await;
+    restoring
+        .connection_generation
+        .fetch_add(2, Ordering::SeqCst);
+
+    assert_eq!(first.connection_generation.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        first
+            .persistence_manager
+            .get_device_snapshot()
+            .login_counter,
+        0,
+        "the first client has never authenticated, in this process or any other"
+    );
+    assert!(restoring.connection_generation.load(Ordering::SeqCst) > 0);
+    assert!(
+        restoring
+            .persistence_manager
+            .get_device_snapshot()
+            .login_counter
+            > 0,
+        "and the second has, which is the whole of the difference between them"
+    );
+
+    assert_eq!(
+        first.reachability(),
+        restoring.reachability(),
+        "yet nothing reachability reads separates them"
+    );
+    assert_eq!(first.reachability(), Reachability::Reconnecting);
+    assert!(first.reachability().recovers_on_its_own());
+    assert!(restoring.reachability().recovers_on_its_own());
+
+    for client in [&first, &restoring] {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), client.wait_until_reachable())
+                .await
+                .is_err(),
+            "so a wait sits through both alike"
+        );
+    }
+}
+
+/// A client that has never connected is the state every healthy start passes
+/// through, so it is waited out like any other and ends on the connection
+/// rather than on a verdict about the past. A state that reported "no
+/// connection has ever landed" and settled the wait would hand that verdict to
+/// every caller that waits right after starting the loop.
+#[tokio::test]
+async fn a_first_connection_is_waited_out_like_any_other() {
+    let client = crate::test_utils::create_test_client_with_name("first-connect-wait").await;
+    client.is_running.store(true, Ordering::Relaxed);
+    assert_eq!(
+        client.connection_generation.load(Ordering::SeqCst),
+        0,
+        "no connection of this client was ever driven or torn down"
+    );
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+    assert!(
+        !waiter.is_finished(),
+        "having never connected is not a reason to stop waiting"
+    );
+
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    client.notify_session_state();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the first connection must end the wait")
+            .expect("the waiter should not panic"),
+        Reachability::Reachable
+    );
+}
+
+/// The gate an embedder reads before every call stays flag loads and a match,
+/// on the path that is taken most: no store read, and nothing to allocate.
+#[tokio::test]
+async fn reading_reachability_costs_nothing_on_the_reachable_path() {
+    let client = create_reachable_wait_test_client("reachability-cost").await;
+
+    let allocations = crate::test_alloc::min_allocs(0, || {
+        assert_eq!(client.reachability(), Reachability::Reachable);
+        assert!(!client.reachability().recovers_on_its_own());
+    });
+    assert_eq!(allocations, 0);
 }

@@ -12,10 +12,22 @@ use crate::protocol::{
 };
 
 /// A unique identifier selecting among this client's known signed pre-keys.
-#[derive(
-    Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, derive_more::From, derive_more::Into,
-)]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct SignedPreKeyId(u32);
+
+impl From<u32> for SignedPreKeyId {
+    #[inline]
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl From<SignedPreKeyId> for u32 {
+    #[inline]
+    fn from(id: SignedPreKeyId) -> Self {
+        id.0
+    }
+}
 
 impl fmt::Display for SignedPreKeyId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -84,14 +96,26 @@ pub trait GenericSignedPreKey {
         ))
     }
 
+    /// Adopt a stored structure, normalizing its public key the way
+    /// [`deserialize`](Self::deserialize) does.
+    ///
+    /// See `PreKeyRecord::from_storage` for why a store read moves the structure
+    /// in instead of rebuilding it from parsed keys.
+    fn from_stored_structure(mut storage: SignedPreKeyRecordStructure) -> Self
+    where
+        Self: Sized,
+    {
+        super::normalize_stored_public_key(&mut storage.public_key);
+        Self::from_storage(storage)
+    }
+
     fn deserialize(data: &[u8]) -> Result<Self>
     where
         Self: Sized,
     {
-        let mut storage = waproto::codec::signed_pre_key_record_decode(data)
+        let storage = waproto::codec::signed_pre_key_record_decode(data)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
-        super::normalize_stored_public_key(&mut storage.public_key);
-        Ok(Self::from_storage(storage))
+        Ok(Self::from_stored_structure(storage))
     }
 
     fn id(&self) -> Result<Self::Id> {
@@ -110,11 +134,17 @@ pub trait GenericSignedPreKey {
         ))
     }
 
-    fn signature(&self) -> Result<Vec<u8>> {
+    /// Borrow the stored signature. Prefer this over
+    /// [`signature`](Self::signature) wherever the bytes are only read.
+    fn signature_bytes(&self) -> Result<&[u8]> {
         self.get_storage()
             .signature
-            .clone()
+            .as_deref()
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)
+    }
+
+    fn signature(&self) -> Result<Vec<u8>> {
+        self.signature_bytes().map(<[u8]>::to_vec)
     }
 
     fn public_key(&self) -> Result<<Self::KeyPair as KeyPairSerde>::PublicKey> {

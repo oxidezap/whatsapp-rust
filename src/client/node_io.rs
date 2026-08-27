@@ -3,6 +3,7 @@
 use super::*;
 use crate::client::{PhashWaiter, ResponseWaiter};
 use wacore::net::DisconnectReason;
+use wacore::stanza::wire_tags::StanzaTag;
 
 /// Non-error exits of [`Client::read_messages_loop`] — `ServerRecycle` keeps the
 /// routine reconnect path out of `Err`, so severity consumers (logs, the span's
@@ -55,6 +56,36 @@ fn from_jid_matches(
 
 /// The wire shape the server uses for E2EE status updates, carrying the same
 /// payload as `<message from="status@broadcast">`.
+/// Stanzas that carry connection state, which an interceptor may not claim.
+///
+/// `success` and `failure` settle authentication, `stream:error` drives
+/// shutdown and reconnection, and `ack` resolves the waiters a send is blocked
+/// on. Letting a consumer take one would not extend the client — it would leave
+/// it authenticated-but-unaware, or never reconnecting, or waiting forever on a
+/// send that already completed.
+///
+/// `zapo` protects the same two auth tags from its stanza filters, for the same
+/// reason.
+fn is_connection_critical(node: &wacore_binary::NodeRef<'_>) -> bool {
+    matches!(
+        StanzaTag::try_from(node.tag.as_ref()),
+        Ok(StanzaTag::Success | StanzaTag::Failure | StanzaTag::StreamError | StanzaTag::Ack)
+    ) || (node.tag.as_ref() == StanzaTag::Iq.as_str() && is_ping_request(node))
+}
+
+/// A server-initiated ping, which this client owes a pong.
+///
+/// Type-agnostic on an absent type, like WA Web's `handleIq`, but never a
+/// `type="result"`/`"error"` ping — that is a response to our own ping, and
+/// ponging it back is wrong.
+fn is_ping_request(node: &wacore_binary::NodeRef<'_>) -> bool {
+    node.get_attr("type").is_none_or(|s| s.as_str() == "get")
+        && (node.get_optional_child("ping").is_some()
+            || node
+                .get_attr("xmlns")
+                .is_some_and(|s| s.as_str() == "urn:xmpp:ping"))
+}
+
 fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
     from_jid_matches(node, |jid| jid.is_status_broadcast())
 }
@@ -163,7 +194,6 @@ impl Client {
         // so resolve it once instead of locking the mutex per frame.
         let noise_socket = self
             .get_noise_socket()
-            .await
             .map_err(|_| ReadLoopError::NotStarted("no noise socket"))?;
 
         // Frame decoder to parse incoming data
@@ -323,7 +353,7 @@ impl Client {
     ) {
         // ACKs need shared ownership only for opt-in raw/node observers. The
         // usual response-waiter path borrows the node and can skip the Arc.
-        if node.tag() == "ack"
+        if node.tag() == StanzaTag::Ack.as_str()
             && !self.raw_node_forwarding_enabled()
             && self.node_waiter_count.load(Ordering::Acquire) == 0
             && !self.offline_sync_metrics.active.load(Ordering::Acquire)
@@ -349,7 +379,7 @@ impl Client {
         let nr = node.get();
 
         // --- Offline Sync Tracking ---
-        if nr.tag.as_ref() == "ib" {
+        if nr.tag.as_ref() == StanzaTag::InfoBanner.as_str() {
             // Check for offline_preview child to get expected count
             if let Some(preview) = nr.get_optional_child("offline_preview") {
                 let count: usize = preview
@@ -439,7 +469,7 @@ impl Client {
         }
         // --- End Tracking ---
 
-        if nr.tag.as_ref() == "iq"
+        if nr.tag.as_ref() == StanzaTag::Iq.as_str()
             && let Some(sync_node) = nr.get_optional_child("sync")
             && let Some(collection_node) = sync_node.get_optional_child("collection")
         {
@@ -461,7 +491,7 @@ impl Client {
                 .dispatch(Event::RawNode(Arc::clone(&node)));
         }
 
-        if nr.tag.as_ref() == "xmlstreamend" {
+        if nr.tag.as_ref() == StanzaTag::XmlStreamEnd.as_str() {
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 debug!("Received <xmlstreamend/>, expected disconnect.");
             } else {
@@ -478,7 +508,7 @@ impl Client {
             self.resolve_node_waiters(&node);
         }
 
-        if nr.tag.as_ref() == "iq"
+        if nr.tag.as_ref() == StanzaTag::Iq.as_str()
             && let Some(id) = nr.get_attr("id").map(|v| v.as_str())
             && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
         {
@@ -486,8 +516,7 @@ impl Client {
             // message ids), so a mismatch here means the id space collided.
             match waiter {
                 ResponseWaiter::Iq(sender) => {
-                    #[cfg(feature = "voip-runtime")]
-                    self.bind_pending_call_link_join_ack(nr);
+                    subsystem::on_response(self, nr);
                     if sender.send(Arc::clone(&node)).is_err() {
                         warn!(target: "Client/IQ", "Failed to send IQ response to waiter. Receiver was likely dropped.");
                     }
@@ -509,16 +538,50 @@ impl Client {
         let should_ack = self.should_ack(nr);
         let deferred_ack_node = should_ack.then(|| Arc::clone(&node));
 
+        // An interceptor runs before the built-in pipeline so a consumer can
+        // act on a stanza this version does not model, instead of watching it
+        // get nacked.
+        if self.has_stanza_interceptors()
+            && !is_connection_critical(nr)
+            && self.intercept_stanza(&node)
+        {
+            // A claim does not change what the server is owed. Where this
+            // client would have acked it still acks; where it would have nacked
+            // a tag it does not model, the claim turns that into an ack,
+            // because someone did handle it — and answering nothing would leave
+            // the stanza in the offline queue with the stream recycling.
+            //
+            // A tag the client models but answers some other way gets nothing
+            // here: a direct <message> draws a delivery <receipt>, an <iq>
+            // draws an <iq type="result">, and a generic <ack class="message">
+            // is neither. Inventing one is worse than silence — whoever claimed
+            // the stanza took on the reply. The tags `should_ack` covers are
+            // unaffected; they were already answered above.
+            //
+            // Same identity requirement as the nack path: without `id` and
+            // `from` there is nothing to address.
+            let ack = deferred_ack_node.or_else(|| {
+                (!self.stanza_router.models(nr.tag.as_ref())
+                    && nr.get_attr("id").is_some()
+                    && nr.get_attr("from").is_some())
+                .then(|| Arc::clone(&node))
+            });
+            if let Some(node) = ack {
+                self.maybe_deferred_ack(node).await;
+            }
+            return;
+        }
+
         // Bypass async_trait's boxed future for the hot built-in handlers while
         // retaining router registration for direct router callers.
         match nr.tag.as_ref() {
-            "ack" => {
+            t if t == StanzaTag::Ack.as_str() => {
                 self.handle_ack_response_arc(&node);
             }
-            "receipt" => {
+            t if t == StanzaTag::Receipt.as_str() => {
                 self.handle_receipt_inline(node);
             }
-            "message" => {
+            t if t == StanzaTag::Message.as_str() => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
                     node,
@@ -528,7 +591,7 @@ impl Client {
             }
             // Differs from a `<message>` only in tag, so WA Web retags it and
             // runs the same pipeline.
-            "status" if is_status_broadcast_stanza(nr) => {
+            t if t == StanzaTag::Status.as_str() && is_status_broadcast_stanza(nr) => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
                     node,
@@ -557,6 +620,25 @@ impl Client {
         }
     }
 
+    /// Offer a stanza to the registered interceptors.
+    ///
+    /// Returns whether one took it. The first to claim the stanza wins, so an
+    /// interceptor registered earlier can shadow a later one — registration
+    /// order is the priority order.
+    fn intercept_stanza(self: &Arc<Self>, node: &Arc<wacore_binary::OwnedNodeRef>) -> bool {
+        for registration in self.stanza_interceptors().iter() {
+            if registration.interceptor.intercept(node).is_handled() {
+                debug!(
+                    target: "Client/Recv",
+                    "Stanza <{}> taken by an interceptor",
+                    node.tag()
+                );
+                return true;
+            }
+        }
+        false
+    }
+
     /// Whether a decrypted node must stay on the read loop instead of moving to
     /// a spawned task. success/failure/stream:error carry connection state the
     /// rest depends on, and `ib` sets up offline-sync tracking before the batch
@@ -564,10 +646,16 @@ impl Client {
     /// enqueue could put a group message ahead of the pkmsg that establishes its
     /// session. Acks and receipts qualify only while nothing observes them.
     pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        match node.tag.as_ref() {
-            "success" | "failure" | "stream:error" | "message" | "ib" => true,
-            "status" => is_status_broadcast_stanza(node),
-            "receipt" => {
+        match StanzaTag::try_from(node.tag.as_ref()) {
+            Ok(
+                StanzaTag::Success
+                | StanzaTag::Failure
+                | StanzaTag::StreamError
+                | StanzaTag::Message
+                | StanzaTag::InfoBanner,
+            ) => true,
+            Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Receipt) => {
                 !self.synchronous_ack
                     && !self.raw_node_forwarding_enabled()
                     && !self
@@ -575,7 +663,7 @@ impl Client {
                         .event_bus
                         .has_handler_for(wacore::types::events::EventKind::Receipt)
             }
-            "ack" => {
+            Ok(StanzaTag::Ack) => {
                 !self.raw_node_forwarding_enabled()
                     && !self
                         .core
@@ -614,7 +702,7 @@ impl Client {
     /// would redeliver indefinitely. WA Web emits `<receipt context="status">`
     /// in the success path on top of this; the duplicate is tolerated.
     pub(crate) fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        let tag = node.tag.as_ref();
+        let tag = StanzaTag::try_from(node.tag.as_ref());
         if node.get_attr("id").is_none() {
             return false;
         }
@@ -622,9 +710,11 @@ impl Client {
             return false;
         }
         match tag {
-            "receipt" | "notification" | "call" => true,
-            "message" => from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast()),
-            "status" => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Receipt | StanzaTag::Notification | StanzaTag::Call) => true,
+            Ok(StanzaTag::Message) => {
+                from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast())
+            }
+            Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
             _ => false,
         }
     }
@@ -957,6 +1047,18 @@ impl Client {
             "Successfully authenticated with WhatsApp servers! (gen={})",
             current_generation
         );
+        // The generation this connection will be admitted under is now final.
+        // Published here, after the increment, and not by `is_logged_in` above —
+        // that one is the duplicate-`<success>` guard and has to be set first,
+        // which leaves a window where the client looks authenticated on a
+        // generation that is about to change. Work binding a scope in that
+        // window had every attempt rejected as retired.
+        self.authenticated_generation
+            .store(current_generation, Ordering::SeqCst);
+        // Only now is there something worth waking for: released here and not at
+        // `socket_ready_notifier`, which fires before login, so an IQ sent in
+        // that gap is answered by nobody.
+        self.notify_session_state();
         // Record the auth time but DON'T reset the backoff counter yet: WA Web
         // resets only after the connection has been stable for ~30s
         // (`resetDelay`). Resetting on <success> alone lets a server that
@@ -1245,7 +1347,7 @@ impl Client {
 
             check_generation!();
 
-            let flag_set = client_clone.needs_initial_full_sync.load(Ordering::Relaxed);
+            let flag_set = client_clone.needs_initial_full_sync.is_armed();
             let needs_initial_sync = flag_set || needs_pushname_from_sync;
 
             if needs_initial_sync {
@@ -1257,6 +1359,8 @@ impl Client {
                     "Starting Initial App State Sync (flag_set={flag_set}, needs_pushname={needs_pushname_from_sync})"
                 );
 
+                const CRITICAL_COLLECTIONS: [WAPatchName; 2] =
+                    [WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow];
                 // Single deadline for the whole critical path (key-share grace + batched
                 // IQ + missing-key fallback). Matches WhatsApp Web's WAWebSyncBootstrap
                 // 180s critical-data deadline. Armed before the wait so every step below
@@ -1264,16 +1368,23 @@ impl Client {
                 const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
                 let critical_deadline = wacore::time::Instant::now()
                     + Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS);
-                // Explicit "critical sync completed" signal for the watchdog. A push_name
-                // check is not a reliable proxy: a business account gets push_name set
-                // from business_name at pairing (src/pair.rs) while still needing the
-                // full sync, so the watchdog would wrongly stand down on a failed sync.
-                let critical_sync_done =
+                // Claimed by whichever of the sync and the watchdog gets there
+                // first, and never by both. A plain "the sync finished" flag is not
+                // enough: `reconnect_immediately` sets `expected_disconnect` and
+                // then awaits seconds of bounded flushes before it closes the
+                // socket, so a sync landing in that window would abort the
+                // watchdog mid-teardown and leave the connection up, flagged for a
+                // disconnect that never comes, with `dispatch_connected` declining
+                // to announce it. The claim is also not a push_name check, which
+                // was never a reliable proxy: a business account gets push_name
+                // set from business_name at pairing (src/pair.rs) while still
+                // needing the full sync.
+                let critical_sync_settled =
                     Arc::new(AtomicBool::new(false));
                 let timeout_client = client_clone.clone();
                 let timeout_generation = task_generation;
                 let timeout_rt = client_clone.runtime.clone();
-                let timeout_done = critical_sync_done.clone();
+                let timeout_settled = critical_sync_settled.clone();
                 let critical_sync_timeout_handle = timeout_rt.spawn(Box::pin(async move {
                     timeout_client.runtime.sleep(Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS)).await;
                     // Check generation — if connection was replaced, this timeout is stale
@@ -1282,15 +1393,15 @@ impl Client {
                     {
                         return;
                     }
-                    if timeout_done.load(Ordering::SeqCst) {
+                    if timeout_settled.swap(true, Ordering::SeqCst) {
                         debug!(
                             target: "Client/AppState",
-                            "Critical sync timeout fired but critical sync already completed"
+                            "Critical sync timeout fired but the sync already settled"
                         );
                     } else {
                         warn!(
                             target: "Client/AppState",
-                            "Critical app state sync did not complete within {CRITICAL_SYNC_TIMEOUT_SECS}s. \
+                            "Critical app state sync produced no answer within {CRITICAL_SYNC_TIMEOUT_SECS}s. \
                              Reconnecting to retry."
                         );
                         // WhatsApp Web does socketLogout here which clears device identity.
@@ -1334,43 +1445,70 @@ impl Client {
                 // The deadline lets the missing-key fallback recover a late/never-shared
                 // key on this connection instead of stalling to the watchdog.
                 check_generation!();
-                match client_clone
-                    .sync_collections_batched(
-                        vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
-                        Some(critical_deadline),
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        // Critical sync completed — signal the watchdog, then cancel it.
-                        critical_sync_done.store(true, Ordering::SeqCst);
-                        critical_sync_timeout_handle.abort();
+                let critical_scope = client_clone.sync_scope(Some(critical_deadline));
+                let result = client_clone
+                    .sync_collections_batched(CRITICAL_COLLECTIONS.to_vec(), critical_scope)
+                    .await;
 
-                        check_generation!();
+                // Whatever it says, this is the answer the watchdog was waiting
+                // for, so it stands down here rather than per branch. It cannot
+                // be the retry for a bad answer: the collection that failed
+                // would fail the same way on every reconnect, and the two would
+                // loop for good, announcing and dropping a live session every
+                // 180s, since `needs_pushname_from_sync` is derived from the
+                // persisted push name and survives even a restart. What did not
+                // sync rides along with the background sync instead, on this
+                // connection, which is also where a late app state key lands.
+                if critical_sync_settled.swap(true, Ordering::SeqCst) {
+                    // The watchdog claimed it first and is already retiring this
+                    // connection. Aborting it now would strand the teardown, and
+                    // announcing a connection it is closing would be a lie; the
+                    // replacement it brings up announces itself. detach() because
+                    // dropping the handle would abort the task.
+                    debug!(
+                        target: "Client/AppState",
+                        "Critical app state sync answered after the watchdog fired; leaving the reconnect to it"
+                    );
+                    critical_sync_timeout_handle.detach();
+                    return;
+                }
+                critical_sync_timeout_handle.abort();
 
-                        client_clone
-                            .resubscribe_presence_subscriptions(task_generation)
-                            .await;
-
-                        check_generation!();
-
-                        // Dispatch Connected after critical sync completes.
-                        // Presence is NOT sent here — WhatsApp Web sends presence from the
-                        // setting_pushName mutation handler (WAWebPushNameSync), not from
-                        // criticalSyncDone. Our setting_pushName handler already does this.
-                        client_clone.dispatch_connected(task_generation).await;
+                // WA Web's answer to a critical collection it cannot get is to
+                // notify the primary and log out (`WAWebSyncdFatal`), which a
+                // library must not do on a consumer's behalf. Having chosen to
+                // keep the session, it owes the consumer the other half: the
+                // connection is announced and the gap is reported, because by
+                // this point `set_passive(false)` has already been sent and
+                // offline stanzas are being delivered to a consumer that still
+                // believes nothing ever connected.
+                let outcome = match result {
+                    Ok(outcome) => {
+                        if !outcome.all_synced() {
+                            warn!(
+                                target: "Client/AppState",
+                                "Critical app state sync incomplete (fatal={:?} retryable={:?} skipped={:?}); connecting anyway",
+                                outcome.fatal, outcome.retryable, outcome.skipped
+                            );
+                        }
+                        outcome
                     }
                     Err(e) => {
                         client_clone.log_sync_error("critical app state sync", &e);
-                        // The sync failed — the watchdog must stay alive to force a reconnect.
-                        // detach() so this early return doesn't abort it on drop (AbortHandle
-                        // aborts the task when dropped); without this the watchdog would be
-                        // cancelled exactly when the deadline-bound wait fails, and no
-                        // reconnect would happen.
-                        critical_sync_timeout_handle.detach();
-                        return;
+                        BatchedSyncOutcome::all_retryable(&CRITICAL_COLLECTIONS)
                     }
+                };
+                let plan = CriticalSyncPlan::from_outcome(&outcome);
+
+                if !client_clone
+                    .finish_critical_bootstrap(critical_scope, &plan, &outcome)
+                    .await
+                {
+                    return;
                 }
+
+                let critical_retry = plan.retry;
+                let critical_refused = plan.stranded;
 
                 // Spawn remaining non-critical collections in background
                 let sync_client = client_clone.clone();
@@ -1381,24 +1519,42 @@ impl Client {
                         return;
                     }
 
-                    if let Err(e) = sync_client
-                        .sync_collections_batched(
-                            vec![
-                                WAPatchName::RegularLow,
-                                WAPatchName::RegularHigh,
-                                WAPatchName::Regular,
-                            ],
-                            None,
-                        )
-                        .await
-                    {
-                        sync_client.log_sync_error("non-critical app state sync", &e);
-                    }
+                    // Any critical collection the bootstrap handed over goes
+                    // first: it is the one the account actually needs.
+                    let mut to_sync = critical_retry;
+                    to_sync.extend([
+                        WAPatchName::RegularLow,
+                        WAPatchName::RegularHigh,
+                        WAPatchName::Regular,
+                    ]);
+                    let requested = to_sync.clone();
+                    let scope = sync_client.sync_scope(None);
+                    let result = sync_client.sync_collections_batched(to_sync, scope).await;
 
-                    sync_client
-                        .needs_initial_full_sync
-                        .store(false, Ordering::Relaxed);
-                    debug!(target: "Client/AppState", "Initial App State Sync Completed.");
+                    let complete = !critical_refused
+                        && result.as_ref().is_ok_and(|outcome| outcome.all_synced());
+
+                    // Settled before the report, because reporting dispatches to
+                    // consumer handlers synchronously and one of them
+                    // disconnecting would retire the scope and take this
+                    // decision with it — leaving an unfinished bootstrap
+                    // unarmed, which is the failure this path exists to prevent.
+                    // `settle_bootstrap` is what makes the "only for this
+                    // connection" part impossible to forget.
+                    sync_client.settle_bootstrap(scope, !complete);
+
+                    // A refused critical collection is not in `requested` and
+                    // never will be retried, but it is why the bootstrap is
+                    // unfinished. Handing that to the scheduler keeps a later
+                    // clean round from standing the gate down on its behalf.
+                    sync_client.report_background_sync_stranded(
+                        "non-critical app state sync",
+                        scope,
+                        SyncSettles::InitialSync,
+                        &requested,
+                        critical_refused,
+                        result,
+                    );
                 }));
             } else {
                 // === Reconnection path ===
@@ -1431,13 +1587,13 @@ impl Client {
         self: &Arc<Self>,
         node: &Arc<wacore_binary::OwnedNodeRef>,
     ) -> bool {
+        self.maybe_refresh_lid_from_ack(node.get());
         let Some(waiter) = self.take_ack_waiter(node.get()) else {
             return false;
         };
         match waiter {
             ResponseWaiter::Iq(sender) => {
-                #[cfg(feature = "voip-runtime")]
-                self.bind_pending_call_link_join_ack(node.get());
+                subsystem::on_response(self, node.get());
                 if let Err(rejected) = sender.send(Arc::clone(node)) {
                     Self::warn_ack_waiter_dropped(&rejected);
                 }
@@ -1454,13 +1610,13 @@ impl Client {
         self: &Arc<Self>,
         node: wacore_binary::OwnedNodeRef,
     ) -> bool {
+        self.maybe_refresh_lid_from_ack(node.get());
         let Some(waiter) = self.take_ack_waiter(node.get()) else {
             return false;
         };
         match waiter {
             ResponseWaiter::Iq(sender) => {
-                #[cfg(feature = "voip-runtime")]
-                self.bind_pending_call_link_join_ack(node.get());
+                subsystem::on_response(self, node.get());
                 if let Err(rejected) = sender.send(Arc::new(node)) {
                     Self::warn_ack_waiter_dropped(&rejected);
                 }
@@ -1468,6 +1624,37 @@ impl Client {
             ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
         }
         true
+    }
+
+    /// `<ack refresh_lid="true">`: the server telling us the LID mapping we hold
+    /// for this peer is stale.
+    ///
+    /// It is the only invalidation this client gets. `lid_pn_cache` entries
+    /// never expire, so without acting here a mapping that has gone stale stays
+    /// stale for the lifetime of the process, and every Signal address derived
+    /// from it keeps resolving to the wrong identity.
+    ///
+    /// Both ack entry points call this before taking the waiter, because a send
+    /// ack carries the flag whether or not anything is waiting on it.
+    fn maybe_refresh_lid_from_ack(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) {
+        let Some(peer) = Self::refresh_lid_peer_from_ack(node) else {
+            return;
+        };
+        let client = Arc::clone(self);
+        self.runtime.spawn_detached(Box::pin(async move {
+            client.refresh_lid_mapping_for(peer).await;
+        }));
+    }
+
+    /// The peer an `<ack>` asks us to re-resolve, or `None` when it asks for
+    /// nothing. Split out from the spawn so the gate can be asserted directly.
+    fn refresh_lid_peer_from_ack(node: &wacore_binary::NodeRef<'_>) -> Option<Jid> {
+        // Absent on all but a handful of acks, so the common path is one failed
+        // attribute lookup on the read loop and nothing else.
+        if node.get_attr("refresh_lid")?.as_str() != "true" {
+            return None;
+        }
+        node.attrs().optional_jid("from")
     }
 
     /// Inline half of the phash check. The comparison is a string equality on
@@ -1562,7 +1749,10 @@ impl Client {
             let ack = wacore::types::events::ServerAck::builder()
                 .id(id.as_str().to_string())
                 .maybe_class(node.get_attr("class").map(|v| v.as_str().to_string()))
-                .maybe_from(node.get_attr("from").and_then(|v| v.as_str().parse().ok()))
+                // `to_jid`, not `as_str().parse()`: `from` arrives as a JID token,
+                // so the string form is a fresh render that the parse immediately
+                // undoes, and that render also drops the interop `integrator`.
+                .maybe_from(node.get_attr("from").and_then(|v| v.to_jid()))
                 .maybe_timestamp(
                     node.get_attr("t")
                         .and_then(|v| v.as_str().parse::<i64>().ok())
@@ -1682,6 +1872,18 @@ impl Client {
                     // Deliberate rate-limit backoff: the stability reset must
                     // not erase it even if the connection had been up >= 30s.
                     self.backoff_reset_suppressed.store(true, Ordering::Relaxed);
+                    // Not fidelity: WA Web (Handle/StreamError.js) special-cases
+                    // only 500..600, so 429 is indistinguishable from any other
+                    // reconnect there — survivable because a human watches the UI.
+                    // An embedder has none, so report the rate limit through
+                    // `StreamError`. Dispatched after the stores so a handler
+                    // sees the rate-limited session.
+                    self.core.event_bus.dispatch(Event::StreamError(
+                        crate::types::events::StreamError::builder()
+                            .code(code.to_string())
+                            .raw(node.to_owned())
+                            .build(),
+                    ));
                 }
                 "503" => {
                     // Server is going down/restarting: mark logged-out so sends fail
@@ -1760,7 +1962,6 @@ impl Client {
     )]
     pub(crate) async fn handle_connect_failure(&self, node: &wacore_binary::NodeRef<'_>) {
         self.expected_disconnect.store(true, Ordering::Relaxed);
-        self.notify_connection_shutdown();
 
         let failure = wacore::stanza::connect_failure::ConnectFailureStanza::parse(node);
         // A `<failure>` with no usable `reason` is not a failure we can classify:
@@ -1774,6 +1975,13 @@ impl Client {
         } else {
             self.enable_auto_reconnect.store(false, Ordering::Relaxed);
         }
+        // Announced after the classification, not before it. This notify is what
+        // wakes work parked in `await_connection`, and that work answers by
+        // reading the state — so announcing first offers it the state of a
+        // client that has not yet decided, and the decision that follows makes
+        // no sound of its own. Nothing awaits between the stores and here, so
+        // the pair is what a waiter observes.
+        self.notify_connection_shutdown();
 
         // Every branch below keeps the stanza on its event. The server states
         // things here exactly once — an account lock's one-time `appeal_token`,
@@ -1839,17 +2047,11 @@ impl Client {
         tracing::instrument(name = "wa.conn.iq_in", level = "debug", skip_all)
     )]
     pub(crate) async fn handle_iq(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
-        // Pong a server-initiated ping (a request: type="get" or, like WA Web's
-        // type-agnostic handleIq, an absent type), but not a type="result"/"error"
-        // ping — that's a response to our own ping, and ponging it back is wrong.
-        // The previous gate required type=="get" exactly, dropping an absent-type
-        // ping and risking a keepalive timeout/disconnect.
-        let is_ping_request = node.get_attr("type").is_none_or(|s| s.as_str() == "get")
-            && (node.get_optional_child("ping").is_some()
-                || node
-                    .get_attr("xmlns")
-                    .is_some_and(|s| s.as_str() == "urn:xmpp:ping"));
-        if is_ping_request {
+        // Pong a server-initiated ping. The gate is shared with
+        // `is_connection_critical`, which never offers one to an interceptor:
+        // a claimed ping is a pong never sent, and the server drops the
+        // connection for it.
+        if is_ping_request(node) {
             debug!("Received ping, sending pong.");
             let mut parser = node.attrs();
             let from_jid = parser.jid("from");
@@ -1870,5 +2072,58 @@ impl Client {
 
     pub(crate) fn update_server_time_offset(&self, node: &wacore_binary::NodeRef<'_>) {
         self.unified_session.update_server_time_offset(node);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ack(attrs: &[(&'static str, &str)]) -> Node {
+        attrs
+            .iter()
+            .fold(NodeBuilder::new("ack"), |b, (k, v)| b.attr(k, *v))
+            .build()
+    }
+
+    /// The flag is what asks for a refresh. Every other ack -- which is nearly
+    /// all of them -- must cost nothing beyond the attribute lookup.
+    #[test]
+    fn an_ack_without_the_flag_asks_for_no_refresh() {
+        for attrs in [
+            &[("from", "5511987650001@s.whatsapp.net")][..],
+            &[
+                ("from", "5511987650001@s.whatsapp.net"),
+                ("refresh_lid", "false"),
+            ][..],
+        ] {
+            let node = ack(attrs);
+            assert!(
+                Client::refresh_lid_peer_from_ack(&node.as_node_ref()).is_none(),
+                "{attrs:?} must not request a refresh"
+            );
+        }
+    }
+
+    /// The peer to re-resolve is the ack's sender, not the local device: the
+    /// server is telling us which mapping it disagrees with.
+    #[test]
+    fn a_flagged_ack_names_its_sender_as_the_peer() {
+        let node = ack(&[
+            ("from", "111000011112222@lid"),
+            ("refresh_lid", "true"),
+            ("id", "ACK-REFRESH-1"),
+        ]);
+        assert_eq!(
+            Client::refresh_lid_peer_from_ack(&node.as_node_ref()),
+            Some(Jid::new("111000011112222", wacore_binary::Server::Lid)),
+        );
+    }
+
+    /// A flag with no sender names nobody to refresh.
+    #[test]
+    fn a_flagged_ack_without_a_sender_asks_for_no_refresh() {
+        let node = ack(&[("refresh_lid", "true"), ("id", "ACK-REFRESH-2")]);
+        assert!(Client::refresh_lid_peer_from_ack(&node.as_node_ref()).is_none());
     }
 }

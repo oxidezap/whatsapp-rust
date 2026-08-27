@@ -47,10 +47,7 @@ impl PersistenceManager {
         let device_data_opt = backend.load().await?;
 
         let device = if let Some(serializable_device) = device_data_opt {
-            debug!(
-                "PersistenceManager: Loaded existing device data (PushName: '{}'). Initializing Device.",
-                serializable_device.push_name
-            );
+            debug!("PersistenceManager: Loaded existing device data. Initializing Device.");
             let mut dev = Device::new(backend.clone());
             dev.load_from_serializable(serializable_device);
             dev
@@ -74,7 +71,7 @@ impl PersistenceManager {
         })
     }
 
-    /// Handle for store adapters that need `&mut Device` trait access.
+    /// Handle for callers that need `&mut Device` trait access directly.
     /// For plain reads, prefer [`get_device_snapshot`](Self::get_device_snapshot).
     pub async fn get_device_arc(&self) -> Arc<RwLock<Device>> {
         self.device.clone()

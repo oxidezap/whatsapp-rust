@@ -2,6 +2,7 @@ use super::traits::StanzaHandler;
 use crate::client::Client;
 use async_trait::async_trait;
 use std::sync::Arc;
+use wacore::stanza::wire_tags::StanzaTag;
 
 /// Handler for `<receipt>` stanzas.
 ///
@@ -16,7 +17,7 @@ pub struct ReceiptHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for ReceiptHandler {
     fn tag(&self) -> &'static str {
-        "receipt"
+        StanzaTag::Receipt.as_str()
     }
 
     async fn handle(

@@ -19,7 +19,7 @@ Timeouts that hold up in practice: 10-15s for event waits in online flows (event
 
 ## Isolation
 
-Each `TestClient` owns an isolated `InMemoryBackend`; the mock server is shared. Libtest runs tests inside a binary in parallel, so nothing may depend on test order — and file boundaries are organization, not synchronization.
+Each `TestClient` owns an isolated `InMemoryBackend`; the mock server is shared. CI runs the suite under `cargo nextest run --profile e2e -p e2e-tests`, which schedules across binaries — tests from different files run at the same time, each in its own process — so nothing may depend on test order, and file boundaries are organization, not synchronization.
 
 `unique_push_name()` gives server-side account isolation — it appends a fresh UUID, so two clients built from the same prefix still land on different accounts. Sharing an account is therefore explicit: build one name and hand it to each device with `connect_as(prefix, &name)`, which pairs them to the same phone number under different device IDs.
 

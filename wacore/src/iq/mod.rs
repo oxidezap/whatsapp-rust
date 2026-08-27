@@ -1,5 +1,6 @@
 pub mod abprops;
 pub mod blocklist;
+pub mod bot;
 pub mod business;
 pub mod chatstate;
 pub mod contacts;
@@ -19,5 +20,6 @@ pub mod profile;
 pub mod props;
 pub mod spam_report;
 pub mod spec;
+pub mod targets;
 pub mod tctoken;
 pub mod usync;

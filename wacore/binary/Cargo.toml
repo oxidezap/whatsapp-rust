@@ -1,6 +1,6 @@
 [package]
 name = "wacore-binary"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version.workspace = true
 authors = ["João Lucas <jlucaso@hotmail.com>"]
@@ -12,8 +12,6 @@ description = "Binary data and constants for WhatsApp protocol"
 crate-type = ["rlib"]
 
 [features]
-default = ["simd"]
-simd = []
 serde = ["dep:serde", "compact_str/serde", "smallvec/serde"]
 # Render raw phone numbers in `Jid::observe()` instead of the redacted `pn#<hash>`.
 # Local debugging only; never enable in production.
@@ -50,3 +48,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "group_fanout_benchmark"
+harness = false

@@ -350,6 +350,11 @@ pub struct Device {
     /// rotation path treats as "seed the baseline, don't rotate yet".
     #[serde(default)]
     pub last_signed_pre_key_rotation_ms: i64,
+    /// Deadline the server pushed for this build, via `<ib><client_expiration>`.
+    /// `None` until the server says otherwise, which is the common case: the
+    /// stanza is sent when a build is being retired, not on every connect.
+    #[serde(default)]
+    pub server_client_expiration: Option<ServerClientExpiration>,
     /// true means the account's `readreceipts` privacy is `none`, so DM
     /// read/played receipts go out as `*-self` (which don't notify the sender).
     /// Persisted so the value is known on reconnect before the privacy fetch
@@ -368,6 +373,95 @@ pub struct CachedNoiseCert {
     /// Unix epoch seconds. Validation window from `NoiseCertificate.Details`.
     pub not_before: i64,
     pub not_after: i64,
+}
+
+/// The server's answer to "when does this client build stop being accepted".
+///
+/// Scoped to the build it was issued against, exactly like WA Web's
+/// `setServerClientExpirationOverride(value, VERSION_BASE)`. A deadline learned
+/// for one build says nothing about the next one, so a version change retires
+/// the record rather than carrying it forward.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerClientExpiration {
+    /// Unix seconds after which the server expects to stop accepting this build.
+    pub expires_at: i64,
+    /// The `(primary, secondary, tertiary)` build the deadline was issued for.
+    pub version: (u32, u32, u32),
+}
+
+/// Outcome of applying a `<ib><client_expiration>` to what we already hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientExpirationUpdate {
+    /// Record the new deadline.
+    Set(ServerClientExpiration),
+    /// The stanza carried no `t`: the server withdrew the deadline.
+    Clear,
+    /// The deadline is not sooner than the one we hold, so it changes nothing.
+    Unchanged,
+}
+
+impl ServerClientExpiration {
+    /// WA Web `WATimeUtils.DAY_SECONDS * 3`: the shortest notice a build is
+    /// ever given, however abrupt the server's own answer is.
+    pub const MIN_NOTICE_SECS: i64 = 3 * 86_400;
+
+    /// WA Web's `handleServerClientExpiration`, as a decision over the state we
+    /// already hold.
+    ///
+    /// Scoped to the running build first: see [`Self::held_for`]. What remains
+    /// is two rules, both deliberate. A deadline is only ever brought *forward*:
+    /// the server retiring a build sooner is news, and a later answer -- a
+    /// stale retransmit, or a reconnect to a host that has not caught up --
+    /// must not hand the build an extension. And whatever the server says, the
+    /// recorded deadline is at least [`Self::MIN_NOTICE_SECS`] out, so a client
+    /// told it expires now still gets a window to be updated in.
+    ///
+    /// The comparison is against the stored value, not against the raw `t` that
+    /// produced it, so the two rules interact: an abrupt deadline is stored at
+    /// the floor, and a repeat of that same `t` is still sooner than the stored
+    /// floor and gets re-floored against the new now. A server that keeps
+    /// signalling expiry therefore holds a rolling minimum notice rather than
+    /// pinning one date -- which is WA Web's behaviour, and the reason this is
+    /// not idempotent for an already-elapsed `t`.
+    pub fn decide(
+        current: Option<&Self>,
+        t: Option<i64>,
+        now_secs: i64,
+        version: (u32, u32, u32),
+    ) -> ClientExpirationUpdate {
+        let held = Self::held_for(current, version);
+        let Some(t) = t else {
+            return ClientExpirationUpdate::Clear;
+        };
+        if held.is_some_and(|held| t >= held.expires_at) {
+            return ClientExpirationUpdate::Unchanged;
+        }
+        ClientExpirationUpdate::Set(Self {
+            expires_at: t.max(now_secs.saturating_add(Self::MIN_NOTICE_SECS)),
+            version,
+        })
+    }
+
+    /// The held deadline, but only when it describes the build now running.
+    ///
+    /// A record left from an earlier build is not evidence about this one, so
+    /// every decision treats it as absent. Skipping this is how an upgrade
+    /// silences the new build: the old build's nearer date would read as
+    /// "sooner than the new one" and reject the only notice that applies.
+    ///
+    /// WA Web compares version-blind here, because its stored record is read
+    /// back by a consumer that checks `appVersion` itself. This record is the
+    /// client's own state and is what the comparison above consults, so the
+    /// scoping has to happen at the point of use instead.
+    pub fn held_for(current: Option<&Self>, version: (u32, u32, u32)) -> Option<&Self> {
+        current.filter(|held| held.applies_to(version))
+    }
+
+    /// Whether this deadline describes the build now running. A deadline
+    /// issued against another build says nothing about this one.
+    pub fn applies_to(&self, version: (u32, u32, u32)) -> bool {
+        self.version == version
+    }
 }
 
 /// Cached form of the server's two-cert chain. `leaf.key` is the server
@@ -437,9 +531,12 @@ impl Device {
             adv_secret_key,
             account: None,
             push_name: String::new(),
-            app_version_primary: 2,
-            app_version_secondary: 3000,
-            app_version_tertiary: 1042742319,
+            // The build the vendored whatspec artifacts describe, so a device
+            // that never reaches sw.js still announces a version whose stanza
+            // shapes and feature flags this client actually implements.
+            app_version_primary: crate::version::WA_WEB_VERSION.0,
+            app_version_secondary: crate::version::WA_WEB_VERSION.1,
+            app_version_tertiary: crate::version::WA_WEB_VERSION.2,
             app_version_last_fetched_ms: 0,
             device_props: Arc::new(DEVICE_PROPS.clone()),
             client_profile: ClientProfile::web(),
@@ -453,6 +550,7 @@ impl Device {
             server_cert_chain: None,
             login_counter: 0,
             lid_migrated: false,
+            server_client_expiration: None,
             last_signed_pre_key_rotation_ms: crate::time::now_millis(),
             read_receipts_disabled: false,
         }
@@ -1079,5 +1177,164 @@ mod tests {
         let restored: Device =
             serde_json::from_value(val).expect("deserialize without account field");
         assert!(restored.account.is_none());
+    }
+}
+
+#[cfg(test)]
+mod client_expiration_tests {
+    use super::*;
+
+    const V: (u32, u32, u32) = (2, 3000, 1044659339);
+    const NOW: i64 = 1_800_000_000;
+    /// Anything past `NOW + MIN_NOTICE_SECS` is recorded verbatim.
+    const FAR: i64 = NOW + ServerClientExpiration::MIN_NOTICE_SECS + 10_000;
+
+    fn held(expires_at: i64) -> ServerClientExpiration {
+        ServerClientExpiration {
+            expires_at,
+            version: V,
+        }
+    }
+
+    #[test]
+    fn a_first_deadline_is_recorded_against_the_running_build() {
+        assert_eq!(
+            ServerClientExpiration::decide(None, Some(FAR), NOW, V),
+            ClientExpirationUpdate::Set(held(FAR))
+        );
+    }
+
+    /// The floor is the whole point: a server that says "now" still has to
+    /// leave a window in which the build can be replaced.
+    #[test]
+    fn an_abrupt_deadline_is_held_off_by_the_minimum_notice() {
+        let floor = NOW + ServerClientExpiration::MIN_NOTICE_SECS;
+        for abrupt in [0, NOW, NOW + 60] {
+            assert_eq!(
+                ServerClientExpiration::decide(None, Some(abrupt), NOW, V),
+                ClientExpirationUpdate::Set(held(floor)),
+                "t={abrupt} must not land sooner than the minimum notice"
+            );
+        }
+    }
+
+    /// A deadline only ever moves closer. A later answer is a stale retransmit
+    /// or a host that has not caught up, and honouring it would hand the build
+    /// an extension the server never granted.
+    #[test]
+    fn a_later_deadline_never_extends_the_one_held() {
+        for later in [FAR + 1, FAR + 86_400] {
+            assert_eq!(
+                ServerClientExpiration::decide(Some(&held(FAR)), Some(later), NOW, V),
+                ClientExpirationUpdate::Unchanged,
+                "t={later} must not push the deadline out"
+            );
+        }
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&held(FAR)), Some(FAR), NOW, V),
+            ClientExpirationUpdate::Unchanged,
+            "an equal deadline is not sooner either"
+        );
+    }
+
+    #[test]
+    fn a_sooner_deadline_replaces_the_one_held() {
+        let sooner = FAR - 5_000;
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&held(FAR)), Some(sooner), NOW, V),
+            ClientExpirationUpdate::Set(held(sooner))
+        );
+    }
+
+    /// The comparison is against the stored (floored) value, so an already
+    /// elapsed `t` stays sooner than it and is re-floored against the new now.
+    /// A server that keeps signalling expiry holds a rolling minimum notice
+    /// rather than pinning one date.
+    #[test]
+    fn repeating_an_abrupt_deadline_rolls_the_notice_forward() {
+        let ClientExpirationUpdate::Set(first) =
+            ServerClientExpiration::decide(None, Some(NOW), NOW, V)
+        else {
+            panic!("the first abrupt deadline is recorded");
+        };
+        assert_eq!(
+            first.expires_at,
+            NOW + ServerClientExpiration::MIN_NOTICE_SECS
+        );
+
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&first), Some(NOW), NOW + 600, V),
+            ClientExpirationUpdate::Set(held(NOW + 600 + ServerClientExpiration::MIN_NOTICE_SECS))
+        );
+    }
+
+    /// A dated deadline, by contrast, settles: once stored it is not sooner
+    /// than itself, so restating it changes nothing however often it arrives.
+    #[test]
+    fn repeating_a_dated_deadline_settles() {
+        let ClientExpirationUpdate::Set(first) =
+            ServerClientExpiration::decide(None, Some(FAR), NOW, V)
+        else {
+            panic!("the first deadline is recorded");
+        };
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&first), Some(FAR), NOW + 600, V),
+            ClientExpirationUpdate::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_stanza_with_no_deadline_withdraws_whatever_is_held() {
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&held(FAR)), None, NOW, V),
+            ClientExpirationUpdate::Clear
+        );
+        assert_eq!(
+            ServerClientExpiration::decide(None, None, NOW, V),
+            ClientExpirationUpdate::Clear
+        );
+    }
+
+    /// The reason `held_for` exists. An upgrade leaves the previous build's
+    /// record in place, and comparing against it would reject the new build's
+    /// deadline as "not sooner" -- silencing the only notice that applies.
+    #[test]
+    fn an_old_builds_deadline_does_not_suppress_the_running_ones() {
+        let old_build = ServerClientExpiration {
+            expires_at: NOW + 1_000,
+            version: (2, 2999, 1),
+        };
+        let later = FAR;
+        assert!(
+            later >= old_build.expires_at,
+            "the case only bites when the new deadline is the later one"
+        );
+        assert_eq!(
+            ServerClientExpiration::decide(Some(&old_build), Some(later), NOW, V),
+            ClientExpirationUpdate::Set(held(later))
+        );
+    }
+
+    /// The scoping is not a free pass either: within the running build the
+    /// comparison still applies.
+    #[test]
+    fn scoping_does_not_weaken_the_forward_only_rule() {
+        assert_eq!(
+            ServerClientExpiration::held_for(Some(&held(FAR)), V),
+            Some(&held(FAR))
+        );
+        assert_eq!(
+            ServerClientExpiration::held_for(Some(&held(FAR)), (2, 2999, 1)),
+            None
+        );
+    }
+
+    /// A deadline is about the build it names, so an upgrade retires it rather
+    /// than inheriting someone else's date.
+    #[test]
+    fn a_deadline_only_describes_the_build_it_was_issued_for() {
+        let e = held(FAR);
+        assert!(e.applies_to(V));
+        assert!(!e.applies_to((2, 3000, 1044659340)));
     }
 }

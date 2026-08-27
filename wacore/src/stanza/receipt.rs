@@ -6,7 +6,7 @@
 use crate::types::message::{MessageCategory, MessageInfo};
 use crate::types::presence::ReceiptType;
 use wacore_binary::NodeRef;
-use wacore_binary::{Jid, JidExt as _, STATUS_BROADCAST_USER};
+use wacore_binary::{CompactString, Jid, JidExt as _, STATUS_BROADCAST_USER};
 
 /// Parsed `<user>` entry inside `<receipt><participants>`.
 ///
@@ -16,14 +16,18 @@ use wacore_binary::{Jid, JidExt as _, STATUS_BROADCAST_USER};
 ///
 /// `timestamp` is `None` when the `<user t>` attr is missing (malformed
 /// stanza). The handler falls back to the stanza-level `t` in that case.
+///
+/// The text fields are `CompactString`: a receipt type ("delivery", "read") and
+/// a username both fit in the 24 inline bytes, and a group receipt builds one
+/// of these per participant.
 #[derive(Debug, Clone)]
 pub struct ReceiptUser {
     pub jid: Jid,
     pub timestamp: Option<u64>,
     /// Per-user `type` attr (only on aggregated_by_message shape).
-    pub r#type: Option<String>,
+    pub r#type: Option<CompactString>,
     pub participant_pn: Option<Jid>,
-    pub participant_username: Option<String>,
+    pub participant_username: Option<CompactString>,
 }
 
 /// Parses `<participants>` child of `<receipt>`. Returns `(message_id, key, users)`.
@@ -31,10 +35,14 @@ pub struct ReceiptUser {
 /// (aggregated_by_message); `key` is the legacy aggregated_by_type identifier.
 pub fn parse_participants(
     node: &NodeRef<'_>,
-) -> (Option<String>, Option<String>, Vec<ReceiptUser>) {
+) -> (
+    Option<CompactString>,
+    Option<CompactString>,
+    Vec<ReceiptUser>,
+) {
     let mut attrs = node.attrs();
-    let message_id = attrs.optional_string("message_id").map(|s| s.into_owned());
-    let key = attrs.optional_string("key").map(|s| s.into_owned());
+    let message_id = attrs.optional_string("message_id").map(CompactString::from);
+    let key = attrs.optional_string("key").map(CompactString::from);
 
     let users = node
         .children()
@@ -46,11 +54,11 @@ pub fn parse_participants(
                     let mut a = c.attrs();
                     let jid = a.optional_jid("jid")?;
                     let timestamp = a.optional_u64("t");
-                    let r#type = a.optional_string("type").map(|s| s.into_owned());
+                    let r#type = a.optional_string("type").map(CompactString::from);
                     let participant_pn = a.optional_jid("participant_pn");
                     let participant_username = a
                         .optional_string("participant_username")
-                        .map(|s| s.into_owned());
+                        .map(CompactString::from);
                     Some(ReceiptUser {
                         jid,
                         timestamp,
@@ -71,9 +79,13 @@ pub fn parse_participants(
 /// Mirrors `WAWebHandleMsgReceiptParser` p() branch: read `<list><item id=.../>`
 /// when present, then append the stanza id for non-view receipts (for view
 /// receipts the items use `server_id` and the stanza id is NOT appended).
+///
+/// Takes `stanza_id` by value: the common receipt carries no `<list>` at all, so
+/// the stanza id is the whole result and the caller's copy would otherwise be
+/// cloned into the vector and dropped one line later.
 pub fn collect_simple_message_ids(
     node: &NodeRef<'_>,
-    stanza_id: &str,
+    stanza_id: String,
     is_view: bool,
 ) -> Vec<String> {
     let id_attr = if is_view { "server_id" } else { "id" };
@@ -91,7 +103,10 @@ pub fn collect_simple_message_ids(
         .unwrap_or_default();
 
     if !is_view {
-        ids.push(stanza_id.to_string());
+        // Exact, not the growth default: a listless receipt holds this one id and
+        // is handed straight to the event, so the spare capacity is never used.
+        ids.reserve_exact(1);
+        ids.push(stanza_id);
     }
     ids
 }
@@ -449,7 +464,7 @@ mod tests {
                 ])
                 .build()])
             .build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "STANZA-Z", false);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "STANZA-Z".to_string(), false);
         assert_eq!(ids, vec!["MSG-A", "MSG-B", "STANZA-Z"]);
     }
 
@@ -457,7 +472,7 @@ mod tests {
     #[test]
     fn simple_message_ids_without_list() {
         let node = NodeBuilder::new("receipt").attr("id", "SOLO").build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO", false);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO".to_string(), false);
         assert_eq!(ids, vec!["SOLO"]);
     }
 
@@ -474,7 +489,45 @@ mod tests {
                 ])
                 .build()])
             .build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "VIEW-STANZA", true);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "VIEW-STANZA".to_string(), true);
         assert_eq!(ids, vec!["100", "101"]);
+    }
+
+    /// The listless receipt is the common one, and its vector is handed straight
+    /// to the event: sizing it to the growth default left three unused slots on
+    /// every receipt.
+    ///
+    /// Asserted as "below the growth default" rather than "exactly one": an
+    /// allocator is free to hand back a larger block than `reserve_exact` asked
+    /// for, so an exact figure would be testing the allocator. Growing from
+    /// empty lands on 4 for a `String` element, so this still fails if the
+    /// reservation goes away.
+    #[test]
+    fn listless_receipt_ids_are_sized_to_what_they_hold() {
+        let node = NodeBuilder::new("receipt").attr("id", "SOLO").build();
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO".to_string(), false);
+        assert_eq!(ids.len(), 1);
+        assert!(
+            ids.capacity() < 4,
+            "one id must not take the growth default, got capacity {}",
+            ids.capacity()
+        );
+    }
+
+    /// Failure shape: a view receipt whose items carry no `server_id` yields an
+    /// empty vector, and the stanza id is still not appended.
+    #[test]
+    fn view_receipt_without_server_ids_collects_nothing() {
+        let node = NodeBuilder::new("receipt")
+            .attr("id", "VIEW-STANZA")
+            .children([NodeBuilder::new("list")
+                .children([NodeBuilder::new("item").attr("id", "MSG-A").build()])
+                .build()])
+            .build();
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "VIEW-STANZA".to_string(), true);
+        assert!(
+            ids.is_empty(),
+            "items without server_id contribute nothing and the stanza id is not appended"
+        );
     }
 }

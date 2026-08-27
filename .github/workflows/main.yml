@@ -9,6 +9,23 @@ on:
     branches: [main]
   workflow_call:
 
+concurrency:
+  # The decision point for every `workflow_call`-able workflow here; the others
+  # carry a one-line pointer rather than a copy of this.
+  #
+  # Cancelling is scoped to `pull_request`. A push to main and a run started by
+  # `release.yml` calling this workflow must both finish, so neither may cancel
+  # the other. `github.event_name` is in the group for exactly that: it is what
+  # keeps a release validating main out of the same group as a `push` run on
+  # main, which would otherwise cancel it. docker.yml already grouped on the
+  # event name for this reason before any of these did.
+  #
+  # `release.yml` calls main.yml, e2e.yml and docker.yml today; miri.yml,
+  # supply-chain.yml and wasm.yml expose `workflow_call` without a caller yet,
+  # and are grouped the same way so adding one is not a silent cancellation bug.
+  group: rust-ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   PROTOC_VERSION: '3.25.3'
@@ -33,6 +50,34 @@ jobs:
           toolchain: nightly-2026-06-16
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  generated:
+    name: Generated Artifacts
+    runs-on: ubuntu-latest
+    # The vendored whatspec files are regenerated, never edited, and the tool
+    # that writes them pins the exact IR commit — so a hand-edit or a
+    # half-refreshed tree is a diff this job can name. Lives beside `format`
+    # rather than in a build job: it needs rustfmt and git, not protoc (--check
+    # never rebuilds the descriptor) and not a compiled workspace.
+    # Bounded because the step fetches an external repository: a hung fetch
+    # would otherwise hold a required check open for the full six hours.
+    timeout-minutes: 15
+    steps:
+      # This job never pushes, and the codegen shells out to `git fetch` against
+      # a different repository; the checkout token has no business being left in
+      # .git/config for that.
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+          components: rustfmt
+      # RUSTC_WRAPPER is set workspace-wide, so cargo needs sccache on PATH even
+      # in a job this small.
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - run: cargo run -p whatspec-codegen -- --check
 
   clippy:
     name: Clippy Linter
@@ -78,10 +123,12 @@ jobs:
       # The voip example (built under --all-targets) links cpal, which needs ALSA headers.
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - name: Install protoc
+      # cargo-nextest ships pre-built binaries (nexte.st/docs/installation/pre-built-binaries),
+      # which is what install-action fetches — no compile step on the runner.
+      - name: Install protoc and cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: protoc@${{ env.PROTOC_VERSION }}
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
@@ -91,16 +138,96 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
-      - name: Build project
-        run: cargo build --workspace --exclude e2e-tests --all-targets --verbose
+      # No separate build step. There used to be one, and it was pure waste: in
+      # three different spellings, `cargo build --all-targets`, `cargo test
+      # --all-targets --no-run`, and finally nextest's own `--no-run` build, the
+      # step below went on to recompile the same thirteen crates anyway. Measured
+      # on the runner with the last of those, which differs from the step below
+      # only by `--no-run`: 223s to build, then 189s recompiling before the first
+      # test ran. Whatever cargo is keying on there, nothing the build step
+      # produced was reusable, so the workspace is compiled once, here.
+      #
+      # What that gives up is a job whose default-feature targets all link:
+      # benches and examples are not test targets, so nextest does not build
+      # them. `Clippy Linter` still compiles them on this same push, and `Build &
+      # Lint (all features)` still links them with all features on. The seam left
+      # is a target that links with all features and not with the default set.
       - name: Run tests
-        run: cargo test --workspace --exclude e2e-tests --verbose -- --nocapture
-      # waproto serde tests are feature-gated and produce zero tests under the
-      # default feature set, so exercise each representation explicitly.
-      - name: Test waproto serde (enum repr)
-        run: cargo test -p waproto --features serde-enum-repr --verbose
-      - name: Test waproto serde (snake_case)
-        run: cargo test -p waproto --features serde-snake-case --verbose
+        env:
+          NEXTEST_PROFILE: ci
+          TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
+        run: scripts/ci/nextest_timed.sh workspace --workspace --exclude e2e-tests
+      - name: Publish test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-build-and-test
+          path: ${{ runner.temp }}/test-timings
+          retention-days: 14
+          if-no-files-found: warn
+          # v4 artifacts are immutable and scoped to the run, not the attempt,
+          # and `if: always()` means attempt 1 uploaded even when it failed. So
+          # a rerun of a failed job would 409 here and finish red with green
+          # tests, which is the opposite of what these reports are for. Same
+          # reason on every timing upload below and in e2e.yml.
+          overwrite: true
+      # nextest cannot run doctests (nextest-rs/nextest#16) and silently reports
+      # none, so they need their own libtest step — the workspace has ~200 doc
+      # examples whose compilation is asserted nowhere else.
+      - name: Run doctests
+        run: cargo test --workspace --exclude e2e-tests --doc --verbose
+
+  waproto-serde:
+    name: waproto serde representations
+    runs-on: ubuntu-latest
+    # waproto serde tests are feature-gated and produce zero tests under the
+    # default feature set, so each representation has to be built on its own.
+    # Its own job rather than two more steps on `Build & Test`: 11 tests that
+    # run in 20ms cost ~104s of recompiling waproto with a different feature
+    # set, and paying that on the workflow's most-read job put it on the
+    # critical path for nothing. Here it runs beside everything else.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - name: Install protoc and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Cache Rust build (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+      # No doctest counterpart: the features only swap derives on generated
+      # code, whose doc comments `Build & Test` already builds.
+      - name: Test waproto serde representations
+        env:
+          NEXTEST_PROFILE: ci
+          TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
+        run: |
+          # Both representations run whichever one fails, and the job exits with
+          # the first failure rather than the last.
+          status=0
+          for feature in serde-enum-repr serde-snake-case; do
+            echo "::group::$feature"
+            rc=0
+            scripts/ci/nextest_timed.sh "$feature" -p waproto --features "$feature" || rc=$?
+            if [ "$status" -eq 0 ]; then status="$rc"; fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+      - name: Publish test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-waproto-serde
+          path: ${{ runner.temp }}/test-timings
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
 
   test-all-features:
     name: Build & Lint (all features)
@@ -123,10 +250,10 @@ jobs:
       # which needs ALSA on Linux.
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - name: Install protoc
+      - name: Install protoc and cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: protoc@${{ env.PROTOC_VERSION }}
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
@@ -140,14 +267,41 @@ jobs:
         run: cargo build --workspace --exclude e2e-tests --all-features --all-targets --verbose
       - name: Clippy (all features)
         run: cargo clippy --workspace --exclude e2e-tests --all-features --all-targets -- -D warnings
-      # No `cargo test --all-features`: it enables the `danger-skip-*-verify` flags, which disable
-      # security verification (the cert-chain negative test is even cfg'd out), so the suite would
-      # change behavior rather than catch rot; build + clippy cover that. The voip suite runs under
-      # the explicit `voip` feature set instead, never `--all-features`.
-      - name: Test (voip)
+      # There is no `cargo test --all-features` because a few features cannot
+      # share a build with the rest. `scripts/ci/test_features.sh` derives the
+      # set that can from cargo metadata and carries the exclusions with their
+      # reasons, so a feature added tomorrow is tested without editing CI.
+      # Compiling a test is not running it: the two `--all-features` steps above
+      # build the codec suite, its golden checksums and every C/Go ground-truth
+      # vector among them, but nothing executed them until a step actually
+      # enabled `voip-mlow` and ran it. That is what this loop does.
+      - name: Test (every shareable feature)
+        env:
+          NEXTEST_PROFILE: ci
+          TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
         run: |
-          cargo test -p wacore --features voip --lib
-          cargo test -p whatsapp-rust --features "voip tokio-native tokio-transport" --lib
+          # Every package runs whichever one fails, and the job exits with the
+          # first failure rather than the last.
+          status=0
+          for package in wacore wacore-libsignal whatsapp-rust; do
+            features="$(./scripts/ci/test_features.sh "$package")"
+            echo "::group::$package [$features]"
+            rc=0
+            scripts/ci/nextest_timed.sh "$package" \
+              -p "$package" --features "$features" --lib --tests || rc=$?
+            if [ "$status" -eq 0 ]; then status="$rc"; fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+      - name: Publish test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-all-features
+          path: ${{ runner.temp }}/test-timings
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
 
   rustdoc:
     name: Rustdoc
@@ -188,22 +342,48 @@ jobs:
       - name: Build docs
         run: cargo doc --workspace --no-deps --all-features
 
-  feature-matrix:
-    name: Feature Matrix (each feature)
+  feature-matrix-crates:
+    name: Feature Matrix (crates)
     runs-on: ubuntu-latest
+    # `cargo metadata` reads manifests; it runs no build script, so this needs
+    # neither protoc nor a compiled workspace and costs about as long as the
+    # checkout.
+    outputs:
+      crates: ${{ steps.crates.outputs.crates }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: crates
+        run: echo "crates=$(scripts/ci/feature_matrix_crates.sh)" >> "$GITHUB_OUTPUT"
+
+  feature-matrix:
+    name: Feature Matrix (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    needs: feature-matrix-crates
     # Individual features are only ever exercised in the combinations the other
     # jobs happen to build (default / --all-features), so a feature whose gates
     # are wrong compiles fine there and breaks for a downstream consumer that
-    # picks it alone. Restricted to the published library crates; bin/test
-    # members carry no feature surface worth enumerating.
+    # picks it alone.
+    strategy:
+      # One crate per runner. `cargo hack` walks a crate's features serially, so
+      # a single job spent its whole time on seven walks that shared nothing but
+      # the dependency build, with whatsapp-rust alone most of it. Each leg is
+      # also an independent question, so one failing must not withdraw the
+      # verdict on the others.
+      fail-fast: false
+      matrix:
+        crate: ${{ fromJSON(needs.feature-matrix-crates.outputs.crates) }}
     steps:
       - uses: actions/checkout@v6
-      - name: Reclaim unused Android SDK space
-        run: |
-          df -h /
-          sudo rm -rf --one-file-system /usr/local/lib/android
-          df -h /
-      # `simd` needs nightly, so the matrix runs on the pinned toolchain.
+      # No Android SDK reclaim here, unlike the three jobs that build the whole
+      # workspace. A runner starts this leg with 87G free and one crate's
+      # `check` comes nowhere near it, so the `rm -rf` bought 10G nothing asked
+      # for at a price that ran from 18s to 188s per leg: on wacore-binary it
+      # was 188s of deleting against 13s of actual checking. That was one step
+      # when this was a single job, and splitting it per crate multiplied it by
+      # the number of published crates. The `df` closing the check step below is
+      # what keeps this claim answerable rather than asserted.
+      # Pinned toolchain: .cargo/config.toml carries nightly-only rustflags
+      # (-Zshare-generics) for this target, and this job does not clear them.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -224,33 +404,38 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
+          # Each leg builds a different feature set into the same target dir;
+          # without this they would all write one cache entry and race for it.
+          key: ${{ matrix.crate }}
       # --no-dev-deps: dev-dependencies enable features on the crate under test
       # (wacore/test-util, for one), which would mask exactly the gaps this
       # job looks for.
       - name: Check each feature
-        run: >
-          cargo hack check --each-feature --no-dev-deps
-          -p whatsapp-rust -p wacore -p wacore-binary -p wacore-appstate
-          -p wacore-libsignal -p wacore-noise -p waproto
+        run: |
+          cargo hack check --each-feature --no-dev-deps -p ${{ matrix.crate }}
+          df -h /
 
   test-stable:
-    name: Test Stable (no-simd)
+    name: Test Stable (MSRV)
     runs-on: ubuntu-latest
     # .cargo/config.toml sets nightly-only rustflags (-Zshare-generics) for the
     # x86_64-linux target; a set-but-empty RUSTFLAGS takes precedence over
     # config rustflags, keeping this stable-toolchain job buildable.
     env:
       RUSTFLAGS: ""
+      NEXTEST_PROFILE: ci
     steps:
       - uses: actions/checkout@v6
       # Pinned rather than `@stable`: this version is the workspace MSRV
       # (`rust-version` in the root Cargo.toml). To raise the floor, bump both
       # together — a floating `stable` would silently let the declared MSRV rot.
       - uses: dtolnay/rust-toolchain@1.94.1
-      - name: Install protoc
+      # The pre-built nextest binary is toolchain-independent — it drives this
+      # MSRV cargo the same way it drives the nightly one.
+      - name: Install protoc and cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: protoc@${{ env.PROTOC_VERSION }}
+          tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
@@ -260,18 +445,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: "true"
-      - name: Build wacore-binary (stable, no SIMD)
-        run: cargo build -p wacore-binary --no-default-features --verbose
-      - name: Test wacore-binary (stable, no SIMD)
-        run: cargo test -p wacore-binary --no-default-features --lib --verbose
-      - name: Build wacore-appstate (stable, no SIMD)
-        run: cargo build -p wacore-appstate --no-default-features --verbose
-      - name: Test wacore-appstate (stable, no SIMD)
-        run: cargo test -p wacore-appstate --no-default-features --lib --verbose
-      - name: Build wacore (stable, no SIMD)
-        run: cargo build -p wacore --no-default-features --verbose
-      - name: Test wacore (stable, no SIMD)
-        run: cargo test -p wacore --no-default-features --lib --verbose
+      # `TEST_TIMINGS_DIR` cannot join `NEXTEST_PROFILE` in the job's `env:`
+      # above: it needs `runner.temp`, the `runner` context is not available to
+      # a job-level `env:`, and that is a whole-workflow startup failure rather
+      # than a failure of this job. Exported once here instead of repeated on
+      # each of the three steps below.
+      - name: Point the timing wrapper at this job's report directory
+        run: echo "TEST_TIMINGS_DIR=$RUNNER_TEMP/test-timings" >> "$GITHUB_ENV"
+      # These three used to be reachable here only with `--no-default-features`,
+      # because their default `simd` feature pulled in `portable_simd` and so
+      # needed nightly. There is no SIMD in the tree any more and no feature
+      # gating it, so this now runs what ships. They go through the wrapper for
+      # the reason every `ci`-profile call does: the profile has one JUnit path,
+      # so run two in a job and the second overwrites the first. This is the only
+      # place these crates are measured at the MSRV toolchain.
+      - name: Test wacore-binary (stable)
+        run: scripts/ci/nextest_timed.sh wacore-binary -p wacore-binary --lib
+      - name: Test wacore-appstate (stable)
+        run: scripts/ci/nextest_timed.sh wacore-appstate -p wacore-appstate --lib
+      - name: Test wacore (stable)
+        run: scripts/ci/nextest_timed.sh wacore -p wacore --lib
       # `rust-version` is published metadata for every member, but only the
       # three crates above are exercised at that toolchain. This compiles the
       # rest of the publishable set so the declared floor is a checked promise
@@ -281,5 +474,14 @@ jobs:
         run: >
           cargo check --no-default-features --verbose
           -p whatsapp-rust -p wacore-derive -p wacore-libsignal -p wacore-noise -p waproto
-          -p whatsapp-rust-ureq-http-client -p whatsapp-rust-chat-store
+          -p whatsapp-rust-ureq-http-client
           -p whatsapp-rust-sqlite-storage -p whatsapp-rust-tokio-transport
+      - name: Publish test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-timings-msrv
+          path: ${{ runner.temp }}/test-timings
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true

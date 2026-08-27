@@ -359,12 +359,9 @@ mod tests {
     #[test]
     fn test_classify_server_error_is_transient() {
         assert_eq!(
-            classify_keepalive_error(&IqError::ServerError {
-                code: 500,
-                text: "internal".to_string(),
-                error_type: None,
-                backoff: None,
-            }),
+            classify_keepalive_error(&crate::test_utils::server_error_iq(
+                500, "internal", None, None
+            )),
             KeepaliveResult::TransientFailure,
             "ServerError should be transient — server may recover"
         );
@@ -419,12 +416,9 @@ mod tests {
         assert!(!is_benign_teardown(&IqError::ParseError(anyhow::anyhow!(
             "bad response"
         ))));
-        assert!(!is_benign_teardown(&IqError::ServerError {
-            code: 500,
-            text: "internal".to_string(),
-            error_type: None,
-            backoff: None,
-        }));
+        assert!(!is_benign_teardown(&crate::test_utils::server_error_iq(
+            500, "internal", None, None
+        )));
         assert!(!is_benign_teardown(&IqError::UnexpectedResponseType {
             got: Some("get".to_string()),
         }));

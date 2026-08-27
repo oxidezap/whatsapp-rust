@@ -5,6 +5,7 @@ use crate::client::Client;
 use async_trait::async_trait;
 use log::debug;
 use std::sync::Arc;
+use wacore::stanza::wire_tags::StanzaTag;
 use wacore::types::events::{Event, PresenceUpdate};
 
 /// Handler for `<presence>` stanzas.
@@ -17,7 +18,7 @@ pub struct PresenceHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for PresenceHandler {
     fn tag(&self) -> &'static str {
-        "presence"
+        StanzaTag::Presence.as_str()
     }
 
     #[cfg_attr(

@@ -3,6 +3,7 @@ use crate::client::Client;
 use async_trait::async_trait;
 use log::{debug, warn};
 use std::sync::Arc;
+use wacore::stanza::wire_tags::StanzaTag;
 use wacore::xml::DisplayableNodeRef;
 
 /// Handler for `<iq>` (Info/Query) stanzas.
@@ -19,7 +20,7 @@ pub struct IqHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for IqHandler {
     fn tag(&self) -> &'static str {
-        "iq"
+        StanzaTag::Iq.as_str()
     }
 
     #[cfg_attr(

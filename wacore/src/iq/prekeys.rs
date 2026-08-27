@@ -249,7 +249,7 @@ impl IqSpec for DigestKeyBundleSpec {
         let reg_id = extract_content_uint(Some(reg_node));
 
         let identity_node = required_child(digest_node, "identity")?;
-        let identity = match identity_node.content.as_deref() {
+        let identity = match identity_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) if !b.is_empty() => b.to_vec(),
             _ => return Err(anyhow!("missing or empty bytes in <identity>")),
         };
@@ -280,7 +280,7 @@ impl IqSpec for DigestKeyBundleSpec {
             .unwrap_or_default();
 
         let hash_node = required_child(digest_node, "hash")?;
-        let hash = match hash_node.content.as_deref() {
+        let hash = match hash_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) if !b.is_empty() => b.to_vec(),
             _ => return Err(anyhow!("missing or empty bytes in <hash>")),
         };
@@ -623,14 +623,14 @@ impl ProtocolNode for SignedPreKeyNode {
         }
 
         let id_node = required_child(node, "id")?;
-        let id_bytes = match id_node.content.as_deref() {
+        let id_bytes = match id_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b,
             _ => return Err(anyhow!("missing bytes in <id>")),
         };
         let id = expand_from_3bytes(id_bytes)?;
 
         let value_node = required_child(node, "value")?;
-        let public_bytes = match value_node.content.as_deref() {
+        let public_bytes = match value_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b.to_vec(),
             _ => return Err(anyhow!("missing bytes in <value>")),
         };
@@ -639,7 +639,7 @@ impl ProtocolNode for SignedPreKeyNode {
         }
 
         let sig_node = required_child(node, "signature")?;
-        let signature = match sig_node.content.as_deref() {
+        let signature = match sig_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b.to_vec(),
             _ => return Err(anyhow!("missing bytes in <signature>")),
         };
@@ -698,14 +698,14 @@ impl ProtocolNode for OneTimePreKeyNode {
         }
 
         let id_node = required_child(node, "id")?;
-        let id_bytes = match id_node.content.as_deref() {
+        let id_bytes = match id_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b,
             _ => return Err(anyhow!("missing bytes in <id>")),
         };
         let id = expand_from_3bytes(id_bytes)?;
 
         let value_node = required_child(node, "value")?;
-        let public_bytes = match value_node.content.as_deref() {
+        let public_bytes = match value_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b.to_vec(),
             _ => return Err(anyhow!("missing bytes in <value>")),
         };
@@ -846,7 +846,7 @@ impl ProtocolNode for PreKeyBundleUserNode {
 
         // Parse registration ID (4 bytes big-endian)
         let reg_node = required_child(node, "registration")?;
-        let reg_bytes = match reg_node.content.as_deref() {
+        let reg_bytes = match reg_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b,
             _ => return Err(anyhow!("missing bytes in <registration>")),
         };
@@ -858,7 +858,7 @@ impl ProtocolNode for PreKeyBundleUserNode {
 
         // Parse identity key (32 bytes)
         let identity_node = required_child(node, "identity")?;
-        let identity_key = match identity_node.content.as_deref() {
+        let identity_key = match identity_node.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => b.to_vec(),
             _ => return Err(anyhow!("missing bytes in <identity>")),
         };
@@ -878,7 +878,7 @@ impl ProtocolNode for PreKeyBundleUserNode {
 
         // Parse optional device identity
         let device_identity = match node.get_optional_child("device-identity") {
-            Some(n) => match n.content.as_deref() {
+            Some(n) => match n.content.as_ref() {
                 Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
                 _ => return Err(anyhow!("device-identity must be bytes")),
             },

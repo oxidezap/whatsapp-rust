@@ -14,7 +14,7 @@ use std::any::{Any, TypeId};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -32,15 +32,21 @@ use wacore_binary::Jid;
 use waproto::whatsapp::Message;
 
 use crate::Client;
-use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState, RawNodeLease};
+use crate::client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
+use crate::client::{
+    ClientLifecycle, ConnectionScope, ConnectionScopeState, DecryptedPayloadLease,
+    EncDecryptFailedLease, RawNodeLease, SentFrameLease,
+};
 use crate::request::IqError;
 use crate::send::{SendError, SendResult};
+use wacore_binary::node::OwnedNodeRef;
 
 const CAP_CORE_EVENTS: u64 = 1 << 0;
 const CAP_TASKS: u64 = 1 << 1;
 const CAP_MESSAGING: u64 = 1 << 2;
 const CAP_IQ: u64 = 1 << 3;
 const CAP_PLUGIN_EVENTS: u64 = 1 << 4;
+const CAP_STANZA_INTERCEPTION: u64 = 1 << 5;
 const DEFAULT_PLUGIN_INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PLUGIN_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PLUGIN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -54,6 +60,7 @@ pub enum PluginCapability {
     Messaging,
     Iq,
     PluginEvents,
+    StanzaInterception,
 }
 
 impl PluginCapability {
@@ -64,6 +71,7 @@ impl PluginCapability {
             Self::Messaging => "messaging.send",
             Self::Iq => "iq.execute",
             Self::PluginEvents => "events.plugin.publish",
+            Self::StanzaInterception => "stanza.intercept",
         }
     }
 
@@ -74,6 +82,7 @@ impl PluginCapability {
             Self::Messaging => CAP_MESSAGING,
             Self::Iq => CAP_IQ,
             Self::PluginEvents => CAP_PLUGIN_EVENTS,
+            Self::StanzaInterception => CAP_STANZA_INTERCEPTION,
         }
     }
 }
@@ -348,6 +357,9 @@ pub struct PluginStats {
     pub connection_tasks: u64,
     pub connection_generations: u64,
     pub core_event_subscriptions: u64,
+    pub stanza_interceptors: u64,
+    /// Panics isolated before they could unwind through the read loop.
+    pub stanza_interception_panics: u64,
     pub events: Option<PluginEventPublisherStats>,
 }
 
@@ -371,6 +383,7 @@ struct PluginResources {
     install_tasks: Arc<TaskTracker>,
     connection_tasks: Mutex<ConnectionTaskRegistry>,
     subscriptions: Mutex<Vec<Weak<PluginCoreEventSubscriptionInner>>>,
+    interceptors: Mutex<Vec<Weak<PluginInterceptorRegistrationInner>>>,
     teardown_panics: AtomicU64,
 }
 
@@ -380,21 +393,23 @@ struct ConnectionTaskRegistry {
     trackers: HashMap<u64, Arc<TaskTracker>>,
 }
 
-#[derive(Default)]
-struct TaskTrackerState {
-    active: usize,
-    closed: bool,
-}
+/// Bit 0 of [`TaskTracker::state`]: the tracker is closed to new leases.
+const TRACKER_CLOSED: usize = 1;
+/// One live [`TaskLease`]; the count occupies bits 1.. of the same word.
+/// Packing the flag next to the count makes "refuse if closed, otherwise
+/// increment" a single read-modify-write, which is what guarantees no lease is
+/// handed out after `close()` returns.
+const ONE_TASK: usize = 2;
 
 struct TaskTracker {
-    state: Mutex<TaskTrackerState>,
+    state: AtomicUsize,
     idle: ShutdownNotifier,
 }
 
 impl TaskTracker {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(TaskTrackerState::default()),
+            state: AtomicUsize::new(0),
             idle: ShutdownNotifier::new(),
         })
     }
@@ -406,32 +421,38 @@ impl TaskTracker {
     }
 
     fn register(self: &Arc<Self>) -> Result<TaskLease, PluginResourceError> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.closed {
-            return Err(PluginResourceError::ShuttingDown);
-        }
-        state.active = state
-            .active
-            .checked_add(1)
-            .ok_or(PluginResourceError::TaskCapacityExceeded)?;
+        // Relaxed: no data crosses here, and the exclusion against `close`
+        // comes from both being read-modify-writes on one location, which the
+        // per-location modification order already totally orders.
+        self.state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                if state & TRACKER_CLOSED != 0 {
+                    return None;
+                }
+                state.checked_add(ONE_TASK)
+            })
+            .map_err(|state| {
+                if state & TRACKER_CLOSED != 0 {
+                    PluginResourceError::ShuttingDown
+                } else {
+                    PluginResourceError::TaskCapacityExceeded
+                }
+            })?;
         Ok(TaskLease {
             tracker: Arc::clone(self),
         })
     }
 
     fn close(&self) {
-        let idle = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.closed = true;
-            state.active == 0
-        };
-        if idle {
+        // Without the lock, a concurrent last `TaskLease::drop` can reach the
+        // same idle edge and both sides notify. That is sound because
+        // `ShutdownNotifier::notify` is sticky and wakes every listener, so the
+        // second call changes nothing an observer can see.
+        //
+        // Acquire: whoever declares idle must have observed the work of every
+        // lease that finished before it, which is the happens-before the lock
+        // used to provide to the waiter it wakes.
+        if self.state.fetch_or(TRACKER_CLOSED, Ordering::Acquire) >> 1 == 0 {
             self.idle.notify();
         }
     }
@@ -441,10 +462,7 @@ impl TaskTracker {
     }
 
     fn active(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .active
+        self.state.load(Ordering::Acquire) >> 1
     }
 }
 
@@ -454,24 +472,99 @@ struct TaskLease {
 
 impl Drop for TaskLease {
     fn drop(&mut self) {
-        let idle = {
-            let mut state = self
-                .tracker
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.active = state.active.saturating_sub(1);
-            state.closed && state.active == 0
-        };
-        if idle {
+        // AcqRel: release publishes this task's work, acquire makes the thread
+        // that sees the idle edge observe every other lease's work too.
+        let previous = self.tracker.state.fetch_sub(ONE_TASK, Ordering::AcqRel);
+        debug_assert!(previous >> 1 > 0, "TaskLease outlived its registration");
+        if previous >> 1 == 1 && previous & TRACKER_CLOSED != 0 {
             self.tracker.idle.notify();
+        }
+    }
+}
+
+/// Forwarding leases held on behalf of one subscription's interest.
+///
+/// A few events are gated: the client produces them only while a consumer asks,
+/// so subscribing to one is not enough — the subscription has to hold the lease
+/// for as long as its interest names the kind, and give it up as soon as it
+/// stops. Adding a gated kind means adding it here; nothing else in the
+/// subscription path knows which kinds are gated.
+#[derive(Default)]
+struct GatedForwarding {
+    raw_node: Option<RawNodeLease>,
+    decrypted_payload: Option<DecryptedPayloadLease>,
+    sent_frame: Option<SentFrameLease>,
+    enc_decrypt_failed: Option<EncDecryptFailedLease>,
+}
+
+impl GatedForwarding {
+    /// Whether `interest` names a gated kind this does not already cover.
+    ///
+    /// Checked before upgrading the client so an interest change that needs no
+    /// lease cannot fail on a client that is going away.
+    fn is_short_for(&self, interest: EventInterest) -> bool {
+        (interest.wants(EventKind::RawNode) && self.raw_node.is_none())
+            || (interest.wants(EventKind::DecryptedPayload) && self.decrypted_payload.is_none())
+            || (interest.wants(EventKind::SentFrame) && self.sent_frame.is_none())
+            || (interest.wants(EventKind::EncDecryptFailed) && self.enc_decrypt_failed.is_none())
+    }
+
+    /// Acquire what `interest` needs and this does not hold yet.
+    ///
+    /// Kept separate from committing it: the caller may still abandon the
+    /// interest change, and dropping the result is then the whole rollback.
+    fn acquire_missing(&self, client: &Arc<Client>, interest: EventInterest) -> Self {
+        Self {
+            raw_node: (interest.wants(EventKind::RawNode) && self.raw_node.is_none())
+                .then(|| client.acquire_raw_node_forwarding()),
+            decrypted_payload: (interest.wants(EventKind::DecryptedPayload)
+                && self.decrypted_payload.is_none())
+            .then(|| client.acquire_decrypted_payload_forwarding()),
+            sent_frame: (interest.wants(EventKind::SentFrame) && self.sent_frame.is_none())
+                .then(|| client.acquire_sent_frame_forwarding()),
+            enc_decrypt_failed: (interest.wants(EventKind::EncDecryptFailed)
+                && self.enc_decrypt_failed.is_none())
+            .then(|| client.acquire_enc_decrypt_failed_forwarding()),
+        }
+    }
+
+    /// Take over leases from [`Self::acquire_missing`], keeping those held.
+    fn commit(&mut self, acquired: Self) {
+        self.raw_node = self.raw_node.take().or(acquired.raw_node);
+        self.decrypted_payload = self.decrypted_payload.take().or(acquired.decrypted_payload);
+        self.sent_frame = self.sent_frame.take().or(acquired.sent_frame);
+        self.enc_decrypt_failed = self
+            .enc_decrypt_failed
+            .take()
+            .or(acquired.enc_decrypt_failed);
+    }
+
+    /// Give up what `interest` no longer asks for.
+    ///
+    /// Returned rather than dropped so the caller releases it outside the state
+    /// lock, where a consumer's `Drop` cannot deadlock against this one.
+    #[must_use]
+    fn retire_unwanted(&mut self, interest: EventInterest) -> Self {
+        Self {
+            raw_node: (!interest.wants(EventKind::RawNode))
+                .then(|| self.raw_node.take())
+                .flatten(),
+            decrypted_payload: (!interest.wants(EventKind::DecryptedPayload))
+                .then(|| self.decrypted_payload.take())
+                .flatten(),
+            sent_frame: (!interest.wants(EventKind::SentFrame))
+                .then(|| self.sent_frame.take())
+                .flatten(),
+            enc_decrypt_failed: (!interest.wants(EventKind::EncDecryptFailed))
+                .then(|| self.enc_decrypt_failed.take())
+                .flatten(),
         }
     }
 }
 
 struct PluginCoreEventSubscriptionState {
     subscription: Option<Subscription>,
-    raw_node_lease: Option<RawNodeLease>,
+    leases: GatedForwarding,
     interest: EventInterest,
 }
 
@@ -504,36 +597,30 @@ impl PluginCoreEventSubscriptionInner {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let wants_raw_node = interest.wants(EventKind::RawNode);
-        let acquired_raw_node_lease = if wants_raw_node && state.raw_node_lease.is_none() {
-            Some(
-                self.client
-                    .upgrade()
-                    .ok_or(PluginResourceError::ClientUnavailable)?
-                    .acquire_raw_node_forwarding(),
-            )
+        let acquired = if state.leases.is_short_for(interest) {
+            let client = self
+                .client
+                .upgrade()
+                .ok_or(PluginResourceError::ClientUnavailable)?;
+            state.leases.acquire_missing(&client, interest)
         } else {
-            None
+            GatedForwarding::default()
         };
         let Some(subscription) = state.subscription.as_ref() else {
             return Ok(false);
         };
         if !subscription.update_interest(interest) {
             drop(state);
-            drop(acquired_raw_node_lease);
+            drop(acquired);
             self.close();
             return Ok(false);
         }
 
         state.interest = interest;
-        if let Some(lease) = acquired_raw_node_lease {
-            state.raw_node_lease = Some(lease);
-        }
-        let retired_raw_node_lease = (!wants_raw_node)
-            .then(|| state.raw_node_lease.take())
-            .flatten();
+        state.leases.commit(acquired);
+        let retired = state.leases.retire_unwanted(interest);
         drop(state);
-        drop(retired_raw_node_lease);
+        drop(retired);
         Ok(true)
     }
 
@@ -544,7 +631,7 @@ impl PluginCoreEventSubscriptionInner {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (state.subscription.take(), state.raw_node_lease.take())
+            (state.subscription.take(), std::mem::take(&mut state.leases))
         };
         let active = registration.0.is_some();
         if std::panic::catch_unwind(AssertUnwindSafe(|| drop(registration))).is_err() {
@@ -612,6 +699,7 @@ impl PluginResources {
             install_tasks: TaskTracker::new(),
             connection_tasks: Mutex::new(ConnectionTaskRegistry::default()),
             subscriptions: Mutex::new(Vec::new()),
+            interceptors: Mutex::new(Vec::new()),
             teardown_panics: AtomicU64::new(0),
         })
     }
@@ -652,7 +740,7 @@ impl PluginResources {
         plugin_id: Arc<str>,
         interest: EventInterest,
         subscription: Subscription,
-        raw_node_lease: Option<RawNodeLease>,
+        leases: GatedForwarding,
     ) -> Result<PluginCoreEventSubscription, PluginResourceError> {
         let registration = Arc::new(PluginCoreEventSubscriptionInner {
             client,
@@ -660,24 +748,33 @@ impl PluginResources {
             plugin_id,
             state: Mutex::new(PluginCoreEventSubscriptionState {
                 subscription: Some(subscription),
-                raw_node_lease,
+                leases,
                 interest,
             }),
         });
+        self.retain_weakly(&self.subscriptions, registration)
+            .map(|inner| PluginCoreEventSubscription { inner })
+    }
+
+    /// Index a registration weakly, refusing once this plugin is closing.
+    ///
+    /// Weakly, so terminal shutdown can invalidate a token a plugin API
+    /// retained without keeping alive one the plugin already released. Dead and
+    /// closed entries are swept here, which is the only place the index grows.
+    fn retain_weakly<T: WeaklyIndexed>(
+        &self,
+        index: &Mutex<Vec<Weak<T>>>,
+        registration: Arc<T>,
+    ) -> Result<Arc<T>, PluginResourceError> {
         let rejected = {
-            let mut subscriptions = self
-                .subscriptions
+            let mut index = index
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if self.closed.load(Ordering::Acquire) {
                 true
             } else {
-                subscriptions.retain(|subscription| {
-                    subscription
-                        .upgrade()
-                        .is_some_and(|subscription| subscription.is_active())
-                });
-                subscriptions.push(Arc::downgrade(&registration));
+                index.retain(|entry| entry.upgrade().is_some_and(|entry| entry.is_active()));
+                index.push(Arc::downgrade(&registration));
                 false
             }
         };
@@ -685,20 +782,31 @@ impl PluginResources {
             registration.close();
             Err(PluginResourceError::ShuttingDown)
         } else {
-            Ok(PluginCoreEventSubscription {
-                inner: registration,
-            })
+            Ok(registration)
         }
     }
 
+    fn retain_interceptor(
+        &self,
+        resources: Weak<PluginResources>,
+        plugin_id: Arc<str>,
+        handle: InterceptorHandle,
+    ) -> Result<PluginInterceptorRegistration, PluginResourceError> {
+        let registration = Arc::new(PluginInterceptorRegistrationInner {
+            resources,
+            plugin_id,
+            handle: Mutex::new(Some(handle)),
+        });
+        self.retain_weakly(&self.interceptors, registration)
+            .map(|inner| PluginInterceptorRegistration { inner })
+    }
+
+    fn forget_interceptor(&self, registration: &PluginInterceptorRegistrationInner) {
+        forget_weakly(&self.interceptors, registration);
+    }
+
     fn forget_subscription(&self, subscription: &PluginCoreEventSubscriptionInner) {
-        let subscription_ptr = std::ptr::from_ref(subscription);
-        self.subscriptions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|candidate| {
-                candidate.strong_count() != 0 && !std::ptr::eq(candidate.as_ptr(), subscription_ptr)
-            });
+        forget_weakly(&self.subscriptions, subscription);
     }
 
     fn connection_task_tracker(&self, generation: u64) -> (Arc<TaskTracker>, bool) {
@@ -797,19 +905,82 @@ impl PluginResources {
             tracker.close();
         }
         self.shutdown.notify();
-        let subscriptions = {
-            let mut subscriptions = self
-                .subscriptions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::take(&mut *subscriptions)
-        };
-        for subscription in subscriptions {
-            if let Some(subscription) = subscription.upgrade() {
-                subscription.close();
-            }
+        close_weakly(&self.subscriptions);
+        close_weakly(&self.interceptors);
+    }
+}
+
+/// A registration the host holds weakly and can invalidate on shutdown.
+///
+/// Core-event subscriptions and stanza interceptors are the same object with
+/// different contents: an owned token the plugin drops, indexed weakly so the
+/// host can close it first. One implementation of the indexing keeps the two
+/// from drifting.
+trait WeaklyIndexed {
+    /// Whether this registration is still installed.
+    fn is_active(&self) -> bool;
+    /// Remove it, returning whether it was installed. Must not unwind.
+    fn close(&self) -> bool;
+}
+
+// Both forward to the inherent method of the same name. Naming the type is not
+// redundant: `self.is_active()` inside a trait impl resolves to the inherent
+// method only because inherent methods win, and a later refactor that removed
+// one would turn the call into infinite recursion instead of a compile error.
+impl WeaklyIndexed for PluginCoreEventSubscriptionInner {
+    fn is_active(&self) -> bool {
+        PluginCoreEventSubscriptionInner::is_active(self)
+    }
+
+    fn close(&self) -> bool {
+        PluginCoreEventSubscriptionInner::close(self)
+    }
+}
+
+impl WeaklyIndexed for PluginInterceptorRegistrationInner {
+    fn is_active(&self) -> bool {
+        PluginInterceptorRegistrationInner::is_active(self)
+    }
+
+    fn close(&self) -> bool {
+        PluginInterceptorRegistrationInner::close(self)
+    }
+}
+
+/// Drop `registration` from its index, along with any entry already dead.
+fn forget_weakly<T: WeaklyIndexed>(index: &Mutex<Vec<Weak<T>>>, registration: &T) {
+    let registration_ptr = std::ptr::from_ref(registration);
+    index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|candidate| {
+            candidate.strong_count() != 0 && !std::ptr::eq(candidate.as_ptr(), registration_ptr)
+        });
+}
+
+/// Close every live registration in an index and empty it.
+fn close_weakly<T: WeaklyIndexed>(index: &Mutex<Vec<Weak<T>>>) {
+    let entries = {
+        let mut index = index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *index)
+    };
+    for entry in entries {
+        if let Some(entry) = entry.upgrade() {
+            entry.close();
         }
     }
+}
+
+fn count_active<T: WeaklyIndexed>(index: &Mutex<Vec<Weak<T>>>) -> usize {
+    index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|entry| entry.is_active())
+        .count()
 }
 
 fn close_plugin_resources(plugin_id: &str, resources: &PluginResources) {
@@ -840,14 +1011,8 @@ impl PluginResources {
             install_tasks: self.install_tasks.active(),
             connection_tasks,
             connection_generations,
-            core_event_subscriptions: self
-                .subscriptions
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .iter()
-                .filter_map(Weak::upgrade)
-                .filter(|subscription| subscription.is_active())
-                .count(),
+            core_event_subscriptions: count_active(&self.subscriptions),
+            stanza_interceptors: count_active(&self.interceptors),
             teardown_panics: self.teardown_panics.load(Ordering::Relaxed),
         }
     }
@@ -861,6 +1026,7 @@ struct PluginResourceStats {
     connection_tasks: usize,
     connection_generations: usize,
     core_event_subscriptions: usize,
+    stanza_interceptors: usize,
     teardown_panics: u64,
 }
 
@@ -873,6 +1039,7 @@ struct PluginDiagnostics {
     task_panics: AtomicU64,
     core_events_delivered: AtomicU64,
     core_event_panics: AtomicU64,
+    stanza_interception_panics: AtomicU64,
     shutdown_complete: AtomicBool,
 }
 
@@ -887,6 +1054,7 @@ impl PluginDiagnostics {
             task_panics: AtomicU64::new(0),
             core_events_delivered: AtomicU64::new(0),
             core_event_panics: AtomicU64::new(0),
+            stanza_interception_panics: AtomicU64::new(0),
             shutdown_complete: AtomicBool::new(false),
         })
     }
@@ -946,6 +1114,7 @@ impl PluginDiagnostics {
         let task_panics = self.task_panics.load(Ordering::Relaxed);
         let core_events_delivered = self.core_events_delivered.load(Ordering::Relaxed);
         let core_event_panics = self.core_event_panics.load(Ordering::Relaxed);
+        let stanza_interception_panics = self.stanza_interception_panics.load(Ordering::Relaxed);
         let state = if self.shutdown_complete.load(Ordering::Acquire) {
             PluginState::Stopped
         } else if resources.closed || terminal {
@@ -963,6 +1132,7 @@ impl PluginDiagnostics {
             || task_drain_timeouts > 0
             || task_panics > 0
             || core_event_panics > 0
+            || stanza_interception_panics > 0
             || resources.teardown_panics > 0
             || event_degraded
         {
@@ -988,6 +1158,8 @@ impl PluginDiagnostics {
                 .unwrap_or(u64::MAX),
             core_event_subscriptions: u64::try_from(resources.core_event_subscriptions)
                 .unwrap_or(u64::MAX),
+            stanza_interceptors: u64::try_from(resources.stanza_interceptors).unwrap_or(u64::MAX),
+            stanza_interception_panics,
             events,
         }
     }
@@ -1127,9 +1299,7 @@ impl PluginCoreEvents {
             .client
             .upgrade()
             .ok_or(PluginResourceError::ClientUnavailable)?;
-        let raw_node_lease = interest
-            .wants(EventKind::RawNode)
-            .then(|| client.acquire_raw_node_forwarding());
+        let leases = GatedForwarding::default().acquire_missing(&client, interest);
         let handler = Arc::new(PluginCoreEventHandler {
             plugin_id: Arc::clone(&self.plugin_id),
             inner: Some(handler),
@@ -1143,8 +1313,157 @@ impl PluginCoreEvents {
             Arc::clone(&self.plugin_id),
             interest,
             subscription,
-            raw_node_lease,
+            leases,
         )
+    }
+}
+
+/// Claiming a stanza before the built-in pipeline sees it.
+///
+/// Observation is [`PluginCoreEvents`]' job. This is the other half: a plugin
+/// that can *act* on a stanza the client does not model, instead of watching it
+/// get nacked. See [`crate::client::interceptor`] for what may be claimed and
+/// what the server is owed afterwards.
+///
+/// # What a claim skips
+///
+/// Interception runs before the built-in pipeline, so a claimed stanza is one
+/// the client did no work on at all — no decryption, no session mutation, no
+/// prekey consumed. Signal state is untouched rather than half-advanced, which
+/// is what makes claiming safe to reason about; but it also means claiming a
+/// `<message>` leaves it undecrypted forever, since the ack that follows tells
+/// the server not to redeliver. A plugin that claims stanzas carrying Signal
+/// state takes over that responsibility whole. Match narrowly.
+#[derive(Clone)]
+pub struct PluginStanzaInterception {
+    client: Weak<Client>,
+    resources: Arc<PluginResources>,
+    plugin_id: Arc<str>,
+    diagnostics: Arc<PluginDiagnostics>,
+}
+
+impl PluginStanzaInterception {
+    /// Register `interceptor` for the life of the returned token.
+    ///
+    /// Dropping the token removes it, and host shutdown invalidates a token a
+    /// plugin API retained.
+    pub fn register(
+        &self,
+        interceptor: Arc<dyn StanzaInterceptor>,
+    ) -> Result<PluginInterceptorRegistration, PluginResourceError> {
+        let client = self
+            .client
+            .upgrade()
+            .ok_or(PluginResourceError::ClientUnavailable)?;
+        if self.resources.closed.load(Ordering::Acquire) {
+            return Err(PluginResourceError::ShuttingDown);
+        }
+        let handle = client.add_stanza_interceptor(Arc::new(GuardedStanzaInterceptor {
+            plugin_id: Arc::clone(&self.plugin_id),
+            inner: interceptor,
+            diagnostics: Arc::clone(&self.diagnostics),
+        }));
+        self.resources.retain_interceptor(
+            Arc::downgrade(&self.resources),
+            Arc::clone(&self.plugin_id),
+            handle,
+        )
+    }
+}
+
+/// Wraps a plugin's interceptor so a panic cannot unwind through the read loop.
+///
+/// The trait asks implementations not to panic, and a directly registered
+/// interceptor is trusted to honour that. A plugin is not: one faulty plugin
+/// must not take the connection with it. A panicking interceptor passes, which
+/// leaves the stanza with the client — the same outcome as not being there.
+struct GuardedStanzaInterceptor {
+    plugin_id: Arc<str>,
+    inner: Arc<dyn StanzaInterceptor>,
+    diagnostics: Arc<PluginDiagnostics>,
+}
+
+impl StanzaInterceptor for GuardedStanzaInterceptor {
+    fn intercept(&self, node: &OwnedNodeRef) -> Interception {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| self.inner.intercept(node))) {
+            Ok(interception) => interception,
+            Err(_) => {
+                self.diagnostics
+                    .stanza_interception_panics
+                    .fetch_add(1, Ordering::Relaxed);
+                log::warn!("Plugin `{}` stanza interceptor panicked", self.plugin_id);
+                Interception::Pass
+            }
+        }
+    }
+}
+
+struct PluginInterceptorRegistrationInner {
+    resources: Weak<PluginResources>,
+    plugin_id: Arc<str>,
+    handle: Mutex<Option<InterceptorHandle>>,
+}
+
+impl PluginInterceptorRegistrationInner {
+    fn is_active(&self) -> bool {
+        self.handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn close(&self) -> bool {
+        let resources = self.resources.upgrade();
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let active = handle.is_some();
+        // Dropping the handle drops the plugin's interceptor, whose destructor
+        // is the plugin's code. An unwind here during shutdown would leave
+        // every later registration open, so it is isolated like the
+        // core-event subscription path isolates its own.
+        if std::panic::catch_unwind(AssertUnwindSafe(|| drop(handle))).is_err() {
+            if let Some(resources) = &resources {
+                resources.teardown_panics.fetch_add(1, Ordering::Relaxed);
+            }
+            log::warn!(
+                "Plugin `{}` stanza interceptor panicked while being dropped",
+                self.plugin_id
+            );
+        }
+        if let Some(resources) = resources {
+            resources.forget_interceptor(self);
+        }
+        active
+    }
+}
+
+/// Ownership token for one plugin stanza interceptor.
+///
+/// Dropping the token unregisters immediately. Host shutdown also invalidates a
+/// retained token, so keeping it in a plugin API cannot leave an interceptor
+/// deciding for a client that is shutting down.
+#[must_use = "dropping the token immediately unregisters the interceptor"]
+pub struct PluginInterceptorRegistration {
+    inner: Arc<PluginInterceptorRegistrationInner>,
+}
+
+impl PluginInterceptorRegistration {
+    pub fn is_active(&self) -> bool {
+        self.inner.is_active()
+    }
+
+    /// Unregister now instead of waiting for `Drop`.
+    pub fn unregister(&self) -> bool {
+        self.inner.close()
+    }
+}
+
+impl Drop for PluginInterceptorRegistration {
+    fn drop(&mut self) {
+        self.inner.close();
     }
 }
 
@@ -1213,6 +1532,7 @@ pub struct PluginContext {
     messaging: Option<PluginMessaging>,
     iq: Option<PluginIq>,
     plugin_events: Option<PluginEvents>,
+    stanza_interception: Option<PluginStanzaInterception>,
 }
 
 impl PluginContext {
@@ -1245,6 +1565,10 @@ impl PluginContext {
 
     pub fn plugin_events(&self) -> Option<&PluginEvents> {
         self.plugin_events.as_ref()
+    }
+
+    pub fn stanza_interception(&self) -> Option<&PluginStanzaInterception> {
+        self.stanza_interception.as_ref()
     }
 }
 
@@ -2125,7 +2449,7 @@ impl PluginHost {
                     runtime: Arc::clone(&runtime),
                     resources: Arc::clone(&resources),
                     diagnostics: Arc::clone(&diagnostics),
-                    plugin_id,
+                    plugin_id: Arc::clone(&plugin_id),
                 }),
             messaging: capabilities.contains(PluginCapability::Messaging).then(|| {
                 PluginMessaging {
@@ -2138,6 +2462,14 @@ impl PluginHost {
                 .then(|| PluginIq {
                     client: client.clone(),
                     resources: Arc::clone(&resources),
+                }),
+            stanza_interception: capabilities
+                .contains(PluginCapability::StanzaInterception)
+                .then(|| PluginStanzaInterception {
+                    client: client.clone(),
+                    resources: Arc::clone(&resources),
+                    plugin_id,
+                    diagnostics: Arc::clone(&diagnostics),
                 }),
             plugin_events: self
                 .event_router
@@ -2854,6 +3186,7 @@ mod tests {
             PluginCapability::Messaging,
             PluginCapability::Iq,
             PluginCapability::PluginEvents,
+            PluginCapability::StanzaInterception,
         ];
         let combined = capabilities
             .into_iter()
@@ -4530,6 +4863,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracker_tracks_leases_and_signals_when_the_last_one_drains() {
+        let tracker = TaskTracker::new();
+        let signal = tracker.completion_signal();
+        let leases: Vec<_> = (0..3)
+            .map(|_| tracker.register().expect("open tracker must register"))
+            .collect();
+        assert_eq!(tracker.active(), 3);
+
+        tracker.close();
+        assert!(matches!(
+            tracker.register(),
+            Err(PluginResourceError::ShuttingDown)
+        ));
+        assert!(!signal.is_fired(), "leases are still outstanding");
+
+        drop(leases);
+        assert_eq!(tracker.active(), 0);
+        tokio::time::timeout(Duration::from_secs(1), wait_for_shutdown(&signal))
+            .await
+            .expect("draining the last lease must signal completion");
+    }
+
+    /// The guarantee that decides the packed layout: once `close()` has
+    /// returned, no further lease is handed out. Raced, because the failure
+    /// mode is a check-then-increment window a serial test cannot open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tracker_close_wins_against_concurrent_register() {
+        for _ in 0..64 {
+            let tracker = TaskTracker::new();
+            let start = Arc::new(Barrier::new(5));
+            // Published by the closer the instant `close()` returns. Read
+            // BEFORE each attempt: seeing it set means close already returned,
+            // so a registration that then succeeds is a violation on its own,
+            // with no shared count to launder it.
+            let closed = Arc::new(AtomicBool::new(false));
+
+            let registrars: Vec<_> = (0..4)
+                .map(|_| {
+                    let tracker = Arc::clone(&tracker);
+                    let start = Arc::clone(&start);
+                    let closed = Arc::clone(&closed);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let mut late = 0usize;
+                        // The leases are handed back rather than dropped here,
+                        // so the count the closer sampled stays comparable.
+                        let leases: Vec<_> = std::iter::from_fn(|| {
+                            let seen_closed = closed.load(Ordering::SeqCst);
+                            let lease = tracker.register().ok()?;
+                            if seen_closed {
+                                late += 1;
+                            }
+                            Some(lease)
+                        })
+                        .take(256)
+                        .collect();
+                        (leases, late)
+                    })
+                })
+                .collect();
+
+            start.wait();
+            tracker.close();
+            // Sampled before the flag is published, so the two nets abut: a
+            // grant later than this sample is caught by the count, an earlier
+            // one by a racer that already saw the flag. Only a grant between
+            // close() returning and this single load escapes both.
+            let after_close = tracker.active();
+            closed.store(true, Ordering::SeqCst);
+
+            let results: Vec<_> = registrars
+                .into_iter()
+                .map(|t| t.join().expect("registrar thread"))
+                .collect();
+            let granted: usize = results.iter().map(|(leases, _)| leases.len()).sum();
+            let late: usize = results.iter().map(|(_, late)| late).sum();
+            assert_eq!(late, 0, "register granted a lease after close() returned");
+            assert_eq!(
+                granted, after_close,
+                "register granted a lease after close() returned"
+            );
+        }
+    }
+
+    /// Dropping the lock lets `close` and the last `TaskLease::drop` both reach
+    /// the idle edge, so the notification can fire twice. What matters is that
+    /// it is a double notification and not a double observation: every
+    /// subscriber, early or late, still sees one sticky completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tracker_idle_notification_survives_a_close_drop_race() {
+        for _ in 0..64 {
+            let tracker = TaskTracker::new();
+            let lease = tracker.register().expect("open tracker must register");
+            let early = tracker.completion_signal();
+            let start = Arc::new(Barrier::new(2));
+
+            let closer = {
+                let tracker = Arc::clone(&tracker);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    tracker.close();
+                })
+            };
+            let dropper = {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    drop(lease);
+                })
+            };
+            closer.join().expect("closer thread");
+            dropper.join().expect("dropper thread");
+
+            assert_eq!(tracker.active(), 0);
+            let late = tracker.completion_signal();
+            for signal in [early, late] {
+                tokio::time::timeout(Duration::from_secs(1), wait_for_shutdown(&signal))
+                    .await
+                    .expect("idle must be signalled whichever side got there first");
+            }
+        }
+    }
+
+    /// The idempotence the racing notification rests on, asserted directly:
+    /// a repeated notify is invisible to subscribers taken before or after it.
+    #[tokio::test]
+    async fn tracker_idle_notification_is_idempotent() {
+        let tracker = TaskTracker::new();
+        let early = tracker.completion_signal();
+        tracker.idle.notify();
+        tracker.idle.notify();
+        let late = tracker.completion_signal();
+
+        for signal in [early, late] {
+            assert!(signal.is_fired());
+            tokio::time::timeout(Duration::from_secs(1), wait_for_shutdown(&signal))
+                .await
+                .expect("a repeated notify must not strand a subscriber");
+        }
+    }
+
+    #[tokio::test]
+    async fn tracker_reports_capacity_exceeded_at_saturation() {
+        let tracker = TaskTracker::new();
+        tracker
+            .state
+            .store(usize::MAX & !TRACKER_CLOSED, Ordering::Relaxed);
+        assert!(matches!(
+            tracker.register(),
+            Err(PluginResourceError::TaskCapacityExceeded)
+        ));
+        assert_eq!(
+            tracker.state.load(Ordering::Relaxed) & TRACKER_CLOSED,
+            0,
+            "a refused registration must not corrupt the closed flag"
+        );
+
+        // Closed still outranks saturation, as it did when both lived under
+        // the lock.
+        tracker.state.store(usize::MAX, Ordering::Relaxed);
+        assert!(matches!(
+            tracker.register(),
+            Err(PluginResourceError::ShuttingDown)
+        ));
+    }
+
+    #[tokio::test]
     async fn connection_scoped_tasks_stop_when_the_generation_is_cancelled() {
         let scope = ConnectionScope::new(77);
         let task_dropped = Arc::new(AtomicBool::new(false));
@@ -5153,6 +5654,424 @@ mod tests {
         client.disconnect().await;
         assert!(!client.core.event_bus.has_handler_for(EventKind::Connected));
         assert!(!client.raw_node_forwarding_enabled());
+    }
+
+    // --- stanza interception ---------------------------------------------
+
+    /// Claims `<vendor:thing>` and records what it was offered.
+    struct RecordingInterceptor {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StanzaInterceptor for RecordingInterceptor {
+        fn intercept(&self, node: &OwnedNodeRef) -> Interception {
+            self.seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(node.tag().to_string());
+            if node.tag() == "vendor:thing" || node.tag() == "receipt" {
+                Interception::Handled
+            } else {
+                Interception::Pass
+            }
+        }
+    }
+
+    struct InterceptingPlugin;
+
+    struct InterceptingApi {
+        seen: Arc<Mutex<Vec<String>>>,
+        registration: PluginInterceptorRegistration,
+        /// A cloned capability handle, which plugin APIs are meant to keep.
+        interception: PluginStanzaInterception,
+    }
+
+    impl ClientPlugin for InterceptingPlugin {
+        type Api = InterceptingApi;
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("intercepting", "0.1.0")
+                .with_capability(PluginCapability::StanzaInterception)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async move {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let interception = context
+                    .stanza_interception()
+                    .ok_or_else(|| anyhow::anyhow!("interception capability missing"))?
+                    .clone();
+                let registration = interception.register(Arc::new(RecordingInterceptor {
+                    seen: Arc::clone(&seen),
+                }))?;
+                Ok(Arc::new(InterceptingApi {
+                    seen,
+                    registration,
+                    interception,
+                }))
+            })
+        }
+    }
+
+    struct PanickingInterceptor;
+
+    impl StanzaInterceptor for PanickingInterceptor {
+        fn intercept(&self, _node: &OwnedNodeRef) -> Interception {
+            panic!("injected stanza interceptor panic");
+        }
+    }
+
+    struct PanickingInterceptorPlugin;
+
+    impl ClientPlugin for PanickingInterceptorPlugin {
+        type Api = PluginInterceptorRegistration;
+
+        fn manifest(&self) -> PluginManifest {
+            PluginManifest::new("panicking-interceptor", "0.1.0")
+                .with_capability(PluginCapability::StanzaInterception)
+        }
+
+        fn install(&self, context: PluginContext) -> BoxFuture<'_, anyhow::Result<Arc<Self::Api>>> {
+            Box::pin(async move {
+                let registration = context
+                    .stanza_interception()
+                    .ok_or_else(|| anyhow::anyhow!("interception capability missing"))?
+                    .register(Arc::new(PanickingInterceptor))?;
+                Ok(Arc::new(registration))
+            })
+        }
+    }
+
+    fn stanza(tag: &'static str) -> Arc<OwnedNodeRef> {
+        crate::test_utils::node_to_owned_ref(&wacore_binary::builder::NodeBuilder::new(tag).build())
+    }
+
+    #[tokio::test]
+    async fn a_plugin_without_the_capability_gets_no_handle() {
+        let client = complete_builder()
+            .await
+            .with_plugin(EventSubscriptionPlugin)
+            .build()
+            .await
+            .expect("event subscription plugin")
+            .into_client();
+        assert!(
+            !client.has_stanza_interceptors(),
+            "a plugin that did not ask cannot intercept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_interceptor_claims_the_stanzas_it_recognizes() {
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+        assert!(client.has_stanza_interceptors());
+        assert!(api.registration.is_active());
+
+        for tag in ["ib", "vendor:thing"] {
+            client.process_node(stanza(tag)).await;
+        }
+        assert_eq!(
+            *api.seen.lock().expect("recorder lock"),
+            ["ib", "vendor:thing"],
+            "offered both; only the second was claimed"
+        );
+
+        let stats = client.plugin_stats().expect("plugin stats");
+        let plugin = stats.plugins.first().expect("plugin stats entry");
+        assert_eq!(plugin.stanza_interceptors, 1);
+        assert_eq!(plugin.stanza_interception_panics, 0);
+        assert_eq!(plugin.health, PluginHealth::Healthy);
+        assert_eq!(
+            client.memory_report().await.plugin_stanza_interceptors,
+            1,
+            "a retained registration is attributable, like every other one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_claim_actually_suppresses_the_built_in_handler() {
+        // The claim has to reach the client, not just be recorded. A <receipt>
+        // is modelled by the built-in pipeline and dispatches an event, so the
+        // absence of that event is what proves the decision was honoured.
+        use wacore::types::events::ChannelEventHandler;
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+        let (handler, events) = ChannelEventHandler::new();
+        client.subscribe_handler(handler).detach();
+
+        client
+            .process_node(crate::test_utils::node_to_owned_ref(
+                &wacore_binary::builder::NodeBuilder::new("receipt")
+                    .attr("from", "5511999998888@s.whatsapp.net")
+                    .attr("id", "RCPT-PLUGIN")
+                    .build(),
+            ))
+            .await;
+
+        assert_eq!(api.seen.lock().expect("recorder lock").len(), 1, "it ran");
+        assert!(
+            events.try_recv().is_err(),
+            "the built-in receipt handler must not have dispatched"
+        );
+
+        // Unclaimed, the same stanza still reaches the built-in handler, so the
+        // assertion above is about the claim and not about the harness.
+        api.registration.unregister();
+        client
+            .process_node(crate::test_utils::node_to_owned_ref(
+                &wacore_binary::builder::NodeBuilder::new("receipt")
+                    .attr("from", "5511999998888@s.whatsapp.net")
+                    .attr("id", "RCPT-PLUGIN-2")
+                    .build(),
+            ))
+            .await;
+        assert!(events.try_recv().is_ok(), "dispatched without the claim");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_plugin_interceptor_passes_instead_of_unwinding() {
+        // The read loop calls this directly, so an unwind would take the
+        // connection with it. Passing leaves the stanza with the client, which
+        // is what would have happened without the plugin at all.
+        let client = complete_builder()
+            .await
+            .with_plugin(PanickingInterceptorPlugin)
+            .build()
+            .await
+            .expect("panicking interceptor plugin")
+            .into_client();
+
+        client.process_node(stanza("receipt")).await;
+
+        let stats = client.plugin_stats().expect("plugin stats");
+        let plugin = stats.plugins.first().expect("plugin stats entry");
+        assert_eq!(plugin.stanza_interception_panics, 1);
+        assert_eq!(
+            plugin.health,
+            PluginHealth::Degraded,
+            "a panicking interceptor is not a healthy plugin"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_registration_unregisters_the_interceptor() {
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+
+        assert!(api.registration.unregister());
+        assert!(!api.registration.is_active());
+        assert!(!api.registration.unregister(), "idempotent");
+        assert!(!client.has_stanza_interceptors());
+
+        client.process_node(stanza("vendor:thing")).await;
+        assert!(
+            api.seen.lock().expect("recorder lock").is_empty(),
+            "an unregistered interceptor is offered nothing"
+        );
+        assert_eq!(
+            client
+                .plugin_stats()
+                .expect("plugin stats")
+                .plugins
+                .first()
+                .expect("plugin stats entry")
+                .stanza_interceptors,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_second_registration_removes_only_that_one() {
+        // `unregister()` is the explicit path; `Drop` is the one a plugin gets
+        // by forgetting the token, and it is the one that has to work.
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+
+        let extra = api
+            .interception
+            .register(Arc::new(RecordingInterceptor {
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }))
+            .expect("a second interceptor");
+        assert_eq!(active_interceptors(&client), 2);
+
+        drop(extra);
+        assert_eq!(
+            active_interceptors(&client),
+            1,
+            "dropping the token removed its own registration and no other"
+        );
+        assert!(api.registration.is_active());
+        assert!(client.has_stanza_interceptors());
+    }
+
+    fn active_interceptors(client: &Arc<Client>) -> u64 {
+        client
+            .plugin_stats()
+            .expect("plugin stats")
+            .plugins
+            .first()
+            .expect("plugin stats entry")
+            .stanza_interceptors
+    }
+
+    #[tokio::test]
+    async fn shutdown_invalidates_a_retained_registration() {
+        // The plugin API holds the token, so nothing else would drop it. A
+        // client that is shutting down must not still be asking a plugin what
+        // to do with its stanzas.
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+
+        client.disconnect().await;
+        assert!(!api.registration.is_active());
+        assert!(!client.has_stanza_interceptors());
+    }
+
+    #[tokio::test]
+    async fn registering_after_shutdown_is_refused() {
+        let client = complete_builder()
+            .await
+            .with_plugin(InterceptingPlugin)
+            .build()
+            .await
+            .expect("intercepting plugin")
+            .into_client();
+        let api = client
+            .plugin::<InterceptingPlugin>()
+            .expect("interception API");
+
+        client.disconnect().await;
+        assert!(matches!(
+            api.interception.register(Arc::new(PanickingInterceptor)),
+            Err(PluginResourceError::ShuttingDown)
+        ));
+        assert!(!client.has_stanza_interceptors());
+    }
+
+    #[tokio::test]
+    async fn each_gated_kind_holds_its_own_lease() {
+        // Subscribing to a gated kind is not enough on its own: the client only
+        // produces those events while a lease is held, so a subscription that
+        // acquired the wrong one would deliver nothing and look correct.
+        let client = complete_builder()
+            .await
+            .with_plugin(EventSubscriptionPlugin)
+            .build()
+            .await
+            .expect("event subscription plugin")
+            .into_client();
+        let subscription = client
+            .plugin::<EventSubscriptionPlugin>()
+            .expect("subscription API");
+
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::DecryptedPayload]))
+                .expect("interest update")
+        );
+        assert!(client.decrypted_payload_forwarding_enabled());
+        assert!(
+            !client.raw_node_forwarding_enabled(),
+            "the kind that is no longer wanted releases its own lease"
+        );
+        assert!(
+            !client.enc_decrypt_failed_forwarding_enabled(),
+            "the success half of a decrypt must not turn on the failure half"
+        );
+
+        // All at once, then each removed on its own.
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[
+                    EventKind::RawNode,
+                    EventKind::DecryptedPayload,
+                    EventKind::SentFrame,
+                    EventKind::EncDecryptFailed,
+                ]))
+                .expect("interest update")
+        );
+        assert!(client.raw_node_forwarding_enabled());
+        assert!(client.decrypted_payload_forwarding_enabled());
+        assert!(client.sent_frame_forwarding_enabled());
+        assert!(client.enc_decrypt_failed_forwarding_enabled());
+
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::RawNode]))
+                .expect("interest update")
+        );
+        assert!(client.raw_node_forwarding_enabled(), "kept");
+        assert!(!client.decrypted_payload_forwarding_enabled(), "released");
+        assert!(!client.sent_frame_forwarding_enabled(), "released");
+        assert!(!client.enc_decrypt_failed_forwarding_enabled(), "released");
+
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::SentFrame]))
+                .expect("interest update")
+        );
+        assert!(client.sent_frame_forwarding_enabled());
+        assert!(!client.raw_node_forwarding_enabled(), "released");
+
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::EncDecryptFailed]))
+                .expect("interest update")
+        );
+        assert!(client.enc_decrypt_failed_forwarding_enabled());
+        assert!(!client.sent_frame_forwarding_enabled(), "released");
+        assert!(
+            !client.decrypted_payload_forwarding_enabled(),
+            "and the failure half must not drag the success half back in"
+        );
+
+        assert!(subscription.unsubscribe());
+        assert!(!client.raw_node_forwarding_enabled());
+        assert!(!client.decrypted_payload_forwarding_enabled());
+        assert!(!client.sent_frame_forwarding_enabled());
+        assert!(!client.enc_decrypt_failed_forwarding_enabled());
     }
 
     #[tokio::test]

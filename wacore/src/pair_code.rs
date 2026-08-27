@@ -95,6 +95,21 @@ const PAIR_CODE_MAX_PRIMARY_HELLO_ATTEMPTS: u32 = 3;
 /// goes quiet — no error ever reaches the companion.
 const PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS: u64 = 60;
 
+/// How long the `companion_finish` IQ waits for its own answer.
+///
+/// Deliberately inside
+/// [`PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS`], which is the whole
+/// budget stage 2 has: a refusal that only landed after that window would be
+/// reported against a flow already written off, so the request has to be able
+/// to fail while the flow it belongs to is still the current one. The answer
+/// itself is the server acknowledging the bundle, not the primary opening it,
+/// so it arrives in one round trip or not at all.
+const PAIR_CODE_COMPANION_FINISH_IQ_TIMEOUT_SECS: u64 = 30;
+const _: () = assert!(
+    PAIR_CODE_COMPANION_FINISH_IQ_TIMEOUT_SECS < PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS,
+    "a companion_finish refusal has to land while the flow it belongs to is still the current one"
+);
+
 fn build_id_and_display(
     id: CompanionWebClientType,
     props: &wa::DeviceProps,
@@ -478,7 +493,7 @@ impl PairCodeUtils {
     pub fn parse_companion_hello_response(node: &NodeRef<'_>) -> Option<Vec<u8>> {
         node.get_optional_child_by_tag(&["link_code_companion_reg"])
             .and_then(|n| n.get_optional_child_by_tag(&["link_code_pairing_ref"]))
-            .and_then(|n| match n.content.as_deref() {
+            .and_then(|n| match n.content.as_ref() {
                 Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
                 _ => None,
             })
@@ -618,15 +633,29 @@ impl PairCodeUtils {
     pub fn primary_hello_pair_success_timeout() -> std::time::Duration {
         std::time::Duration::from_secs(PAIR_CODE_PRIMARY_HELLO_PAIR_SUCCESS_TIMEOUT_SECS)
     }
+
+    /// How long the `companion_finish` IQ waits for its answer.
+    pub fn companion_finish_iq_timeout() -> std::time::Duration {
+        std::time::Duration::from_secs(PAIR_CODE_COMPANION_FINISH_IQ_TIMEOUT_SECS)
+    }
 }
 
-/// How the server refused a `companion_hello`, as a matchable status.
+/// How the server refused a pair-code request, as a matchable status.
 ///
 /// The five named variants are the complete set WA Web's own response parser
 /// accepts (`WASmaxInMdIqMixinErrors.parseIqMixinErrors`, reached from
 /// `WASmaxInMdCompanionHelloResponseError`); anything else makes its RPC throw
 /// "unknown error". They exist so a consumer can branch on the refusal instead
 /// of matching the formatted message, which is not a stable surface.
+///
+/// Both stages report through this, though they were read off `companion_hello`
+/// and the `companion_finish` parser is narrower — `WASmaxInMdCompanionFinishErrors`
+/// admits only `bad-request` and `internal-server-error`, and WA Web shows its
+/// generic failure for anything else. A code outside that pair is still
+/// classified here rather than discarded: what a consumer does about a refusal
+/// follows from the code, which is one namespace across both requests, and
+/// answering "nothing was refused" to a refusal we can read would be worse than
+/// naming it.
 ///
 /// The numbers are the `code` attribute, and each is the enum's whole wire form
 /// — [`code()`](Self::code) is what `Serialize` emits and what `From<i32>` reads

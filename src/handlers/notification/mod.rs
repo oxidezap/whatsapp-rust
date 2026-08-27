@@ -4,6 +4,8 @@ use crate::types::events::Event;
 use async_trait::async_trait;
 use log::debug;
 use std::sync::Arc;
+use wacore::stanza::wire_tags::NotificationType;
+use wacore::stanza::wire_tags::StanzaTag;
 use wacore_binary::OwnedNodeRef;
 
 /// Handler for `<notification>` stanzas.
@@ -20,7 +22,7 @@ pub struct NotificationHandler;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StanzaHandler for NotificationHandler {
     fn tag(&self) -> &'static str {
-        "notification"
+        StanzaTag::Notification.as_str()
     }
 
     async fn handle(
@@ -44,37 +46,50 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
     let nr = node.get();
     let notification_type = nr.attrs().optional_string("type");
 
-    match notification_type.as_deref().unwrap_or_default() {
-        "encrypt" => handle_encrypt_notification(client, nr).await,
-        "server_sync" => handle_server_sync_notification(client, nr),
-        "account_sync" => handle_account_sync_notification(client, nr).await,
-        "devices" => handle_devices_notification(client, nr).await,
-        "link_code_companion_reg" => {
+    let parsed = notification_type
+        .as_deref()
+        .and_then(|t| NotificationType::try_from(t).ok());
+
+    match parsed {
+        Some(NotificationType::Encrypt) => handle_encrypt_notification(client, nr).await,
+        Some(NotificationType::ServerSync) => handle_server_sync_notification(client, nr),
+        Some(NotificationType::AccountSync) => handle_account_sync_notification(client, nr).await,
+        Some(NotificationType::Devices) => handle_devices_notification(client, nr).await,
+        Some(NotificationType::LinkCodeCompanionReg) => {
             crate::pair_code::handle_pair_code_notification(client, nr).await;
         }
-        "companion_reg_refresh" => handle_companion_reg_refresh(client, nr).await,
-        "business" => handle_business_notification(client, nr).await,
-        "picture" => handle_picture_notification(client, nr),
-        "privacy_token" => handle_privacy_token_notification(client, nr).await,
-        "status" => handle_status_notification(client, nr),
-        "contacts" => handle_contacts_notification(client, nr).await,
-        "w:gp2" => handle_group_notification(client, Arc::clone(&node)).await,
-        "disappearing_mode" => handle_disappearing_mode_notification(client, nr),
-        "newsletter" => handle_newsletter_notification(client, Arc::clone(&node)),
-        "mex" => handle_mex_notification(client, nr),
-        crate::passkey::flow::NOTIF_PASSKEY_REQUEST => {
-            crate::passkey::flow::handle_passkey_notification(client, Arc::clone(&node)).await;
+        Some(NotificationType::CompanionRegRefresh) => {
+            handle_companion_reg_refresh(client, nr).await
         }
-        crate::passkey::flow::NOTIF_PASSKEY_CONTINUATION => {
-            crate::passkey::flow::handle_passkey_continuation(client, Arc::clone(&node)).await;
+        Some(NotificationType::Business) => handle_business_notification(client, nr).await,
+        Some(NotificationType::Picture) => handle_picture_notification(client, nr),
+        Some(NotificationType::PrivacyToken) => handle_privacy_token_notification(client, nr).await,
+        Some(NotificationType::Status) => handle_status_notification(client, nr),
+        Some(NotificationType::Contacts) => handle_contacts_notification(client, nr).await,
+        Some(NotificationType::WGp2) => handle_group_notification(client, Arc::clone(&node)).await,
+        Some(NotificationType::DisappearingMode) => {
+            handle_disappearing_mode_notification(client, nr)
         }
-        "mediaretry" => {
+        Some(NotificationType::Newsletter) => {
+            handle_newsletter_notification(client, Arc::clone(&node))
+        }
+        Some(NotificationType::Mex) => handle_mex_notification(client, nr),
+        Some(NotificationType::MediaRetry) => {
             debug!(
                 "Received mediaretry notification for msg {}",
                 nr.attrs().optional_string("id").unwrap_or_default()
             );
         }
-        other => {
+        // A type the core does not model itself. An attached subsystem may
+        // claim it; otherwise it is one this client does not act on, or does
+        // not model at all, and both reach the consumer as a raw event.
+        _ => {
+            if let Some(parsed) = parsed
+                && crate::client::subsystem::dispatch_notification(client, parsed, &node).await
+            {
+                return;
+            }
+            let other = notification_type.as_deref().unwrap_or_default();
             debug!("Unhandled notification type '{other}', dispatching raw event");
             client
                 .core
@@ -137,6 +152,68 @@ mod tests {
             .persistence_manager
             .get_device_snapshot()
             .adv_secret_key
+    }
+
+    /// The failure path of the seam: a type the core does not
+    /// model and no attached subsystem claims reaches the consumer whole
+    /// instead of being dropped. That is what an operation belonging to a
+    /// subsystem this build left out looks like from outside.
+    #[tokio::test]
+    async fn an_unclaimed_notification_type_reaches_the_consumer_raw() {
+        use crate::types::events::EventHandler;
+
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+
+        let notif = NodeBuilder::new("notification")
+            .attr("type", NotificationType::Psa.as_str())
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "psa-1")
+            .build();
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert!(
+            collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::Notification(_))),
+            "an unclaimed notification type must reach the consumer as a raw event"
+        );
+    }
+
+    /// A type a subsystem claims must not be shadowed by a core arm. The seam
+    /// is consulted only in the fallthrough, so an arm added here later would
+    /// take the stanza and the subsystem would silently stop seeing it. The
+    /// counter is what separates the two: suppressing the raw event alone
+    /// proves nothing, since a shadowing arm suppresses it too. `from` is not
+    /// the server, which the handlers reject, so this observes routing without
+    /// running the subsystem's work. Vacuous when no subsystem is attached, so
+    /// the all-features job is where it has teeth.
+    #[tokio::test]
+    async fn a_claimed_notification_type_is_not_shadowed_by_a_core_arm() {
+        use crate::client::subsystem::{CLAIMS, DISPATCHED};
+
+        let client = create_test_client().await;
+
+        for claimed in CLAIMS {
+            for notification_type in *claimed {
+                let before = DISPATCHED.with(|dispatched| dispatched.get());
+                let notif = NodeBuilder::new("notification")
+                    .attr("type", notification_type.as_str())
+                    .attr("from", "12025550111@s.whatsapp.net")
+                    .attr("id", "claimed-1")
+                    .build();
+                handle_notification_impl(&client, node_to_arc(notif)).await;
+
+                assert!(
+                    DISPATCHED.with(|dispatched| dispatched.get()) > before,
+                    "{notification_type:?} never reached its subsystem, so a core arm took it"
+                );
+            }
+        }
     }
 
     #[tokio::test]

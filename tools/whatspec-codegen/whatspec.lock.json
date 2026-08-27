@@ -1,0 +1,19 @@
+{
+  "repo": "https://github.com/oxidezap/whatspec",
+  "rev": "12dbeeb89be46d823902aa73859373440e0eb014",
+  "waVersion": "2.3000.1045368834",
+  "files": {
+    "abprops/index.json": "sha256:5fb1f19c2547f8617f719268276016336aa04949fea91690773015a250a526f3",
+    "appstate/index.json": "sha256:5c3b3881a6eb307436496236f981a466c195bd8f0a19a719eb6ed47eff0af2ed",
+    "enums/index.json": "sha256:7eda6cfd16fd0e5b927e797b01d891ab2296cedd23e89635cb47877dffe84a21",
+    "iq/index.json": "sha256:b814494668a0bf36839679dff0cb9f263238391378b57b90ad8bfae7f70fcffa",
+    "manifest.json": "sha256:222c5a1047b0e21e20f4f02371f3328d179cd0dbb374f98e555107c3f1966bb2",
+    "mex/index.json": "sha256:2f94dad2691eb9036fea7a2685acf3340364ba2a333df88299145933847ddb4a",
+    "notif/index.json": "sha256:0002dd3f9e74a9ffcc37f0bca4772abcb9f6efdcdfcbceea80d245ca691729fa",
+    "proto/WAProto.proto": "sha256:f3da4ba028402ea225747dc40247a5d55473012da9c4ef0c4b9de5c443117e2f",
+    "srvreq/index.json": "sha256:d8eff4e11cdbb4d1f98daccde3bc90756ff0606853d2d547cde4d90742c0d544",
+    "stanza/index.json": "sha256:71bf4cf68551b9a70a9eca21e78ac33f02c13925a039769780f8da3bc6c016ab",
+    "tokens/index.json": "sha256:2c21ee752449f0d12d6ea3b10897597416013eb14e36e12bad815f266985c3c7",
+    "wam/index.json": "sha256:39e3ffcac131264d99b368a951a94c1fc3ff44091f837250d70fa445c2948736"
+  }
+}

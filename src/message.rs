@@ -1,4 +1,5 @@
 use crate::client::Client;
+use crate::types::events::EncDecryptFailureReason;
 use crate::types::events::Event;
 use crate::types::message::MessageInfo;
 use log::{debug, warn};
@@ -71,28 +72,83 @@ pub(crate) struct EncPayload {
     pub ciphertext: bytes::Bytes,
     pub enc_type: EncType,
     pub padding_version: u8,
+    /// Position in the order [`message_enc_nodes_for_device`] yields, counting
+    /// from zero: direct `<enc>` children first, then this device's under
+    /// `<participants><to>`.
+    ///
+    /// Recorded during classification because nothing downstream can recover
+    /// it: payloads are split into per-kind buckets and encs that produce no
+    /// payload are skipped, so a position within a bucket is not a position in
+    /// the stanza.
+    pub enc_index: usize,
+    /// The node's `state` attribute, verbatim. Absent on ordinary traffic, so
+    /// the common case allocates nothing.
+    pub state: Option<String>,
+    /// The node's `session_type` attribute, verbatim. Absent on ordinary
+    /// traffic, so the common case allocates nothing.
+    pub session_type: Option<String>,
 }
 
 impl EncPayload {
-    fn from_parts(ciphertext: bytes::Bytes, enc_node: &NodeRef<'_>) -> Option<Self> {
+    fn from_parts(
+        ciphertext: bytes::Bytes,
+        enc_node: &NodeRef<'_>,
+        enc_index: usize,
+    ) -> Option<Self> {
         let enc_type = EncType::from_wire(enc_node.attrs().optional_string("type")?.as_ref())?;
         let padding_version = enc_node.attrs().optional_u64("v").unwrap_or(2) as u8;
+        let mut attrs = enc_node.attrs();
         Some(Self {
             ciphertext,
             enc_type,
             padding_version,
+            enc_index,
+            state: attrs.optional_string("state").map(|s| s.into_owned()),
+            session_type: attrs
+                .optional_string("session_type")
+                .map(|s| s.into_owned()),
         })
     }
 
     /// Zero-copy extraction from an OwnedNodeRef.
-    pub(crate) fn from_owned_node(owner: &OwnedNodeRef, enc_node: &NodeRef<'_>) -> Option<Self> {
-        Self::from_parts(owner.slice_bytes(enc_node.content_bytes()?), enc_node)
+    pub(crate) fn from_owned_node(
+        owner: &OwnedNodeRef,
+        enc_node: &NodeRef<'_>,
+        enc_index: usize,
+    ) -> Option<Self> {
+        Self::from_parts(
+            owner.slice_bytes(enc_node.content_bytes()?),
+            enc_node,
+            enc_index,
+        )
     }
 
     /// Copying extraction from a NodeRef (used in tests where there's no OwnedNodeRef).
     #[cfg(test)]
-    pub(crate) fn from_node_ref(node: &NodeRef<'_>) -> Option<Self> {
-        Self::from_parts(bytes::Bytes::copy_from_slice(node.content_bytes()?), node)
+    pub(crate) fn from_node_ref(node: &NodeRef<'_>, enc_index: usize) -> Option<Self> {
+        Self::from_parts(
+            bytes::Bytes::copy_from_slice(node.content_bytes()?),
+            node,
+            enc_index,
+        )
+    }
+}
+
+/// The `<enc>` attributes this build carries to the consumer without acting on
+/// them. Borrowed from the payload they came from, so passing them costs
+/// nothing on a node that declared neither.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EncNodeAnnotations<'a> {
+    pub state: Option<&'a str>,
+    pub session_type: Option<&'a str>,
+}
+
+impl EncPayload {
+    pub(crate) fn annotations(&self) -> EncNodeAnnotations<'_> {
+        EncNodeAnnotations {
+            state: self.state.as_deref(),
+            session_type: self.session_type.as_deref(),
+        }
     }
 }
 
@@ -128,8 +184,16 @@ enum MigrationDecryptResult {
     Decrypted,
     /// Server redelivered an already-processed message.
     Duplicate,
-    /// Migration didn't apply or still failed; caller sends a retry receipt.
-    NotDecrypted,
+    /// Migration didn't apply, or applied and the retry still failed; the
+    /// caller sends a retry receipt either way.
+    ///
+    /// `Some` carries the terminal cause when a migration actually ran and its
+    /// retry decrypt failed. Without it the caller would report the error that
+    /// sent it here — typically `NoSession` — for a message whose session was
+    /// in fact found and whose retry then failed a MAC or a store read.
+    /// `None` means nothing was migrated, so the caller's own error still is
+    /// the terminal one.
+    NotDecrypted(Option<EncDecryptFailureReason>),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -195,6 +259,11 @@ struct DeferredPlaintext {
     enc_type: &'static str,
     plaintext: Vec<u8>,
     padding_version: u8,
+    /// Which `<enc>` in the stanza produced this — [`EncPayload::enc_index`],
+    /// carried through because the buffer drains after the decrypt loop.
+    enc_index: usize,
+    state: Option<String>,
+    session_type: Option<String>,
 }
 
 fn should_process_skmsg_after_session(
@@ -230,6 +299,85 @@ fn decrypt_fail_log_level(mode: crate::types::events::DecryptFailMode) -> log::L
     match mode {
         crate::types::events::DecryptFailMode::Hide => log::Level::Debug,
         crate::types::events::DecryptFailMode::Show => log::Level::Warn,
+    }
+}
+
+/// Errors libsignal raises while turning bytes into a message of their declared
+/// type: too short to hold the signature, a version this build predates or does
+/// not know, or a body that is not the protobuf it claims. No key material is
+/// used to reach any of them.
+///
+/// Shared by the session and group arms so one libsignal error cannot be
+/// reported as a malformed envelope on one path and an unclassified failure on
+/// the other. `UnrecognizedMessageVersion` is deliberately absent: it is the
+/// *state* mismatch `group_decrypt` raises after parsing, not a parse failure —
+/// `UnrecognizedCiphertextVersion` is that one.
+fn is_malformed_envelope_error(e: &SignalProtocolError) -> bool {
+    matches!(
+        e,
+        SignalProtocolError::CiphertextMessageTooShort(_)
+            | SignalProtocolError::LegacyCiphertextVersion(_)
+            | SignalProtocolError::UnrecognizedCiphertextVersion(_)
+            | SignalProtocolError::InvalidProtobufEncoding
+    )
+}
+
+/// Cause reported for a libsignal error the decrypt arms do not name themselves.
+///
+/// Shared by the session catch-all and the group arm so the same error cannot be
+/// classified two ways. `BackendError` is local storage failing to answer — the
+/// store adapter wraps every backend error in it — and not the ciphertext
+/// failing: reporting it as a cryptographic error would blame the peer for our
+/// own disk, and corrupt any per-peer health signal built on this event.
+fn signal_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
+    if is_malformed_envelope_error(e) {
+        EncDecryptFailureReason::MalformedCiphertext
+    } else if matches!(e, SignalProtocolError::BackendError(_, _)) {
+        EncDecryptFailureReason::StorageFailure
+    } else if matches!(e, SignalProtocolError::KeyAgreementFailed(_)) {
+        // "the active crypto provider failed the key agreement" — our provider,
+        // not the sender's bytes, which were never judged.
+        EncDecryptFailureReason::LocalCryptoFailure
+    } else if e.is_stored_session_corruption() {
+        // A stored `SessionRecord` that decoded and then would not yield usable
+        // state. The predicate lives in libsignal because the distinction is
+        // drawn on `InvalidSessionStructure`'s message, and only the crate that
+        // writes those messages can keep the two in step.
+        EncDecryptFailureReason::StorageFailure
+    } else if matches!(e, SignalProtocolError::InvalidSenderKeySession) {
+        // A sender-key record that loaded but does not hold usable state: no
+        // chain key, a signing key that will not parse, or a chain whose derived
+        // key/IV the cipher rejects. Every site `group_decrypt` can reach it
+        // from is reading our stored record, which is why libsignal's own log
+        // there says the state is corrupt. The peer's copy is judged by
+        // `SignatureValidationFailed` and `InvalidMessage` instead.
+        EncDecryptFailureReason::StorageFailure
+    } else if matches!(e, SignalProtocolError::UnrecognizedMessageVersion(_)) {
+        // The group arm reaches this one through `group_decrypt_retry_reason`
+        // and calls it an invalid message. Naming it here too keeps a session
+        // `<enc>` and an `skmsg` from reporting the same rejection differently.
+        EncDecryptFailureReason::InvalidMessage
+    } else {
+        EncDecryptFailureReason::SignalError
+    }
+}
+
+/// Cause for a terminal error on the 1:1 session path, matching what the arms
+/// of `process_session_enc_batch` report for the same libsignal errors.
+///
+/// Used where an error reaches a reporting site that has no arm of its own —
+/// the PN→LID migration's retry decrypt — so a migrated session that then fails
+/// a MAC is not reported under the error that opened the migration.
+fn session_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
+    match e {
+        SignalProtocolError::SessionNotFound(_) => EncDecryptFailureReason::NoSession,
+        SignalProtocolError::BadMac(_) => EncDecryptFailureReason::BadMac,
+        SignalProtocolError::InvalidMessage(_, _) => EncDecryptFailureReason::InvalidMessage,
+        SignalProtocolError::InvalidPreKeyId | SignalProtocolError::InvalidSignedPreKeyId => {
+            EncDecryptFailureReason::UnknownPreKey
+        }
+        SignalProtocolError::UntrustedIdentity(_) => EncDecryptFailureReason::UntrustedIdentity,
+        other => signal_error_reason(other),
     }
 }
 

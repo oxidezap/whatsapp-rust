@@ -35,13 +35,15 @@ pub fn notification_timestamp(node: &Node) -> chrono::DateTime<chrono::Utc> {
 pub fn parse_disappearing_mode(node: &Node) -> Option<(u32, u64)> {
     let dm_node = node.get_optional_child("disappearing_mode")?;
     let mut dm_attrs = dm_node.attrs();
+    // Read through the numeric accessors, the way `notification_timestamp`
+    // above already does, instead of handing a `Cow<str>` back to the call site
+    // to parse: same work, one less place that has to know the attribute is a
+    // number.
     let duration = dm_attrs
-        .optional_string("duration")
-        .and_then(|s| s.parse::<u32>().ok())
+        .optional_u64("duration")
+        .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(0);
-    let setting_timestamp = dm_attrs
-        .optional_string("t")
-        .and_then(|s| s.parse::<u64>().ok())?;
+    let setting_timestamp = dm_attrs.optional_u64("t")?;
     Some((duration, setting_timestamp))
 }
 

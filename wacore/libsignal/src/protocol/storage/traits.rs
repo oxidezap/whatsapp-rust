@@ -27,14 +27,28 @@ pub enum Direction {
 }
 
 /// The result of saving a new identity key for a protocol address.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, derive_more::TryFrom)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
-#[try_from(repr)]
 pub enum IdentityChange {
     /// The protocol address didn't have an identity key or had the same key.
     NewOrUnchanged,
     /// The new identity key replaced a different key for the protocol address.
     ReplacedExisting,
+}
+
+// `isize` rather than the narrower `u8` the variants fit in: `repr(C)` leaves
+// the discriminant type unspecified, so this mirrors what a repr-driven derive
+// falls back to and keeps the conversion callable with the same argument.
+impl TryFrom<isize> for IdentityChange {
+    type Error = crate::core::UnknownDiscriminant<isize>;
+
+    fn try_from(value: isize) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::NewOrUnchanged),
+            1 => Ok(Self::ReplacedExisting),
+            _ => Err(crate::core::UnknownDiscriminant { value }),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

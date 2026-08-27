@@ -715,7 +715,7 @@ pub(crate) fn project_device_list_response(
             .key_index
             .and_then(|key_index| key_index.signed_key_index_bytes)
             .filter(|bytes| !bytes.is_empty());
-        let parsed_devices = device_list
+        let mut parsed_devices = device_list
             .devices
             .into_iter()
             .map(|device| {
@@ -724,19 +724,38 @@ pub(crate) fn project_device_list_response(
             })
             .collect::<Vec<_>>();
 
+        // Companions we cannot validate are dropped; the identity is not. WA
+        // Web's `handleOmittedResult` collapses such a record to the primary
+        // (`devices = [{id: DEFAULT_DEVICE_ID, keyIndex: 0}]`) and its fan-out
+        // falls back to the bare user for any wid it has no list for. Losing
+        // the primary here takes the user out of every group send's sender-key
+        // targets and out of the phash, where nothing downstream can see it.
+        let mut phash = device_list.hash.map(|hash| hash.to_string());
         let has_companion = parsed_devices.iter().any(|device| device.device != 0);
         if has_companion && key_index_bytes.is_none() {
+            parsed_devices.retain(|device| device.device == 0);
+            if parsed_devices.is_empty() {
+                warn!(
+                    target: "usync",
+                    "User {user_jid} has no signedKeyIndexBytes and no primary device, skipping"
+                );
+                continue;
+            }
             warn!(
                 target: "usync",
-                "User {user_jid} has companion devices but no signedKeyIndexBytes, skipping"
+                "User {user_jid} has companion devices but no signedKeyIndexBytes; keeping only the primary"
             );
-            continue;
+            // The server's hash covers the devices it sent, not the ones kept.
+            // Storing it would make the next query claim this truncated list is
+            // current and let the server omit the user, stranding the dropped
+            // companions.
+            phash = None;
         }
 
         device_lists.push(UserDeviceList {
             user: user_jid,
             devices: parsed_devices,
-            phash: device_list.hash.map(|hash| hash.to_string()),
+            phash,
             key_index_bytes,
         });
     }
@@ -1606,6 +1625,91 @@ mod tests {
             assert_eq!(result.device_lists.len(), 1);
             assert_eq!(result.device_lists[0].user.user, "9876543210");
         }
+    }
+
+    /// A user whose companions cannot be validated still has a primary, and the
+    /// primary is the device that carries the group sender key. WA Web's
+    /// `handleOmittedResult` collapses such a record to
+    /// `devices = [{id: DEFAULT_DEVICE_ID, keyIndex: 0}]` rather than dropping
+    /// the identity, and `getFanOutList` falls back to the bare user wid for any
+    /// wid it has no device list for ("no device for N wids => primary").
+    /// Dropping the whole user takes them out of the SKDM target set and out of
+    /// the phash, so nothing downstream can tell they were ever expected.
+    #[test]
+    fn user_without_key_index_keeps_its_primary() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let spec = DeviceListSpec::new(vec![jid], "test-sid");
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "1234567890@s.whatsapp.net")
+                        .children([NodeBuilder::new("devices")
+                            .children([NodeBuilder::new("device-list")
+                                .attr("hash", "2:abcdef123456")
+                                .children([
+                                    NodeBuilder::new("device").attr("id", "0").build(),
+                                    NodeBuilder::new("device").attr("id", "33").build(),
+                                ])
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(
+            result.device_lists.len(),
+            1,
+            "an unvalidatable companion must not take its user's primary with it"
+        );
+        let user = &result.device_lists[0];
+        assert_eq!(user.user.user, "1234567890");
+        assert_eq!(
+            user.devices.iter().map(|d| d.device).collect::<Vec<_>>(),
+            [0],
+            "only the primary survives: the companion has no signedKeyIndexBytes to validate it"
+        );
+        assert!(
+            user.key_index_bytes.is_none(),
+            "no key index was returned, so none is invented"
+        );
+        assert!(
+            user.phash.is_none(),
+            "the server's hash describes the devices it sent, not the ones kept: \
+             persisting it would let a later query call this truncated list current"
+        );
+    }
+
+    /// The degradation above has a floor: a device list that does not even carry
+    /// a primary says nothing usable, so the user is still skipped rather than
+    /// persisted as an empty record.
+    #[test]
+    fn user_without_key_index_or_primary_is_still_skipped() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let spec = DeviceListSpec::new(vec![jid], "test-sid");
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", "1234567890@s.whatsapp.net")
+                        .children([NodeBuilder::new("devices")
+                            .children([NodeBuilder::new("device-list")
+                                .children([NodeBuilder::new("device").attr("id", "33").build()])
+                                .build()])
+                            .build()])
+                        .build()])
+                    .build()])
+                .build()])
+            .build();
+
+        let result = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert!(result.device_lists.is_empty());
     }
 
     #[test]

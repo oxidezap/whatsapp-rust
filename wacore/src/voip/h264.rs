@@ -142,19 +142,110 @@ pub fn au_has_idr(au: &[u8]) -> bool {
     split_annexb(au).any(|nal| nal_unit_type(nal) == NAL_TYPE_IDR)
 }
 
+/// Capacity a [`PacketizedAu`] keeps between frames. A 1080p keyframe packs into tens of KB,
+/// so this holds an ordinary stream's working set without ever reallocating; an access unit
+/// may be up to [`H264_MAX_AU_BYTES`] (4 MiB), and since the send path keeps one buffer for
+/// the whole call, a single outlier frame would otherwise pin that much per video pipeline
+/// until the call ended. `Vec<Vec<u8>>` did not have this problem: clearing it dropped every
+/// fragment's allocation outright.
+const PACKETIZED_AU_RETAINED_BYTES: usize = 128 * 1024;
+
+/// Payload-count sibling of [`PACKETIZED_AU_RETAINED_BYTES`]: no fragment exceeds
+/// `H264_SINGLE_NAL_MAX`, so this many boundaries cover the retained byte budget.
+const PACKETIZED_AU_RETAINED_PAYLOADS: usize =
+    PACKETIZED_AU_RETAINED_BYTES / H264_SINGLE_NAL_MAX + 1;
+
+/// One access unit's RTP payloads, packed back-to-back in a single buffer.
+///
+/// The send path holds one across the whole call and hands it to [`packetize_au`] per
+/// frame: clearing keeps both allocations, so a steady stream packetizes with zero
+/// allocations after the first access unit. A `Vec<Vec<u8>>` instead allocates and frees
+/// one buffer per fragment -- roughly 40 per 1080p keyframe, ~1200/s at 30 fps.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct PacketizedAu {
+    data: Vec<u8>,
+    /// End offset of each payload within `data`; a payload starts where the previous one
+    /// ended (0 for the first), so the boundaries need one `usize` per payload, not two.
+    ends: Vec<usize>,
+}
+
+impl PacketizedAu {
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        let end = *self.ends.get(index)?;
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        self.data.get(start..end)
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        (0..self.len()).map(|i| self.get(i).unwrap_or_default())
+    }
+
+    /// Drop the previous access unit's payloads, keeping both allocations.
+    fn clear(&mut self) {
+        self.data.clear();
+        self.ends.clear();
+    }
+
+    /// Hand back the capacity an outlier frame grew, instead of pinning it for the rest of
+    /// the call. Runs once the frame is packed, so it keys on what that frame actually
+    /// needed: a stream that stays large never shrinks (and so never regrows), while one
+    /// that spikes and returns to normal releases the excess on the very next frame.
+    fn release_outlier_capacity(&mut self) {
+        if self.data.len() <= PACKETIZED_AU_RETAINED_BYTES
+            && self.data.capacity() > PACKETIZED_AU_RETAINED_BYTES
+        {
+            self.data.shrink_to(PACKETIZED_AU_RETAINED_BYTES);
+        }
+        if self.ends.len() <= PACKETIZED_AU_RETAINED_PAYLOADS
+            && self.ends.capacity() > PACKETIZED_AU_RETAINED_PAYLOADS
+        {
+            self.ends.shrink_to(PACKETIZED_AU_RETAINED_PAYLOADS);
+        }
+    }
+
+    /// Bytes currently reserved for payload storage. Test-only: the retention behaviour above
+    /// is invisible through the payload accessors, so this is what pins it.
+    #[cfg(test)]
+    fn payload_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// Close the payload whose bytes were just appended to `data`, recording its boundary.
+    fn finish_payload(&mut self) {
+        self.ends.push(self.data.len());
+    }
+}
+
+impl core::ops::Index<usize> for PacketizedAu {
+    type Output = [u8];
+
+    fn index(&self, index: usize) -> &[u8] {
+        self.get(index).expect("payload index out of range")
+    }
+}
+
 /// Packetize one Annex-B access unit into WhatsApp RTP payloads (no RTP headers): each
 /// media NAL goes out as a single-NAL payload when it fits, or a run of FU-A
 /// fragments otherwise. Encoder-only AUDs are omitted because WhatsApp's H.264
 /// decoder requires SPS/PPS to lead an IDR frame. `out` is cleared and refilled
 /// so the send path can reuse one buffer per AU.
-pub fn packetize_au(au: &[u8], out: &mut Vec<Vec<u8>>) {
+pub fn packetize_au(au: &[u8], out: &mut PacketizedAu) {
     out.clear();
     for nal in split_annexb(au) {
         if nal_unit_type(nal) == NAL_TYPE_AUD {
             continue;
         }
         if nal.len() <= H264_SINGLE_NAL_MAX {
-            out.push(nal.to_vec());
+            out.data.extend_from_slice(nal);
+            out.finish_payload();
             continue;
         }
         let indicator = (nal[0] & 0xe0) | NAL_TYPE_FU_A;
@@ -169,13 +260,13 @@ pub fn packetize_au(au: &[u8], out: &mut Vec<Vec<u8>>) {
             if i == n_frags - 1 {
                 fu_header |= 0x40; // E
             }
-            let mut pkt = Vec::with_capacity(2 + chunk.len());
-            pkt.push(indicator);
-            pkt.push(fu_header);
-            pkt.extend_from_slice(chunk);
-            out.push(pkt);
+            out.data.push(indicator);
+            out.data.push(fu_header);
+            out.data.extend_from_slice(chunk);
+            out.finish_payload();
         }
     }
+    out.release_outlier_capacity();
 }
 
 /// Access units completed but not yet returned can briefly exceed one when a
@@ -434,12 +525,12 @@ mod tests {
 
     /// Drive the depacketizer with consecutive sequence numbers (the on-wire
     /// order the sender emits), returning the last AU produced.
-    fn depacketize_all(payloads: &[Vec<u8>]) -> Option<Vec<u8>> {
+    fn depacketize_all<'a>(payloads: impl ExactSizeIterator<Item = &'a [u8]>) -> Option<Vec<u8>> {
         let mut d = H264Depacketizer::default();
         let last = payloads.len() - 1;
         let mut au = None;
         // All packets of one AU share a timestamp.
-        for (i, p) in payloads.iter().enumerate() {
+        for (i, p) in payloads.enumerate() {
             if let Some(got) = d.push(i as u16, 9000, p, i == last) {
                 au = Some(got);
             }
@@ -484,14 +575,58 @@ mod tests {
         assert!(!au_is_keyframe(&[]));
     }
 
+    /// A spike frame must not pin its buffer for the rest of the call. `Vec<Vec<u8>>` dropped
+    /// every fragment allocation on each clear; the packed buffer has to release an outlier
+    /// deliberately, or one 4 MiB access unit costs that much per video pipeline until hangup.
+    #[test]
+    fn an_outlier_access_unit_does_not_pin_its_buffer_for_the_call() {
+        let mut payloads = PacketizedAu::default();
+        let big = au_from_nals(&[nal(5, 512 * 1024)]);
+        packetize_au(&big, &mut payloads);
+        assert!(
+            payloads.payload_capacity() > PACKETIZED_AU_RETAINED_BYTES,
+            "the large AU should have grown the buffer past the retained cap"
+        );
+
+        // Back to ordinary frames: the spike's capacity is handed back.
+        let small = au_from_nals(&[nal(1, 50)]);
+        packetize_au(&small, &mut payloads);
+        assert!(
+            payloads.payload_capacity() <= PACKETIZED_AU_RETAINED_BYTES,
+            "an outlier's capacity must not survive the next frame"
+        );
+        assert_eq!(depacketize_all(payloads.iter()), Some(small));
+
+        // And the steady state still reuses one buffer: no growth across ordinary frames.
+        let steady = payloads.payload_capacity();
+        for _ in 0..4 {
+            packetize_au(&au_from_nals(&[nal(1, 400)]), &mut payloads);
+            assert_eq!(
+                payloads.payload_capacity(),
+                steady,
+                "an ordinary frame must not reallocate"
+            );
+        }
+
+        // A run of large frames keeps its buffer rather than shrinking and regrowing each time.
+        packetize_au(&big, &mut payloads);
+        let large = payloads.payload_capacity();
+        packetize_au(&big, &mut payloads);
+        assert_eq!(
+            payloads.payload_capacity(),
+            large,
+            "consecutive large frames must not thrash the allocator"
+        );
+    }
+
     #[test]
     fn single_nal_round_trips() {
         let au = au_from_nals(&[nal(1, 100)]);
-        let mut payloads = Vec::new();
+        let mut payloads = PacketizedAu::default();
         packetize_au(&au, &mut payloads);
         assert_eq!(payloads.len(), 1);
         assert!(payloads.iter().all(|p| p.len() <= H264_SINGLE_NAL_MAX));
-        assert_eq!(depacketize_all(&payloads), Some(au));
+        assert_eq!(depacketize_all(payloads.iter()), Some(au));
     }
 
     #[test]
@@ -500,26 +635,24 @@ mod tests {
         let pps = nal(8, 8);
         let idr = nal(5, 100);
         let au = au_from_nals(&[nal(9, 2), sps.clone(), pps.clone(), idr.clone()]);
-        let mut payloads = Vec::new();
+        let mut payloads = PacketizedAu::default();
 
         packetize_au(&au, &mut payloads);
 
         assert_eq!(
-            payloads
-                .iter()
-                .map(|nal| nal_unit_type(nal))
-                .collect::<Vec<_>>(),
+            payloads.iter().map(nal_unit_type).collect::<Vec<_>>(),
             [NAL_TYPE_SPS, NAL_TYPE_PPS, NAL_TYPE_IDR]
         );
         assert_eq!(
-            depacketize_all(&payloads),
+            depacketize_all(payloads.iter()),
             Some(au_from_nals(&[sps, pps, idr]))
         );
     }
 
     #[test]
     fn aud_only_access_unit_produces_no_rtp_payload() {
-        let mut payloads = vec![vec![1]];
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au_from_nals(&[nal(1, 40)]), &mut payloads);
         packetize_au(&au_from_nals(&[nal(9, 2)]), &mut payloads);
         assert!(payloads.is_empty());
     }
@@ -527,7 +660,7 @@ mod tests {
     #[test]
     fn boundary_800_stays_single_and_801_fragments() {
         let au = au_from_nals(&[nal(1, H264_SINGLE_NAL_MAX)]);
-        let mut payloads = Vec::new();
+        let mut payloads = PacketizedAu::default();
         packetize_au(&au, &mut payloads);
         assert_eq!(payloads.len(), 1, "800-byte NAL must not fragment");
 
@@ -537,16 +670,16 @@ mod tests {
         assert_eq!(nal_unit_type(&payloads[0]), NAL_TYPE_FU_A);
         assert_eq!(payloads[0][1] & 0x80, 0x80, "first fragment sets S");
         assert_eq!(payloads[1][1] & 0x40, 0x40, "last fragment sets E");
-        assert_eq!(depacketize_all(&payloads), Some(au));
+        assert_eq!(depacketize_all(payloads.iter()), Some(au));
     }
 
     #[test]
     fn large_idr_round_trips_via_fua() {
         let au = au_from_nals(&[nal(7, 20), nal(8, 8), nal(5, 3000)]);
-        let mut payloads = Vec::new();
+        let mut payloads = PacketizedAu::default();
         packetize_au(&au, &mut payloads);
         assert!(payloads.len() >= 5);
-        let got = depacketize_all(&payloads).expect("AU must reassemble");
+        let got = depacketize_all(payloads.iter()).expect("AU must reassemble");
         assert_eq!(got, au);
         assert!(au_is_keyframe(&got));
     }
@@ -560,7 +693,7 @@ mod tests {
             stap.extend_from_slice(&(n.len() as u16).to_be_bytes());
             stap.extend_from_slice(n);
         }
-        let got = depacketize_all(&[stap]).expect("STAP-A must unpack");
+        let got = depacketize_all([stap.as_slice()].into_iter()).expect("STAP-A must unpack");
         assert_eq!(got, au_from_nals(&[a, b]));
     }
 
@@ -570,7 +703,7 @@ mod tests {
     #[test]
     fn lost_middle_fragment_drops_the_truncated_nal() {
         let au = au_from_nals(&[nal(5, 3000)]);
-        let mut payloads = Vec::new();
+        let mut payloads = PacketizedAu::default();
         packetize_au(&au, &mut payloads);
         assert!(payloads.len() >= 3);
         let mut d = H264Depacketizer::default();
@@ -594,9 +727,9 @@ mod tests {
         }
         // A subsequent complete AU (contiguous seqs) still reassembles.
         let au2 = au_from_nals(&[nal(1, 50)]);
-        let mut p2 = Vec::new();
+        let mut p2 = PacketizedAu::default();
         packetize_au(&au2, &mut p2);
-        assert_eq!(depacketize_all(&p2), Some(au2));
+        assert_eq!(depacketize_all(p2.iter()), Some(au2));
     }
 
     // A reordered fragment (seq jumps) is treated the same as loss: the partial
@@ -604,7 +737,7 @@ mod tests {
     #[test]
     fn reordered_fu_fragment_drops_the_partial() {
         let au = au_from_nals(&[nal(5, 2500)]);
-        let mut payloads = Vec::new();
+        let mut payloads = PacketizedAu::default();
         packetize_au(&au, &mut payloads);
         let mut d = H264Depacketizer::default();
         // Feed start at seq 0, then jump the next fragment's seq forward.
@@ -619,11 +752,11 @@ mod tests {
     #[test]
     fn lost_end_fragment_discards_partial_and_keeps_next_nal() {
         let au = au_from_nals(&[nal(5, 2000)]);
-        let mut payloads = Vec::new();
+        let mut payloads = PacketizedAu::default();
         packetize_au(&au, &mut payloads);
-        payloads.pop(); // lose the E fragment
         let mut d = H264Depacketizer::default();
-        for (i, p) in payloads.iter().enumerate() {
+        // The E fragment is "lost": everything but the last payload arrives.
+        for (i, p) in payloads.iter().take(payloads.len() - 1).enumerate() {
             assert_eq!(d.push(i as u16, 7000, p, false), None);
         }
         // Next single NAL arrives with the marker: partial FU is dropped, the
@@ -655,9 +788,9 @@ mod tests {
         }
         // Still functional afterwards.
         let au = au_from_nals(&[nal(1, 10)]);
-        let mut p = Vec::new();
+        let mut p = PacketizedAu::default();
         packetize_au(&au, &mut p);
-        assert_eq!(depacketize_all(&p), Some(au));
+        assert_eq!(depacketize_all(p.iter()), Some(au));
     }
 
     // A lost marker packet must not merge two AUs: the next AU's new RTP timestamp flushes the
@@ -759,7 +892,8 @@ mod tests {
 
     #[test]
     fn empty_au_yields_no_payloads_and_marker_alone_yields_none() {
-        let mut payloads = vec![vec![1u8]];
+        let mut payloads = PacketizedAu::default();
+        packetize_au(&au_from_nals(&[nal(1, 40)]), &mut payloads);
         packetize_au(&[], &mut payloads);
         assert!(payloads.is_empty(), "packetize_au must clear stale output");
         let mut d = H264Depacketizer::default();

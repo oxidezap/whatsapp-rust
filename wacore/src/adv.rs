@@ -5,15 +5,29 @@
 //!
 //! Reference: WAWebHandleAdvDeviceNotificationUtils.decodeSignedKeyIndexBytes()
 
+use buffa::view::MessageView as _;
+use smallvec::SmallVec;
+
 use crate::libsignal::protocol::PublicKey;
 use crate::store::traits::DeviceInfo;
 
+/// Every ADV prefix is a two-byte domain separator, which is what lets the
+/// signed messages be built once and re-prefixed per family below.
+const ADV_PREFIX_LEN: usize = 2;
+
 // ADV signature prefixes (WAWebAdvSignatureConstants). The hosted ([6,5]/[6,6])
 // variants apply to business-hosted companion devices.
-const ADV_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 0];
-const ADV_PREFIX_DEVICE_SIGNATURE: &[u8] = &[6, 1];
-const ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 5];
-const ADV_HOSTED_PREFIX_DEVICE_SIGNATURE: &[u8] = &[6, 6];
+const ADV_PREFIX_ACCOUNT_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 0];
+const ADV_PREFIX_DEVICE_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 1];
+const ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 5];
+const ADV_HOSTED_PREFIX_DEVICE_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 6];
+
+/// Stack-backed buffer for a signed ADV message.
+///
+/// The longest is `prefix(2) || details || identity(32) || accountKey(32)`, and
+/// `details` is an encoded `ADVDeviceIdentity` of a couple dozen bytes, so 256
+/// keeps both messages off the heap for every shape the server sends.
+type AdvSigBuffer = SmallVec<[u8; 256]>;
 
 /// Outcome of validating a fetched companion device's `ADVSignedDeviceIdentity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,20 +70,23 @@ pub fn validate_adv_with_identity_key(
     fetched_identity_key: &[u8; 32],
     account_identity_fallback: Option<&[u8; 32]>,
 ) -> AdvValidation {
-    let Ok(signed) = waproto::codec::adv_signed_device_identity_decode(device_identity_bytes)
+    // Decoded as a view: every field here is read once and compared, so the
+    // owned decode's four `Vec<u8>` copies bought nothing.
+    let Ok(signed) =
+        waproto::whatsapp::ADVSignedDeviceIdentityView::decode_view(device_identity_bytes)
     else {
         return AdvValidation::Invalid;
     };
     let (Some(details), Some(account_sig), Some(device_sig)) = (
-        signed.details.as_deref(),
-        signed.account_signature.as_deref(),
-        signed.device_signature.as_deref(),
+        signed.details,
+        signed.account_signature,
+        signed.device_signature,
     ) else {
         return AdvValidation::Invalid;
     };
     // WA Web `e.accountSignatureKey || t`: prefer the in-blob key, else the
     // caller-supplied trusted identity. An empty field counts as absent.
-    let account_key: &[u8] = match signed.account_signature_key.as_deref() {
+    let account_key: &[u8] = match signed.account_signature_key {
         Some(k) if !k.is_empty() => k,
         _ => match account_identity_fallback {
             Some(f) => f.as_slice(),
@@ -83,6 +100,20 @@ pub fn validate_adv_with_identity_key(
         return AdvValidation::Invalid;
     };
 
+    // Both signed messages differ between the two prefix families only in their
+    // leading `ADV_PREFIX_LEN` bytes, so they are assembled once and the prefix
+    // is overwritten per attempt. The zeroed placeholder is always replaced
+    // before either message is verified.
+    let mut account_msg =
+        AdvSigBuffer::with_capacity(ADV_PREFIX_LEN + details.len() + fetched_identity_key.len());
+    account_msg.extend_from_slice(&[0u8; ADV_PREFIX_LEN]);
+    account_msg.extend_from_slice(details);
+    account_msg.extend_from_slice(fetched_identity_key);
+
+    let mut device_msg = AdvSigBuffer::with_capacity(account_msg.len() + account_key.len());
+    device_msg.extend_from_slice(&account_msg);
+    device_msg.extend_from_slice(account_key);
+
     let verified = [
         (ADV_PREFIX_ACCOUNT_SIGNATURE, ADV_PREFIX_DEVICE_SIGNATURE),
         (
@@ -92,8 +123,8 @@ pub fn validate_adv_with_identity_key(
     ]
     .into_iter()
     .any(|(account_prefix, device_prefix)| {
-        let account_msg = [account_prefix, details, fetched_identity_key].concat();
-        let device_msg = [device_prefix, details, fetched_identity_key, account_key].concat();
+        account_msg[..ADV_PREFIX_LEN].copy_from_slice(&account_prefix);
+        device_msg[..ADV_PREFIX_LEN].copy_from_slice(&device_prefix);
         account_pub.verify_signature(&account_msg, account_sig)
             && device_pub.verify_signature(&device_msg, device_sig)
     });
@@ -336,11 +367,11 @@ mod tests {
         let account_key = account.public_key.public_key_bytes();
         let (acct_prefix, dev_prefix): (&[u8], &[u8]) = if hosted {
             (
-                ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE,
-                ADV_HOSTED_PREFIX_DEVICE_SIGNATURE,
+                &ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE,
+                &ADV_HOSTED_PREFIX_DEVICE_SIGNATURE,
             )
         } else {
-            (ADV_PREFIX_ACCOUNT_SIGNATURE, ADV_PREFIX_DEVICE_SIGNATURE)
+            (&ADV_PREFIX_ACCOUNT_SIGNATURE, &ADV_PREFIX_DEVICE_SIGNATURE)
         };
         let account_sig = account
             .private_key

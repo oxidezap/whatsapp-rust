@@ -1,0 +1,23 @@
+[package]
+name = "whatspec-codegen"
+# 0.0.0 like the other non-published members: nothing links this, so it has no
+# version to keep in lockstep with the released crates.
+version = "0.0.0"
+edition = "2024"
+rust-version.workspace = true
+# Build tooling, not a library: it exists to rewrite files in this checkout and
+# has no meaning outside it.
+publish = false
+description = "Regenerates the whatspec-derived artifacts committed in this repository."
+
+[dependencies]
+# `std` on each: the workspace pins these with default-features off for the
+# no_std/wasm builds, and none of that applies to a host-only binary that reads
+# files and shells out.
+anyhow = { workspace = true, features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

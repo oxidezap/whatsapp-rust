@@ -79,9 +79,38 @@ impl SignalSessionMigration {
     }
 }
 
+/// Fewest bytes either accepted sender-key distribution encoding can occupy.
+///
+/// Rejecting under it changes no outcome, only the message: the framed decoder
+/// wants a version byte plus a type-prefixed 33-byte key on top of the same
+/// fields, so it needs more than this, and the unframed one needs exactly this.
+///
+/// Both carry the same four protobuf fields and the unframed one is the
+/// shorter: `id` and `iteration` are two bytes each at their smallest, the
+/// 32-byte `chain_key` is 34 with its tag and length, and `signing_key` is a
+/// bare 32-byte key on that path, so 34 as well. A payload under this floor is
+/// not a distribution either decoder could have read, whatever the two of them
+/// happen to say about it.
+const MIN_SENDER_KEY_DISTRIBUTION_LEN: usize = 2 + 2 + 34 + 34;
+
+/// Decode a sender-key distribution, tolerating the unframed encoding.
+///
+/// The primary parser reads WhatsApp's framed form: a version byte, then the
+/// protobuf body with a type-prefixed signing key. Peers also send the body on
+/// its own, and that shape reaches here as a version refusal rather than a
+/// decode error, because the leading protobuf tag (`0x08`) has a zero high
+/// nibble. So the fallback decodes the whole buffer and reads the signing key
+/// bare. Neither half is redundant, and neither may be aligned to the other.
 fn decode_sender_key_distribution(
     bytes: &[u8],
 ) -> Result<SenderKeyDistributionMessage, SignalError> {
+    if bytes.len() < MIN_SENDER_KEY_DISTRIBUTION_LEN {
+        return Err(SignalError::InvalidInput(format!(
+            "sender-key distribution is {} bytes, under the {MIN_SENDER_KEY_DISTRIBUTION_LEN}-byte \
+             minimum any accepted encoding needs",
+            bytes.len()
+        )));
+    }
     match SenderKeyDistributionMessage::try_from(bytes) {
         Ok(message) => Ok(message),
         Err(primary_error) => {
@@ -182,7 +211,7 @@ impl<'a> Signal<'a> {
         let address = jid.to_protocol_address();
         let lock = self.client.session_lock_for(address.as_str()).await;
         let _guard = lock.lock().await;
-        let mut adapter = self.client.signal_adapter().await;
+        let mut adapter = self.client.signal_adapter();
         Ok(message_encrypt(
             plaintext,
             &address,
@@ -200,7 +229,7 @@ impl<'a> Signal<'a> {
         let address = jid.to_protocol_address();
         let lock = self.client.session_lock_for(address.as_str()).await;
         let _guard = lock.lock().await;
-        let mut adapter = self.client.signal_adapter().await;
+        let mut adapter = self.client.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let decrypted = message_decrypt(
             parsed,
@@ -242,7 +271,7 @@ impl<'a> Signal<'a> {
         bundle: &PreKeyBundle,
     ) -> Result<IdentityChange, SignalError> {
         let resolved = self.client.resolve_encryption_jid(jid).await;
-        let mut adapter = self.client.signal_adapter().await;
+        let mut adapter = self.client.signal_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let identity_change = self
             .client
@@ -276,7 +305,7 @@ impl<'a> Signal<'a> {
         let distribution = decode_sender_key_distribution(distribution)?;
         let sender_address = sender_jid.to_non_ad().to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_address);
-        let mut store = self.client.sender_key_adapter().await;
+        let mut store = self.client.sender_key_adapter();
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
         let chain_guard = chain_lock.lock().await;
 
@@ -294,7 +323,7 @@ impl<'a> Signal<'a> {
     ) -> Result<Vec<u8>, SignalError> {
         let sender_address = sender_jid.to_non_ad().to_protocol_address();
         let sender_key_name = make_sender_key_name(group_jid, &sender_address);
-        let mut store = self.client.sender_key_adapter().await;
+        let mut store = self.client.sender_key_adapter();
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
         let chain_guard = chain_lock.lock().await;
         let distribution = wacore::send::create_sender_key_distribution_message_for_group(
@@ -512,7 +541,7 @@ impl<'a> Signal<'a> {
             .await?
             .is_some();
 
-        let mut store = self.client.sender_key_adapter().await;
+        let mut store = self.client.sender_key_adapter();
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
 
         let pending_distribution = self
@@ -574,7 +603,7 @@ impl<'a> Signal<'a> {
         let sender_key_name =
             make_sender_key_name(group_jid, &sender_jid.to_non_ad().to_protocol_address());
 
-        let mut store = self.client.sender_key_adapter().await;
+        let mut store = self.client.sender_key_adapter();
         let chain_lock = store.sender_key_lock(&sender_key_name).await;
         let _chain_guard = chain_lock.lock().await;
 
@@ -652,7 +681,7 @@ impl<'a> Signal<'a> {
         let _session_guards = self.client.session_guards_for(&lock_jids).await;
 
         let plaintext = MessageUtils::encode_and_pad(message);
-        let mut adapter = self.client.signal_adapter().await;
+        let mut adapter = self.client.signal_adapter();
         let mediatype = wacore::send::media_type_from_message(message);
         let hide_decrypt_fail = wacore::send::should_hide_decrypt_fail(message);
 
@@ -735,7 +764,7 @@ mod tests {
             Some((7u32.into(), prekey.public_key)),
             9u32.into(),
             signed_prekey.public_key,
-            signature.to_vec(),
+            signature,
             *identity.identity_key(),
         )
         .expect("prekey bundle")
@@ -1311,5 +1340,107 @@ mod tests {
         client
             .signal_flush_test_block
             .store(false, Ordering::Release);
+    }
+
+    /// Holds down the unframed encoding described on
+    /// [`decode_sender_key_distribution`], which nothing covered before.
+    #[tokio::test]
+    async fn unframed_sender_key_distribution_is_still_accepted() {
+        use wacore::libsignal::protocol::KeyPair;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+
+        // Hand-encoded, because this shape has no constructor: id, iteration,
+        // chain_key, then the signing key with no type prefix.
+        let mut unframed = vec![0x08, 7, 0x10, 0];
+        unframed.extend_from_slice(&[0x1A, 32]);
+        unframed.extend_from_slice(&[0x11; 32]);
+        unframed.extend_from_slice(&[0x22, 32]);
+        unframed.extend_from_slice(signing.public_key.public_key_bytes());
+
+        assert!(
+            matches!(
+                SenderKeyDistributionMessage::try_from(&unframed[..]),
+                Err(SignalProtocolError::LegacyCiphertextVersion(0))
+            ),
+            "the primary reads the leading protobuf tag as a version, which is \
+             how this shape reaches the fallback at all"
+        );
+
+        let decoded = decode_sender_key_distribution(&unframed)
+            .expect("the unframed encoding must keep decoding");
+        assert_eq!(decoded.chain_id(), 7);
+        assert_eq!(decoded.chain_key(), &[0x11u8; 32]);
+        assert_eq!(decoded.signing_key(), &signing.public_key);
+    }
+
+    /// The shortest byte string either accepted encoding can produce: the
+    /// unframed one, with both varint fields at their one-byte minimum. It is
+    /// what makes `MIN_SENDER_KEY_DISTRIBUTION_LEN` a floor rather than a
+    /// guess, so the guard can never reject a distribution the fallback would
+    /// otherwise have accepted.
+    fn shortest_unframed_distribution() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x08, 0x00]); // id = 0
+        bytes.extend_from_slice(&[0x10, 0x00]); // iteration = 0
+        bytes.extend_from_slice(&[0x1a, 0x20]); // chain_key, 32 bytes
+        bytes.extend_from_slice(&[7u8; 32]);
+        bytes.extend_from_slice(&[0x22, 0x20]); // signing_key, bare 32 bytes
+        bytes.extend_from_slice(&[9u8; 32]);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn shortest_accepted_distribution_sits_exactly_on_the_minimum() {
+        let bytes = shortest_unframed_distribution();
+        assert_eq!(bytes.len(), MIN_SENDER_KEY_DISTRIBUTION_LEN);
+
+        let decoded = decode_sender_key_distribution(&bytes).expect("shortest unframed encoding");
+        assert_eq!(decoded.chain_id(), 0);
+        assert_eq!(decoded.iteration(), 0);
+        assert_eq!(decoded.chain_key(), &[7u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn undersized_distribution_names_the_minimum_instead_of_two_parser_errors() {
+        // 64 bytes is what a live peer sends: below the floor, and below it by
+        // enough that no framing recovers it. The message has to say that, or
+        // the two decoders' incidental protobuf errors read as a parser bug.
+        let error = decode_sender_key_distribution(&[0xab; 64])
+            .expect_err("64 bytes cannot hold a distribution");
+        let text = error.to_string();
+        assert!(text.contains("64"), "{text}");
+        assert!(
+            text.contains(&MIN_SENDER_KEY_DISTRIBUTION_LEN.to_string()),
+            "{text}"
+        );
+        assert!(!text.contains("wire type"), "{text}");
+    }
+
+    /// The framed encoding keeps working through the primary, unchanged.
+    #[tokio::test]
+    async fn framed_sender_key_distribution_decodes_through_the_primary() {
+        use wacore::libsignal::protocol::KeyPair;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let framed = SenderKeyDistributionMessage::new(
+            SENDERKEY_MESSAGE_CURRENT_VERSION,
+            7,
+            0,
+            [0x11; 32],
+            signing.public_key,
+        )
+        .expect("distribution")
+        .into_serialized();
+
+        assert!(
+            SenderKeyDistributionMessage::try_from(&framed[..]).is_ok(),
+            "the framed shape must decode through the primary, not by falling back"
+        );
+        let decoded = decode_sender_key_distribution(&framed).expect("framed distribution");
+        assert_eq!(decoded.chain_id(), 7);
+        assert_eq!(decoded.signing_key(), &signing.public_key);
     }
 }

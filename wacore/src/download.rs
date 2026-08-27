@@ -16,6 +16,10 @@ use waproto::whatsapp::message::HistorySyncNotification;
 const MEDIA_MAC_SIZE: usize = 10;
 const AES_BLOCK_SIZE: usize = 16;
 const STREAM_CHUNK_SIZE: usize = 8 * 1024;
+/// Bytes held back from processing while streaming: until the reader hits EOF,
+/// the last `MEDIA_MAC_SIZE + AES_BLOCK_SIZE` bytes seen might be the final
+/// ciphertext block plus the trailing MAC rather than more ciphertext.
+const WITHHELD: usize = MEDIA_MAC_SIZE + AES_BLOCK_SIZE;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -369,6 +373,21 @@ impl<W: DownloadWriter + ?Sized> DownloadWriter for &mut W {
     }
 }
 
+/// Decrypt `buf` — a whole number of AES blocks — in place, advancing the CBC
+/// chaining state held by `cbc`.
+///
+/// In place so a streaming decrypt can hand the writer one contiguous batch
+/// instead of a 16-byte array per block; the ciphertext is already MAC'd by the
+/// time this overwrites it. Going through the mode rather than block-at-a-time
+/// also lets it use the AES backend's parallel-block path, which decrypts
+/// several blocks per pipeline pass.
+fn cbc_decrypt_blocks(cbc: &mut cbc::Decryptor<aes::Aes256>, buf: &mut [u8]) {
+    use aes::cipher::{Block, BlockModeDecrypt};
+    let (blocks, rest) = Block::<aes::Aes256>::slice_as_chunks_mut(buf);
+    debug_assert!(rest.is_empty(), "batches are whole AES blocks");
+    cbc.decrypt_blocks(blocks);
+}
+
 pub struct DownloadUtils;
 
 impl DownloadUtils {
@@ -506,25 +525,7 @@ impl DownloadUtils {
         writer: &mut W,
     ) -> Result<u64> {
         use aes::Aes256;
-        use aes::cipher::KeyInit;
-
-        fn decrypt_cbc_block(
-            cblock: &[u8],
-            cipher: &Aes256,
-            prev_block: &[u8; AES_BLOCK_SIZE],
-        ) -> Result<([u8; AES_BLOCK_SIZE], [u8; AES_BLOCK_SIZE])> {
-            use aes::cipher::{Block, BlockCipherDecrypt};
-            let cblock_arr: [u8; AES_BLOCK_SIZE] = cblock
-                .try_into()
-                .map_err(|_| anyhow!("Invalid block size"))?;
-            let mut block: Block<Aes256> = cblock_arr.into();
-            cipher.decrypt_block(&mut block);
-            let mut decrypted: [u8; AES_BLOCK_SIZE] = block.into();
-            for (b, &p) in decrypted.iter_mut().zip(prev_block.iter()) {
-                *b ^= p;
-            }
-            Ok((decrypted, cblock_arr))
-        }
+        use aes::cipher::{KeyInit, KeyIvInit};
 
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, app_info)?;
 
@@ -532,76 +533,80 @@ impl DownloadUtils {
             .map_err(|_| anyhow!("Failed to init HMAC"))?;
         hmac.update(&iv);
 
-        let cipher =
-            Aes256::new_from_slice(&cipher_key).map_err(|_| anyhow!("Bad AES key length"))?;
+        // Holds the AES key schedule and the CBC chaining block across refills.
+        let mut cbc = cbc::Decryptor::<Aes256>::new(&cipher_key.into(), &iv.into());
 
         let mut bytes_written: u64 = 0;
-        let mut tail: Vec<u8> =
-            Vec::with_capacity(STREAM_CHUNK_SIZE + AES_BLOCK_SIZE + MEDIA_MAC_SIZE);
-        let mut prev_block = iv;
 
-        let mut read_buf = [0u8; STREAM_CHUNK_SIZE];
+        // Single buffer: refilled from `reader` after the retained bytes, then
+        // decrypted in place so the whole batch reaches `writer` in one call.
+        // It replaces the separate read buffer and `tail`/`final_plain` vectors,
+        // and is kept to exactly `STREAM_CHUNK_SIZE` rather than that plus the
+        // carry, so the stack this holds on an embedded target is no more than
+        // the read buffer alone used to be. A refill after a carry just reads
+        // that much less; the carry is at most 41 bytes, so a whole number of
+        // blocks is always processable and the loop always advances.
+        let mut buf = [0u8; STREAM_CHUNK_SIZE];
+        let mut filled = 0usize;
 
         loop {
-            let n = reader.read(&mut read_buf)?;
+            let n = reader.read(&mut buf[filled..])?;
             if n == 0 {
                 break;
             }
-            tail.extend_from_slice(&read_buf[..n]);
+            filled += n;
 
-            if tail.len() > MEDIA_MAC_SIZE + AES_BLOCK_SIZE {
-                let mut processable_len = tail.len() - (MEDIA_MAC_SIZE + AES_BLOCK_SIZE);
-                processable_len -= processable_len % AES_BLOCK_SIZE;
-                if processable_len >= AES_BLOCK_SIZE {
-                    hmac.update(&tail[..processable_len]);
-                    for cblock in tail[..processable_len].chunks_exact(AES_BLOCK_SIZE) {
-                        let (decrypted, cblock_arr) =
-                            decrypt_cbc_block(cblock, &cipher, &prev_block)?;
-                        writer.write_all(&decrypted)?;
-                        bytes_written += AES_BLOCK_SIZE as u64;
-                        prev_block = cblock_arr;
-                    }
-                    // Drain processed bytes, reusing the Vec's existing allocation
-                    tail.drain(..processable_len);
-                }
+            // The trailing `WITHHELD` bytes can't be processed yet: until EOF we
+            // don't know whether they are ciphertext or the final MAC.
+            if filled <= WITHHELD {
+                continue;
             }
+            let processable = (filled - WITHHELD) - ((filled - WITHHELD) % AES_BLOCK_SIZE);
+            if processable == 0 {
+                continue;
+            }
+
+            // MAC covers ciphertext, so hash before decrypting over it in place.
+            hmac.update(&buf[..processable]);
+            cbc_decrypt_blocks(&mut cbc, &mut buf[..processable]);
+            writer.write_all(&buf[..processable])?;
+            bytes_written += processable as u64;
+
+            // Compact the carry to the front. It is at most 41 bytes, so this
+            // is a register-sized move rather than a shift of the whole buffer.
+            buf.copy_within(processable..filled, 0);
+            filled -= processable;
         }
 
-        if tail.len() < MEDIA_MAC_SIZE + AES_BLOCK_SIZE
-            || !(tail.len() - MEDIA_MAC_SIZE).is_multiple_of(AES_BLOCK_SIZE)
-        {
+        let tail = &mut buf[..filled];
+        if tail.len() < WITHHELD || !(tail.len() - MEDIA_MAC_SIZE).is_multiple_of(AES_BLOCK_SIZE) {
             return Err(anyhow!("Invalid final media size"));
         }
         let mac_index = tail.len() - MEDIA_MAC_SIZE;
-        let (final_ciphertext, mac_bytes) = tail.split_at(mac_index);
+        let (final_ciphertext, mac_bytes) = tail.split_at_mut(mac_index);
         hmac.update(final_ciphertext);
         let expected_mac_full = hmac.finalize().into_bytes();
         let expected_mac = &expected_mac_full[..MEDIA_MAC_SIZE];
-        if subtle::ConstantTimeEq::ct_eq(mac_bytes, expected_mac).unwrap_u8() == 0 {
+        if subtle::ConstantTimeEq::ct_eq(&*mac_bytes, expected_mac).unwrap_u8() == 0 {
             return Err(anyhow!("MAC mismatch"));
         }
 
-        let mut final_plain = Vec::with_capacity(final_ciphertext.len());
-        for cblock in final_ciphertext.chunks_exact(AES_BLOCK_SIZE) {
-            let (decrypted, cblock_arr) = decrypt_cbc_block(cblock, &cipher, &prev_block)?;
-            final_plain.extend_from_slice(&decrypted);
-            prev_block = cblock_arr;
-        }
-        let pad_len = match final_plain.last() {
+        cbc_decrypt_blocks(&mut cbc, final_ciphertext);
+        let pad_len = match final_ciphertext.last() {
             Some(&v) => v as usize,
             None => return Err(anyhow!("Empty plaintext after decrypt")),
         };
-        if pad_len == 0 || pad_len > AES_BLOCK_SIZE || pad_len > final_plain.len() {
+        if pad_len == 0 || pad_len > AES_BLOCK_SIZE || pad_len > final_ciphertext.len() {
             return Err(anyhow!("Invalid PKCS7 padding"));
         }
-        if !final_plain[final_plain.len() - pad_len..]
+        if !final_ciphertext[final_ciphertext.len() - pad_len..]
             .iter()
             .all(|&b| b as usize == pad_len)
         {
             return Err(anyhow!("Bad PKCS7 padding bytes"));
         }
-        final_plain.truncate(final_plain.len() - pad_len);
-        writer.write_all(&final_plain)?;
+        let final_plain = &final_ciphertext[..final_ciphertext.len() - pad_len];
+        writer.write_all(final_plain)?;
         bytes_written += final_plain.len() as u64;
 
         Ok(bytes_written)
@@ -812,6 +817,91 @@ mod tests {
             assert_eq!(in_place.as_ptr(), allocation, "allocation must be reused");
             assert_eq!(in_place.capacity(), capacity, "capacity must be reused");
         }
+    }
+
+    /// A `Read` that never returns more than `step` bytes, so the streaming
+    /// decryptor's carry/compaction path sees non-block-aligned refills.
+    struct ThrottledReader<'a> {
+        data: &'a [u8],
+        step: usize,
+    }
+
+    impl std::io::Read for ThrottledReader<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.step.min(out.len()).min(self.data.len());
+            out[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// A `Write` that records how many calls it received and how much they carried.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for CountingWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn streaming_decrypt_is_independent_of_reader_chunking() {
+        // The refill loop withholds a MAC + one block and only ever processes a
+        // block-aligned prefix, so odd read sizes must not shift a single byte.
+        let media_key = [0x5B; 32];
+        let plaintext: Vec<u8> = (0..70_000_usize)
+            .map(|index| index.wrapping_mul(17) as u8)
+            .collect();
+        let encrypted = encrypted_media_fixture(&plaintext, &media_key, MediaType::Video);
+
+        for step in [1_usize, 7, 15, 16, 17, 26, 4096, 8192, 8193, 100_000] {
+            let out = DownloadUtils::decrypt_stream(
+                ThrottledReader {
+                    data: &encrypted,
+                    step,
+                },
+                &media_key,
+                MediaType::Video,
+            )
+            .unwrap();
+            assert_eq!(out, plaintext, "reader step {step}");
+        }
+    }
+
+    #[test]
+    fn streaming_decrypt_writes_whole_batches_not_single_blocks() {
+        // Pins the batching: an unbuffered writer (a `File`) pays one syscall
+        // per write, so a 16-byte-per-block loop would be ~64k writes here.
+        let media_key = [0x6C; 32];
+        let plaintext = vec![0xA7u8; 1024 * 1024];
+        let encrypted = encrypted_media_fixture(&plaintext, &media_key, MediaType::Document);
+
+        let mut writer = CountingWriter::default();
+        DownloadUtils::decrypt_stream_to_writer(
+            std::io::Cursor::new(&encrypted),
+            &media_key,
+            MediaType::Document,
+            &mut writer,
+        )
+        .unwrap();
+
+        assert_eq!(writer.bytes, plaintext);
+        let blocks = plaintext.len() / AES_BLOCK_SIZE;
+        let max_writes = encrypted.len().div_ceil(STREAM_CHUNK_SIZE) + 2;
+        assert!(
+            writer.writes <= max_writes,
+            "expected at most {max_writes} batched writes for {blocks} blocks, got {}",
+            writer.writes
+        );
     }
 
     #[test]

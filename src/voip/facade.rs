@@ -25,6 +25,7 @@ use wacore::stanza::group_call::{
     GroupInviteOfferParams, InitialGroupOfferParams, build_group_invite_offer,
     build_initial_group_offer, parse_initial_group_call_ack,
 };
+use wacore::stats::UnkeyableDevice;
 use wacore::types::call::{CallAction, IncomingCall, VideoState};
 use wacore::types::group_call::{
     CallLinkMedia, GROUP_CALL_MAX_PARTICIPANTS, GROUP_CALL_MAX_REMOTE_PARTICIPANTS,
@@ -205,8 +206,7 @@ impl<'a> AcceptCall<'a> {
         let video = self.video.take();
         let peer_invite_device = self
             .incoming
-            .media
-            .as_ref()
+            .media()
             .and_then(|media| media.peer_device.clone());
         let has_video = video.is_some();
         if video.as_ref().is_some_and(|v| !v.has_valid_timing()) {
@@ -245,7 +245,7 @@ impl<'a> AcceptCall<'a> {
             None => None,
         };
         if self.incoming.group.is_some()
-            && self.incoming.media.is_none()
+            && self.incoming.media().is_none()
             && group
                 .as_ref()
                 .and_then(|update| update.relay.as_ref())
@@ -274,7 +274,7 @@ impl<'a> AcceptCall<'a> {
             ));
         }
         let is_group = group.is_some();
-        if self.incoming.media.is_none()
+        if self.incoming.media().is_none()
             && group
                 .as_ref()
                 .and_then(|group| group.relay.as_ref())
@@ -417,8 +417,7 @@ impl<'a> AcceptCall<'a> {
 
         let media = self
             .incoming
-            .media
-            .as_ref()
+            .media()
             .ok_or(CallError::Media("offer carried no media block"))?;
         let enc = media
             .enc_for(Some(&own_lid))
@@ -1260,11 +1259,7 @@ fn build_answer_signaling(
         video,
     );
     // Captured video accepts mirror the offer's peer experiment metadata; audio accepts omit it.
-    let metadata = if video {
-        incoming.media.as_deref()
-    } else {
-        None
-    };
+    let metadata = if video { incoming.media() } else { None };
     let accept = build_accept(&AcceptParams {
         call_id,
         to: &target,
@@ -1471,7 +1466,7 @@ async fn fanout_group_epoch_for_generation(
             }
         }
         let plan = wacore::send::SessionPlan::assume_ready(recipients.len());
-        let mut adapter = client.signal_adapter().await;
+        let mut adapter = client.signal_adapter();
         let mut stores = adapter.as_signal_stores();
         let encrypted = wacore::send::encrypt_for_devices_with_sessions_raw(
             &*client.runtime,
@@ -1486,6 +1481,12 @@ async fn fanout_group_epoch_for_generation(
         encrypted
     };
     let encrypted = encrypted?;
+    // This path asserts sessions upstream instead of establishing them, so
+    // nothing else has counted a device the fan-out could not encrypt for.
+    // Recorded before the checks below, which can return early.
+    client
+        .stats
+        .record_unkeyable_devices(UnkeyableDevice::Encrypt, encrypted.unkeyed_at_encrypt);
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
     let device_identity = wacore::send::needs_device_identity(
         encrypted.includes_prekey_message,
@@ -1580,6 +1581,7 @@ async fn publish_group_epoch_ciphertexts(
 pub(crate) fn drain_pending_outgoing_on_disconnect(client: &Client) {
     let drained: Vec<PendingOutgoing> = {
         let mut map = client
+            .voip_state()
             .pending_outgoing_calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1613,7 +1615,7 @@ async fn place_call(
     let multi_device = ring_devices.len() > 1;
     // Diagnostic: the resolved callee device set drives sibling-dismiss. If a multi-device callee
     // shows only one here, a device-list resolution gap (e.g. the primary missing) is why a sibling
-    // keeps ringing -- the dismiss is gated on `multi_device`.
+    // keeps ringing -- a lone device has no sibling to dismiss.
     log::debug!(
         "voip: call {call_id} resolved {} callee device(s) (sibling-dismiss {}): [{}]",
         ring_devices.len(),
@@ -1654,7 +1656,7 @@ async fn place_call(
         // encrypt against the existing sessions directly: a device whose session is somehow still
         // missing fails its encrypt and is skipped, exactly as the old per-device loop did.
         let plan = wacore::send::SessionPlan::assume_ready(devices.len());
-        let mut adapter = client.signal_adapter().await;
+        let mut adapter = client.signal_adapter();
         let mut stores = adapter.as_signal_stores();
         let raw = wacore::send::encrypt_for_devices_with_sessions_raw(
             &*client.runtime,
@@ -1665,6 +1667,11 @@ async fn place_call(
         )
         .await
         .map_err(|e| CallError::Setup(e.to_string()))?;
+        // Before the persist below, which can bail with `?`: the devices this
+        // fan-out dropped are dropped whether or not the offer goes out.
+        client
+            .stats
+            .record_unkeyable_devices(UnkeyableDevice::Encrypt, raw.unkeyed_at_encrypt);
         drop(_session_guards);
         client
             .persist_signal_state_pre_wire()
@@ -1749,10 +1756,9 @@ async fn place_call(
     // call deregisters (every end path removes the registry entry). Use the FULL server-rung set, NOT
     // the encrypted `device_keys` subset: a device we couldn't encrypt for (e.g. the primary phone,
     // dropped as pkmsg without an ADV account) still rings and must be dismissed, or it times the call
-    // out. Only when the callee is multi-device -- a single-device callee has no sibling.
-    if multi_device {
-        session.ring_devices = ring_devices.to_vec();
-    }
+    // out. Retained for a single-device callee too: it has no sibling to dismiss, but it is still the
+    // device a `<terminate>` has to reach if the call is cancelled before anyone answers.
+    session.ring_devices = ring_devices.to_vec();
     let _ = session.transition_to(CallPhase::Calling);
     let generation = registry.insert(session);
     registry.set_group_invite_self_device(
@@ -1792,6 +1798,7 @@ async fn place_call(
 
     // Park the material needed to spawn the engine once the relay arrives. Keyed by call-id.
     client
+        .voip_state()
         .pending_outgoing_calls
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1816,7 +1823,11 @@ async fn place_call(
     // registry generation, drop the dangling ack-waiter, and wake any wait_ended() waiter, then
     // propagate. Guarded so a same-call-id replacement that already superseded us isn't evicted.
     if let Err(e) = client.send_node(offer).await {
-        let removed = take_pending_if_current(&client.pending_outgoing_calls, &call_id, generation);
+        let removed = take_pending_if_current(
+            &client.voip_state().pending_outgoing_calls,
+            &call_id,
+            generation,
+        );
         registry.remove_if_current(&call_id, generation);
         // No ack will ever arrive for the failed offer; drop the waiter so it can't leak.
         client.response_waiters_guard().remove(&offer_stanza_id);
@@ -1840,7 +1851,7 @@ async fn place_call(
         peer_jid: peer.clone(),
         call_creator: call_creator.clone(),
         client_registry: registry,
-        pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+        pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
         client: client_weak(client),
         muted,
         video: video_shared,
@@ -1967,7 +1978,11 @@ fn take_pending_if_current(
 }
 
 fn fail_pending_outgoing(client: &Client, call_id: &str, generation: u64) {
-    let pending = take_pending_if_current(&client.pending_outgoing_calls, call_id, generation);
+    let pending = take_pending_if_current(
+        &client.voip_state().pending_outgoing_calls,
+        call_id,
+        generation,
+    );
     client
         .call_registry()
         .remove_if_current(call_id, generation);
@@ -2040,6 +2055,7 @@ pub(crate) async fn attach_outgoing_relay(
     // Remove-on-match: a second relay for the same call-id is ignored (the engine is already up).
     let pending = {
         let mut map = client
+            .voip_state()
             .pending_outgoing_calls
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2275,7 +2291,11 @@ impl GroupRekeyTeardown {
 
 fn claim_group_rekey_generation(client: &Client, call_id: &str, generation: Option<u64>) -> bool {
     generation.is_none_or(|generation| {
-        let pending = take_pending_if_current(&client.pending_outgoing_calls, call_id, generation);
+        let pending = take_pending_if_current(
+            &client.voip_state().pending_outgoing_calls,
+            call_id,
+            generation,
+        );
         let removed = client
             .call_registry()
             .remove_if_current(call_id, generation);
@@ -2543,7 +2563,7 @@ async fn spawn_registered_call(
         peer_jid: registration.peer_jid.clone(),
         call_creator: registration.call_creator.clone(),
         client_registry: client.call_registry(),
-        pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+        pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
         client: client_weak(client),
         muted,
         video: video_shared,
@@ -2851,12 +2871,15 @@ impl VideoShared {
             ended,
         };
         let handle = client.runtime.spawn(Box::pin(feed.run()));
-        if let Some(old) = self
+        // Abort outside the guard: edition 2024 keeps an `if let` scrutinee temporary
+        // alive for the whole matching arm, and a `Runtime` that cancels synchronously
+        // would drop the task inline and re-enter this non-reentrant mutex.
+        let old = self
             .feed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .replace(handle)
-        {
+            .replace(handle);
+        if let Some(old) = old {
             old.abort();
         }
     }
@@ -2865,7 +2888,8 @@ impl VideoShared {
     /// dropped, and the drive loop's video plane is disabled so it stops emitting/decoding video.
     fn detach_endpoints(&self) {
         *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        if let Some(feed) = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let feed = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(feed) = feed {
             feed.abort();
         }
         self.send_control(VideoControl::Disable);
@@ -2994,8 +3018,36 @@ impl EndedFlag {
     }
 }
 
+/// What [`CallHandle::terminate`] achieved. The local side is down in every case; the variants only
+/// say how much the peer learned, so a consumer can log a silent hangup without having to handle an
+/// error in order to end a call.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CallTermination {
+    /// `<terminate>` went out to every address this call had to reach.
+    PeerNotified,
+    /// Some of a still-ringing call's devices were told and the rest could not be confirmed, so those
+    /// may keep ringing until their own transport gives up. The local side is down either way.
+    /// `unconfirmed` is not the same as undelivered: a send can fail after bytes reach the wire.
+    PartlyNotified { notified: usize, unconfirmed: usize },
+    /// No send was confirmed, so the peer may keep ringing or talking until its own transport gives
+    /// up. Carries why the send failed; it may still have reached the wire.
+    LocalOnly(CallError),
+    /// The call was already over (peer terminate, superseded handle, earlier local teardown): nothing
+    /// was sent and nothing was torn down.
+    AlreadyEnded,
+}
+
+impl CallTermination {
+    /// Whether every address this call had to reach was confirmed sent. `false` for a partial fan-out
+    /// too, so match on [`CallTermination::PartlyNotified`] to tell that apart from a silent hangup.
+    pub fn peer_notified(&self) -> bool {
+        matches!(self, Self::PeerNotified)
+    }
+}
+
 /// Opaque handle to a live call. Drop does NOT end the call (the driver task owns its own lifetime);
-/// call [`hangup`](Self::hangup) to tear it down. No public fields, so the surface can grow without
+/// call [`terminate`](Self::terminate) to end it. No public fields, so the surface can grow without
 /// breaking callers. `Clone` is cheap (shared `Arc` state); every clone controls the SAME live call.
 #[derive(Clone)]
 pub struct CallHandle {
@@ -3154,6 +3206,34 @@ impl CallHandle {
             .unwrap_or_else(|| self.peer_jid.clone())
     }
 
+    /// Every address a `<terminate>` for this call must reach. One, except while an outgoing call is
+    /// still ringing: call signaling is routed per device and the server does not fan a terminate
+    /// out, so until one device answers, every device the offer rang has to be told.
+    fn terminate_targets(&self) -> Vec<Jid> {
+        if self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            .is_some()
+        {
+            return vec![Jid::new(&self.call_id, Server::Call)];
+        }
+        // One snapshot for both: read separately, an `<accept>` landing between them sets the
+        // answerer and drains the rung set, leaving neither read holding a target.
+        let Some(session) = self
+            .client_registry
+            .snapshot_if_current(&self.call_id, self.generation)
+        else {
+            return vec![self.peer_jid.clone()];
+        };
+        if let Some(device) = session.answering_device {
+            return vec![device];
+        }
+        if !session.ring_devices.is_empty() {
+            return session.ring_devices;
+        }
+        vec![self.peer_jid.clone()]
+    }
+
     /// The call's creator JID, as carried in the signaling (needed by `voip().terminate(..)`).
     pub fn call_creator(&self) -> &Jid {
         &self.call_creator
@@ -3234,6 +3314,7 @@ impl CallHandle {
             target_devices: &devices,
             participants: &participants,
             video,
+            device_orientation: self.local_video_orientation(),
         })
         .map_err(|error| CallError::Response(error.to_string()))?;
         self.ensure_current()?;
@@ -3347,16 +3428,170 @@ impl CallHandle {
             .await
     }
 
-    /// Mute or unmute the local microphone. While muted the engine sends DTX comfort-noise (the
-    /// stream stays fed); it does not gap, so the peer doesn't re-negotiate the transport.
-    /// This affects PCM audio only; encoded-audio callers must mute their external source.
-    pub fn set_muted(&self, muted: bool) {
-        self.muted.store(muted, Ordering::Relaxed);
+    /// Mute or unmute the local microphone and tell the other side.
+    ///
+    /// While muted the engine sends DTX comfort-noise (the stream stays fed) instead of gapping, so the
+    /// peer doesn't re-negotiate the transport. This affects PCM audio only; encoded-audio callers must
+    /// mute their external source.
+    ///
+    /// The state is announced as `<mute_v2>`, addressed like the rest of this call's signaling: the
+    /// call scope for a group or call-link call, whose roster shows who is muted, and the device that
+    /// answered for a direct call. Muting takes effect locally whatever becomes of the stanza, so an
+    /// `Err` there means the peer still shows this side open while it is really muted. Unmuting waits
+    /// for the announcement, so an `Err` there means the microphone is still muted. Dropping this
+    /// future resolves the same way: the microphone is never left live while the peer shows it muted.
+    ///
+    /// An outgoing call nobody has answered yet is muted locally only: the state belongs to a call
+    /// that does not exist on any of the devices still ringing, and answering does not replay it. Call
+    /// this again once the call is up to announce a state chosen while it rang.
+    pub async fn set_muted(&self, muted: bool) -> Result<(), CallError> {
+        self.ensure_current()?;
+        let client = self.upgrade_client()?;
+        // One ordered transition per call: two cloned handles muting at once would otherwise race,
+        // and the older value could land on the wire after the newer one.
+        let _transition = client.lock_answer_transition(&self.call_id).await;
+        // Re-checked under the lane: a call that ended while we waited must report that, not the
+        // `Ok(())` a live call still ringing gets.
+        self.ensure_current()?;
+        let Some(target) = self.mute_target() else {
+            // Nobody to mislead: a call still ringing has no answered call anywhere to carry the
+            // state. The answer path does not replay it either, so a caller that mutes before the
+            // callee picks up has to set it again once the call is up.
+            self.muted.store(muted, Ordering::Relaxed);
+            return Ok(());
+        };
+        // The two directions commit around the announcement rather than at one point, because either
+        // half can be lost: the stanza to a failed send, the local half to a caller that drops this
+        // future (a timeout, a `select!`) while the send is in flight. Muting applies first and
+        // unmuting only once the announcement is out, so whatever is lost, the microphone is never
+        // live while the peer is still showing this side muted.
+        if muted {
+            self.muted.store(true, Ordering::Relaxed);
+        }
+        client
+            .voip()
+            .announce_muted_locked(
+                &self.call_id,
+                &target,
+                &self.call_creator,
+                self.generation,
+                muted,
+            )
+            .await
+            .inspect(|()| self.muted.store(muted, Ordering::Relaxed))
+    }
+
+    /// Where this call's mute state can land: the call scope once it is a group call, the peer device
+    /// otherwise. An outgoing call has one only after an `<accept>` names the device that answered;
+    /// an incoming call we answered has had the caller's device since the offer.
+    fn mute_target(&self) -> Option<Jid> {
+        if self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            .is_some()
+        {
+            return Some(Jid::new(&self.call_id, Server::Call));
+        }
+        let session = self
+            .client_registry
+            .snapshot_if_current(&self.call_id, self.generation)?;
+        match session.direction {
+            CallDirection::Incoming => Some(session.peer_jid),
+            _ => session.answering_device,
+        }
     }
 
     /// Whether the microphone is currently muted.
     pub fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Relaxed)
+    }
+
+    /// The rotation to stamp on a `<video>` we are about to send. `0` for a call
+    /// that has already gone: the stanza is on its way out either way, and an
+    /// upright default is the one that cannot describe a rotation that never
+    /// happened.
+    fn local_video_orientation(&self) -> u8 {
+        self.client_registry
+            .local_video_orientation(&self.call_id, self.generation)
+            .unwrap_or(0)
+    }
+
+    /// Announce this side's camera rotation to the peer, as quarter turns in
+    /// `0..=3`. See `CallEntry::self_video_orientation` for what the value is
+    /// and what it is not.
+    ///
+    /// Every `<video>` this call sends from now on carries it. While video is
+    /// running the change is announced at once, as a `<video state=1>` that
+    /// re-states the current state: that is the shape the peer's own rotations
+    /// arrive in, and a no-op there beyond the new orientation. A call still
+    /// ringing has nobody to tell — the peer has no call entry to apply it
+    /// against — so the value waits and is announced when they answer.
+    ///
+    /// `Err` when the call is over, when the value is out of range, or when the
+    /// stanza could not be sent. A value rejected for range is not stored.
+    pub async fn set_video_orientation(&self, orientation: u8) -> Result<(), CallError> {
+        self.ensure_current()?;
+        // Range first: rejecting it costs nothing and does not need the lock.
+        if orientation > 3 {
+            return Err(CallError::Media(
+                "video orientation must be quarter turns in 0..=3",
+            ));
+        }
+
+        // Store and announce under the same lock the state transitions take. Two
+        // handles rotating at once would otherwise interleave — one storing `1`
+        // and pausing while the other stores and sends `2` — and the first would
+        // then send its stale `1`, leaving the peer at a rotation the registry
+        // does not record. The lock also keeps a rotation from putting a
+        // `state=1` on the wire after `stop_video`'s `state=6`.
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
+
+        if !self.client_registry.set_local_video_orientation(
+            &self.call_id,
+            self.generation,
+            orientation,
+        ) {
+            return Err(CallError::Media("call no longer active"));
+        }
+
+        // Nothing to announce until there is a direction to announce it for, and
+        // nobody to announce it to until the call is answered: a video-from-start
+        // offer sets `self_state` to Enabled while the peer is still ringing, and
+        // it has no call entry to apply a `<video>` against, so one sent now is
+        // dropped. The value is kept either way — `announce_orientation_on_accept`
+        // sends it when the peer answers, and the stanza that enables video
+        // carries it for every other path.
+        let announceable = self
+            .client_registry
+            .video_states(&self.call_id, self.generation)
+            .is_some_and(|(self_state, _)| self_state == VideoState::Enabled)
+            && self
+                .client_registry
+                .phase_if_current(&self.call_id, self.generation)
+                .is_some_and(|phase| phase != CallPhase::Ringing);
+        if !announceable {
+            return Ok(());
+        }
+
+        let client = self.upgrade_client()?;
+        let stanza = build_video_state(&VideoStateParams {
+            call_id: &self.call_id,
+            to: &self.peer_jid(),
+            id: &client.generate_request_id(),
+            call_creator: &self.call_creator,
+            state: VideoState::Enabled,
+            dec: Some(VIDEO_DEC_REQUEST),
+            // Read back rather than reusing the argument: under the lock they
+            // agree, and reading makes that the invariant rather than a habit.
+            device_orientation: Some(self.local_video_orientation()),
+        });
+        client.send_node(stanza).await?;
+        Ok(())
     }
 
     /// UPGRADE the call to video (we initiate): attaches the endpoints, enables the media plane,
@@ -3415,7 +3650,7 @@ impl CallHandle {
             call_creator: &self.call_creator,
             state: VideoState::Enabled,
             dec: Some(VIDEO_DEC_REQUEST),
-            device_orientation: Some(0),
+            device_orientation: Some(self.local_video_orientation()),
         });
         client.send_node(stanza).await?;
         Ok(())
@@ -3446,7 +3681,9 @@ impl CallHandle {
             call_creator: &self.call_creator,
             state: VideoState::Stopped,
             dec: None,
-            device_orientation: Some(0),
+            // No direction left for a rotation to describe. `None` omits the
+            // attribute rather than asserting `0`, which is a real rotation.
+            device_orientation: None,
         });
         client.send_node(stanza).await?;
         Ok(())
@@ -3554,7 +3791,12 @@ impl CallHandle {
                 call_creator: &self.call_creator,
                 state,
                 dec,
-                device_orientation: Some(0),
+                // The rotation rides every stanza that announces a direction, so
+                // one set before video started is announced by the stanza that
+                // starts it rather than waiting for the next rotation. Read per
+                // stanza, so a rotation between the two an upgrade sends lands on
+                // the second.
+                device_orientation: Some(self.local_video_orientation()),
             });
             let client = client.clone();
             async move { client.send_node(stanza).await }
@@ -3679,19 +3921,21 @@ impl CallHandle {
         }
     }
 
-    /// Tear the call down: abort the media task (which closes the relay and the audio channels).
-    /// Idempotent. Signaling `<terminate>` is a separate concern; send it via
-    /// [`Voip::terminate`](crate::Voip::terminate) if the peer must be told.
+    /// Drop this side of the call without telling the peer: aborts the media task (which closes the
+    /// relay and the audio channels). Idempotent, infallible, and silent on the wire, so the peer
+    /// keeps its own call up until its transport times out. That is what you want only when the call
+    /// is already over for the peer (it sent `<terminate>`/`<reject>`, or this handle was superseded);
+    /// to end a live call use [`terminate`](Self::terminate).
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
-            name = "wa.voip.hangup",
+            name = "wa.voip.hangup_local",
             level = "debug",
             skip_all,
             fields(call_id = %self.call_id)
         )
     )]
-    pub async fn hangup(&self) {
+    pub async fn hangup_local(&self) {
         // Generation-guarded: if a same-call-id glare/retry replaced this call under a newer
         // generation, this no-ops instead of aborting the replacement. For an ATTACHED call this
         // aborts the media task, whose drop-guard notifies `ended`. The bool reports whether we
@@ -3716,6 +3960,53 @@ impl CallHandle {
         // the dial. A superseded/already-gone handle removed nothing and stays quiet.
         if removed_registry || removed_pending.is_some() {
             self.ended.notify();
+        }
+    }
+
+    /// End the call: send `<terminate>` to the peer, then tear the local side down.
+    ///
+    /// A group or call-link call is addressed at the call scope. A direct call is addressed at the
+    /// device that answered, or, while it is still ringing, at every device the offer rang, since the
+    /// server does not fan a terminate out. The local teardown runs whether or not the stanzas went
+    /// out, which is why this reports its outcome instead of returning an error the caller must
+    /// handle to hang up.
+    pub async fn terminate(&self) -> CallTermination {
+        let client = match self.upgrade_client() {
+            Ok(client) => client,
+            Err(error) => {
+                self.hangup_local().await;
+                return CallTermination::LocalOnly(error);
+            }
+        };
+        // Armed before the first await: waiting for the lane is cancellable too, and a caller that
+        // drops this future must not be left with a live call. Generation-scoped, so a superseded
+        // handle tears down nothing.
+        let _teardown = crate::client::voip::LocalTeardown {
+            client: &client,
+            call_id: &self.call_id,
+            generation: self.generation,
+        };
+        // The answer-transition lane, held across the check AND the send: a replacement installed in
+        // that window would be ended by a `<terminate>` the peer cannot tell apart from ours, since
+        // both carry the same call-id.
+        let _transition = client.lock_answer_transition(&self.call_id).await;
+        // Nothing of ours is live: a superseded handle must not signal, or the peer would drop the
+        // replacement that now owns this call-id.
+        if self.client_registry.generation_of(&self.call_id) != Some(self.generation) {
+            return CallTermination::AlreadyEnded;
+        }
+        let targets = self.terminate_targets();
+        let delivery = client
+            .voip()
+            .terminate_for_generation(&self.call_id, &targets, &self.call_creator, self.generation)
+            .await;
+        match delivery.failure {
+            None => CallTermination::PeerNotified,
+            Some(error) if delivery.notified == 0 => CallTermination::LocalOnly(error),
+            Some(_) => CallTermination::PartlyNotified {
+                notified: delivery.notified,
+                unconfirmed: targets.len() - delivery.notified,
+            },
         }
     }
 
@@ -3772,7 +4063,7 @@ mod tests {
             NoiseCipher::new(&key).expect("key"),
             NoiseCipher::new(&key).expect("key"),
         );
-        *client.noise_socket.lock().await = Some(Arc::new(noise_socket));
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
     }
 
     struct GatedSendTransport {
@@ -3971,7 +4262,6 @@ mod tests {
         let group = Jid::new("120363000000000001", Server::Group);
         client
             .get_group_cache()
-            .await
             .insert(
                 group.clone(),
                 Arc::new(GroupInfo::new(
@@ -5119,7 +5409,7 @@ mod tests {
             peer_jid: caller(),
             call_creator: caller(),
             client_registry: client.call_registry(),
-            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: std::sync::Weak::new(),
             muted: Arc::new(AtomicBool::new(false)),
             video: Arc::new(VideoShared::new()),
@@ -5353,11 +5643,791 @@ mod tests {
         .await
         .expect("spawn_call");
         assert_eq!(client.call_registry().active_count(), 1);
-        handle.hangup().await;
+        handle.hangup_local().await;
         assert_eq!(
             client.call_registry().active_count(),
             0,
             "hangup deregisters the call"
+        );
+    }
+
+    /// A handle over an already-registered call with no engine behind it: enough to drive the
+    /// signaling-only methods (`terminate`) without standing a media task up.
+    fn registry_handle(client: &Arc<Client>, generation: u64) -> CallHandle {
+        let (_ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
+        CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: client.call_registry(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
+            client: Arc::downgrade(client),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: Arc::new(VideoShared::new()),
+            events: ev_rx,
+            ended: Arc::new(EndedFlag::default()),
+        }
+    }
+
+    // The reported symptom: ending a call from the handle used to be local-only, so the peer kept
+    // talking until its transport timed out. terminate() must put exactly one <terminate> on the wire,
+    // addressed at the device that answered the <accept>, and tear the local call down.
+    #[tokio::test]
+    async fn terminate_signals_the_answering_device() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let device = caller().with_device(3);
+        registry.set_answering_device("CID-FACADE", device.clone());
+        let handle = registry_handle(&client, generation);
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let outcome = handle.terminate().await;
+        assert!(
+            outcome.peer_notified(),
+            "a reachable peer must be told: {outcome:?}"
+        );
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("terminate must be sent")
+            .expect("waiter");
+        let wrapper = node.as_node_ref();
+        assert_eq!(
+            wrapper.attrs().optional_jid("to"),
+            Some(device),
+            "the terminate must reach the device that answered, not the bare peer"
+        );
+        let action = &wrapper.children().expect("call action")[0];
+        assert_eq!(action.tag.as_ref(), "terminate");
+        assert_eq!(
+            action.attrs().optional_string("call-id").as_deref(),
+            Some("CID-FACADE")
+        );
+        assert_eq!(action.attrs().optional_jid("call-creator"), Some(caller()));
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "exactly one terminate, not one per teardown step"
+        );
+        assert_eq!(
+            registry.active_count(),
+            0,
+            "signaling the peer must still end our own call"
+        );
+    }
+
+    /// Promote a registered call to a group call, which is what gives it a roster to publish to.
+    fn apply_group_state(client: &Arc<Client>) {
+        let update = GroupCallUpdate::builder()
+            .call_id("CID-FACADE".to_string())
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        assert_eq!(
+            client.call_registry().apply_group_update(update),
+            wacore::voip::GroupStateApply::Applied
+        );
+    }
+
+    // Muting in a group call is state the roster shows, so it must reach the participants: one
+    // <mute_v2> at the call scope carrying the new state, both ways.
+    #[tokio::test]
+    async fn muting_a_group_call_announces_the_new_state() {
+        let (client, sends) = make_sending_client().await;
+        let generation = client.call_registry().insert(mk_session());
+        apply_group_state(&client);
+        let handle = registry_handle(&client, generation);
+
+        for (muted, expected) in [(true, "1"), (false, "0")] {
+            let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+            handle.set_muted(muted).await.expect("announce");
+            assert_eq!(handle.is_muted(), muted, "the local half must apply too");
+
+            let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .expect("mute must be announced")
+                .expect("waiter");
+            let wrapper = node.as_node_ref();
+            assert_eq!(
+                wrapper.attrs().optional_jid("to"),
+                Some(Jid::new("CID-FACADE", Server::Call)),
+                "the roster lives at the call scope"
+            );
+            let action = &wrapper.children().expect("call action")[0];
+            assert_eq!(action.tag.as_ref(), "mute_v2");
+            assert_eq!(
+                action.attrs().optional_string("mute-state").as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                action.attrs().optional_jid("call-creator"),
+                Some(caller()),
+                "the action must carry the call creator"
+            );
+        }
+        assert_eq!(sends.load(Ordering::SeqCst), 2, "one stanza per transition");
+    }
+
+    // A direct call has no roster, but it has a peer device, and mute is addressed there like the
+    // rest of its signaling: the answering device, not the bare JID the offer rang.
+    #[tokio::test]
+    async fn muting_a_direct_call_announces_to_the_answering_device() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+            "CID-FACADE",
+            caller(),
+            caller(),
+        ));
+        let device = caller().with_device(3);
+        registry.set_answering_device("CID-FACADE", device.clone());
+        let handle = registry_handle(&client, generation);
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.set_muted(true).await.expect("announce");
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("mute must be announced")
+            .expect("waiter");
+        let wrapper = node.as_node_ref();
+        assert_eq!(wrapper.attrs().optional_jid("to"), Some(device));
+        let action = &wrapper.children().expect("call action")[0];
+        assert_eq!(action.tag.as_ref(), "mute_v2");
+        assert_eq!(
+            action.attrs().optional_string("mute-state").as_deref(),
+            Some("1")
+        );
+        assert!(handle.is_muted());
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    // An unmute is only local once the peer has been told, so a caller that drops it mid-send leaves
+    // the microphone muted rather than live while the peer still shows this side muted.
+    #[tokio::test]
+    async fn cancelling_an_unmute_mid_send_keeps_the_microphone_muted() {
+        let client = make_client().await;
+        let (transport, entered, _release) = gated_send_transport(0, false);
+        install_noise_transport(&client, transport).await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+            "CID-FACADE",
+            caller(),
+            caller(),
+        ));
+        registry.set_answering_device("CID-FACADE", caller().with_device(3));
+        let handle = registry_handle(&client, generation);
+        handle.muted.store(true, Ordering::Relaxed);
+
+        let unmuting = handle.clone();
+        let task = tokio::spawn(async move { unmuting.set_muted(false).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.recv())
+            .await
+            .expect("the unmute send must reach the gate")
+            .expect("gate observer");
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            handle.is_muted(),
+            "an unmute nobody was told about must leave the microphone muted"
+        );
+    }
+
+    // The other half of that rule: an announced unmute does open the microphone again.
+    #[tokio::test]
+    async fn an_announced_unmute_opens_the_microphone() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+            "CID-FACADE",
+            caller(),
+            caller(),
+        ));
+        registry.set_answering_device("CID-FACADE", caller().with_device(3));
+        let handle = registry_handle(&client, generation);
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.set_muted(false).await.expect("announce");
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the state must be announced")
+            .expect("waiter");
+        let wrapper = node.as_node_ref();
+        let action = &wrapper.children().expect("call action")[0];
+        assert_eq!(
+            action.attrs().optional_string("mute-state").as_deref(),
+            Some("0")
+        );
+        assert!(!handle.is_muted());
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    // Dropped before the announcement can go out, a mute must leave the microphone where it was:
+    // applying it locally alone would show this side muted while the peer still sees it open, and the
+    // cancelled caller gets no `Err` to tell it apart.
+    #[tokio::test]
+    async fn cancelling_a_mute_at_the_lane_leaves_both_sides_on_the_old_state() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+            "CID-FACADE",
+            caller(),
+            caller(),
+        ));
+        registry.set_answering_device("CID-FACADE", caller().with_device(3));
+        let handle = registry_handle(&client, generation);
+        let held = client.lock_answer_transition("CID-FACADE").await;
+
+        let muting = handle.clone();
+        let task = tokio::spawn(async move { muting.set_muted(true).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+        drop(held);
+
+        assert!(
+            !handle.is_muted(),
+            "a mute nobody was told about must not apply locally"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "the send never started");
+    }
+
+    // A superseded handle must not announce a state the replacement never chose.
+    #[tokio::test]
+    async fn stale_handle_mute_announces_nothing() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let stale_generation = registry.insert(mk_session());
+        let stale = registry_handle(&client, stale_generation);
+        registry.insert(mk_session());
+
+        assert!(
+            stale.set_muted(true).await.is_err(),
+            "a superseded handle has no call to mute"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+    }
+
+    // A direct call still ringing has no answered call on any device to carry the state, so the mute
+    // stays local until one answers. True of a single-device callee too, which retains no rung set.
+    #[tokio::test]
+    async fn muting_a_ringing_direct_call_stays_local() {
+        for ring_devices in [
+            Vec::new(),
+            vec![caller().with_device(1), caller().with_device(2)],
+        ] {
+            let (client, sends) = make_sending_client().await;
+            let mut session =
+                wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+            session.ring_devices = ring_devices;
+            let generation = client.call_registry().insert(session);
+            let handle = registry_handle(&client, generation);
+
+            handle
+                .set_muted(true)
+                .await
+                .expect("a ringing mute is local");
+
+            assert!(handle.is_muted(), "the local half still applies");
+            assert_eq!(sends.load(Ordering::SeqCst), 0, "nobody to announce it to");
+        }
+    }
+
+    // An answered incoming call has known its peer device since the offer, so muting it must reach the
+    // caller: there is no `<accept>` of ours to learn an answering device from.
+    #[tokio::test]
+    async fn muting_an_answered_incoming_call_announces_to_the_caller_device() {
+        let (client, sends) = make_sending_client().await;
+        let device = caller().with_device(5);
+        let generation = client
+            .call_registry()
+            .insert(wacore::voip::CallSession::new_incoming(
+                "CID-FACADE",
+                device.clone(),
+                caller(),
+            ));
+        let handle = registry_handle(&client, generation);
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.set_muted(true).await.expect("announce");
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("mute must be announced")
+            .expect("waiter");
+        let wrapper = node.as_node_ref();
+        assert_eq!(
+            wrapper.attrs().optional_jid("to"),
+            Some(device),
+            "an answered incoming call is addressed at the caller's device"
+        );
+        assert_eq!(
+            wrapper.children().expect("call action")[0].tag.as_ref(),
+            "mute_v2"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    // A still-ringing call told some of its devices and not others is not the same as telling nobody:
+    // the outcome has to say which, or a consumer logs a silent hangup that was not silent.
+    #[tokio::test]
+    async fn partly_delivered_terminate_reports_what_reached_the_wire() {
+        // The second send fails, so the first device is told and the second is not.
+        let (client, sends) = make_sending_client_with_failure_after(Some(1)).await;
+        let mut session = wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+        session.ring_devices = vec![caller().with_device(1), caller().with_device(2)];
+        let generation = client.call_registry().insert(session);
+        let handle = registry_handle(&client, generation);
+
+        let outcome = handle.terminate().await;
+
+        assert!(
+            matches!(
+                outcome,
+                CallTermination::PartlyNotified {
+                    notified: 1,
+                    unconfirmed: 1
+                }
+            ),
+            "a partial fan-out must be reported as such: {outcome:?}"
+        );
+        assert!(!outcome.peer_notified(), "not every device was confirmed");
+        assert_eq!(sends.load(Ordering::SeqCst), 2, "both sends were attempted");
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "the local call ends either way"
+        );
+    }
+
+    // The microphone must stop when the user says so, even when the announcement cannot go out: the
+    // local half is applied first and the error only reports that the roster is now stale.
+    #[tokio::test]
+    async fn mute_announce_failure_still_mutes_locally() {
+        let client = make_failing_send_client().await; // send_node errors (no noise socket)
+        let generation = client.call_registry().insert(mk_session());
+        apply_group_state(&client);
+        let handle = registry_handle(&client, generation);
+
+        assert!(
+            handle.set_muted(true).await.is_err(),
+            "a failed announcement must be reported"
+        );
+        assert!(handle.is_muted(), "the local mute must hold regardless");
+    }
+
+    /// The lines of `source` that a release build compiles: `#[cfg(test)]` items are dropped whole,
+    /// by brace depth, and `use` lines with them.
+    fn runtime_lines(source: &str) -> Vec<String> {
+        let mut kept = Vec::new();
+        let mut lines = source.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim() != "#[cfg(test)]" {
+                if !line.trim_start().starts_with("use ") {
+                    kept.push(line.to_string());
+                }
+                continue;
+            }
+            let mut depth = 0i32;
+            let mut opened = false;
+            for item in lines.by_ref() {
+                depth += item.matches('{').count() as i32;
+                depth -= item.matches('}').count() as i32;
+                opened |= item.contains('{');
+                if opened {
+                    if depth <= 0 {
+                        break;
+                    }
+                    continue;
+                }
+                // A brace-less item (a `use`, a const) ends at its `;`. Without this the scan waits
+                // for a body that never comes and swallows the runtime code after it, which is how a
+                // builder with no caller would slip past the check below.
+                if item.trim_end().ends_with(';') {
+                    break;
+                }
+            }
+        }
+        kept
+    }
+
+    #[test]
+    fn runtime_lines_resume_after_a_brace_less_test_item() {
+        let kept = runtime_lines(
+            "fn before() {}\n#[cfg(test)]\nconst ONLY_IN_TESTS: u8 = 1;\nfn after() { build_mute_v2(); }\n",
+        );
+
+        assert!(
+            kept.iter().any(|line| line.contains("build_mute_v2")),
+            "runtime code after a brace-less test item must still be scanned: {kept:?}"
+        );
+        assert!(
+            !kept.iter().any(|line| line.contains("ONLY_IN_TESTS")),
+            "the test item itself is not runtime code: {kept:?}"
+        );
+    }
+
+    // A call-signaling builder nobody sends is the cheap signal of the bug this pair exists for: an
+    // action with a wire form that never leaves the process. A new one must be wired to a caller or
+    // listed here (suffixes only, so this list is not its own evidence of a caller) with the reason.
+    #[test]
+    fn call_stanza_builders_are_wired_to_the_runtime() {
+        // Media-plane keepalives: no public call-control method claims to send them today, and what
+        // the official client emits for them is not established here. See the audit notes.
+        const UNWIRED: &[&str] = &["transport", "relay_latency", "heartbeat"];
+        const CALLERS: &[&str] = &[
+            "src/voip/facade.rs",
+            "src/client/voip.rs",
+            "src/handlers/call.rs",
+            "wacore/src/stanza/group_call.rs",
+        ];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Absent when this crate is consumed unpacked from a registry: nothing to check, not a failure.
+        let Ok(builders) = std::fs::read_to_string(root.join("wacore/src/stanza/call.rs")) else {
+            return;
+        };
+        // Runtime callers only: `use` lines are imports rather than calls, and a `#[cfg(test)]` item
+        // calling a builder says nothing about whether anything sends it.
+        let callers = CALLERS
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(root.join(path)).ok())
+            .flat_map(|source| runtime_lines(&source))
+            .collect::<Vec<_>>();
+
+        // A call, not a prefix: `build_preaccept_with_capability` must not stand in for a caller of
+        // `build_preaccept`.
+        let is_wired = |suffix: &str| {
+            let call = format!("build_{suffix}(");
+            callers.iter().any(|line| line.contains(&call))
+        };
+        for suffix in builders.lines().filter_map(|line| {
+            line.strip_prefix("pub fn build_")
+                .and_then(|rest| rest.split('(').next())
+        }) {
+            assert!(
+                is_wired(suffix) || UNWIRED.contains(&suffix),
+                "build_{suffix} has no runtime caller: send it, or list it in UNWIRED with why"
+            );
+        }
+        for suffix in UNWIRED {
+            assert!(
+                !is_wired(suffix),
+                "build_{suffix} is wired now; drop it from UNWIRED"
+            );
+        }
+    }
+
+    // Group and call-link calls address every transition at the call scope, not at a device. Ending one
+    // must follow that, or the terminate reaches nobody.
+    #[tokio::test]
+    async fn terminate_of_a_group_call_addresses_the_call_scope() {
+        let (client, _sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let handle = registry_handle(&client, generation);
+        let update = GroupCallUpdate::builder()
+            .call_id("CID-FACADE".to_string())
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        assert_eq!(
+            registry.apply_group_update(update),
+            wacore::voip::GroupStateApply::Applied
+        );
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        assert!(handle.terminate().await.peer_notified());
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("terminate must be sent")
+            .expect("waiter");
+        assert_eq!(
+            node.as_node_ref().attrs().optional_jid("to"),
+            Some(Jid::new("CID-FACADE", Server::Call)),
+            "a promoted call must be ended at its call scope"
+        );
+    }
+
+    // The generation-less public terminate holds the same lane, so a replacement installed while it
+    // sends is not ended by a `<terminate>` the peer cannot tell apart from ours.
+    #[tokio::test]
+    async fn public_terminate_refuses_a_replaced_call() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        registry.insert(mk_session());
+        let live = registry.insert(mk_session());
+        let held = client.lock_answer_transition("CID-FACADE").await;
+
+        let terminating = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .voip()
+                    .terminate("CID-FACADE", &caller(), &caller())
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The replacement lands while the terminate waits for the lane.
+        let newest = registry.insert(mk_session());
+        drop(held);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), terminating)
+                .await
+                .expect("terminate must finish")
+                .expect("join")
+                .is_err(),
+            "a call replaced under the lane must not be terminated"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "no stanza for a dead call");
+        assert_ne!(live, newest);
+        assert_eq!(
+            registry.generation_of("CID-FACADE"),
+            Some(newest),
+            "the replacement must survive"
+        );
+    }
+
+    // Waiting for the answer-transition lane is cancellable too: a caller that gives up while another
+    // transition holds it must not be left with a live call and an open microphone.
+    #[tokio::test]
+    async fn cancelling_terminate_while_waiting_for_the_lane_still_ends_the_call() {
+        let (client, sends) = make_sending_client().await;
+        let generation = client.call_registry().insert(mk_session());
+        let handle = registry_handle(&client, generation);
+        let held = client.lock_answer_transition("CID-FACADE").await;
+
+        let terminate = tokio::spawn(async move { handle.terminate().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        terminate.abort();
+        let _ = terminate.await;
+        drop(held);
+
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "the send never started");
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "a terminate cancelled at the lane must still tear the local call down"
+        );
+    }
+
+    // A terminate that starts on a call-id nothing is registered under owns no local call. A call
+    // registered while it waits for the lane is somebody else's, so it must neither be signalled (the
+    // peer cannot tell two same-call-id terminates apart) nor torn down.
+    #[tokio::test]
+    async fn terminate_of_an_unregistered_call_spares_a_call_registered_while_it_waits() {
+        let (client, sends) = make_sending_client().await;
+        let held = client.lock_answer_transition("CID-FACADE").await;
+
+        let terminating = client.clone();
+        let task = tokio::spawn(async move {
+            terminating
+                .voip()
+                .terminate("CID-FACADE", &caller(), &caller())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let generation = client.call_registry().insert(mk_session());
+        drop(held);
+
+        assert!(
+            task.await.expect("join").is_err(),
+            "the call-id now belongs to a call this terminate never started on"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "nothing to tell the peer");
+        assert_eq!(
+            client.call_registry().generation_of("CID-FACADE"),
+            Some(generation),
+            "the call registered meanwhile must survive"
+        );
+    }
+
+    // An outgoing call still ringing has no answering device yet, and the server does not fan a
+    // terminate out: cancelling it must reach every device the offer rang, or the rest keep ringing.
+    #[tokio::test]
+    async fn terminate_while_ringing_reaches_every_rung_device() {
+        let (client, sends) = make_sending_client().await;
+        let first = caller().with_device(1);
+        let second = caller().with_device(2);
+        let mut session = wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+        session.ring_devices = vec![first.clone(), second.clone()];
+        let generation = client.call_registry().insert(session);
+        let handle = registry_handle(&client, generation);
+
+        let to_first = client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("call").attr("to", first.to_string()),
+        );
+        let to_second = client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("call").attr("to", second.to_string()),
+        );
+        assert!(handle.terminate().await.peer_notified());
+
+        for (waiter, device) in [(to_first, first), (to_second, second)] {
+            let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .unwrap_or_else(|_| panic!("{device} must be told"))
+                .expect("waiter");
+            assert_eq!(
+                node.as_node_ref().children().expect("call action")[0]
+                    .tag
+                    .as_ref(),
+                "terminate"
+            );
+        }
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            2,
+            "one stanza per rung device"
+        );
+    }
+
+    // A single-device callee is still a device: cancelling before it answers must reach that JID, the
+    // one the offer resolved, not the bare peer.
+    #[tokio::test]
+    async fn terminate_while_ringing_reaches_a_lone_device() {
+        let (client, sends) = make_sending_client().await;
+        let device = peer_lid();
+        seed_peer_session(&client, &device).await;
+        let own_lid = client.lid().expect("own lid");
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+        let handle = place_call(
+            &client,
+            "00abcdef0123456789abcdef01234567".into(),
+            &Jid::new("333333333333333", Server::Lid),
+            &own_lid,
+            &own_lid,
+            std::slice::from_ref(&device),
+            std::slice::from_ref(&device),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
+        )
+        .await
+        .expect("place_call");
+        let offers = sends.load(Ordering::SeqCst);
+
+        let waiter = client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("call").attr("to", device.to_string()),
+        );
+        assert!(handle.terminate().await.peer_notified());
+
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the lone device must be told")
+            .expect("waiter");
+        assert_eq!(
+            node.as_node_ref().children().expect("call action")[0]
+                .tag
+                .as_ref(),
+            "terminate"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), offers + 1);
+    }
+
+    // Cancellation (a timeout, a `select!`) at the send await must not strand the media task with the
+    // microphone open: the local teardown is a drop guard, not a statement after the await.
+    #[tokio::test]
+    async fn cancelling_terminate_mid_send_still_ends_the_call() {
+        let client = make_client().await;
+        let (transport, entered, _release) = gated_send_transport(0, false);
+        install_noise_transport(&client, transport).await;
+        let generation = client.call_registry().insert(mk_session());
+        let handle = registry_handle(&client, generation);
+
+        let terminate = tokio::spawn(async move { handle.terminate().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.recv())
+            .await
+            .expect("the terminate send must reach the gate")
+            .expect("gate observer");
+        terminate.abort();
+        let _ = terminate.await;
+
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "a cancelled terminate must still tear the local call down"
+        );
+    }
+
+    // The local teardown is not conditional on the wire: an offline/failing send still ends the call
+    // here, and the outcome says the peer was not reached.
+    #[tokio::test]
+    async fn terminate_send_failure_still_ends_the_call_locally() {
+        let client = make_failing_send_client().await; // send_node errors (no noise socket)
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let handle = registry_handle(&client, generation);
+
+        let outcome = handle.terminate().await;
+        assert!(
+            matches!(outcome, CallTermination::LocalOnly(_)),
+            "a failed send must be reported as a local-only hangup: {outcome:?}"
+        );
+        assert_eq!(
+            registry.active_count(),
+            0,
+            "a failed terminate send must not leave the call registered"
+        );
+    }
+
+    // hangup_local() is the deliberately silent half of the pair. Naming it is the fix for the trap;
+    // this pins the behavior difference so the two can't drift back together.
+    #[tokio::test]
+    async fn hangup_local_tells_the_peer_nothing() {
+        let (client, sends) = make_sending_client().await;
+        let generation = client.call_registry().insert(mk_session());
+        let handle = registry_handle(&client, generation);
+
+        handle.hangup_local().await;
+
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            0,
+            "hangup_local must stay off the wire"
+        );
+        assert_eq!(client.call_registry().active_count(), 0);
+    }
+
+    // A superseded handle (same-call-id glare/retry replaced it) must not signal: the peer would drop
+    // the replacement that now owns this call-id.
+    #[tokio::test]
+    async fn stale_handle_terminate_spares_the_replacement() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let stale_generation = registry.insert(mk_session());
+        let stale = registry_handle(&client, stale_generation);
+        let live_generation = registry.insert(mk_session());
+        assert_ne!(stale_generation, live_generation);
+
+        let outcome = stale.terminate().await;
+        assert!(
+            matches!(outcome, CallTermination::AlreadyEnded),
+            "a superseded handle has nothing to end: {outcome:?}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "no stanza for a dead call");
+        assert_eq!(
+            registry.generation_of("CID-FACADE"),
+            Some(live_generation),
+            "the live replacement must survive"
         );
     }
 
@@ -5408,14 +6478,14 @@ mod tests {
         );
 
         // The stale handle hangs up: it must NOT abort the replacement.
-        stale.hangup().await;
+        stale.hangup_local().await;
         assert_eq!(
             client.call_registry().active_count(),
             1,
             "stale hangup must leave the live replacement registered"
         );
         // The live handle still tears it down.
-        live.hangup().await;
+        live.hangup_local().await;
         assert_eq!(client.call_registry().active_count(), 0);
     }
 
@@ -5516,7 +6586,7 @@ mod tests {
         // Let the waiter register its listener and pass the still-present phase check, so it is truly
         // parked on `listener.await` (the path the guard must cover), not the early return.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        handle.hangup().await;
+        handle.hangup_local().await;
         tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .expect("wait_ended must resolve after hangup aborts the task")
@@ -5698,6 +6768,7 @@ mod tests {
         );
         assert!(
             client
+                .voip_state()
                 .pending_outgoing_calls
                 .lock()
                 .unwrap()
@@ -5966,6 +7037,9 @@ mod tests {
             includes_prekey_message: false,
             had_unregistered_device: false,
             rejected_devices: Vec::new(),
+            // One of the two recipients has no ciphertext, which is the drop
+            // this fixture is about.
+            unkeyed_at_encrypt: 1,
         };
 
         assert!(matches!(
@@ -6425,7 +7499,12 @@ mod tests {
             "an unsendable offer must not register the call"
         );
         assert!(
-            client.pending_outgoing_calls.lock().unwrap().is_empty(),
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
             "an unsendable offer must not park a pending entry"
         );
     }
@@ -6472,6 +7551,7 @@ mod tests {
         let (handle, call_id) = place_dormant_outgoing(&client).await;
         assert!(
             client
+                .voip_state()
                 .pending_outgoing_calls
                 .lock()
                 .unwrap()
@@ -6479,10 +7559,15 @@ mod tests {
             "the dormant call is parked pending the relay"
         );
 
-        handle.hangup().await;
+        handle.hangup_local().await;
 
         assert!(
-            client.pending_outgoing_calls.lock().unwrap().is_empty(),
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
             "hangup must drop the dormant pending entry"
         );
         assert_eq!(
@@ -6495,6 +7580,33 @@ mod tests {
             .expect("dormant hangup must resolve wait_ended (no engine task to notify it)");
     }
 
+    // A call still dormant (offer sent, relay not back yet) terminated through the handle must drop its
+    // pending entry, so the relay riding a late ack cannot resurrect it.
+    #[tokio::test]
+    async fn dormant_outgoing_terminate_signals_and_survives_a_late_relay_ack() {
+        let (client, _sends) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+
+        let outcome = handle.terminate().await;
+        assert!(
+            outcome.peer_notified(),
+            "a dormant call still rings the peer, so it must be told: {outcome:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
+            .await
+            .expect("dormant terminate must resolve wait_ended (no engine task to notify it)");
+
+        let attached = attach_outgoing_relay(&client, &call_id, &sample_relay())
+            .await
+            .expect("late relay ack");
+        assert!(!attached, "a terminated call must not attach a late relay");
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "the late ack must not re-register the call"
+        );
+    }
+
     // A disconnect must tear down dormant outgoing calls: drain pending_outgoing_calls and notify each
     // `ended`, so a parked wait_ended() resolves instead of hanging across the reconnect.
     #[tokio::test]
@@ -6505,7 +7617,12 @@ mod tests {
         drain_pending_outgoing_on_disconnect(&client);
 
         assert!(
-            client.pending_outgoing_calls.lock().unwrap().is_empty(),
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
             "disconnect must drain dormant outgoing calls"
         );
         tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
@@ -6675,7 +7792,7 @@ mod tests {
             peer_jid: caller(),
             call_creator: caller(),
             client_registry: client.call_registry(),
-            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: std::sync::Weak::new(),
             muted: muted.clone(),
             video: Arc::new(VideoShared::new()),
@@ -6709,7 +7826,7 @@ mod tests {
         // Let attach_engine reach the gated connect before hanging up.
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        handle.hangup().await;
+        handle.hangup_local().await;
 
         tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
@@ -7768,7 +8885,12 @@ mod tests {
             "a send failure must surface as a Send error"
         );
         assert!(
-            client.pending_outgoing_calls.lock().unwrap().is_empty(),
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
             "a send failure must drop the parked pending entry"
         );
         assert_eq!(
@@ -7939,7 +9061,12 @@ mod tests {
             "a refused offer must not register the call"
         );
         assert!(
-            client.pending_outgoing_calls.lock().unwrap().is_empty(),
+            client
+                .voip_state()
+                .pending_outgoing_calls
+                .lock()
+                .unwrap()
+                .is_empty(),
             "a refused offer must not park a pending entry"
         );
     }
@@ -8115,6 +9242,268 @@ mod tests {
         node.as_node_ref().children().unwrap()[0].to_owned()
     }
 
+    /// The rotation rides the stanza that announces a direction, so one set
+    /// before video starts is announced by the stanza that starts it rather than
+    /// waiting for the app to rotate again.
+    #[tokio::test]
+    async fn orientation_set_before_video_rides_the_upgrade_request() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        handle
+            .set_video_orientation(3)
+            .await
+            .expect("no direction yet, so nothing to announce");
+
+        let (vsrc, vsink) = video_endpoints();
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("upgrade request must be sent")
+            .expect("waiter");
+        let action = call_action_of(&node);
+        assert_eq!(
+            action
+                .as_node_ref()
+                .attrs()
+                .optional_string("device_orientation")
+                .as_deref(),
+            Some("3"),
+            "the stanza that starts video must carry the rotation already set"
+        );
+        handle.hangup_local().await;
+    }
+
+    /// A rotation while video is running is announced on its own, as a `state=1`
+    /// that re-states the direction — which is how the peer's own rotations
+    /// arrive, and a no-op there beyond the new orientation.
+    #[tokio::test]
+    async fn rotating_mid_call_announces_the_new_orientation() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        client.call_registry().apply_peer_video_state(
+            "CID-FACADE",
+            handle.generation,
+            VideoState::UpgradeAccept,
+        );
+        // Answered: a call still ringing has no entry on the peer's side to
+        // apply a `<video>` against, and deliberately sends none.
+        assert!(client.call_registry().transition_if_current(
+            "CID-FACADE",
+            handle.generation,
+            CallPhase::Connecting
+        ));
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.set_video_orientation(1).await.expect("rotate");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("a rotation with video running must reach the peer")
+            .expect("waiter");
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.tag, "video");
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("1"));
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation").as_deref(),
+            Some("1")
+        );
+        handle.hangup_local().await;
+    }
+
+    /// Every mutating method on `CallHandle` refuses a handle a replacement has
+    /// superseded, and a rotation is no exception: it would otherwise write the
+    /// live call's orientation from a handle that no longer owns it.
+    #[tokio::test]
+    async fn a_stale_handle_cannot_rotate_the_replacement() {
+        let client = make_client().await;
+        let spawn = |_client: &Client| {
+            let (_relay_tx, relay_rx) = async_channel::unbounded();
+            let factory = MockFactory {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                relay_rx: Mutex::new(Some(relay_rx)),
+                connects: Arc::new(AtomicUsize::new(0)),
+            };
+            let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+            let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+            (factory, Arc::new(mic_rx), Arc::new(spk_tx))
+        };
+
+        let (f1, mic1, spk1) = spawn(&client);
+        let stale = spawn_call(
+            &client,
+            mk_session(),
+            engine(),
+            &f1,
+            pcm_audio(mic1, spk1),
+            None,
+        )
+        .await
+        .expect("first spawn_call");
+        let (f2, mic2, spk2) = spawn(&client);
+        let live = spawn_call(
+            &client,
+            mk_session(),
+            engine(),
+            &f2,
+            pcm_audio(mic2, spk2),
+            None,
+        )
+        .await
+        .expect("replacement spawn_call");
+
+        stale
+            .set_video_orientation(3)
+            .await
+            .expect_err("a superseded handle must not rotate the call");
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation(&stale.call_id, live.generation),
+            Some(0),
+            "the live call keeps the rotation it had"
+        );
+        live.hangup_local().await;
+    }
+
+    /// A camera does not un-rotate because a negotiation restarted. Six paths
+    /// rebuild `VideoNegotiation` — a group downgrade among them — and a rotation
+    /// stored before one of them has to still be there for the `<video>` that
+    /// starts video again.
+    #[tokio::test]
+    async fn a_rotation_survives_a_video_negotiation_rebuild() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        handle.set_video_orientation(3).await.expect("rotate");
+        handle.stop_video().await.expect("stop_video");
+
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation("CID-FACADE", handle.generation),
+            Some(3),
+            "the device is still rotated, whatever the negotiation did"
+        );
+
+        let (vsrc, vsink) = video_endpoints();
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.start_video(vsrc, vsink).await.expect("restart");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("restart must be sent")
+            .expect("waiter");
+        assert_eq!(
+            call_action_of(&node)
+                .as_node_ref()
+                .attrs()
+                .optional_string("device_orientation")
+                .as_deref(),
+            Some("3"),
+            "restarting video must announce the rotation still in force"
+        );
+        handle.hangup_local().await;
+    }
+
+    /// A video-from-start offer leaves `self_state` Enabled while the peer is
+    /// still ringing, so the direction check alone would send a `<video>` the
+    /// peer has no call entry to apply — dropped, and never resent, because such
+    /// a caller sends no further video stanza of its own. The value waits for
+    /// the answer instead.
+    #[tokio::test]
+    async fn a_ringing_call_stores_the_rotation_without_announcing_it() {
+        let (client, sent, handle, _relay_keepalive) = sending_handle().await;
+        // What a video-from-start offer leaves behind: the direction is already
+        // Enabled, from the offer, while the call is still ringing. The direction
+        // check alone would take that for a call that can be told about a
+        // rotation.
+        assert!(
+            client
+                .call_registry()
+                .set_is_video("CID-FACADE", handle.generation, true)
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states("CID-FACADE", handle.generation)
+                .map(|(self_state, _)| self_state),
+            Some(VideoState::Enabled)
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .phase_if_current("CID-FACADE", handle.generation),
+            Some(CallPhase::Ringing),
+            "and still ringing, which is the case under test"
+        );
+
+        let before = sent.load(Ordering::SeqCst);
+        handle.set_video_orientation(2).await.expect("store it");
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            before,
+            "a ringing call has nobody to announce to"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation("CID-FACADE", handle.generation),
+            Some(2),
+            "and the rotation is kept for the answer"
+        );
+        handle.hangup_local().await;
+    }
+
+    /// Out of range is refused rather than folded in: `4` is a caller counting
+    /// something other than quarter turns, and answering it with `0` would leave
+    /// the call upright and wrong. The stored value must survive the attempt.
+    #[tokio::test]
+    async fn an_out_of_range_orientation_is_refused_and_does_not_replace_the_stored_one() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        handle.set_video_orientation(2).await.expect("in range");
+
+        for rejected in [4u8, 255] {
+            handle
+                .set_video_orientation(rejected)
+                .await
+                .expect_err("out of range must not be accepted");
+        }
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation("CID-FACADE", handle.generation),
+            Some(2),
+            "a rejected value must not have replaced the one in force"
+        );
+        handle.hangup_local().await;
+    }
+
+    /// Stopping leaves no direction for a rotation to describe, so the stanza
+    /// omits the attribute rather than asserting `0`, which is a real rotation.
+    #[tokio::test]
+    async fn stopping_video_announces_no_orientation() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        handle.set_video_orientation(3).await.expect("rotate");
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.stop_video().await.expect("stop_video");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("stop must be sent")
+            .expect("waiter");
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("6"));
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation"),
+            None,
+            "a stopped direction has no rotation to announce"
+        );
+        handle.hangup_local().await;
+    }
+
     #[tokio::test]
     async fn start_video_sends_upgrade_request_with_marker() {
         let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
@@ -8154,7 +9543,7 @@ mod tests {
                 .is_video,
             "start_video must mark the session as video"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -8176,7 +9565,7 @@ mod tests {
             handle.video.sink_slot.lock().unwrap().is_none(),
             "invalid timing must not attach endpoints"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -8215,7 +9604,7 @@ mod tests {
             handle.video.sink_slot.lock().unwrap().is_none(),
             "an ineligible group call must not attach video endpoints"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -8278,7 +9667,7 @@ mod tests {
             handle.video.sink_slot.lock().unwrap().is_none(),
             "the overtaken upgrade must not attach video endpoints"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[test]
@@ -8325,7 +9714,7 @@ mod tests {
             peer_jid: caller(),
             call_creator: caller(),
             client_registry: registry.clone(),
-            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video_shared.clone(),
@@ -8382,7 +9771,7 @@ mod tests {
             None,
             "an accept must not carry the upgrade marker"
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -8405,7 +9794,7 @@ mod tests {
             peer_jid: caller(),
             call_creator: caller(),
             client_registry: registry.clone(),
-            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
@@ -8472,7 +9861,7 @@ mod tests {
                 .client_registry
                 .peer_video_request_is_current(&handle.call_id, second)
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -8495,7 +9884,7 @@ mod tests {
             peer_jid: caller(),
             call_creator: caller(),
             client_registry: registry.clone(),
-            pending_outgoing_calls: client.pending_outgoing_calls.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
             client: Arc::downgrade(&client),
             muted: Arc::new(AtomicBool::new(false)),
             video: video.clone(),
@@ -8542,7 +9931,7 @@ mod tests {
             registry.video_states("CID-FACADE", generation),
             Some((VideoState::Disabled, VideoState::Disabled))
         );
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     #[tokio::test]
@@ -8589,7 +9978,7 @@ mod tests {
             .await
             .expect("restart_video");
         assert!(handle.video.sink_slot.lock().unwrap().is_some());
-        handle.hangup().await;
+        handle.hangup_local().await;
         assert!(
             handle.video.sink_slot.lock().unwrap().is_none(),
             "a restarted video plane must rearm terminal teardown"
@@ -8605,6 +9994,7 @@ mod tests {
                 .await;
         assert!(
             client
+                .voip_state()
                 .pending_outgoing_calls
                 .lock()
                 .unwrap()
@@ -8615,6 +10005,7 @@ mod tests {
         handle.stop_video().await.expect("dormant downgrade");
         assert!(
             client
+                .voip_state()
                 .pending_outgoing_calls
                 .lock()
                 .unwrap()
@@ -8628,7 +10019,7 @@ mod tests {
             Some((VideoState::Stopped, VideoState::Enabled))
         );
         assert!(registry.snapshot(&call_id).unwrap().is_video);
-        handle.hangup().await;
+        handle.hangup_local().await;
     }
 
     // The VideoFeed pumps the consumer's source into the drive loop's channel and dies on the
@@ -8674,6 +10065,114 @@ mod tests {
             after.is_err(),
             "an AU sent after ended must not be forwarded (feed stopped)"
         );
+    }
+
+    /// Runs a caller-supplied hook inline on `abort()`, standing in for a `Runtime` that
+    /// finishes cancellation synchronously and therefore drops the task on the spot.
+    #[derive(Clone, Default)]
+    struct AbortHook(Arc<std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>>);
+
+    struct ReentrantAbortRuntime {
+        handle: tokio::runtime::Handle,
+        hook: AbortHook,
+    }
+
+    impl wacore::runtime::Runtime for ReentrantAbortRuntime {
+        fn spawn(
+            &self,
+            future: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) -> wacore::runtime::AbortHandle {
+            let task = self.handle.spawn(future);
+            let hook = self.hook.clone();
+            wacore::runtime::AbortHandle::new(move || {
+                task.abort();
+                if let Some(reenter) = hook.0.get() {
+                    reenter();
+                }
+            })
+        }
+
+        fn spawn_detached(
+            &self,
+            future: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        ) {
+            self.handle.spawn(future);
+        }
+
+        fn sleep(&self, duration: Duration) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(tokio::time::sleep(duration))
+        }
+
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {
+                let _ = tokio::task::spawn_blocking(f).await;
+            })
+        }
+
+        fn yield_now(&self) -> Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    /// The old feed must be aborted with the `feed` mutex already released: cancellation runs
+    /// runtime-supplied code, and on a runtime that cancels synchronously that code runs the
+    /// task's drop inline, re-entering this non-reentrant mutex.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn feed_swap_does_not_abort_while_holding_the_feed_lock() {
+        let hook = AbortHook::default();
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let client = Client::builder()
+            .with_runtime_arc(Arc::new(ReentrantAbortRuntime {
+                handle: tokio::runtime::Handle::current(),
+                hook: hook.clone(),
+            }))
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(crate::transport::mock::MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .build()
+            .await
+            .expect("client build")
+            .into_client();
+
+        let shared = Arc::new(VideoShared::new());
+        let _receivers = shared.take_receivers();
+        hook.0
+            .set({
+                let shared = Arc::clone(&shared);
+                Box::new(move || {
+                    let _guard = shared.feed.lock().unwrap_or_else(|e| e.into_inner());
+                })
+            })
+            .ok()
+            .expect("the hook is installed once");
+
+        let (src_rx, vout_tx) = video_endpoints();
+        let source: Arc<dyn VideoSource> = Arc::new(src_rx);
+        let sink: Arc<dyn VideoSink> = Arc::new(vout_tx);
+        let ended = Arc::new(EndedFlag::default());
+
+        // A re-entrant lock parks its thread for good, so drive the sequence on a thread of its
+        // own and let the timeout report the deadlock instead of hanging the suite.
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            shared.attach_endpoints(&client, &source, &sink, ended.clone());
+            // Replacing an existing feed aborts it...
+            shared.attach_endpoints(&client, &source, &sink, ended.clone());
+            // ...and so does releasing the endpoints.
+            shared.detach_endpoints();
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("attach/detach must not hold the feed lock while aborting the old feed");
     }
 
     // A second take is defensive: it must yield closed channels (their driver arms self-disable),
