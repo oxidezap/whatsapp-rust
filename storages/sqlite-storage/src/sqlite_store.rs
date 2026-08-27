@@ -2987,7 +2987,7 @@ impl ProtocolStore for SqliteStore {
     async fn update_device_list(&self, record: DeviceListRecord) -> Result<()> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
-        let devices_json = serde_json::to_string(&record.devices)
+        let devices_json = serde_json::to_string(&*record.devices)
             .map_err(|e| StoreError::Serialization(Box::new(e)))?;
         let now = wacore::time::now_secs() as i32;
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -3044,7 +3044,7 @@ impl ProtocolStore for SqliteStore {
         let prepared: Vec<PreparedRow> = records
             .into_iter()
             .map(|r| {
-                let devices_json = serde_json::to_string(&r.devices)
+                let devices_json = serde_json::to_string(&*r.devices)
                     .map_err(|e| StoreError::Serialization(Box::new(e)))?;
                 Ok(PreparedRow {
                     user: r.user.to_string(),
@@ -3119,11 +3119,14 @@ impl ProtocolStore for SqliteStore {
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
             match row {
                 Some((user, devices_json, timestamp, phash, raw_id)) => {
-                    let devices: Box<[DeviceInfo]> = serde_json::from_str(&devices_json)
+                    // Decoded as a `Vec` and converted, so this reuses the
+                    // `Vec<DeviceInfo>` codec the crate already instantiates
+                    // rather than stamping a second one for `Box<[_]>`.
+                    let devices: Vec<DeviceInfo> = serde_json::from_str(&devices_json)
                         .map_err(|e| StoreError::Serialization(Box::new(e)))?;
                     Ok(Some(DeviceListRecord {
                         user: Arc::from(user),
-                        devices,
+                        devices: devices.into_boxed_slice(),
                         timestamp: timestamp as i64,
                         phash: phash.map(Box::<str>::from),
                         raw_id: raw_id.map(|r| r as u32),

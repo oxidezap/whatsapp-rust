@@ -298,6 +298,54 @@ mod device_info_tests {
         assert_eq!(size_of::<super::DeviceListRecord>(), 64);
     }
 
+    /// The record now serializes through a shadow struct; the blob it writes
+    /// and reads has to stay exactly what the owned-field layout produced.
+    #[test]
+    fn a_device_list_record_keeps_its_persisted_shape() {
+        use super::DeviceListRecord;
+
+        let record = DeviceListRecord {
+            user: "5511999999999".into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(2, Some(9))].into(),
+            timestamp: 1234,
+            phash: Some("2:abcdef".into()),
+            raw_id: Some(7),
+        };
+
+        let json = serde_json::to_value(record.clone()).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "user": "5511999999999",
+                "devices": [
+                    { "device_id": 0, "key_index": null, "is_hosted": false },
+                    { "device_id": 2, "key_index": 9, "is_hosted": false },
+                ],
+                "timestamp": 1234,
+                "phash": "2:abcdef",
+                "raw_id": 7,
+            })
+        );
+
+        let round: DeviceListRecord = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(&*round.user, "5511999999999");
+        assert_eq!(round.devices, record.devices);
+        assert_eq!(round.phash.as_deref(), Some("2:abcdef"));
+        assert_eq!(round.raw_id, Some(7));
+
+        // `raw_id` has always been optional, and a record without a phash
+        // writes an explicit null the way it always did.
+        let legacy: DeviceListRecord = serde_json::from_value(serde_json::json!({
+            "user": "5511888888888",
+            "devices": [],
+            "timestamp": 0,
+            "phash": null,
+        }))
+        .expect("deserialize legacy");
+        assert!(legacy.devices.is_empty());
+        assert_eq!(legacy.raw_id, None);
+    }
+
     /// A device id is a `u16` on the wire and in a `Jid`. A blob claiming a
     /// wider one is corrupt, and has to be rejected rather than truncated into
     /// a different device — which is what a plain `as u16` would have done.
@@ -394,7 +442,14 @@ mod msg_secret_entry_tests {
 }
 
 /// Device list record matching WhatsApp Web's DeviceListRecord structure.
+///
+/// Serialized through [`DeviceListRecordDe`], whose fields are the `String`,
+/// `Vec` and `Option<String>` the previous layout used. Deriving serde on the
+/// compact fields directly would stamp a second set of `Box<[T]>` and
+/// `Option<Box<str>>` codecs into every crate that persists a record, for a
+/// blob that is byte-for-byte the same either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "DeviceListRecordDe", into = "DeviceListRecordDe")]
 pub struct DeviceListRecord {
     /// The user part of the JID (phone number or LID)
     /// `Arc<str>`, so the registry cache can key the record by exactly this
@@ -418,6 +473,41 @@ pub struct DeviceListRecord {
     /// When this changes, all sessions and sender keys for the user must be cleared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_id: Option<u32>,
+}
+
+/// Serialization shadow: the owned-collection shape the blobs carry.
+#[derive(Serialize, Deserialize)]
+struct DeviceListRecordDe {
+    user: String,
+    devices: Vec<DeviceInfo>,
+    timestamp: i64,
+    phash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_id: Option<u32>,
+}
+
+impl From<DeviceListRecordDe> for DeviceListRecord {
+    fn from(d: DeviceListRecordDe) -> Self {
+        Self {
+            user: Arc::from(d.user),
+            devices: d.devices.into_boxed_slice(),
+            timestamp: d.timestamp,
+            phash: d.phash.map(String::into_boxed_str),
+            raw_id: d.raw_id,
+        }
+    }
+}
+
+impl From<DeviceListRecord> for DeviceListRecordDe {
+    fn from(d: DeviceListRecord) -> Self {
+        Self {
+            user: d.user.to_string(),
+            devices: d.devices.into_vec(),
+            timestamp: d.timestamp,
+            phash: d.phash.map(String::from),
+            raw_id: d.raw_id,
+        }
+    }
 }
 
 impl DeviceListRecord {
