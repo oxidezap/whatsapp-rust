@@ -49,10 +49,14 @@ fn ordered_indices(pairs: &[LidPnPair], by: OrderBy) -> Vec<u32> {
 /// order is computed over indices and applied here.
 fn sort_pairs(pairs: Vec<LidPnPair>) -> Box<[LidPnPair]> {
     let order = ordered_indices(&pairs, OrderBy::Lid);
-    let mut slots: Vec<Option<LidPnPair>> = pairs.into_iter().map(Some).collect();
+    // `mem::take` rather than wrapping each slot in an `Option`: a pair is
+    // `Default`, every index appears exactly once, and the alternative asks
+    // the binary to carry a second set of `Vec` codegen for
+    // `Option<LidPnPair>` to say the same thing.
+    let mut slots = pairs;
     order
         .into_iter()
-        .map(|i| slots[i as usize].take().expect("each index appears once"))
+        .map(|i| std::mem::take(&mut slots[i as usize]))
         .collect()
 }
 
