@@ -419,6 +419,21 @@ pub mod codec {
         record.encode(out);
     }
 
+    /// One archived Signal session state, held by `SessionRecord` as the bytes
+    /// it was persisted as and decoded only when a message arrives for the
+    /// session it belongs to.
+    #[inline(never)]
+    pub fn session_structure_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::SessionStructure, buffa::DecodeError> {
+        whatsapp::SessionStructure::decode_from_slice(bytes)
+    }
+
+    #[inline(never)]
+    pub fn session_structure_to_vec(session: &whatsapp::SessionStructure) -> Vec<u8> {
+        session.encode_to_vec()
+    }
+
     #[inline(never)]
     pub fn signed_pre_key_record_decode(
         bytes: &[u8],
