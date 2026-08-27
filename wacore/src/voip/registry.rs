@@ -348,6 +348,13 @@ impl CallEntry {
                 .as_ref()
                 .map_or(0, HeapSize::heap_bytes)
             + self
+                .media_stats
+                .as_ref()
+                // Fixed-size and behind one Arc: the counters are all integers, so the allocation
+                // is the whole cost. Counted anyway -- a per-call allocation that no report
+                // mentions is how an estimate drifts from the heap it claims to describe.
+                .map_or(0, |_| size_of::<crate::voip::media_stats::MediaStatsCell>())
+            + self
                 .peer_announced_capability
                 .capacity()
                 .saturating_mul(size_of::<(Jid, crate::stanza::call::CapabilityBit)>())

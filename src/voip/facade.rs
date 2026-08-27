@@ -97,11 +97,19 @@ macro_rules! impl_media_builder_methods {
         /// disagree with it: MLow needs both sides to have asked for it. Answering a call whose
         /// peer selects the other codec fails with
         /// [`CallError::EncodedAudioCodecNotNegotiated`](crate::CallError::EncodedAudioCodecNotNegotiated),
-        /// naming both codecs so the call can be retried on the right one. On an outgoing call the
-        /// peer's answer arrives after media is up, so the switch is announced instead, as
-        /// [`CallEvent::AudioCodecSwitched`](wacore::voip::CallEvent::AudioCodecSwitched): a source
-        /// that can re-encode should follow it, since inbound frames carry their own codec but
-        /// outbound ones are whatever the source produced.
+        /// naming both codecs so the call can be retried on the right one.
+        ///
+        /// On an outgoing call the peer's answer arrives after media is up, so there is nothing to
+        /// refuse: the receive side switches -- inbound frames carry their own codec -- and the
+        /// send side stops, because this source emits the codec it was built with and the engine
+        /// cannot re-point it. The frames it keeps producing are dropped and counted in
+        /// `outbound_frames_without_encoder` rather than sent under a profile that would accept
+        /// them and leave the peer hearing noise. Both events fire, in this order:
+        /// [`AudioCodecSwitched`](wacore::voip::CallEvent::AudioCodecSwitched) and
+        /// [`AudioCodecSourceIsFixed`](wacore::voip::CallEvent::AudioCodecSourceIsFixed). Recovery
+        /// is to end this call and place a new one on the codec the peer named -- re-encoding in
+        /// place does not resume the outbound audio, since the format this call was built with is
+        /// what the engine compares against for its lifetime.
         pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
         where
             S: EncodedAudioSource,

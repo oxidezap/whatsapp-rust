@@ -6,9 +6,10 @@
 //! "transport-decorator dump" the design notes left as a follow-up -- modular and consumer-driven,
 //! and zero cost when not wired (you simply don't wrap the transport).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -39,16 +40,67 @@ pub trait PacketTap: crate::sync_marker::MaybeSendSync {
 }
 
 /// Decorates a [`RelayTransport`], recording every outbound packet before delegating to the inner
-/// transport. Pure: no runtime and no I/O of its own (any I/O is the sink's).
+/// transport. No I/O of its own (any I/O is the sink's).
 pub struct TappedTransport {
     inner: Arc<dyn RelayTransport>,
     tap: Arc<dyn PacketTap>,
+    /// Needed only by [`RelayTransport::reconnect`], which has to spawn a forwarding hop for the
+    /// replacement channel's inbound stream. `None` for a transport built by [`Self::new`].
+    runtime: Option<Arc<dyn Runtime>>,
 }
 
 impl TappedTransport {
+    /// Tap a transport that will never be asked to reconnect.
+    ///
+    /// A relay migration through this one fails the call: wrapping the replacement channel means
+    /// spawning a forwarder for its inbound stream, and that needs a runtime. Prefer
+    /// [`with_runtime`](Self::with_runtime), which [`TappedFactory`] uses for exactly this reason.
     pub fn new(inner: Arc<dyn RelayTransport>, tap: Arc<dyn PacketTap>) -> Self {
-        Self { inner, tap }
+        Self {
+            inner,
+            tap,
+            runtime: None,
+        }
     }
+
+    /// Tap a transport that can follow the call to a new relay, keeping the tap attached.
+    pub fn with_runtime(
+        inner: Arc<dyn RelayTransport>,
+        tap: Arc<dyn PacketTap>,
+        runtime: Arc<dyn Runtime>,
+    ) -> Self {
+        Self {
+            inner,
+            tap,
+            runtime: Some(runtime),
+        }
+    }
+}
+
+/// Wrap one connected inner channel: tap the send side, and put the inbound stream behind a
+/// forwarding hop that records it. Shared by the factory's first connect and by every later
+/// reconnect, so a migrated call is tapped exactly like the original.
+fn tap_channel(
+    inner_transport: Arc<dyn RelayTransport>,
+    inner_rx: async_channel::Receiver<RelayTransportEvent>,
+    tap: Arc<dyn PacketTap>,
+    runtime: Arc<dyn Runtime>,
+) -> (
+    Arc<dyn RelayTransport>,
+    async_channel::Receiver<RelayTransportEvent>,
+) {
+    let transport: Arc<dyn RelayTransport> = Arc::new(TappedTransport::with_runtime(
+        inner_transport,
+        tap.clone(),
+        runtime.clone(),
+    ));
+    let (out_tx, out_rx) = async_channel::bounded(TAP_FORWARD_CAP);
+    // Fire-and-forget: the forwarder self-terminates when the inner stream closes (relay gone) or
+    // the driver drops `out_rx` (call ended), so the abort handle is detached rather than stored.
+    runtime
+        .spawn(Box::pin(tap_forward(inner_rx, out_tx, tap)))
+        .detach();
+    (transport, out_rx)
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -60,6 +112,27 @@ impl RelayTransport for TappedTransport {
     }
     async fn disconnect(&self) {
         self.inner.disconnect().await;
+    }
+    /// Follow the call to the new relay rather than inheriting the trait's "cannot redial" default,
+    /// which would end every tapped call that migrates -- a group update moving the relay is a
+    /// routine event, and tapping a call must not change whether it survives one.
+    async fn reconnect(
+        &self,
+        endpoint: SocketAddr,
+    ) -> Result<(
+        Arc<dyn RelayTransport>,
+        async_channel::Receiver<RelayTransportEvent>,
+    )> {
+        let Some(runtime) = self.runtime.clone() else {
+            bail!("tapped transport was built without a runtime and cannot rewrap {endpoint}")
+        };
+        let (inner_transport, inner_rx) = self.inner.reconnect(endpoint).await?;
+        Ok(tap_channel(
+            inner_transport,
+            inner_rx,
+            self.tap.clone(),
+            runtime,
+        ))
     }
 }
 
@@ -163,15 +236,12 @@ impl RelayTransportFactory for TappedFactory {
         async_channel::Receiver<RelayTransportEvent>,
     )> {
         let (inner_transport, inner_rx) = self.inner.connect().await?;
-        let transport: Arc<dyn RelayTransport> =
-            Arc::new(TappedTransport::new(inner_transport, self.tap.clone()));
-        let (out_tx, out_rx) = async_channel::bounded(TAP_FORWARD_CAP);
-        // Fire-and-forget: the forwarder self-terminates when the inner stream closes (relay gone) or
-        // the driver drops `out_rx` (call ended), so the abort handle is detached rather than stored.
-        self.runtime
-            .spawn(Box::pin(tap_forward(inner_rx, out_tx, self.tap.clone())))
-            .detach();
-        Ok((transport, out_rx))
+        Ok(tap_channel(
+            inner_transport,
+            inner_rx,
+            self.tap.clone(),
+            self.runtime.clone(),
+        ))
     }
 }
 
@@ -198,8 +268,12 @@ impl PacketTap for InMemoryTap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::AbortHandle;
     use crate::voip::RelayDisconnectReason;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct RecordingTransport {
@@ -212,6 +286,94 @@ mod tests {
             Ok(())
         }
         async fn disconnect(&self) {}
+    }
+
+    /// An inner transport that can redial, handing back a fresh channel like a real one does.
+    #[derive(Default)]
+    struct RedialingTransport {
+        sent: Mutex<Vec<Bytes>>,
+        inbound: Mutex<Option<async_channel::Sender<RelayTransportEvent>>>,
+    }
+    #[async_trait]
+    impl RelayTransport for RedialingTransport {
+        async fn send(&self, data: Bytes) -> Result<()> {
+            self.sent.lock().unwrap().push(data);
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+        async fn reconnect(
+            &self,
+            _endpoint: SocketAddr,
+        ) -> Result<(
+            Arc<dyn RelayTransport>,
+            async_channel::Receiver<RelayTransportEvent>,
+        )> {
+            let replacement = Arc::new(RedialingTransport::default());
+            let (tx, rx) = async_channel::unbounded();
+            *replacement.inbound.lock().unwrap() = Some(tx);
+            Ok((replacement, rx))
+        }
+    }
+
+    /// Runs spawned futures on a thread of their own, which is all `tap_forward` needs.
+    struct BlockingRuntime;
+    #[async_trait]
+    impl Runtime for BlockingRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            std::thread::spawn(move || futures::executor::block_on(future));
+            AbortHandle::new(|| {})
+        }
+        fn sleep(&self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(std::future::pending())
+        }
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            f();
+            Box::pin(std::future::ready(()))
+        }
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            None
+        }
+    }
+
+    // A group update can move a call to another relay, and the driver ends the call when its
+    // transport cannot redial. Inheriting the trait's "cannot redial" default meant tapping a call
+    // decided whether it survived a routine migration -- and the tap is a debugging aid that must
+    // not change what it observes.
+    #[test]
+    fn a_tapped_call_survives_a_relay_migration_and_stays_tapped() {
+        let inner = Arc::new(RedialingTransport::default());
+        let tap = Arc::new(InMemoryTap::default());
+        let tapped = TappedTransport::with_runtime(
+            inner.clone(),
+            tap.clone(),
+            Arc::new(BlockingRuntime) as Arc<dyn Runtime>,
+        );
+
+        let endpoint: SocketAddr = "203.0.113.7:3478".parse().expect("endpoint");
+        let (replacement, rx) = futures::executor::block_on(tapped.reconnect(endpoint))
+            .expect("a tapped transport must be able to follow the call to the new relay");
+
+        // The replacement still records what it sends...
+        futures::executor::block_on(replacement.send(Bytes::from_static(b"\x01\x02"))).unwrap();
+        assert_eq!(tap.captured(), vec![(PacketDir::Outbound, vec![1, 2])]);
+        // ...and can itself migrate again, rather than being a one-shot.
+        assert!(futures::executor::block_on(replacement.reconnect(endpoint)).is_ok());
+        drop(rx);
+    }
+
+    // Built without a runtime there is no way to wrap the replacement's inbound stream, so the
+    // failure is explicit rather than a silently untapped channel.
+    #[test]
+    fn a_runtimeless_tapped_transport_refuses_to_reconnect() {
+        let tapped = TappedTransport::new(
+            Arc::new(RedialingTransport::default()),
+            Arc::new(InMemoryTap::default()),
+        );
+        let endpoint: SocketAddr = "203.0.113.7:3478".parse().expect("endpoint");
+        assert!(futures::executor::block_on(tapped.reconnect(endpoint)).is_err());
     }
 
     #[test]
