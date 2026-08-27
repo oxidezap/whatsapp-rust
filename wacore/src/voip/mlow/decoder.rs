@@ -15,7 +15,8 @@ use super::smpl_mem::load_smpl_mem;
 use super::smpl_pitch::decode_smpl_pitch;
 use super::smpl_pulse::decode_smpl_pulses;
 use super::smpl_synth::{
-    SMPL_INTF_LEN, SmplDecoderState, load_smpl_synth_tables, smpl_reconstruct_nlsf,
+    SMPL_INTF_LEN, SmplDecodeRollback, SmplDecoderState, load_smpl_synth_tables,
+    smpl_reconstruct_nlsf,
 };
 use super::toc::parse_mlow_toc;
 
@@ -107,11 +108,11 @@ pub struct MlowDecoder {
     /// once + every-100th `warn`, so a peer sending a stream this decoder cannot read is visible in
     /// a log rather than silently quiet.
     malformed: u32,
-    /// Snapshot of `state` taken before each active decode, so a malformed body can be undone.
+    /// Snapshot of the part of `state` an active decode advances, so a malformed body can be undone.
     ///
-    /// Owned by the decoder and reused: see the `clone_from` in `decode_active_frame` for why this
-    /// is a field rather than a local.
-    state_backup: SmplDecoderState,
+    /// Owned by the decoder and reused: see the `save` in `decode_active_frame` for why this is a
+    /// field rather than a local, and [`SmplDecodeRollback`] for what it leaves out.
+    state_backup: SmplDecodeRollback,
     /// What the in-flight `decode` call has done so far. Reset at the top of every `decode` and
     /// drained by the caller through [`MlowDecoder::take_frame_report`].
     report: MlowFrameReport,
@@ -131,7 +132,7 @@ impl MlowDecoder {
     pub fn new() -> Self {
         MlowDecoder {
             state: SmplDecoderState::default(),
-            state_backup: SmplDecoderState::default(),
+            state_backup: SmplDecodeRollback::default(),
             redundancy: 0,
             had_error: false,
             dropped_unsupported: 0,
@@ -171,7 +172,7 @@ impl MlowDecoder {
     /// Clear the cross-frame state (call at a stream discontinuity).
     pub fn reset(&mut self) {
         self.state = SmplDecoderState::default();
-        self.state_backup = SmplDecoderState::default();
+        self.state_backup = SmplDecodeRollback::default();
         self.had_error = false;
     }
 
@@ -373,7 +374,10 @@ impl MlowDecoder {
         // `Vec` of fixed length, so cloning into an existing snapshot reuses its allocations and the
         // copy costs a `memcpy`; a fresh clone allocates four buffers on every packet, which at
         // ~17 packets a second is pure churn on a heap that an ESP32 target has to keep unfragmented.
-        self.state_backup.copy_from(&self.state);
+        //
+        // And it copies only what this loop can reach: the harmonic postfilter runs after the
+        // endpoint check below, so a concealed packet never advanced it. See [`SmplDecodeRollback`].
+        self.state_backup.save(&self.state);
 
         let mut out: Vec<f32> = Vec::with_capacity(frames * SMPL_INTF_LEN);
         // Collect the per-40-block lags (8 per internal frame) and the average normalized bitrate
@@ -479,9 +483,10 @@ impl MlowDecoder {
             if dec.err != 0 {
                 self.had_error = true;
             }
-            // Swap rather than assign: the advanced state moves into the backup slot, whose
-            // allocations the next packet's `clone_from` then reuses. Assigning would drop them.
-            core::mem::swap(&mut self.state, &mut self.state_backup);
+            // Copied back rather than swapped: the snapshot is narrower than the state, so it has
+            // no `harm` to trade for the live one. It keeps its own buffers either way, which is
+            // what the swap was protecting.
+            self.state_backup.restore(&mut self.state);
             self.malformed += 1;
             if self.malformed == 1 || self.malformed.is_multiple_of(100) {
                 log::warn!(
