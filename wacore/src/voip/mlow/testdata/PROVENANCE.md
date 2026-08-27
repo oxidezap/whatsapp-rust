@@ -103,6 +103,11 @@ covered; regenerating it requires the external encoder above on `synth_mic.raw`.
 | --- | --- | --- |
 | `mlow_120ms_frames.json` | `decoder.rs::multi_frame_decode_matches_the_reference` | `scripts/regenerate-mlow-vectors.sh` |
 | `ref_120ms_expected.raw` | same test | same run of the same script |
+| `mlow_dtx_off_frames.json` | `decoder.rs::dtx_off_frames_decode_to_audio` | same script, DTX-off pass |
+| `ref_dtx_off_expected.raw` | same test | same run of the same script |
+
+The DTX-off pair is what pins that a coded-inactive frame carries a decodable body rather than
+silence: the same script emits it in the same run, so regenerating one regenerates all four.
 
 ```sh
 MLOW_REFERENCE=/path/to/opus_mlow scripts/regenerate-mlow-vectors.sh

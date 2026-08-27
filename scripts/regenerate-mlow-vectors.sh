@@ -80,8 +80,18 @@ lib="$ref/.libs/libopus.a"
 # branch moves the branch ref while leaving .git/HEAD untouched, so a HEAD mtime check would accept
 # an archive built from a different revision. A source newer than the archive is the direct
 # statement that the archive does not correspond to the tree it would be attributed to.
+# Check the layout first. `find` on a missing directory exits nonzero, and with `&&` below that
+# would skip the whole staleness check in silence -- reporting nothing on exactly the day the oracle
+# moved, which is the day this guard exists for.
+for dir in "$ref/smpl" "$ref/src" "$ref/celt"; do
+  if [[ ! -d "$dir" ]]; then
+    echo "error: $dir is missing, so the archive cannot be checked against its sources." >&2
+    echo "       The oracle layout changed; update this script before regenerating." >&2
+    exit 1
+  fi
+done
 if newer="$(find "$ref/smpl" "$ref/src" "$ref/celt" \
-             \( -name '*.c' -o -name '*.h' \) -newer "$lib" -print -quit 2>/dev/null)" \
+             \( -name '*.c' -o -name '*.h' \) -newer "$lib" -print -quit)" \
    && [[ -n "$newer" ]]; then
   echo "error: $lib is older than $newer, so it was not built from the current tree." >&2
   echo "       Rebuild it (make -j\"\$(nproc)\" in \$MLOW_REFERENCE) and re-run." >&2

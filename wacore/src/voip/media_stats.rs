@@ -51,7 +51,15 @@ pub struct CallMediaStats {
     pub foreign_frames_decoded: u32,
     /// Frames the peer sent in a codec this build has no decoder for. Not recoverable inside the
     /// call, and the one silence reason a consumer can act on before the next call.
+    ///
+    /// Inbound only. The send-side twin is [`Self::outbound_frames_without_encoder`], and they are
+    /// deliberately separate: [`AudioSilenceReason`] describes why WE hear nothing, so folding an
+    /// encode gap into it would answer an inbound question with an outbound fact.
     pub audio_frames_without_decoder: u32,
+    /// Mic frames dropped because the call switched to a codec this build cannot encode.
+    ///
+    /// The peer hears nothing. Invisible from every other counter here, which describe reception.
+    pub outbound_frames_without_encoder: u32,
     /// Samples discarded from the head of the playout buffer to hold the latency ceiling.
     pub playout_trimmed_samples: u32,
     /// Inbound media the relay read pump discarded under backpressure, before the engine.
@@ -418,6 +426,22 @@ mod tests {
             ..CallMediaStats::default()
         };
         assert_eq!(
+            dominant_reason(&stats),
+            AudioSilenceReason::NoDecoderForNegotiatedCodec
+        );
+    }
+
+    // A call that cannot ENCODE must not report an inbound decoder problem. `AudioSilenceReason`
+    // answers "why do we hear nothing", and the encode gap is the peer's problem, not ours.
+    #[test]
+    fn an_outbound_encode_gap_is_not_an_inbound_silence_reason() {
+        let stats = CallMediaStats {
+            rtp_received: 100,
+            audio_frames_decoded: 100,
+            outbound_frames_without_encoder: 100,
+            ..CallMediaStats::default()
+        };
+        assert_ne!(
             dominant_reason(&stats),
             AudioSilenceReason::NoDecoderForNegotiatedCodec
         );

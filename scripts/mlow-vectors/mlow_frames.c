@@ -30,6 +30,15 @@ extern int smpl_CreateCodec(void);
 #define FS 16000
 #define MAX_PACKET 400
 
+/* Report a failed control and return nonzero, so the caller can bail before writing a fixture. */
+static int CHECK_CTL(int rc, const char *what) {
+    if (rc != OPUS_OK) {
+        fprintf(stderr, "error: %s: %s\n", what, opus_strerror(rc));
+        return 1;
+    }
+    return 0;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
             "usage: %s <input.raw> <frame_ms> [packets] [bitrate]\n"
@@ -54,6 +63,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: frame_ms must be 10, 20, 60 or 120 (got %d)\n", frame_ms);
         return 2;
     }
+    /* `atoi` turns a typo into 0, and a bitrate of 0 would produce a plausible-looking fixture that
+     * is not the operating point anyone asked for. Refuse rather than encode it. */
+    if (bitrate <= 0) {
+        fprintf(stderr, "error: bitrate must be a positive integer (got \"%s\")\n",
+                argc > 4 ? argv[4] : "");
+        return 2;
+    }
     const int samps = FS / 1000 * frame_ms;
 
     if (smpl_CreateCodec() != 0) {
@@ -73,16 +89,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: encoder create: %s\n", opus_strerror(err));
         return 1;
     }
-    opus_encoder_ctl(enc, OPUS_SET_USING_SMPL(1));
-    opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate));
-    opus_encoder_ctl(enc, OPUS_SET_FORCE_CHANNELS(1));
+    /* Every control is checked. An OPUS_SET_USING_SMPL that silently fails on some reference build
+     * makes this harness emit plain Opus, and the script would then overwrite committed MLow
+     * fixtures with them. A fixture is only worth what its generator refused to guess about. */
+    if (CHECK_CTL(opus_encoder_ctl(enc, OPUS_SET_USING_SMPL(1)), "encoder OPUS_SET_USING_SMPL") ||
+        CHECK_CTL(opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate)), "encoder OPUS_SET_BITRATE") ||
+        CHECK_CTL(opus_encoder_ctl(enc, OPUS_SET_FORCE_CHANNELS(1)),
+                  "encoder OPUS_SET_FORCE_CHANNELS")) {
+        return 1;
+    }
 
     OpusDecoder *dec = opus_decoder_create(FS, 1, &err);
     if (err != OPUS_OK || !dec) {
         fprintf(stderr, "error: decoder create: %s\n", opus_strerror(err));
         return 1;
     }
-    opus_decoder_ctl(dec, OPUS_SET_USING_SMPL(1));
+    if (CHECK_CTL(opus_decoder_ctl(dec, OPUS_SET_USING_SMPL(1)), "decoder OPUS_SET_USING_SMPL")) {
+        return 1;
+    }
 
     opus_int16 *pcm = malloc((size_t)samps * sizeof(opus_int16));
     opus_int16 *out = malloc((size_t)samps * sizeof(opus_int16));

@@ -473,8 +473,8 @@ impl MlowDecoder {
         // plausible-looking symbols and the synthesis can diverge to full scale. Comparing where the
         // decode ended against what the body actually held is the only way to see it. Anything
         // outside the accepted window is a malformed frame, concealed as a lost one rather than
-        // synthesized. State already advanced is left as-is, matching the reference, which also
-        // returns without rolling back.
+        // synthesized, and the state the loop advanced is rolled back below -- deliberately unlike
+        // the reference, for the reason given where the snapshot is taken.
         let consumed_bytes = (dec.tell().max(0) as u32).div_ceil(8);
         let body = dec.storage();
         if !endpoint_is_valid(body, consumed_bytes) || dec.err != 0 {

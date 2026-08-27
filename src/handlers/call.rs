@@ -324,16 +324,9 @@ impl StanzaHandler for CallHandler {
                                 })
                             })
                             .and_then(|action| action.get_optional_child("capability"));
-                        // Read the MLow gate before the group-promotion parse below, which folds an
-                        // unparseable `ver` into "no capability". For codec selection the two are
-                        // opposite: the official client rebuilds an unreadable blob as a version
-                        // that answers false for every index, so it must read as an explicit Clear.
+                        // Only an ABSENT node is `Unknown`; a present one reads through
+                        // `capability_bit`, which owns what an unreadable `ver` means.
                         peer_mlow_bit = capability.map_or(CapabilityBit::Unknown, |capability| {
-                            // `ver` is NOT defaulted to 1 here, unlike the group-promotion parse
-                            // below. The client's deserializer treats a missing `ver` as an error
-                            // and rebuilds the capability with a version that answers false for
-                            // every index, so for codec selection a missing attribute has to read
-                            // as an explicit Clear. Only an absent `<capability>` node is Unknown.
                             let version = capability
                                 .get_attr("ver")
                                 .and_then(|version| version.as_str().parse::<u32>().ok());

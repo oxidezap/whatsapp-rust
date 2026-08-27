@@ -2799,10 +2799,10 @@ impl CallEngine {
                 // Nothing to encode with, so nothing goes out at all -- not even the comfort-noise
                 // frame that keeps the peer's media-liveness timer fed. Counted rather than dropped
                 // in silence: an outbound side that has gone mute is the other half of #1105, and
-                // it is invisible from the receive counters.
-                self.media_stats.audio_frames_without_decoder = self
+                // it is invisible from every other counter here, which describe reception.
+                self.media_stats.outbound_frames_without_encoder = self
                     .media_stats
-                    .audio_frames_without_decoder
+                    .outbound_frames_without_encoder
                     .saturating_add(1);
                 return;
             };

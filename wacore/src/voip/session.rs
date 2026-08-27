@@ -277,9 +277,7 @@ impl SrtpRecvStreams {
     /// The rollover counter to authenticate `seq` against, WITHOUT allocating anything.
     ///
     /// A stream never seen before estimates from a fresh counter, which is what one would answer
-    /// anyway. Allocation is deliberately not done here: the SSRC is read from the unauthenticated
-    /// RTP header, so anyone able to inject datagrams could otherwise spend the whole stream table
-    /// on forged SSRCs before the peer's first real packet and leave the call permanently deaf.
+    /// anyway. Nothing is allocated here on purpose; see [`Self::commit_mut`].
     fn estimate_roc(&self, ssrc: u32, seq: u16) -> u32 {
         self.primary
             .iter()
@@ -292,6 +290,11 @@ impl SrtpRecvStreams {
     }
 
     /// Borrow the state for an AUTHENTICATED packet's SSRC, creating it on first sight.
+    ///
+    /// Called only after the WARP MI tag verifies, which is the point: the SSRC comes from the
+    /// unauthenticated RTP header, so allocating on sight would let anyone able to inject datagrams
+    /// spend the whole table on forged SSRCs before the peer's first real packet and leave the call
+    /// permanently deaf.
     ///
     /// `None` once the stream cap is reached, which drops the packet rather than evicting a live
     /// stream: evicting would reset a rollover counter that a real stream is still using. Reaching

@@ -1389,6 +1389,17 @@ async fn run_call_with_clock_and_wallclock(
                 }
                 Ok(RelayTransportEvent::InboundDropped(packets)) => {
                     eng.note_inbound_dropped(packets);
+                    // Same overdue-timer check the packet arm does. This arm has priority over the
+                    // timer arm, so a sustained run of drop reports -- exactly what a call under
+                    // backpressure produces -- would otherwise starve playout and the keepalive
+                    // while reporting that it is starving.
+                    let now = now_ms();
+                    if let Some(at) = eng.poll_timeout()
+                        && at != engine::NEVER
+                        && now >= at
+                    {
+                        eng.handle_input(now, Input::Timeout);
+                    }
                 }
                 // The channel is already open by the time we run; Connected is a redundant confirm.
                 Ok(RelayTransportEvent::Connected) => {}

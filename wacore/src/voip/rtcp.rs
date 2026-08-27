@@ -296,6 +296,9 @@ impl RtpReceptionStats {
         arrival_ms: u64,
         clock_rate: u32,
     ) {
+        // Whether this packet is the newest of the stream, which decides below whether it may move
+        // the timestamp baseline. A fresh stream's first packet is newest by definition.
+        let is_newest;
         if self.ssrc != Some(ssrc) {
             *self = Self {
                 ssrc: Some(ssrc),
@@ -304,9 +307,11 @@ impl RtpReceptionStats {
                 received: 1,
                 ..Self::default()
             };
+            is_newest = true;
         } else {
             let delta = sequence.wrapping_sub(self.max_sequence);
-            if delta != 0 && delta < 0x8000 {
+            is_newest = delta != 0 && delta < 0x8000;
+            if is_newest {
                 if sequence < self.max_sequence {
                     self.sequence_cycles = self.sequence_cycles.wrapping_add(1 << 16);
                 }
@@ -328,15 +333,23 @@ impl RtpReceptionStats {
         }
         self.transit = Some(transit);
 
-        // Only forward steps count. A reordered or retransmitted packet would produce a negative or
-        // absurd difference, and one bad sample must not be able to move a codec decision.
-        if let Some(previous) = self.last_rtp_timestamp {
-            let delta = rtp_timestamp.wrapping_sub(previous);
-            if delta > 0 && delta <= clock_rate {
-                self.frame_span = Some(delta);
+        // The baseline tracks the NEWEST packet, not the last one to arrive. Advancing it on a
+        // reordered packet would poison the following measurement as well as its own: given
+        // 1/1000, 3/2920, 2/1960, 4/3880, leaving the baseline at 1960 makes packet 4 read a step of
+        // 1920 rather than the 960 the peer is actually pacing at, and the codec probe would go on
+        // refusing a stream that agrees with itself.
+        //
+        // Only forward steps within a second of audio count: a retransmission or a wrap would
+        // otherwise produce an absurd difference, and one bad sample must not move a codec decision.
+        if is_newest {
+            if let Some(previous) = self.last_rtp_timestamp {
+                let delta = rtp_timestamp.wrapping_sub(previous);
+                if delta > 0 && delta <= clock_rate {
+                    self.frame_span = Some(delta);
+                }
             }
+            self.last_rtp_timestamp = Some(rtp_timestamp);
         }
-        self.last_rtp_timestamp = Some(rtp_timestamp);
     }
 
     /// The SSRC of the stream currently being tracked, if any.
@@ -660,6 +673,23 @@ mod frame_span_tests {
             stats.frame_span(),
             Some(960),
             "a backwards timestamp is not a new cadence"
+        );
+    }
+
+    // The reordered packet must not poison the NEXT one either. Leaving the baseline on an old
+    // packet makes the packet after it measure a step that spans the gap, so the span reads 1920 on
+    // a stream pacing at 960 and the codec probe refuses a stream that agrees with itself.
+    #[test]
+    fn the_packet_after_a_reordered_one_still_measures_the_real_cadence() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        observe(&mut stats, 3, 2_920, SSRC);
+        observe(&mut stats, 2, 1_960, SSRC); // late
+        observe(&mut stats, 4, 3_880, SSRC);
+        assert_eq!(
+            stats.frame_span(),
+            Some(960),
+            "the baseline must follow the newest packet, not the last to arrive"
         );
     }
 

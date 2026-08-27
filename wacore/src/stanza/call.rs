@@ -155,22 +155,24 @@ fn parse_media_offer(
             )
         })
         .unwrap_or_default();
-    let peer_device = offer
-        .get_optional_child("capability")
-        .and_then(|capability| {
-            let bytes = capability.content_bytes()?.to_vec();
-            if bytes.is_empty() {
-                return None;
-            }
-            let capability_version = match capability.get_attr("ver") {
-                None => 1,
-                Some(version) => version.as_str().parse::<u32>().ok()?,
-            };
-            let mut device = GroupCallDevice::new(peer.clone());
-            device.capability_version = Some(capability_version);
-            device.capability = bytes;
-            Some(device)
-        });
+    // A `<capability>` that is PRESENT keeps its device, even when the blob is empty or its `ver`
+    // will not parse. Those are the conditions the official client sends to its version -1 fallback,
+    // against which every query answers false -- so they have to reach `capability_bit` as an
+    // unreadable blob and read `Clear`. Dropping the node here would collapse them into "the peer
+    // announced nothing", which resets nothing and keeps MLOW on against a peer that cannot decode
+    // it: the exact shape of issue #1105. Absence, and only absence, is the absent case.
+    let peer_device = offer.get_optional_child("capability").map(|capability| {
+        let mut device = GroupCallDevice::new(peer.clone());
+        // `None` for absent AND for unparseable, so both read as an unreadable blob. The official
+        // client's deserializer treats a missing `ver` as an error and rebuilds the capability with
+        // a version that answers false for every index; its own writer always emits `ver="1"`, so a
+        // node without one is not something a conforming peer sends.
+        device.capability_version = capability
+            .get_attr("ver")
+            .and_then(|version| version.as_str().parse::<u32>().ok());
+        device.capability = capability.content_bytes().unwrap_or_default().to_vec();
+        device
+    });
     Some(MediaOffer {
         encs,
         relay,
@@ -1324,22 +1326,36 @@ mod tests {
             .clone()
     }
 
+    /// A `<capability>` that is present keeps its device whatever its `ver` says.
+    ///
+    /// Absence and unreadability are opposite states downstream: an absent node resets nothing,
+    /// while an unreadable blob resets every capability-gated parameter. Discarding the device for a
+    /// malformed `ver` collapsed the second into the first, which keeps MLOW enabled against a peer
+    /// that cannot decode it. See `capability_bit`.
     #[cfg(feature = "voip")]
     #[test]
-    fn capability_version_defaults_only_when_absent() {
-        assert_eq!(
-            parsed_peer_capability(None).and_then(|device| device.capability_version),
-            Some(1)
-        );
+    fn a_present_capability_survives_an_unreadable_version() {
         assert_eq!(
             parsed_peer_capability(Some("7")).and_then(|device| device.capability_version),
             Some(7)
         );
-        assert!(
-            parsed_peer_capability(Some("invalid")).is_none(),
-            "an explicitly malformed version must discard the entire capability"
-        );
-        assert!(parsed_peer_capability(Some("4294967296")).is_none());
+        for unreadable in [None, Some("invalid"), Some("4294967296")] {
+            let device = parsed_peer_capability(unreadable)
+                .expect("a present node keeps its device so the blob can read as unreadable");
+            assert_eq!(
+                device.capability_version, None,
+                "ver {unreadable:?} is not readable"
+            );
+            assert_eq!(
+                capability_bit(
+                    device.capability_version,
+                    device.capability(),
+                    CAPABILITY_INDEX_MLOW_V1
+                ),
+                CapabilityBit::Clear,
+                "an unreadable blob must reset, not be mistaken for absence"
+            );
+        }
     }
 
     // An offer carrying an <enc> (the encrypted callKey) and a <relay> must surface both on

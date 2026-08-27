@@ -83,9 +83,17 @@ async fn tap_forward(
             // This forwarder sits AFTER the pump, so it must preserve STUN too (a Request that
             // survived the pump can't be silently dropped here). Drop only media; block on STUN.
             Err(async_channel::TrySendError::Full(ev)) => {
-                let is_stun = matches!(&ev, RelayTransportEvent::PacketReceived(d)
-                    if classify_relay_packet(d) == RelayPacketKind::Stun);
-                if is_stun && out_tx.send(ev).await.is_err() {
+                // `InboundDropped` is a control event, not media: it is the pump's report of media
+                // it already discarded, and discarding the report too would leave the call with no
+                // record of the loss at precisely the moment it is losing packets.
+                let is_control = match &ev {
+                    RelayTransportEvent::PacketReceived(d) => {
+                        classify_relay_packet(d) == RelayPacketKind::Stun
+                    }
+                    RelayTransportEvent::InboundDropped(_) => true,
+                    _ => false,
+                };
+                if is_control && out_tx.send(ev).await.is_err() {
                     break;
                 }
             }

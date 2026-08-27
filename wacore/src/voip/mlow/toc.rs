@@ -85,7 +85,7 @@ pub(crate) fn parse_mlow_toc(b: u8) -> MlowToc {
         stereo: b & 1 != 0,
     };
     log::trace!(
-        "mlow TOC 0x{b:02x}: sid={} vad={} sr={} ms={} voiced={} active={} f2={} f0={}",
+        "mlow TOC 0x{b:02x}: sid={} vad={} sr={} ms={} fec={} active={} low_rate={} stereo={}",
         toc.sid,
         toc.vad,
         toc.sample_rate,

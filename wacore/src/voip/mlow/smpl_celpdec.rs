@@ -377,9 +377,6 @@ impl Clone for CelpDecState {
         self.lpc_synth_mem = source.lpc_synth_mem;
         self.lsf_prev = source.lsf_prev;
         self.prev_nrgres = source.prev_nrgres;
-        // Only the HP postfilter's persistent fields: its four scratch buffers are 5 KB of the
-        // 6.4 KB it occupies and each is fully overwritten before it is read, so copying them is
-        // 5 KB of `memcpy` per packet that no rollback can observe.
         self.hp.copy_state_from(&source.hp);
         // `dbg_exc_pre` is deliberately not carried, for the reason above the `clone` impl.
     }
