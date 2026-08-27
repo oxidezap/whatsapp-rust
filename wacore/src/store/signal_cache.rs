@@ -1845,9 +1845,9 @@ impl SignalStoreCache {
     }
 
     /// Entry counts and estimated retained bytes for each store
-    /// (sessions, identities, sender_keys). Sizes use the records' encoded-size
-    /// proxy (see `SessionRecord::estimated_size`); on-demand only — walks the
-    /// caches under their locks.
+    /// (sessions, identities, sender_keys). Sizes walk the records' live
+    /// structures (see `SessionRecord::estimated_size`); on-demand only — walks
+    /// the caches under their locks.
     ///
     /// Session entry counts include negative (`Absent`) and checked-out slots
     /// — they occupy the map. Byte totals include the key length for every
@@ -1861,7 +1861,7 @@ impl SignalStoreCache {
     ) {
         use crate::stats::CollectionStats;
 
-        // Sizing a record walks its whole protobuf tree, and these mutexes
+        // Sizing a record walks its whole structure tree, and these mutexes
         // serialize the Signal encrypt/decrypt path — so only key lengths and
         // Arc refcount bumps happen under the locks; the estimated_size walks
         // run after each guard drops. Identities are raw bytes (len is free)

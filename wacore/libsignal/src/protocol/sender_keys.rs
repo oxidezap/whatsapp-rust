@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use buffa::{Message, MessageField};
+use buffa::MessageField;
 
 use hmac::{HmacReset, KeyInit, Mac};
 use sha2::Sha256;
@@ -945,28 +945,63 @@ impl SenderKeyRecord {
         Ok(buf)
     }
 
-    /// Estimated in-memory footprint proxy: encoded size of each state's
-    /// structure plus the out-of-order message-key backlog (held outside the
-    /// protobuf in memory). Size computation only — nothing is cloned or
-    /// encoded. Used by per-session memory reports.
+    /// Retained in-memory bytes of every state this record holds.
+    ///
+    /// Walks the live structures rather than asking for their protobuf-encoded
+    /// size, which is what this used to report — the encoded form omits the
+    /// `Option` slots and `Vec` capacity that memory actually pays for. Size
+    /// computation only: nothing is cloned or encoded.
     pub fn estimated_size(&self) -> usize {
-        let mut cache = buffa::SizeCache::new();
-        self.states
-            .iter()
-            .map(|s| {
-                s.state.compute_size(&mut cache) as usize
-                    + s.message_keys.len() * size_of::<StoredMessageKey>()
-                    + s.sender_chain.map_or(0, |_| size_of::<SenderChainKey>())
-            })
-            .sum()
+        self.states.capacity() * size_of::<SenderKeyState>()
+            + self
+                .states
+                .iter()
+                .map(|s| {
+                    state_structure_retained_bytes(&s.state)
+                        + s.message_keys.capacity() * size_of::<StoredMessageKey>()
+                        + s.sender_chain.map_or(0, |_| size_of::<SenderChainKey>())
+                })
+                .sum::<usize>()
     }
+}
+
+/// Retained bytes of one sender-key state structure, including everything it
+/// points at.
+///
+/// The skipped-key backlog is not walked here: this record keeps it in
+/// [`StoredMessageKey`] (36 bytes, seed inline) rather than in the protobuf's
+/// `SenderMessageKey`, and `estimated_size` counts it there.
+fn state_structure_retained_bytes(state: &SenderKeyStateStructure) -> usize {
+    fn bytes_field(field: &Option<bytes::Bytes>) -> usize {
+        field.as_ref().map_or(0, |b| b.len())
+    }
+
+    size_of::<SenderKeyStateStructure>()
+        + state.sender_chain_key.as_option().map_or(0, |chain| {
+            size_of::<sender_key_state_structure::SenderChainKey>() + bytes_field(&chain.seed)
+        })
+        + state.sender_signing_key.as_option().map_or(0, |signing| {
+            size_of::<sender_key_state_structure::SenderSigningKey>()
+                + bytes_field(&signing.public)
+                + bytes_field(&signing.private)
+        })
+        + state.sender_message_keys.capacity()
+            * size_of::<sender_key_state_structure::SenderMessageKey>()
+        + state
+            .sender_message_keys
+            .iter()
+            .map(|key| bytes_field(&key.seed))
+            .sum::<usize>()
 }
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    // The protobuf encode helpers are only needed to build fixtures here; the
+    // module itself no longer encodes anything.
     use crate::protocol::KeyPair;
+    use buffa::Message;
 
     /// An injected derivation has to be indistinguishable from the one the
     /// state would have produced, or the API trades correctness for speed.

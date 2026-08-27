@@ -762,6 +762,78 @@ pub struct SessionRecord {
     lease: CounterLease,
 }
 
+/// Bytes one `Bytes` field holds beyond its inline representation.
+///
+/// `Bytes` may point into a shared buffer, in which case the slice is counted
+/// against whichever field names it. That over-counts a session decoded from
+/// one contiguous blob and under-counts nothing, which is the safe direction
+/// for a report that exists to catch growth.
+fn bytes_field_retained(field: &Option<bytes::Bytes>) -> usize {
+    field.as_ref().map_or(0, |b| b.len())
+}
+
+fn vec_field_retained(field: &Option<Vec<u8>>) -> usize {
+    field.as_ref().map_or(0, Vec::capacity)
+}
+
+fn chain_retained_bytes(chain: &session_structure::Chain) -> usize {
+    size_of::<session_structure::Chain>()
+        + vec_field_retained(&chain.sender_ratchet_key)
+        + vec_field_retained(&chain.sender_ratchet_key_private)
+        + chain.chain_key.as_option().map_or(0, |key| {
+            size_of::<session_structure::chain::ChainKey>() + bytes_field_retained(&key.key)
+        })
+        // The skipped-key backlog: capacity, not length, because the `Vec`
+        // keeps its allocation when keys are consumed or pruned.
+        + chain.message_keys.capacity() * size_of::<session_structure::chain::MessageKey>()
+        + chain
+            .message_keys
+            .iter()
+            .map(|key| {
+                bytes_field_retained(&key.cipher_key)
+                    + bytes_field_retained(&key.mac_key)
+                    + bytes_field_retained(&key.iv)
+                    + bytes_field_retained(&key.seed)
+            })
+            .sum::<usize>()
+}
+
+/// Retained bytes of one session state, including everything it points at.
+fn session_retained_bytes(session: &SessionStructure) -> usize {
+    size_of::<SessionStructure>()
+        + vec_field_retained(&session.local_identity_public)
+        + vec_field_retained(&session.remote_identity_public)
+        + vec_field_retained(&session.root_key)
+        + vec_field_retained(&session.alice_base_key)
+        + session
+            .sender_chain
+            .as_option()
+            .map_or(0, chain_retained_bytes)
+        + session.receiver_chains.capacity() * size_of::<session_structure::Chain>()
+        + session
+            .receiver_chains
+            .iter()
+            .map(chain_retained_bytes)
+            .sum::<usize>()
+        + session
+            .pending_key_exchange
+            .as_option()
+            .map_or(0, |pending| {
+                size_of::<session_structure::PendingKeyExchange>()
+                    + vec_field_retained(&pending.local_base_key)
+                    + vec_field_retained(&pending.local_base_key_private)
+                    + vec_field_retained(&pending.local_ratchet_key)
+                    + vec_field_retained(&pending.local_ratchet_key_private)
+                    + vec_field_retained(&pending.local_identity_key)
+                    + vec_field_retained(&pending.local_identity_key_private)
+            })
+        + session.pending_pre_key.as_option().map_or(0, |pending| {
+            size_of::<session_structure::PendingPreKey>()
+                + vec_field_retained(&pending.base_key)
+                + vec_field_retained(&pending.kyber_ciphertext)
+        })
+}
+
 impl SessionRecord {
     pub fn new_fresh() -> Self {
         Self {
@@ -1278,21 +1350,29 @@ impl SessionRecord {
         }
     }
 
-    /// Estimated in-memory footprint proxy: the protobuf-encoded size of the
-    /// current plus archived states. Size computation only — no encode buffer
-    /// is allocated. Used by per-session memory reports.
+    /// Retained in-memory bytes of the current plus archived states.
+    ///
+    /// Walks the live structures rather than asking for their protobuf-encoded
+    /// size, which is what this used to report. The two are far apart: a
+    /// skipped message key is 36 bytes on the wire but a 136-byte
+    /// `MessageKey` plus a 32-byte `Bytes` allocation in memory, because the
+    /// three fields a modern seed-only key leaves empty still occupy their
+    /// `Option<Bytes>` slots. A session with a backlog of skipped keys was
+    /// therefore reported at roughly a fifth of what it costs — the wrong
+    /// direction for the one structure whose growth these reports exist to
+    /// catch. Size computation only: nothing is cloned or encoded.
     pub fn estimated_size(&self) -> usize {
-        let mut cache = buffa::SizeCache::new();
         let current = self
             .current_session
             .as_ref()
-            .map(|s| s.session.compute_size(&mut cache) as usize)
+            .map(|s| session_retained_bytes(&s.session))
             .unwrap_or(0);
         let previous: usize = self
             .previous_sessions
             .iter()
-            .map(|s| s.compute_size(&mut cache) as usize)
-            .sum();
+            .map(session_retained_bytes)
+            .sum::<usize>()
+            + self.previous_sessions.capacity() * size_of::<SessionStructure>();
         current + previous
     }
 
@@ -1708,6 +1788,60 @@ mod tests {
             chain_key: MessageField::some(chain_key),
             message_keys,
         }
+    }
+
+    /// What these reports exist to catch is a receiver chain accumulating
+    /// skipped message keys — up to `MAX_MESSAGE_KEYS` of them per chain. That
+    /// only works if the figure is memory, not wire bytes: a modern seed-only
+    /// key is ~36 bytes encoded and 136 bytes of `MessageKey` plus a 32-byte
+    /// `Bytes` allocation in memory, because the three fields it leaves empty
+    /// still occupy their `Option<Bytes>` slots.
+    #[test]
+    fn skipped_message_keys_are_reported_at_their_in_memory_cost() {
+        const KEYS: usize = 500;
+
+        let message_keys: Vec<session_structure::chain::MessageKey> = (0..KEYS)
+            .map(|index| session_structure::chain::MessageKey {
+                index: Some(index as u32),
+                cipher_key: None,
+                mac_key: None,
+                iv: None,
+                seed: Some(vec![7u8; 32].into()),
+            })
+            .collect();
+        let chain = session_structure::Chain {
+            sender_ratchet_key: Some(vec![1u8; 33]),
+            sender_ratchet_key_private: Some(vec![2u8; 32]),
+            chain_key: MessageField::some(session_structure::chain::ChainKey {
+                index: Some(0),
+                key: Some(vec![3u8; 32].into()),
+            }),
+            message_keys,
+        };
+        let mut session = make_cache_shape_session(1, 0, 0);
+        session.receiver_chains = vec![chain];
+
+        let record = SessionRecord {
+            current_session: Some(SessionState::from_session_structure(session.clone())),
+            previous_sessions: Arc::new(Vec::new()),
+            lease: CounterLease::default(),
+        };
+
+        let reported = record.estimated_size();
+        let backlog = KEYS * size_of::<session_structure::chain::MessageKey>();
+        assert!(
+            reported >= backlog,
+            "a {KEYS}-key backlog occupies at least {backlog} B; reported {reported} B"
+        );
+
+        // And the figure this replaced: the encoded size, which is what the
+        // report used to hand back for the very same record.
+        let encoded = session.encode_to_vec().len();
+        assert!(
+            reported > encoded * 3,
+            "the in-memory figure ({reported} B) must be far above the encoded \
+             one ({encoded} B) for a seed-only backlog"
+        );
     }
 
     fn make_cache_shape_session(

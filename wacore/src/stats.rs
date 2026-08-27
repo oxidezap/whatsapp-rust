@@ -407,9 +407,12 @@ impl SessionStats {
 /// Estimated heap bytes owned by a value, excluding `size_of::<Self>()` and
 /// allocator overhead.
 ///
-/// Implementations are honest approximations (protobuf-encoded size for
-/// Signal records, string/collection payload sums elsewhere): good for
-/// per-session attribution and growth tracking, not for byte-exact accounting.
+/// Implementations are honest approximations (string/collection payload sums,
+/// walked structure sizes for Signal records, [`hash_table_bytes`] for
+/// hash-backed collections): good for per-session attribution and growth
+/// tracking, not for byte-exact accounting. What they must not do is
+/// understate a structure that grows — a report that is quietest when memory
+/// is climbing is worse than none.
 pub trait HeapSize {
     fn heap_bytes(&self) -> usize;
 }
@@ -421,6 +424,37 @@ impl<T: HeapSize> HeapSize for Arc<T> {
     fn heap_bytes(&self) -> usize {
         size_of::<T>() + T::heap_bytes(self)
     }
+}
+
+/// Bytes a hash table of `capacity` usable entries actually allocates, for
+/// entries of `entry_size` bytes.
+///
+/// `HashMap::capacity()` is how many entries fit before the next resize, not
+/// how many buckets exist: hashbrown rounds the bucket count up to a power of
+/// two and keeps one eighth of it free, so a map holding 1024 entries owns
+/// 2048 buckets. Multiplying `capacity()` by the entry size — what these
+/// reports did before — therefore under-counts by an eighth at best and by
+/// nearly half right after a resize. Each bucket also carries one control
+/// byte.
+///
+/// This inverts hashbrown's own `capacity_to_buckets`, so it is exact for the
+/// bucket count. The fixed `Group::WIDTH` tail on the control array (16 bytes
+/// on x86-64) is not counted: it does not scale with the map, and counting it
+/// would attribute a constant to whichever collection happened to be empty.
+pub fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
+    if capacity == 0 {
+        // An unused map allocates nothing at all.
+        return 0;
+    }
+    let buckets = if capacity < 8 {
+        if capacity < 4 { 4 } else { 8 }
+    } else {
+        // hashbrown's own `capacity_to_buckets`, floor division included.
+        (capacity.saturating_mul(8) / 7)
+            .checked_next_power_of_two()
+            .unwrap_or(capacity)
+    };
+    buckets.saturating_mul(entry_size.saturating_add(1))
 }
 
 impl HeapSize for Vec<u8> {

@@ -34,7 +34,10 @@ impl wacore::stats::HeapSize for GroupDevicesMemo {
         // The Weak keeps only the GroupInfo allocation header alive; the memo
         // does not retain its payload.
         self.members.iter().map(|m| m.heap_bytes()).sum::<usize>()
-            + self.members.capacity() * size_of::<wacore_binary::CompactString>()
+            + wacore::stats::hash_table_bytes(
+                self.members.capacity(),
+                size_of::<wacore_binary::CompactString>(),
+            )
             + self.devices.heap_bytes()
     }
 }
@@ -64,7 +67,10 @@ impl wacore::stats::HeapSize for DmDevicesMemo {
         self.own_pn.heap_bytes()
             + self.own_lid.as_ref().map_or(0, |lid| lid.heap_bytes())
             + self.members.iter().map(|m| m.heap_bytes()).sum::<usize>()
-            + self.members.capacity() * size_of::<wacore_binary::CompactString>()
+            + wacore::stats::hash_table_bytes(
+                self.members.capacity(),
+                size_of::<wacore_binary::CompactString>(),
+            )
             + self.devices.heap_bytes()
     }
 }

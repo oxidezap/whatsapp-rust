@@ -9,6 +9,7 @@ use portable_atomic::AtomicU64;
 
 use crate::cache::Cache;
 use crate::cache_config::CacheEntryConfig;
+use wacore::stats::hash_table_bytes;
 use wacore_binary::Jid;
 
 /// Pre-parsed, pre-indexed sender key device map for one group.
@@ -179,16 +180,25 @@ impl SenderKeyDeviceCache {
 
     /// Approximate entry count plus estimated retained bytes.
     pub(crate) async fn memory_stats(&self) -> wacore::stats::CollectionStats {
-        // Slot allocations use capacity() (outer and inner maps alike);
-        // per-entry heap is summed by iteration.
+        // Table allocations go through `hash_table_bytes` (outer and inner
+        // maps alike), which accounts for the buckets hashbrown really owns
+        // rather than the entries that fit in them; per-entry heap is summed
+        // by iteration.
         self.inner
             .memory_stats(|k, v| {
                 k.capacity()
-                    + v.devices.capacity() * size_of::<(Arc<str>, HashMap<u16, AtomicBool>)>()
+                    + hash_table_bytes(
+                        v.devices.capacity(),
+                        size_of::<(Arc<str>, HashMap<u16, AtomicBool>)>(),
+                    )
                     + v.devices
                         .iter()
                         .map(|(user, by_device)| {
-                            user.len() + by_device.capacity() * size_of::<(u16, AtomicBool)>()
+                            user.len()
+                                + hash_table_bytes(
+                                    by_device.capacity(),
+                                    size_of::<(u16, AtomicBool)>(),
+                                )
                         })
                         .sum::<usize>()
             })
