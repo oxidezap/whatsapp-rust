@@ -6,13 +6,50 @@ use std::sync::Arc;
 use wacore_binary::CompactString;
 use wacore_binary::Jid;
 
-fn build_pn_to_lid_map(
-    lid_to_pn_map: &HashMap<CompactString, Jid>,
-) -> HashMap<CompactString, CompactString> {
-    lid_to_pn_map
-        .iter()
-        .map(|(lid_user, phone_jid)| (phone_jid.user.clone(), lid_user.clone()))
-        .collect()
+/// One LID→PN mapping. Kept as `(lid, phone jid)` rather than `(lid, phone
+/// user + server)` because `Jid` is 32 bytes and a `CompactString` plus a
+/// `Server` pads to the same 32: storing the whole JID costs nothing and lets
+/// [`GroupInfo::phone_jid_for_lid_user`] keep handing out a borrow. The server
+/// is not assumed to be `Pn` — a malformed response can map a LID to another
+/// LID, and callers such as `collect_stale_device_users` check for that.
+type LidPnPair = (CompactString, Jid);
+
+/// Order `lid_pn` by the PN user part, returning indices into it.
+///
+/// Duplicate PN users (two LIDs claiming one phone number) resolve to the
+/// last entry in LID order. The `HashMap` this replaced resolved them by
+/// iteration order, i.e. arbitrarily; any deterministic rule is an
+/// improvement, and this one is stable across rebuilds.
+fn build_pn_order(lid_pn: &[LidPnPair]) -> Box<[u32]> {
+    let mut order: Vec<u32> = (0..lid_pn.len() as u32).collect();
+    order.sort_unstable_by(|a, b| {
+        let (a, b) = (*a as usize, *b as usize);
+        lid_pn[a]
+            .1
+            .user
+            .cmp(&lid_pn[b].1.user)
+            .then_with(|| lid_pn[a].0.cmp(&lid_pn[b].0))
+    });
+    order.into_boxed_slice()
+}
+
+/// Sort by LID user and drop the `HashMap`'s excess capacity in one step.
+fn build_lid_pn(map: HashMap<CompactString, Jid>) -> Box<[LidPnPair]> {
+    let mut pairs: Vec<LidPnPair> = map.into_iter().collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    pairs.into_boxed_slice()
+}
+
+fn serialize_lid_pn<S: serde::Serializer>(
+    lid_pn: &[LidPnPair],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(lid_pn.len()))?;
+    for (lid_user, phone_jid) in lid_pn.iter() {
+        map.serialize_entry(lid_user, phone_jid)?;
+    }
+    map.end()
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -25,16 +62,24 @@ pub struct GroupInfo {
     /// predates the field, so the answer is unknown and callers must re-query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_community_announce: Option<bool>,
-    /// Maps a LID user identifier (the `user` part of the LID JID) to the
-    /// corresponding phone-number JID. This is used for device queries since
-    /// LID usync requests may not work reliably.
-    lid_to_pn_map: HashMap<CompactString, Jid>,
-    /// Reverse index: phone user → LID user. Derived from `lid_to_pn_map`
-    /// (the LID jid is reconstructed on demand), so it is neither persisted
-    /// nor stores Jids — for a large LID group that halves the map bytes in
-    /// memory and in the serialized `group_metadata` blob.
+    /// LID→PN mappings, sorted by the LID user part, looked up by binary
+    /// search. Used for device queries, since LID usync requests may not work
+    /// reliably.
+    ///
+    /// A sorted slice rather than a `HashMap`: a 1024-member group needs 2048
+    /// hashbrown buckets, so roughly half the map's bytes were empty slots,
+    /// and the entries are read far more often than they are written (member
+    /// changes arrive on notifications; lookups run once per participant per
+    /// send). Serialized as the `lid_to_pn_map` object the previous layout
+    /// wrote, so the persisted `group_metadata` blob is unchanged.
+    #[serde(rename = "lid_to_pn_map", serialize_with = "serialize_lid_pn")]
+    lid_pn: Box<[LidPnPair]>,
+    /// Reverse index: indices into `lid_pn` ordered by the PN user part.
+    ///
+    /// Derived, so it is not persisted. Four bytes per mapping instead of the
+    /// 48 the reverse `HashMap` spent re-storing both identifier strings.
     #[serde(skip)]
-    pn_to_lid_map: HashMap<CompactString, CompactString>,
+    pn_order: Box<[u32]>,
 }
 
 /// Deserialization shadow: rebuilds the derived reverse index. Old blobs
@@ -69,8 +114,8 @@ impl GroupInfo {
             participants,
             addressing_mode,
             is_community_announce: None,
-            lid_to_pn_map: HashMap::new(),
-            pn_to_lid_map: HashMap::new(),
+            lid_pn: Box::default(),
+            pn_order: Box::default(),
         }
     }
 
@@ -80,52 +125,86 @@ impl GroupInfo {
         addressing_mode: AddressingMode,
         lid_to_pn_map: HashMap<CompactString, Jid>,
     ) -> Self {
-        let pn_to_lid_map = build_pn_to_lid_map(&lid_to_pn_map);
+        let lid_pn = build_lid_pn(lid_to_pn_map);
+        let pn_order = build_pn_order(&lid_pn);
 
         Self {
             participants,
             addressing_mode,
             is_community_announce: None,
-            lid_to_pn_map,
-            pn_to_lid_map,
+            lid_pn,
+            pn_order,
         }
     }
 
     /// Replace the current LID-to-phone mapping.
     pub fn set_lid_to_pn_map(&mut self, lid_to_pn_map: HashMap<CompactString, Jid>) {
-        self.pn_to_lid_map = build_pn_to_lid_map(&lid_to_pn_map);
-        self.lid_to_pn_map = lid_to_pn_map;
+        self.lid_pn = build_lid_pn(lid_to_pn_map);
+        self.pn_order = build_pn_order(&self.lid_pn);
+    }
+
+    /// Rebuild both slices from an edited pair list. The reverse index is
+    /// derived, so every write goes through here and no caller can leave the
+    /// two out of step.
+    fn store_pairs(&mut self, mut pairs: Vec<LidPnPair>) {
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        self.lid_pn = pairs.into_boxed_slice();
+        self.pn_order = build_pn_order(&self.lid_pn);
+    }
+
+    /// Position of `lid_user` in the LID-sorted pair list.
+    fn lid_index(&self, lid_user: &str) -> Option<usize> {
+        self.lid_pn
+            .binary_search_by(|(lid, _)| lid.as_str().cmp(lid_user))
+            .ok()
+    }
+
+    /// Position in `lid_pn` of the mapping whose phone user is `phone_user`,
+    /// found through the reverse index.
+    fn pn_index(&self, phone_user: &str) -> Option<usize> {
+        self.pn_order
+            .binary_search_by(|slot| self.lid_pn[*slot as usize].1.user.as_str().cmp(phone_user))
+            .ok()
+            .map(|slot| self.pn_order[slot] as usize)
     }
 
     /// Look up the mapped phone-number JID for a given LID user identifier.
     pub fn phone_jid_for_lid_user(&self, lid_user: &str) -> Option<&Jid> {
-        self.lid_to_pn_map.get(lid_user)
+        self.lid_index(lid_user).map(|i| &self.lid_pn[i].1)
     }
 
     /// Look up the mapped LID user for a given phone number (user part).
     pub fn lid_user_for_phone_user(&self, phone_user: &str) -> Option<&CompactString> {
-        self.pn_to_lid_map.get(phone_user)
+        self.pn_index(phone_user).map(|i| &self.lid_pn[i].0)
     }
 
     /// Append participants that are not already present.
     ///
-    /// For LID-addressed groups, also updates the LID-to-PN and PN-to-LID maps
-    /// using the `phone_number` field from each participant.  Maps are updated
-    /// even for already-present participants so that a later call with
+    /// For LID-addressed groups, also updates the LID→PN mappings using the
+    /// `phone_number` field from each participant. Mappings are updated even
+    /// for already-present participants so that a later call with
     /// `Some(phone_number)` backfills a previous `None` entry.
     pub fn add_participants<'a, I>(&mut self, new: I)
     where
         I: IntoIterator<Item = (&'a Jid, Option<&'a Jid>)>,
     {
+        // The pair list is rebuilt once for the whole batch, not once per
+        // added member: sorting a 1024-entry slice per notification is
+        // cheaper than the n insertions it replaces, and a notification that
+        // maps nobody (the common PN-group case) never touches it at all.
+        let mut pairs: Option<Vec<LidPnPair>> = None;
         for (jid, phone_number) in new {
-            // Always backfill LID maps — a re-add with phone_number fills a
-            // previous None (e.g., client-initiated add followed by server
-            // notification that carries the phone number).
+            // Always backfill the LID mapping — a re-add with phone_number
+            // fills a previous None (e.g., client-initiated add followed by
+            // server notification that carries the phone number).
             if self.addressing_mode == AddressingMode::Lid
                 && let Some(pn) = phone_number
             {
-                self.pn_to_lid_map.insert(pn.user.clone(), jid.user.clone());
-                self.lid_to_pn_map.insert(jid.user.clone(), pn.clone());
+                let pairs = pairs.get_or_insert_with(|| self.lid_pn.to_vec());
+                match pairs.iter_mut().find(|(lid, _)| *lid == jid.user) {
+                    Some((_, mapped)) => *mapped = pn.clone(),
+                    None => pairs.push((jid.user.clone(), pn.clone())),
+                }
             }
 
             if self.participants.iter().any(|p| p.user == jid.user) {
@@ -133,22 +212,33 @@ impl GroupInfo {
             }
             self.participants.push(jid.clone());
         }
+        if let Some(pairs) = pairs {
+            self.store_pairs(pairs);
+        }
     }
 
     /// Remove participants whose user part is in `users_to_remove`.
     ///
-    /// Also cleans up the LID-to-PN and PN-to-LID maps.
+    /// Also drops the LID→PN mappings naming them, on either side.
     pub fn remove_participants(&mut self, users_to_remove: &[&str]) {
         self.participants
             .retain(|p| !users_to_remove.iter().any(|u| *u == p.user));
+        // Each name can be either side of a mapping, so both directions are
+        // resolved against the *current* slices before anything is dropped,
+        // then the survivors are rebuilt in one pass.
+        let mut drop_indices: Vec<usize> = Vec::new();
         for user in users_to_remove {
-            if let Some(pn_jid) = self.lid_to_pn_map.remove(*user) {
-                self.pn_to_lid_map.remove(&pn_jid.user);
+            drop_indices.extend(self.lid_index(user));
+            drop_indices.extend(self.pn_index(user));
+        }
+        if !drop_indices.is_empty() {
+            drop_indices.sort_unstable();
+            drop_indices.dedup();
+            let mut pairs = self.lid_pn.to_vec();
+            for index in drop_indices.into_iter().rev() {
+                pairs.remove(index);
             }
-            // Also try reverse: user might be a PN
-            if let Some(lid_user) = self.pn_to_lid_map.remove(*user) {
-                self.lid_to_pn_map.remove(&lid_user);
-            }
+            self.store_pairs(pairs);
         }
     }
 
@@ -172,19 +262,14 @@ impl crate::stats::HeapSize for GroupInfo {
                 .iter()
                 .map(|j| j.heap_bytes())
                 .sum::<usize>();
-        let lid_to_pn = self.lid_to_pn_map.capacity() * size_of::<(CompactString, Jid)>()
+        let lid_pn = self.lid_pn.len() * size_of::<LidPnPair>()
             + self
-                .lid_to_pn_map
+                .lid_pn
                 .iter()
                 .map(|(k, v)| k.heap_bytes() + v.heap_bytes())
                 .sum::<usize>();
-        let pn_to_lid = self.pn_to_lid_map.capacity() * size_of::<(CompactString, CompactString)>()
-            + self
-                .pn_to_lid_map
-                .iter()
-                .map(|(k, v)| k.heap_bytes() + v.heap_bytes())
-                .sum::<usize>();
-        participants + lid_to_pn + pn_to_lid
+        let pn_order = self.pn_order.len() * size_of::<u32>();
+        participants + lid_pn + pn_order
     }
 }
 
@@ -424,6 +509,145 @@ mod tests {
                 .phone_jid_for_lid_user("lid_bob")
                 .map(|j| j.user.as_str()),
             Some("bob_pn")
+        );
+    }
+
+    /// The sorted slices replace two `HashMap`s, so every edit path has to
+    /// leave both of them ordered and in step. This drives adds and removes
+    /// against a `HashMap` oracle and checks the invariants after each step.
+    #[test]
+    fn pair_slices_stay_consistent_with_a_map_oracle() {
+        let mut info = GroupInfo::new(Vec::new(), AddressingMode::Lid);
+        let mut oracle: HashMap<CompactString, Jid> = HashMap::new();
+
+        // A deterministic walk that mixes fresh adds, re-adds that remap an
+        // existing LID, removals by the LID side and removals by the PN side.
+        for round in 0..40u32 {
+            let lid_user = CompactString::from(format!("lid_{}", round % 13));
+            let pn_user = CompactString::from(format!("pn_{}", round % 7));
+            let lid_jid = Jid::lid(lid_user.clone());
+            let pn_jid = Jid::pn(pn_user.clone());
+
+            if round % 5 == 4 {
+                let victim = format!("lid_{}", round % 11);
+                info.remove_participants(&[victim.as_str()]);
+                if let Some(pn) = oracle.remove(victim.as_str()) {
+                    let _ = pn;
+                }
+                oracle.retain(|_, mapped| mapped.user != victim.as_str());
+            } else if round % 7 == 6 {
+                let victim = format!("pn_{}", round % 7);
+                info.remove_participants(&[victim.as_str()]);
+                oracle.retain(|lid, mapped| {
+                    lid.as_str() != victim.as_str() && mapped.user != victim.as_str()
+                });
+            } else {
+                info.add_participants([(&lid_jid, Some(&pn_jid))]);
+                oracle.insert(lid_user.clone(), pn_jid.clone());
+            }
+
+            assert!(
+                info.lid_pn.windows(2).all(|w| w[0].0 < w[1].0),
+                "lid_pn must stay sorted and unique by LID: {:?}",
+                info.lid_pn
+                    .iter()
+                    .map(|(l, _)| l.as_str())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(info.pn_order.len(), info.lid_pn.len());
+            assert!(
+                info.pn_order
+                    .windows(2)
+                    .all(|w| info.lid_pn[w[0] as usize].1.user
+                        <= info.lid_pn[w[1] as usize].1.user),
+                "pn_order must stay ordered by the PN user"
+            );
+
+            assert_eq!(
+                info.lid_pn.len(),
+                oracle.len(),
+                "round {round}: entry count diverged from the oracle"
+            );
+            for (lid_user, phone_jid) in &oracle {
+                assert_eq!(
+                    info.phone_jid_for_lid_user(lid_user),
+                    Some(phone_jid),
+                    "round {round}: forward lookup diverged for {lid_user}"
+                );
+                // The reverse direction only promises *a* LID for a phone
+                // number; two LIDs claiming one PN is a server bug, not a
+                // shape this has to preserve. What it must never do is
+                // answer with a LID that is not mapped to that PN.
+                let reverse = info
+                    .lid_user_for_phone_user(&phone_jid.user)
+                    .expect("reverse lookup must find some LID");
+                assert_eq!(
+                    oracle.get(reverse).map(|j| &j.user),
+                    Some(&phone_jid.user),
+                    "round {round}: reverse lookup pointed at an unmapped LID"
+                );
+            }
+        }
+    }
+
+    /// `remove_participants` takes user parts without saying which namespace
+    /// they are in, so naming the phone side has to drop the mapping too.
+    #[test]
+    fn remove_by_phone_side_drops_the_mapping() {
+        let lid_to_pn = HashMap::from([(CompactString::from("lid_bob"), pn("bob_pn"))]);
+        let mut info =
+            GroupInfo::with_lid_to_pn_map(vec![lid("lid_bob")], AddressingMode::Lid, lid_to_pn);
+
+        info.remove_participants(&["bob_pn"]);
+
+        assert!(info.phone_jid_for_lid_user("lid_bob").is_none());
+        assert!(info.lid_user_for_phone_user("bob_pn").is_none());
+    }
+
+    /// A malformed response can map a LID to something that is not a phone
+    /// number. The pair keeps the whole JID rather than a user part plus an
+    /// assumed `Pn` server, so callers can still see what it really was.
+    #[test]
+    fn a_non_pn_mapping_survives_the_round_trip() {
+        let lid_to_pn = HashMap::from([(
+            CompactString::from("100000000000007"),
+            Jid::lid("100000000000099"),
+        )]);
+        let info = GroupInfo::with_lid_to_pn_map(Vec::new(), AddressingMode::Lid, lid_to_pn);
+
+        let mapped = info
+            .phone_jid_for_lid_user("100000000000007")
+            .expect("mapping present");
+        assert!(!mapped.is_pn());
+        assert_eq!(mapped.user.as_str(), "100000000000099");
+    }
+
+    /// The layout exists to bound what a resident group snapshot costs, so the
+    /// bound is asserted rather than left to a comment. A 1024-member LID
+    /// group holds, per participant: a 32-byte `Jid`, a 56-byte
+    /// `(CompactString, Jid)` pair and a 4-byte reverse index — 92 bytes, with
+    /// every identifier short enough to live inline in its `CompactString`.
+    /// The two `HashMap`s this replaced needed 2048 buckets for the same 1024
+    /// entries and spent 212 bytes per participant.
+    #[test]
+    fn retained_bytes_per_participant_stay_bounded() {
+        use crate::stats::HeapSize;
+
+        const N: usize = 1024;
+        let mut participants = Vec::with_capacity(N);
+        let mut lid_to_pn = HashMap::with_capacity(N);
+        for i in 0..N {
+            let lid_user = CompactString::from(format!("1000000{i:08}"));
+            let pn_user = CompactString::from(format!("5511{i:09}"));
+            participants.push(Jid::lid(lid_user.clone()));
+            lid_to_pn.insert(lid_user, Jid::pn(pn_user));
+        }
+        let info = GroupInfo::with_lid_to_pn_map(participants, AddressingMode::Lid, lid_to_pn);
+
+        let per_participant = (size_of::<GroupInfo>() + info.heap_bytes()) / N;
+        assert!(
+            per_participant <= 92,
+            "a resident LID group must stay within 92 B/participant, got {per_participant}"
         );
     }
 }

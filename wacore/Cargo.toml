@@ -160,6 +160,10 @@ name = "media_benchmark"
 harness = false
 
 [[bench]]
+name = "retained_memory_benchmark"
+harness = false
+
+[[bench]]
 name = "voip_benchmark"
 harness = false
 # Only `voip-mlow` here on purpose: cargo SILENTLY SKIPS a bench target whose required features are
