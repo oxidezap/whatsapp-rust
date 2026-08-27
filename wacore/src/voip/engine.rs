@@ -138,9 +138,9 @@ const MAX_PRIME_TICKS: u32 = 10;
 #[cfg(feature = "voip-mlow")]
 const MLOW_DTX_CNG: [u8; 1] = [0x90];
 
-/// One 60ms MLow frame at 16kHz. `Input::MicFrame` must carry exactly this; a wrong-length buffer is
-/// dropped (the encoder requires it), never sent.
-#[cfg(feature = "voip-mlow")]
+/// One 60ms frame at 16kHz. `Input::MicFrame` must carry exactly this; a wrong-length buffer is
+/// dropped (either encoder requires it), never sent. Both halves of the swappable pair share the
+/// cadence, which is what lets a call switch between them without re-signalling.
 const MIC_FRAME_SAMPLES: usize = 960;
 #[cfg(feature = "voip-mlow")]
 const MLOW_ENCODED_CAPACITY: usize = 513;
@@ -722,6 +722,27 @@ impl CallEvent {
     }
 }
 
+/// Restore an encoded source's payload for an active format it was not configured for.
+///
+/// `Some` only for the one pair that is translatable at all: a source fixed to MLOW's CELT escape
+/// feeding a call that has since downgraded to native Opus, where the fix is the TOC rewrite the
+/// escape applied in the first place. `None` means the frame cannot honestly go on the wire.
+///
+/// The escape's SID token has no RFC Opus spelling, so it translates to nothing -- and that is
+/// correct rather than lossy: a SID says the speaker is silent, and a native Opus peer reads a gap
+/// in the stream the same way. It is reported as a drop all the same, because a source stuck in DTX
+/// against a peer that never hears comfort noise is worth seeing in the counters.
+fn translate_encoded_for_active_format(m: &MediaState, payload: &[u8]) -> Option<Vec<u8>> {
+    let escape_source = m.audio.format.codec == AudioCodec::Opus
+        && m.audio.format.rtp_profile == AudioRtpProfile::Mlow;
+    if !escape_source || m.active_format != m.audio.format.sibling_for(AudioCodec::Opus)? {
+        return None;
+    }
+    let mut translated = payload.to_vec();
+    depacketize_opus_from_mlow(&mut translated).ok()?;
+    Some(translated)
+}
+
 /// Ask the content probe whether this packet's own two statements contradict the negotiation.
 ///
 /// Free function rather than a method because both callers hold `&mut MediaState` while the switch
@@ -774,8 +795,7 @@ struct MediaState {
     foreign_audio: Option<Box<dyn ForeignAudioCodec>>,
     /// Reused across packets so the foreign decode path does not allocate per frame.
     foreign_pcm: Vec<i16>,
-    /// The send-side twin of `foreign_pcm`. Only the PCM send path uses it, which is MLOW-gated.
-    #[cfg(feature = "voip-mlow")]
+    /// The send-side twin of `foreign_pcm`, used by the standard-Opus PCM send path.
     foreign_encoded: Vec<u8>,
     audio_rtcp_announced: bool,
     audio_tx_invalid_streak: u8,
@@ -1003,8 +1023,14 @@ impl CallEngine {
         {
             return Err(EngineError::UnsupportedPcmAudio);
         }
+        // Only the MLOW half of the swappable pair needs the built-in codec. Standard Opus PCM is
+        // what `voip-libopus` is for, and a peer outside the rollout selects it during signaling --
+        // refusing it here would make that feature combination reject every call it exists to serve.
         #[cfg(not(feature = "voip-mlow"))]
-        if config.enable_media && config.audio.io == AudioIo::Pcm {
+        if config.enable_media
+            && config.audio.io == AudioIo::Pcm
+            && config.audio.format.codec == AudioCodec::Mlow
+        {
             return Err(EngineError::MlowUnavailable);
         }
         let endpoint_xor = stun::encode_xor_relay_endpoint(&config.relay_ip, config.relay_port)
@@ -1072,7 +1098,6 @@ impl CallEngine {
                 codec_probe: InboundCodecProbe::default(),
                 foreign_audio: None,
                 foreign_pcm: Vec::new(),
-                #[cfg(feature = "voip-mlow")]
                 foreign_encoded: Vec::new(),
                 audio_rtcp_announced: false,
                 audio_tx_invalid_streak: 0,
@@ -2663,8 +2688,18 @@ impl CallEngine {
             // the race with its first packets, and then the sink would be handed native Opus
             // labelled `Mlow` with nothing to notice it. The arithmetic that makes the probe safe
             // is about the packets, not about who decodes them.
+            // The switch itself runs after this borrow ends, so `active_format` is still the old
+            // one here. Label the frame with what the verdict implies rather than what has not been
+            // applied yet: a sink that depacketizes by `format.rtp_profile` would otherwise treat
+            // this one valid transition packet as an MLOW escape and corrupt it. Only a verdict with
+            // a sibling relabels -- one without is a switch that will be refused anyway.
             let verdict = observe_codec_content(m, &encoded);
-            let codec = verdict.unwrap_or(codec);
+            let (codec, active_format) = match verdict
+                .and_then(|c| m.active_format.sibling_for(c).map(|format| (c, format)))
+            {
+                Some(pair) => pair,
+                None => (codec, m.active_format),
+            };
             // Counted where the engine hands the frame over, which is the last point it can see. A
             // sink that refuses it is reported separately, through `note_audio_sink_dropped`.
             self.media_stats.audio_frames_delivered =
@@ -2672,7 +2707,7 @@ impl CallEngine {
             self.health.on_audio_produced();
             self.outbox
                 .push_back(Output::EncodedAudio(EncodedAudioFrame {
-                    format: m.active_format,
+                    format: active_format,
                     codec,
                     data: Bytes::from(encoded),
                     payload_type: header.payload_type,
@@ -2973,7 +3008,6 @@ impl CallEngine {
         }
     }
 
-    #[cfg(feature = "voip-mlow")]
     fn on_mic(&mut self, pcm: &[i16]) {
         if !self.group_epoch_ready() {
             return;
@@ -3014,6 +3048,29 @@ impl CallEngine {
             }
             return;
         }
+        // Past this point the frame has to become MLOW, which only the built-in codec can do. A
+        // build without it counts the frame the same way the Opus branch counts a missing encoder:
+        // an outbound side gone mute is invisible from every other counter here.
+        #[cfg(not(feature = "voip-mlow"))]
+        {
+            self.media_stats.outbound_frames_without_encoder = self
+                .media_stats
+                .outbound_frames_without_encoder
+                .saturating_add(1);
+        }
+        #[cfg(feature = "voip-mlow")]
+        {
+            self.encode_mlow_frame(pcm);
+        }
+    }
+
+    /// The MLOW half of [`Self::on_mic`], split out so the standard-Opus half compiles without the
+    /// built-in codec.
+    #[cfg(feature = "voip-mlow")]
+    fn encode_mlow_frame(&mut self, pcm: &[i16]) {
+        let Some(m) = self.media.as_mut() else {
+            return;
+        };
         let Some(pcm_state) = m.pcm.as_mut() else {
             return;
         };
@@ -3044,9 +3101,6 @@ impl CallEngine {
         self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
     }
 
-    #[cfg(not(feature = "voip-mlow"))]
-    fn on_mic(&mut self, _pcm: &[i16]) {}
-
     fn on_encoded_audio(&mut self, payload: &[u8]) {
         if !self.group_epoch_ready() {
             return;
@@ -3058,18 +3112,28 @@ impl CallEngine {
         else {
             return;
         };
-        // The source is fixed to the codec the call was BUILT with. Once a switch has moved the
-        // active grammar away from it, its bytes are not what this profile says they are, and the
-        // profile accepts any nonempty payload -- so sending them would put MLow on the wire under
-        // an Opus payload type and the peer would hear noise. Counted where a call that cannot
-        // encode is already counted, and announced once by `switch_audio_codec`.
-        if m.audio.format.codec != m.active_format.codec {
+        // The source is fixed to the FORMAT the call was built with, not just its codec: MLOW's
+        // escape and native Opus are both codec `Opus`, and the source supplies the escape's
+        // rewritten TOC (which is exactly what `accepts_encoded_payload` demands of it). Compared on
+        // the codec alone, a call downgraded off the escape kept handing those rewritten TOCs to a
+        // peer expecting RFC Opus, under a profile that accepts any nonempty payload.
+        //
+        // That one pair is also the one the engine can repair itself: the escape's payload IS an
+        // RFC Opus packet with one byte rewritten, so restoring the TOC costs a byte and no
+        // transcode. Any other divergence has no such translation and is dropped, counted where a
+        // call that cannot encode is already counted and announced once by `switch_audio_codec`.
+        let translated = if m.audio.format == m.active_format {
+            None
+        } else if let Some(payload) = translate_encoded_for_active_format(m, payload) {
+            Some(payload)
+        } else {
             self.media_stats.outbound_frames_without_encoder = self
                 .media_stats
                 .outbound_frames_without_encoder
                 .saturating_add(1);
             return;
-        }
+        };
+        let payload = translated.as_deref().unwrap_or(payload);
         if !m.active_format.accepts_encoded_payload(payload) {
             if m.audio_tx_invalid_streak < MAX_INVALID_AUDIO_WARNINGS {
                 log::warn!(
@@ -4992,6 +5056,128 @@ mod encoded_tests {
         assert_eq!(frame.format, AudioFormat::OPUS_16KHZ_60MS);
     }
 
+    // A source fixed to the escape keeps sending escape bytes after the call downgrades off it --
+    // it is immutable by contract. Compared on the codec alone both formats read `Opus`, so the
+    // guard passed and rewritten TOCs went to a peer that registered RFC Opus: the outbound half of
+    // #1105, from a fix meant to cure it. The engine restores the byte the escape rewrote.
+    #[test]
+    fn an_encoded_escape_source_is_translated_after_a_downgrade_to_native_opus() {
+        let mut cfg = config();
+        cfg.audio = AudioConfig::encoded(AudioFormat::OPUS_MLOW_16KHZ_60MS);
+        let mut engine =
+            CallEngine::new(cfg.clone(), Box::new(SequentialTxIds::new())).expect("engine");
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+
+        let mut peer = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &cfg.call_key,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: cfg.ssrc,
+            samples_per_packet: AudioFormat::OPUS_16KHZ_60MS.rtp_timestamp_step,
+            warp_mi_tag_len: cfg.warp_mi_tag_len,
+        })
+        .expect("peer pipeline");
+        assert!(peer.set_audio_payload_type(AudioFormat::OPUS_16KHZ_60MS.rtp_payload_type));
+
+        // The same packet in both spellings: TOC 0xDD is what the escape puts on the wire for the
+        // RFC code-3 packet 0xEB, and only the first byte differs.
+        let escaped = [0xDDu8, 0x03, 0x11, 0x22, 0x33];
+        let mut rfc = escaped;
+        depacketize_opus_from_mlow(&mut rfc).expect("the escape is translatable");
+        assert_ne!(rfc[0], escaped[0]);
+
+        engine
+            .switch_audio_codec(AudioCodec::Opus, CodecDecisionSource::Negotiated)
+            .expect("the peer cleared the capability");
+        assert_eq!(engine.active_audio_codec(), Some(AudioCodec::Opus));
+
+        engine.handle_input(2, Input::EncodedAudio(&escaped));
+        let protected: Vec<_> = drain(&mut engine)
+            .into_iter()
+            .filter_map(|output| match output {
+                Output::Transmit(packet) => Some(packet),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(protected.len(), 1, "the frame still goes out");
+        let (_, payload) = peer
+            .unprotect_audio(&protected[0])
+            .expect("peer decrypts outbound audio");
+        assert_eq!(
+            payload, rfc,
+            "and carries the RFC TOC the peer's decoder expects"
+        );
+        assert_eq!(engine.media_stats().outbound_frames_without_encoder, 0);
+
+        // The escape's SID token has no RFC spelling. Dropped rather than sent as garbage, and
+        // counted so a source stuck in DTX is visible.
+        engine.handle_input(3, Input::EncodedAudio(&[0x90]));
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .all(|output| !matches!(output, Output::Transmit(_)))
+        );
+        assert_eq!(engine.media_stats().outbound_frames_without_encoder, 1);
+    }
+
+    /// An encoder that answers with a fixed payload, so the send path can be proven without
+    /// pulling libopus into `wacore`.
+    #[cfg(not(feature = "voip-mlow"))]
+    struct EncodeOnlyCodec;
+
+    #[cfg(not(feature = "voip-mlow"))]
+    impl ForeignAudioCodec for EncodeOnlyCodec {
+        fn decode(
+            &mut self,
+            _payload: &[u8],
+            _out: &mut Vec<i16>,
+        ) -> Result<(), crate::voip::audio::ForeignCodecError> {
+            Err(crate::voip::audio::ForeignCodecError::InvalidPayload)
+        }
+
+        fn conceal(&mut self, samples: usize, out: &mut Vec<i16>) {
+            out.resize(out.len() + samples, 0);
+        }
+
+        fn encode(
+            &mut self,
+            pcm: &[i16],
+            out: &mut Vec<u8>,
+        ) -> Result<(), crate::voip::audio::ForeignCodecError> {
+            out.extend(core::iter::repeat_n(0x58, pcm.len() / 16));
+            Ok(())
+        }
+    }
+
+    // `voip-libopus` is advertised as the standard-Opus PCM adapter, and standard Opus is what a
+    // peer outside the MLOW rollout selects during signaling. Gated on PCM I/O rather than on the
+    // MLOW format, the availability check refused every call that feature exists to serve, and the
+    // send path was a stub besides -- so the combination could neither start such a call nor speak
+    // on one. Runs only where the gap was: a build without the built-in codec.
+    #[cfg(not(feature = "voip-mlow"))]
+    #[test]
+    fn standard_opus_pcm_works_without_the_built_in_codec() {
+        let mut cfg = config();
+        cfg.audio = AudioConfig::OPUS_PCM;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new()))
+            .expect("standard Opus PCM does not need the MLOW codec")
+            .with_foreign_audio_codec(Box::new(EncodeOnlyCodec));
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocation_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        eng.handle_input(1, Input::MicFrame(&[64i16; MIC_FRAME_SAMPLES]));
+        let sent = drain(&mut eng)
+            .into_iter()
+            .filter(|output| matches!(output, Output::Transmit(_)))
+            .count();
+        assert_eq!(sent, 1, "the mic frame has to reach the wire");
+        assert_eq!(eng.media_stats().outbound_frames_without_encoder, 0);
+    }
+
     #[test]
     fn opus_mlow_escape_uses_pt120_and_rejects_ambiguous_toc() {
         let mut cfg = config();
@@ -6666,6 +6852,51 @@ mod tests {
         assert!(
             !outputs.iter().any(|o| matches!(o, Output::EncodedAudio(_))),
             "and a RED wrapper must never reach a consumer labelled as an Opus frame"
+        );
+    }
+
+    // The peer is the one that must be able to read the frame, so a format the engine has not
+    // switched to yet is the wrong label for the packet that triggers the switch.
+    #[test]
+    fn the_frame_that_triggers_the_content_switch_is_labelled_with_its_own_format() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        let mut peer_tx = peer_pipeline();
+        let mut frames = Vec::new();
+        for n in 0..6u64 {
+            let packet = peer_tx.protect_audio(&body);
+            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                if let Output::EncodedAudio(frame) = output {
+                    frames.push((frame.codec, frame.format));
+                }
+            }
+        }
+
+        let transition = frames
+            .iter()
+            .position(|(codec, _)| *codec == AudioCodec::Opus)
+            .expect("the probe fires");
+        assert_eq!(
+            frames[transition].1,
+            AudioFormat::OPUS_16KHZ_60MS,
+            "the frame carrying the verdict is labelled by it, not by the format still installed"
+        );
+        assert!(
+            frames[transition..]
+                .iter()
+                .all(|(codec, format)| *codec == AudioCodec::Opus
+                    && *format == AudioFormat::OPUS_16KHZ_60MS),
+            "and every frame after it agrees"
         );
     }
 

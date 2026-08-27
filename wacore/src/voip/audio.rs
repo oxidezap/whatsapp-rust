@@ -471,6 +471,17 @@ impl AudioConfig {
         io: AudioIo::Pcm,
     };
 
+    /// The other half of the swappable pair, for a peer outside the MLOW rollout.
+    ///
+    /// PCM I/O admits exactly these two formats, so they are named rather than left to a general
+    /// constructor: this one needs a [`ForeignAudioCodec`], since standard Opus is not something
+    /// `wacore` can implement, and the engine reports [`crate::voip::CallEvent::AudioSilent`]
+    /// rather than pretending when none was installed.
+    pub const OPUS_PCM: Self = Self {
+        format: AudioFormat::OPUS_16KHZ_60MS,
+        io: AudioIo::Pcm,
+    };
+
     pub const fn encoded(format: AudioFormat) -> Self {
         Self {
             format,
