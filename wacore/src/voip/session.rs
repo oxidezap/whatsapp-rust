@@ -247,6 +247,43 @@ impl SrtcpReplayState {
 }
 
 const SRTP_REPLAY_WINDOW_BITS: u64 = 64;
+/// Concurrent inbound RTP streams tracked per pipeline, matching [`SRTCP_REPLAY_STREAM_CAP`].
+///
+/// One is the norm. A peer that renumbers its SSRC mid-call adds a second, and the bound keeps a
+/// peer that renumbers on every packet from growing this without limit.
+const SRTP_REPLAY_STREAM_CAP: usize = 16;
+
+/// Per-SSRC inbound RTP state: rollover counter and replay window.
+///
+/// Both are indexed by sequence number, and a sequence number only means something within one
+/// stream. Sharing them across SSRCs is what the RTCP side already avoids: two interleaved streams
+/// would each look to the other like a huge jump backwards, so roughly half the packets would fail
+/// their tag or be rejected as replays. Silently, and only for a peer that happens to use two
+/// SSRCs.
+#[derive(Default)]
+struct SrtpRecvStreams {
+    streams: Vec<(u32, RecvRocTracker, SrtpReplayWindow)>,
+}
+
+impl SrtpRecvStreams {
+    /// Borrow the ROC tracker and replay window for `ssrc`, creating them on first sight.
+    ///
+    /// `None` once the stream cap is reached, which drops the packet rather than evicting a live
+    /// stream: evicting would reset a rollover counter that a real stream is still using.
+    fn stream_mut(&mut self, ssrc: u32) -> Option<(&mut RecvRocTracker, &mut SrtpReplayWindow)> {
+        if let Some(index) = self.streams.iter().position(|(known, _, _)| *known == ssrc) {
+            let (_, roc, replay) = &mut self.streams[index];
+            return Some((roc, replay));
+        }
+        if self.streams.len() >= SRTP_REPLAY_STREAM_CAP {
+            return None;
+        }
+        self.streams
+            .push((ssrc, RecvRocTracker::default(), SrtpReplayWindow::default()));
+        let (_, roc, replay) = self.streams.last_mut().expect("just pushed");
+        Some((roc, replay))
+    }
+}
 
 #[derive(Default)]
 struct SrtpReplayWindow {
@@ -379,8 +416,7 @@ pub struct MediaPipeline {
     warp_mi_tag_len: usize,
     rtp: RtpStream,
     send_roc: RocTracker,
-    recv_roc: RecvRocTracker,
-    recv_rtp_replay: SrtpReplayWindow,
+    recv_streams: SrtpRecvStreams,
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
     recv_srtcp_replay: SrtcpReplayState,
@@ -434,8 +470,7 @@ impl MediaPipeline {
             warp_mi_tag_len: p.warp_mi_tag_len,
             rtp: RtpStream::new(p.ssrc, p.samples_per_packet, false),
             send_roc: RocTracker::default(),
-            recv_roc: RecvRocTracker::default(),
-            recv_rtp_replay: SrtpReplayWindow::default(),
+            recv_streams: SrtpRecvStreams::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, false)?,
             recv_srtcp_keys: derive_srtcp_keys(
                 p.call_key,
@@ -495,8 +530,7 @@ impl MediaPipeline {
         };
         self.recv_keys = keys;
         self.recv_srtcp_keys = srtcp_keys;
-        self.recv_roc = RecvRocTracker::default();
-        self.recv_rtp_replay = SrtpReplayWindow::default();
+        self.recv_streams = SrtpRecvStreams::default();
         self.recv_srtcp_replay = SrtcpReplayState::default();
         true
     }
@@ -565,8 +599,7 @@ impl MediaPipeline {
     pub fn unprotect_audio(&mut self, packet: &[u8]) -> Option<(RtpHeader, Vec<u8>)> {
         unprotect_srtp_packet(
             &self.recv_keys,
-            &mut self.recv_roc,
-            &mut self.recv_rtp_replay,
+            &mut self.recv_streams,
             self.warp_mi_tag_len,
             packet,
         )
@@ -616,8 +649,7 @@ fn protect_srtp_packet(
 /// desync the receiver.
 fn unprotect_srtp_packet(
     recv_keys: &E2eSrtpKeys,
-    recv_roc: &mut RecvRocTracker,
-    recv_replay: &mut SrtpReplayWindow,
+    recv_streams: &mut SrtpRecvStreams,
     warp_mi_tag_len: usize,
     packet: &[u8],
 ) -> Option<(RtpHeader, Vec<u8>)> {
@@ -632,6 +664,10 @@ fn unprotect_srtp_packet(
     if without_tag.len() <= header_len {
         return None;
     }
+    // The SSRC comes from the unauthenticated header, so a forged one can only cause a lookup that
+    // fails its own tag a moment later. It cannot touch another stream's counter, which is exactly
+    // the property a single shared tracker did not have.
+    let (recv_roc, recv_replay) = recv_streams.stream_mut(header.ssrc)?;
     let roc = recv_roc.estimate_roc(header.sequence_number);
     if !verify_warp_mi_tag(
         &recv_keys.auth_key,
@@ -663,8 +699,7 @@ pub struct VideoPipeline {
     warp_mi_tag_len: usize,
     rtp: VideoRtpStream,
     send_roc: RocTracker,
-    recv_roc: RecvRocTracker,
-    recv_rtp_replay: SrtpReplayWindow,
+    recv_streams: SrtpRecvStreams,
     depacketizer: H264Depacketizer,
     pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
@@ -707,8 +742,7 @@ impl VideoPipeline {
             warp_mi_tag_len: p.warp_mi_tag_len,
             rtp: VideoRtpStream::new(p.ssrc, p.ts_stride)?,
             send_roc: RocTracker::default(),
-            recv_roc: RecvRocTracker::default(),
-            recv_rtp_replay: SrtpReplayWindow::default(),
+            recv_streams: SrtpRecvStreams::default(),
             depacketizer: H264Depacketizer::default(),
             pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
@@ -749,8 +783,7 @@ impl VideoPipeline {
             return false;
         };
         self.recv_keys = keys;
-        self.recv_roc = RecvRocTracker::default();
-        self.recv_rtp_replay = SrtpReplayWindow::default();
+        self.recv_streams = SrtpRecvStreams::default();
         self.depacketizer.reset();
         true
     }
@@ -838,8 +871,7 @@ impl VideoPipeline {
     ) -> Option<(RtpHeader, Vec<Vec<u8>>)> {
         let (header, payload) = unprotect_srtp_packet(
             &self.recv_keys,
-            &mut self.recv_roc,
-            &mut self.recv_rtp_replay,
+            &mut self.recv_streams,
             self.warp_mi_tag_len,
             packet,
         )?;
@@ -857,6 +889,71 @@ impl VideoPipeline {
             completed.push(au);
         }
         Some((header, completed))
+    }
+}
+
+#[cfg(test)]
+mod replay_stream_tests {
+    use super::*;
+
+    // A sequence number only means something inside one stream. With a shared window two
+    // interleaved SSRCs each look to the other like a huge jump, and roughly half the packets are
+    // rejected as replays -- silently, and only for a peer that happens to use two SSRCs.
+    #[test]
+    fn interleaved_ssrcs_do_not_reject_each_other() {
+        let mut streams = SrtpRecvStreams::default();
+        for seq in 0..64u64 {
+            for ssrc in [0xAAAA_0001u32, 0xBBBB_0002] {
+                let (_, replay) = streams.stream_mut(ssrc).expect("within the cap");
+                assert!(
+                    replay.accept(seq),
+                    "ssrc {ssrc:#x} seq {seq} must be accepted on its own timeline"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_replay_within_one_stream_is_still_rejected() {
+        let mut streams = SrtpRecvStreams::default();
+        let (_, replay) = streams.stream_mut(1).expect("first stream");
+        assert!(replay.accept(10));
+        assert!(!replay.accept(10), "a repeat is a replay");
+        assert!(replay.accept(11));
+    }
+
+    // Dropping past the cap rather than evicting: eviction would reset a rollover counter a live
+    // stream is still using, turning a bounded resource into a correctness bug.
+    #[test]
+    fn the_stream_table_is_bounded_and_refuses_rather_than_evicting() {
+        let mut streams = SrtpRecvStreams::default();
+        for ssrc in 0..SRTP_REPLAY_STREAM_CAP as u32 {
+            assert!(streams.stream_mut(ssrc).is_some());
+        }
+        assert!(
+            streams.stream_mut(9999).is_none(),
+            "past the cap the packet is dropped"
+        );
+        assert!(
+            streams.stream_mut(0).is_some(),
+            "an established stream keeps its state"
+        );
+    }
+
+    // Each stream keeps its own rollover counter, so one stream wrapping cannot move another's.
+    #[test]
+    fn each_stream_keeps_its_own_rollover_counter() {
+        let mut streams = SrtpRecvStreams::default();
+        let (roc_a, _) = streams.stream_mut(1).expect("stream a");
+        roc_a.commit_roc(0, 0xffff);
+        let (roc_a, _) = streams.stream_mut(1).expect("stream a again");
+        assert_eq!(roc_a.estimate_roc(0x0001), 1, "stream a wrapped");
+        let (roc_b, _) = streams.stream_mut(2).expect("stream b");
+        assert_eq!(
+            roc_b.estimate_roc(0x0001),
+            0,
+            "stream b must not inherit another stream's wrap"
+        );
     }
 }
 
