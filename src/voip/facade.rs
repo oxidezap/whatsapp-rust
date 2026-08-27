@@ -92,6 +92,16 @@ macro_rules! impl_media_builder_methods {
         }
 
         /// Send and receive complete codec payloads instead of using the built-in PCM adapter.
+        ///
+        /// `format` is a promise about the bytes the source will emit, and the negotiation can
+        /// disagree with it: MLow needs both sides to have asked for it. Answering a call whose
+        /// peer selects the other codec fails with
+        /// [`CallError::EncodedAudioCodecNotNegotiated`](crate::CallError::EncodedAudioCodecNotNegotiated),
+        /// naming both codecs so the call can be retried on the right one. On an outgoing call the
+        /// peer's answer arrives after media is up, so the switch is announced instead, as
+        /// [`CallEvent::AudioCodecSwitched`](wacore::voip::CallEvent::AudioCodecSwitched): a source
+        /// that can re-encode should follow it, since inbound frames carry their own codec but
+        /// outbound ones are whatever the source produced.
         pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
         where
             S: EncodedAudioSource,
@@ -188,6 +198,18 @@ impl<'a> AcceptCall<'a> {
         if let Some(codec) = peer_selected_codec_from_offer(self.incoming, audio_config.format)
             && let Some(format) = audio_config.format.sibling_for(codec)
         {
+            // An encoded endpoint's format is a promise the APPLICATION made about the bytes it will
+            // hand us: the source is already built and carries no per-frame codec, so there is
+            // nothing to tell that the call chose the other one. Rewriting the config would keep
+            // taking its MLow bytes and send them in a profile that accepts any nonempty payload,
+            // and the peer would hear noise with nothing on this side noticing. Refusing is the
+            // only honest answer -- the application picks the codec, so only it can pick again.
+            if let AudioEndpoints::Encoded { format: fixed, .. } = &audio {
+                return Err(CallError::EncodedAudioCodecNotNegotiated {
+                    configured: fixed.codec,
+                    selected: codec,
+                });
+            }
             audio_config.format = format;
         }
         let audio_config = audio_config;
@@ -4963,6 +4985,41 @@ mod tests {
         assert_eq!(
             peer_selected_codec_from_offer(&stale, AudioFormat::MLOW_16KHZ_60MS),
             Some(AudioCodec::Opus)
+        );
+    }
+
+    // An `EncodedAudioSource` emits one codec for the life of the call and has nothing to be told
+    // a switch on, so a call whose negotiation lands on the other one is refused rather than
+    // answered: taking it would send MLow bytes in a profile that accepts any nonempty payload, and
+    // the peer would hear noise with nothing on this side noticing.
+    #[tokio::test]
+    async fn accept_refuses_a_fixed_encoded_codec_the_peer_did_not_negotiate() {
+        use wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER;
+        use wacore::voip::AudioCodec;
+
+        let client = make_client().await;
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+
+        let result = client
+            .voip()
+            .accept(&outside_rollout)
+            .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+            .start()
+            .await;
+
+        let error = result.err().expect("the mismatch must be refused");
+        assert!(
+            matches!(
+                error,
+                CallError::EncodedAudioCodecNotNegotiated {
+                    configured: AudioCodec::Mlow,
+                    selected: AudioCodec::Opus,
+                }
+            ),
+            "expected the mismatch to be refused, got {error:?}"
         );
     }
 

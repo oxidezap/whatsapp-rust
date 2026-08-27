@@ -2310,8 +2310,13 @@ impl CallEngine {
                 if self.media.is_some() {
                     self.rtcp_deadline = now + RTCP_MS;
                     // Inbound media only becomes possible here, so this is the earliest instant at
-                    // which "no audio has arrived" means anything.
-                    self.health.media_started(now);
+                    // which "no audio has arrived" means anything. Direct calls only: a group call
+                    // returns through `on_group_rtp`, which feeds neither the arrival nor the
+                    // production side, so arming it there would report every healthy group call as
+                    // stalled three seconds in. The counters it reasons over are direct-path too.
+                    if self.group.is_none() {
+                        self.health.media_started(now);
+                    }
                     self.announce_audio_rtcp_session();
                 }
             }
@@ -2382,6 +2387,14 @@ impl CallEngine {
             }
             return;
         }
+        // The watchdog counts ARRIVALS, not authenticated packets, and that distinction is the
+        // whole point: wrong recv keys make every packet fail below, and a watchdog fed after that
+        // point would see an empty window and conclude the peer is simply not speaking. This is the
+        // deafest failure the receive path has, so it is the one the alarm must reach. Counted
+        // BEFORE the payload-type gate for the same reason: a peer that switched profiles is
+        // sending audio RTP, so reading it as "nothing arrived" would report the transport alarm
+        // and bury the one reason the counters can actually name. Video has already returned above.
+        self.health.on_rtp();
         if !m
             .audio
             .format
@@ -2395,11 +2408,6 @@ impl CallEngine {
                 .saturating_add(1);
             return;
         }
-        // The watchdog counts ARRIVALS, not authenticated packets, and that distinction is the
-        // whole point: wrong recv keys make every packet fail below, and a watchdog fed after that
-        // point would see an empty window and conclude the peer is simply not speaking. This is the
-        // deafest failure the receive path has, so it is the one the alarm must reach.
-        self.health.on_rtp();
         let Some((header, payload)) = m.pipe.unprotect_audio(pkt) else {
             // Wrong recv keys, wrong peer LID or a desynced ROC all land here, and every one of
             // them makes the call totally deaf with no other symptom.
@@ -4153,6 +4161,32 @@ mod encoded_tests {
         );
     }
 
+    // A group call never reaches the direct receive path: `on_group_rtp` returns before anything
+    // the watchdog counts, so arming it there would report every healthy group call as stalled
+    // three seconds in -- a false alarm on the one event that is supposed to mean something.
+    #[test]
+    fn a_group_call_never_reports_a_direct_audio_stall() {
+        let mut engine = group_engine();
+        engine.start(0, 1_700_000_000_000);
+        let _ = drain(&mut engine);
+        let allocate_success = allocation_success(&engine);
+        engine.handle_input(1, Input::RelayPacket(&allocate_success));
+        let _ = drain(&mut engine);
+        for tick in 1..=40u64 {
+            engine.handle_input(tick * 500, Input::Timeout);
+            for output in drain(&mut engine) {
+                assert!(
+                    !matches!(
+                        output,
+                        Output::Event(CallEvent::AudioReceptionStalled { .. })
+                            | Output::Event(CallEvent::AudioSilent { .. })
+                    ),
+                    "a group call must not raise the direct-audio alarms, got {output:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn group_relay_endpoint_change_requests_reconnect_before_allocate() {
         let mut engine = group_engine();
@@ -5704,6 +5738,44 @@ mod tests {
         let stats = eng.media_stats();
         assert_eq!(stats.rtp_payload_type_unexpected, 1);
         assert_eq!(stats.rtp_received, 0);
+    }
+
+    // A peer that switched RTP profiles under us IS sending audio RTP, so the arrival has to be
+    // counted before the profile gate rejects it. Counted after, the watchdog would see an empty
+    // window, report the transport alarm, and bury the one reason the counters can name exactly.
+    #[test]
+    fn a_stream_on_an_unexpected_payload_type_reports_that_reason_not_a_stall() {
+        let mut eng = allocated_engine();
+        let mut peer_tx = peer_pipeline();
+        let mut now = 1;
+        let mut events = Vec::new();
+        for _ in 0..80 {
+            let mut packet = peer_tx.protect_audio(&[0x50, 1, 2, 3]);
+            packet[1] = (packet[1] & 0x80) | 99;
+            eng.handle_input(now, Input::RelayPacket(&packet));
+            let (outputs, _) = drain(&mut eng);
+            events.extend(outputs);
+            now += 60;
+            eng.handle_input(now, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            events.extend(outputs);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::AudioReceptionStalled { .. }))),
+            "packets are arriving, so this is not a stalled reception"
+        );
+        let reason = events
+            .iter()
+            .find_map(|o| match o {
+                Output::Event(CallEvent::AudioSilent {
+                    dominant_reason, ..
+                }) => Some(*dominant_reason),
+                _ => None,
+            })
+            .expect("a stream on the wrong payload type must report itself silent");
+        assert_eq!(reason, AudioSilenceReason::UnexpectedPayloadType);
     }
 
     // The most dangerous discard in the file: wrong recv keys make a call totally deaf, and before

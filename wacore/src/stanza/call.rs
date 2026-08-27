@@ -551,7 +551,15 @@ pub fn capability_bit(version: Option<u32>, bytes: &[u8], index: u32) -> Capabil
         return CapabilityBit::Clear;
     };
     let mask = &bytes[CAPABILITY_HEADER_LEN..];
-    let mask_len = usize::from(declared_len).min(mask.len());
+    // A blob that promises more mask bytes than it carries is truncated, and a truncated blob is
+    // one the peer never wrote: reading the prefix that did arrive would report a bit as set on the
+    // strength of bytes whose sender we cannot vouch for. The client's parser fails the whole blob
+    // and installs the version -1 fallback, which answers false for every index, so refuse before
+    // touching the mask rather than after clamping to what is there.
+    if usize::from(declared_len) > mask.len() {
+        return CapabilityBit::Clear;
+    }
+    let mask_len = usize::from(declared_len);
     let byte = (index / 8) as usize;
     // `contain()` masks the byte index with 31 before indexing, so an index past 255 aliases onto a
     // low one rather than reading out of range. Mirrored here so a blob is read the way the peer
@@ -1219,6 +1227,16 @@ mod capability_tests {
             capability_bit(Some(1), &[0x01], CAPABILITY_INDEX_MLOW_V1),
             CapabilityBit::Clear,
             "a blob with no length byte"
+        );
+        // The dangerous truncation is the one that still carries the byte the index lives in: the
+        // normal offer blob with its last byte lost. Clamping to the surviving prefix would read
+        // index 31 out of it and report Set for a blob the peer's own parser rejects wholesale.
+        let mut truncated = CAPABILITY_OFFER.to_vec();
+        truncated.pop();
+        assert_eq!(
+            capability_bit(Some(1), &truncated, CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "a truncated blob is unreadable even where the index's own byte survived"
         );
     }
 

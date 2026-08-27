@@ -64,20 +64,36 @@ impl RelayTransport for TappedTransport {
 }
 
 /// Forward inbound events from `inner_rx` to `out_tx`, recording each `PacketReceived` to `tap`
-/// first. Drops on a full `out_tx` (loss tolerant, like the relay pump) and stops when the source
-/// closes (relay gone) or the driver drops its receiver. Spawned by [`TappedFactory::connect`]; a
+/// first. Drops media on a full `out_tx` (loss tolerant, like the relay pump), accumulating what it
+/// dropped and reporting it as `InboundDropped` as soon as there is room again, and stops when the
+/// source closes (relay gone) or the driver drops its receiver. Spawned by [`TappedFactory::connect`]; a
 /// free fn so the forwarding/recording logic is testable without a runtime.
 async fn tap_forward(
     inner_rx: async_channel::Receiver<RelayTransportEvent>,
     out_tx: async_channel::Sender<RelayTransportEvent>,
     tap: Arc<dyn PacketTap>,
 ) {
+    // Media this forwarder itself discarded, waiting for room to report it. Kept as a running total
+    // rather than sent per packet: the moment there is something to report is exactly the moment the
+    // channel is full, so a blocking send here would stall the tap behind the driver it is feeding.
+    let mut local_drops: u32 = 0;
     while let Ok(ev) = inner_rx.recv().await {
         if let RelayTransportEvent::PacketReceived(data) = &ev {
             tap.on_packet(PacketDir::Inbound, data);
         }
         match out_tx.try_send(ev) {
-            Ok(()) => {}
+            Ok(()) => {
+                // Room again, so the backlog can be handed over. The engine folds it into
+                // `inbound_pipe_dropped`; without this a tapped call under backpressure loses audio
+                // with no counter moving and the watchdog blaming the codec for it.
+                if local_drops > 0
+                    && out_tx
+                        .try_send(RelayTransportEvent::InboundDropped(local_drops))
+                        .is_ok()
+                {
+                    local_drops = 0;
+                }
+            }
             // Mirror the native relay pump: media is loss tolerant, but a dropped STUN Binding
             // Request means the engine never replies Binding Success and relay consent expires.
             // This forwarder sits AFTER the pump, so it must preserve STUN too (a Request that
@@ -93,12 +109,22 @@ async fn tap_forward(
                     RelayTransportEvent::InboundDropped(_) => true,
                     _ => false,
                 };
-                if is_control && out_tx.send(ev).await.is_err() {
-                    break;
+                if is_control {
+                    if out_tx.send(ev).await.is_err() {
+                        break;
+                    }
+                } else {
+                    local_drops = local_drops.saturating_add(1);
                 }
             }
             Err(async_channel::TrySendError::Closed(_)) => break,
         }
+    }
+    // Best effort on the way out: the driver may still be draining, and a report that arrives with
+    // the last packets is worth more than one that is never made. A closed or full channel here is
+    // the end of the call, where nothing is left to diagnose.
+    if local_drops > 0 {
+        let _ = out_tx.try_send(RelayTransportEvent::InboundDropped(local_drops));
     }
 }
 
@@ -294,6 +320,49 @@ mod tests {
             tap.captured().len(),
             3,
             "the tap records every packet, even ones later dropped"
+        );
+    }
+
+    // What the forwarder discards has to reach the same counter the relay pump's own drops do,
+    // otherwise a tapped call under backpressure loses audio while `inbound_pipe_dropped` stays at
+    // zero and the watchdog blames the codec for a transport problem.
+    #[test]
+    fn tap_forward_reports_the_media_it_dropped_as_inbound_dropped() {
+        let media = || RelayTransportEvent::PacketReceived(Bytes::from_static(b"\x90\x78\x01\x02"));
+        let (inner_tx, inner_rx) = async_channel::unbounded();
+        // Two fill the cap-2 channel; the two behind them are dropped by this forwarder.
+        for _ in 0..4 {
+            inner_tx.try_send(media()).unwrap();
+        }
+        let (out_tx, out_rx) = async_channel::bounded(2);
+        let tap = Arc::new(InMemoryTap::default());
+
+        let seen = futures::executor::block_on(async {
+            let fwd = tap_forward(inner_rx, out_tx, tap);
+            let drive = async {
+                let mut seen = vec![out_rx.recv().await.unwrap(), out_rx.recv().await.unwrap()];
+                // Room again: the next packet the driver takes carries the backlog with it.
+                inner_tx.try_send(media()).unwrap();
+                inner_tx.close();
+                while let Ok(ev) = out_rx.recv().await {
+                    seen.push(ev);
+                }
+                seen
+            };
+            let (_, seen) = futures::join!(fwd, drive);
+            seen
+        });
+
+        let reported: u32 = seen
+            .iter()
+            .filter_map(|ev| match ev {
+                RelayTransportEvent::InboundDropped(n) => Some(*n),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(
+            reported, 2,
+            "both dropped media packets are accounted for, got {seen:?}"
         );
     }
 }

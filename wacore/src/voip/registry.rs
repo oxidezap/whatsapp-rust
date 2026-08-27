@@ -38,6 +38,10 @@ const PENDING_INITIAL_GROUP_CONTROL_TTL: Duration = Duration::from_secs(10);
 const MAX_CALL_EVENT_QUEUE_BYTES: usize = 1024 * 1024;
 const MAX_GROUP_CONTROL_QUEUE_BYTES: usize = 1024 * 1024;
 const DEFAULT_CALL_EVENT_QUEUE_CAPACITY: usize = 64;
+/// Peer devices whose `<capability>` statement one call retains. A peer answers from one device;
+/// this is headroom for its siblings preaccepting first, and a bound on what an unsolicited stream
+/// of `<preaccept>`s can make this call allocate.
+const PEER_CAPABILITY_DEVICE_CAP: usize = 8;
 const MAX_RINGING_GROUP_CALLS: usize = 64;
 const MAX_RINGING_GROUP_CALL_BYTES: usize = 1024 * 1024;
 
@@ -285,6 +289,14 @@ struct CallEntry {
     group_invite_peer_device: Option<GroupCallDevice>,
     /// Once an `<accept>` selects a device, delayed sibling preaccepts cannot replace it.
     group_invite_peer_selected: bool,
+    /// What each peer device stated about `use_mlow_codec_v1` in a `<preaccept>`, kept so a later
+    /// `<accept>` from the same device that omits the `<capability>` child is still read against
+    /// what that device said. A video `<accept>` omits it by construction, and reading that as
+    /// "the peer said nothing" leaves MLow on against a peer outside the rollout, which is the
+    /// silence of issue #1105 arriving through the other door. Bounded: a peer with more devices
+    /// than this is not answering from all of them, and an unbounded list is a free allocation for
+    /// anyone who can send a `<preaccept>`.
+    peer_announced_capability: Vec<(Jid, crate::stanza::call::CapabilityBit)>,
     /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
     /// `EndedNotify`'s Drop whenever the entry leaves the map.
     on_terminal: Option<EndedNotify>,
@@ -1453,6 +1465,7 @@ impl CallRegistry {
             group_invite_self_device: None,
             group_invite_peer_device: None,
             group_invite_peer_selected: false,
+            peer_announced_capability: Vec::new(),
             on_terminal: None,
         }
     }
@@ -2461,6 +2474,68 @@ impl CallRegistry {
         self.active_calls()
             .get(call_id)
             .is_some_and(|entry| entry.generation == generation)
+    }
+
+    /// Remember what one peer device stated about `use_mlow_codec_v1`.
+    ///
+    /// [`CapabilityBit::Unknown`](crate::stanza::call::CapabilityBit::Unknown) is not recorded and
+    /// never overwrites a statement: it means the
+    /// stanza carried no `<capability>` at all, which is the absence this exists to fill in. A
+    /// device that states the bit twice keeps its latest statement.
+    pub fn note_peer_capability(
+        &self,
+        call_id: &str,
+        device: &Jid,
+        peer: crate::stanza::call::CapabilityBit,
+    ) {
+        use crate::stanza::call::CapabilityBit;
+
+        if peer == CapabilityBit::Unknown {
+            return;
+        }
+        let mut calls = self.active_calls();
+        let Some(entry) = calls.get_mut(call_id) else {
+            return;
+        };
+        if let Some(slot) = entry
+            .peer_announced_capability
+            .iter_mut()
+            .find(|(known, _)| known == device)
+        {
+            slot.1 = peer;
+        } else if entry.peer_announced_capability.len() < PEER_CAPABILITY_DEVICE_CAP {
+            entry.peer_announced_capability.push((device.clone(), peer));
+        }
+    }
+
+    /// What `device` has stated about `use_mlow_codec_v1`, preferring what THIS stanza carried.
+    ///
+    /// A stanza that carries a `<capability>` is the peer speaking now and always wins, including
+    /// when it clears the bit. Only an absent one falls back, and only to the same device: two
+    /// devices of one account can sit on opposite sides of a rollout, so another device's statement
+    /// is not evidence about this one.
+    #[must_use]
+    pub fn resolve_peer_capability(
+        &self,
+        call_id: &str,
+        device: &Jid,
+        stated: crate::stanza::call::CapabilityBit,
+    ) -> crate::stanza::call::CapabilityBit {
+        use crate::stanza::call::CapabilityBit;
+
+        if stated != CapabilityBit::Unknown {
+            return stated;
+        }
+        self.active_calls()
+            .get(call_id)
+            .and_then(|entry| {
+                entry
+                    .peer_announced_capability
+                    .iter()
+                    .find(|(known, _)| known == device)
+                    .map(|(_, bit)| *bit)
+            })
+            .unwrap_or(CapabilityBit::Unknown)
     }
 
     /// The audio codec a peer's `<capability>` selects for a live call, or `None` when the
@@ -5045,6 +5120,53 @@ mod tests {
         ] {
             assert_eq!(reg.peer_selected_audio_codec("CID", peer), None);
         }
+    }
+
+    // A video `<accept>` omits the `<capability>` child by construction, so the accept alone reads
+    // as "the peer said nothing" and leaves MLow on -- against the same device that just said, in
+    // its `<preaccept>`, that it does not speak it.
+    #[test]
+    fn an_accept_without_a_capability_reads_the_same_device_preaccept() {
+        use crate::stanza::call::CapabilityBit;
+
+        let reg = CallRegistry::new();
+        reg.insert(session("CID"));
+        let answering = Jid::new("222222222222222", Server::Lid).with_device(2);
+        let sibling = Jid::new("222222222222222", Server::Lid).with_device(3);
+
+        reg.note_peer_capability("CID", &answering, CapabilityBit::Clear);
+        reg.note_peer_capability("CID", &sibling, CapabilityBit::Set);
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &answering, CapabilityBit::Unknown),
+            CapabilityBit::Clear,
+            "the accept's own device is the one whose earlier statement applies"
+        );
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &sibling, CapabilityBit::Unknown),
+            CapabilityBit::Set,
+            "two devices of one account can sit on opposite sides of a rollout"
+        );
+        // A stanza that carries the child is the peer speaking now, and always wins.
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &answering, CapabilityBit::Set),
+            CapabilityBit::Set
+        );
+        // Unknown is an absence, not a statement: it never overwrites one.
+        reg.note_peer_capability("CID", &answering, CapabilityBit::Unknown);
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &answering, CapabilityBit::Unknown),
+            CapabilityBit::Clear
+        );
+        // A device nobody has heard from stays unknown, as does an unknown call.
+        let stranger = Jid::new("333333333333333", Server::Lid).with_device(1);
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &stranger, CapabilityBit::Unknown),
+            CapabilityBit::Unknown
+        );
+        assert_eq!(
+            reg.resolve_peer_capability("NOPE", &answering, CapabilityBit::Unknown),
+            CapabilityBit::Unknown
+        );
     }
 
     #[test]

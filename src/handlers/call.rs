@@ -333,6 +333,16 @@ impl StanzaHandler for CallHandler {
                             let bytes = capability.content_bytes().unwrap_or_default();
                             capability_bit(version, bytes, CAPABILITY_INDEX_MLOW_V1)
                         });
+                        // A device states its codec capability in the `<preaccept>` and its
+                        // `<accept>` need not repeat it -- a video answer omits the child by
+                        // construction. Retained per device so the accept below reads what THIS
+                        // device said rather than treating the omission as "the peer said nothing",
+                        // which would leave MLow on against a peer outside the rollout.
+                        client.call_registry().note_peer_capability(
+                            call.action.call_id(),
+                            &routed_call_sender(&call),
+                            peer_mlow_bit,
+                        );
                         let device = if let Some(capability) = capability
                             && let Some(bytes) =
                                 capability.content_bytes().filter(|bytes| !bytes.is_empty())
@@ -395,6 +405,11 @@ impl StanzaHandler for CallHandler {
                         // The peer's capability and the answering device land in the same stanza
                         // and both have to be applied before the first inbound packet, so they
                         // travel as one message rather than racing.
+                        let peer_mlow_bit = client.call_registry().resolve_peer_capability(
+                            call.action.call_id(),
+                            &sender,
+                            peer_mlow_bit,
+                        );
                         let audio_codec = client
                             .call_registry()
                             .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);

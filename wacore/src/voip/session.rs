@@ -745,6 +745,14 @@ pub struct VideoPipeline {
     send_roc: RocTracker,
     recv_streams: SrtpRecvStreams,
     depacketizer: H264Depacketizer,
+    /// SSRC whose fragments the depacketizer currently holds, once one has authenticated.
+    ///
+    /// The receive table tracks several SSRCs so a renumbering peer keeps its own rollover counter
+    /// and replay window, but reassembly is one state machine keyed on sequence number and
+    /// timestamp -- neither of which means anything across a stream boundary. Without this, a
+    /// renumbered stream's restarted timestamps read as an old frame and its fragments splice onto
+    /// the previous stream's.
+    depacketizer_ssrc: Option<u32>,
     pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
 }
@@ -788,6 +796,7 @@ impl VideoPipeline {
             send_roc: RocTracker::default(),
             recv_streams: SrtpRecvStreams::default(),
             depacketizer: H264Depacketizer::default(),
+            depacketizer_ssrc: None,
             pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
         })
@@ -829,6 +838,7 @@ impl VideoPipeline {
         self.recv_keys = keys;
         self.recv_streams = SrtpRecvStreams::default();
         self.depacketizer.reset();
+        self.depacketizer_ssrc = None;
         true
     }
 
@@ -868,6 +878,7 @@ impl VideoPipeline {
 
     pub(crate) fn reset_depacketizer(&mut self) {
         self.depacketizer.reset();
+        self.depacketizer_ssrc = None;
     }
 
     /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
@@ -919,6 +930,15 @@ impl VideoPipeline {
             self.warp_mi_tag_len,
             packet,
         )?;
+        // Committing to a new stream discards what the previous one left half-assembled. Dropping a
+        // partial access unit is the correct trade: the alternative is emitting one spliced from two
+        // encoders' fragments, which decodes to garbage rather than to nothing.
+        if self.depacketizer_ssrc != Some(header.ssrc) {
+            if self.depacketizer_ssrc.is_some() {
+                self.depacketizer.reset();
+            }
+            self.depacketizer_ssrc = Some(header.ssrc);
+        }
         let first = self.depacketizer.push(
             header.sequence_number,
             header.timestamp,
@@ -1721,6 +1741,40 @@ mod tests {
         let packets2 = tx.protect_video(&au2);
         assert_eq!(packets2.len(), 1);
         assert_eq!(rx.unprotect_video(&packets2[0]), Some(vec![au2]));
+    }
+
+    // The receive table authenticates a renumbered stream on its own rollover counter and replay
+    // window, but reassembly is keyed on the RTP timestamp, which restarts with the stream. Without
+    // committing the depacketizer to one SSRC at a time, the replacement stream's first frames read
+    // as reordered packets of the old one and the video freezes for as long as the peer keeps its
+    // new numbering -- which is forever.
+    #[test]
+    fn video_renumbering_peer_is_reassembled_on_its_own_timeline() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut renumbered = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        // Three AUs on the original stream carry its clock well past zero.
+        for _ in 0..3 {
+            let au = video_au(60);
+            let packet = tx.protect_video(&au).pop().expect("one packet");
+            assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+        }
+        // The replacement stream starts its own clock at zero.
+        let au = video_au(60);
+        let packet = renumbered.protect_video(&au).pop().expect("one packet");
+        assert_eq!(
+            rx.unprotect_video(&packet),
+            Some(vec![au]),
+            "a renumbered stream's first AU must not read as a reordered packet of the old one"
+        );
     }
 
     #[test]

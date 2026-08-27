@@ -158,9 +158,15 @@ pub(crate) enum AudioHealthAlarm {
 const HEALTH_TICK_MS: Millis = 500;
 /// Sliding window over which "packets in, no audio out" is judged.
 const SILENT_WINDOW_MS: Millis = 2_000;
-/// Packets that must land inside the window before silence is diagnosable. ~1.2s of media at the
-/// 16.7 packets/s a 60ms stream produces; below this it is jitter, not a diagnosis.
-const SILENT_WINDOW_MIN_PACKETS: u32 = 20;
+/// Packets that must land inside the window before silence is diagnosable; below this it is jitter,
+/// not a diagnosis.
+///
+/// Sized by the SLOWEST cadence the receive path admits, not the common one. A 120 ms stream puts
+/// only 16 or 17 packets in the window, so a minimum of 20 could never be met -- and because `poll`
+/// rolls the window whenever the count falls short, such a call would stay silent forever without
+/// ever producing an alarm. Twelve is 1.44 s of media at 120 ms and 0.72 s at 60 ms: still most of
+/// the window in both, and still far above a jitter burst.
+const SILENT_WINDOW_MIN_PACKETS: u32 = 12;
 /// No audio RTP at all for this long after media came up is a stalled reception.
 const STALL_AFTER_MS: Millis = 3_000;
 /// Re-alarm cadence while the condition persists, so a truncated log still catches it.
@@ -413,6 +419,32 @@ mod tests {
             stats.rtp_received += 1;
         }
         assert_eq!(watch.poll(2_100, &stats), None);
+    }
+
+    // The slowest cadence the receive path admits is the one that sets the minimum: a 120 ms stream
+    // fits 16 or 17 packets in the 2 s window, so a threshold above that would make a permanently
+    // silent 120 ms call the one case the watchdog can never report.
+    #[test]
+    fn a_120ms_stream_still_reaches_the_window_minimum() {
+        let mut watch = armed(0);
+        let mut stats = CallMediaStats::default();
+        // 2 s of a 120 ms cadence, one packet short of the ideal count to allow for jitter.
+        for _ in 0..16 {
+            watch.on_rtp();
+            stats.rtp_received += 1;
+        }
+        stats.audio_frames_concealed = 16;
+        let alarm = watch.poll(2_100, &stats).expect("silent");
+        assert!(
+            matches!(
+                alarm,
+                AudioHealthAlarm::Silent {
+                    dominant_reason: AudioSilenceReason::CodecRejectingFrames,
+                    ..
+                }
+            ),
+            "got {alarm:?}"
+        );
     }
 
     // The only reason a consumer can act on, so it outranks every downstream symptom.
