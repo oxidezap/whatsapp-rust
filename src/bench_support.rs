@@ -318,9 +318,10 @@ async fn send_once(client: &Arc<Client>, group: &Jid) {
         .expect("offline group send must reach the sink");
 }
 
-async fn seed_registry(client: &Arc<Client>, user: &str, devices: &[u32]) {
+async fn seed_registry(client: &Arc<Client>, user: &str, devices: &[u16]) {
+    let user: Arc<str> = Arc::from(user);
     let record = DeviceListRecord {
-        user: user.into(),
+        user: Arc::clone(&user),
         devices: devices
             .iter()
             .map(|id| DeviceInfo::new(*id, None))
@@ -331,7 +332,7 @@ async fn seed_registry(client: &Arc<Client>, user: &str, devices: &[u32]) {
     };
     client
         .device_registry_cache
-        .promote(user.to_string(), Arc::new(record))
+        .promote(user, Arc::new(record))
         .await;
 }
 
