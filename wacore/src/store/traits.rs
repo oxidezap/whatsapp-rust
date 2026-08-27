@@ -443,7 +443,7 @@ mod msg_secret_entry_tests {
 
 /// Device list record matching WhatsApp Web's DeviceListRecord structure.
 ///
-/// Serialized through [`DeviceListRecordDe`], whose fields are the `String`,
+/// Serialized through a private shadow struct whose fields are the `String`,
 /// `Vec` and `Option<String>` the previous layout used. Deriving serde on the
 /// compact fields directly would stamp a second set of `Box<[T]>` and
 /// `Option<Box<str>>` codecs into every crate that persists a record, for a
