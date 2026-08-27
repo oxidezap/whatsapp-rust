@@ -872,25 +872,27 @@ async fn sleep_until(deadline: Option<Instant>) {
 ///
 /// `dropped` accumulates media discarded here. It cannot be reported at the moment of the drop: the
 /// queue being full is precisely why the packet is going away, so a notification sent right then
-/// would be discarded too. It is flushed on the next delivery that succeeds, which is the first
-/// instant the channel has room for it.
+/// would be discarded too. It is flushed BEFORE the next packet, not after: sustained backpressure
+/// where the call drains one slot per packet would otherwise refill that slot with the packet
+/// itself every time, and the report -- the one number that explains the overload -- would stay
+/// pending for the life of the call. A pending report only exists after a drop, so in a healthy
+/// call this costs nothing; when it does take the slot, the packet behind it is media (lossy by
+/// design here) or STUN, which waits for a slot rather than being dropped.
 async fn deliver(
     events: &async_channel::Sender<RelayTransportEvent>,
     packet: Bytes,
     dropped: &mut u32,
 ) -> bool {
     let kind = classify_relay_packet(&packet);
+    if *dropped > 0
+        && events
+            .try_send(RelayTransportEvent::InboundDropped(*dropped))
+            .is_ok()
+    {
+        *dropped = 0;
+    }
     match events.try_send(RelayTransportEvent::PacketReceived(packet)) {
-        Ok(()) => {
-            if *dropped > 0
-                && events
-                    .try_send(RelayTransportEvent::InboundDropped(*dropped))
-                    .is_ok()
-            {
-                *dropped = 0;
-            }
-            true
-        }
+        Ok(()) => true,
         // Media is loss tolerant, but STUN control is NOT: dropping a Binding Request means the
         // engine never replies Binding Success, so the relay's consent-freshness check fails and it
         // tears the call down (~4s) -- even though only media should be lossy. Under backpressure
@@ -985,6 +987,37 @@ mod tests {
             Ok(RelayTransportEvent::PacketReceived(b)) => assert_eq!(b.as_ref(), &[4u8, 5][..]),
             other => panic!("expected second packet, got {other:?}"),
         }
+    }
+
+    // The drop report is the one number that explains an overload, and it used to be sent AFTER the
+    // packet that had just refilled the only free slot. Under exactly the backpressure it exists to
+    // describe -- the call draining one slot per arriving packet -- it could stay pending for the
+    // whole call, leaving `inbound_pipe_dropped` at zero while media was being discarded.
+    #[tokio::test]
+    async fn a_pending_drop_report_reaches_the_call_under_sustained_backpressure() {
+        let (tx, rx) = async_channel::bounded(1);
+        let mut dropped = 0;
+        // Fills the single slot.
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2]), &mut dropped).await);
+        // Nowhere to go: media, so discarded and counted.
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 3, 4]), &mut dropped).await);
+        assert_eq!(dropped, 1, "the discarded media is pending a report");
+
+        // The call takes one event and one more packet arrives -- the steady state of a call that
+        // is behind. The slot must go to the report first, or it never goes anywhere.
+        let _ = rx.recv().await.unwrap();
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 5, 6]), &mut dropped).await);
+        match rx.try_recv() {
+            Ok(RelayTransportEvent::InboundDropped(n)) => assert_eq!(n, 1),
+            other => panic!("expected the drop report, got {other:?}"),
+        }
+        // The packet behind the report found the channel full and became the next pending report:
+        // under sustained overload the count arrives one round late, which is what a counter can
+        // honestly do here. What matters is that it arrives at all.
+        assert_eq!(
+            dropped, 1,
+            "the media displaced by the report is itself counted"
+        );
     }
 
     // A closed receiver (the call dropped it) stops the driver promptly via the try_send Closed arm.

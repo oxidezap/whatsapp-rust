@@ -341,12 +341,16 @@ impl RtpReceptionStats {
         //
         // Only forward steps within a second of audio count: a retransmission or a wrap would
         // otherwise produce an absurd difference, and one bad sample must not move a codec decision.
+        //
+        // A step that does not qualify CLEARS the span rather than leaving the last good one in
+        // place. The codec probe reads this as the current packet's own statement about its pacing,
+        // so a stale value would let packets that say nothing about their cadence -- a repeated or
+        // backward timestamp on a newer sequence number -- borrow the agreement of packets that
+        // did, and three of those are enough to switch the call's codec for good.
         if is_newest {
             if let Some(previous) = self.last_rtp_timestamp {
                 let delta = rtp_timestamp.wrapping_sub(previous);
-                if delta > 0 && delta <= clock_rate {
-                    self.frame_span = Some(delta);
-                }
+                self.frame_span = (delta > 0 && delta <= clock_rate).then_some(delta);
             }
             self.last_rtp_timestamp = Some(rtp_timestamp);
         }
@@ -360,8 +364,10 @@ impl RtpReceptionStats {
 
     /// Samples between the last two packets of this stream, per the peer's own RTP timestamps.
     ///
-    /// `None` until two consecutive in-order packets have been seen, and reset with the stream when
-    /// the SSRC changes, because a renumbered stream is a new statement and not a continuation.
+    /// `None` until two consecutive in-order packets have been seen, cleared again by a newest
+    /// packet whose step is unusable (zero, backward, or over a second), and reset with the stream
+    /// when the SSRC changes, because a renumbered stream is a new statement and not a
+    /// continuation.
     #[cfg(any(feature = "voip-mlow", test))]
     pub(crate) fn frame_span(&self) -> Option<u32> {
         self.frame_span
@@ -659,11 +665,14 @@ mod frame_span_tests {
         assert_eq!(stats.frame_span(), Some(960));
     }
 
-    // A reordered or retransmitted packet produces a backwards difference, which `wrapping_sub`
-    // turns into an enormous positive number. One such sample must not be able to move a codec
-    // decision, so the span holds its last good value.
+    // A newest packet whose timestamp goes backwards states nothing about its own cadence, so the
+    // span reports nothing rather than the previous packet's. The consumer is the codec probe,
+    // which reads the span as THIS packet's statement and abstains without penalty when there is
+    // none: holding the old value instead would let packets that say nothing about their pacing
+    // borrow the agreement of packets that did, and three borrowed agreements switch the call's
+    // codec permanently.
     #[test]
-    fn a_reordered_packet_does_not_move_the_span() {
+    fn a_backwards_timestamp_leaves_no_cadence_to_borrow() {
         let mut stats = RtpReceptionStats::default();
         observe(&mut stats, 1, 1_000, SSRC);
         observe(&mut stats, 2, 1_960, SSRC);
@@ -671,9 +680,12 @@ mod frame_span_tests {
         observe(&mut stats, 3, 1_000, SSRC);
         assert_eq!(
             stats.frame_span(),
-            Some(960),
-            "a backwards timestamp is not a new cadence"
+            None,
+            "a backwards timestamp is not a cadence, and not the last one either"
         );
+        // And the stream recovering re-states it.
+        observe(&mut stats, 4, 1_960, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
     }
 
     // The reordered packet must not poison the NEXT one either. Leaving the baseline on an old
@@ -693,14 +705,15 @@ mod frame_span_tests {
         );
     }
 
-    // A difference larger than a second of audio is not a frame duration, whatever caused it.
+    // A difference larger than a second of audio is not a frame duration, whatever caused it -- and
+    // like a backwards step, it leaves no cadence rather than the previous packet's.
     #[test]
-    fn an_absurd_forward_jump_is_ignored() {
+    fn an_absurd_forward_jump_states_no_cadence() {
         let mut stats = RtpReceptionStats::default();
         observe(&mut stats, 1, 1_000, SSRC);
         observe(&mut stats, 2, 1_960, SSRC);
         observe(&mut stats, 3, 1_960 + CLOCK + 1, SSRC);
-        assert_eq!(stats.frame_span(), Some(960));
+        assert_eq!(stats.frame_span(), None);
     }
 
     // A renumbered stream restarts the timestamp sequence, so differences across the change are not

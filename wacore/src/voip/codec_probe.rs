@@ -127,6 +127,38 @@ mod tests {
         );
     }
 
+    // The span is the packet's OWN statement about its pacing, and a packet that makes no such
+    // statement must not borrow the last one's. `RtpReceptionStats` clears the span on a repeated
+    // or backward timestamp for this reason; the probe's half of the contract is to abstain when it
+    // is absent, without penalising the stream that did state one.
+    #[test]
+    fn a_packet_with_no_cadence_of_its_own_neither_agrees_nor_resets() {
+        let mut probe = InboundCodecProbe::default();
+        let packet = silk_wb_60ms(80);
+        assert_eq!(
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
+            None
+        );
+        // Three packets that state no cadence: with a stale span these would have counted, and
+        // three of them are the whole threshold.
+        for _ in 0..3 {
+            assert_eq!(
+                probe.observe(&packet, AudioCodec::Mlow, None, 16_000, 960),
+                None,
+                "a packet with no cadence is no evidence"
+            );
+        }
+        // The stream that does state one picks up where it left off rather than starting over.
+        assert_eq!(
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
+            None
+        );
+        assert_eq!(
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
+            Some(AudioCodec::Opus)
+        );
+    }
+
     // The decision is taken once. A peer that alternates grammars is either adversarial or broken,
     // and thrashing the decoder for the rest of the call helps neither case.
     #[test]

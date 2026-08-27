@@ -156,8 +156,9 @@ pub(crate) enum AudioHealthAlarm {
         frames_produced: u32,
         dominant_reason: AudioSilenceReason,
     },
-    /// No audio RTP has arrived at all since media came up. A transport problem, not a codec one,
-    /// and the two are split precisely because conflating them is how #1105 stayed open.
+    /// No audio RTP has arrived for long enough that reception has stopped: either none ever
+    /// arrived, or the peer's media stopped mid-call. A transport problem, not a codec one, and the
+    /// two are split precisely because conflating them is how #1105 stayed open.
     Stalled { silent_for_ms: Millis },
 }
 
@@ -175,7 +176,8 @@ const SILENT_WINDOW_MS: Millis = 2_000;
 /// ever producing an alarm. Twelve is 1.44 s of media at 120 ms and 0.72 s at 60 ms: still most of
 /// the window in both, and still far above a jitter burst.
 const SILENT_WINDOW_MIN_PACKETS: u32 = 12;
-/// No audio RTP at all for this long after media came up is a stalled reception.
+/// No audio RTP at all for this long -- since media came up, or since the last packet -- is a
+/// stalled reception.
 const STALL_AFTER_MS: Millis = 3_000;
 /// Re-alarm cadence while the condition persists, so a truncated log still catches it.
 const REALARM_MS: Millis = 10_000;
@@ -192,6 +194,14 @@ pub(crate) struct AudioHealthWatch {
     window_produced: u32,
     /// Arrivals since media came up, used only to tell "nothing arrived" from "nothing worked".
     total_arrivals: u32,
+    /// When the last audio RTP packet arrived; `NEVER` until one does.
+    ///
+    /// The stall rule reads THIS rather than `total_arrivals`, because a call that goes deaf
+    /// mid-way is the same failure as one that never heard anything and needs the same alarm.
+    /// Keyed off "has anything ever arrived", one packet would disarm the rule for the rest of the
+    /// call, and the window rule cannot cover the gap -- an empty window is below
+    /// `SILENT_WINDOW_MIN_PACKETS`, so it resets without diagnosing anything.
+    last_arrival: Millis,
     /// The counters as they stood when the current window opened.
     ///
     /// The alarm describes THIS window, so the reason has to come from what moved inside it. Read
@@ -213,6 +223,7 @@ impl Default for AudioHealthWatch {
             window_rtp: 0,
             window_produced: 0,
             total_arrivals: 0,
+            last_arrival: NEVER,
             window_stats: CallMediaStats::default(),
             silent_since: None,
             last_alarm_at: None,
@@ -239,9 +250,12 @@ impl AudioHealthWatch {
     }
 
     /// One audio RTP packet arrived, whether or not it went on to authenticate or decode.
-    pub(crate) fn on_rtp(&mut self) {
+    pub(crate) fn on_rtp(&mut self, now: Millis) {
         self.window_rtp = self.window_rtp.saturating_add(1);
         self.total_arrivals = self.total_arrivals.saturating_add(1);
+        self.last_arrival = now;
+        // Reception recovered, so a later stall is a new one and worth its own alarm.
+        self.stall_reported = false;
     }
 
     pub(crate) fn on_audio_produced(&mut self) {
@@ -258,18 +272,28 @@ impl AudioHealthWatch {
         }
         self.deadline = now.saturating_add(HEALTH_TICK_MS);
 
-        // Nothing at all has ARRIVED: a transport problem, distinct from packets arriving that we
-        // cannot turn into sound. `window_rtp` counts arrivals rather than authenticated packets,
-        // so a call whose every packet fails its tag falls through to the silence rule below with a
-        // full window, which is where it belongs -- `dominant_reason` then names the failing tags.
+        // Nothing is ARRIVING: a transport problem, distinct from packets arriving that we cannot
+        // turn into sound. `window_rtp` counts arrivals rather than authenticated packets, so a
+        // call whose every packet fails its tag falls through to the silence rule below with a full
+        // window, which is where it belongs -- `dominant_reason` then names the failing tags.
+        //
+        // Measured from the last packet, falling back to when media came up. A call that has never
+        // heard anything and one that went deaf ten seconds in are the same failure to the person
+        // holding the phone, and the window rule below can diagnose neither: an empty window is
+        // under `SILENT_WINDOW_MIN_PACKETS`, so it resets rather than alarming.
+        let quiet_since = if self.last_arrival == NEVER {
+            self.started_at
+        } else {
+            self.last_arrival
+        };
+        let elapsed = now.saturating_sub(quiet_since);
+        if !self.stall_reported && elapsed >= STALL_AFTER_MS {
+            self.stall_reported = true;
+            return Some(AudioHealthAlarm::Stalled {
+                silent_for_ms: elapsed,
+            });
+        }
         if self.total_arrivals == 0 {
-            let elapsed = now.saturating_sub(self.started_at);
-            if !self.stall_reported && elapsed >= STALL_AFTER_MS {
-                self.stall_reported = true;
-                return Some(AudioHealthAlarm::Stalled {
-                    silent_for_ms: elapsed,
-                });
-            }
             return None;
         }
 
@@ -437,17 +461,61 @@ mod tests {
         assert_eq!(watch.poll(9_000, &stats), None, "reported exactly once");
     }
 
+    // A call that goes deaf mid-way is the same failure as one that never heard anything, and used
+    // to be the one silence nothing could report: the stall rule was disarmed by the first packet
+    // ever received, and the window rule resets on an empty window instead of alarming.
+    #[test]
+    fn reception_that_stops_mid_call_stalls_too() {
+        let mut watch = armed(0);
+        let mut stats = CallMediaStats::default();
+        // Two seconds of a healthy call, audio coming out.
+        for _ in 0..40 {
+            watch.on_rtp(2_000);
+            watch.on_audio_produced();
+            stats.rtp_received += 1;
+            stats.audio_frames_decoded += 1;
+        }
+        assert_eq!(watch.poll(2_100, &stats), None, "healthy");
+        // The peer's media stops. Nothing arrives from here on.
+        assert_eq!(watch.poll(4_500, &stats), None, "under the stall threshold");
+        let alarm = watch.poll(5_200, &stats).expect("reception stalled");
+        let AudioHealthAlarm::Stalled { silent_for_ms } = alarm else {
+            panic!("expected Stalled, got {alarm:?}");
+        };
+        assert_eq!(
+            silent_for_ms, 3_200,
+            "measured from the last packet, not from when media came up"
+        );
+        assert_eq!(watch.poll(6_000, &stats), None, "reported once per stall");
+        // Reception recovers and stops again: a second stall is a new fact, not a repeat.
+        for _ in 0..40 {
+            watch.on_rtp(7_000);
+            watch.on_audio_produced();
+            stats.rtp_received += 1;
+            stats.audio_frames_decoded += 1;
+        }
+        assert_eq!(watch.poll(7_100, &stats), None, "recovered");
+        assert!(
+            matches!(
+                watch.poll(10_500, &stats),
+                Some(AudioHealthAlarm::Stalled { .. })
+            ),
+            "a stall after a recovery is its own alarm"
+        );
+    }
+
     #[test]
     fn packets_arriving_with_no_audio_out_alarms_and_repeats_on_cadence() {
         let mut watch = armed(0);
         let mut stats = CallMediaStats::default();
-        let feed = |watch: &mut AudioHealthWatch, stats: &mut CallMediaStats, n: u32| {
-            for _ in 0..n {
-                watch.on_rtp();
-                stats.rtp_received = stats.rtp_received.saturating_add(1);
-            }
-        };
-        feed(&mut watch, &mut stats, 40);
+        let feed =
+            |watch: &mut AudioHealthWatch, stats: &mut CallMediaStats, n: u32, at: Millis| {
+                for _ in 0..n {
+                    watch.on_rtp(at);
+                    stats.rtp_received = stats.rtp_received.saturating_add(1);
+                }
+            };
+        feed(&mut watch, &mut stats, 40, 2_100);
         stats.mlow_off_point_dropped = 40;
         let alarm = watch.poll(2_100, &stats).expect("silent");
         let AudioHealthAlarm::Silent {
@@ -463,9 +531,9 @@ mod tests {
         assert_eq!(dominant_reason, AudioSilenceReason::CodecRejectingFrames);
 
         // Same condition inside the re-alarm window stays quiet.
-        feed(&mut watch, &mut stats, 40);
+        feed(&mut watch, &mut stats, 40, 4_500);
         assert_eq!(watch.poll(4_500, &stats), None, "inside the realarm window");
-        feed(&mut watch, &mut stats, 40);
+        feed(&mut watch, &mut stats, 40, 13_000);
         let repeat = watch.poll(13_000, &stats).expect("re-alarmed");
         let AudioHealthAlarm::Silent { silent_for_ms, .. } = repeat else {
             panic!("expected Silent, got {repeat:?}");
@@ -481,7 +549,7 @@ mod tests {
         let mut watch = armed(0);
         let mut stats = CallMediaStats::default();
         for _ in 0..40 {
-            watch.on_rtp();
+            watch.on_rtp(2_100);
             stats.rtp_received += 1;
         }
         watch.on_audio_produced();
@@ -494,7 +562,7 @@ mod tests {
         let mut watch = armed(0);
         let mut stats = CallMediaStats::default();
         for _ in 0..(SILENT_WINDOW_MIN_PACKETS - 1) {
-            watch.on_rtp();
+            watch.on_rtp(2_100);
             stats.rtp_received += 1;
         }
         assert_eq!(watch.poll(2_100, &stats), None);
@@ -509,7 +577,7 @@ mod tests {
         let mut stats = CallMediaStats::default();
         // 2 s of a 120 ms cadence, one packet short of the ideal count to allow for jitter.
         for _ in 0..16 {
-            watch.on_rtp();
+            watch.on_rtp(2_100);
             stats.rtp_received += 1;
         }
         stats.audio_frames_concealed = 16;
@@ -536,7 +604,7 @@ mod tests {
         let mut stats = CallMediaStats::default();
         // A codec problem early on, alarmed and then recovered.
         for _ in 0..40 {
-            watch.on_rtp();
+            watch.on_rtp(2_100);
             stats.rtp_received += 1;
         }
         stats.audio_frames_concealed = 40;
@@ -550,7 +618,7 @@ mod tests {
         ));
         // Audio flows again, which clears the run and the re-alarm cadence with it.
         for _ in 0..40 {
-            watch.on_rtp();
+            watch.on_rtp(4_200);
             watch.on_audio_produced();
             stats.rtp_received += 1;
             stats.audio_frames_decoded += 1;
@@ -559,7 +627,7 @@ mod tests {
         // Now a different failure entirely: packets arrive and none of them authenticates. Nothing
         // was concealed in this window, so nothing here is the codec's doing.
         for _ in 0..40 {
-            watch.on_rtp();
+            watch.on_rtp(6_300);
             stats.srtp_unprotect_failed += 1;
         }
         let second = watch.poll(6_300, &stats).expect("silent again");
@@ -679,7 +747,7 @@ mod tests {
         let mut watch = armed(0);
         watch.window_rtp = u32::MAX;
         watch.total_arrivals = u32::MAX;
-        watch.on_rtp();
+        watch.on_rtp(2_100);
         assert_eq!(watch.window_rtp, u32::MAX, "pinned, not wrapped");
         let stats = CallMediaStats {
             rtp_received: u32::MAX,

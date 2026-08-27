@@ -618,11 +618,33 @@ pub enum CallEvent {
         /// immediate one without correlating timestamps.
         packets_observed: u32,
     },
-    /// No audio RTP has arrived at all since the relay allocated.
+    /// The peer speaks one codec and this call's encoded source emits another, and neither can
+    /// move: the source was built by the application and carries no per-frame codec, so the engine
+    /// cannot re-point it the way it re-points its own encoder.
+    ///
+    /// The mid-call twin of [`CallError::EncodedAudioCodecNotNegotiated`][enc], which refuses the
+    /// same mismatch at answer time. Nothing is switched -- switching would keep taking the
+    /// application's bytes and send them under a profile that accepts any nonempty payload, so the
+    /// peer would hear noise with nothing on this side noticing. Only the application can pick a
+    /// codec, so only it can end or rebuild this call.
+    ///
+    /// [enc]: https://docs.rs/whatsapp-rust/latest/whatsapp_rust/voip/enum.CallError.html
+    AudioCodecSourceIsFixed {
+        /// What the application's source emits, and what this call keeps sending.
+        sending: AudioCodec,
+        /// What the peer says it speaks.
+        peer_expects: AudioCodec,
+        /// Whether the peer said so in signaling or in its packets.
+        source: CodecDecisionSource,
+    },
+    /// Audio RTP has stopped arriving: either none ever did since the relay allocated, or the
+    /// peer's media stopped mid-call. `silent_for_ms` measures from the last packet, or from the
+    /// allocate when there has been none.
     ///
     /// Deliberately distinct from [`Self::AudioSilent`]: this one is a transport problem and that
     /// one is a codec problem, and conflating them is exactly how #1105 was mis-triaged for months.
-    /// Emitted once per call.
+    /// Emitted once per stall -- reception recovering re-arms it, so a call that drops out twice
+    /// says so twice.
     AudioReceptionStalled { silent_for_ms: Millis },
 }
 
@@ -688,6 +710,7 @@ impl CallEvent {
             | Self::OutboundMediaDropped { .. }
             | Self::AudioSilent { .. }
             | Self::AudioCodecSwitched { .. }
+            | Self::AudioCodecSourceIsFixed { .. }
             | Self::AudioReceptionStalled { .. } => 0,
         }
     }
@@ -737,6 +760,15 @@ struct MediaState {
     audio_rtcp_announced: bool,
     audio_tx_invalid_streak: u8,
     sframe: Option<SframeSession>,
+    /// Whether any inbound frame has ever authenticated as SFrame.
+    ///
+    /// The gate on counting a failed tag. `SframeSession::decrypt` reads the wrapping from the
+    /// frame's own trailing bytes, and a plain codec frame can end in bytes that parse as a header
+    /// by coincidence -- roughly a percent of them do -- so a failed tag alone does not mean the
+    /// peer wraps. One frame that authenticates does mean it, and from then on a failure is real.
+    /// Until then the two are genuinely indistinguishable and the silence alarm is what reports a
+    /// call whose keys are wrong from end to end.
+    sframe_authenticated: bool,
     #[cfg(feature = "voip-mlow")]
     pcm: Option<PcmAudioState>,
     /// `NEVER` for encoded I/O, which has no core-side playout timer.
@@ -1026,6 +1058,7 @@ impl CallEngine {
                 audio_rtcp_announced: false,
                 audio_tx_invalid_streak: 0,
                 sframe,
+                sframe_authenticated: false,
                 #[cfg(feature = "voip-mlow")]
                 pcm: (config.audio.io == AudioIo::Pcm).then(|| PcmAudioState {
                     encoder: mlow::MlowEncoder::new(),
@@ -1969,6 +2002,14 @@ impl CallEngine {
             .format
             .sibling_for(to)
             .ok_or(CodecSwitchError::NotASiblingFormat)?;
+        // An encoded call's outbound bytes come from a source the APPLICATION built, fixed to one
+        // codec for the life of the call. The switch still happens, because the RECEIVE side is
+        // what it is for -- the peer's packets have to be decoded and labelled as the grammar they
+        // are. The send side cannot follow: the engine can re-point its own encoder, not the
+        // application's source. `on_encoded_audio` stops transmitting those bytes rather than
+        // sending them under a profile that accepts any nonempty payload (the peer would hear
+        // noise), and this event is how the application learns that only it can fix the call.
+        let outbound_stranded = m.audio.io == AudioIo::Encoded && m.audio.format.codec != to;
         if self.media_stats.codec_switches >= CODEC_FLAP_LIMIT {
             return Err(CodecSwitchError::Latched);
         }
@@ -1993,6 +2034,14 @@ impl CallEngine {
                 source,
                 packets_observed,
             }));
+        if outbound_stranded {
+            self.outbox
+                .push_back(Output::Event(CallEvent::AudioCodecSourceIsFixed {
+                    sending: self.media.as_ref().map_or(from, |m| m.audio.format.codec),
+                    peer_expects: to,
+                    source,
+                }));
+        }
         Ok(())
     }
 
@@ -2404,7 +2453,7 @@ impl CallEngine {
         // BEFORE the payload-type gate for the same reason: a peer that switched profiles is
         // sending audio RTP, so reading it as "nothing arrived" would report the transport alarm
         // and bury the one reason the counters can actually name. Video has already returned above.
-        self.health.on_rtp();
+        self.health.on_rtp(now);
         if !m
             .audio
             .format
@@ -2442,8 +2491,11 @@ impl CallEngine {
         );
         // SFrame on: use the GCM-decrypted bytes; otherwise the SRTP payload is already plain codec.
         let encoded = match m.sframe.as_ref().map(|s| s.decrypt(&payload)) {
-            Some(SframeIn::Decrypted(plain)) => plain,
-            Some(SframeIn::AuthFailed) => {
+            Some(SframeIn::Decrypted(plain)) => {
+                m.sframe_authenticated = true;
+                plain
+            }
+            Some(SframeIn::AuthFailed) if m.sframe_authenticated => {
                 // The frame WAS SFrame-wrapped and its tag did not authenticate. Passing the
                 // payload through is the documented contract, but doing it silently would hand
                 // ciphertext to the codec and call the result a codec problem.
@@ -2452,8 +2504,9 @@ impl CallEngine {
                 payload
             }
             // A peer that does not SFrame-wrap at all is a supported mode, not a failure: counting
-            // it would make every packet of a healthy call report one.
-            Some(SframeIn::Plaintext) | None => payload,
+            // it would make every packet of a healthy call report one. `AuthFailed` before anything
+            // has authenticated lands here too -- see `sframe_authenticated`.
+            Some(SframeIn::AuthFailed | SframeIn::Plaintext) | None => payload,
         };
         let codec = m.active_format.inbound_codec(header.payload_type, &encoded);
         if m.audio.io == AudioIo::Pcm && codec == AudioCodec::Opus {
@@ -2589,7 +2642,11 @@ impl CallEngine {
                 .media_stats
                 .mlow_inactive_or_sid
                 .saturating_add(u32::from(decode_report.inactive_or_sid));
-            if decode_report.decoded > 0 {
+            // A SID is the peer TELLING us it is silent, and the decoder handled it: a muted peer
+            // is a healthy stream, not a call that cannot turn packets into sound. Counted as
+            // production so the silence alarm does not fire through a long mute -- the failures
+            // this alarm exists for report `off_point` or concealment, never `inactive_or_sid`.
+            if decode_report.decoded > 0 || decode_report.inactive_or_sid > 0 {
                 self.health.on_audio_produced();
             }
         }
@@ -2882,6 +2939,18 @@ impl CallEngine {
         else {
             return;
         };
+        // The source is fixed to the codec the call was BUILT with. Once a switch has moved the
+        // active grammar away from it, its bytes are not what this profile says they are, and the
+        // profile accepts any nonempty payload -- so sending them would put MLow on the wire under
+        // an Opus payload type and the peer would hear noise. Counted where a call that cannot
+        // encode is already counted, and announced once by `switch_audio_codec`.
+        if m.audio.format.codec != m.active_format.codec {
+            self.media_stats.outbound_frames_without_encoder = self
+                .media_stats
+                .outbound_frames_without_encoder
+                .saturating_add(1);
+            return;
+        }
         if !m.active_format.accepts_encoded_payload(payload) {
             if m.audio_tx_invalid_streak < MAX_INVALID_AUDIO_WARNINGS {
                 log::warn!(
@@ -6049,6 +6118,42 @@ mod tests {
         assert!(eng.media_stats().audio_frames_decoded > 0);
     }
 
+    // A muted peer sends SID/DTX, and the decoder handling one is the stream working exactly as
+    // designed. Counting only DECODED frames as production made a mute look identical to a codec
+    // that cannot decode anything: `AudioSilent` every two seconds, re-alarming for as long as the
+    // peer stayed quiet, with no reason to name because nothing was actually wrong.
+    #[test]
+    fn a_muted_peer_sending_sid_is_not_a_silent_call() {
+        let mut eng = allocated_engine();
+        let mut peer_tx = peer_pipeline();
+        let mut now = 1;
+        // Twelve seconds of comfort noise: past the 2 s window, the 3 s stall bound, and one full
+        // re-alarm cadence, so a false alarm has every chance to fire.
+        for _ in 0..200u32 {
+            // TOC 0x80: a SID, silenced through the comfort-noise path without opening the range
+            // coder (see `MlowDecoder::decode_frame`).
+            let packet = peer_tx.protect_audio(&[0x80, 0xAA, 0xBB, 0xCC]);
+            eng.handle_input(now, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+            now += 60;
+            eng.handle_input(now, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                assert!(
+                    !matches!(
+                        output,
+                        Output::Event(CallEvent::AudioSilent { .. })
+                            | Output::Event(CallEvent::AudioReceptionStalled { .. })
+                    ),
+                    "a peer that is telling us it is silent is not a call that cannot hear, got {output:?}"
+                );
+            }
+        }
+        let stats = eng.media_stats();
+        assert!(stats.mlow_inactive_or_sid > 0, "the SIDs were recognised");
+        assert_eq!(stats.audio_frames_decoded, 0, "and none of them was speech");
+    }
+
     // Reception that never starts is a transport problem, and it gets its own event: conflating it
     // with a codec problem is how #1105 was mis-triaged.
     #[test]
@@ -6195,6 +6300,61 @@ mod tests {
             })
             .expect("the payload must reach the encoded sink");
         assert_eq!(codec, AudioCodec::Opus);
+    }
+
+    // An `EncodedAudioSource` emits one codec for the life of the call: the application built it,
+    // it carries no per-frame codec, and the engine cannot re-point it the way it re-points its own
+    // encoder. When the peer turns out to speak the other grammar, the switch still has to happen
+    // for the RECEIVE side -- but sending the source's bytes under the new profile would put MLow
+    // on the wire labelled Opus, and that profile accepts any nonempty payload, so nothing would
+    // catch it and the peer would hear noise.
+    #[test]
+    fn a_fixed_encoded_source_stops_sending_rather_than_mislabelling_its_bytes() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+
+        // While the call is on the source's own grammar, its bytes go out.
+        let mlow_frame: Vec<u8> = core::iter::once(0x08u8).chain(0..40u8).collect();
+        eng.handle_input(1, Input::EncodedAudio(&mlow_frame));
+        let (outputs, _) = drain(&mut eng);
+        assert!(
+            outputs.iter().any(|o| matches!(o, Output::Transmit(_))),
+            "the source's own codec is what this call sends"
+        );
+
+        // The peer's capability says Opus. The receive side follows it; the source cannot.
+        eng.switch_audio_codec(AudioCodec::Opus, CodecDecisionSource::Negotiated)
+            .expect("the inbound side must still switch");
+        let (outputs, _) = drain(&mut eng);
+        let announced = outputs.iter().any(|o| {
+            matches!(
+                o,
+                Output::Event(CallEvent::AudioCodecSourceIsFixed {
+                    sending: AudioCodec::Mlow,
+                    peer_expects: AudioCodec::Opus,
+                    ..
+                })
+            )
+        });
+        assert!(
+            announced,
+            "the application has to learn that only it can fix this call, got {outputs:?}"
+        );
+
+        eng.handle_input(2, Input::EncodedAudio(&mlow_frame));
+        let (outputs, _) = drain(&mut eng);
+        assert!(
+            !outputs.iter().any(|o| matches!(o, Output::Transmit(_))),
+            "bytes the peer cannot decode must not go out labelled as bytes it can"
+        );
+        assert_eq!(
+            eng.media_stats().outbound_frames_without_encoder,
+            1,
+            "and the frames that stay behind are counted"
+        );
     }
 
     // Encoded routing follows negotiation, not an ambiguous TOC-byte heuristic.
@@ -6543,6 +6703,68 @@ mod tests {
         assert!(
             peak > 0,
             "SFrame-wrapped peer audio must decrypt, MLow-decode, and reach playout"
+        );
+    }
+
+    // `SframeSession::decrypt` reads the wrapping off the frame's own trailing bytes, and a plain
+    // codec frame whose last bytes happen to parse as a header fails GCM exactly like a corrupted
+    // wrapped one. Counting a failed tag on its own therefore reports authentication failures on a
+    // healthy unwrapped call. One frame that DOES authenticate is the proof the peer wraps, and
+    // only after it is a failure attributable.
+    #[test]
+    fn a_failed_tag_counts_only_once_the_peer_is_known_to_wrap() {
+        let mut cfg = config(true);
+        cfg.enable_sframe = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let mut peer_tx = peer_pipeline();
+        // Ends in `00 00 03`: a 3-byte header whose two varints parse, so this unwrapped frame is
+        // read as SFrame-framed and its (absent) tag cannot authenticate.
+        let mut looks_wrapped = vec![0x50u8; 24];
+        looks_wrapped.extend_from_slice(&[0x00, 0x00, 0x03]);
+        eng.handle_input(
+            1,
+            Input::RelayPacket(&peer_tx.protect_audio(&looks_wrapped)),
+        );
+        let _ = drain(&mut eng);
+        assert_eq!(
+            eng.media_stats().sframe_decrypt_failed,
+            0,
+            "nothing has authenticated yet, so this is indistinguishable from a peer that does not wrap"
+        );
+
+        // A genuinely wrapped frame settles the question: this peer wraps.
+        let mut peer_sframe = SframeSession::new(&call_key, PEER_LID, SELF_LID).unwrap();
+        let mut peer_enc = MlowEncoder::new();
+        let tone: Vec<f32> = (0..SAMPLES as usize)
+            .map(|i| 0.3 * (i as f32 * 0.07).sin())
+            .collect();
+        let frame = peer_enc.encode(&tone).expect("mlow encode");
+        let wrapped = peer_sframe.encrypt(&frame);
+        eng.handle_input(2, Input::RelayPacket(&peer_tx.protect_audio(&wrapped)));
+        let _ = drain(&mut eng);
+        assert_eq!(
+            eng.media_stats().sframe_decrypt_failed,
+            0,
+            "it authenticated"
+        );
+
+        // Now the same failing frame IS a failure, because we know what this peer sends.
+        eng.handle_input(
+            3,
+            Input::RelayPacket(&peer_tx.protect_audio(&looks_wrapped)),
+        );
+        let _ = drain(&mut eng);
+        assert_eq!(
+            eng.media_stats().sframe_decrypt_failed,
+            1,
+            "a tag that fails after the peer has proven it wraps is a real failure"
         );
     }
 
