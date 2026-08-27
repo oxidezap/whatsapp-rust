@@ -6,10 +6,16 @@
 //! Its own integration test, not a unit test: a global allocator applies to the
 //! whole binary, and the library's other tests must not run under one.
 //!
-//! One test function, not several: the counter is process-wide, and the test
-//! harness runs functions on separate threads. A mutex is not enough — the
-//! harness allocates around each function it starts — so the measurements are
-//! kept in one function that never yields.
+//! What a table holds is measured by **dropping** it and reading how much the
+//! counter falls, not by bracketing its construction. The counter is
+//! process-wide, so a window around a construction also catches whatever else
+//! the process allocated in it — a lazily seeded global, the harness, a
+//! neighbouring test — and under `--all-features` that is not nothing. A drop
+//! frees exactly the table's own allocation and nothing else, so unrelated
+//! allocations in the window cancel instead of inflating the figure.
+//!
+//! Still one test function, not several: the counter is process-wide and the
+//! harness runs functions on separate threads.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
@@ -47,26 +53,34 @@ static ALLOC: Counting = Counting;
 /// reports actually hold.
 type Entry = (u64, [u8; 16]);
 
+/// Bytes the allocator reclaims when `map` is dropped — that is, exactly what
+/// its table held.
+///
+/// `HashMap<u64, [u8; 16]>` owns a single allocation and its entries own none,
+/// so the fall in the counter across the drop is the table and nothing else.
+fn bytes_released_by_dropping(map: HashMap<u64, [u8; 16]>) -> usize {
+    let before = LIVE.load(Ordering::Relaxed);
+    drop(map);
+    before - LIVE.load(Ordering::Relaxed)
+}
+
 #[test]
 fn reported_bytes_match_what_the_table_allocates() {
-    // One throwaway table first: `RandomState` seeds a thread-local on first
-    // use, and that allocation would otherwise land on the first measurement.
+    // One throwaway table first, so `RandomState`'s thread-local seeding is
+    // done before anything is measured.
     drop(HashMap::<u64, [u8; 16]>::from_iter([(0, [0u8; 16])]));
 
     // Sizes either side of hashbrown's small-table cases (4 and 8 buckets) and
     // across several resize boundaries.
     for entries in [1usize, 3, 4, 7, 8, 9, 100, 1000, 1024, 1792, 1793] {
-        let before = LIVE.load(Ordering::Relaxed);
         // `with_capacity`, so the table is one allocation of the final size
-        // rather than a series of doublings whose freed intermediates the
-        // counter would have to net out.
+        // rather than a series of doublings.
         let mut map: HashMap<u64, [u8; 16]> = HashMap::with_capacity(entries);
         for i in 0..entries {
             map.insert(i as u64, [0u8; 16]);
         }
-        let allocated = LIVE.load(Ordering::Relaxed) - before;
         let capacity = map.capacity();
-        drop(map);
+        let allocated = bytes_released_by_dropping(map);
 
         let reported = hash_table_bytes(capacity, size_of::<Entry>());
 
@@ -100,7 +114,6 @@ fn reported_bytes_match_what_the_table_allocates() {
     // growth slots without shrinking the array. The figure is a floor there
     // rather than exact — the safe direction, and the property worth pinning
     // is that it never reads *over* what the table holds.
-    let before = LIVE.load(Ordering::Relaxed);
     let mut map: HashMap<u64, [u8; 16]> = HashMap::with_capacity(1000);
     for i in 0..1000u64 {
         map.insert(i, [0u8; 16]);
@@ -108,9 +121,8 @@ fn reported_bytes_match_what_the_table_allocates() {
     for i in 0..900u64 {
         map.remove(&i);
     }
-    let allocated = LIVE.load(Ordering::Relaxed) - before;
     let reported = hash_table_bytes(map.capacity(), size_of::<Entry>());
-    drop(map);
+    let allocated = bytes_released_by_dropping(map);
 
     assert!(
         reported <= allocated,
