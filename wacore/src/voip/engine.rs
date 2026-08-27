@@ -2001,6 +2001,16 @@ impl CallEngine {
         self.media.as_ref().map(|m| m.active_format.codec)
     }
 
+    /// Fold in playout the consumer's sink refused after the engine produced it.
+    ///
+    /// The drop happens one layer out, in the drive loop that owns the application's channels, so
+    /// the engine cannot observe it. Counting it keeps "the application heard nothing" separable
+    /// from "the call carried nothing", which are different problems with different owners.
+    pub fn note_audio_sink_dropped(&mut self, frames: u32) {
+        self.media_stats.audio_sink_dropped =
+            self.media_stats.audio_sink_dropped.saturating_add(frames);
+    }
+
     /// Fold in inbound media the transport dropped before the engine could see it.
     ///
     /// The drop happens one crate out, in the relay read pump, so the engine cannot observe it
@@ -2433,15 +2443,17 @@ impl CallEngine {
         // SFrame on: use the GCM-decrypted bytes; otherwise the SRTP payload is already plain codec.
         let encoded = match m.sframe.as_ref().map(|s| s.decrypt(&payload)) {
             Some(SframeIn::Decrypted(plain)) => plain,
-            Some(SframeIn::Plaintext) => {
-                // A session was installed and the tag did not authenticate. Passing the payload
-                // through is the documented contract, but doing it silently would hand ciphertext
-                // to the codec and call the result a codec problem.
+            Some(SframeIn::AuthFailed) => {
+                // The frame WAS SFrame-wrapped and its tag did not authenticate. Passing the
+                // payload through is the documented contract, but doing it silently would hand
+                // ciphertext to the codec and call the result a codec problem.
                 self.media_stats.sframe_decrypt_failed =
                     self.media_stats.sframe_decrypt_failed.saturating_add(1);
                 payload
             }
-            None => payload,
+            // A peer that does not SFrame-wrap at all is a supported mode, not a failure: counting
+            // it would make every packet of a healthy call report one.
+            Some(SframeIn::Plaintext) | None => payload,
         };
         let codec = m.active_format.inbound_codec(header.payload_type, &encoded);
         if m.audio.io == AudioIo::Pcm && codec == AudioCodec::Opus {
@@ -2517,6 +2529,8 @@ impl CallEngine {
             return;
         }
         if m.audio.io == AudioIo::Encoded {
+            // Counted where the engine hands the frame over, which is the last point it can see. A
+            // sink that refuses it is reported separately, through `note_audio_sink_dropped`.
             self.media_stats.audio_frames_delivered =
                 self.media_stats.audio_frames_delivered.saturating_add(1);
             self.health.on_audio_produced();
@@ -5720,6 +5734,39 @@ mod tests {
         eng.handle_input(0, Input::RelayPacket(&success));
         let _ = drain(&mut eng);
         eng
+    }
+
+    // A peer that ships plain codec bytes inside E2E-SRTP without SFrame-wrapping is a SUPPORTED
+    // mode, not a failure. Counting the pass-through made every packet of such a call report an
+    // authentication failure and pointed whoever read the counters at keys that were fine.
+    #[test]
+    fn a_peer_that_does_not_sframe_wrap_is_not_an_authentication_failure() {
+        let mut cfg = config(true);
+        cfg.enable_sframe = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        let mut peer_tx = peer_pipeline();
+        for n in 0..5 {
+            // Shorter than a GCM tag plus a header, so it carries no SFrame framing at all.
+            let packet = peer_tx.protect_audio(&[0x50, 1, 2, n]);
+            eng.handle_input(u64::from(n) + 1, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+        assert_eq!(
+            eng.media_stats().rtp_received,
+            5,
+            "the packets authenticated"
+        );
+        assert_eq!(
+            eng.media_stats().sframe_decrypt_failed,
+            0,
+            "an unwrapped frame is not a tag that failed"
+        );
     }
 
     // Every discard on the receive path has to leave a trace. A payload type outside the negotiated

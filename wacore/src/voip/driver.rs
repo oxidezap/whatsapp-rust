@@ -990,6 +990,7 @@ async fn run_call_with_clock_and_wallclock(
         // Drain every intent the last mutation produced; stop at the terminal Timeout.
         let mut pending_video = Vec::new();
         let mut reconnect_to = None;
+        let mut sink_dropped = 0u32;
         loop {
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
@@ -1007,12 +1008,18 @@ async fn run_call_with_clock_and_wallclock(
                         });
                     }
                 }
-                // Loss tolerant: drop the frame if the speaker can't keep up.
+                // Loss tolerant: drop the frame if the speaker can't keep up. Counted, because the
+                // engine has already recorded the frame as produced and this is the only place that
+                // can tell "the application did not take it" from "the call carried nothing".
                 Output::Playout(pcm) => {
-                    let _ = channels.speaker.try_send(pcm);
+                    if channels.speaker.try_send(pcm).is_err() {
+                        sink_dropped = sink_dropped.saturating_add(1);
+                    }
                 }
                 Output::EncodedAudio(frame) => {
-                    let _ = channels.encoded_audio_out.try_send(frame);
+                    if channels.encoded_audio_out.try_send(frame).is_err() {
+                        sink_dropped = sink_dropped.saturating_add(1);
+                    }
                 }
                 // Same policy for video: a stalled sink sheds frames, never the drive loop.
                 Output::VideoPlayout(frame) => {
@@ -1048,6 +1055,12 @@ async fn run_call_with_clock_and_wallclock(
                     break;
                 }
             }
+        }
+        // Reported after the drain rather than per frame: the engine only reads its counters
+        // between mutations, and one fold per iteration keeps a stalled sink from costing a call
+        // that is already behind anything per packet.
+        if sink_dropped != 0 {
+            eng.note_audio_sink_dropped(sink_dropped);
         }
 
         // The terminal event above must reach the consumer before transport teardown.
@@ -1216,10 +1229,31 @@ async fn run_call_with_clock_and_wallclock(
                     // Codec first: rekeying decides which keys decrypt the next packet, and this
                     // decides what the plaintext under them means. Getting either wrong is silence,
                     // and both have to be right before the first inbound packet either way.
-                    if let Some(codec) = answer.audio_codec
-                        && let Err(e) = eng.switch_audio_codec(codec, engine::CodecDecisionSource::Negotiated)
-                    {
-                        log::debug!("voip: peer capability selected {codec:?}, not switching: {e}");
+                    if let Some(codec) = answer.audio_codec {
+                        let before = eng.active_audio_codec();
+                        if let Err(e) = eng.switch_audio_codec(codec, engine::CodecDecisionSource::Negotiated) {
+                            log::debug!("voip: peer capability selected {codec:?}, not switching: {e}");
+                        } else if eng.active_audio_codec() != before {
+                            // Whatever is queued was protected under the grammar the peer has just
+                            // told us it does not speak, so sending it delays the audio it CAN
+                            // decode behind bytes that will only feed its decoder garbage. Retire
+                            // the unstarted audio; video is unaffected by an audio codec change, and
+                            // control must survive. A batch already begun is left alone: the write
+                            // is mid-flight and cancelling it is delivery-ambiguous, so at most one
+                            // packet of the old grammar reaches the peer.
+                            let dropped = purge_queued(
+                                &mut send_queue,
+                                &mut pending_video,
+                                &mut awaiting_video_keyframe,
+                                |batch| !batch.started && batch.kind == SendBatchKind::Media,
+                            );
+                            if dropped.packets != 0 {
+                                let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                    video_access_units: dropped.video_access_units,
+                                    packets: dropped.packets,
+                                });
+                            }
+                        }
                     }
                     if !eng.rekey_recv(&answer.answering_lid) {
                         break 'drive; // malformed stored call_key (a setup invariant violated)
@@ -1458,6 +1492,11 @@ async fn run_call_with_clock_and_wallclock(
             while channels.video_in.try_recv().is_ok() {}
         }
     }
+
+    // The loop publishes at the TOP of each iteration, so whatever the last one counted -- and the
+    // last iteration is where a failing call does most of its counting -- would never be published.
+    // Publish once more on the way out, so the final snapshot is the final state.
+    channels.media_stats.publish(eng.media_stats());
 
     // Any local exit (relay disconnect or send failure -- not a closed mic, which only disables its
     // arm) tears down the transport so the platform's relay read pump -- which may be parked in recv()
@@ -3299,11 +3338,17 @@ mod tests {
         relay: Arc<ScheduleRelay>,
         speaker: async_channel::Receiver<Vec<i16>>,
         video_out: async_channel::Receiver<VideoFrame>,
+        media_stats: Arc<crate::voip::media_stats::MediaStatsCell>,
     }
 
     /// Drive one audio-only call over virtual time until `horizon_ms`, with the video plane wired but
     /// never enabled.
     fn drive_schedule(horizon_ms: u64) -> ScheduleHarness {
+        drive_schedule_with_speaker(horizon_ms, None)
+    }
+
+    /// The same call with a bounded speaker, so the sink can be made to refuse playout.
+    fn drive_schedule_with_speaker(horizon_ms: u64, speaker_cap: Option<usize>) -> ScheduleHarness {
         let clock = Arc::new(AtomicU64::new(0));
         let arms = Arc::new(Mutex::new(Vec::new()));
         let (relay_tx, relay_rx) = async_channel::unbounded();
@@ -3320,11 +3365,15 @@ mod tests {
             allocates: AtomicUsize::new(0),
         });
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, spk_rx) = async_channel::unbounded();
+        let (spk_tx, spk_rx) = match speaker_cap {
+            Some(cap) => async_channel::bounded(cap),
+            None => async_channel::unbounded(),
+        };
         let (ev_tx, _ev_rx) = async_channel::unbounded();
         let (vout_tx, vout_rx) = async_channel::unbounded::<VideoFrame>();
         let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
         channels.video_out = vout_tx;
+        let media_stats = channels.media_stats.clone();
 
         let eng = CallEngine::new(config(), Box::new(SequentialTxIds::new())).unwrap();
         let drive_relay = relay.clone();
@@ -3346,7 +3395,26 @@ mod tests {
             relay,
             speaker: spk_rx,
             video_out: vout_rx,
+            media_stats,
         }
+    }
+
+    // Playout the application never takes is a real loss, and it is the one loss on this path that
+    // belongs to the application rather than to the call. The engine counts a frame as produced
+    // when it hands it over, so without this the counters describe a healthy call while the
+    // consumer hears nothing, and no alarm distinguishes the two.
+    #[test]
+    fn playout_a_stalled_sink_refuses_is_counted() {
+        const HORIZON_MS: u64 = 2_600;
+        // One slot, never drained: the first playout frame fills it and every later one is refused.
+        let harness = drive_schedule_with_speaker(HORIZON_MS, Some(1));
+        let ticks = HORIZON_MS / engine::PLAYOUT_MS;
+        let stats = harness.media_stats.snapshot();
+        assert_eq!(
+            u64::from(stats.audio_sink_dropped),
+            ticks - 1,
+            "every playout tick past the one the sink took is a counted drop"
+        );
     }
 
     // The happy path for the hoisted deadline timer: an armed sleep that survives across iterations

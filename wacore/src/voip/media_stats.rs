@@ -64,6 +64,14 @@ pub struct CallMediaStats {
     pub playout_trimmed_samples: u32,
     /// Inbound media the relay read pump discarded under backpressure, before the engine.
     pub inbound_pipe_dropped: u32,
+    /// Playout the consumer's own sink refused, after the engine produced it.
+    ///
+    /// The counters above describe the engine's output, so a frame it hands over is counted as
+    /// produced whether or not the application takes it. Without this one, an application whose
+    /// speaker or encoded-audio channel has stalled hears nothing while every counter says the call
+    /// is healthy -- and it IS healthy: this is the one loss on the receive path that belongs to
+    /// the consumer rather than to the call, which is why it does not feed the silence alarm.
+    pub audio_sink_dropped: u32,
     /// Relay datagrams that failed to classify as STUN, RTP or RTCP.
     pub relay_packet_unclassified: u32,
     /// Group forwarding envelopes that failed to unwrap.
@@ -184,6 +192,12 @@ pub(crate) struct AudioHealthWatch {
     window_produced: u32,
     /// Arrivals since media came up, used only to tell "nothing arrived" from "nothing worked".
     total_arrivals: u32,
+    /// The counters as they stood when the current window opened.
+    ///
+    /// The alarm describes THIS window, so the reason has to come from what moved inside it. Read
+    /// from the running totals instead, one concealed frame early in a call would keep naming the
+    /// codec for every later silence, including one whose cause is somewhere else entirely.
+    window_stats: CallMediaStats,
     /// Start of the current uninterrupted silence, for a monotonic `silent_for_ms`.
     silent_since: Option<Millis>,
     last_alarm_at: Option<Millis>,
@@ -199,6 +213,7 @@ impl Default for AudioHealthWatch {
             window_rtp: 0,
             window_produced: 0,
             total_arrivals: 0,
+            window_stats: CallMediaStats::default(),
             silent_since: None,
             last_alarm_at: None,
             stall_reported: false,
@@ -266,9 +281,11 @@ impl AudioHealthWatch {
         // did, not now. Taking it after would make every first alarm claim zero milliseconds of
         // silence despite the two full seconds that authorised it.
         let window_began = self.window_start;
+        let window_opened_at = self.window_stats;
         self.window_start = now;
         self.window_rtp = 0;
         self.window_produced = 0;
+        self.window_stats = *stats;
 
         if produced > 0 || rtp < SILENT_WINDOW_MIN_PACKETS {
             // Audio is flowing, or too little arrived to judge. Either way the silence, if any,
@@ -291,8 +308,70 @@ impl AudioHealthWatch {
             silent_for_ms,
             rtp_received: rtp,
             frames_produced: produced,
-            dominant_reason: dominant_reason(stats),
+            dominant_reason: dominant_reason(&window_delta(stats, &window_opened_at)),
         })
+    }
+}
+
+/// What moved between the start of a window and its end.
+///
+/// Every field is monotonic, so a saturating subtraction is the whole story. Taking the delta is
+/// what keeps the alarm about the silence being reported rather than about anything that went wrong
+/// earlier in the same call and has since recovered.
+fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
+    CallMediaStats {
+        rtp_received: now.rtp_received.saturating_sub(then.rtp_received),
+        rtp_payload_type_unexpected: now
+            .rtp_payload_type_unexpected
+            .saturating_sub(then.rtp_payload_type_unexpected),
+        srtp_unprotect_failed: now
+            .srtp_unprotect_failed
+            .saturating_sub(then.srtp_unprotect_failed),
+        sframe_decrypt_failed: now
+            .sframe_decrypt_failed
+            .saturating_sub(then.sframe_decrypt_failed),
+        audio_frames_decoded: now
+            .audio_frames_decoded
+            .saturating_sub(then.audio_frames_decoded),
+        audio_frames_delivered: now
+            .audio_frames_delivered
+            .saturating_sub(then.audio_frames_delivered),
+        audio_frames_concealed: now
+            .audio_frames_concealed
+            .saturating_sub(then.audio_frames_concealed),
+        mlow_off_point_dropped: now
+            .mlow_off_point_dropped
+            .saturating_sub(then.mlow_off_point_dropped),
+        mlow_inactive_or_sid: now
+            .mlow_inactive_or_sid
+            .saturating_sub(then.mlow_inactive_or_sid),
+        foreign_frames_decoded: now
+            .foreign_frames_decoded
+            .saturating_sub(then.foreign_frames_decoded),
+        audio_frames_without_decoder: now
+            .audio_frames_without_decoder
+            .saturating_sub(then.audio_frames_without_decoder),
+        outbound_frames_without_encoder: now
+            .outbound_frames_without_encoder
+            .saturating_sub(then.outbound_frames_without_encoder),
+        playout_trimmed_samples: now
+            .playout_trimmed_samples
+            .saturating_sub(then.playout_trimmed_samples),
+        inbound_pipe_dropped: now
+            .inbound_pipe_dropped
+            .saturating_sub(then.inbound_pipe_dropped),
+        audio_sink_dropped: now
+            .audio_sink_dropped
+            .saturating_sub(then.audio_sink_dropped),
+        relay_packet_unclassified: now
+            .relay_packet_unclassified
+            .saturating_sub(then.relay_packet_unclassified),
+        forwarding_envelope_rejected: now
+            .forwarding_envelope_rejected
+            .saturating_sub(then.forwarding_envelope_rejected),
+        // NOT a delta: the flap limit is a property of the whole call, and a probe that has latched
+        // stays latched. Resetting it per window would let a thrashing call look settled.
+        codec_switches: now.codec_switches,
     }
 }
 
@@ -444,6 +523,56 @@ mod tests {
                 }
             ),
             "got {alarm:?}"
+        );
+    }
+
+    // The alarm describes the window that produced it. Attributed from the running totals, one
+    // concealed frame early in a call keeps naming the codec for every later silence -- including
+    // one whose cause is somewhere else entirely, which is the wrong answer to the only question
+    // this event exists to answer.
+    #[test]
+    fn the_reason_follows_the_window_that_alarmed_not_the_whole_call() {
+        let mut watch = armed(0);
+        let mut stats = CallMediaStats::default();
+        // A codec problem early on, alarmed and then recovered.
+        for _ in 0..40 {
+            watch.on_rtp();
+            stats.rtp_received += 1;
+        }
+        stats.audio_frames_concealed = 40;
+        let first = watch.poll(2_100, &stats).expect("silent");
+        assert!(matches!(
+            first,
+            AudioHealthAlarm::Silent {
+                dominant_reason: AudioSilenceReason::CodecRejectingFrames,
+                ..
+            }
+        ));
+        // Audio flows again, which clears the run and the re-alarm cadence with it.
+        for _ in 0..40 {
+            watch.on_rtp();
+            watch.on_audio_produced();
+            stats.rtp_received += 1;
+            stats.audio_frames_decoded += 1;
+        }
+        assert_eq!(watch.poll(4_200, &stats), None, "audio came out");
+        // Now a different failure entirely: packets arrive and none of them authenticates. Nothing
+        // was concealed in this window, so nothing here is the codec's doing.
+        for _ in 0..40 {
+            watch.on_rtp();
+            stats.srtp_unprotect_failed += 1;
+        }
+        let second = watch.poll(6_300, &stats).expect("silent again");
+        let AudioHealthAlarm::Silent {
+            dominant_reason, ..
+        } = second
+        else {
+            panic!("expected Silent, got {second:?}");
+        };
+        assert_eq!(
+            dominant_reason,
+            AudioSilenceReason::AuthenticationFailing,
+            "the reason must describe this window, not the concealment two windows ago"
         );
     }
 

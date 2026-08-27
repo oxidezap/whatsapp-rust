@@ -148,15 +148,23 @@ fn gcm_decrypt(key: &[u8], nonce16: &[u8; 16], ciphertext_with_tag: &[u8]) -> Op
 
 /// Outcome of [`SframeSession::decrypt`]. Discrimination is by GCM authentication, not a payload
 /// heuristic: a frame that parses as a valid SFrame header AND authenticates is `Decrypted`;
-/// anything else is `Plaintext`: the peer ships plain Opus inside E2E-SRTP without SFrame-wrapping,
-/// so those bytes are the payload and must be used verbatim.
+/// anything else is passed through verbatim, because the peer ships plain Opus inside E2E-SRTP
+/// without SFrame-wrapping and those bytes are the payload.
+///
+/// The pass-through is two different facts and they are kept apart, because a call where the peer
+/// simply does not SFrame-wrap is healthy and one whose tags do not authenticate is a keying
+/// problem. Reporting the first as the second makes every packet of a normal call look like a
+/// failure and points whoever reads the counters at keys that are fine.
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SframeIn {
     /// The frame was a real SFrame frame; GCM auth passed. Inner is the recovered plaintext.
     Decrypted(Vec<u8>),
-    /// Not an authenticatable SFrame frame; the raw frame bytes are the plaintext payload.
+    /// No SFrame framing at all: too short, no readable header, so the frame bytes are the payload.
     Plaintext,
+    /// A well-formed SFrame header whose GCM tag did not authenticate. The bytes are still passed
+    /// through, as the contract requires, but this one is worth counting.
+    AuthFailed,
 }
 
 /// SFrame send/recv with the per-direction keys (encrypt for peer, decrypt for self).
@@ -200,9 +208,12 @@ impl SframeSession {
         gcm_encrypt_framed(&self.encrypt_key, &iv, plaintext, header)
     }
 
-    /// Decrypt one frame. Returns [`SframeIn::Decrypted`] only when the trailing SFrame header parses
-    /// and the GCM tag authenticates; otherwise [`SframeIn::Plaintext`], the frame is plain Opus to
-    /// be used as-is. The caller branches on intent rather than guessing from the payload bytes.
+    /// Decrypt one frame. Returns [`SframeIn::Decrypted`] only when the trailing SFrame header
+    /// parses and the GCM tag authenticates. Otherwise the frame bytes are the payload and are used
+    /// as-is, split between [`SframeIn::Plaintext`] for a frame that carries no SFrame framing at
+    /// all and [`SframeIn::AuthFailed`] for one whose header parsed and whose tag did not: the
+    /// first is a peer that does not wrap, which is a supported mode, and the second is worth
+    /// counting. The caller branches on intent rather than guessing from the payload bytes.
     pub fn decrypt(&self, frame: &[u8]) -> SframeIn {
         // Too small to hold ciphertext + tag + a 3-byte header: it's plaintext Opus.
         if frame.len() < GCM_TAG_LEN + 3 {
@@ -225,7 +236,8 @@ impl SframeSession {
         // GCM auth is the sole discriminator: a forged/plain frame fails the tag → pass-through.
         match gcm_decrypt(&self.decrypt_key, &iv, ciphertext) {
             Some(plain) => SframeIn::Decrypted(plain),
-            None => SframeIn::Plaintext,
+            // The header parsed, so this frame WAS wrapped and the tag is the thing that failed.
+            None => SframeIn::AuthFailed,
         }
     }
 }
@@ -353,10 +365,11 @@ mod tests {
         let mut other = call_key.clone();
         other[0] ^= 0xff;
         let receiver = SframeSession::new(&other, peer_lid, self_lid).unwrap();
-        // GCM auth rejects → fail-closed to Plaintext (never a forged Decrypted plaintext).
+        // GCM auth rejects → fail-closed (never a forged Decrypted plaintext), and reported as the
+        // authentication failure it is rather than as a peer that simply does not wrap.
         assert_eq!(
             receiver.decrypt(&frame),
-            SframeIn::Plaintext,
+            SframeIn::AuthFailed,
             "wrong key must not recover the plaintext (GCM auth must reject)"
         );
     }

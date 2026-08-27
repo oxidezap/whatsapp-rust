@@ -142,12 +142,40 @@ pub fn opus_packet_shape(payload: &[u8]) -> Option<OpusPacketShape> {
                 }
             }
             let bodies = remaining.len().checked_sub(padding)?;
-            // CBR (the VBR bit clear) means every frame is the same size, so RFC 6716 section 3.2.5
-            // requires the remaining bytes to divide evenly by the frame count. Without this the
-            // reader accepts packets libopus refuses, and each one it accepts is extra surface for
-            // the codec probe to mistake for the codec we are looking for.
-            if count_byte & 0x80 == 0 && !bodies.is_multiple_of(usize::from(frames)) {
-                return None;
+            if count_byte & 0x80 == 0 {
+                // CBR (the VBR bit clear) means every frame is the same size, so RFC 6716
+                // section 3.2.5 requires the remaining bytes to divide evenly by the frame count.
+                // Without this the reader accepts packets libopus refuses, and each one it accepts
+                // is extra surface for the codec probe to mistake for the codec we are looking for.
+                if !bodies.is_multiple_of(usize::from(frames)) {
+                    return None;
+                }
+            } else {
+                // VBR carries `M-1` explicit lengths and leaves the last frame implicit. Skipping
+                // them entirely admits a two-byte packet as three 20 ms frames, and three of those
+                // at the negotiated cadence are exactly what the codec probe accepts as proof of a
+                // standard-Opus peer -- so a reader that does not walk them can flip the call's
+                // codec on bytes that describe no audio at all.
+                let mut declared = 0usize;
+                let mut header = 0usize;
+                let mut lengths = remaining.get(..bodies)?;
+                for _ in 1..frames {
+                    let (&first, after) = lengths.split_first()?;
+                    let (length, width) = if first < 252 {
+                        (usize::from(first), 1usize)
+                    } else {
+                        let (&second, _) = after.split_first()?;
+                        (usize::from(first) + usize::from(second) * 4, 2usize)
+                    };
+                    lengths = lengths.get(width..)?;
+                    declared = declared.checked_add(length)?;
+                    header = header.checked_add(width)?;
+                }
+                // The implicit last frame takes what is left, so the declared ones plus their own
+                // length fields must still leave a non-negative remainder.
+                header
+                    .checked_add(declared)
+                    .filter(|used| *used <= bodies)?;
             }
             frames
         }
@@ -331,6 +359,33 @@ mod tests {
             opus_packet_shape(&packet).map(|shape| shape.frames),
             Some(3)
         );
+    }
+
+    // The VBR lengths are not decoration: three packets that pass this reader at the negotiated
+    // cadence are what the codec probe accepts as proof of a standard-Opus peer, so a packet whose
+    // declared frames are not in it must not read as a shape at all.
+    #[test]
+    fn a_variable_bitrate_packet_whose_frames_are_not_there_is_rejected() {
+        // Code 3, VBR, three frames -- and nothing after the count byte. Two length fields and
+        // three frame bodies are all missing.
+        assert_eq!(opus_packet_shape(&[0x4b, 0x83]), None);
+        // The two lengths are present but describe more than the body holds: 200 + 200 in 100 bytes.
+        let packet: Vec<u8> = [0x4bu8, 0x83, 200, 200]
+            .into_iter()
+            .chain((0..100u32).map(|i| i as u8))
+            .collect();
+        assert_eq!(opus_packet_shape(&packet), None);
+        // The same lengths inside a body that holds them, plus an implicit last frame.
+        let packet: Vec<u8> = [0x4bu8, 0x83, 200, 200]
+            .into_iter()
+            .chain((0..450u32).map(|i| i as u8))
+            .collect();
+        assert_eq!(
+            opus_packet_shape(&packet).map(|shape| shape.frames),
+            Some(3)
+        );
+        // A two-byte length that runs off the end takes the packet with it.
+        assert_eq!(opus_packet_shape(&[0x4b, 0x82, 252]), None);
     }
 
     #[test]

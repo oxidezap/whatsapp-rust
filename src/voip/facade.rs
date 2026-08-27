@@ -1859,6 +1859,9 @@ async fn place_call(
     );
 
     let muted = Arc::new(AtomicBool::new(false));
+    // Created here, before the relay is even dialled, so the handle this returns and the drive loop
+    // that starts minutes of signaling later publish into the SAME cell.
+    let media_stats = Arc::new(wacore::voip::MediaStatsCell::default());
     let ended = Arc::new(EndedFlag::default());
     // Wake wait_ended() whenever this registry entry is removed -- including a terminal stanza or a
     // disconnect that lands while we're still dialing the relay (no media task yet to carry the notify).
@@ -1906,6 +1909,7 @@ async fn place_call(
                 ended: ended.clone(),
                 ev_tx,
                 rekey_rx,
+                media_stats: media_stats.clone(),
             },
         );
 
@@ -1947,6 +1951,7 @@ async fn place_call(
         video: video_shared,
         events: ev_rx,
         ended,
+        media_stats,
     })
 }
 
@@ -2120,6 +2125,9 @@ pub(crate) struct PendingOutgoing {
     /// Receiver half of the one-shot recv-rekey channel (sender lives on the registry). Handed to the
     /// drive loop when the relay arrives so a `<accept>` that beat the relay is still applied (buffered).
     rekey_rx: async_channel::Receiver<wacore::voip::driver::PeerAnswer>,
+    /// Shared with the handle this call already returned, so the counters the drive loop publishes
+    /// once the relay lands reach a consumer that has been holding the handle since before it did.
+    media_stats: Arc<wacore::voip::MediaStatsCell>,
 }
 
 /// The relay socket address to dial, read off a built config's already-parsed endpoint (avoids
@@ -2216,6 +2224,7 @@ pub(crate) async fn attach_outgoing_relay(
         // Outgoing: hand the drive loop the recv-rekey receiver so a callee `<accept>` rekeys recv to
         // the answering device (buffered if the accept beat this relay).
         Some(pending.rekey_rx),
+        pending.media_stats,
     )
     .await?;
     Ok(true)
@@ -2622,6 +2631,7 @@ async fn spawn_registered_call(
     registration.ensure_current()?;
     let registry = &registration.registry;
     let muted = Arc::new(AtomicBool::new(false));
+    let media_stats = Arc::new(wacore::voip::MediaStatsCell::default());
     let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
     let video_shared = Arc::new(VideoShared::new());
     registry.set_video_channels(
@@ -2646,6 +2656,7 @@ async fn spawn_registered_call(
         ev_tx,
         // Incoming (callee): no recv-rekey — the callee already keys recv on its own self LID.
         None,
+        media_stats.clone(),
     )
     .await?;
     Ok(CallHandle {
@@ -2660,6 +2671,7 @@ async fn spawn_registered_call(
         video: video_shared,
         events: ev_rx,
         ended: registration.ended.clone(),
+        media_stats,
     })
 }
 
@@ -2716,6 +2728,7 @@ async fn attach_engine(
     // Caller-only recv-rekey receiver; `None` for an incoming call (the callee keys recv on its own
     // self LID and never rekeys).
     rekey_rx: Option<async_channel::Receiver<wacore::voip::driver::PeerAnswer>>,
+    media_stats: Arc<wacore::voip::MediaStatsCell>,
 ) -> Result<(), CallError> {
     let (group_tx, group_rx) = async_channel::bounded(GROUP_CONTROL_CHANNEL_CAPACITY);
     if !client.call_registry().set_group_control_sender(
@@ -2834,10 +2847,10 @@ async fn attach_engine(
         video_shared.send_control(VideoControl::Enable);
     }
 
-    // One cell, two readers: the drive loop publishes into it and the consumer's `CallHandle` reads
-    // it back through the registry. Installed here rather than at registration because a call
-    // without a media plane has nothing to count.
-    let media_stats = Arc::new(wacore::voip::MediaStatsCell::default());
+    // One cell, three readers: the drive loop publishes into it, the consumer's `CallHandle` holds
+    // it directly, and the registry hands it to anyone who has only a call id. The handle's own
+    // reference is what makes the FINAL counters readable: the registry entry is removed before
+    // `wait_ended()` fires, which is exactly when a consumer inspects a call that failed.
     client
         .call_registry()
         .set_media_stats(call_id, generation, media_stats.clone());
@@ -3172,6 +3185,10 @@ pub struct CallHandle {
     video: Arc<VideoShared>,
     events: async_channel::Receiver<CallEvent>,
     ended: Arc<EndedFlag>,
+    /// The same cell the drive loop publishes into. Held here rather than looked up by call id: the
+    /// registry entry is gone by the time `wait_ended()` returns, and the counters of a call that
+    /// just failed are the ones most worth reading.
+    media_stats: Arc<wacore::voip::MediaStatsCell>,
 }
 
 fn ensure_group_invite_capacity(
@@ -3295,9 +3312,13 @@ impl CallHandle {
     /// for a rate. Pair it with [`wacore::voip::CallEvent::AudioSilent`], which fires on its own
     /// when packets keep arriving and none of them becomes sound: the event says a call is silent
     /// and these counters say why.
+    ///
+    /// **Readable after the call ends**, which is the point: the drive loop publishes once more on
+    /// its way out, and this handle holds the cell itself, so the natural moment to inspect a call
+    /// that carried nothing -- right after [`wait_ended`](Self::wait_ended) -- returns the final
+    /// counters rather than zeroes.
     pub fn media_stats(&self) -> wacore::voip::CallMediaStats {
-        self.client_registry
-            .media_stats(&self.call_id, self.generation)
+        self.media_stats.snapshot()
     }
 
     /// The peer this call is with, as the `<terminate>` target. For an outgoing call this is the
@@ -5642,6 +5663,7 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         };
         assert_eq!(handle.peer_jid(), caller(), "bare peer before any accept");
         let device = caller().with_device(2);
@@ -5894,7 +5916,48 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         }
+    }
+
+    // The counters of a call that carried nothing are the ones worth reading, and the natural moment
+    // to read them is right after `wait_ended()` -- by which point the registry entry is already
+    // gone. A handle that looked its stats up by call id answered that question with zeroes.
+    #[tokio::test]
+    async fn media_stats_survive_the_end_of_the_call() {
+        let client = make_client().await;
+        let generation = client.call_registry().insert(mk_session());
+        let (_ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
+        let media_stats = Arc::new(wacore::voip::MediaStatsCell::default());
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: client.call_registry(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
+            client: std::sync::Weak::new(),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: Arc::new(VideoShared::new()),
+            events: ev_rx,
+            ended: Arc::new(EndedFlag::default()),
+            media_stats: media_stats.clone(),
+        };
+        // What the drive loop publishes on its way out: a call that heard nothing and said why.
+        let mut final_stats = wacore::voip::CallMediaStats::default();
+        assert_eq!(handle.media_stats(), final_stats, "nothing published yet");
+        final_stats.rtp_received = 120;
+        final_stats.audio_frames_without_decoder = 120;
+        media_stats.publish(final_stats);
+        client
+            .call_registry()
+            .remove_if_current("CID-FACADE", generation);
+        let stats = handle.media_stats();
+        assert_eq!(
+            (stats.rtp_received, stats.audio_frames_without_decoder),
+            (120, 120),
+            "the final counters must outlive the registry entry"
+        );
     }
 
     // The reported symptom: ending a call from the handle used to be local-only, so the peer kept
@@ -8025,6 +8088,7 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: ended.clone(),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         };
 
         // Drive attach_engine in the background; it parks in the gated connect.
@@ -8046,6 +8110,7 @@ mod tests {
                     ended,
                     ev_tx,
                     None,
+                    Arc::new(wacore::voip::MediaStatsCell::default()),
                 )
                 .await
             }
@@ -8124,6 +8189,7 @@ mod tests {
                     ended,
                     ev_tx,
                     None,
+                    Arc::new(wacore::voip::MediaStatsCell::default()),
                 )
                 .await
             }
@@ -8196,6 +8262,7 @@ mod tests {
                     ended,
                     ev_tx,
                     None,
+                    Arc::new(wacore::voip::MediaStatsCell::default()),
                 )
                 .await
             }
@@ -9947,6 +10014,7 @@ mod tests {
             video: video_shared.clone(),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         };
 
         let (vsrc, vsink) = video_endpoints();
@@ -10027,6 +10095,7 @@ mod tests {
             video: video.clone(),
             events,
             ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         };
 
         let request = peer_upgrade_request(&handle).await;
@@ -10117,6 +10186,7 @@ mod tests {
             video: video.clone(),
             events,
             ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         };
 
         let drops = Arc::new(AtomicUsize::new(0));
