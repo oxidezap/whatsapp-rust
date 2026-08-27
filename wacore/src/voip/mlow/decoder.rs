@@ -20,6 +20,26 @@ use super::smpl_synth::{
 use super::toc::parse_mlow_toc;
 
 const OPUS_FRAME_SAMPS: usize = 960; // 60 ms @ 16 kHz
+/// The decoder synthesises at 16 kHz regardless of the internal rate a TOC declares.
+const OUTPUT_SAMPLES_PER_MS: i32 = 16;
+
+/// The longest audio one packet may carry, in samples at 16 kHz.
+///
+/// 120 ms, which is both the longest duration a TOC can declare and the ceiling the shipped
+/// client applies when it totals a multiframe envelope. It is a hard bound and not a hint: without
+/// it an envelope of eighteen sub-frames turns a few hundred bytes into tens of thousands of
+/// samples, and the jitter buffer on the other side of this function has no way to tell that
+/// expansion from real audio.
+const MAX_PACKET_SAMPS: usize = 1920;
+
+/// Samples a frame that produced no audio should occupy.
+///
+/// Its own declared duration, not a fixed 60 ms slot. A fixed slot makes a run of concealed 20 ms
+/// frames arrive at three times real time, which floods the jitter buffer and gets speech trimmed
+/// off its head to hold the latency ceiling: the concealment evicts the audio that did decode.
+fn silence_samps(declared: usize) -> usize {
+    declared.clamp(1, MAX_PACKET_SAMPS)
+}
 
 /// Internal 20 ms frames chained inside one packet, or `None` for a duration this decoder cannot
 /// run. A packet is not a single unit of decode: the reference derives the loop count from the
@@ -209,16 +229,35 @@ impl MlowDecoder {
                 return vec![0.0; OPUS_FRAME_SAMPS];
             }
         };
-        let mut out = Vec::new();
+        // Refuse before decoding anything, not while appending: a packet whose sub-frames total
+        // more than the format allows is malformed as a whole, and half-decoding it would leave the
+        // predictor advanced by frames the peer never meant as one packet. The shipped client
+        // applies the same 120 ms ceiling when it totals an envelope.
         let mut declared = 0usize;
-        for frame in frames {
-            let decoded = self.decode_frame(frame);
-            // `decode_frame` overwrote `last_packet_samps` with this sub-frame's duration; the
-            // packet's own duration is their sum, which is what the playout cushion has to size to.
-            declared += self.last_packet_samps;
-            out.extend_from_slice(&decoded);
+        for frame in &frames {
+            let ms = frame.first().map_or(0, |&b| parse_mlow_toc(b).frame_ms);
+            declared += silence_samps((16 * ms.max(0)) as usize);
         }
-        self.last_packet_samps = declared.max(OPUS_FRAME_SAMPS);
+        if declared == 0 || declared > MAX_PACKET_SAMPS {
+            self.malformed += 1;
+            if self.malformed == 1 || self.malformed.is_multiple_of(100) {
+                log::warn!(
+                    "mlow: multiframe packet #{} declares {declared} samples, past the {MAX_PACKET_SAMPS} ceiling",
+                    self.malformed
+                );
+            }
+            MlowFrameReport::bump(&mut self.report.concealed);
+            self.last_packet_samps = OPUS_FRAME_SAMPS;
+            return vec![0.0; OPUS_FRAME_SAMPS];
+        }
+
+        let mut out = Vec::with_capacity(declared);
+        for frame in frames {
+            out.extend_from_slice(&self.decode_frame(frame));
+        }
+        // The playout cushion sizes to the whole envelope, not to one sub-frame: the packet is what
+        // arrives on the wire, and its cadence is what the buffer has to absorb.
+        self.last_packet_samps = declared;
         out
     }
 
@@ -228,11 +267,14 @@ impl MlowDecoder {
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         let toc = parse_mlow_toc(frame[0]);
-        if toc.frame_ms > 0 && toc.sample_rate > 0 {
-            self.last_packet_samps = (toc.sample_rate / 1000 * toc.frame_ms) as usize;
+        // In OUTPUT samples, always 16 kHz: the synthesis runs at one rate, so a frame declaring a
+        // 32 kHz internal rate still occupies its duration's worth of 16 kHz samples. Sizing this
+        // from the declared rate would double the cushion for a frame the decoder then drops.
+        if toc.frame_ms > 0 {
+            self.last_packet_samps = (OUTPUT_SAMPLES_PER_MS * toc.frame_ms) as usize;
         }
         if toc.std_opus {
-            let out_len = (16000 / 1000 * toc.frame_ms) as usize;
+            let out_len = silence_samps((OUTPUT_SAMPLES_PER_MS * toc.frame_ms) as usize);
             log::debug!(
                 "mlow: standard-opus TOC 0x{:02x} -> {out_len} samples silence",
                 frame[0]
@@ -249,9 +291,13 @@ impl MlowDecoder {
         // A frame that is merely coded inactive is NOT silence: with DTX off the encoder keeps sending
         // background noise this way, and the reference decodes it. It goes through the normal path.
         if toc.sid {
-            log::debug!("mlow: SID TOC 0x{:02x} -> 60ms silence", frame[0]);
+            let samps = silence_samps(self.last_packet_samps);
+            log::debug!(
+                "mlow: SID TOC 0x{:02x} -> {samps} samples of silence",
+                frame[0]
+            );
             MlowFrameReport::bump(&mut self.report.inactive_or_sid);
-            return vec![0.0; OPUS_FRAME_SAMPS];
+            return vec![0.0; samps];
         }
         // Operating-point guard for active frames: a different internal rate, the low_rate=1 2x160
         // geometry, or a duration whose internal geometry differs would consume the payload with the
@@ -279,7 +325,7 @@ impl MlowDecoder {
                 );
             }
             MlowFrameReport::bump(&mut self.report.off_point);
-            return vec![0.0; OPUS_FRAME_SAMPS];
+            return vec![0.0; silence_samps(self.last_packet_samps)];
         }
         let frames = frames.expect("the guard above rejected every unsupported duration");
         self.decode_active_frame(frame, frames * SMPL_INTF_LEN, frames, toc.active)
@@ -617,7 +663,9 @@ mod tests {
 
         let mut dec = MlowDecoder::new();
         let out = dec.decode(&[0x40, 0xAA, 0xBB, 0xCC]);
-        assert_eq!(out.len(), OPUS_FRAME_SAMPS);
+        // Dropped, but still occupying the 10 ms it declares: a run of these must not arrive at six
+        // times real time and push decoded speech out of the jitter buffer.
+        assert_eq!(out.len(), 160);
         assert!(
             out.iter().all(|&s| s == 0.0),
             "10 ms runs a geometry the synthesis does not implement"
@@ -625,19 +673,25 @@ mod tests {
         assert!(!dec.had_error(), "the drop must not open the range decoder");
     }
 
-    /// The playout cushion is sized from the peer's packet duration, and a SID must not shrink it:
-    /// a DTX transition returns a fixed 60 ms silence slot regardless of the duration the packet
-    /// declares, so reading the cushion off the OUTPUT length would drop buffered speech that had
-    /// not been played yet. The declared duration is the one that governs arrival cadence.
+    /// Silence occupies the time the packet claims, and the cushion follows the declared duration.
+    ///
+    /// A frame that produces no audio still has to occupy its slot: emitting a fixed 60 ms for a
+    /// packet the peer sends every 120 ms starves playout, and emitting it for one sent every 20 ms
+    /// floods the buffer at three times real time until the latency ceiling trims speech off the
+    /// head. Either way the concealment displaces audio that did decode.
     #[test]
     fn declared_duration_survives_a_dtx_transition() {
         let mut dec = MlowDecoder::new();
         let _ = dec.decode(&[0x58, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
         assert_eq!(dec.last_packet_samps(), 6 * SMPL_INTF_LEN);
 
-        // A SID that still declares 120 ms (0x98 = SID | 120 ms) emits a 60 ms silence slot.
+        // A SID that still declares 120 ms (0x98 = SID | 120 ms) fills 120 ms of silence.
         let sid = dec.decode(&[0x98, 0xAA, 0xBB, 0xCC]);
-        assert_eq!(sid.len(), OPUS_FRAME_SAMPS, "SID is a fixed silence slot");
+        assert_eq!(
+            sid.len(),
+            6 * SMPL_INTF_LEN,
+            "silence occupies the duration the packet declares"
+        );
         assert_eq!(
             dec.last_packet_samps(),
             6 * SMPL_INTF_LEN,
@@ -1107,7 +1161,8 @@ mod tests {
             "a real low_rate=0 frame must decode to audio"
         );
 
-        // A 32kHz/fullband TOC (bit5=1, e.g. 0x70) -> dropped to 60ms silence.
+        // A 32kHz/fullband TOC (bit5=1, e.g. 0x70) -> dropped. It declares 60 ms, and the slot is
+        // 60 ms of OUTPUT samples: the synthesis rate does not follow the declared internal rate.
         let out_32k = dec.decode(&[0x70, 0xAA, 0xBB, 0xCC]);
         assert_eq!(out_32k.len(), 960);
         assert!(
@@ -1128,7 +1183,7 @@ mod tests {
         // internal frame length and subframe count differ, so decoding it under the implemented
         // geometry would desync the range coder. 20/60/120ms all decode (see the geometry tests).
         let out_10ms = dec.decode(&[0x40, 0xAA, 0xBB, 0xCC]);
-        assert_eq!(out_10ms.len(), 960);
+        assert_eq!(out_10ms.len(), 160, "the slot is the declared 10 ms");
         assert!(
             out_10ms.iter().all(|&s| s == 0.0),
             "a 10ms active frame must drop to silence"
@@ -1163,12 +1218,13 @@ mod tests {
             "a real low_rate=0 frame must decode to audio"
         );
 
-        // TOC 0x80 -> SID: silenced via the comfort-noise path, not the operating-point drop.
+        // TOC 0x80 -> SID: silenced via the comfort-noise path, not the operating-point drop. It
+        // declares 10 ms, so it fills 10 ms: silence tracks the cadence the peer is sending at.
         let inactive = dec.decode(&[0x80, 0xAA, 0xBB, 0xCC]);
         assert_eq!(
             inactive.len(),
-            960,
-            "an inactive frame still fills a 60ms slot"
+            160,
+            "a SID occupies the duration it declares"
         );
         assert!(
             inactive.iter().all(|&s| s == 0.0),
