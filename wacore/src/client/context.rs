@@ -14,30 +14,74 @@ use wacore_binary::Jid;
 /// LID, and callers such as `collect_stale_device_users` check for that.
 type LidPnPair = (CompactString, Jid);
 
+/// Which side of a pair an ordering keys on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrderBy {
+    Lid,
+    Phone,
+}
+
+/// Indices `0..pairs.len()` ordered by one side of the pairs.
+///
+/// Both orderings go through this one function, and it sorts `u32` indices
+/// rather than the pairs themselves, so the binary carries a **single**
+/// `sort_unstable_by` instantiation for the whole module. That matters more
+/// than it looks: pdqsort monomorphizes per (element type, comparator type)
+/// and costs roughly 10 KiB of `.text` a copy, so the obvious spelling — a
+/// closure at each of the four call sites that needed an order — put ~40 KiB
+/// into the binary for ~40 lines of logic. The `by` branch inside the
+/// comparator is the price, paid on the build path only.
+fn ordered_indices(pairs: &[LidPnPair], by: OrderBy) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..pairs.len() as u32).collect();
+    order.sort_unstable_by(|a, b| {
+        let (a, b) = (&pairs[*a as usize], &pairs[*b as usize]);
+        match by {
+            OrderBy::Lid => a.0.cmp(&b.0),
+            OrderBy::Phone => a.1.user.cmp(&b.1.user).then_with(|| a.0.cmp(&b.0)),
+        }
+    });
+    order
+}
+
+/// Put a pair list in LID order.
+///
+/// Permutes rather than sorts, for the reason in [`ordered_indices`]: the
+/// order is computed over indices and applied here.
+fn sort_pairs(pairs: Vec<LidPnPair>) -> Box<[LidPnPair]> {
+    let order = ordered_indices(&pairs, OrderBy::Lid);
+    let mut slots: Vec<Option<LidPnPair>> = pairs.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| slots[i as usize].take().expect("each index appears once"))
+        .collect()
+}
+
 /// Order `lid_pn` by the PN user part, returning indices into it.
 ///
-/// Duplicate PN users (two LIDs claiming one phone number) resolve to the
-/// last entry in LID order. The `HashMap` this replaced resolved them by
-/// iteration order, i.e. arbitrarily; any deterministic rule is an
-/// improvement, and this one is stable across rebuilds.
+/// **One slot per phone user.** The reverse `HashMap` this replaced was keyed
+/// by phone user and so could hold only one LID per number; keeping every
+/// duplicate here would answer reverse lookups differently from the map and
+/// make `remove_participants` drop mappings it used to leave alone. Two LIDs
+/// claiming one phone number is a server bug either way; the map resolved it
+/// by iteration order, i.e. arbitrarily, and this resolves it to the last LID
+/// in sort order — deterministic, and stable across rebuilds.
 fn build_pn_order(lid_pn: &[LidPnPair]) -> Box<[u32]> {
-    let mut order: Vec<u32> = (0..lid_pn.len() as u32).collect();
-    order.sort_unstable_by(|a, b| {
-        let (a, b) = (*a as usize, *b as usize);
-        lid_pn[a]
-            .1
-            .user
-            .cmp(&lid_pn[b].1.user)
-            .then_with(|| lid_pn[a].0.cmp(&lid_pn[b].0))
+    let mut order = ordered_indices(lid_pn, OrderBy::Phone);
+    // `dedup_by` keeps the first of each run; the winner is the last, so the
+    // comparison hands the later index to the entry that survives.
+    order.dedup_by(|later, earlier| {
+        let same = lid_pn[*later as usize].1.user == lid_pn[*earlier as usize].1.user;
+        if same {
+            *earlier = *later;
+        }
+        same
     });
     order.into_boxed_slice()
 }
 
 /// Sort by LID user and drop the `HashMap`'s excess capacity in one step.
 fn build_lid_pn(map: HashMap<CompactString, Jid>) -> Box<[LidPnPair]> {
-    let mut pairs: Vec<LidPnPair> = map.into_iter().collect();
-    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    pairs.into_boxed_slice()
+    sort_pairs(map.into_iter().collect())
 }
 
 fn serialize_lid_pn<S: serde::Serializer>(
@@ -146,9 +190,8 @@ impl GroupInfo {
     /// Rebuild both slices from an edited pair list. The reverse index is
     /// derived, so every write goes through here and no caller can leave the
     /// two out of step.
-    fn store_pairs(&mut self, mut pairs: Vec<LidPnPair>) {
-        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        self.lid_pn = pairs.into_boxed_slice();
+    fn store_pairs(&mut self, pairs: Vec<LidPnPair>) {
+        self.lid_pn = sort_pairs(pairs);
         self.pn_order = build_pn_order(&self.lid_pn);
     }
 
@@ -223,21 +266,19 @@ impl GroupInfo {
     pub fn remove_participants(&mut self, users_to_remove: &[&str]) {
         self.participants
             .retain(|p| !users_to_remove.iter().any(|u| *u == p.user));
-        // Each name can be either side of a mapping, so both directions are
-        // resolved against the *current* slices before anything is dropped,
-        // then the survivors are rebuilt in one pass.
-        let mut drop_indices: Vec<usize> = Vec::new();
-        for user in users_to_remove {
-            drop_indices.extend(self.lid_index(user));
-            drop_indices.extend(self.pn_index(user));
-        }
-        if !drop_indices.is_empty() {
-            drop_indices.sort_unstable();
-            drop_indices.dedup();
+        // Each name can be either side of a mapping. The phone side is
+        // resolved through the reverse index first, so a phone number shared
+        // by two LIDs drops exactly the one that index names — which is what
+        // removing it from the reverse `HashMap` used to do.
+        let doomed_lids: Vec<CompactString> = users_to_remove
+            .iter()
+            .filter_map(|user| self.pn_index(user).map(|i| self.lid_pn[i].0.clone()))
+            .collect();
+        if !doomed_lids.is_empty() || users_to_remove.iter().any(|u| self.lid_index(u).is_some()) {
             let mut pairs = self.lid_pn.to_vec();
-            for index in drop_indices.into_iter().rev() {
-                pairs.remove(index);
-            }
+            pairs.retain(|(lid, _)| {
+                !users_to_remove.contains(&lid.as_str()) && !doomed_lids.contains(lid)
+            });
             self.store_pairs(pairs);
         }
     }
@@ -524,7 +565,9 @@ mod tests {
         // existing LID, removals by the LID side and removals by the PN side.
         for round in 0..40u32 {
             let lid_user = CompactString::from(format!("lid_{}", round % 13));
-            let pn_user = CompactString::from(format!("pn_{}", round % 7));
+            // One phone number per LID: the duplicate case has its own test,
+            // and mixing it in here would only let the oracle drift.
+            let pn_user = CompactString::from(format!("pn_{}", round % 13));
             let lid_jid = Jid::lid(lid_user.clone());
             let pn_jid = Jid::pn(pn_user.clone());
 
@@ -536,7 +579,7 @@ mod tests {
                 }
                 oracle.retain(|_, mapped| mapped.user != victim.as_str());
             } else if round % 7 == 6 {
-                let victim = format!("pn_{}", round % 7);
+                let victim = format!("pn_{}", round % 11);
                 info.remove_participants(&[victim.as_str()]);
                 oracle.retain(|lid, mapped| {
                     lid.as_str() != victim.as_str() && mapped.user != victim.as_str()
@@ -554,12 +597,15 @@ mod tests {
                     .map(|(l, _)| l.as_str())
                     .collect::<Vec<_>>()
             );
-            assert_eq!(info.pn_order.len(), info.lid_pn.len());
+            assert_eq!(
+                info.pn_order.len(),
+                info.lid_pn.len(),
+                "with one phone number per LID the reverse index loses nothing"
+            );
             assert!(
                 info.pn_order
                     .windows(2)
-                    .all(|w| info.lid_pn[w[0] as usize].1.user
-                        <= info.lid_pn[w[1] as usize].1.user),
+                    .all(|w| info.lid_pn[w[0] as usize].1.user < info.lid_pn[w[1] as usize].1.user),
                 "pn_order must stay ordered by the PN user"
             );
 
@@ -620,6 +666,46 @@ mod tests {
             .expect("mapping present");
         assert!(!mapped.is_pn());
         assert_eq!(mapped.user.as_str(), "100000000000099");
+    }
+
+    /// Two LIDs claiming one phone number is a server bug, but it has to
+    /// resolve the same way every time. The reverse `HashMap` this replaced
+    /// was keyed by phone user, so it held one LID per number and resolved
+    /// collisions by iteration order — arbitrarily. The reverse index keeps
+    /// the same one-slot-per-number shape and picks the last LID in sort
+    /// order, which survives a rebuild.
+    #[test]
+    fn two_lids_claiming_one_phone_number_resolve_deterministically() {
+        let shared = pn("shared_pn");
+        let lid_to_pn = HashMap::from([
+            (CompactString::from("lid_aaa"), shared.clone()),
+            (CompactString::from("lid_zzz"), shared.clone()),
+        ]);
+        let mut info = GroupInfo::with_lid_to_pn_map(
+            vec![lid("lid_aaa"), lid("lid_zzz")],
+            AddressingMode::Lid,
+            lid_to_pn,
+        );
+
+        assert_eq!(info.pn_order.len(), 1, "one slot per phone number");
+        assert_eq!(
+            info.lid_user_for_phone_user("shared_pn")
+                .map(|u| u.as_str()),
+            Some("lid_zzz")
+        );
+
+        // Removing by the phone side drops the mapping that slot names and
+        // leaves the other alone, which is what removing the entry from the
+        // reverse map used to do.
+        info.remove_participants(&["shared_pn"]);
+        assert!(info.phone_jid_for_lid_user("lid_zzz").is_none());
+        assert!(info.phone_jid_for_lid_user("lid_aaa").is_some());
+        assert_eq!(
+            info.lid_user_for_phone_user("shared_pn")
+                .map(|u| u.as_str()),
+            Some("lid_aaa"),
+            "the survivor takes the slot on the rebuild"
+        );
     }
 
     /// The layout exists to bound what a resident group snapshot costs, so the
