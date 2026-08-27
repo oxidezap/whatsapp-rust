@@ -1299,8 +1299,8 @@ mod tests {
         let recipient = Jid::new("15550002000", Server::Pn);
         client
             .update_device_list(DeviceListRecord {
-                user: recipient.user.to_string(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(1, None)],
+                user: recipient.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(1, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,

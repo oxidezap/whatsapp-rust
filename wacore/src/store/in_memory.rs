@@ -127,7 +127,8 @@ struct InMemoryState {
     /// Reverse index: phone_number -> lid
     pn_to_lid: HashMap<String, String>,
     base_keys: HashMap<BaseKeyKey, Vec<u8>>,
-    device_lists: HashMap<String, DeviceListRecord>,
+    /// Keyed by `Arc<str>`, shared with each record's own `user`.
+    device_lists: HashMap<Arc<str>, DeviceListRecord>,
     group_metadata: HashMap<String, Vec<u8>>,
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
@@ -773,7 +774,7 @@ impl ProtocolStore for InMemoryBackend {
             .lock()
             .await
             .device_lists
-            .insert(record.user.clone(), record);
+            .insert(Arc::clone(&record.user), record);
         Ok(())
     }
 
@@ -1265,11 +1266,11 @@ impl DeviceStore for InMemoryBackend {
             .capacity()
             + k.1.capacity()
             + v.capacity());
-        account!(state.device_lists, |k: &String, v: &DeviceListRecord| {
-            k.capacity()
-                + v.user.capacity()
-                + v.devices.capacity() * size_of::<DeviceInfo>()
-                + v.phash.as_ref().map_or(0, String::capacity)
+        // The key and the record's `user` are one allocation, counted once.
+        account!(state.device_lists, |_k: &Arc<str>, v: &DeviceListRecord| {
+            v.user.len()
+                + v.devices.len() * size_of::<DeviceInfo>()
+                + v.phash.as_ref().map_or(0, |p| p.len())
         });
         account!(state.group_metadata, |k: &String, v: &Vec<u8>| k.capacity()
             + v.capacity());

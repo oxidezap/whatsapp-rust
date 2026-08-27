@@ -337,11 +337,11 @@ impl Client {
                             record
                                 .devices
                                 .iter()
-                                .find(|cached| cached.device_id == d.device as u32)
-                                .and_then(|cached| cached.key_index)
+                                .find(|cached| cached.device_id() == d.device)
+                                .and_then(|cached| cached.key_index())
                         })
                     });
-                    wacore::store::traits::DeviceInfo::new(d.device as u32, key_index)
+                    wacore::store::traits::DeviceInfo::new(d.device, key_index)
                         .with_hosting(d.is_hosted)
                 })
                 .collect();
@@ -386,14 +386,14 @@ impl Client {
             // Convert filtered DeviceInfo list back to JIDs for return
             let user_jid = &user_list.user;
             for d in &devices {
-                fetched_devices.push(user_jid.with_device_hosting(d.device_id as u16, d.is_hosted));
+                fetched_devices.push(user_jid.with_device_hosting(d.device_id(), d.is_hosted()));
             }
 
             device_records.push(wacore::store::traits::DeviceListRecord {
-                user: user_list.user.user.to_string(),
-                devices,
+                user: std::sync::Arc::from(user_list.user.user.as_str()),
+                devices: devices.into_boxed_slice(),
                 timestamp: wacore::time::now_secs(),
-                phash: user_list.phash.clone(),
+                phash: user_list.phash.clone().map(Box::<str>::from),
                 raw_id,
             });
         }
@@ -453,7 +453,7 @@ impl Client {
             if let Some(record) = self.load_device_record(&bare.user).await
                 && let Some(phash) = record.phash
             {
-                hashes.insert(bare.clone(), (phash, record.timestamp));
+                hashes.insert(bare.clone(), (String::from(phash), record.timestamp));
             }
             jids.push(bare);
         }
@@ -571,7 +571,7 @@ mod tests {
         // Insert a device record into the registry (simulates prior usync/notification)
         let record = DeviceListRecord {
             user: "1234567890".into(),
-            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(3, Some(10))],
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(10))].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -593,7 +593,7 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: "12025550102".into(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(8, None)],
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(8, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -633,7 +633,7 @@ mod tests {
 
         let record = DeviceListRecord {
             user: "100000012345678".into(),
-            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(39, Some(25))],
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(39, Some(25))].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -656,7 +656,7 @@ mod tests {
         // Insert into backend DB via update_device_list
         let record = DeviceListRecord {
             user: "9876543210".into(),
-            devices: vec![DeviceInfo::new(5, None)],
+            devices: [DeviceInfo::new(5, None)].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -688,7 +688,7 @@ mod tests {
 
         let record = DeviceListRecord {
             user: "5551230000".into(),
-            devices: vec![],
+            devices: [].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -736,9 +736,9 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: "2222222222".into(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, None)],
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, None)].into(),
                 timestamp: wacore::time::now_secs(),
-                phash: Some("2:oldB".to_string()),
+                phash: Some("2:oldB".into()),
                 raw_id: None,
             })
             .await
@@ -748,8 +748,8 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: "1111111111@s.whatsapp.net".parse().unwrap(),
-                devices: vec![UsyncDevice::new(0, None)],
-                phash: Some("2:a".to_string()),
+                devices: [UsyncDevice::new(0, None)].into(),
+                phash: Some("2:a".into()),
                 key_index_bytes: None,
             }],
             lid_mappings: vec![],
@@ -787,11 +787,12 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
-                devices: vec![
+                devices: [
                     UsyncDevice::new(0, None),
                     UsyncDevice::new(7, Some(3)).with_hosting(true),
-                ],
-                phash: Some("2:hosted".to_string()),
+                ]
+                .into(),
+                phash: Some("2:hosted".into()),
                 key_index_bytes: None,
             }],
             lid_mappings: Vec::new(),
@@ -826,10 +827,10 @@ mod tests {
         let user = Jid::pn("12025550102");
         client
             .update_device_list(DeviceListRecord {
-                user: user.user.to_string(),
-                devices: vec![DeviceInfo::new(0, None)],
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
-                phash: Some("1:before".to_string()),
+                phash: Some("1:before".into()),
                 raw_id: None,
             })
             .await
@@ -839,8 +840,8 @@ mod tests {
         let stale_response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
-                devices: vec![UsyncDevice::new(0, None)],
-                phash: Some("1:stale".to_string()),
+                devices: [UsyncDevice::new(0, None)].into(),
+                phash: Some("1:stale".into()),
                 key_index_bytes: None,
             }],
             lid_mappings: Vec::new(),
@@ -962,8 +963,8 @@ mod tests {
         let refresh_started_at = client.device_topology.current();
         client
             .update_device_list(DeviceListRecord {
-                user: "12025550105".to_string(),
-                devices: vec![DeviceInfo::new(0, None)],
+                user: "12025550105".into(),
+                devices: [DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -974,7 +975,7 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: refreshed,
-                devices: vec![UsyncDevice::new(0, None)],
+                devices: [UsyncDevice::new(0, None)].into(),
                 phash: None,
                 key_index_bytes: None,
             }],
@@ -1010,7 +1011,7 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: refreshed,
-                devices: vec![UsyncDevice::new(0, None)],
+                devices: [UsyncDevice::new(0, None)].into(),
                 phash: None,
                 key_index_bytes: None,
             }],
@@ -1042,9 +1043,9 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: "3333333333".into(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(4, None)],
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(4, None)].into(),
                 timestamp: wacore::time::now_secs(),
-                phash: Some("3:old".to_string()),
+                phash: Some("3:old".into()),
                 raw_id: None,
             })
             .await
@@ -1054,8 +1055,8 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: "3333333333@s.whatsapp.net".parse().unwrap(),
-                devices: vec![],
-                phash: Some("3:empty".to_string()),
+                devices: [].into(),
+                phash: Some("3:empty".into()),
                 key_index_bytes: None,
             }],
             lid_mappings: vec![],
@@ -1091,10 +1092,10 @@ mod tests {
         let user = Jid::pn("4444444444");
         client
             .update_device_list(DeviceListRecord {
-                user: user.user.to_string(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))],
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
                 timestamp: wacore::time::now_secs(),
-                phash: Some("2:previous".to_string()),
+                phash: Some("2:previous".into()),
                 raw_id: Some(1),
             })
             .await
@@ -1106,8 +1107,8 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
-                devices: vec![UsyncDevice::new(7, Some(3))],
-                phash: Some("2:incomplete".to_string()),
+                devices: [UsyncDevice::new(7, Some(3))].into(),
+                phash: Some("2:incomplete".into()),
                 key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
             }],
             lid_mappings: Vec::new(),
@@ -1138,10 +1139,10 @@ mod tests {
         for (user, raw_id) in [(&identity_changed, 2), (&invalid, 1)] {
             client
                 .update_device_list(DeviceListRecord {
-                    user: user.user.to_string(),
-                    devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))],
+                    user: user.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
                     timestamp: wacore::time::now_secs(),
-                    phash: Some("2:previous".to_string()),
+                    phash: Some("2:previous".into()),
                     raw_id: Some(raw_id),
                 })
                 .await
@@ -1155,16 +1156,16 @@ mod tests {
                     user: identity_changed.clone(),
                     // A primary device survives key-index filtering, so this
                     // first user schedules a valid identity replacement.
-                    devices: vec![UsyncDevice::new(0, None)],
-                    phash: Some("1:changed".to_string()),
+                    devices: [UsyncDevice::new(0, None)].into(),
+                    phash: Some("1:changed".into()),
                     key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
                 },
                 UserDeviceList {
                     user: invalid,
                     // The second user makes the authoritative response invalid
                     // only after key-index projection.
-                    devices: vec![UsyncDevice::new(7, Some(3))],
-                    phash: Some("1:invalid".to_string()),
+                    devices: [UsyncDevice::new(7, Some(3))].into(),
+                    phash: Some("1:invalid".into()),
                     key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
                 },
             ],
@@ -1195,10 +1196,10 @@ mod tests {
         let user = Jid::pn("4444444453");
         client
             .update_device_list(DeviceListRecord {
-                user: user.user.to_string(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))],
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
                 timestamp: wacore::time::now_secs(),
-                phash: Some("2:previous".to_string()),
+                phash: Some("2:previous".into()),
                 raw_id: Some(2),
             })
             .await
@@ -1208,8 +1209,8 @@ mod tests {
         let response = DeviceListResponse {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
-                devices: vec![UsyncDevice::new(7, Some(3))],
-                phash: Some("1:changed".to_string()),
+                devices: [UsyncDevice::new(7, Some(3))].into(),
+                phash: Some("1:changed".into()),
                 key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
             }],
             lid_mappings: Vec::new(),

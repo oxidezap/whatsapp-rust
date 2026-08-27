@@ -4250,8 +4250,8 @@ mod tests {
         for peer in [&peer_a, &peer_b] {
             client
                 .update_device_list(DeviceListRecord {
-                    user: peer.user.to_string(),
-                    devices: vec![DeviceInfo::new(0, None)],
+                    user: peer.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,
@@ -7028,8 +7028,8 @@ mod tests {
         let update = rekey_update(&client, &recipients);
         let generation = register_group_update(&client, &update);
         let encrypted = wacore::send::EncryptForDevicesRaw {
-            devices: vec![wacore::send::EncryptedDevice {
-                device_jid: recipients[0].clone(),
+            devices: [wacore::send::EncryptedDevice {
+                device_jid: recipients[0].into().clone(),
                 enc_type: "msg",
                 is_prekey: false,
                 ciphertext: vec![7; 32],
@@ -8410,8 +8410,8 @@ mod tests {
         for target in &targets {
             client
                 .update_device_list(DeviceListRecord {
-                    user: target.user.to_string(),
-                    devices: vec![DeviceInfo::new(0, None)],
+                    user: target.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,
@@ -8480,8 +8480,8 @@ mod tests {
         for target in &targets {
             client
                 .update_device_list(DeviceListRecord {
-                    user: target.user.to_string(),
-                    devices: vec![DeviceInfo::new(0, None)],
+                    user: target.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,

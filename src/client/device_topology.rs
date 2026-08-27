@@ -139,13 +139,16 @@ impl DeviceTopology {
 /// non-recording [`promote`](Self::promote) (whose data is by definition what
 /// the DB fallback already answered).
 pub(crate) struct DeviceRegistryCache {
-    cache: crate::cache_store::TypedCache<String, Arc<wacore::store::traits::DeviceListRecord>>,
+    cache: crate::cache_store::TypedCache<Arc<str>, Arc<wacore::store::traits::DeviceListRecord>>,
     topology: Arc<DeviceTopology>,
 }
 
 impl DeviceRegistryCache {
     pub(crate) fn new(
-        cache: crate::cache_store::TypedCache<String, Arc<wacore::store::traits::DeviceListRecord>>,
+        cache: crate::cache_store::TypedCache<
+            Arc<str>,
+            Arc<wacore::store::traits::DeviceListRecord>,
+        >,
         topology: Arc<DeviceTopology>,
     ) -> Self {
         Self { cache, topology }
@@ -164,7 +167,7 @@ impl DeviceRegistryCache {
     pub(crate) async fn insert<'a>(
         &self,
         guard: &DeviceRegistryMutationGuard<'_>,
-        key: String,
+        key: Arc<str>,
         record: Arc<wacore::store::traits::DeviceListRecord>,
         touched: impl IntoIterator<Item = &'a str>,
     ) {
@@ -181,7 +184,7 @@ impl DeviceRegistryCache {
     /// answer is unchanged, so no topology change is recorded.
     pub(crate) async fn promote(
         &self,
-        key: String,
+        key: Arc<str>,
         record: Arc<wacore::store::traits::DeviceListRecord>,
     ) {
         self.cache.insert(key, record).await;
@@ -191,9 +194,9 @@ impl DeviceRegistryCache {
     /// when backed by a custom store (entries live outside this process).
     pub(crate) async fn memory_stats(&self) -> wacore::stats::CollectionStats {
         use wacore::stats::HeapSize;
-        self.cache
-            .memory_stats(|k, v| k.capacity() + v.heap_bytes())
-            .await
+        // The key is the record's own `user` string, one allocation shared
+        // between them, so only `heap_bytes` counts it.
+        self.cache.memory_stats(|_k, v| v.heap_bytes()).await
     }
 
     /// Test-only passthrough for cache maintenance flushes.
@@ -208,7 +211,7 @@ impl DeviceRegistryCache {
     #[cfg(test)]
     pub(crate) async fn raw_insert_for_tests(
         &self,
-        key: String,
+        key: Arc<str>,
         record: Arc<wacore::store::traits::DeviceListRecord>,
     ) {
         self.cache.insert(key, record).await;

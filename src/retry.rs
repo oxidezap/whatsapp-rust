@@ -522,7 +522,7 @@ impl Client {
         // list for this user, so refresh it (rate-limited, dedup'd) to learn the
         // device for the next send. Done before the message-cache lookup so an
         // evicted retry still triggers it.
-        let sender_device_id = info.requester.device() as u32;
+        let sender_device_id = info.requester.device();
         let device_known = self
             .has_device(&info.requester.user, sender_device_id)
             .await;

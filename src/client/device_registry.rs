@@ -664,13 +664,12 @@ impl Client {
 
     /// WA Web: `isFromKnownDevice(author)` — local check only, no network.
     pub(crate) async fn is_from_known_device(&self, sender: &Jid) -> bool {
-        let device_id = sender.device as u32;
-        self.has_device(&sender.user, device_id).await
+        self.has_device(&sender.user, sender.device).await
     }
 
     /// Check if a device exists for a user.
     /// Returns true for device_id 0 (primary device always exists).
-    pub(crate) async fn has_device(&self, user: &str, device_id: u32) -> bool {
+    pub(crate) async fn has_device(&self, user: &str, device_id: u16) -> bool {
         if device_id == 0 {
             return true;
         }
@@ -680,7 +679,7 @@ impl Client {
 
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
-                return record.devices.iter().any(|d| d.device_id == device_id);
+                return record.devices.iter().any(|d| d.device_id() == device_id);
             }
         }
 
@@ -688,11 +687,11 @@ impl Client {
         for key in lookup.all_keys() {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
-                    let has_device = record.devices.iter().any(|d| d.device_id == device_id);
+                    let has_device = record.devices.iter().any(|d| d.device_id() == device_id);
                     // Cache under the record's actual stored key, not our guessed one,
                     // to keep the cache and backend consistent.
                     self.device_registry_cache
-                        .promote(record.user.clone(), Arc::new(record))
+                        .promote(Arc::clone(&record.user), Arc::new(record))
                         .await;
                     return has_device;
                 }
@@ -732,26 +731,25 @@ impl Client {
     ) -> Result<()> {
         use anyhow::Context;
 
-        let original_user = record.user.clone();
+        let original_user = Arc::clone(&record.user);
         let lookup = self.resolve_lookup_keys(&original_user).await;
-        let canonical_key = lookup.canonical_key().to_string();
-        record.user.clone_from(&canonical_key); // More efficient: reuses allocation
+        // One allocation for the canonical name: the record carries it and
+        // the cache is keyed by it, and both hold the same `Arc`.
+        let canonical_key: Arc<str> = Arc::from(lookup.canonical_key());
+        record.user = Arc::clone(&canonical_key);
 
         // Clone record for cache before moving to backend
         let record_for_cache = record.clone();
 
-        // Use canonical_key directly as cache key (no extra clone)
         // Record every lookup alias, not just canonical+original: a LID-keyed
         // update must also touch the mapped PN, or a PN-addressed group's memo
         // (whose member set only knows the PN side) would re-stamp stale.
         self.device_registry_cache
             .insert(
                 guard,
-                canonical_key.clone(),
+                Arc::clone(&canonical_key),
                 Arc::new(record_for_cache),
-                lookup
-                    .all_keys()
-                    .chain(std::iter::once(original_user.as_str())),
+                lookup.all_keys().chain(std::iter::once(&*original_user)),
             )
             .await;
 
@@ -761,7 +759,7 @@ impl Client {
             .await
             .context("Failed to update device list in backend")?;
 
-        if canonical_key != original_user {
+        if *canonical_key != *original_user {
             // Invalidate before + after delete so a concurrent reader that
             // resurrects the cache from the about-to-be-deleted DB row still
             // gets cleared. Run the second invalidate unconditionally: even
@@ -815,28 +813,26 @@ impl Client {
         }
 
         let mut prepared = Vec::with_capacity(records.len());
-        let mut to_delete: Vec<String> = Vec::new();
+        let mut to_delete: Vec<Arc<str>> = Vec::new();
 
         for mut record in records {
-            let original_user = record.user.clone();
+            let original_user = Arc::clone(&record.user);
             let lookup = self.resolve_lookup_keys(&original_user).await;
-            let canonical_key = lookup.canonical_key().to_string();
-            record.user.clone_from(&canonical_key);
+            let canonical_key: Arc<str> = Arc::from(lookup.canonical_key());
+            record.user = Arc::clone(&canonical_key);
 
             let record_for_cache = record.clone();
             // Same alias rule as update_device_list: record every lookup key.
             self.device_registry_cache
                 .insert(
                     guard,
-                    canonical_key.clone(),
+                    Arc::clone(&canonical_key),
                     Arc::new(record_for_cache),
-                    lookup
-                        .all_keys()
-                        .chain(std::iter::once(original_user.as_str())),
+                    lookup.all_keys().chain(std::iter::once(&*original_user)),
                 )
                 .await;
 
-            if canonical_key != original_user {
+            if *canonical_key != *original_user {
                 to_delete.push(original_user);
             }
             prepared.push(record);
@@ -958,7 +954,16 @@ impl Client {
         key_index_info: Option<&wacore::stanza::devices::KeyIndexInfo>,
     ) {
         let guard = self.device_topology.lock_registry().await;
-        let device_id = device.device_id();
+        // The notification carries the id as a `u32`; a registry device id is
+        // a `u16`, as it is on the wire, so anything wider names a device that
+        // cannot exist rather than one to add.
+        let Ok(device_id) = u16::try_from(device.device_id()) else {
+            warn!(
+                "patch_device_add: device_id {} exceeds u16 — ignoring",
+                device.device_id()
+            );
+            return;
+        };
         let is_hosted = wacore_binary::JidExt::is_hosted(&device.jid);
 
         let Some(mut record) = self.load_device_record(user).await else {
@@ -982,11 +987,13 @@ impl Client {
                     );
                     self.clear_device_record(user, device.jid.server.as_str(), &record)
                         .await;
-                    record.devices.retain(|device| device.device_id == 0);
+                    record.edit_devices(|devices| devices.retain(|device| device.device_id() == 0));
                 } else {
                     // Filter stale devices by valid_indexes. A raw_id reset already
                     // removed every companion while preserving primary metadata.
-                    wacore::adv::retain_devices_by_key_index(&mut record.devices, &decoded);
+                    record.edit_devices(|devices| {
+                        wacore::adv::retain_devices_by_key_index(devices, &decoded)
+                    });
                 }
                 record.raw_id = Some(decoded.raw_id);
 
@@ -1018,10 +1025,10 @@ impl Client {
         // `None` to match how device 0 is recorded everywhere else. Hosting belongs
         // to each device-list entry, so the companion notification cannot classify
         // the primary.
-        if !record.devices.iter().any(|d| d.device_id == 0) {
-            record
-                .devices
-                .push(wacore::store::traits::DeviceInfo::new(0, None));
+        if !record.devices.iter().any(|d| d.device_id() == 0) {
+            record.edit_devices(|devices| {
+                devices.push(wacore::store::traits::DeviceInfo::new(0, None))
+            });
         }
 
         // New devices are picked up automatically by `resolve_skdm_targets`:
@@ -1037,21 +1044,22 @@ impl Client {
     fn append_or_refresh_device(
         &self,
         record: &mut wacore::store::traits::DeviceListRecord,
-        device_id: u32,
+        device_id: u16,
         key_index: Option<u32>,
         is_hosted: bool,
     ) {
-        match record
-            .devices
-            .iter_mut()
-            .find(|device| device.device_id == device_id)
-        {
-            Some(device) => device.is_hosted = is_hosted,
-            None => record.devices.push(
-                wacore::store::traits::DeviceInfo::new(device_id, key_index)
-                    .with_hosting(is_hosted),
-            ),
-        }
+        record.edit_devices(|devices| {
+            match devices
+                .iter_mut()
+                .find(|device| device.device_id() == device_id)
+            {
+                Some(device) => *device = device.with_hosting(is_hosted),
+                None => devices.push(
+                    wacore::store::traits::DeviceInfo::new(device_id, key_index)
+                        .with_hosting(is_hosted),
+                ),
+            }
+        });
     }
 
     /// Delete Signal sessions for specific device IDs in every user namespace,
@@ -1093,8 +1101,8 @@ impl Client {
         let non_primary_ids: Vec<u16> = record
             .devices
             .iter()
-            .filter(|d| d.device_id != 0)
-            .map(|d| d.device_id as u16)
+            .map(|d| d.device_id())
+            .filter(|id| *id != 0)
             .collect();
         info!(
             "Clearing device record for user {user}: removing {} non-primary device(s) due to raw_id change",
@@ -1125,36 +1133,28 @@ impl Client {
         if device_id == 0 {
             return;
         }
+        // A registry device id is a `u16`, as it is on the wire and as the
+        // JID-keyed structures (Signal sessions, sender_key_devices) store it,
+        // so a wider id names no device the registry could be holding. This
+        // used to remove it from the record and then skip the session cleanup;
+        // there is now nothing to remove.
+        let Ok(device_id) = u16::try_from(device_id) else {
+            warn!("patch_device_remove: device_id {device_id} > u16::MAX — nothing to remove");
+            return;
+        };
         let guard = self.device_topology.lock_registry().await;
         if let Some(mut record) = self.load_device_record(user).await {
             let before = record.devices.len();
-            record.devices.retain(|d| d.device_id != device_id);
+            record.edit_devices(|devices| devices.retain(|d| d.device_id() != device_id));
             if record.devices.len() != before {
-                // JID-keyed structures (Signal sessions, sender_key_devices)
-                // store device as u16. A blind cast for ids > u16::MAX would
-                // truncate to a different value and cleanup the wrong device.
-                let Ok(device_id_u16) = u16::try_from(device_id) else {
-                    warn!(
-                        "patch_device_remove: device_id {device_id} > u16::MAX — skipping \
-                         session/SKDM cleanup but still persisting registry removal"
-                    );
-                    if let Err(e) = self.update_device_list_guarded(record, &guard).await {
-                        warn!("patch_device_remove: failed to persist: {e}");
-                    }
-                    return;
-                };
-
-                if device_id_u16 != 0 {
-                    self.delete_sessions_for_devices(user, &[device_id_u16])
-                        .await;
-                }
+                self.delete_sessions_for_devices(user, &[device_id]).await;
                 // WA Web's `updateGroupParticipantsInTransaction` deletes the
                 // device JID from each affected group's senderKey Map. Skip
                 // the registry update on failure: a half-applied state where
                 // `resolve_devices` says "gone" but the tracker still vouches
                 // `has_key=true` would silently skip SKDM redistribution.
                 if let Err(e) = self
-                    .delete_sender_key_rows_for_device(user, device_id_u16)
+                    .delete_sender_key_rows_for_device(user, device_id)
                     .await
                 {
                     warn!(
@@ -1229,13 +1229,20 @@ impl Client {
         device: &wacore::stanza::devices::DeviceElement,
     ) {
         let guard = self.device_topology.lock_registry().await;
-        let device_id = device.device_id();
+        let Ok(device_id) = u16::try_from(device.device_id()) else {
+            return;
+        };
 
-        if let Some(mut record) = self.load_device_record(user).await
-            && let Some(d) = record.devices.iter_mut().find(|d| d.device_id == device_id)
-        {
-            d.key_index = device.key_index;
-            if let Err(e) = self.update_device_list_guarded(record, &guard).await {
+        if let Some(mut record) = self.load_device_record(user).await {
+            let mut updated = false;
+            record.edit_devices(|devices| {
+                if let Some(d) = devices.iter_mut().find(|d| d.device_id() == device_id) {
+                    *d = wacore::store::traits::DeviceInfo::new(device_id, device.key_index)
+                        .with_hosting(d.is_hosted());
+                    updated = true;
+                }
+            });
+            if updated && let Err(e) = self.update_device_list_guarded(record, &guard).await {
                 warn!("patch_device_update: failed to persist: {e}");
             }
         }
@@ -1315,7 +1322,7 @@ impl Client {
                         continue;
                     }
                     self.device_registry_cache
-                        .promote(record.user.clone(), Arc::new(record))
+                        .promote(Arc::clone(&record.user), Arc::new(record))
                         .await;
                     return Some(devices);
                 }
@@ -1337,19 +1344,13 @@ impl Client {
         record: &wacore::store::traits::DeviceListRecord,
     ) -> Vec<Jid> {
         let base = query_jid.to_non_ad();
-        let mut devices = Vec::with_capacity(record.devices.len());
-        for device in &record.devices {
-            match u16::try_from(device.device_id) {
-                Ok(device_id) => {
-                    devices.push(base.with_device_hosting(device_id, device.is_hosted));
-                }
-                Err(_) => warn!(
-                    "reconstruct_device_jids: device_id {} exceeds u16; skipping",
-                    device.device_id
-                ),
-            }
-        }
-        devices
+        // No range check: a registry device id is a `u16`, the width the JID
+        // itself carries, so the conversion this used to guard cannot fail.
+        record
+            .devices
+            .iter()
+            .map(|device| base.with_device_hosting(device.device_id(), device.is_hosted()))
+            .collect()
     }
 
     /// Migrate device registry entries from PN key to LID key.
@@ -1374,7 +1375,7 @@ impl Client {
                     record.devices.len()
                 );
 
-                record.user = lid.to_string();
+                record.user = Arc::from(lid);
 
                 if let Err(e) = backend.update_device_list(record.clone()).await {
                     // The backend row may have changed even on error, so the
@@ -1386,7 +1387,12 @@ impl Client {
                 }
 
                 self.device_registry_cache
-                    .insert(&guard, lid.to_string(), Arc::new(record), [lid, pn])
+                    .insert(
+                        &guard,
+                        Arc::clone(&record.user),
+                        Arc::new(record),
+                        [lid, pn],
+                    )
                     .await;
 
                 // Drop the PN-keyed row in both cache and DB. Invalidate
@@ -1426,7 +1432,7 @@ mod tests {
         client.lid_pn_cache.add(&entry).await;
     }
 
-    async fn setup_device_record(client: &Arc<Client>, user: &str, device_ids: &[u32]) {
+    async fn setup_device_record(client: &Arc<Client>, user: &str, device_ids: &[u16]) {
         let record = wacore::store::traits::DeviceListRecord {
             user: user.into(),
             devices: device_ids
@@ -1728,7 +1734,7 @@ mod tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: pn.into(),
-                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
+                devices: [wacore::store::traits::DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1749,10 +1755,11 @@ mod tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: lid.into(),
-                devices: vec![
+                devices: [
                     wacore::store::traits::DeviceInfo::new(0, None),
                     wacore::store::traits::DeviceInfo::new(11, None),
-                ],
+                ]
+                .into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1783,7 +1790,7 @@ mod tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: "5511999990003".into(),
-                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
+                devices: [wacore::store::traits::DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1799,7 +1806,7 @@ mod tests {
         client
             .update_device_lists(vec![wacore::store::traits::DeviceListRecord {
                 user: "5511999990004".into(),
-                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
+                devices: [wacore::store::traits::DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1833,7 +1840,7 @@ mod tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: "5511999990005".into(),
-                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
+                devices: [wacore::store::traits::DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2080,9 +2087,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.devices.len(), 2);
-        assert!(updated.devices.iter().any(|d| d.device_id == 3));
-        let dev3 = updated.devices.iter().find(|d| d.device_id == 3).unwrap();
-        assert_eq!(dev3.key_index, Some(5));
+        assert!(updated.devices.iter().any(|d| d.device_id() == 3));
+        let dev3 = updated.devices.iter().find(|d| d.device_id() == 3).unwrap();
+        assert_eq!(dev3.key_index(), Some(5));
     }
 
     #[tokio::test]
@@ -2102,15 +2109,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            updated.devices.iter().filter(|d| d.device_id == 3).count(),
+            updated
+                .devices
+                .iter()
+                .filter(|d| d.device_id() == 3)
+                .count(),
             1
         );
-        assert!(updated.devices.iter().any(|d| d.device_id == 0));
+        assert!(updated.devices.iter().any(|d| d.device_id() == 0));
         assert!(
             updated
                 .devices
                 .iter()
-                .any(|d| d.device_id == 3 && d.is_hosted)
+                .any(|d| d.device_id() == 3 && d.is_hosted())
         );
         assert_eq!(updated.devices.len(), 2);
     }
@@ -2146,7 +2157,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.devices.len(), 1);
-        assert_eq!(updated.devices[0].device_id, 0);
+        assert_eq!(updated.devices[0].device_id(), 0);
     }
 
     #[tokio::test]
@@ -2243,18 +2254,19 @@ mod tests {
 
         // Pre-populate registry cache
         let record = wacore::store::traits::DeviceListRecord {
-            user: "15551234567".to_string(),
-            devices: vec![
+            user: "15551234567".into(),
+            devices: [
                 wacore::store::traits::DeviceInfo::new(0, None),
                 wacore::store::traits::DeviceInfo::new(3, Some(1)),
-            ],
+            ]
+            .into(),
             timestamp: 1000,
             phash: None,
             raw_id: None,
         };
         client
             .device_registry_cache
-            .raw_insert_for_tests("15551234567".to_string(), Arc::new(record))
+            .raw_insert_for_tests("15551234567".into(), Arc::new(record))
             .await;
 
         // Patch: update device 3 key_index to 5
@@ -2266,8 +2278,8 @@ mod tests {
             .get("15551234567")
             .await
             .unwrap();
-        let dev3 = updated.devices.iter().find(|d| d.device_id == 3).unwrap();
-        assert_eq!(dev3.key_index, Some(5));
+        let dev3 = updated.devices.iter().find(|d| d.device_id() == 3).unwrap();
+        assert_eq!(dev3.key_index(), Some(5));
     }
 
     #[tokio::test]
@@ -2287,8 +2299,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.devices.len(), 2);
-        let dev3 = updated.devices.iter().find(|d| d.device_id == 3).unwrap();
-        assert_eq!(dev3.key_index, Some(2));
+        let dev3 = updated.devices.iter().find(|d| d.device_id() == 3).unwrap();
+        assert_eq!(dev3.key_index(), Some(2));
     }
 
     #[tokio::test]
@@ -2309,13 +2321,13 @@ mod tests {
             updated
                 .devices
                 .iter()
-                .any(|device| device.device_id == 3 && device.is_hosted)
+                .any(|device| device.device_id() == 3 && device.is_hosted())
         );
         assert!(
             updated
                 .devices
                 .iter()
-                .any(|device| device.device_id == 0 && !device.is_hosted)
+                .any(|device| device.device_id() == 0 && !device.is_hosted())
         );
     }
 
@@ -2346,7 +2358,7 @@ mod tests {
 
     fn record_with_raw_id(
         user: &str,
-        device_ids: &[u32],
+        device_ids: &[u16],
         raw_id: u32,
     ) -> wacore::store::traits::DeviceListRecord {
         wacore::store::traits::DeviceListRecord {
@@ -2369,7 +2381,7 @@ mod tests {
         client
             .device_registry_cache
             .raw_insert_for_tests(
-                "15551234567".to_string(),
+                "15551234567".into(),
                 Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
             )
             .await;
@@ -2394,7 +2406,7 @@ mod tests {
             updated
                 .devices
                 .iter()
-                .any(|device| device.device_id == 5 && device.is_hosted)
+                .any(|device| device.device_id() == 5 && device.is_hosted())
         );
     }
 
@@ -2405,16 +2417,17 @@ mod tests {
         let client = create_test_client().await;
 
         let mut record = record_with_raw_id("15551234567", &[0, 5], 1);
-        record
-            .devices
-            .iter_mut()
-            .find(|device| device.device_id == 0)
-            .unwrap()
-            .is_hosted = true;
+        record.edit_devices(|devices| {
+            let primary = devices
+                .iter_mut()
+                .find(|device| device.device_id() == 0)
+                .unwrap();
+            *primary = primary.with_hosting(true);
+        });
 
         client
             .device_registry_cache
-            .raw_insert_for_tests("15551234567".to_string(), Arc::new(record))
+            .raw_insert_for_tests("15551234567".into(), Arc::new(record))
             .await;
 
         // New raw_id (2) != stored (1) → clear + rebuild. Notified device 19 has a
@@ -2437,7 +2450,7 @@ mod tests {
         let dev0 = updated
             .devices
             .iter()
-            .find(|d| d.device_id == 0)
+            .find(|d| d.device_id() == 0)
             .unwrap_or_else(|| {
                 panic!(
                     "primary (device 0) must survive a raw_id mismatch clear, got {:?}",
@@ -2446,11 +2459,11 @@ mod tests {
             });
         // The existing primary metadata is retained; it is not reconstructed from
         // the incoming companion's namespace.
-        assert_eq!(dev0.key_index, None);
-        assert!(dev0.is_hosted);
-        assert!(updated.devices.iter().any(|d| d.device_id == 19));
+        assert_eq!(dev0.key_index(), None);
+        assert!(dev0.is_hosted());
+        assert!(updated.devices.iter().any(|d| d.device_id() == 19));
         // Stale companion from the old identity is dropped by the clear.
-        assert!(!updated.devices.iter().any(|d| d.device_id == 5));
+        assert!(!updated.devices.iter().any(|d| d.device_id() == 5));
     }
 
     // Same mismatch but the notified device's key index is rejected, so the
@@ -2463,7 +2476,7 @@ mod tests {
         client
             .device_registry_cache
             .raw_insert_for_tests(
-                "15551234567".to_string(),
+                "15551234567".into(),
                 Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
             )
             .await;
@@ -2491,8 +2504,8 @@ mod tests {
             "expected only the primary, got {:?}",
             updated.devices
         );
-        assert_eq!(updated.devices[0].device_id, 0);
-        assert_eq!(updated.devices[0].key_index, None);
+        assert_eq!(updated.devices[0].device_id(), 0);
+        assert_eq!(updated.devices[0].key_index(), None);
     }
 
     #[tokio::test]
@@ -2505,8 +2518,8 @@ mod tests {
 
         // Store device list under PN in backend
         let record = DeviceListRecord {
-            user: pn.to_string(),
-            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(39, Some(25))],
+            user: pn.into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(39, Some(25))].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2584,14 +2597,15 @@ mod tests {
         assert_eq!(devices[0].user, lid, "device JID user should be the LID");
     }
 
+    /// `reconstruct_device_jids` used to skip persisted ids too wide for a
+    /// JID's `u16` device field. A registry device id is now a `u16` itself,
+    /// so there is no such record to skip; what rejects a blob claiming one is
+    /// `DeviceInfo`'s deserializer, covered in `wacore::store::traits`.
     #[test]
-    fn reconstruct_device_jids_skips_unrepresentable_persisted_ids() {
+    fn reconstruct_device_jids_carries_hosting_through() {
         let record = wacore::store::traits::DeviceListRecord {
             user: "13135550100".into(),
-            devices: vec![
-                wacore::store::traits::DeviceInfo::new(7, None).with_hosting(true),
-                wacore::store::traits::DeviceInfo::new(u32::from(u16::MAX) + 1, None),
-            ],
+            devices: [wacore::store::traits::DeviceInfo::new(7, None).with_hosting(true)].into(),
             timestamp: 0,
             phash: None,
             raw_id: None,
@@ -2633,7 +2647,7 @@ mod tests {
         // Seed backend DB directly (bypassing the in-process cache)
         let record = DeviceListRecord {
             user: "15551234567".into(),
-            devices: vec![DeviceInfo::new(0, None)],
+            devices: [DeviceInfo::new(0, None)].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2666,7 +2680,7 @@ mod tests {
             .unwrap()
             .expect("record should still exist in DB");
         assert_eq!(updated.devices.len(), 2);
-        assert!(updated.devices.iter().any(|d| d.device_id == 3));
+        assert!(updated.devices.iter().any(|d| d.device_id() == 3));
 
         // Cache should be warm now too
         assert!(
@@ -2686,7 +2700,7 @@ mod tests {
 
         let record = DeviceListRecord {
             user: "15551234567".into(),
-            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(3, Some(5))],
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(5))].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2716,7 +2730,7 @@ mod tests {
             .unwrap()
             .expect("record should still exist");
         assert_eq!(updated.devices.len(), 1);
-        assert_eq!(updated.devices[0].device_id, 0);
+        assert_eq!(updated.devices[0].device_id(), 0);
     }
 
     // ── Sender key device cache: post-fix behavior ──────────────────────
@@ -2761,7 +2775,7 @@ mod tests {
         // Pre-populate device registry with device 0 AND device 3
         let record = DeviceListRecord {
             user: "15551234567".into(),
-            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(3, Some(5))],
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(5))].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -2854,8 +2868,8 @@ mod tests {
         // Legacy state: DB row stored under PN (mapping wasn't known yet).
         backend
             .update_device_list(DeviceListRecord {
-                user: pn.to_string(),
-                devices: vec![DeviceInfo::new(5, None)],
+                user: pn.into(),
+                devices: [DeviceInfo::new(5, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2869,8 +2883,8 @@ mod tests {
         // now resolves to LID because the mapping is known.
         client
             .update_device_list(DeviceListRecord {
-                user: pn.to_string(),
-                devices: vec![DeviceInfo::new(7, None)],
+                user: pn.into(),
+                devices: [DeviceInfo::new(7, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2884,7 +2898,7 @@ mod tests {
         );
         let lid_row = backend.get_devices(lid).await.unwrap();
         assert!(lid_row.is_some(), "new LID-keyed DB row must exist");
-        assert_eq!(lid_row.unwrap().devices[0].device_id, 7);
+        assert_eq!(lid_row.unwrap().devices[0].device_id(), 7);
     }
 
     /// U2 — `migrate_device_registry_on_lid_discovery` deletes the PN-keyed DB
@@ -2901,8 +2915,8 @@ mod tests {
 
         backend
             .update_device_list(DeviceListRecord {
-                user: pn.to_string(),
-                devices: vec![DeviceInfo::new(0, None)],
+                user: pn.into(),
+                devices: [DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2942,8 +2956,8 @@ mod tests {
         for user in [pn, lid] {
             backend
                 .update_device_list(DeviceListRecord {
-                    user: user.to_string(),
-                    devices: vec![DeviceInfo::new(1, None)],
+                    user: user.into(),
+                    devices: [DeviceInfo::new(1, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,
@@ -2997,8 +3011,8 @@ mod tests {
         let backend = client.persistence_manager.backend();
 
         let legacy = DeviceListRecord {
-            user: pn.to_string(),
-            devices: vec![DeviceInfo::new(9, None)],
+            user: pn.into(),
+            devices: [DeviceInfo::new(9, None)].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -3015,8 +3029,8 @@ mod tests {
 
         client
             .update_device_list(DeviceListRecord {
-                user: pn.to_string(),
-                devices: vec![DeviceInfo::new(10, None)],
+                user: pn.into(),
+                devices: [DeviceInfo::new(10, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -3108,12 +3122,12 @@ mod tests {
 
         let record = client.device_registry_cache.get(user).await.unwrap();
         assert!(
-            record.devices.iter().any(|d| d.device_id == 0),
+            record.devices.iter().any(|d| d.device_id() == 0),
             "remove for the primary must be ignored, got {:?}",
             record.devices
         );
         // The companion is untouched too — the remove is a full no-op.
-        assert!(record.devices.iter().any(|d| d.device_id == 5));
+        assert!(record.devices.iter().any(|d| d.device_id() == 5));
     }
 
     #[tokio::test]
@@ -3488,7 +3502,7 @@ mod tests {
             .await
             .expect("a hash-only <update> must not drop the device registry");
         assert!(
-            record.devices.iter().any(|d| d.device_id == 65),
+            record.devices.iter().any(|d| d.device_id() == 65),
             "companion devices must survive a hash-only <update>"
         );
     }
@@ -3587,7 +3601,7 @@ mod tests {
 
     /// Seed a device record straight into the registry cache WITHOUT recording a
     /// topology change, so a memo that is really hitting must serve it stale.
-    async fn setup_hosted_device_record(client: &Arc<Client>, user: &str, devices: &[(u32, bool)]) {
+    async fn setup_hosted_device_record(client: &Arc<Client>, user: &str, devices: &[(u16, bool)]) {
         let record = wacore::store::traits::DeviceListRecord {
             user: user.into(),
             devices: devices
@@ -3608,7 +3622,7 @@ mod tests {
 
     /// Publish a device record through the real write path, which records the
     /// topology change every invalidation rule depends on.
-    async fn publish_device_record(client: &Arc<Client>, user: &str, device_ids: &[u32]) {
+    async fn publish_device_record(client: &Arc<Client>, user: &str, device_ids: &[u16]) {
         let record = wacore::store::traits::DeviceListRecord {
             user: user.into(),
             devices: device_ids

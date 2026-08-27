@@ -2345,8 +2345,8 @@ mod tests {
         // from "migration never called".
         backend
             .update_device_list(DeviceListRecord {
-                user: pn.to_string(),
-                devices: vec![DeviceInfo::new(3, None)],
+                user: pn.into(),
+                devices: [DeviceInfo::new(3, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2388,7 +2388,7 @@ mod tests {
             "migration must delete the old PN-keyed device row"
         );
         let lid_row = backend.get_devices(lid).await.unwrap().unwrap();
-        assert_eq!(lid_row.devices[0].device_id, 3);
+        assert_eq!(lid_row.devices[0].device_id(), 3);
         // And the mapping resolves from both directions.
         assert_eq!(
             client

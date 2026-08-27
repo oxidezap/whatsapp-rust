@@ -1097,7 +1097,7 @@ mod tests {
         // Pre-populate device registry so clear_device_record has something to clear
         let record = wacore::store::traits::DeviceListRecord {
             user: "5511999999999".into(),
-            devices: vec![wacore::store::traits::DeviceInfo::new(1, None)],
+            devices: [wacore::store::traits::DeviceInfo::new(1, None)].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: Some(42),
@@ -1411,7 +1411,7 @@ mod tests {
                 "5511666666666".into(),
                 Arc::new(wacore::store::traits::DeviceListRecord {
                     user: "5511666666666".into(),
-                    devices: vec![wacore::store::traits::DeviceInfo::new(1, None)],
+                    devices: [wacore::store::traits::DeviceInfo::new(1, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: Some(1),

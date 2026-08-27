@@ -633,16 +633,15 @@ pub(crate) async fn handle_account_sync_devices(
     // Build DeviceListRecord for storage
     // Note: update_device_list() will automatically store under LID if mapping is known
     let device_list = DeviceListRecord {
-        user: from_jid.user.to_string(),
+        user: Arc::from(from_jid.user.as_str()),
         devices: devices
             .iter()
             .map(|d| {
-                DeviceInfo::new(d.jid.device as u32, d.key_index)
-                    .with_hosting(JidExt::is_hosted(&d.jid))
+                DeviceInfo::new(d.jid.device, d.key_index).with_hosting(JidExt::is_hosted(&d.jid))
             })
             .collect(),
         timestamp,
-        phash: dhash,
+        phash: dhash.map(Box::<str>::from),
         raw_id: existing_raw_id,
     };
 

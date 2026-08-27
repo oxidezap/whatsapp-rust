@@ -3177,14 +3177,14 @@ mod tests {
             {
                 let record = DeviceListRecord {
                     user: user.into(),
-                    devices: vec![DeviceInfo::new(0, None)],
+                    devices: [DeviceInfo::new(0, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,
                 };
                 client
                     .device_registry_cache
-                    .raw_insert_for_tests(user.to_string(), Arc::new(record))
+                    .raw_insert_for_tests(Arc::from(user), Arc::new(record))
                     .await;
             }
 
@@ -3278,17 +3278,14 @@ mod tests {
             // through the mapping.
             let record = DeviceListRecord {
                 user: own.user.as_str().into(),
-                devices: vec![
-                    DeviceInfo::new(0, None),
-                    DeviceInfo::new(u32::from(device_id), None),
-                ],
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(device_id, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
             };
             self.client
                 .device_registry_cache
-                .raw_insert_for_tests(own.user.to_string(), Arc::new(record))
+                .raw_insert_for_tests(Arc::from(own.user.as_str()), Arc::new(record))
                 .await;
             let companion = self.own_sending.with_device(device_id);
             crate::test_utils::seed_peer_session(&self.client, &companion).await;
@@ -3846,10 +3843,10 @@ mod tests {
             client
                 .device_registry_cache
                 .raw_insert_for_tests(
-                    user.to_string(),
+                    user.into(),
                     Arc::new(DeviceListRecord {
                         user: user.into(),
-                        devices: vec![DeviceInfo::new(0, None)],
+                        devices: [DeviceInfo::new(0, None)].into(),
                         timestamp: wacore::time::now_secs(),
                         phash: None,
                         raw_id: None,
@@ -4734,7 +4731,7 @@ mod tests {
         for user in &participant_users {
             let record = DeviceListRecord {
                 user: (*user).into(),
-                devices: vec![DeviceInfo::new(0, None)],
+                devices: [DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -6511,14 +6508,14 @@ mod tests {
         // blocking on a network device-list fetch (which would time out with
         // no socket).
         for user in [
-            peer_lid.user.to_string(),
-            peer_pn.user.to_string(),
-            own_pn.user.to_string(),
+            Arc::from(peer_lid.user.as_str()),
+            Arc::from(peer_pn.user.as_str()),
+            Arc::<str>::from(own_pn.user.as_str()),
         ] {
             client
                 .update_device_list(wacore::store::traits::DeviceListRecord {
                     user,
-                    devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
+                    devices: [wacore::store::traits::DeviceInfo::new(0, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,
@@ -7455,7 +7452,7 @@ mod clock_budget_tests {
         client
             .update_device_list(wacore::store::traits::DeviceListRecord {
                 user: user.into(),
-                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)],
+                devices: [wacore::store::traits::DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,

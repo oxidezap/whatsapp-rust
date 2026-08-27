@@ -195,7 +195,7 @@ pub fn retain_devices_by_key_index(devices: &mut Vec<DeviceInfo>, decoded: &Deco
 }
 
 fn should_retain_device(device: &DeviceInfo, decoded: &DecodedKeyIndex) -> bool {
-    device.device_id == 0 || is_key_index_valid(device.key_index, decoded)
+    device.device_id() == 0 || is_key_index_valid(device.key_index(), decoded)
 }
 
 /// Check if a key_index is accepted by the decoded ADV list.
@@ -216,7 +216,7 @@ mod tests {
     use super::*;
     use buffa::Message;
 
-    fn dev(id: u32, key_index: Option<u32>) -> DeviceInfo {
+    fn dev(id: u16, key_index: Option<u32>) -> DeviceInfo {
         DeviceInfo::new(id, key_index)
     }
 
@@ -231,7 +231,7 @@ mod tests {
         };
         let result = filter_devices_by_key_index(&devices, &decoded);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].device_id, 0);
+        assert_eq!(result[0].device_id(), 0);
     }
 
     #[test]
@@ -245,9 +245,9 @@ mod tests {
         };
         let result = filter_devices_by_key_index(&devices, &decoded);
         assert_eq!(result.len(), 2); // device 0 + device 12
-        assert!(result.iter().any(|d| d.device_id == 0));
-        assert!(result.iter().any(|d| d.device_id == 12));
-        assert!(!result.iter().any(|d| d.device_id == 11));
+        assert!(result.iter().any(|d| d.device_id() == 0));
+        assert!(result.iter().any(|d| d.device_id() == 12));
+        assert!(!result.iter().any(|d| d.device_id() == 11));
     }
 
     #[test]
@@ -275,7 +275,7 @@ mod tests {
         };
         let result = filter_devices_by_key_index(&devices, &decoded);
         assert_eq!(result.len(), 1); // only primary device kept
-        assert_eq!(result[0].device_id, 0);
+        assert_eq!(result[0].device_id(), 0);
     }
 
     #[test]

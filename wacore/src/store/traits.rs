@@ -122,31 +122,196 @@ impl MsgSecretEntry {
 }
 
 /// Device information for registry tracking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Packed into 8 bytes rather than the 16 the obvious three fields occupy: a
+/// `u32` device id, an `Option<u32>` key index and a `bool` carry 5 bytes of
+/// information and 11 bytes of alignment padding, and a device registry holds
+/// one of these per device per known contact. The device id is a `u16`
+/// because that is what it is on the wire — [`Jid::device`] has always been
+/// one — and the hosted flag and the key index's presence share one byte.
+///
+/// Serialized as the `{device_id, key_index, is_hosted}` object the previous
+/// layout wrote, so stored device-list blobs are unchanged in both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "DeviceInfoDe", into = "DeviceInfoDe")]
 pub struct DeviceInfo {
-    /// The device ID (0 = primary device, 1+ = companion devices)
-    pub device_id: u32,
-    /// The key index, if known
-    pub key_index: Option<u32>,
-    /// Whether the device uses the hosted PN/LID address space.
+    device_id: u16,
+    flags: u8,
+    /// Meaningful only when [`Self::HAS_KEY_INDEX`] is set.
+    key_index: u32,
+}
+
+/// Serialization shadow: the field-per-value shape the blobs carry.
+///
+/// `device_id` is a `u16` here too, so a corrupt blob claiming a device
+/// beyond the wire's range is rejected by serde with its own message instead
+/// of being silently truncated into a different device.
+#[derive(Serialize, Deserialize)]
+struct DeviceInfoDe {
+    device_id: u16,
+    key_index: Option<u32>,
     #[serde(default)]
-    pub is_hosted: bool,
+    is_hosted: bool,
+}
+
+impl From<DeviceInfoDe> for DeviceInfo {
+    fn from(d: DeviceInfoDe) -> Self {
+        Self::new(d.device_id, d.key_index).with_hosting(d.is_hosted)
+    }
+}
+
+impl From<DeviceInfo> for DeviceInfoDe {
+    fn from(d: DeviceInfo) -> Self {
+        Self {
+            device_id: d.device_id(),
+            key_index: d.key_index(),
+            is_hosted: d.is_hosted(),
+        }
+    }
 }
 
 impl DeviceInfo {
+    const IS_HOSTED: u8 = 1 << 0;
+    const HAS_KEY_INDEX: u8 = 1 << 1;
+
     /// Construct a regular device entry.
-    pub const fn new(device_id: u32, key_index: Option<u32>) -> Self {
+    pub const fn new(device_id: u16, key_index: Option<u32>) -> Self {
+        let (flags, key_index) = match key_index {
+            Some(index) => (Self::HAS_KEY_INDEX, index),
+            None => (0, 0),
+        };
         Self {
             device_id,
+            flags,
             key_index,
-            is_hosted: false,
         }
     }
 
     /// Apply the hosted bit reported by the device-list source.
     pub const fn with_hosting(mut self, is_hosted: bool) -> Self {
-        self.is_hosted = is_hosted;
+        if is_hosted {
+            self.flags |= Self::IS_HOSTED;
+        } else {
+            self.flags &= !Self::IS_HOSTED;
+        }
         self
+    }
+
+    /// The device ID (0 = primary device, 1+ = companion devices).
+    pub const fn device_id(&self) -> u16 {
+        self.device_id
+    }
+
+    /// The key index, if known.
+    pub const fn key_index(&self) -> Option<u32> {
+        if self.flags & Self::HAS_KEY_INDEX != 0 {
+            Some(self.key_index)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the device uses the hosted PN/LID address space.
+    pub const fn is_hosted(&self) -> bool {
+        self.flags & Self::IS_HOSTED != 0
+    }
+}
+
+#[cfg(test)]
+mod device_info_tests {
+    use super::DeviceInfo;
+
+    /// The packed layout is the whole point; a field added carelessly would
+    /// undo it silently.
+    #[test]
+    fn a_device_entry_is_eight_bytes() {
+        assert_eq!(size_of::<DeviceInfo>(), 8);
+    }
+
+    #[test]
+    fn accessors_round_trip_every_combination() {
+        for device_id in [0u16, 1, 7, u16::MAX] {
+            for key_index in [None, Some(0), Some(1), Some(u32::MAX)] {
+                for is_hosted in [false, true] {
+                    let info = DeviceInfo::new(device_id, key_index).with_hosting(is_hosted);
+                    assert_eq!(info.device_id(), device_id);
+                    assert_eq!(info.key_index(), key_index, "key_index {key_index:?}");
+                    assert_eq!(info.is_hosted(), is_hosted);
+                }
+            }
+        }
+    }
+
+    /// `key_index: Some(0)` and `None` share the same stored word, so only the
+    /// presence bit tells them apart — the case a sentinel value would break.
+    #[test]
+    fn a_zero_key_index_is_not_an_absent_one() {
+        assert_eq!(DeviceInfo::new(3, Some(0)).key_index(), Some(0));
+        assert_eq!(DeviceInfo::new(3, None).key_index(), None);
+    }
+
+    #[test]
+    fn hosted_flag_is_backward_compatible_with_persisted_json() {
+        let legacy: DeviceInfo = serde_json::from_str(r#"{"device_id":7,"key_index":3}"#).unwrap();
+        assert!(!legacy.is_hosted());
+
+        let hosted = DeviceInfo::new(7, Some(3)).with_hosting(true);
+        let roundtrip: DeviceInfo =
+            serde_json::from_str(&serde_json::to_string(&hosted).unwrap()).unwrap();
+        assert!(roundtrip.is_hosted());
+    }
+
+    /// Device-list blobs already on disk were written by the three-field
+    /// layout, and are read back by the packed one. Both directions have to
+    /// hold, including `is_hosted` absent from a blob predating that field.
+    #[test]
+    fn the_persisted_shape_is_unchanged() {
+        let info = DeviceInfo::new(3, Some(42)).with_hosting(true);
+        let json = serde_json::to_value(info).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({ "device_id": 3, "key_index": 42, "is_hosted": true })
+        );
+
+        let stored: DeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": 5,
+            "key_index": null,
+            "is_hosted": false
+        }))
+        .expect("deserialize");
+        assert_eq!(stored, DeviceInfo::new(5, None));
+
+        // Predates `is_hosted`, which has always been `#[serde(default)]`.
+        let legacy: DeviceInfo =
+            serde_json::from_value(serde_json::json!({ "device_id": 9, "key_index": 4 }))
+                .expect("deserialize legacy");
+        assert_eq!(legacy, DeviceInfo::new(9, Some(4)));
+        assert!(!legacy.is_hosted());
+    }
+
+    /// The record is held per known contact for the life of a cache entry, so
+    /// its inline size is part of the budget: `Arc<str>` + `Box<[_]>` +
+    /// `Option<Box<str>>` rather than `String` + `Vec` + `Option<String>` is
+    /// what keeps it at 64 bytes instead of 88.
+    #[test]
+    fn a_device_list_record_is_sixty_four_bytes() {
+        assert_eq!(size_of::<super::DeviceListRecord>(), 64);
+    }
+
+    /// A device id is a `u16` on the wire and in a `Jid`. A blob claiming a
+    /// wider one is corrupt, and has to be rejected rather than truncated into
+    /// a different device — which is what a plain `as u16` would have done.
+    #[test]
+    fn a_device_id_beyond_the_wire_range_is_rejected() {
+        let err = serde_json::from_value::<DeviceInfo>(serde_json::json!({
+            "device_id": u32::from(u16::MAX) + 1,
+            "key_index": null
+        }))
+        .expect_err("a device id past u16 must not decode");
+        assert!(
+            err.to_string().contains("u16"),
+            "the error should name the range it violated: {err}"
+        );
     }
 }
 
@@ -228,44 +393,54 @@ mod msg_secret_entry_tests {
     }
 }
 
-#[cfg(test)]
-mod device_info_tests {
-    use super::DeviceInfo;
-
-    #[test]
-    fn hosted_flag_is_backward_compatible_with_persisted_json() {
-        let legacy: DeviceInfo = serde_json::from_str(r#"{"device_id":7,"key_index":3}"#).unwrap();
-        assert!(!legacy.is_hosted);
-
-        let hosted = DeviceInfo::new(7, Some(3)).with_hosting(true);
-        let roundtrip: DeviceInfo =
-            serde_json::from_str(&serde_json::to_string(&hosted).unwrap()).unwrap();
-        assert!(roundtrip.is_hosted);
-    }
-}
-
 /// Device list record matching WhatsApp Web's DeviceListRecord structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceListRecord {
     /// The user part of the JID (phone number or LID)
-    pub user: String,
-    /// List of known devices for this user
-    pub devices: Vec<DeviceInfo>,
+    /// `Arc<str>`, so the registry cache can key the record by exactly this
+    /// string instead of allocating a second copy of it: every write stores
+    /// the record under its own `user`, and the two used to be separate
+    /// `String` allocations of identical content.
+    pub user: Arc<str>,
+    /// List of known devices for this user.
+    ///
+    /// Boxed rather than a `Vec`: the list is built once and then read for the
+    /// life of the cache entry, so the capacity field is dead weight — and
+    /// worse, `retain_devices_by_key_index` shortens it without releasing the
+    /// capacity, leaving the dropped devices' slots resident. Mutations go
+    /// through [`DeviceListRecord::edit_devices`].
+    pub devices: Box<[DeviceInfo]>,
     /// Timestamp when this record was last updated
     pub timestamp: i64,
     /// Participant hash from usync, if available
-    pub phash: Option<String>,
+    pub phash: Option<Box<str>>,
     /// ADV raw_id from `ADVKeyIndexList` — used to detect identity changes.
     /// When this changes, all sessions and sender keys for the user must be cleared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_id: Option<u32>,
 }
 
+impl DeviceListRecord {
+    /// Mutate the device list in place.
+    ///
+    /// The field is a `Box<[_]>`, so an edit moves through a `Vec` and back.
+    /// Every caller is a notification path (a device added, removed or
+    /// key-index filtered), never a send, and the round trip is what keeps a
+    /// filtered list from retaining the slots it dropped.
+    pub fn edit_devices(&mut self, edit: impl FnOnce(&mut Vec<DeviceInfo>)) {
+        let mut devices = std::mem::take(&mut self.devices).into_vec();
+        edit(&mut devices);
+        self.devices = devices.into_boxed_slice();
+    }
+}
+
 impl crate::stats::HeapSize for DeviceListRecord {
+    /// The `user` string is shared with the registry cache's key, so the
+    /// report must not also count it there.
     fn heap_bytes(&self) -> usize {
-        self.user.capacity()
-            + self.devices.capacity() * size_of::<DeviceInfo>()
-            + self.phash.as_ref().map_or(0, |p| p.capacity())
+        self.user.len()
+            + self.devices.len() * size_of::<DeviceInfo>()
+            + self.phash.as_ref().map_or(0, |p| p.len())
     }
 }
 

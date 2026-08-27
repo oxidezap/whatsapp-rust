@@ -2997,10 +2997,10 @@ impl ProtocolStore for SqliteStore {
             let raw_id_i32 = record.raw_id.map(|r| r as i32);
             diesel::insert_into(device_registry::table)
                 .values((
-                    device_registry::user_id.eq(&record.user),
+                    device_registry::user_id.eq(record.user.as_ref()),
                     device_registry::devices_json.eq(&devices_json),
                     device_registry::timestamp.eq(record.timestamp as i32),
-                    device_registry::phash.eq(&record.phash),
+                    device_registry::phash.eq(record.phash.as_deref()),
                     device_registry::device_id.eq(device_id),
                     device_registry::updated_at.eq(now),
                     device_registry::raw_id.eq(raw_id_i32),
@@ -3010,7 +3010,7 @@ impl ProtocolStore for SqliteStore {
                 .set((
                     device_registry::devices_json.eq(&devices_json),
                     device_registry::timestamp.eq(record.timestamp as i32),
-                    device_registry::phash.eq(&record.phash),
+                    device_registry::phash.eq(record.phash.as_deref()),
                     device_registry::updated_at.eq(now),
                     device_registry::raw_id.eq(raw_id_i32),
                 ))
@@ -3047,10 +3047,10 @@ impl ProtocolStore for SqliteStore {
                 let devices_json = serde_json::to_string(&r.devices)
                     .map_err(|e| StoreError::Serialization(Box::new(e)))?;
                 Ok(PreparedRow {
-                    user: r.user,
+                    user: r.user.to_string(),
                     devices_json,
                     timestamp: r.timestamp as i32,
-                    phash: r.phash,
+                    phash: r.phash.map(String::from),
                     raw_id: r.raw_id.map(|v| v as i32),
                 })
             })
@@ -3119,13 +3119,13 @@ impl ProtocolStore for SqliteStore {
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
             match row {
                 Some((user, devices_json, timestamp, phash, raw_id)) => {
-                    let devices: Vec<DeviceInfo> = serde_json::from_str(&devices_json)
+                    let devices: Box<[DeviceInfo]> = serde_json::from_str(&devices_json)
                         .map_err(|e| StoreError::Serialization(Box::new(e)))?;
                     Ok(Some(DeviceListRecord {
-                        user,
+                        user: Arc::from(user),
                         devices,
                         timestamp: timestamp as i64,
-                        phash,
+                        phash: phash.map(Box::<str>::from),
                         raw_id: raw_id.map(|r| r as u32),
                     }))
                 }
@@ -4529,10 +4529,10 @@ mod tests {
         let store = create_test_store().await;
 
         let record = DeviceListRecord {
-            user: "1234567890".to_string(),
-            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(1, Some(42))],
+            user: "1234567890".into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(1, Some(42))].into(),
             timestamp: 1234567890,
-            phash: Some("2:abcdef".to_string()),
+            phash: Some("2:abcdef".into()),
             raw_id: None,
         };
 
@@ -4545,9 +4545,9 @@ mod tests {
 
         assert_eq!(loaded.user, "1234567890");
         assert_eq!(loaded.devices.len(), 2);
-        assert_eq!(loaded.devices[0].device_id, 0);
-        assert_eq!(loaded.devices[1].device_id, 1);
-        assert_eq!(loaded.devices[1].key_index, Some(42));
+        assert_eq!(loaded.devices[0].device_id(), 0);
+        assert_eq!(loaded.devices[1].device_id(), 1);
+        assert_eq!(loaded.devices[1].key_index(), Some(42));
         assert_eq!(loaded.phash, Some("2:abcdef".to_string()));
     }
 
@@ -4556,10 +4556,10 @@ mod tests {
         let store = create_test_store().await;
 
         let record1 = DeviceListRecord {
-            user: "1234567890".to_string(),
-            devices: vec![DeviceInfo::new(0, None)],
+            user: "1234567890".into(),
+            devices: [DeviceInfo::new(0, None)].into(),
             timestamp: 1000,
-            phash: Some("2:old".to_string()),
+            phash: Some("2:old".into()),
             raw_id: None,
         };
         store
@@ -4568,10 +4568,10 @@ mod tests {
             .expect("save1 failed");
 
         let record2 = DeviceListRecord {
-            user: "1234567890".to_string(),
-            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(2, None)],
+            user: "1234567890".into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(2, None)].into(),
             timestamp: 2000,
-            phash: Some("2:new".to_string()),
+            phash: Some("2:new".into()),
             raw_id: None,
         };
         store
@@ -6123,7 +6123,7 @@ mod read_routing_tests {
 
         store
             .update_device_list(DeviceListRecord {
-                user: "559990000001".to_string(),
+                user: "559990000001".into(),
                 devices: Vec::new(),
                 timestamp: 5,
                 phash: None,
