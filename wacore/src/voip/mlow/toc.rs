@@ -45,8 +45,10 @@ pub(crate) struct MlowToc {
 /// 2.5 ms rounds up to 3: the smpl path only needs a length for a slot it fills with silence, and
 /// rounding down would under-fill it.
 fn celt_escape_frame_ms(b: u8) -> i32 {
-    let mode = (b >> 2) & 0x0f;
-    [3, 5, 10, 20][(mode & 3) as usize]
+    // Only the low two bits of the mode select the duration; the high two select the rate, which
+    // this path does not need because it emits a slot at the decoder's own 16 kHz. Masking the
+    // whole nibble first would be dead arithmetic, so the bits are taken directly.
+    [3, 5, 10, 20][((b >> 2) & 3) as usize]
 }
 
 /// Parse the smpl TOC byte. Emits a per-frame `trace!` while this parse is production-validated.

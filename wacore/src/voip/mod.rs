@@ -7,7 +7,12 @@
 
 pub mod app_data;
 pub mod audio;
-pub mod codec_probe;
+// The content corroborator is an internal decision, not API: exposing it would invite a consumer to
+// make codec choices from payload bytes, which is the reflex this whole module exists to avoid. It
+// is also MLOW-only, because the only stream it can rescue is one that negotiated MLOW: a build
+// without that codec never reaches the branch that consults it.
+#[cfg(feature = "voip-mlow")]
+pub(crate) mod codec_probe;
 pub mod demux;
 pub mod driver;
 pub mod e2e_srtp;
@@ -29,9 +34,11 @@ pub mod session;
 pub mod sframe;
 pub mod ssrc;
 pub mod stun;
-// Packet-capture facility. Attachable by a consumer through `CallHandle::attach_packet_tap`: it
-// sees every relay datagram in both directions, which is what turns the next media incident into a
-// dump instead of an investigation.
+// Packet-capture facility: decorate a `RelayTransportFactory` with `TappedFactory` and every relay
+// datagram in both directions reaches your `PacketTap`. Public so that seam exists at all -- it was
+// `pub(crate)` with no consumer, which is why the last media incident was an investigation instead
+// of a dump. Note that the runtime does not yet expose a factory injection point for a live call,
+// so today this is reachable from a shell that builds its own transport, not from `CallHandle`.
 pub mod tap;
 pub mod transport;
 pub mod warp;

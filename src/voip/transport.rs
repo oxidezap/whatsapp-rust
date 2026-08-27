@@ -1053,6 +1053,40 @@ mod tests {
         );
         feed.await.unwrap();
     }
+
+    // A media packet dropped under backpressure is indistinguishable from a peer who stopped
+    // sending unless it is counted, and the count cannot be reported at the moment of the drop --
+    // the queue being full is precisely why the packet is going away. It is flushed on the next
+    // delivery that succeeds, which is the first instant the channel has room for it.
+    #[tokio::test]
+    async fn a_dropped_media_packet_is_counted_and_reported_on_the_next_delivery() {
+        let (tx, rx) = async_channel::bounded(4);
+        let mut dropped = 0u32;
+
+        // Fill the channel, then two media packets that have nowhere to go.
+        for n in 0..4u8 {
+            assert!(deliver(&tx, Bytes::from(vec![0x90, 0x78, n]), &mut dropped).await);
+        }
+        assert_eq!(dropped, 0, "nothing was dropped while there was room");
+        for n in 0..2u8 {
+            assert!(deliver(&tx, Bytes::from(vec![0x90, 0x78, 100 + n]), &mut dropped).await);
+        }
+        assert_eq!(dropped, 2, "both media packets were discarded and counted");
+
+        // Draining makes room; the next successful delivery flushes the count.
+        let _ = rx.recv().await.unwrap();
+        let _ = rx.recv().await.unwrap();
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 9]), &mut dropped).await);
+        assert_eq!(dropped, 0, "the count was handed over, not kept");
+
+        let reported = core::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|event| match event {
+                RelayTransportEvent::InboundDropped(n) => Some(n),
+                _ => None,
+            })
+            .expect("the drop must reach the call, not die at the crate boundary");
+        assert_eq!(reported, 2);
+    }
 }
 
 /// The stack on its own, with no socket and no clock: two [`RelayStack`]s wired to each other in
@@ -1283,7 +1317,10 @@ mod loopback_relay {
             match event {
                 RelayTransportEvent::PacketReceived(p) => return Some(p),
                 RelayTransportEvent::Disconnected(_) => return None,
-                RelayTransportEvent::Connected | RelayTransportEvent::InboundDropped(_) => {}
+                // `_`, not an exhaustive list: the event stream is `#[non_exhaustive]` precisely so
+                // the media plane can learn to report something new without breaking a consumer
+                // that only forwards packets, and this helper is one such consumer.
+                _ => {}
             }
         }
         None

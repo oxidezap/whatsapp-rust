@@ -455,6 +455,24 @@ impl IncomingCall {
     /// Minimal constructor for in-tree tests in dependent crates; `#[non_exhaustive]` blocks the
     /// struct literal cross-crate, so this is the supported way to build one outside `wacore`. The
     /// optional/media fields default to absent; mutate the public fields after for other shapes.
+    /// Attach an `<offer>` media block carrying just the offerer's device capability.
+    ///
+    /// The media block is parser output, not something a consumer composes, so it is
+    /// `#[non_exhaustive]` and its field is `pub(crate)`. A dependent crate's tests still need a
+    /// call that carries a capability, and [`Self::new_for_test`] alone cannot build one.
+    #[cfg(feature = "voip")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_peer_device_for_test(self, peer_device: Option<GroupCallDevice>) -> Self {
+        self.with_media(Some(Box::new(MediaOffer {
+            encs: Vec::new(),
+            relay: None,
+            peer_abtest_bucket: None,
+            peer_abtest_bucket_id_list: None,
+            peer_device,
+        })))
+    }
+
     #[doc(hidden)]
     pub fn new_for_test(
         from: Jid,

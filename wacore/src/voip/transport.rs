@@ -39,7 +39,12 @@ impl std::fmt::Display for RelayDisconnectReason {
 
 /// An event pushed from a relay media channel. Mirrors `wacore::net::TransportEvent` for the VoIP
 /// media plane.
+///
+/// `#[non_exhaustive]`: this is the platform transport seam, and it has now grown a variant once.
+/// An out-of-tree implementation matching on it exhaustively would break every time the media plane
+/// learns to report something new, which is a poor trade for a stream a consumer only forwards.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum RelayTransportEvent {
     /// The channel is open and ready to carry packets.
     Connected,

@@ -53,11 +53,25 @@ impl InboundCodecProbe {
         active: AudioCodec,
         frame_span: Option<u32>,
         clock_rate: u32,
+        negotiated_step: u32,
     ) -> Option<AudioCodec> {
         if self.decided || active != AudioCodec::Mlow {
             return None;
         }
         let span = frame_span?;
+        // The peer must also be pacing at the cadence the call negotiated. Without this the
+        // agreement is not evidence at all: MLow reads bits 4:3 as {10,20,60,120} ms and an Opus
+        // SILK TOC reads the SAME bits as {10,20,40,60}, so the two grammars agree by construction
+        // at 10 and 20 ms. A genuine MLow stream at either duration -- which reaches this function
+        // precisely because the operating-point guard refused it, so nothing decoded -- would
+        // otherwise be promoted to Opus and the call would break in both directions, permanently.
+        //
+        // At the negotiated 960-sample step the collision cannot happen: those same MLow durations
+        // read as 40 ms of Opus, every reachable total is a multiple of 640, and 960 is not.
+        if span != negotiated_step {
+            self.agreeing = 0;
+            return None;
+        }
         let agrees = opus_packet_shape(payload)
             .and_then(|shape| shape.total_samples(clock_rate))
             .is_some_and(|declared| declared == span);
@@ -100,15 +114,15 @@ mod tests {
         let mut probe = InboundCodecProbe::default();
         let packet = silk_wb_60ms(80);
         assert_eq!(
-            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
             None
         );
         assert_eq!(
-            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
             None
         );
         assert_eq!(
-            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
             Some(AudioCodec::Opus)
         );
     }
@@ -120,10 +134,10 @@ mod tests {
         let mut probe = InboundCodecProbe::default();
         let packet = silk_wb_60ms(80);
         for _ in 0..AGREEING_PACKETS_TO_SWITCH {
-            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000);
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960);
         }
         assert_eq!(
-            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
             None,
             "already decided"
         );
@@ -138,7 +152,7 @@ mod tests {
         let packet = silk_wb_60ms(80);
         for _ in 0..10 {
             assert_eq!(
-                probe.observe(&packet, AudioCodec::Mlow, Some(1_920), 16_000),
+                probe.observe(&packet, AudioCodec::Mlow, Some(1_920), 16_000, 960),
                 None
             );
         }
@@ -150,22 +164,22 @@ mod tests {
         let good = silk_wb_60ms(80);
         // Two agreeing, then a payload with no valid Opus shape at all, then two more agreeing:
         // still short of three consecutive.
-        probe.observe(&good, AudioCodec::Mlow, Some(960), 16_000);
-        probe.observe(&good, AudioCodec::Mlow, Some(960), 16_000);
+        probe.observe(&good, AudioCodec::Mlow, Some(960), 16_000, 960);
+        probe.observe(&good, AudioCodec::Mlow, Some(960), 16_000, 960);
         assert_eq!(
-            probe.observe(&[], AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&[], AudioCodec::Mlow, Some(960), 16_000, 960),
             None
         );
         assert_eq!(
-            probe.observe(&good, AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&good, AudioCodec::Mlow, Some(960), 16_000, 960),
             None
         );
         assert_eq!(
-            probe.observe(&good, AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&good, AudioCodec::Mlow, Some(960), 16_000, 960),
             None
         );
         assert_eq!(
-            probe.observe(&good, AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&good, AudioCodec::Mlow, Some(960), 16_000, 960),
             Some(AudioCodec::Opus)
         );
     }
@@ -177,7 +191,10 @@ mod tests {
         let mut probe = InboundCodecProbe::default();
         let packet = silk_wb_60ms(80);
         for _ in 0..10 {
-            assert_eq!(probe.observe(&packet, AudioCodec::Mlow, None, 16_000), None);
+            assert_eq!(
+                probe.observe(&packet, AudioCodec::Mlow, None, 16_000, 960),
+                None
+            );
         }
     }
 
@@ -189,7 +206,7 @@ mod tests {
         let packet = silk_wb_60ms(80);
         for _ in 0..10 {
             assert_eq!(
-                probe.observe(&packet, AudioCodec::Opus, Some(960), 16_000),
+                probe.observe(&packet, AudioCodec::Opus, Some(960), 16_000, 960),
                 None
             );
         }
@@ -201,25 +218,66 @@ mod tests {
     fn a_stream_restart_clears_the_streak_but_not_the_decision() {
         let mut probe = InboundCodecProbe::default();
         let packet = silk_wb_60ms(80);
-        probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000);
-        probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000);
+        probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960);
+        probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960);
         probe.stream_restarted();
         assert_eq!(
-            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
             None,
             "the streak restarted"
         );
-        probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000);
+        probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960);
         assert_eq!(
-            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
             Some(AudioCodec::Opus)
         );
         probe.stream_restarted();
         assert_eq!(
-            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000),
+            probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
             None,
             "a restart must not reopen a decision already taken"
         );
+    }
+
+    // The hole the cadence gate closes, and the reason it exists.
+    //
+    // MLow reads bits 4:3 as {10,20,60,120} ms; an Opus SILK TOC reads the SAME bits as
+    // {10,20,40,60}. The two grammars therefore agree by construction at 10 and 20 ms, and those
+    // are exactly the durations the operating-point guard refuses -- so they arrive here with
+    // nothing decoded, which is when the probe is asked. Without the gate a genuine MLow stream at
+    // either duration is promoted to Opus and the call breaks in both directions, for good.
+    #[test]
+    fn a_genuine_mlow_stream_at_a_colliding_duration_is_never_promoted() {
+        // (TOC, the stream's own timestamp step)
+        for (toc, span) in [(0x00u8, 160u32), (0x08, 320), (0x40, 160), (0x48, 320)] {
+            let mut probe = InboundCodecProbe::default();
+            for len in 1..120usize {
+                let packet: Vec<u8> = core::iter::once(toc)
+                    .chain((0..len).map(|i| (i % 251) as u8))
+                    .collect();
+                assert_eq!(
+                    probe.observe(&packet, AudioCodec::Mlow, Some(span), 16_000, 960),
+                    None,
+                    "TOC {toc:#04x} at a {span}-sample cadence is MLow, not Opus"
+                );
+            }
+        }
+    }
+
+    // A peer pacing at something other than what the call negotiated is not the stream we
+    // negotiated, whatever its payload happens to parse as.
+    #[test]
+    fn a_cadence_other_than_the_negotiated_step_promotes_nothing() {
+        let mut probe = InboundCodecProbe::default();
+        // 20 ms of Opus, consistently, at a 20 ms cadence: internally consistent and still refused,
+        // because the call negotiated 60 ms.
+        let packet: Vec<u8> = core::iter::once(0x48u8).chain(0..40u8).collect();
+        for _ in 0..10 {
+            assert_eq!(
+                probe.observe(&packet, AudioCodec::Mlow, Some(320), 16_000, 960),
+                None
+            );
+        }
     }
 
     // The arithmetic proof, exercised through the probe rather than the parser: no payload the MLow
@@ -233,7 +291,7 @@ mod tests {
                     .chain((0..len).map(|i| (i % 251) as u8))
                     .collect();
                 assert_eq!(
-                    probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000),
+                    probe.observe(&packet, AudioCodec::Mlow, Some(960), 16_000, 960),
                     None,
                     "TOC {toc:#04x} with a {len}-byte body must never promote"
                 );

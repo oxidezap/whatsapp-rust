@@ -163,19 +163,42 @@ mod tests {
     // The indicator is unreachable as a real TOC because the encoder never emits a SID frame that
     // also carries FEC. If this ever stopped holding, an ordinary frame would be split as an
     // envelope and the call would break in a new way.
+    //
+    // Asserted against the REAL parser, not a local re-derivation of the bit layout: a test that
+    // recomputes the classification it is checking proves only that two copies of the same
+    // expression agree.
     #[test]
     fn the_indicator_is_not_reachable_as_an_ordinary_toc() {
+        use super::super::toc::parse_mlow_toc;
+
+        let mut envelopes = 0;
         for byte in 0..=255u8 {
-            let sid = byte & 0x80 != 0;
-            let fec = byte & 0x02 != 0;
-            let celt_escape = byte & 0xC0 == 0xC0;
+            let toc = parse_mlow_toc(byte);
             let looks_like_envelope = is_multiframe(&[byte, 0x01, 0xaa]);
-            assert_eq!(
-                looks_like_envelope,
-                sid && fec && !celt_escape,
-                "byte {byte:#04x} classified inconsistently"
+            if !looks_like_envelope {
+                continue;
+            }
+            envelopes += 1;
+            // Every byte the splitter claims is an envelope must be one the encoder cannot emit as
+            // a frame: it declares SID, and the SID path is the one that would have silenced it.
+            assert!(
+                toc.sid,
+                "envelope indicator {byte:#04x} would otherwise be a decodable frame"
             );
+            assert!(
+                !toc.std_opus,
+                "the CELT escape must not be mistaken for an envelope ({byte:#04x})"
+            );
+            // A SID never carries FEC in anything the encoder produces, which is what makes the
+            // bit-1 collision safe. `MlowToc::fec` is `vad && bit1`, and a SID has vad clear, so the
+            // raw bit is what has to be checked here.
+            assert_eq!(byte & 0x02, 0x02);
+            assert!(!toc.fec, "a SID frame never reports FEC");
         }
+        assert_eq!(
+            envelopes, 32,
+            "the indicator space is bits 7 and 1 set with bit 6 clear"
+        );
     }
 
     #[test]
@@ -260,21 +283,34 @@ mod tests {
         );
     }
 
+    // Every input either splits into a sane set of sub-frames or is refused, and the refusals are
+    // counted so a splitter that started rejecting everything could not pass by never entering the
+    // `Ok` arm.
     #[test]
-    fn no_input_makes_the_splitter_panic() {
+    fn every_short_input_either_splits_sanely_or_is_refused() {
+        let (mut ok, mut refused) = (0usize, 0usize);
         for count in 0..=255u8 {
             for len in 0..24usize {
                 let packet: Vec<u8> = [0x92u8, count]
                     .into_iter()
                     .chain((0..len).map(|i| (i % 253) as u8))
                     .collect();
-                if let Ok(frames) = split_multiframe(&packet) {
-                    assert!((1..=MAX_FRAMES).contains(&frames.len()));
-                    assert!(frames.iter().all(|frame| !frame.is_empty()));
-                    let total: usize = frames.iter().map(|frame| frame.len()).sum();
-                    assert!(total <= packet.len());
+                match split_multiframe(&packet) {
+                    Ok(frames) => {
+                        ok += 1;
+                        assert!((1..=MAX_FRAMES).contains(&frames.len()));
+                        assert!(frames.iter().all(|frame| !frame.is_empty()));
+                        let total: usize = frames.iter().map(|frame| frame.len()).sum();
+                        assert!(total <= packet.len());
+                    }
+                    Err(_) => refused += 1,
                 }
             }
         }
+        assert!(
+            ok > 0,
+            "a splitter that refuses everything must not pass this test"
+        );
+        assert!(refused > 0, "malformed envelopes must still be refused");
     }
 }

@@ -10,33 +10,44 @@
 //! is not sending Opus has no reason to make them agree.
 //!
 //! Deliberately no libopus: this has to run on wasm32 and ESP32, where the C library is not
-//! available, and a structural read needs no codec anyway. It allocates nothing and touches at most
-//! three bytes of the payload.
+//! available, and a structural read needs no codec anyway. It allocates nothing and, apart from
+//! walking a code-3 padding run, reads a handful of bytes at the front of the packet.
 
 /// Which Opus mode the configuration selects. Not used for the decision, but a caller logging a
 /// rejected packet wants to know whether it looked like SILK or CELT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpusMode {
+    /// Linear-prediction coder; what WhatsApp's standard-Opus path uses at 16 kHz.
     Silk,
+    /// SILK below and CELT above the crossover, for super-wideband and fullband.
     Hybrid,
+    /// Transform coder, and the only mode MLOW's in-profile escape carries.
     Celt,
 }
 
 /// The declared audio bandwidth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpusBandwidth {
+    /// 4 kHz.
     Narrow,
+    /// 6 kHz.
     Medium,
+    /// 8 kHz. The band a 16 kHz WhatsApp audio stream uses.
     Wide,
+    /// 12 kHz.
     SuperWide,
+    /// 20 kHz.
     Full,
 }
 
 /// What a well-formed Opus packet header says about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpusPacketShape {
+    /// Coding mode the configuration selects.
     pub mode: OpusMode,
+    /// Audio bandwidth the configuration declares.
     pub bandwidth: OpusBandwidth,
+    /// Two channels rather than one.
     pub stereo: bool,
     /// Frames chained in this packet, 1..=48.
     pub frames: u8,
@@ -111,25 +122,32 @@ pub fn opus_packet_shape(payload: &[u8]) -> Option<OpusPacketShape> {
             if frames == 0 || frames > MAX_FRAMES {
                 return None;
             }
-            // Padding is a run of 255s followed by a final byte; it has to fit in the packet. The
-            // exact bytes do not matter here, only that the declared padding does not overrun.
+            let mut remaining = after;
+            // Padding is a run of 255s ended by a final byte. Each 255 contributes 254 bytes and
+            // costs another length byte, so the total ACCUMULATES; checking each byte against what
+            // is left, without adding them up, accepts a packet declaring far more padding than the
+            // packet contains. `split_multiframe` gets this right and this used to not, which is
+            // how two Opus padding readers in one change came to disagree.
+            let mut padding = 0usize;
             if count_byte & 0x40 != 0 {
-                let mut remaining = after;
                 loop {
                     let (&pad, next) = remaining.split_first()?;
                     remaining = next;
-                    if pad != 255 {
-                        let total: usize = usize::from(pad);
-                        if total > remaining.len() {
-                            return None;
-                        }
+                    if pad == 255 {
+                        padding = padding.checked_add(254)?;
+                    } else {
+                        padding = padding.checked_add(usize::from(pad))?;
                         break;
                     }
-                    // Each 255 contributes 254 bytes of padding plus another length byte.
-                    if remaining.len() < 254 {
-                        return None;
-                    }
                 }
+            }
+            let bodies = remaining.len().checked_sub(padding)?;
+            // CBR (the VBR bit clear) means every frame is the same size, so RFC 6716 section 3.2.5
+            // requires the remaining bytes to divide evenly by the frame count. Without this the
+            // reader accepts packets libopus refuses, and each one it accepts is extra surface for
+            // the codec probe to mistake for the codec we are looking for.
+            if count_byte & 0x80 == 0 && !bodies.is_multiple_of(usize::from(frames)) {
+                return None;
             }
             frames
         }
@@ -279,6 +297,40 @@ mod tests {
         // Code 3 with the padding bit set and a padding length past the end.
         let packet = [0x0bu8, 0x41, 200, 1, 2];
         assert_eq!(opus_packet_shape(&packet), None);
+    }
+
+    // Each 255 in a padding run is worth 254 bytes and costs another length byte, so the run has to
+    // be summed. Checking each byte on its own accepts a packet claiming far more padding than it
+    // carries -- and libopus rejects exactly that packet.
+    #[test]
+    fn a_padding_run_accumulates_rather_than_being_checked_byte_by_byte() {
+        // Three 255s plus a 3: 3*254 + 3 = 765 bytes of padding declared inside a 300-byte body.
+        let packet: Vec<u8> = [0x0bu8, 0x43, 255, 255, 255, 3]
+            .into_iter()
+            .chain((0..300u32).map(|i| i as u8))
+            .collect();
+        assert_eq!(opus_packet_shape(&packet), None);
+    }
+
+    // CBR means every frame is the same size, so the remaining bytes must divide by the frame
+    // count. Accepting a packet that does not is extra surface for the codec probe to trip over.
+    #[test]
+    fn a_constant_bitrate_packet_whose_body_does_not_divide_is_rejected() {
+        // Code 3, VBR clear, three frames, ten body bytes.
+        let packet: Vec<u8> = [0x0bu8, 0x03].into_iter().chain(0..10u8).collect();
+        assert_eq!(opus_packet_shape(&packet), None);
+        // Nine divides by three.
+        let packet: Vec<u8> = [0x0bu8, 0x03].into_iter().chain(0..9u8).collect();
+        assert_eq!(
+            opus_packet_shape(&packet).map(|shape| shape.frames),
+            Some(3)
+        );
+        // VBR set: the sizes are explicit, so divisibility says nothing.
+        let packet: Vec<u8> = [0x0bu8, 0x83].into_iter().chain(0..10u8).collect();
+        assert_eq!(
+            opus_packet_shape(&packet).map(|shape| shape.frames),
+            Some(3)
+        );
     }
 
     #[test]

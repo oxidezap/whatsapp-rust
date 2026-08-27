@@ -266,11 +266,28 @@ struct SrtpRecvStreams {
 }
 
 impl SrtpRecvStreams {
-    /// Borrow the ROC tracker and replay window for `ssrc`, creating them on first sight.
+    /// The rollover counter to authenticate `seq` against, WITHOUT allocating anything.
+    ///
+    /// A stream never seen before estimates from a fresh counter, which is what one would answer
+    /// anyway. Allocation is deliberately not done here: the SSRC is read from the unauthenticated
+    /// RTP header, so anyone able to inject datagrams could otherwise spend the whole stream table
+    /// on forged SSRCs before the peer's first real packet and leave the call permanently deaf.
+    fn estimate_roc(&self, ssrc: u32, seq: u16) -> u32 {
+        self.streams
+            .iter()
+            .find(|(known, _, _)| *known == ssrc)
+            .map_or_else(
+                || RecvRocTracker::default().estimate_roc(seq),
+                |(_, roc, _)| roc.estimate_roc(seq),
+            )
+    }
+
+    /// Borrow the state for an AUTHENTICATED packet's SSRC, creating it on first sight.
     ///
     /// `None` once the stream cap is reached, which drops the packet rather than evicting a live
-    /// stream: evicting would reset a rollover counter that a real stream is still using.
-    fn stream_mut(&mut self, ssrc: u32) -> Option<(&mut RecvRocTracker, &mut SrtpReplayWindow)> {
+    /// stream: evicting would reset a rollover counter that a real stream is still using. Reaching
+    /// the cap now requires that many distinct SSRCs to have each produced a packet with a valid tag.
+    fn commit_mut(&mut self, ssrc: u32) -> Option<(&mut RecvRocTracker, &mut SrtpReplayWindow)> {
         if let Some(index) = self.streams.iter().position(|(known, _, _)| *known == ssrc) {
             let (_, roc, replay) = &mut self.streams[index];
             return Some((roc, replay));
@@ -664,11 +681,10 @@ fn unprotect_srtp_packet(
     if without_tag.len() <= header_len {
         return None;
     }
-    // The SSRC comes from the unauthenticated header, so a forged one can only cause a lookup that
-    // fails its own tag a moment later. It cannot touch another stream's counter, which is exactly
-    // the property a single shared tracker did not have.
-    let (recv_roc, recv_replay) = recv_streams.stream_mut(header.ssrc)?;
-    let roc = recv_roc.estimate_roc(header.sequence_number);
+    // Estimate against this SSRC's own counter without allocating for it. The SSRC is read from the
+    // unauthenticated header, so committing state before the tag verifies would let anyone able to
+    // inject datagrams fill the stream table with forged SSRCs and leave the call deaf.
+    let roc = recv_streams.estimate_roc(header.ssrc, header.sequence_number);
     if !verify_warp_mi_tag(
         &recv_keys.auth_key,
         without_tag,
@@ -678,11 +694,12 @@ fn unprotect_srtp_packet(
     ) {
         return None;
     }
+    // Authenticated: only now is it safe to allocate state for this SSRC and advance its counter.
+    let (recv_roc, recv_replay) = recv_streams.commit_mut(header.ssrc)?;
     let index = (u64::from(roc) << 16) | u64::from(header.sequence_number);
     if !recv_replay.accept(index) {
         return None;
     }
-    // Authenticated: now it's safe to advance the rollover counter.
     recv_roc.commit_roc(roc, header.sequence_number);
     let cipher = &without_tag[header_len..];
     let plain = crypt_payload(recv_keys, header.ssrc, header.sequence_number, roc, cipher);
@@ -904,7 +921,7 @@ mod replay_stream_tests {
         let mut streams = SrtpRecvStreams::default();
         for seq in 0..64u64 {
             for ssrc in [0xAAAA_0001u32, 0xBBBB_0002] {
-                let (_, replay) = streams.stream_mut(ssrc).expect("within the cap");
+                let (_, replay) = streams.commit_mut(ssrc).expect("within the cap");
                 assert!(
                     replay.accept(seq),
                     "ssrc {ssrc:#x} seq {seq} must be accepted on its own timeline"
@@ -916,7 +933,7 @@ mod replay_stream_tests {
     #[test]
     fn a_replay_within_one_stream_is_still_rejected() {
         let mut streams = SrtpRecvStreams::default();
-        let (_, replay) = streams.stream_mut(1).expect("first stream");
+        let (_, replay) = streams.commit_mut(1).expect("first stream");
         assert!(replay.accept(10));
         assert!(!replay.accept(10), "a repeat is a replay");
         assert!(replay.accept(11));
@@ -928,14 +945,14 @@ mod replay_stream_tests {
     fn the_stream_table_is_bounded_and_refuses_rather_than_evicting() {
         let mut streams = SrtpRecvStreams::default();
         for ssrc in 0..SRTP_REPLAY_STREAM_CAP as u32 {
-            assert!(streams.stream_mut(ssrc).is_some());
+            assert!(streams.commit_mut(ssrc).is_some());
         }
         assert!(
-            streams.stream_mut(9999).is_none(),
+            streams.commit_mut(9999).is_none(),
             "past the cap the packet is dropped"
         );
         assert!(
-            streams.stream_mut(0).is_some(),
+            streams.commit_mut(0).is_some(),
             "an established stream keeps its state"
         );
     }
@@ -944,11 +961,11 @@ mod replay_stream_tests {
     #[test]
     fn each_stream_keeps_its_own_rollover_counter() {
         let mut streams = SrtpRecvStreams::default();
-        let (roc_a, _) = streams.stream_mut(1).expect("stream a");
+        let (roc_a, _) = streams.commit_mut(1).expect("stream a");
         roc_a.commit_roc(0, 0xffff);
-        let (roc_a, _) = streams.stream_mut(1).expect("stream a again");
+        let (roc_a, _) = streams.commit_mut(1).expect("stream a again");
         assert_eq!(roc_a.estimate_roc(0x0001), 1, "stream a wrapped");
-        let (roc_b, _) = streams.stream_mut(2).expect("stream b");
+        let (roc_b, _) = streams.commit_mut(2).expect("stream b");
         assert_eq!(
             roc_b.estimate_roc(0x0001),
             0,

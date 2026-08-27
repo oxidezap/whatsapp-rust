@@ -27,10 +27,11 @@ All current profiles signal `<audio enc="opus" rate="16000">`. The rate alone do
 RTP profile, and it never discriminates MLOW from Opus: every profile above signals 16000.
 
 PT 121 is MLOW's `mlow-red-1` redundancy. The shipped client also registers PT 122 as a second
-`mlow-1` when `enable_mlow_separate_pt_rx` is on, and the `_rx` props are **not** gated by the peer's
-capability while the `_tx` ones (indices 36 and 38) are: a client always registers what it can
-receive and only conditions what it sends. We do not announce index 38, so a peer with parity never
-sends us PT 122.
+`mlow-1` when `enable_mlow_separate_pt_rx` is on. Neither `_rx` prop is gated by the peer's
+capability, so a client always registers what it can receive; of the `_tx` pair only
+`enable_mlow_separate_pt_tx` (index 38) is gated, while `enable_red_pt_support_tx` is not, and index
+36 gates `enable_mlow_red` rather than a `_tx` prop. We announce 36 and not 38, so a peer with parity
+never sends us PT 122.
 
 ## Negotiation
 
@@ -64,6 +65,11 @@ Where the decision is applied differs by role, and neither needs a mutable `Audi
 - **caller**: it arrives with `<preaccept>`/`<accept>`, after setup. It rides the channel that
   already carries the answering device's LID (`PeerAnswer`), because both have to be applied before
   the first inbound packet.
+
+**Group calls are not covered.** The client's mutual AND walks every participant; ours reads one
+peer, because a 1:1 call has one. A group call with a participant outside the rollout stays on MLOW,
+and `GroupCallDevice::capability()` is public so the group path can read it when someone does that
+work. Stated here rather than left to be discovered.
 
 Mid-call the codec is swapped with `CallEngine::switch_audio_codec`, which accepts **only** the
 MLOW/Opus pair at 16 kHz, 60 ms, PT 120. Those two `AudioFormat`s agree on payload type, clock rate,
@@ -99,10 +105,21 @@ the duration its Opus header declares (`voip::opus_packet::opus_packet_shape`, a
 read with no libopus, so it works on wasm32 and ESP32) and the step its RTP timestamps advance by.
 Three consecutive agreements switch the decoder, once.
 
-For every packet the MLow decoder accepts today the two **cannot** agree, and that is arithmetic
-rather than sampling: such a TOC is in `{0x10..=0x13, 0x50..=0x53}`, each reads as an Opus config of
-2 or 10 (both 40 ms), every reachable duration is a multiple of 640 samples, and the stream's step is
-960. A test walks all eight TOCs at every body length to pin it.
+Two conditions have to hold together, and the second is easy to mistake for redundant:
+
+1. **The peer must be pacing at the cadence the call negotiated.** Without this the agreement is not
+   evidence at all. MLow reads TOC bits 4:3 as `{10, 20, 60, 120}` ms and an Opus SILK TOC reads the
+   *same bits* as `{10, 20, 40, 60}`, so the two grammars agree by construction at 10 and 20 ms — and
+   those are exactly the durations the operating-point guard refuses, which means they reach the
+   probe precisely because nothing decoded. A genuine MLow stream at either would otherwise be
+   promoted to Opus and the call would break in both directions, permanently.
+2. **At the negotiated 960-sample step the collision cannot happen.** The TOCs the decoder accepts
+   are the 24 bytes with bit 7 clear, bit 5 clear, bit 2 clear and bits 4:3 in `{01, 10, 11}`; each
+   reads as an Opus config of 1, 2, 9 or 10, every reachable total is a multiple of 320 or 640
+   samples, and 960 is neither.
+
+Tests pin both: one walks the colliding durations at their own cadences and one walks the 60 ms TOCs
+at every body length. Removing the cadence gate as "redundant" is what the first one exists to catch.
 
 A switch driven by content emits `CallEvent::AudioCodecSwitched { source: Content }`. That is worth
 acting on: it means our model of the peer is wrong, not just that one call was rescued.
@@ -118,9 +135,10 @@ loop:
 - `CallEvent::AudioReceptionStalled` when none arrives at all.
 
 They are deliberately distinct: one is a codec problem and the other is transport, and conflating
-them is how #1105 was mis-triaged for months. `voip::tap::PacketTap` is public and sees every relay
-datagram in both directions, which is the difference between the next media incident being a dump
-and being an investigation.
+them is how #1105 was mis-triaged for months. `voip::tap::PacketTap` is public: decorating a
+`RelayTransportFactory` with `TappedFactory` puts every relay datagram in both directions through
+your sink. The runtime does not yet expose a factory injection point for a live call, so that is
+reachable from a shell building its own transport rather than from a `CallHandle`.
 
 A build with no decoder for the negotiated codec does not pretend. It reports `AudioSilent` with
 `NoDecoderForNegotiatedCodec`, which is the one silence reason a consumer can act on.

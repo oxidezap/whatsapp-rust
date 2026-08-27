@@ -329,11 +329,15 @@ impl StanzaHandler for CallHandler {
                         // opposite: the official client rebuilds an unreadable blob as a version
                         // that answers false for every index, so it must read as an explicit Clear.
                         peer_mlow_bit = capability.map_or(CapabilityBit::Unknown, |capability| {
+                            // `ver` is NOT defaulted to 1 here, unlike the group-promotion parse
+                            // below. The client's deserializer treats a missing `ver` as an error
+                            // and rebuilds the capability with a version that answers false for
+                            // every index, so for codec selection a missing attribute has to read
+                            // as an explicit Clear. Only an absent `<capability>` node is Unknown.
+                            let version = capability
+                                .get_attr("ver")
+                                .and_then(|version| version.as_str().parse::<u32>().ok());
                             let bytes = capability.content_bytes().unwrap_or_default();
-                            let version = match capability.get_attr("ver") {
-                                None => Some(1),
-                                Some(version) => version.as_str().parse::<u32>().ok(),
-                            };
                             capability_bit(version, bytes, CAPABILITY_INDEX_MLOW_V1)
                         });
                         let device = if let Some(capability) = capability
@@ -3212,6 +3216,13 @@ mod tests {
             .try_recv()
             .expect("the receive pipeline must rekey to the actual answering device");
         assert_eq!(answer.answering_lid, routed_participant.to_string());
+        // The other half of what an `<accept>` teaches the caller. This fixture's peer announces the
+        // MLow capability, so the negotiated choice stands and nothing is asked to change; asserting
+        // it explicitly is what keeps the capability read from silently becoming a no-op.
+        assert_eq!(
+            answer.audio_codec, None,
+            "a peer that announced MLow changes nothing"
+        );
         client
             .call_registry()
             .remove_if_current("CALL-ID-0001", generation);

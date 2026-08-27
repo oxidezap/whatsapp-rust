@@ -87,12 +87,6 @@ pub struct MlowFrameReport {
     pub inactive_or_sid: u8,
 }
 
-impl MlowFrameReport {
-    fn bump(slot: &mut u8) {
-        *slot = slot.saturating_add(1);
-    }
-}
-
 /// Stateful pure-Rust MLow decoder. Decodes one RTP payload (a bare MLow frame, or a SplitRed
 /// packet when redundancy was negotiated) into a PCM frame at 16 kHz, one 20 ms internal frame
 /// per chained frame in the packet.
@@ -179,28 +173,39 @@ impl MlowDecoder {
     pub fn decode(&mut self, payload: &[u8]) -> Vec<f32> {
         self.report = MlowFrameReport::default();
         if payload.is_empty() {
-            MlowFrameReport::bump(&mut self.report.concealed);
+            self.report.concealed = self.report.concealed.saturating_add(1);
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         if self.redundancy > 0 {
             return match depack_split_red(payload) {
                 // the main (current) frame is last; its slice borrows `payload`, not `self`, so it
                 // can drive the decode directly (no copy).
+                //
+                // Through `decode_inner`, not `decode_frame`: a redundancy wrapper is chosen by the
+                // payload type, and nothing stops the frame inside it from being a multiframe
+                // envelope. Going straight to `decode_frame` would read that envelope's indicator
+                // as a SID and answer comfort noise -- the same total silence this triage exists to
+                // prevent, just reached through the RED payload type instead of the bare one.
                 Ok(frames) => match frames.last() {
-                    Some(main) => self.decode_frame(main.data),
+                    Some(main) => self.decode_inner(main.data),
                     None => self.decode_frame(&[]),
                 },
                 Err(e) => {
                     log::warn!("mlow RED depacketization failed: {e:?}");
-                    MlowFrameReport::bump(&mut self.report.concealed);
+                    self.report.concealed = self.report.concealed.saturating_add(1);
                     vec![0.0; OPUS_FRAME_SAMPS]
                 }
             };
         }
-        // The multiframe envelope is checked before the TOC is read, because under the TOC grammar
-        // its first byte reads as a SID: bit 7 set. A decoder that skips this check answers every
-        // packet of such a call with comfort noise and never reports anything, which is a total
-        // silence with no symptom at all.
+        self.decode_inner(payload)
+    }
+
+    /// Route one bare MLow payload: multiframe envelope, or a single frame.
+    ///
+    /// The envelope is checked before the TOC is read, because under the TOC grammar its first byte
+    /// reads as a SID (bit 7 set). A decoder that skips this check answers every packet of such a
+    /// call with comfort noise and reports nothing: total silence with no symptom at all.
+    fn decode_inner(&mut self, payload: &[u8]) -> Vec<f32> {
         if is_multiframe(payload) {
             return self.decode_multiframe(payload);
         }
@@ -224,7 +229,7 @@ impl MlowDecoder {
                         payload[0]
                     );
                 }
-                MlowFrameReport::bump(&mut self.report.concealed);
+                self.report.concealed = self.report.concealed.saturating_add(1);
                 self.last_packet_samps = OPUS_FRAME_SAMPS;
                 return vec![0.0; OPUS_FRAME_SAMPS];
             }
@@ -246,7 +251,7 @@ impl MlowDecoder {
                     self.malformed
                 );
             }
-            MlowFrameReport::bump(&mut self.report.concealed);
+            self.report.concealed = self.report.concealed.saturating_add(1);
             self.last_packet_samps = OPUS_FRAME_SAMPS;
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
@@ -263,7 +268,7 @@ impl MlowDecoder {
 
     fn decode_frame(&mut self, frame: &[u8]) -> Vec<f32> {
         if frame.is_empty() {
-            MlowFrameReport::bump(&mut self.report.concealed);
+            self.report.concealed = self.report.concealed.saturating_add(1);
             return vec![0.0; OPUS_FRAME_SAMPS];
         }
         let toc = parse_mlow_toc(frame[0]);
@@ -279,7 +284,7 @@ impl MlowDecoder {
                 "mlow: standard-opus TOC 0x{:02x} -> {out_len} samples silence",
                 frame[0]
             );
-            MlowFrameReport::bump(&mut self.report.off_point);
+            self.report.off_point = self.report.off_point.saturating_add(1);
             return vec![0.0; out_len];
         }
         // A SID (DTX/CNG) frame carries comfort noise rather than coded voice and is silenced without
@@ -296,7 +301,7 @@ impl MlowDecoder {
                 "mlow: SID TOC 0x{:02x} -> {samps} samples of silence",
                 frame[0]
             );
-            MlowFrameReport::bump(&mut self.report.inactive_or_sid);
+            self.report.inactive_or_sid = self.report.inactive_or_sid.saturating_add(1);
             return vec![0.0; samps];
         }
         // Operating-point guard for active frames: a different internal rate, the low_rate=1 2x160
@@ -324,7 +329,7 @@ impl MlowDecoder {
                     frame[0]
                 );
             }
-            MlowFrameReport::bump(&mut self.report.off_point);
+            self.report.off_point = self.report.off_point.saturating_add(1);
             return vec![0.0; silence_samps(self.last_packet_samps)];
         }
         let frames = frames.expect("the guard above rejected every unsupported duration");
@@ -474,12 +479,10 @@ impl MlowDecoder {
                     body
                 );
             }
-            MlowFrameReport::bump(&mut self.report.concealed);
+            self.report.concealed = self.report.concealed.saturating_add(1);
             return vec![0.0; out_len];
         }
-        for _ in 0..frames {
-            MlowFrameReport::bump(&mut self.report.decoded);
-        }
+        self.report.decoded = self.report.decoded.saturating_add(frames as u8);
 
         // Per-packet harmonic postfilter (the codec's final pitch comb + 48-sample group delay), run
         // once over the whole packet with the 24 per-40-block lags and the average normalized bitrate.
@@ -703,9 +706,6 @@ mod tests {
         assert_eq!(dec.last_packet_samps(), 3 * SMPL_INTF_LEN);
     }
 
-    /// A `VoA=00` packet is a normal frame carrying background noise, not a SID: the reference
-    /// decodes it, and with DTX off a peer sends nothing else during a pause. Silencing it drops
-    /// ~12% of a real stream on the floor while the call merely sounds quiet.
     /// The way the shipped client actually reaches a packet longer than its frame length.
     ///
     /// Its encoder caches a fixed three blocks of 20 ms, so `frame_length_ms = 120` produces two
@@ -761,6 +761,9 @@ mod tests {
         assert!(pcm.iter().all(|&s| s == 0.0));
     }
 
+    /// A `VoA=00` packet is a normal frame carrying background noise, not a SID: the reference
+    /// decodes it, and with DTX off a peer sends nothing else during a pause. Silencing it drops
+    /// ~12% of a real stream on the floor while the call merely sounds quiet.
     #[test]
     fn dtx_off_frames_decode_to_audio() {
         let frames: Vec<String> =

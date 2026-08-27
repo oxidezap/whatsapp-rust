@@ -66,7 +66,25 @@ the reference decoder, one record per frame, compared byte-for-byte by the Rust 
 | `pulse_vectors.json` | `smpl_pulse.rs` |
 | `gains_vectors.json` | `smpl_gains.rs` |
 | `rc_vectors.json` | `rangecoder.rs::range_decoder_matches_*` |
-| `toc_vectors.json` | `toc.rs::toc_matches_*` (full 256-TOC table, input-independent) |
+| `toc_vectors.json` | `toc.rs::toc_matches_*` (256-TOC table, input-independent; see the caveat below) |
+
+### `toc_vectors.json`: the escape range is stale, deliberately
+
+The `ms` column is authoritative for the 192 in-profile bytes and **obsolete for the 64 escape bytes**
+(`0xC0..=0xFF`). It records the RFC 6716 reading (`config = b >> 3`), which is not the layout MLOW's
+in-profile CELT escape uses: that is `0xC0 | mode << 2 | stereo << 1 | multi`, as
+`packetize_opus_for_mlow` writes it and `opus_smpl_decode_TOC` in the shipped module reads it. The
+two disagree on the duration for 56 of the 64.
+
+The fixture was **not** edited to agree with the corrected parser. `toc_matches_go_all_256` skips the
+`ms` assertion over that range and names why, and `escape_durations_agree_with_the_escape_writer`
+covers it instead by round-tripping every CELT configuration through this crate's own escape writer —
+an independent statement rather than the parser checking itself.
+
+Editing an oracle until it agrees with the code is the most expensive failure mode this directory
+has: a silence fixture in here had been zeroed to match a buggy decoder, and the test over it passed
+for months. Regenerate from the pinned oracle or narrow the assertion and say so; never split the
+difference.
 
 ## External-encoder frames
 

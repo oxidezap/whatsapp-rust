@@ -1522,9 +1522,6 @@ impl CallRegistry {
         true
     }
 
-    /// Attach (or replace) the media task for the call registered under `generation`. If the call
-    /// was removed or superseded by a newer generation, the handle is aborted immediately so its
-    /// task can't outlive the call.
     /// Install the cell the drive loop publishes media counters into.
     pub fn set_media_stats(
         &self,
@@ -1551,6 +1548,9 @@ impl CallRegistry {
             .unwrap_or_default()
     }
 
+    /// Attach (or replace) the media task for the call registered under `generation`. If the call
+    /// was removed or superseded by a newer generation, the handle is aborted immediately so its
+    /// task can't outlive the call.
     pub fn set_media_task(&self, call_id: &str, generation: u64, handle: AbortHandle) {
         let aborted = {
             let mut map = self.active_calls();
@@ -2463,9 +2463,6 @@ impl CallRegistry {
             .is_some_and(|entry| entry.generation == generation)
     }
 
-    /// Caller side: rekey recv to the device that answered. One-shot — the sender is TAKEN, so a
-    /// duplicate/late `<accept>` from another device is a no-op (first answerer wins, matching WA Web).
-    /// Silently ignored when absent (no engine yet, an incoming call, or the call is torn down).
     /// The audio codec a peer's `<capability>` selects for a live call, or `None` when the
     /// negotiated choice already stands.
     ///
@@ -2492,6 +2489,12 @@ impl CallRegistry {
         })
     }
 
+    /// Caller side: deliver what the callee's `<accept>` taught us — the answering device's LID and
+    /// the codec its capability selects — so the drive loop applies both before media flows.
+    ///
+    /// One-shot: the sender is TAKEN, so a duplicate or late `<accept>` from another device is a
+    /// no-op (first answerer wins, matching WA Web). Silently ignored when absent (no engine yet, an
+    /// incoming call, or the call is torn down).
     pub fn send_rekey(&self, call_id: &str, answer: crate::voip::driver::PeerAnswer) {
         let tx = self
             .active_calls()

@@ -5,8 +5,11 @@
 //! refused, and a jitter buffer trimming its own head all returned without leaving a trace. A call
 //! that carried no audio and a call where nobody spoke produced identical observations.
 //!
-//! The rule this module exists to enforce: **every `return` on the receive path increments exactly
-//! one named counter.** The counters are per call and die with it, which is why they are not in
+//! The rule this module exists to enforce: **every `return` that discards a peer's audio increments
+//! exactly one named counter.** The setup guards that precede it (no media plane, no PCM state, a
+//! call that is not the one this packet belongs to) are deliberately not counted: they fire before
+//! a packet is a packet, and counting them would bury the discards that mean something. The counters
+//! are per call and die with it, which is why they are not in
 //! [`crate::stats::SessionStats`] — that surface describes the WhatsApp session socket, and
 //! `agent_docs/observability.md` keeps the two apart deliberately.
 //!
@@ -64,21 +67,24 @@ pub struct CallMediaStats {
 impl CallMediaStats {
     /// Audio units that actually reached a consumer, whichever I/O mode is in use.
     ///
-    /// The two modes cannot be summed blindly elsewhere: a PCM call never increments
-    /// `audio_frames_delivered` and an encoded call never increments `audio_frames_decoded`, so the
-    /// watchdog needs one number that means "audio came out" in both.
+    /// The modes cannot be summed blindly elsewhere: a PCM/MLOW call increments
+    /// `audio_frames_decoded`, a PCM call rescued onto an injected codec increments
+    /// `foreign_frames_decoded`, and an encoded call increments `audio_frames_delivered`. A consumer
+    /// asking "is this call carrying audio" needs one number that means that in all three.
     #[must_use]
     pub const fn audio_produced(&self) -> u32 {
         self.audio_frames_decoded
             .saturating_add(self.audio_frames_delivered)
+            .saturating_add(self.foreign_frames_decoded)
     }
 }
 
 /// A snapshot of [`CallMediaStats`] the drive loop publishes for a consumer to read.
 ///
 /// The engine keeps plain `u32` because it is sans-io and single-threaded; this is the one place the
-/// numbers cross a task boundary. Published on the health tick rather than per packet: a diagnostic
-/// counter that is at most half a second stale costs nothing, and a lock per inbound packet would.
+/// numbers cross a task boundary. The drive loop republishes whenever a counter moved, which on a
+/// live call is most iterations, since `rtp_received` moves on every authenticated packet. That is
+/// an uncontended lock at roughly the packet rate; measured, it does not appear in a profile.
 #[derive(Debug, Default)]
 pub struct MediaStatsCell(std::sync::Mutex<CallMediaStats>);
 
@@ -162,6 +168,8 @@ pub(crate) struct AudioHealthWatch {
     window_start: Millis,
     window_rtp: u32,
     window_produced: u32,
+    /// Arrivals since media came up, used only to tell "nothing arrived" from "nothing worked".
+    total_arrivals: u32,
     /// Start of the current uninterrupted silence, for a monotonic `silent_for_ms`.
     silent_since: Option<Millis>,
     last_alarm_at: Option<Millis>,
@@ -176,6 +184,7 @@ impl Default for AudioHealthWatch {
             window_start: 0,
             window_rtp: 0,
             window_produced: 0,
+            total_arrivals: 0,
             silent_since: None,
             last_alarm_at: None,
             stall_reported: false,
@@ -200,8 +209,10 @@ impl AudioHealthWatch {
         self.deadline
     }
 
+    /// One audio RTP packet arrived, whether or not it went on to authenticate or decode.
     pub(crate) fn on_rtp(&mut self) {
         self.window_rtp = self.window_rtp.saturating_add(1);
+        self.total_arrivals = self.total_arrivals.saturating_add(1);
     }
 
     pub(crate) fn on_audio_produced(&mut self) {
@@ -218,9 +229,11 @@ impl AudioHealthWatch {
         }
         self.deadline = now.saturating_add(HEALTH_TICK_MS);
 
-        // Nothing at all has arrived: a transport problem. Reported once, because a stalled call
-        // does not become more stalled and the consumer already has the timestamp.
-        if stats.rtp_received == 0 && stats.srtp_unprotect_failed == 0 {
+        // Nothing at all has ARRIVED: a transport problem, distinct from packets arriving that we
+        // cannot turn into sound. `window_rtp` counts arrivals rather than authenticated packets,
+        // so a call whose every packet fails its tag falls through to the silence rule below with a
+        // full window, which is where it belongs -- `dominant_reason` then names the failing tags.
+        if self.total_arrivals == 0 {
             let elapsed = now.saturating_sub(self.started_at);
             if !self.stall_reported && elapsed >= STALL_AFTER_MS {
                 self.stall_reported = true;
@@ -235,6 +248,10 @@ impl AudioHealthWatch {
             return None;
         }
         let (rtp, produced) = (self.window_rtp, self.window_produced);
+        // Captured BEFORE the window rolls: the silence being reported started when this window
+        // did, not now. Taking it after would make every first alarm claim zero milliseconds of
+        // silence despite the two full seconds that authorised it.
+        let window_began = self.window_start;
         self.window_start = now;
         self.window_rtp = 0;
         self.window_produced = 0;
@@ -247,7 +264,7 @@ impl AudioHealthWatch {
             return None;
         }
 
-        let since = *self.silent_since.get_or_insert(self.window_start);
+        let since = *self.silent_since.get_or_insert(window_began);
         let silent_for_ms = now.saturating_sub(since);
         let due = self
             .last_alarm_at
@@ -420,6 +437,21 @@ mod tests {
         );
     }
 
+    // Packets arriving on a payload type the profile does not accept never authenticate, so
+    // `rtp_received` stays zero and this is the only counter that explains the silence.
+    #[test]
+    fn an_unexpected_payload_type_is_named_when_nothing_authenticates() {
+        let stats = CallMediaStats {
+            rtp_received: 0,
+            rtp_payload_type_unexpected: 200,
+            ..CallMediaStats::default()
+        };
+        assert_eq!(
+            dominant_reason(&stats),
+            AudioSilenceReason::UnexpectedPayloadType
+        );
+    }
+
     #[test]
     fn flapping_outranks_frame_rejection() {
         let stats = CallMediaStats {
@@ -432,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_produced_sums_both_io_modes() {
+    fn audio_produced_covers_every_way_audio_reaches_a_consumer() {
         let pcm = CallMediaStats {
             audio_frames_decoded: 7,
             ..CallMediaStats::default()
@@ -441,15 +473,40 @@ mod tests {
             audio_frames_delivered: 9,
             ..CallMediaStats::default()
         };
+        let rescued = CallMediaStats {
+            foreign_frames_decoded: 4,
+            ..CallMediaStats::default()
+        };
         assert_eq!(pcm.audio_produced(), 7);
         assert_eq!(encoded.audio_produced(), 9);
+        assert_eq!(
+            rescued.audio_produced(),
+            4,
+            "a rescued call is carrying audio"
+        );
     }
 
+    // A stream long enough to saturate a counter must still be diagnosable: the alarm compares
+    // against a minimum, so a pinned counter has to stay pinned rather than wrap to zero and make a
+    // silent call look like a quiet one.
     #[test]
-    fn counters_saturate_instead_of_wrapping() {
+    fn a_saturated_arrival_count_still_reports_the_call_as_silent() {
         let mut watch = armed(0);
         watch.window_rtp = u32::MAX;
+        watch.total_arrivals = u32::MAX;
         watch.on_rtp();
-        assert_eq!(watch.window_rtp, u32::MAX);
+        assert_eq!(watch.window_rtp, u32::MAX, "pinned, not wrapped");
+        let stats = CallMediaStats {
+            rtp_received: u32::MAX,
+            mlow_off_point_dropped: 1,
+            ..CallMediaStats::default()
+        };
+        assert!(
+            matches!(
+                watch.poll(2_100, &stats),
+                Some(AudioHealthAlarm::Silent { .. })
+            ),
+            "a saturated counter must not turn a silent call quiet"
+        );
     }
 }

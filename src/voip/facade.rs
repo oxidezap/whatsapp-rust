@@ -415,7 +415,6 @@ impl<'a> AcceptCall<'a> {
             let addr = socket_addr_from_config(&config)?;
             let mut engine = CallEngine::new(config, Box::new(RandTxIds))
                 .map(with_platform_audio_codec)
-                .map(with_platform_audio_codec)
                 .map_err(|error| CallError::Setup(error.to_string()))?;
             engine
                 .configure_group(GroupEngineConfig {
@@ -4884,6 +4883,87 @@ mod tests {
         );
         session.audio_format = Some(AudioFormat::MLOW_16KHZ_60MS);
         RegisteredCall::new(client, session).await
+    }
+
+    /// An `<offer>` whose `<capability>` carries the given blob, or none at all.
+    fn offer_with_capability(capability: Option<(u32, Vec<u8>)>) -> IncomingCall {
+        let peer_device = capability
+            .map(|(version, bytes)| GroupCallDevice::new(caller()).with_capability(version, bytes));
+        incoming_offer(false).with_peer_device_for_test(peer_device)
+    }
+
+    // The callee half of the #1105 fix, and the cheaper of the two: the peer's capability is in the
+    // offer, before anything is fixed, so the call simply starts on the right codec. It had no test.
+    #[test]
+    fn a_callee_starts_on_opus_when_the_offer_clears_the_mlow_bit() {
+        use wacore::stanza::call::{CAPABILITY_OFFER, CAPABILITY_STANDARD_OPUS_OFFER};
+        use wacore::voip::AudioCodec;
+
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&outside_rollout, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus),
+            "a peer that cannot decode MLOW must not be sent it"
+        );
+
+        let inside_rollout = offer_with_capability(Some((1, CAPABILITY_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&inside_rollout, AudioFormat::MLOW_16KHZ_60MS),
+            None,
+            "both sides asked for MLOW, so nothing changes"
+        );
+
+        assert_eq!(
+            peer_selected_codec_from_offer(
+                &offer_with_capability(None),
+                AudioFormat::MLOW_16KHZ_60MS
+            ),
+            None,
+            "a peer that announced nothing resets nothing"
+        );
+    }
+
+    // A consumer that deliberately configured a profile outside the swappable pair keeps it: the
+    // 48 kHz RFC 7587 clock is not something a capability bit may silently change.
+    #[test]
+    fn a_profile_outside_the_swappable_pair_is_left_exactly_as_configured() {
+        use wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER;
+
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        for format in [
+            AudioFormat::OPUS_RFC7587_16KHZ_60MS,
+            AudioFormat::OPUS_RFC7587_48KHZ_60MS,
+            AudioFormat::OPUS_MLOW_16KHZ_60MS,
+        ] {
+            assert_eq!(
+                peer_selected_codec_from_offer(&outside_rollout, format),
+                None,
+                "{format:?} is not swappable and must be preserved"
+            );
+        }
+    }
+
+    // A blob the peer sent that cannot be read resets everything, unlike a blob it never sent. The
+    // two are opposite directions and getting them the same way round is the shape of #1105.
+    #[test]
+    fn an_unreadable_offer_capability_downgrades_but_an_absent_one_does_not() {
+        use wacore::voip::AudioCodec;
+
+        // Present, valid `ver`, but no bitmask at all.
+        let empty = offer_with_capability(Some((1, Vec::new())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&empty, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus)
+        );
+        // A version below the one index 31 belongs to answers false for everything.
+        let stale =
+            offer_with_capability(Some((0, vec![0x00, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13])));
+        assert_eq!(
+            peer_selected_codec_from_offer(&stale, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus)
+        );
     }
 
     #[tokio::test]

@@ -340,6 +340,7 @@ impl RtpReceptionStats {
     }
 
     /// The SSRC of the stream currently being tracked, if any.
+    #[cfg(feature = "voip-mlow")]
     pub(crate) fn ssrc(&self) -> Option<u32> {
         self.ssrc
     }
@@ -348,6 +349,7 @@ impl RtpReceptionStats {
     ///
     /// `None` until two consecutive in-order packets have been seen, and reset with the stream when
     /// the SSRC changes, because a renumbered stream is a new statement and not a continuation.
+    #[cfg(any(feature = "voip-mlow", test))]
     pub(crate) fn frame_span(&self) -> Option<u32> {
         self.frame_span
     }
@@ -613,6 +615,98 @@ pub(crate) fn build_whatsapp_sender_report_with_sdes(
     let sdes = build_whatsapp_source_description(local_ssrc, cname, profile_extension);
     sender_report.extend_from_slice(&sdes);
     sender_report
+}
+
+#[cfg(test)]
+mod frame_span_tests {
+    use super::*;
+
+    const CLOCK: u32 = 16_000;
+    const SSRC: u32 = 0x5741_0001;
+
+    fn observe(stats: &mut RtpReceptionStats, seq: u16, timestamp: u32, ssrc: u32) {
+        stats.observe(ssrc, seq, timestamp, u64::from(seq) * 60, CLOCK);
+    }
+
+    // The number the whole codec decision rests on. `codec_probe` compares the duration a packet's
+    // Opus header declares against this, and the arithmetic that makes a false promotion impossible
+    // assumes it is the negotiated 960. Nothing exercised the producer.
+    #[test]
+    fn two_consecutive_packets_yield_the_step_between_them() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        assert_eq!(
+            stats.frame_span(),
+            None,
+            "one packet is not a difference yet"
+        );
+        observe(&mut stats, 2, 1_960, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+        observe(&mut stats, 3, 2_920, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+    }
+
+    // A reordered or retransmitted packet produces a backwards difference, which `wrapping_sub`
+    // turns into an enormous positive number. One such sample must not be able to move a codec
+    // decision, so the span holds its last good value.
+    #[test]
+    fn a_reordered_packet_does_not_move_the_span() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        observe(&mut stats, 2, 1_960, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+        observe(&mut stats, 3, 1_000, SSRC);
+        assert_eq!(
+            stats.frame_span(),
+            Some(960),
+            "a backwards timestamp is not a new cadence"
+        );
+    }
+
+    // A difference larger than a second of audio is not a frame duration, whatever caused it.
+    #[test]
+    fn an_absurd_forward_jump_is_ignored() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        observe(&mut stats, 2, 1_960, SSRC);
+        observe(&mut stats, 3, 1_960 + CLOCK + 1, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+    }
+
+    // A renumbered stream restarts the timestamp sequence, so differences across the change are not
+    // comparable and the span must not carry over.
+    #[test]
+    fn a_new_ssrc_resets_the_span() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        observe(&mut stats, 2, 1_960, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+        observe(&mut stats, 3, 5_000, 0xDEAD_BEEF);
+        assert_eq!(
+            stats.frame_span(),
+            None,
+            "a new stream has no difference yet"
+        );
+    }
+
+    // The 16-bit RTP timestamp space wraps; the difference across a wrap is still the step.
+    #[test]
+    fn the_span_survives_a_timestamp_wrap() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, u32::MAX - 400, SSRC);
+        observe(&mut stats, 2, 559, SSRC);
+        assert_eq!(stats.frame_span(), Some(960));
+    }
+
+    // A peer repeating a timestamp is not advancing, and a zero step would make the probe compare
+    // against nothing.
+    #[test]
+    fn a_repeated_timestamp_does_not_produce_a_zero_span() {
+        let mut stats = RtpReceptionStats::default();
+        observe(&mut stats, 1, 1_000, SSRC);
+        observe(&mut stats, 2, 1_000, SSRC);
+        assert_eq!(stats.frame_span(), None);
+    }
 }
 
 #[cfg(test)]

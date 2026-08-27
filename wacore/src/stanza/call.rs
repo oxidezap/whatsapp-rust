@@ -502,6 +502,11 @@ const fn without_mlow_capability(mut capability: [u8; 7]) -> [u8; 7] {
 ///   feature stays on. Our own video `<accept>` omits the blob, so this is not hypothetical;
 /// - a peer whose blob is unparseable falls back to a capability of version -1, against which every
 ///   query answers false, so **everything** resets.
+///
+/// Deliberately NOT `#[non_exhaustive]`, unlike its neighbours in this change: a bit is set, clear,
+/// or unstated, and there is no fourth answer for a future version to add. Callers benefit from the
+/// compiler forcing them to decide all three, because getting the last two the same way round is
+/// the bug this type exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityBit {
     /// The peer announced the index.
@@ -516,18 +521,22 @@ pub enum CapabilityBit {
 /// Read one index out of a peer `<capability>` blob.
 ///
 /// `version` is the `ver` attribute of the node, and `bytes` its content. The bit lives at byte
-/// `index / 8` of the bitmask, LSB-first within the byte, which is what
-/// [`without_mlow_capability`] already assumes when it clears `capability[5] & 0x80`.
+/// `index / 8` of the bitmask, LSB-first within the byte, which is the same arithmetic the
+/// `CAPABILITY_STANDARD_OPUS_*` blobs assume: clearing index 31 is `capability[5] &= 0x7f`.
 ///
 /// A blob whose declared length runs past its content, or whose version is below the one the index
 /// belongs to, reads as [`CapabilityBit::Clear`]: the official client's version gate is
 /// `if caps.version < (code >> 16) { return false }`, and its invalid-blob fallback installs
 /// version -1, so both paths answer false rather than "unknown".
+///
+/// **An empty `bytes` is `Clear`, not `Unknown`.** The client's fallback fires on
+/// `blob == null || ver <= 0 || len <= 0`, so a `<capability>` that is present and carries nothing
+/// resets everything. Only an ABSENT node is `Unknown`, and that distinction belongs to the caller,
+/// which is the one that can see whether the node existed: pass [`CapabilityBit::Unknown`] yourself
+/// when there was no node. Getting this backwards keeps MLow enabled against a peer the client
+/// would have downgraded, which is the exact shape of issue #1105.
 #[must_use]
 pub fn capability_bit(version: Option<u32>, bytes: &[u8], index: u32) -> CapabilityBit {
-    if bytes.is_empty() {
-        return CapabilityBit::Unknown;
-    }
     // An unparseable `ver` is not the same as a missing one: the client rebuilds the capability
     // with a version that fails every query, so it must read as Clear.
     let Some(version) = version else {
@@ -1172,10 +1181,13 @@ mod capability_tests {
     // reason `CapabilityBit` has three states is that writing them the same way is easy.
     #[test]
     fn an_absent_blob_is_unknown_and_an_unreadable_one_is_clear() {
+        // A node that is present and carries nothing is one of the three conditions that send the
+        // client to its version -1 fallback, against which every query answers false. Reading it as
+        // "no evidence" would keep MLow on against a peer that cannot decode it.
         assert_eq!(
             capability_bit(Some(1), &[], CAPABILITY_INDEX_MLOW_V1),
-            CapabilityBit::Unknown,
-            "no blob is not evidence"
+            CapabilityBit::Clear,
+            "an empty blob is an unreadable one, not an absent one"
         );
         assert_eq!(
             capability_bit(None, &CAPABILITY_OFFER, CAPABILITY_INDEX_MLOW_V1),
