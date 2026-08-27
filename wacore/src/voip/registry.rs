@@ -236,7 +236,7 @@ struct CallEntry {
     generation: u64,
     /// Caller-only, one-shot: delivers the answering device LID to the drive loop so it can rekey
     /// recv. Taken on first use (a duplicate `<accept>` finds `None`); dropped with the entry.
-    rekey_tx: Option<async_channel::Sender<String>>,
+    rekey_tx: Option<async_channel::Sender<crate::voip::driver::PeerAnswer>>,
     /// The call's consumer-facing event queue (same channel `CallHandle::events()` reads), so the
     /// SIGNALING handler can surface `<video state>` changes next to the engine's events.
     event_tx: Option<CallEventQueue>,
@@ -1758,7 +1758,7 @@ impl CallRegistry {
         &self,
         call_id: &str,
         generation: u64,
-        tx: async_channel::Sender<String>,
+        tx: async_channel::Sender<crate::voip::driver::PeerAnswer>,
     ) {
         if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.generation == generation
@@ -2466,13 +2466,39 @@ impl CallRegistry {
     /// Caller side: rekey recv to the device that answered. One-shot — the sender is TAKEN, so a
     /// duplicate/late `<accept>` from another device is a no-op (first answerer wins, matching WA Web).
     /// Silently ignored when absent (no engine yet, an incoming call, or the call is torn down).
-    pub fn send_rekey(&self, call_id: &str, answering_lid: String) {
+    /// The audio codec a peer's `<capability>` selects for a live call, or `None` when the
+    /// negotiated choice already stands.
+    ///
+    /// The gate is mutual: MLow survives only if we asked for it **and** the peer announced it. A
+    /// peer that announced nothing changes nothing, which is what the official client does with a
+    /// participant that sent no blob.
+    pub fn peer_selected_audio_codec(
+        &self,
+        call_id: &str,
+        peer: crate::stanza::call::CapabilityBit,
+    ) -> Option<crate::voip::audio::AudioCodec> {
+        use crate::voip::audio::AudioCodec;
+
+        let format = self
+            .active_calls()
+            .get(call_id)
+            .and_then(|entry| entry.session.audio_format)?;
+        let local_mlow = format.codec == AudioCodec::Mlow;
+        let effective_mlow = crate::stanza::call::mlow_after_peer_capability(local_mlow, peer);
+        (effective_mlow != local_mlow).then_some(if effective_mlow {
+            AudioCodec::Mlow
+        } else {
+            AudioCodec::Opus
+        })
+    }
+
+    pub fn send_rekey(&self, call_id: &str, answer: crate::voip::driver::PeerAnswer) {
         let tx = self
             .active_calls()
             .get_mut(call_id)
             .and_then(|e| e.rekey_tx.take());
         if let Some(tx) = tx {
-            let _ = tx.try_send(answering_lid);
+            let _ = tx.try_send(answer);
         }
     }
 
@@ -4957,6 +4983,13 @@ mod tests {
         );
     }
 
+    fn peer_answer(lid: &str) -> crate::voip::driver::PeerAnswer {
+        crate::voip::driver::PeerAnswer {
+            answering_lid: lid.to_string(),
+            audio_codec: None,
+        }
+    }
+
     /// An abort handle that flips a shared flag, so a test can assert the registry actually aborts
     /// the stored handle (the runtime-agnostic analog of asserting a tokio task was cancelled).
     fn flag_handle(flag: &Arc<AtomicBool>) -> AbortHandle {
@@ -4964,23 +4997,89 @@ mod tests {
         AbortHandle::new(move || flag.store(true, Ordering::SeqCst))
     }
 
+    // The caller-side half of the #1105 fix: a peer that answers without announcing MLow selects
+    // standard Opus, and the drive loop applies it before the first inbound packet.
+    #[test]
+    fn a_peer_that_clears_the_mlow_bit_selects_opus_for_a_live_call() {
+        use crate::stanza::call::CapabilityBit;
+        use crate::voip::audio::{AudioCodec, AudioFormat};
+
+        let reg = CallRegistry::new();
+        let mut s = session("CID");
+        s.audio_format = Some(AudioFormat::MLOW_16KHZ_60MS);
+        reg.insert(s);
+        assert_eq!(
+            reg.peer_selected_audio_codec("CID", CapabilityBit::Clear),
+            Some(AudioCodec::Opus)
+        );
+        assert_eq!(
+            reg.peer_selected_audio_codec("CID", CapabilityBit::Set),
+            None,
+            "both sides asked for MLow, so nothing changes"
+        );
+        assert_eq!(
+            reg.peer_selected_audio_codec("CID", CapabilityBit::Unknown),
+            None,
+            "a peer that announced nothing resets nothing"
+        );
+    }
+
+    // A consumer that deliberately configured native Opus must not be dragged back to MLow just
+    // because the peer happens to support it. The gate is an AND, and we are one of its inputs.
+    #[test]
+    fn a_locally_chosen_opus_call_is_never_pulled_back_to_mlow() {
+        use crate::stanza::call::CapabilityBit;
+        use crate::voip::audio::AudioFormat;
+
+        let reg = CallRegistry::new();
+        let mut s = session("CID");
+        s.audio_format = Some(AudioFormat::OPUS_16KHZ_60MS);
+        reg.insert(s);
+        for peer in [
+            CapabilityBit::Set,
+            CapabilityBit::Clear,
+            CapabilityBit::Unknown,
+        ] {
+            assert_eq!(reg.peer_selected_audio_codec("CID", peer), None);
+        }
+    }
+
+    #[test]
+    fn a_call_with_no_negotiated_format_selects_nothing() {
+        use crate::stanza::call::CapabilityBit;
+
+        let reg = CallRegistry::new();
+        reg.insert(session("CID"));
+        assert_eq!(
+            reg.peer_selected_audio_codec("CID", CapabilityBit::Clear),
+            None
+        );
+        assert_eq!(
+            reg.peer_selected_audio_codec("UNKNOWN", CapabilityBit::Clear),
+            None
+        );
+    }
+
     #[test]
     fn send_rekey_is_one_shot_and_generation_guarded() {
         let reg = CallRegistry::new();
         let g = reg.insert(session("CID"));
-        let (tx, rx) = async_channel::bounded::<String>(1);
+        let (tx, rx) = async_channel::bounded::<crate::voip::driver::PeerAnswer>(1);
         // A stale generation is ignored (no sender stored).
         reg.set_rekey_sender("CID", g + 99, tx.clone());
-        reg.send_rekey("CID", "x".into());
+        reg.send_rekey("CID", peer_answer("x"));
         assert!(
             rx.try_recv().is_err(),
             "stale-generation sender must not fire"
         );
         // The live generation stores it; the first send fires, the second is a no-op (taken).
         reg.set_rekey_sender("CID", g, tx);
-        reg.send_rekey("CID", "222222222222222:2@lid".into());
-        assert_eq!(rx.try_recv().ok().as_deref(), Some("222222222222222:2@lid"));
-        reg.send_rekey("CID", "again".into());
+        reg.send_rekey("CID", peer_answer("222222222222222:2@lid"));
+        assert_eq!(
+            rx.try_recv().ok().map(|answer| answer.answering_lid),
+            Some("222222222222222:2@lid".to_string())
+        );
+        reg.send_rekey("CID", peer_answer("again"));
         assert!(rx.try_recv().is_err(), "rekey sender is one-shot");
     }
 

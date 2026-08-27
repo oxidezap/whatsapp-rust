@@ -28,7 +28,9 @@ use super::group_media::{
     group_device_is_local,
 };
 use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
-use super::media_stats::{AudioHealthAlarm, AudioHealthWatch, AudioSilenceReason, CallMediaStats};
+use super::media_stats::{
+    AudioHealthAlarm, AudioHealthWatch, AudioSilenceReason, CODEC_FLAP_LIMIT, CallMediaStats,
+};
 #[cfg(feature = "voip-mlow")]
 use super::mlow;
 use super::rtcp::{
@@ -480,6 +482,30 @@ pub enum Output {
     Timeout(Millis),
 }
 
+/// What decided a codec switch, so a consumer can tell parity from a rescue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CodecDecisionSource {
+    /// The peer's `<capability>` said so. The normative source; this is what the official client
+    /// uses and the only thing it uses.
+    Negotiated,
+    /// The bytes on the wire said so, and they disagreed with the negotiation. Worth surfacing:
+    /// it means our model of the peer is wrong, not just that the audio was rescued.
+    Content,
+}
+
+/// Why a requested codec switch was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CodecSwitchError {
+    #[error("the call has no media plane")]
+    NoMedia,
+    #[error("only the MLOW/Opus pair that shares one RTP timing can be swapped mid-call")]
+    NotASiblingFormat,
+    #[error("the codec changed too many times; the decision is latched")]
+    Latched,
+}
+
 /// Group-control command rejected without terminating the media driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -577,6 +603,18 @@ pub enum CallEvent {
         frames_produced: u32,
         dominant_reason: AudioSilenceReason,
     },
+    /// The payload grammar in use changed inside the negotiated RTP timing.
+    ///
+    /// `source: Content` means the peer's bytes contradicted its signaling, which is a statement
+    /// about our model of the peer and not only about this call.
+    AudioCodecSwitched {
+        from: AudioCodec,
+        to: AudioCodec,
+        source: CodecDecisionSource,
+        /// Audio packets seen before the switch, so a late switch is distinguishable from an
+        /// immediate one without correlating timestamps.
+        packets_observed: u32,
+    },
     /// No audio RTP has arrived at all since the relay allocated.
     ///
     /// Deliberately distinct from [`Self::AudioSilent`]: this one is a transport problem and that
@@ -646,6 +684,7 @@ impl CallEvent {
             | Self::GroupRekeyFailed
             | Self::OutboundMediaDropped { .. }
             | Self::AudioSilent { .. }
+            | Self::AudioCodecSwitched { .. }
             | Self::AudioReceptionStalled { .. } => 0,
         }
     }
@@ -657,6 +696,14 @@ impl CallEvent {
 struct MediaState {
     pipe: MediaPipeline,
     audio: AudioConfig,
+    /// The payload grammar in use right now, which is not always the one negotiated at setup.
+    ///
+    /// `audio.format` stays immutable and describes the negotiated RTP timing. This is its sibling
+    /// within that timing: [`AudioFormat::MLOW_16KHZ_60MS`] and [`AudioFormat::OPUS_16KHZ_60MS`]
+    /// agree on payload type, clock rate, timestamp step and samples per frame, and differ only in
+    /// `codec` and `rtp_profile`. Swapping between them therefore changes no RTP header byte, no
+    /// SSRC and no timestamp continuity, which is why this is a field rather than a reconfiguration.
+    active_format: AudioFormat,
     audio_reception: RtpReceptionStats,
     /// Retained so the caller can re-derive the recv keys once the answering device is known (the
     /// callee's `<accept>` carries its device LID). See [`CallEngine::rekey_recv`].
@@ -944,6 +991,7 @@ impl CallEngine {
             Some(MediaState {
                 pipe,
                 audio: config.audio,
+                active_format: config.audio.format,
                 audio_reception: RtpReceptionStats::default(),
                 call_key: config.call_key.clone(),
                 self_lid: config.self_lid.clone(),
@@ -1855,6 +1903,63 @@ impl CallEngine {
         self.media_stats
     }
 
+    /// Swap the audio payload grammar without touching the negotiated RTP timing.
+    ///
+    /// Accepts only the MLow/Opus pair at 16 kHz, 60 ms and payload type 120, because that is the
+    /// only pair whose [`AudioFormat`]s agree on every timing field: the swap changes no RTP header
+    /// byte, so there is no discontinuity for the peer to recover from and nothing to re-signal.
+    ///
+    /// Idempotent, and latched after [`CODEC_FLAP_LIMIT`] changes: evidence that keeps reversing is
+    /// evidence that is wrong, and thrashing the decoder for a whole call is worse than picking one
+    /// and reporting that the call is unhealthy.
+    pub fn switch_audio_codec(
+        &mut self,
+        to: AudioCodec,
+        source: CodecDecisionSource,
+    ) -> Result<(), CodecSwitchError> {
+        let packets_observed = self.media_stats.rtp_received;
+        let m = self.media.as_mut().ok_or(CodecSwitchError::NoMedia)?;
+        let from = m.active_format.codec;
+        if from == to {
+            return Ok(());
+        }
+        let target = m
+            .audio
+            .format
+            .sibling_for(to)
+            .ok_or(CodecSwitchError::NotASiblingFormat)?;
+        if self.media_stats.codec_switches >= CODEC_FLAP_LIMIT {
+            return Err(CodecSwitchError::Latched);
+        }
+        m.active_format = target;
+        // The MLow RTP profile also selects the marker/DTX framing on the send path, so it has to
+        // follow the grammar rather than the negotiated profile.
+        m.pipe
+            .set_audio_mlow_profile(matches!(target.rtp_profile, AudioRtpProfile::Mlow));
+        #[cfg(feature = "voip-mlow")]
+        if let Some(pcm) = m.pcm.as_mut() {
+            // The MLow decoder carries cross-frame predictor and synthesis history. Whatever it
+            // built from the other codec's bytes is not a starting point for this one.
+            pcm.decoder.reset();
+        }
+        self.media_stats.codec_switches = self.media_stats.codec_switches.saturating_add(1);
+        #[cfg(feature = "tracing")]
+        tracing::info!(call_id = %self.call_id, ?from, ?to, ?source, "voip audio codec switched");
+        self.outbox
+            .push_back(Output::Event(CallEvent::AudioCodecSwitched {
+                from,
+                to,
+                source,
+                packets_observed,
+            }));
+        Ok(())
+    }
+
+    /// The codec currently decoding and encoding this call's audio.
+    pub fn active_audio_codec(&self) -> Option<AudioCodec> {
+        self.media.as_ref().map(|m| m.active_format.codec)
+    }
+
     /// Fold in inbound media the transport dropped before the engine could see it.
     ///
     /// The drop happens one crate out, in the relay read pump, so the engine cannot observe it
@@ -2274,7 +2379,7 @@ impl CallEngine {
             }
             None => payload,
         };
-        let codec = m.audio.format.inbound_codec(header.payload_type, &encoded);
+        let codec = m.active_format.inbound_codec(header.payload_type, &encoded);
         #[cfg(feature = "voip-mlow")]
         if m.audio.io == AudioIo::Pcm && codec == AudioCodec::Opus {
             self.outbox
@@ -2287,7 +2392,7 @@ impl CallEngine {
             self.health.on_audio_produced();
             self.outbox
                 .push_back(Output::EncodedAudio(EncodedAudioFrame {
-                    format: m.audio.format,
+                    format: m.active_format,
                     codec,
                     data: Bytes::from(encoded),
                     payload_type: header.payload_type,
@@ -2300,7 +2405,7 @@ impl CallEngine {
                 }));
             return;
         }
-        debug_assert_eq!(m.audio.format.codec, AudioCodec::Mlow);
+        debug_assert_eq!(m.active_format.codec, AudioCodec::Mlow);
         #[cfg(feature = "voip-mlow")]
         let Some(pcm) = m.pcm.as_mut() else {
             return;
@@ -2529,7 +2634,7 @@ impl CallEngine {
         let Some(m) = self.media.as_mut() else {
             return;
         };
-        if m.audio.io != AudioIo::Pcm || m.audio.format.codec != AudioCodec::Mlow {
+        if m.audio.io != AudioIo::Pcm || m.active_format.codec != AudioCodec::Mlow {
             return;
         }
         let Some(pcm_state) = m.pcm.as_mut() else {
@@ -2581,13 +2686,13 @@ impl CallEngine {
         else {
             return;
         };
-        if !m.audio.format.accepts_encoded_payload(payload) {
+        if !m.active_format.accepts_encoded_payload(payload) {
             if m.audio_tx_invalid_streak < MAX_INVALID_AUDIO_WARNINGS {
                 log::warn!(
                     "voip dropping encoded audio incompatible with the negotiated RTP profile call_id={} codec={:?} profile={:?} payload_len={} toc={:?}",
                     self.call_id,
-                    m.audio.format.codec,
-                    m.audio.format.rtp_profile,
+                    m.active_format.codec,
+                    m.active_format.rtp_profile,
                     payload.len(),
                     payload.first().copied(),
                 );
@@ -5557,6 +5662,137 @@ mod tests {
                 .count();
         }
         assert_eq!(stalls, 1, "a stalled call does not become more stalled");
+    }
+
+    // The whole reason the switch is a field swap and not a reconfiguration: the two formats agree
+    // on every timing field, so nothing on the wire moves. If that ever stops being true the swap
+    // becomes a renegotiation the peer cannot learn about, and this test is what says so.
+    #[test]
+    fn the_swappable_pair_agrees_on_every_rtp_timing_field() {
+        let mlow = AudioFormat::MLOW_16KHZ_60MS;
+        let opus = AudioFormat::OPUS_16KHZ_60MS;
+        assert_eq!(mlow.rtp_payload_type, opus.rtp_payload_type);
+        assert_eq!(mlow.rtp_clock_rate, opus.rtp_clock_rate);
+        assert_eq!(mlow.rtp_timestamp_step, opus.rtp_timestamp_step);
+        assert_eq!(mlow.samples_per_frame, opus.samples_per_frame);
+        assert_eq!(mlow.sample_rate, opus.sample_rate);
+        assert_eq!(mlow.channels, opus.channels);
+        assert_eq!(mlow.sibling_for(AudioCodec::Opus), Some(opus));
+        assert_eq!(opus.sibling_for(AudioCodec::Mlow), Some(mlow));
+        // A profile on a different clock is NOT swappable, and must refuse rather than silently
+        // change the RTP timing under a live stream.
+        assert_eq!(
+            AudioFormat::OPUS_RFC7587_16KHZ_60MS.sibling_for(AudioCodec::Mlow),
+            None
+        );
+    }
+
+    #[test]
+    fn switching_to_the_sibling_codec_changes_the_grammar_and_reports_it() {
+        let mut eng = allocated_engine();
+        assert_eq!(eng.active_audio_codec(), Some(AudioCodec::Mlow));
+        eng.switch_audio_codec(AudioCodec::Opus, CodecDecisionSource::Negotiated)
+            .expect("the pair is swappable");
+        assert_eq!(eng.active_audio_codec(), Some(AudioCodec::Opus));
+        let (outputs, _) = drain(&mut eng);
+        let switched = outputs
+            .iter()
+            .find_map(|o| match o {
+                Output::Event(CallEvent::AudioCodecSwitched {
+                    from, to, source, ..
+                }) => Some((*from, *to, *source)),
+                _ => None,
+            })
+            .expect("a codec switch is consumer-visible");
+        assert_eq!(
+            switched,
+            (
+                AudioCodec::Mlow,
+                AudioCodec::Opus,
+                CodecDecisionSource::Negotiated
+            )
+        );
+        assert_eq!(eng.media_stats().codec_switches, 1);
+    }
+
+    #[test]
+    fn switching_to_the_codec_already_in_use_is_a_silent_no_op() {
+        let mut eng = allocated_engine();
+        eng.switch_audio_codec(AudioCodec::Mlow, CodecDecisionSource::Negotiated)
+            .expect("idempotent");
+        let (outputs, _) = drain(&mut eng);
+        assert!(
+            !outputs
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::AudioCodecSwitched { .. }))),
+            "an idempotent switch must not emit an event"
+        );
+        assert_eq!(eng.media_stats().codec_switches, 0);
+    }
+
+    // Evidence that keeps reversing is evidence that is wrong. Thrashing the decoder for a whole
+    // call is worse than picking one grammar and letting the health watchdog say the call is sick.
+    #[test]
+    fn a_codec_that_keeps_flapping_latches() {
+        let mut eng = allocated_engine();
+        let mut codec = AudioCodec::Opus;
+        for _ in 0..CODEC_FLAP_LIMIT {
+            eng.switch_audio_codec(codec, CodecDecisionSource::Content)
+                .expect("within the flap budget");
+            codec = match codec {
+                AudioCodec::Opus => AudioCodec::Mlow,
+                _ => AudioCodec::Opus,
+            };
+        }
+        assert_eq!(
+            eng.switch_audio_codec(codec, CodecDecisionSource::Content),
+            Err(CodecSwitchError::Latched)
+        );
+        assert_eq!(eng.media_stats().codec_switches, CODEC_FLAP_LIMIT);
+    }
+
+    // The engine must refuse a swap that would change the RTP timing under a live stream, rather
+    // than accept it and leave the peer decoding against a clock that silently moved.
+    #[test]
+    fn a_switch_that_would_change_the_rtp_timing_is_refused() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::OPUS_RFC7587_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        assert_eq!(
+            eng.switch_audio_codec(AudioCodec::Mlow, CodecDecisionSource::Negotiated),
+            Err(CodecSwitchError::NotASiblingFormat)
+        );
+    }
+
+    // After the switch the inbound classifier has to follow the new grammar, otherwise the call
+    // announces a codec change and keeps decoding the old way.
+    #[test]
+    fn after_switching_to_opus_inbound_packets_are_classified_as_opus() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        eng.switch_audio_codec(AudioCodec::Opus, CodecDecisionSource::Negotiated)
+            .expect("swappable");
+        let _ = drain(&mut eng);
+        let mut peer_tx = peer_pipeline();
+        // TOC 0x58: Opus SILK wideband, 60 ms. Under the MLow grammar the same byte reads as a
+        // 120 ms packet, which is exactly the collision behind issue #1105.
+        let body: Vec<u8> = core::iter::once(0x58u8).chain(0..40u8).collect();
+        let packet = peer_tx.protect_audio(&body);
+        eng.handle_input(1, Input::RelayPacket(&packet));
+        let (outputs, _) = drain(&mut eng);
+        let codec = outputs
+            .iter()
+            .find_map(|o| match o {
+                Output::EncodedAudio(frame) => Some(frame.codec),
+                _ => None,
+            })
+            .expect("the payload must reach the encoded sink");
+        assert_eq!(codec, AudioCodec::Opus);
     }
 
     // Encoded routing follows negotiation, not an ambiguous TOC-byte heuristic.

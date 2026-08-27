@@ -456,9 +456,9 @@ pub struct CallChannels {
     pub encoded_audio_in: async_channel::Receiver<Bytes>,
     pub encoded_audio_out: async_channel::Sender<EncodedAudioFrame>,
     pub events: async_channel::Sender<CallEvent>,
-    /// Caller-only: the answering device's LID, delivered once the callee's `<accept>` is received so
-    /// the drive loop can rekey the recv path before media flows. `None` on the callee side and esp32.
-    pub rekey: Option<async_channel::Receiver<String>>,
+    /// Caller-only: what the callee's `<accept>` taught us, delivered once so the drive loop can
+    /// apply it before media flows. `None` on the callee side and esp32.
+    pub rekey: Option<async_channel::Receiver<PeerAnswer>>,
     /// Outbound video: one pre-encoded H.264 Annex-B access unit per item.
     pub video_in: async_channel::Receiver<Vec<u8>>,
     /// Inbound video: reassembled peer access units (dropped on sink overflow, like the speaker).
@@ -469,6 +469,21 @@ pub struct CallChannels {
     pub group_ctl: Option<async_channel::Receiver<GroupControl>>,
     /// Where the drive loop publishes media counters for `CallHandle::media_stats`.
     pub media_stats: Arc<crate::voip::media_stats::MediaStatsCell>,
+}
+
+/// What the caller learned from the callee's `<accept>`, as one message.
+///
+/// Both facts land at the same instant and both must be applied before the first inbound packet, so
+/// they travel together rather than racing down two channels. The callee needs no equivalent: its
+/// peer's capability arrives in the `<offer>`, before the engine exists, so it simply starts with
+/// the right format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAnswer {
+    /// The answering device's LID. Recv keys are re-derived from it.
+    pub answering_lid: String,
+    /// The audio codec the peer's capability selects, or `None` when it announced nothing and the
+    /// negotiated choice stands.
+    pub audio_codec: Option<crate::voip::audio::AudioCodec>,
 }
 
 /// Bound slow relay writes without truncating a complete video access unit.
@@ -1195,12 +1210,20 @@ async fn run_call_with_clock_and_wallclock(
                 }
             },
             // Rekey recv to the device that answered, before its media reaches the relay arm below.
-            lid = rekey_fut => {
-                rekey_open = false; // one-shot: a LID or the sender closing both disable the arm
-                if let Some(lid) = lid
-                    && !eng.rekey_recv(&lid)
-                {
-                    break 'drive; // malformed stored call_key (a setup invariant violated)
+            answer = rekey_fut => {
+                rekey_open = false; // one-shot: an answer or the sender closing both disable the arm
+                if let Some(answer) = answer {
+                    // Codec first: rekeying decides which keys decrypt the next packet, and this
+                    // decides what the plaintext under them means. Getting either wrong is silence,
+                    // and both have to be right before the first inbound packet either way.
+                    if let Some(codec) = answer.audio_codec
+                        && let Err(e) = eng.switch_audio_codec(codec, engine::CodecDecisionSource::Negotiated)
+                    {
+                        log::debug!("voip: peer capability selected {codec:?}, not switching: {e}");
+                    }
+                    if !eng.rekey_recv(&answer.answering_lid) {
+                        break 'drive; // malformed stored call_key (a setup invariant violated)
+                    }
                 }
             },
             group = group_ctl_fut => {

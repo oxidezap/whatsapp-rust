@@ -472,10 +472,105 @@ pub const DEFAULT_AUDIO_RATES: &[&str] = &["8000", "16000"];
 /// (`0xbb`), not this.
 pub const CAPABILITY_VIDEO_OFFER: [u8; 7] = [0x01, 0x05, 0xf7, 0x09, 0xe0, 0xfa, 0x13];
 
+/// Capability index for `use_mlow_codec_v1`.
+///
+/// Recovered from the WhatsApp Web VoIP module, not guessed: the index the client's
+/// `reset_voip_params_if_no_capability` consults before zeroing the parameter at offset 2736 is 31,
+/// and that parameter registers under the name `use_mlow_codec_v1`.
+pub const CAPABILITY_INDEX_MLOW_V1: u32 = 31;
+
+/// Capability blob version this client speaks. The official client builds its own with
+/// `capabilities_create(1, ..)`, so an index carries an implicit version of 1.
+const CAPABILITY_VERSION: u32 = 1;
+
+/// Bytes of `[version][len]` that precede the bitmask inside a `<capability>` blob.
+const CAPABILITY_HEADER_LEN: usize = 2;
+
 const fn without_mlow_capability(mut capability: [u8; 7]) -> [u8; 7] {
-    // Capability 31 is the peer gate for `use_mlow_codec_v1`.
+    // Capability 31 is the peer gate for `use_mlow_codec_v1`: byte `31 / 8` of the bitmask, which
+    // starts at index 2, is `capability[5]`, and the bit within it is `1 << (31 % 8)` = 0x80.
     capability[5] &= 0x7f;
     capability
+}
+
+/// What the peer's `<capability>` says about one index.
+///
+/// Three states, not `Option<bool>`, because the official client treats two of them in **opposite**
+/// directions and writing them the same way is an easy and expensive mistake:
+///
+/// - a peer that sends no `<capability>` at all is skipped entirely, and nothing is reset, so a
+///   feature stays on. Our own video `<accept>` omits the blob, so this is not hypothetical;
+/// - a peer whose blob is unparseable falls back to a capability of version -1, against which every
+///   query answers false, so **everything** resets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityBit {
+    /// The peer announced the index.
+    Set,
+    /// The peer announced a valid blob that does not carry the index, or announced a blob this
+    /// client cannot read, which the official client treats the same way.
+    Clear,
+    /// The peer announced nothing. Not evidence either way.
+    Unknown,
+}
+
+/// Read one index out of a peer `<capability>` blob.
+///
+/// `version` is the `ver` attribute of the node, and `bytes` its content. The bit lives at byte
+/// `index / 8` of the bitmask, LSB-first within the byte, which is what
+/// [`without_mlow_capability`] already assumes when it clears `capability[5] & 0x80`.
+///
+/// A blob whose declared length runs past its content, or whose version is below the one the index
+/// belongs to, reads as [`CapabilityBit::Clear`]: the official client's version gate is
+/// `if caps.version < (code >> 16) { return false }`, and its invalid-blob fallback installs
+/// version -1, so both paths answer false rather than "unknown".
+#[must_use]
+pub fn capability_bit(version: Option<u32>, bytes: &[u8], index: u32) -> CapabilityBit {
+    if bytes.is_empty() {
+        return CapabilityBit::Unknown;
+    }
+    // An unparseable `ver` is not the same as a missing one: the client rebuilds the capability
+    // with a version that fails every query, so it must read as Clear.
+    let Some(version) = version else {
+        return CapabilityBit::Clear;
+    };
+    if version < CAPABILITY_VERSION {
+        return CapabilityBit::Clear;
+    }
+    let Some(&declared_len) = bytes.get(1) else {
+        return CapabilityBit::Clear;
+    };
+    let mask = &bytes[CAPABILITY_HEADER_LEN..];
+    let mask_len = usize::from(declared_len).min(mask.len());
+    let byte = (index / 8) as usize;
+    // `contain()` masks the byte index with 31 before indexing, so an index past 255 aliases onto a
+    // low one rather than reading out of range. Mirrored here so a blob is read the way the peer
+    // that built it reads it, not the way a reasonable person would.
+    let byte = byte & 31;
+    match mask.get(..mask_len).and_then(|mask| mask.get(byte)) {
+        Some(value) => {
+            if value & (1 << (index % 8)) != 0 {
+                CapabilityBit::Set
+            } else {
+                CapabilityBit::Clear
+            }
+        }
+        None => CapabilityBit::Clear,
+    }
+}
+
+/// Apply one peer's capability to the locally-enabled MLow setting.
+///
+/// The official client runs `set_voip_params_from_capability` and then
+/// `reset_voip_params_if_no_capability`, and the second one walks every participant: if **any** of
+/// them fails to announce the index, the parameter drops to its safe default. So the effective
+/// value is `local && every peer announced it`, and the result is a single boolean that drives both
+/// the encoder and the receive-side decoder registration, not a pair of per-direction flags.
+///
+/// [`CapabilityBit::Unknown`] deliberately does not reset: a peer that sent no blob is skipped by
+/// the client rather than treated as a refusal.
+#[must_use]
+pub fn mlow_after_peer_capability(local: bool, peer: CapabilityBit) -> bool {
+    local && peer != CapabilityBit::Clear
 }
 
 /// Audio offer/accept capability selecting WhatsApp's standard Opus fallback instead of MLOW.
@@ -1019,6 +1114,134 @@ fn call_wrap(to: &Jid, id: Option<&str>, action: Node) -> Node {
         call = call.attr("id", id.to_string());
     }
     call.children([action]).build()
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    /// The one blob this repository has from a real capture, and the one derived from it.
+    #[test]
+    fn the_captured_blobs_read_the_way_without_mlow_capability_writes_them() {
+        assert_eq!(
+            capability_bit(Some(1), &CAPABILITY_OFFER, CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Set,
+            "a real offer announces MLow"
+        );
+        assert_eq!(
+            capability_bit(
+                Some(1),
+                &CAPABILITY_STANDARD_OPUS_OFFER,
+                CAPABILITY_INDEX_MLOW_V1
+            ),
+            CapabilityBit::Clear,
+            "clearing the bit must be observable by the same reader"
+        );
+        for blob in [CAPABILITY_PREACCEPT, CAPABILITY_VIDEO_OFFER] {
+            assert_eq!(
+                capability_bit(Some(1), &blob, CAPABILITY_INDEX_MLOW_V1),
+                CapabilityBit::Set
+            );
+        }
+        for blob in [
+            CAPABILITY_STANDARD_OPUS_PREACCEPT,
+            CAPABILITY_STANDARD_OPUS_VIDEO_OFFER,
+        ] {
+            assert_eq!(
+                capability_bit(Some(1), &blob, CAPABILITY_INDEX_MLOW_V1),
+                CapabilityBit::Clear
+            );
+        }
+    }
+
+    /// The bit index maps to the byte the const-fn edits. If these two ever disagree the client
+    /// would announce one thing and read another, which is unfalsifiable in a round-trip test.
+    #[test]
+    fn the_index_and_the_hand_written_mask_agree() {
+        let mut blob = CAPABILITY_OFFER;
+        blob[5] &= 0x7f;
+        assert_eq!(blob, CAPABILITY_STANDARD_OPUS_OFFER);
+        assert_eq!(
+            (CAPABILITY_INDEX_MLOW_V1 / 8) as usize + CAPABILITY_HEADER_LEN,
+            5
+        );
+        assert_eq!(1u8 << (CAPABILITY_INDEX_MLOW_V1 % 8), 0x80);
+    }
+
+    // Absent and invalid are treated in OPPOSITE directions by the official client, and the whole
+    // reason `CapabilityBit` has three states is that writing them the same way is easy.
+    #[test]
+    fn an_absent_blob_is_unknown_and_an_unreadable_one_is_clear() {
+        assert_eq!(
+            capability_bit(Some(1), &[], CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Unknown,
+            "no blob is not evidence"
+        );
+        assert_eq!(
+            capability_bit(None, &CAPABILITY_OFFER, CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "an unparseable ver falls back to a capability that answers false for everything"
+        );
+        assert_eq!(
+            capability_bit(Some(0), &CAPABILITY_OFFER, CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "a version below the index's own answers false"
+        );
+    }
+
+    #[test]
+    fn a_truncated_or_short_mask_reads_clear_rather_than_panicking() {
+        assert_eq!(
+            capability_bit(Some(1), &[0x01, 0x05], CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "a header with no mask"
+        );
+        assert_eq!(
+            capability_bit(Some(1), &[0x01, 0x40, 0xff], CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "a declared length longer than the content"
+        );
+        assert_eq!(
+            capability_bit(Some(1), &[0x01], CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Clear,
+            "a blob with no length byte"
+        );
+    }
+
+    // The official reader masks the byte index with 31, so an index past 255 aliases onto a low
+    // one. Pinned so nobody "fixes" it into a bounds check and diverges from the peer.
+    #[test]
+    fn an_index_past_the_readable_space_aliases_the_way_the_client_does() {
+        let blob = [0x01, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(capability_bit(Some(1), &blob, 0), CapabilityBit::Set);
+        assert_eq!(capability_bit(Some(1), &blob, 256), CapabilityBit::Set);
+    }
+
+    #[test]
+    fn the_mutual_and_only_drops_mlow_on_an_explicit_clear() {
+        assert!(mlow_after_peer_capability(true, CapabilityBit::Set));
+        assert!(
+            mlow_after_peer_capability(true, CapabilityBit::Unknown),
+            "a peer that announced nothing does not reset anything"
+        );
+        assert!(!mlow_after_peer_capability(true, CapabilityBit::Clear));
+        assert!(
+            !mlow_after_peer_capability(false, CapabilityBit::Set),
+            "the local setting is the other half of the AND"
+        );
+    }
+
+    // A peer outside the MLow rollout is exactly the #1105 case, and the whole call hinges on this
+    // one boolean coming out false.
+    #[test]
+    fn a_peer_outside_the_mlow_rollout_selects_standard_opus() {
+        let peer = capability_bit(
+            Some(1),
+            &CAPABILITY_STANDARD_OPUS_OFFER,
+            CAPABILITY_INDEX_MLOW_V1,
+        );
+        assert!(!mlow_after_peer_capability(true, peer));
+    }
 }
 
 #[cfg(test)]

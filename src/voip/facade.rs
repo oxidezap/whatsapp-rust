@@ -179,7 +179,18 @@ impl<'a> AcceptCall<'a> {
         // Take the audio endpoints out first; the offline setup (decrypt + config + addr) only
         // borrows `&self`, so move the fields before those borrows to avoid a partial-move clash.
         let audio = self.audio.take().ok_or(CallError::MissingAudio)?;
-        let audio_config = audio.config();
+        let mut audio_config = audio.config();
+        // The callee learns the peer's capability in the `<offer>`, before anything is fixed, so it
+        // simply starts on the right codec: no mutable format, no mid-call switch, no first packet
+        // decoded under the wrong grammar. MLow survives only if we asked for it and the peer
+        // announced index 31; a peer outside that rollout emits standard Opus on the same payload
+        // type, and decoding it as MLow is what makes the call silent (issue #1105).
+        if let Some(codec) = peer_selected_codec_from_offer(&self.incoming, audio_config.format)
+            && let Some(format) = audio_config.format.sibling_for(codec)
+        {
+            audio_config.format = format;
+        }
+        let audio_config = audio_config;
         if let CallAction::Offer { audio, .. } = &self.incoming.action
             && !audio.is_empty()
             && !audio.iter().any(|codec| {
@@ -1165,6 +1176,41 @@ pub(crate) fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8]
     }
 }
 
+/// The codec the offering peer's `<capability>` selects, or `None` when the local choice stands.
+///
+/// Mirrors `reset_voip_params_if_no_capability`: a peer that announced nothing resets nothing, a
+/// peer whose blob is unreadable resets everything, and MLow needs both sides to have asked for it.
+/// Only the MLow/Opus pair at one RTP timing is swappable, so a locally-selected profile outside
+/// that pair (the 48 kHz RFC 7587 one) is left exactly as the consumer configured it.
+fn peer_selected_codec_from_offer(
+    incoming: &IncomingCall,
+    format: wacore::voip::AudioFormat,
+) -> Option<wacore::voip::AudioCodec> {
+    use wacore::stanza::call::{CAPABILITY_INDEX_MLOW_V1, CapabilityBit, capability_bit};
+    use wacore::voip::{AudioCodec, AudioFormat};
+
+    if format != AudioFormat::MLOW_16KHZ_60MS && format != AudioFormat::OPUS_16KHZ_60MS {
+        return None;
+    }
+    let peer = incoming
+        .media()
+        .and_then(|media| media.peer_device.as_ref())
+        .map_or(CapabilityBit::Unknown, |device| {
+            capability_bit(
+                device.capability_version,
+                device.capability(),
+                CAPABILITY_INDEX_MLOW_V1,
+            )
+        });
+    let local_mlow = format.codec == AudioCodec::Mlow;
+    let effective_mlow = wacore::stanza::call::mlow_after_peer_capability(local_mlow, peer);
+    (effective_mlow != local_mlow).then_some(if effective_mlow {
+        AudioCodec::Mlow
+    } else {
+        AudioCodec::Opus
+    })
+}
+
 fn ensure_group_offer_media(
     update: &GroupCallUpdate,
     requested_video: bool,
@@ -1782,7 +1828,7 @@ async fn place_call(
     // relay still lands: the sender lives on the registry from this point; the receiver is parked on
     // the pending entry and handed to the drive loop when the relay arrives (the bounded(1) buffers a
     // pre-engine rekey). One slot is enough — the rekey is one-shot (first answerer wins).
-    let (rekey_tx, rekey_rx) = async_channel::bounded::<String>(1);
+    let (rekey_tx, rekey_rx) = async_channel::bounded::<wacore::voip::driver::PeerAnswer>(1);
     registry.set_rekey_sender(&call_id, generation, rekey_tx);
 
     // Video plumbing exists for EVERY call (idle channels cost nothing): the signaling handler and
@@ -2029,7 +2075,7 @@ pub(crate) struct PendingOutgoing {
     ev_tx: async_channel::Sender<CallEvent>,
     /// Receiver half of the one-shot recv-rekey channel (sender lives on the registry). Handed to the
     /// drive loop when the relay arrives so a `<accept>` that beat the relay is still applied (buffered).
-    rekey_rx: async_channel::Receiver<String>,
+    rekey_rx: async_channel::Receiver<wacore::voip::driver::PeerAnswer>,
 }
 
 /// The relay socket address to dial, read off a built config's already-parsed endpoint (avoids
@@ -2624,7 +2670,7 @@ async fn attach_engine(
     ev_tx: async_channel::Sender<CallEvent>,
     // Caller-only recv-rekey receiver; `None` for an incoming call (the callee keys recv on its own
     // self LID and never rekeys).
-    rekey_rx: Option<async_channel::Receiver<String>>,
+    rekey_rx: Option<async_channel::Receiver<wacore::voip::driver::PeerAnswer>>,
 ) -> Result<(), CallError> {
     let (group_tx, group_rx) = async_channel::bounded(GROUP_CONTROL_CHANNEL_CAPACITY);
     if !client.call_registry().set_group_control_sender(

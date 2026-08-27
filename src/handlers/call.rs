@@ -8,9 +8,10 @@ use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 #[cfg(feature = "voip-runtime")]
 use wacore::stanza::call::{
-    REJECT_REASON_BUSY, TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
+    CAPABILITY_INDEX_MLOW_V1, CapabilityBit, REJECT_REASON_BUSY,
+    TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
     TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, TerminateParams,
-    VideoStateParams, build_call_video_ack, build_terminate, build_video_state,
+    VideoStateParams, build_call_video_ack, build_terminate, build_video_state, capability_bit,
 };
 use wacore::stanza::call::{build_offer_ack_receipt, parse_call_stanza};
 use wacore::stanza::group_call::build_call_control_ack;
@@ -304,6 +305,10 @@ impl StanzaHandler for CallHandler {
                         }
                         return true;
                     }
+                    // Defaults to Unknown, which is "the peer said nothing" and resets nothing:
+                    // a `<preaccept>`/`<accept>` we never parsed must not look like a refusal.
+                    #[cfg(feature = "voip-runtime")]
+                    let mut peer_mlow_bit = CapabilityBit::Unknown;
                     #[cfg(feature = "voip-runtime")]
                     if matches!(
                         &call.action,
@@ -319,6 +324,18 @@ impl StanzaHandler for CallHandler {
                                 })
                             })
                             .and_then(|action| action.get_optional_child("capability"));
+                        // Read the MLow gate before the group-promotion parse below, which folds an
+                        // unparseable `ver` into "no capability". For codec selection the two are
+                        // opposite: the official client rebuilds an unreadable blob as a version
+                        // that answers false for every index, so it must read as an explicit Clear.
+                        peer_mlow_bit = capability.map_or(CapabilityBit::Unknown, |capability| {
+                            let bytes = capability.content_bytes().unwrap_or_default();
+                            let version = match capability.get_attr("ver") {
+                                None => Some(1),
+                                Some(version) => version.as_str().parse::<u32>().ok(),
+                            };
+                            capability_bit(version, &bytes, CAPABILITY_INDEX_MLOW_V1)
+                        });
                         let device = if let Some(capability) = capability
                             && let Some(bytes) =
                                 capability.content_bytes().filter(|bytes| !bytes.is_empty())
@@ -378,9 +395,19 @@ impl StanzaHandler for CallHandler {
                         client
                             .call_registry()
                             .set_answering_device(call.action.call_id(), sender.clone());
-                        client
+                        // The peer's capability and the answering device land in the same stanza
+                        // and both have to be applied before the first inbound packet, so they
+                        // travel as one message rather than racing.
+                        let audio_codec = client
                             .call_registry()
-                            .send_rekey(call.action.call_id(), sender.to_string());
+                            .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);
+                        client.call_registry().send_rekey(
+                            call.action.call_id(),
+                            wacore::voip::driver::PeerAnswer {
+                                answering_lid: sender.to_string(),
+                                audio_codec,
+                            },
+                        );
                         if let Some(generation) =
                             client.call_registry().generation_of(call.action.call_id())
                         {

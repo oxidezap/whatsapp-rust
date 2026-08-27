@@ -46,6 +46,16 @@ pub struct GroupCallDevice {
 }
 
 impl GroupCallDevice {
+    /// The raw `<capability>` bitmask blob this device announced.
+    ///
+    /// Read it through [`crate::stanza::call::capability_bit`] rather than indexing: the byte and
+    /// bit an index maps to, and the way an unreadable blob answers, are the peer's rules and not
+    /// obvious from the bytes.
+    #[must_use]
+    pub fn capability(&self) -> &[u8] {
+        &self.capability
+    }
+
     pub fn new(jid: Jid) -> Self {
         Self {
             jid,

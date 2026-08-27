@@ -159,6 +159,30 @@ impl AudioFormat {
                 || payload == [0x90])
     }
 
+    /// The format carrying `codec` within this one's RTP timing, if one exists.
+    ///
+    /// Two formats are interchangeable mid-call only when every timing field matches: payload type,
+    /// clock rate, timestamp step, sample rate, channels and samples per frame. Swapping such a pair
+    /// changes no RTP header byte, so the peer has nothing to recover from and there is nothing to
+    /// re-signal. Exactly one pair qualifies today, and the comparison below is what keeps that
+    /// honest if a profile is ever added.
+    #[must_use]
+    pub fn sibling_for(self, codec: AudioCodec) -> Option<Self> {
+        // Exhaustive on purpose: a new codec has to declare which format carries it instead of
+        // falling into a wildcard that silently refuses every switch.
+        let candidate = match codec {
+            AudioCodec::Mlow => Self::MLOW_16KHZ_60MS,
+            AudioCodec::Opus => Self::OPUS_16KHZ_60MS,
+        };
+        let same_timing = candidate.rtp_payload_type == self.rtp_payload_type
+            && candidate.rtp_clock_rate == self.rtp_clock_rate
+            && candidate.rtp_timestamp_step == self.rtp_timestamp_step
+            && candidate.samples_per_frame == self.samples_per_frame
+            && candidate.sample_rate == self.sample_rate
+            && candidate.channels == self.channels;
+        same_timing.then_some(candidate)
+    }
+
     pub(crate) fn is_valid(self) -> bool {
         self.signaling_rate != 0
             && self.sample_rate != 0
