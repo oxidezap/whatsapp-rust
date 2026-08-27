@@ -307,7 +307,7 @@ impl MlowDecoder {
         let frames = internal_frames(toc.frame_ms);
         let off_point = if toc.sample_rate != 16000 {
             Some(("rate", i64::from(toc.sample_rate / 1000)))
-        } else if toc.flag2 {
+        } else if toc.low_rate {
             Some(("low_rate", 1))
         } else if frames.is_none() {
             Some(("frame_ms", i64::from(toc.frame_ms)))
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(toc.frame_ms, 120, "0x58 declares a 120 ms packet");
         assert!(toc.active && !toc.sid && !toc.std_opus);
         assert_eq!(toc.sample_rate, 16000);
-        assert!(!toc.flag2, "0x58 is the supported rate mode");
+        assert!(!toc.low_rate, "0x58 is the supported rate mode");
 
         let mut dec = MlowDecoder::new();
         let out = dec.decode(&[0x58, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
