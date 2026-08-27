@@ -246,11 +246,12 @@ impl SrtcpReplayState {
     }
 }
 
-/// How long a just-retired video SSRC stays ignorable, in packets of the stream that replaced it.
+/// How long a just-retired video SSRC stays ignorable, in authenticated packets of either stream.
 ///
 /// The window a renumbering's stragglers arrive in is a network reordering window -- milliseconds --
 /// and 15fps video puts a handful of packets in one. Sized well above that and far below any real
-/// gap, so it covers the overlap without outliving it.
+/// gap, so it covers the overlap without outliving it: a stream still arriving after this many
+/// packets is not a straggler, it is the peer's current stream, and it takes the depacketizer back.
 const RETIRED_SSRC_GRACE_PACKETS: u32 = 64;
 
 const SRTP_REPLAY_WINDOW_BITS: u64 = 64;
@@ -956,15 +957,23 @@ impl VideoPipeline {
             self.warp_mi_tag_len,
             packet,
         )?;
+        // Counted BEFORE the grace check, and for every authenticated packet including the ones that
+        // check ignores. Counting only the stream that replaced the retired one would never expire
+        // the grace in the case that matters: a peer that sends one packet on a new SSRC and then
+        // goes back to the old one delivers nothing but ignored packets, so the window would stay
+        // open and its video would be frozen for the rest of the call -- the permanent failure the
+        // bound exists to avoid, arrived at from the other side.
+        self.packets_since_stream_change = self.packets_since_stream_change.saturating_add(1);
         // Committing to a new stream discards what the previous one left half-assembled. Dropping a
         // partial access unit is the correct trade: the alternative is emitting one spliced from two
         // encoders' fragments, which decodes to garbage rather than to nothing.
         if self.depacketizer_ssrc != Some(header.ssrc) {
             // A straggler from the stream we just left is not a commitment to it -- see
             // `retired_ssrc`. Its own access unit was discarded when we switched, so there is
-            // nothing it can complete; it is counted as received and otherwise ignored.
+            // nothing it can complete; it is counted as received and otherwise ignored. A stream
+            // that keeps arriving past the grace is not a straggler and reclaims below.
             if self.retired_ssrc == Some(header.ssrc)
-                && self.packets_since_stream_change < RETIRED_SSRC_GRACE_PACKETS
+                && self.packets_since_stream_change <= RETIRED_SSRC_GRACE_PACKETS
             {
                 return Some((header, Vec::new()));
             }
@@ -975,7 +984,6 @@ impl VideoPipeline {
             self.depacketizer_ssrc = Some(header.ssrc);
             self.packets_since_stream_change = 0;
         }
-        self.packets_since_stream_change = self.packets_since_stream_change.saturating_add(1);
         let first = self.depacketizer.push(
             header.sequence_number,
             header.timestamp,
@@ -1861,6 +1869,47 @@ mod tests {
             rx.unprotect_video(fragments.last().expect("marker packet")),
             Some(vec![au]),
             "the new stream's access unit must survive the overlap intact"
+        );
+    }
+
+    // The grace has to end even when nothing but the retired stream arrives. A peer that sends one
+    // packet on a new SSRC and then goes back to the old one delivers only ignored packets, so a
+    // window counted in packets of the REPLACEMENT stream would never expire and that peer's video
+    // would be frozen for the rest of the call -- the permanent failure the bound exists to avoid.
+    #[test]
+    fn a_stream_that_resumes_past_the_grace_reclaims_reassembly() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut original = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut replacement = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        let au = video_au(60);
+        let packet = original.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+
+        // One packet on the replacement SSRC, then the peer goes back to the original stream.
+        let au = video_au(60);
+        let packet = replacement.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+
+        let mut delivered = 0;
+        for _ in 0..(RETIRED_SSRC_GRACE_PACKETS + 4) {
+            let au = video_au(60);
+            let packet = original.protect_video(&au).pop().expect("one packet");
+            if rx.unprotect_video(&packet) == Some(vec![au]) {
+                delivered += 1;
+            }
+        }
+        assert!(
+            delivered >= 3,
+            "the resumed stream must take reassembly back rather than stay ignored forever,              got {delivered} of {} delivered",
+            RETIRED_SSRC_GRACE_PACKETS + 4
         );
     }
 

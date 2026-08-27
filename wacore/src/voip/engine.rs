@@ -22,7 +22,6 @@ use super::audio::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
     ForeignAudioCodec, depacketize_opus_from_mlow,
 };
-#[cfg(feature = "voip-mlow")]
 use super::codec_probe::InboundCodecProbe;
 use super::demux::{RelayPacketKind, classify_relay_packet, unwrap_group_forwarding_packet};
 use super::group_audio::ParticipantAudioMixer;
@@ -723,6 +722,20 @@ impl CallEvent {
     }
 }
 
+/// Ask the content probe whether this packet's own two statements contradict the negotiation.
+///
+/// Free function rather than a method because both callers hold `&mut MediaState` while the switch
+/// it may return needs the whole engine; the verdict is applied once that borrow ends.
+fn observe_codec_content(m: &mut MediaState, payload: &[u8]) -> Option<AudioCodec> {
+    m.codec_probe.observe(
+        payload,
+        m.active_format.codec,
+        m.audio_reception.frame_span(),
+        m.active_format.rtp_clock_rate,
+        m.audio.format.rtp_timestamp_step,
+    )
+}
+
 /// The optional media plane: the SRTP pipeline, selected audio mode, an optional SFrame session,
 /// and the PCM playout jitter buffer. One `MediaPipeline` serves both directions: protect uses its send
 /// keys/ROC/RTP state, unprotect its recv keys/ROC, and those fields are disjoint.
@@ -752,9 +765,9 @@ struct MediaState {
     video_ts_stride: u32,
     /// The video plane, present while video is enabled (from the start or via upgrade).
     video: Option<VideoPlaneState>,
-    /// Watches inbound payloads for a peer whose bytes contradict its signaling. MLOW-only: the
-    /// only stream it can rescue is one that negotiated MLOW.
-    #[cfg(feature = "voip-mlow")]
+    /// Watches inbound payloads for a peer whose bytes contradict its signaling. The stream it can
+    /// rescue is one that negotiated MLOW -- which an encoded call does too, so this is not gated
+    /// on the built-in decoder.
     codec_probe: InboundCodecProbe,
     /// The platform's decoder for a codec the core cannot implement. `None` on wasm32/ESP32 and on
     /// any build without the libopus adapter; the engine then reports silence rather than faking it.
@@ -1056,7 +1069,6 @@ impl CallEngine {
                 warp_mi_tag_len: config.warp_mi_tag_len,
                 video_ts_stride: VIDEO_TS_STRIDE_15FPS,
                 video,
-                #[cfg(feature = "voip-mlow")]
                 codec_probe: InboundCodecProbe::default(),
                 foreign_audio: None,
                 foreign_pcm: Vec::new(),
@@ -2015,14 +2027,22 @@ impl CallEngine {
         let packets_observed = self.media_stats.rtp_received;
         let m = self.media.as_mut().ok_or(CodecSwitchError::NoMedia)?;
         let from = m.active_format.codec;
-        if from == to {
+        let Some(target) = m.audio.format.sibling_for(to) else {
+            // Nothing to swap to. Asking for the codec already in use is a no-op either way, so it
+            // is not an error just because this format has no sibling.
+            return if from == to {
+                Ok(())
+            } else {
+                Err(CodecSwitchError::NotASiblingFormat)
+            };
+        };
+        // Compared as FORMATS, not codecs. MLOW's escape profile carries standard Opus inside
+        // MLOW's container, so `Opus -> Opus` is a real change there: it takes the call off a
+        // container the peer only parses if it speaks MLOW. Keyed on the codec, that switch would
+        // read as idempotent and the call would keep sending an escape the peer cannot decode.
+        if m.active_format == target {
             return Ok(());
         }
-        let target = m
-            .audio
-            .format
-            .sibling_for(to)
-            .ok_or(CodecSwitchError::NotASiblingFormat)?;
         // An encoded call's outbound bytes come from a source the APPLICATION built, fixed to one
         // codec for the life of the call. The switch still happens, because the RECEIVE side is
         // what it is for -- the peer's packets have to be decoded and labelled as the grammar they
@@ -2044,6 +2064,17 @@ impl CallEngine {
             // The MLow decoder carries cross-frame predictor and synthesis history. Whatever it
             // built from the other codec's bytes is not a starting point for this one.
             pcm.decoder.reset();
+            // A switch the CONTENT forced is one the probe only asks for after packets stopped
+            // becoming audio, so what is queued is the concealment those packets produced -- up to
+            // the playout cap of it, a quarter second of manufactured silence sitting in front of
+            // the first correctly decoded frame. Rescuing a call and then making it wait out its
+            // own failure is not a rescue. A negotiated switch keeps its buffer: nothing there
+            // failed, and it is real audio the peer sent.
+            if source == CodecDecisionSource::Content {
+                pcm.jitter.clear();
+                pcm.priming = true;
+                pcm.priming_ticks = 0;
+            }
         }
         self.media_stats.codec_switches = self.media_stats.codec_switches.saturating_add(1);
         #[cfg(feature = "tracing")]
@@ -2447,8 +2478,9 @@ impl CallEngine {
             self.on_group_rtp(now, pkt, wire_header);
             return;
         }
-        // Set by the content probe below and applied once the media borrow has ended. The probe is
-        // part of the MLOW receive path, so without that feature it does not exist at all.
+        // Set by the content probe below and applied once the media borrow has ended: the switch
+        // needs the whole engine, and holding both borrows would be a borrow-checker fight for no
+        // behavioural gain. The encoded path keeps its own, since it returns before the tail.
         #[cfg(feature = "voip-mlow")]
         let mut probe_verdict: Option<AudioCodec> = None;
         let Some(m) = self.media.as_mut() else {
@@ -2522,7 +2554,6 @@ impl CallEngine {
         // A renumbered stream restarts the timestamp sequence, so differences across the change are
         // not comparable and the probe's streak has to start over. Its decision does not: a peer
         // must not be able to reopen the codec question by changing its SSRC.
-        #[cfg(feature = "voip-mlow")]
         if m.audio_reception.ssrc() != Some(header.ssrc) {
             m.codec_probe.stream_restarted();
         }
@@ -2626,6 +2657,14 @@ impl CallEngine {
             return;
         }
         if m.audio.io == AudioIo::Encoded {
+            // An encoded call never decodes anything here, so "nothing became audio" -- the PCM
+            // path's trigger for asking -- is true of every packet and cannot be the condition. Ask
+            // whenever the call is still on MLOW: the peer's capability can be absent, or can lose
+            // the race with its first packets, and then the sink would be handed native Opus
+            // labelled `Mlow` with nothing to notice it. The arithmetic that makes the probe safe
+            // is about the packets, not about who decodes them.
+            let verdict = observe_codec_content(m, &encoded);
+            let codec = verdict.unwrap_or(codec);
             // Counted where the engine hands the frame over, which is the last point it can see. A
             // sink that refuses it is reported separately, through `note_audio_sink_dropped`.
             self.media_stats.audio_frames_delivered =
@@ -2644,6 +2683,9 @@ impl CallEngine {
                     device: None,
                     pid: None,
                 }));
+            // Applied here rather than at the tail below, which only the PCM path reaches -- and in
+            // a build without the built-in decoder is the only path there is.
+            self.apply_codec_verdict(verdict);
             return;
         }
         debug_assert_eq!(m.active_format.codec, AudioCodec::Mlow);
@@ -2694,25 +2736,6 @@ impl CallEngine {
                 self.health.on_audio_produced();
             }
         }
-        // Nothing became audio. Ask whether the peer's own two statements about this packet -- the
-        // duration its Opus header would declare, and the step its RTP timestamps actually advance
-        // by -- agree with each other. They cannot agree for any packet this decoder accepts (see
-        // `codec_probe`), so a run of agreements is evidence of a grammar we are not speaking.
-        #[cfg(feature = "voip-mlow")]
-        if decode_report.decoded == 0 {
-            let span = m.audio_reception.frame_span();
-            let clock_rate = m.active_format.rtp_clock_rate;
-            let active = m.active_format.codec;
-            // Applied after the media borrow ends: the switch needs the whole engine, and holding
-            // both borrows here would be a borrow-checker fight for no behavioural gain.
-            probe_verdict = m.codec_probe.observe(
-                &encoded,
-                active,
-                span,
-                clock_rate,
-                m.audio.format.rtp_timestamp_step,
-            );
-        }
         // Bound the buffer on the feed side too: a burst of inbound packets arriving between two 20ms
         // playout ticks must not grow `jitter` without limit (drain_playout's cap only runs on a
         // tick). Drop oldest past the same ceiling the drain path uses.
@@ -2731,10 +2754,26 @@ impl CallEngine {
                     .saturating_add(drop_n as u32);
             }
         }
-        // Content contradicting negotiation is a statement about our model of the peer, not just
-        // about this call, which is why the event names the source.
+        // Nothing became audio. Ask whether the peer's own two statements about this packet -- the
+        // duration its Opus header would declare, and the step its RTP timestamps actually advance
+        // by -- agree with each other. They cannot agree for any packet this decoder accepts (see
+        // `codec_probe`), so a run of agreements is evidence of a grammar we are not speaking.
         #[cfg(feature = "voip-mlow")]
-        if let Some(codec) = probe_verdict
+        if decode_report.decoded == 0
+            && let Some(m) = self.media.as_mut()
+        {
+            probe_verdict = observe_codec_content(m, &encoded);
+        }
+        #[cfg(feature = "voip-mlow")]
+        self.apply_codec_verdict(probe_verdict);
+    }
+
+    /// Act on what the content probe concluded, once the media borrow it needed has ended.
+    ///
+    /// Content contradicting negotiation is a statement about our model of the peer, not just about
+    /// this call, which is why the event names the source.
+    fn apply_codec_verdict(&mut self, verdict: Option<AudioCodec>) {
+        if let Some(codec) = verdict
             && let Err(e) = self.switch_audio_codec(codec, CodecDecisionSource::Content)
         {
             log::debug!("voip: inbound bytes indicate {codec:?}, not switching: {e}");
@@ -6223,6 +6262,53 @@ mod tests {
         );
     }
 
+    // Rescuing a call and then making it wait out its own failure is not a rescue. The probe only
+    // asks for a switch after packets have stopped becoming audio, so what is queued at that moment
+    // is the concealment those packets produced -- up to a quarter second of manufactured silence
+    // sitting in front of the first correctly decoded frame.
+    #[test]
+    fn a_rescued_call_does_not_play_out_the_silence_that_preceded_the_rescue() {
+        let mut eng = engine(true).with_foreign_audio_codec(Box::new(StubForeignCodec {
+            samples: SAMPLES as usize,
+        }));
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        let mut peer_tx = peer_pipeline();
+        let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        // Exactly the four packets the switch costs, then two that decode.
+        for n in 0..6u64 {
+            let packet = peer_tx.protect_audio(&body);
+            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+        assert_eq!(eng.active_audio_codec(), Some(AudioCodec::Opus), "rescued");
+
+        // The very first sample the consumer hears has to be rescued audio, not the concealment
+        // that led to the rescue. The stub decodes every payload to a constant, so anything the
+        // MLow path produced for those first four packets is distinguishable from it.
+        let mut first = None;
+        for tick in 1..=8u64 {
+            eng.handle_input(400 + tick * PLAYOUT_MS, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                if let Output::Playout(frame) = output
+                    && first.is_none()
+                {
+                    first = frame.first().copied();
+                }
+            }
+        }
+        assert_eq!(
+            first,
+            Some(1234),
+            "the first frame played after the rescue must be the rescued audio"
+        );
+    }
+
     // A call carrying real audio must never alarm; without this the watchdog is a false-positive
     // generator and the first thing a consumer does is ignore it.
     #[test]
@@ -6581,6 +6667,53 @@ mod tests {
             !outputs.iter().any(|o| matches!(o, Output::EncodedAudio(_))),
             "and a RED wrapper must never reach a consumer labelled as an Opus frame"
         );
+    }
+
+    // An encoded call never decodes anything in the core, so "nothing became audio" is true of
+    // every packet and cannot be what triggers the probe. Without asking on this path, a peer whose
+    // capability was absent or lost the race with its media had its native Opus handed to the sink
+    // labelled `Mlow`, with no switch and no event -- and the fixed source kept sending MLow at a
+    // peer that cannot decode it, so both directions were broken with nothing to notice.
+    #[test]
+    fn an_encoded_call_probes_the_content_and_relabels_what_it_delivers() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        // TOC 0x58: 60 ms of SILK wideband under the Opus grammar, 120 ms under MLow's -- the
+        // collision behind #1105. The peer paces at the negotiated 960-sample step, so its two
+        // statements agree and only the Opus reading can explain that.
+        let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        let mut peer_tx = peer_pipeline();
+        let mut delivered = Vec::new();
+        for n in 0..6u64 {
+            let packet = peer_tx.protect_audio(&body);
+            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                if let Output::EncodedAudio(frame) = output {
+                    delivered.push(frame.codec);
+                }
+            }
+        }
+
+        assert_eq!(
+            eng.active_audio_codec(),
+            Some(AudioCodec::Opus),
+            "the encoded path has to reach the probe too"
+        );
+        assert_eq!(delivered.len(), 6, "every packet still reaches the sink");
+        assert_eq!(
+            delivered.last(),
+            Some(&AudioCodec::Opus),
+            "and after the switch it is labelled as what it is"
+        );
+        assert_eq!(eng.media_stats().codec_switches, 1);
     }
 
     // Encoded routing follows negotiation, not an ambiguous TOC-byte heuristic.

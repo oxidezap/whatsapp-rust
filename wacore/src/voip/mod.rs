@@ -8,10 +8,10 @@
 pub mod app_data;
 pub mod audio;
 // The content corroborator is an internal decision, not API: exposing it would invite a consumer to
-// make codec choices from payload bytes, which is the reflex this whole module exists to avoid. It
-// is also MLOW-only, because the only stream it can rescue is one that negotiated MLOW: a build
-// without that codec never reaches the branch that consults it.
-#[cfg(feature = "voip-mlow")]
+// make codec choices from payload bytes, which is the reflex this whole module exists to avoid. Not
+// gated on the MLOW codec: the stream it rescues is one that NEGOTIATED MLOW, and an encoded call
+// does that without needing the decoder -- it hands the bytes to the application. A build with only
+// `voip` reaches the branch that consults it.
 pub(crate) mod codec_probe;
 pub mod demux;
 pub mod driver;

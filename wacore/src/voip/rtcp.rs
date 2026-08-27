@@ -357,7 +357,6 @@ impl RtpReceptionStats {
     }
 
     /// The SSRC of the stream currently being tracked, if any.
-    #[cfg(feature = "voip-mlow")]
     pub(crate) fn ssrc(&self) -> Option<u32> {
         self.ssrc
     }
@@ -368,7 +367,6 @@ impl RtpReceptionStats {
     /// packet whose step is unusable (zero, backward, or over a second), and reset with the stream
     /// when the SSRC changes, because a renumbered stream is a new statement and not a
     /// continuation.
-    #[cfg(any(feature = "voip-mlow", test))]
     pub(crate) fn frame_span(&self) -> Option<u32> {
         self.frame_span
     }

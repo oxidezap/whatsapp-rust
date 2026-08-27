@@ -2579,7 +2579,11 @@ impl CallRegistry {
             .active_calls()
             .get(call_id)
             .and_then(|entry| entry.session.audio_format)?;
-        let local_mlow = format.codec == AudioCodec::Mlow;
+        // What the capability gates is MLOW's CONTAINER, not the codec inside it: the escape
+        // profile carries standard Opus in MLOW's framing, so a peer that cleared the bit cannot
+        // parse it either. Keyed on the codec, an escape call would sail past this check and put a
+        // rewritten TOC on the wire for a peer that registered native Opus on the same payload type.
+        let local_mlow = format.rtp_profile == crate::voip::audio::AudioRtpProfile::Mlow;
         let effective_mlow = crate::stanza::call::mlow_after_peer_capability(local_mlow, peer);
         (effective_mlow != local_mlow).then_some(if effective_mlow {
             AudioCodec::Mlow

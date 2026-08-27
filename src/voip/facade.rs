@@ -212,7 +212,13 @@ impl<'a> AcceptCall<'a> {
             // taking its MLow bytes and send them in a profile that accepts any nonempty payload,
             // and the peer would hear noise with nothing on this side noticing. Refusing is the
             // only honest answer -- the application picks the codec, so only it can pick again.
-            if let AudioEndpoints::Encoded { format: fixed, .. } = &audio {
+            // Only a change of CODEC is unanswerable: the source emits one grammar and cannot be
+            // told to emit another. A change of container is not -- the escape profile and native
+            // Opus both consume the same Opus bytes from the source, and the engine is what stops
+            // rewriting their TOCs.
+            if let AudioEndpoints::Encoded { format: fixed, .. } = &audio
+                && fixed.codec != codec
+            {
                 return Err(CallError::EncodedAudioCodecNotNegotiated {
                     configured: fixed.codec,
                     selected: codec,
@@ -1241,7 +1247,10 @@ fn peer_selected_codec_from_offer(
     use wacore::stanza::call::{CAPABILITY_INDEX_MLOW_V1, CapabilityBit, capability_bit};
     use wacore::voip::{AudioCodec, AudioFormat};
 
-    if format != AudioFormat::MLOW_16KHZ_60MS && format != AudioFormat::OPUS_16KHZ_60MS {
+    if format != AudioFormat::MLOW_16KHZ_60MS
+        && format != AudioFormat::OPUS_16KHZ_60MS
+        && format != AudioFormat::OPUS_MLOW_16KHZ_60MS
+    {
         return None;
     }
     let peer = incoming
@@ -1254,7 +1263,9 @@ fn peer_selected_codec_from_offer(
                 CAPABILITY_INDEX_MLOW_V1,
             )
         });
-    let local_mlow = format.codec == AudioCodec::Mlow;
+    // The capability gates MLOW's CONTAINER, not the codec inside it -- the escape profile carries
+    // standard Opus in MLOW's framing, and a peer that cleared the bit cannot parse that either.
+    let local_mlow = format.rtp_profile == AudioRtpProfile::Mlow;
     let effective_mlow = wacore::stanza::call::mlow_after_peer_capability(local_mlow, peer);
     (effective_mlow != local_mlow).then_some(if effective_mlow {
         AudioCodec::Mlow
@@ -4975,10 +4986,10 @@ mod tests {
         );
     }
 
-    // A consumer that deliberately configured a profile outside the swappable pair keeps it: the
-    // 48 kHz RFC 7587 clock is not something a capability bit may silently change.
+    // A consumer that deliberately configured a profile whose TIMING differs keeps it: the RFC 7587
+    // clock is not something a capability bit may silently change under a live stream.
     #[test]
-    fn a_profile_outside_the_swappable_pair_is_left_exactly_as_configured() {
+    fn a_profile_with_its_own_timing_is_left_exactly_as_configured() {
         use wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER;
 
         let outside_rollout =
@@ -4986,14 +4997,45 @@ mod tests {
         for format in [
             AudioFormat::OPUS_RFC7587_16KHZ_60MS,
             AudioFormat::OPUS_RFC7587_48KHZ_60MS,
-            AudioFormat::OPUS_MLOW_16KHZ_60MS,
         ] {
             assert_eq!(
                 peer_selected_codec_from_offer(&outside_rollout, format),
                 None,
-                "{format:?} is not swappable and must be preserved"
+                "{format:?} has its own timing and must be preserved"
             );
         }
+    }
+
+    // MLOW's escape profile carries standard Opus inside MLOW's container, so what the capability
+    // gates is the container, not the codec name. A peer that cleared the bit registers native Opus
+    // on the same payload type and cannot parse the escape's rewritten TOC -- and because the two
+    // formats agree on every timing field, dropping the escape costs nothing and changes no RTP
+    // header byte. Read as "the codec is already Opus, nothing to do", the call would keep sending
+    // a container the peer does not speak.
+    #[test]
+    fn the_mlow_escape_is_dropped_for_a_peer_outside_the_rollout() {
+        use wacore::stanza::call::{CAPABILITY_OFFER, CAPABILITY_STANDARD_OPUS_OFFER};
+        use wacore::voip::AudioCodec;
+
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&outside_rollout, AudioFormat::OPUS_MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus),
+            "the escape has to give way to native Opus"
+        );
+        assert_eq!(
+            AudioFormat::OPUS_MLOW_16KHZ_60MS.sibling_for(AudioCodec::Opus),
+            Some(AudioFormat::OPUS_16KHZ_60MS),
+            "and the timing lets it, so nothing is re-signalled"
+        );
+
+        // A peer inside the rollout speaks the container: the escape stays.
+        let inside_rollout = offer_with_capability(Some((1, CAPABILITY_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&inside_rollout, AudioFormat::OPUS_MLOW_16KHZ_60MS),
+            None
+        );
     }
 
     // A blob the peer sent that cannot be read resets everything, unlike a blob it never sent. The
