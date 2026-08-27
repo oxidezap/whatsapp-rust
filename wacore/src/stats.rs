@@ -437,10 +437,18 @@ impl<T: HeapSize> HeapSize for Arc<T> {
 /// nearly half right after a resize. Each bucket also carries one control
 /// byte.
 ///
-/// This inverts hashbrown's own `capacity_to_buckets`, so it is exact for the
-/// bucket count. The fixed `Group::WIDTH` tail on the control array (16 bytes
-/// on x86-64) is not counted: it does not scale with the map, and counting it
-/// would attribute a constant to whichever collection happened to be empty.
+/// This inverts hashbrown's own `capacity_to_buckets`, so it is exact for a
+/// table that has only ever been inserted into. After removals it is a lower
+/// bound: hashbrown leaves a tombstone where a bucket's group has no empty
+/// slot, and a tombstone consumes a growth slot without shrinking the bucket
+/// array, so `capacity()` can read below the canonical capacity of the buckets
+/// really held. A floor is the right direction for these reports and is what
+/// the previous `capacity() * size_of::<(K, V)>()` failed at, by up to a half,
+/// on every table.
+///
+/// The fixed `Group::WIDTH` tail on the control array (16 bytes on x86-64) is
+/// not counted either: it does not scale with the map, and counting it would
+/// attribute a constant to whichever collection happened to be empty.
 pub fn hash_table_bytes(capacity: usize, entry_size: usize) -> usize {
     if capacity == 0 {
         // An unused map allocates nothing at all.

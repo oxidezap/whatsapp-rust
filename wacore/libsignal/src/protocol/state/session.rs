@@ -776,9 +776,15 @@ fn vec_field_retained(field: &Option<Vec<u8>>) -> usize {
     field.as_ref().map_or(0, Vec::capacity)
 }
 
-fn chain_retained_bytes(chain: &session_structure::Chain) -> usize {
-    size_of::<session_structure::Chain>()
-        + vec_field_retained(&chain.sender_ratchet_key)
+/// Heap bytes a chain points at, **excluding the `Chain` itself**.
+///
+/// Every one of these walkers follows that rule: whoever owns the value counts
+/// its inline size once — a `Vec` element through the buffer's capacity, a
+/// `MessageField` through the `Box` it always is — and the walker adds only
+/// what hangs off it. Counting `size_of::<Chain>()` here as well is how a
+/// report starts growing faster than the memory it describes.
+fn chain_pointed_bytes(chain: &session_structure::Chain) -> usize {
+    vec_field_retained(&chain.sender_ratchet_key)
         + vec_field_retained(&chain.sender_ratchet_key_private)
         + chain.chain_key.as_option().map_or(0, |key| {
             size_of::<session_structure::chain::ChainKey>() + bytes_field_retained(&key.key)
@@ -798,35 +804,36 @@ fn chain_retained_bytes(chain: &session_structure::Chain) -> usize {
             .sum::<usize>()
 }
 
-/// Retained bytes of one session state, including everything it points at.
-fn session_retained_bytes(session: &SessionStructure) -> usize {
-    size_of::<SessionStructure>()
-        + vec_field_retained(&session.local_identity_public)
+/// Heap bytes one session state points at, excluding the `SessionStructure`
+/// itself.
+fn session_pointed_bytes(session: &SessionStructure) -> usize {
+    vec_field_retained(&session.local_identity_public)
         + vec_field_retained(&session.remote_identity_public)
         + vec_field_retained(&session.root_key)
         + vec_field_retained(&session.alice_base_key)
+        // `MessageField` is an `Option<Box<T>>`, so a set one owns a `T` on the
+        // heap; a `Vec` element does not, and is covered by the capacity term.
         + session
             .sender_chain
             .as_option()
-            .map_or(0, chain_retained_bytes)
+            .map_or(0, |chain| {
+                size_of::<session_structure::Chain>() + chain_pointed_bytes(chain)
+            })
         + session.receiver_chains.capacity() * size_of::<session_structure::Chain>()
         + session
             .receiver_chains
             .iter()
-            .map(chain_retained_bytes)
+            .map(chain_pointed_bytes)
             .sum::<usize>()
-        + session
-            .pending_key_exchange
-            .as_option()
-            .map_or(0, |pending| {
-                size_of::<session_structure::PendingKeyExchange>()
-                    + vec_field_retained(&pending.local_base_key)
-                    + vec_field_retained(&pending.local_base_key_private)
-                    + vec_field_retained(&pending.local_ratchet_key)
-                    + vec_field_retained(&pending.local_ratchet_key_private)
-                    + vec_field_retained(&pending.local_identity_key)
-                    + vec_field_retained(&pending.local_identity_key_private)
-            })
+        + session.pending_key_exchange.as_option().map_or(0, |pending| {
+            size_of::<session_structure::PendingKeyExchange>()
+                + vec_field_retained(&pending.local_base_key)
+                + vec_field_retained(&pending.local_base_key_private)
+                + vec_field_retained(&pending.local_ratchet_key)
+                + vec_field_retained(&pending.local_ratchet_key_private)
+                + vec_field_retained(&pending.local_identity_key)
+                + vec_field_retained(&pending.local_identity_key_private)
+        })
         + session.pending_pre_key.as_option().map_or(0, |pending| {
             size_of::<session_structure::PendingPreKey>()
                 + vec_field_retained(&pending.base_key)
@@ -1463,21 +1470,25 @@ impl SessionRecord {
     /// therefore reported at roughly a fifth of what it costs — the wrong
     /// direction for the one structure whose growth these reports exist to
     /// catch. Size computation only: nothing is cloned or encoded.
+    ///
+    /// Each container's inline slots are charged once, by whoever owns them;
+    /// the walkers above add only what hangs off those slots.
     pub fn estimated_size(&self) -> usize {
         let current = self
             .current_session
             .as_ref()
-            .map(|s| session_retained_bytes(&s.session))
+            .map(|s| session_pointed_bytes(&s.session))
             .unwrap_or(0);
-        // Archived states are held as their encoding, so this is what they
-        // cost — the point of keeping them that way.
-        let previous: usize = self
-            .previous_sessions
-            .iter()
-            .map(|archived| archived.as_bytes().len())
-            .sum::<usize>()
-            + self.previous_sessions.capacity() * size_of::<ArchivedSession>();
-        current + previous
+        // The `Arc` owns a `Vec` header plus its buffer; each archived state
+        // is its own boxed slice of encoded bytes.
+        let previous = size_of::<Vec<ArchivedSession>>()
+            + self.previous_sessions.capacity() * size_of::<ArchivedSession>()
+            + self
+                .previous_sessions
+                .iter()
+                .map(|archived| archived.as_bytes().len())
+                .sum::<usize>();
+        size_of::<Self>() + current + previous
     }
 
     pub fn remote_registration_id(&self) -> Result<u32, SignalProtocolError> {
@@ -1894,6 +1905,29 @@ mod tests {
         }
     }
 
+    /// Every walker charges only what hangs off a slot, and the owner charges
+    /// the slot — so adding a receiver chain must raise the figure by one
+    /// chain's worth, not two. This is the shape that made the previous
+    /// version report memory growing faster than it did.
+    #[test]
+    fn a_chain_is_charged_once_not_once_per_walker() {
+        let empty = make_cache_shape_session(1, 0, 0);
+        let mut with_one = empty.clone();
+        with_one.receiver_chains = vec![session_structure::Chain {
+            sender_ratchet_key: None,
+            sender_ratchet_key_private: None,
+            chain_key: MessageField::none(),
+            message_keys: Vec::new(),
+        }];
+
+        let delta = session_pointed_bytes(&with_one) - session_pointed_bytes(&empty);
+        assert_eq!(
+            delta,
+            with_one.receiver_chains.capacity() * size_of::<session_structure::Chain>(),
+            "a bare receiver chain costs its slot and nothing more"
+        );
+    }
+
     /// The archive is the deepest part of a record — up to
     /// `ARCHIVED_STATES_MAX_LENGTH` states, each with its own chains and
     /// skipped-key backlog — and the coldest: nothing reads one until a
@@ -1939,7 +1973,10 @@ mod tests {
             lease: CounterLease::default(),
         };
 
-        let parsed: usize = archived.iter().map(session_retained_bytes).sum();
+        let parsed: usize = archived
+            .iter()
+            .map(|session| size_of::<SessionStructure>() + session_pointed_bytes(session))
+            .sum();
         let held: usize = record
             .previous_sessions
             .iter()

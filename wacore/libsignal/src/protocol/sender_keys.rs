@@ -951,42 +951,54 @@ impl SenderKeyRecord {
     /// size, which is what this used to report — the encoded form omits the
     /// `Option` slots and `Vec` capacity that memory actually pays for. Size
     /// computation only: nothing is cloned or encoded.
+    ///
+    /// Each container's inline slots are charged once, here, and the walker
+    /// below adds only what hangs off them. `sender_chain` and `state` live
+    /// inline in `SenderKeyState`, so they are already inside the capacity
+    /// term; adding their `size_of` again would make the figure grow faster
+    /// than the memory it describes.
+    ///
+    /// Not counted: the lazily built signing/verifying key memos. They are
+    /// fixed-size, shared behind an `Arc` between every clone of a state, and
+    /// bounded by the number of cached states the report already lists as
+    /// entries — so charging them per owner would over-count sharing to
+    /// describe a constant.
     pub fn estimated_size(&self) -> usize {
-        self.states.capacity() * size_of::<SenderKeyState>()
+        size_of::<Self>()
+            + self.states.capacity() * size_of::<SenderKeyState>()
             + self
                 .states
                 .iter()
                 .map(|s| {
-                    state_structure_retained_bytes(&s.state)
+                    state_structure_pointed_bytes(&s.state)
+                        // The `Arc` owns a `Vec` header plus its buffer.
+                        + size_of::<Vec<StoredMessageKey>>()
                         + s.message_keys.capacity() * size_of::<StoredMessageKey>()
-                        + s.sender_chain.map_or(0, |_| size_of::<SenderChainKey>())
                 })
                 .sum::<usize>()
     }
 }
 
-/// Retained bytes of one sender-key state structure, including everything it
-/// points at.
+/// Heap bytes one sender-key state structure points at, excluding the
+/// `SenderKeyStateStructure` itself — it lives inline in `SenderKeyState`.
 ///
 /// The skipped-key backlog is not walked here: this record keeps it in
 /// [`StoredMessageKey`] (36 bytes, seed inline) rather than in the protobuf's
 /// `SenderMessageKey`, and `estimated_size` counts it there.
-fn state_structure_retained_bytes(state: &SenderKeyStateStructure) -> usize {
+fn state_structure_pointed_bytes(state: &SenderKeyStateStructure) -> usize {
     fn bytes_field(field: &Option<bytes::Bytes>) -> usize {
         field.as_ref().map_or(0, |b| b.len())
     }
 
-    size_of::<SenderKeyStateStructure>()
-        + state.sender_chain_key.as_option().map_or(0, |chain| {
-            size_of::<sender_key_state_structure::SenderChainKey>() + bytes_field(&chain.seed)
-        })
-        + state.sender_signing_key.as_option().map_or(0, |signing| {
-            size_of::<sender_key_state_structure::SenderSigningKey>()
-                + bytes_field(&signing.public)
-                + bytes_field(&signing.private)
-        })
-        + state.sender_message_keys.capacity()
-            * size_of::<sender_key_state_structure::SenderMessageKey>()
+    // `MessageField` is an `Option<Box<T>>`, so a set one owns its `T`.
+    state.sender_chain_key.as_option().map_or(0, |chain| {
+        size_of::<sender_key_state_structure::SenderChainKey>() + bytes_field(&chain.seed)
+    }) + state.sender_signing_key.as_option().map_or(0, |signing| {
+        size_of::<sender_key_state_structure::SenderSigningKey>()
+            + bytes_field(&signing.public)
+            + bytes_field(&signing.private)
+    }) + state.sender_message_keys.capacity()
+        * size_of::<sender_key_state_structure::SenderMessageKey>()
         + state
             .sender_message_keys
             .iter()

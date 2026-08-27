@@ -6,9 +6,10 @@
 //! Its own integration test, not a unit test: a global allocator applies to the
 //! whole binary, and the library's other tests must not run under one.
 //!
-//! One test function, not two: the counter is global, so a second test running
-//! on another harness thread would have its allocations land in this one's
-//! measurement.
+//! One test function, not several: the counter is process-wide, and the test
+//! harness runs functions on separate threads. A mutex is not enough — the
+//! harness allocates around each function it starts — so the measurements are
+//! kept in one function that never yields.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
@@ -93,4 +94,27 @@ fn reported_bytes_match_what_the_table_allocates() {
              the old one ({previous_formula} B)"
         );
     }
+
+    // A table that has seen removals reports a `capacity()` below the
+    // canonical one for its buckets: hashbrown leaves tombstones that consume
+    // growth slots without shrinking the array. The figure is a floor there
+    // rather than exact — the safe direction, and the property worth pinning
+    // is that it never reads *over* what the table holds.
+    let before = LIVE.load(Ordering::Relaxed);
+    let mut map: HashMap<u64, [u8; 16]> = HashMap::with_capacity(1000);
+    for i in 0..1000u64 {
+        map.insert(i, [0u8; 16]);
+    }
+    for i in 0..900u64 {
+        map.remove(&i);
+    }
+    let allocated = LIVE.load(Ordering::Relaxed) - before;
+    let reported = hash_table_bytes(map.capacity(), size_of::<Entry>());
+    drop(map);
+
+    assert!(
+        reported <= allocated,
+        "after removals the report must stay a floor: {reported} B reported, \
+         {allocated} B held"
+    );
 }
