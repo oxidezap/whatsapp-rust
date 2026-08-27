@@ -21,23 +21,75 @@ enum OrderBy {
     Phone,
 }
 
+/// Order `order` in place, `le` deciding whether the first index sorts at or
+/// before the second.
+///
+/// A hand-written bottom-up merge sort, not `sort_unstable_by`. pdqsort
+/// monomorphizes into thirteen specialized routines per (element type,
+/// comparator type) — `sort13_optimal`, `sort9_optimal`, `ipnsort`, two
+/// partition variants, a heapsort fallback and more — which a symbol-level
+/// diff of `wacore`'s release object measured at **15.6 KiB of `.text` for
+/// this single call site**, half of the crate's whole growth. Nothing here is
+/// hot enough to buy that: it runs once per group-metadata fetch and once per
+/// membership notification, over at most a few thousand `u32`s.
+///
+/// The comparator is a trait object rather than a generic parameter so this
+/// routine exists exactly once however many orderings are added later — the
+/// property the previous spelling had to get by funnelling every caller
+/// through one closure, now a guarantee of the signature.
+fn merge_sort_indices(order: &mut Vec<u32>, le: &dyn Fn(u32, u32) -> bool) {
+    let n = order.len();
+    if n < 2 {
+        return;
+    }
+    let mut src = std::mem::take(order);
+    let mut dst = vec![0u32; n];
+    let mut width = 1;
+    while width < n {
+        let mut start = 0;
+        while start < n {
+            let mid = (start + width).min(n);
+            let end = (start + 2 * width).min(n);
+            let (mut left, mut right, mut out) = (start, mid, start);
+            while left < mid && right < end {
+                if le(src[left], src[right]) {
+                    dst[out] = src[left];
+                    left += 1;
+                } else {
+                    dst[out] = src[right];
+                    right += 1;
+                }
+                out += 1;
+            }
+            // Exactly one run still has elements, and it fills the rest of
+            // this block.
+            let rest = if left < mid {
+                &src[left..mid]
+            } else {
+                &src[right..end]
+            };
+            dst[out..end].copy_from_slice(rest);
+            start = end;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        width *= 2;
+    }
+    *order = src;
+}
+
 /// Indices `0..pairs.len()` ordered by one side of the pairs.
 ///
-/// Both orderings go through this one function, and it sorts `u32` indices
-/// rather than the pairs themselves, so the binary carries a **single**
-/// `sort_unstable_by` instantiation for the whole module. That matters more
-/// than it looks: pdqsort monomorphizes per (element type, comparator type)
-/// and costs roughly 10 KiB of `.text` a copy, so the obvious spelling — a
-/// closure at each of the four call sites that needed an order — put ~40 KiB
-/// into the binary for ~40 lines of logic. The `by` branch inside the
-/// comparator is the price, paid on the build path only.
+/// Sorts `u32` indices rather than the pairs themselves: the elements moved
+/// are 4 bytes instead of 56, and the permutation is what both callers want
+/// anyway. Ties keep input order, so a rebuild of the same input yields the
+/// same slice.
 fn ordered_indices(pairs: &[LidPnPair], by: OrderBy) -> Vec<u32> {
     let mut order: Vec<u32> = (0..pairs.len() as u32).collect();
-    order.sort_unstable_by(|a, b| {
-        let (a, b) = (&pairs[*a as usize], &pairs[*b as usize]);
+    merge_sort_indices(&mut order, &|a, b| {
+        let (a, b) = (&pairs[a as usize], &pairs[b as usize]);
         match by {
-            OrderBy::Lid => a.0.cmp(&b.0),
-            OrderBy::Phone => a.1.user.cmp(&b.1.user).then_with(|| a.0.cmp(&b.0)),
+            OrderBy::Lid => a.0 <= b.0,
+            OrderBy::Phone => a.1.user.cmp(&b.1.user).then_with(|| a.0.cmp(&b.0)).is_le(),
         }
     });
     order
@@ -555,6 +607,37 @@ mod tests {
                 .map(|j| j.user.as_str()),
             Some("bob_pn")
         );
+    }
+
+    /// A hand-written sort earns a direct test, not only the oracle below:
+    /// merge sorts fail at the block boundaries, on odd lengths, and on runs
+    /// of equal keys, and an ordering bug there would surface as a lookup
+    /// miss far from here.
+    #[test]
+    fn the_index_sort_orders_every_length_and_keeps_ties_in_input_order() {
+        for n in 0..=65usize {
+            // Keys deliberately collide in threes, so most lengths carry runs
+            // of equal elements across a merge boundary.
+            let keys: Vec<u32> = (0..n as u32).map(|i| (i * 7 % 13) / 3).collect();
+            let mut order: Vec<u32> = (0..n as u32).collect();
+            merge_sort_indices(&mut order, &|a, b| keys[a as usize] <= keys[b as usize]);
+
+            assert_eq!(order.len(), n, "length {n}: the permutation lost entries");
+            let mut seen = order.clone();
+            seen.sort_unstable();
+            assert_eq!(
+                seen,
+                (0..n as u32).collect::<Vec<_>>(),
+                "length {n}: not a permutation of the input indices"
+            );
+            for w in order.windows(2) {
+                let (a, b) = (w[0] as usize, w[1] as usize);
+                assert!(keys[a] <= keys[b], "length {n}: out of order at {a},{b}");
+                if keys[a] == keys[b] {
+                    assert!(a < b, "length {n}: a tie was reordered ({a} after {b})");
+                }
+            }
+        }
     }
 
     /// The sorted slices replace two `HashMap`s, so every edit path has to
