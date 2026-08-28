@@ -180,15 +180,21 @@ async fn tap_forward(
             // This forwarder sits AFTER the pump, so it must preserve STUN too (a Request that
             // survived the pump can't be silently dropped here). Drop only media; block on STUN.
             Err(async_channel::TrySendError::Full(ev)) => {
-                // `InboundDropped` is a control event, not media: it is the pump's report of media
-                // it already discarded, and discarding the report too would leave the call with no
-                // record of the loss at precisely the moment it is losing packets.
+                // Exhaustive on purpose, no wildcard: media is the ONLY loss-tolerant thing on this
+                // channel, and a wildcard quietly enrolls every variant added later into being
+                // dropped as media. `Disconnected` fell into one and was discarded -- and counted
+                // as lost media besides -- so a transport that reports the loss before closing its
+                // senders left the driver attached with nothing to tell it otherwise.
+                // `InboundDropped` is likewise not media but the pump's report OF media, and
+                // dropping it would leave the call with no record of the loss at exactly the moment
+                // it is losing packets.
                 let is_control = match &ev {
                     RelayTransportEvent::PacketReceived(d) => {
                         classify_relay_packet(d) == RelayPacketKind::Stun
                     }
-                    RelayTransportEvent::InboundDropped(_) => true,
-                    _ => false,
+                    RelayTransportEvent::Connected
+                    | RelayTransportEvent::InboundDropped(_)
+                    | RelayTransportEvent::Disconnected(_) => true,
                 };
                 if is_control {
                     if out_tx.send(ev).await.is_err() {
@@ -547,6 +553,53 @@ mod tests {
             reported, 2,
             "both dropped media packets are accounted for, got {seen:?}"
         );
+    }
+
+    // Lifecycle is not media. Dropped through the old wildcard, a `Disconnected` that arrived
+    // while the channel was full left the driver attached to a transport that had already reported
+    // itself gone -- and inflated the media-loss counter on the way out.
+    #[test]
+    fn tap_forward_never_drops_the_disconnect() {
+        let media = || RelayTransportEvent::PacketReceived(Bytes::from_static(b"\x90\x78\x01\x02"));
+        let (inner_tx, inner_rx) = async_channel::unbounded();
+        // Fills the cap-1 channel, so everything behind it meets a full queue.
+        inner_tx.try_send(media()).unwrap();
+        inner_tx.try_send(media()).unwrap();
+        inner_tx
+            .try_send(RelayTransportEvent::Disconnected(
+                RelayDisconnectReason::Closed,
+            ))
+            .unwrap();
+        inner_tx.close();
+        let (out_tx, out_rx) = async_channel::bounded(1);
+        let tap = Arc::new(InMemoryTap::default());
+
+        let seen = futures::executor::block_on(async {
+            let fwd = tap_forward(inner_rx, out_tx, tap);
+            let drive = async {
+                let mut seen = Vec::new();
+                while let Ok(ev) = out_rx.recv().await {
+                    seen.push(ev);
+                }
+                seen
+            };
+            let (_, seen) = futures::join!(fwd, drive);
+            seen
+        });
+
+        assert!(
+            seen.iter()
+                .any(|ev| matches!(ev, RelayTransportEvent::Disconnected(_))),
+            "the disconnect has to survive a full queue, got {seen:?}"
+        );
+        assert!(
+            matches!(seen.last(), Some(RelayTransportEvent::Disconnected(_))),
+            "and arrives after the media ahead of it, not instead of it, got {seen:?}"
+        );
+        // Nothing asserts the pending drop report here: at teardown it is best effort by design
+        // (see `tap_forward`), and the disconnect legitimately takes the last slot. What must not
+        // happen is the disconnect being counted AS the lost media, which the assertion above
+        // rules out -- a counted disconnect is a dropped one.
     }
 
     // The steady state of a tapped call that is behind: the driver frees exactly one slot before
