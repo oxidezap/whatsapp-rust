@@ -45,6 +45,12 @@ pub(crate) struct SenderKeyDeviceMap {
     generation: AtomicU64,
 }
 
+/// The two reference counts an `Arc` allocation carries ahead of its payload.
+/// A user key is one `Arc<str>` per user, so leaving this out understated a
+/// 1024-user map by 16 KiB — and a report that understates what grows is the
+/// one thing `HeapSize` says these figures must not do.
+const ARC_HEADER: usize = 2 * size_of::<usize>();
+
 /// The state of `device_id` within one user's devices.
 ///
 /// A linear scan, not a binary search: a user has a handful of devices, and at
@@ -198,7 +204,9 @@ impl SenderKeyDeviceMap {
         ) + self
             .devices
             .iter()
-            .map(|(user, states)| user.len() + states.len() * size_of::<DeviceWarmState>())
+            .map(|(user, states)| {
+                ARC_HEADER + user.len() + states.len() * size_of::<DeviceWarmState>()
+            })
             .sum::<usize>()
     }
 }
@@ -536,8 +544,8 @@ mod tests {
         let per_device =
             (size_of::<SenderKeyDeviceMap>() + map.retained_bytes()) / (USERS * DEVICES_PER_USER);
         assert!(
-            per_device <= 31,
-            "a warm 1024-user sender-key map must stay within 31 B per device, got {per_device}"
+            per_device <= 36,
+            "a warm 1024-user sender-key map must stay within 36 B per device, got {per_device}"
         );
     }
 
