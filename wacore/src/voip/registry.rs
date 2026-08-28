@@ -292,7 +292,7 @@ struct CallEntry {
     /// participant and several `<accept>`s can land in the window between
     /// registration and the media plane attaching -- a single slot would keep
     /// only the last of them.
-    peer_video_orientations: Vec<(Jid, u8)>,
+    peer_video_orientations: Vec<PeerOrientation>,
     /// Explicit group identity exists before the first authoritative roster arrives.
     is_group_call: bool,
     /// This generation originated from a reusable call-link join and may accept waiting-room state.
@@ -313,13 +313,40 @@ struct CallEntry {
 /// Linear because the list holds one entry per participant that has announced a
 /// rotation, which is a handful even in a large group call, and a map's fixed
 /// cost would be paid by every 1:1 call for a single entry.
-fn upsert_peer_orientation(orientations: &mut Vec<(Jid, u8)>, peer: Jid, orientation: u8) {
+/// A rotation a peer announced, and who announced it.
+#[derive(Clone)]
+struct PeerOrientation {
+    announcer: Jid,
+    orientation: u8,
+    /// Whether a roster has ever named this announcer.
+    ///
+    /// It is what separates the two reasons a roster cannot name one now. An
+    /// announcement can arrive before the roster carrying its sender -- an
+    /// `<accept>` beating its own admission -- and must survive whatever
+    /// unrelated snapshots land in between. One that *was* named and no longer
+    /// is belongs to a participant who left, and must not.
+    named_by_roster: bool,
+}
+
+fn upsert_peer_orientation(
+    orientations: &mut Vec<PeerOrientation>,
+    announcer: Jid,
+    orientation: u8,
+    named_by_roster: bool,
+) {
     match orientations
         .iter_mut()
-        .find(|(announcer, _)| *announcer == peer)
+        .find(|entry| entry.announcer == announcer)
     {
-        Some(entry) => entry.1 = orientation,
-        None => orientations.push((peer, orientation)),
+        Some(entry) => {
+            entry.orientation = orientation;
+            entry.named_by_roster |= named_by_roster;
+        }
+        None => orientations.push(PeerOrientation {
+            announcer,
+            orientation,
+            named_by_roster,
+        }),
     }
 }
 
@@ -332,7 +359,7 @@ impl CallEntry {
     /// for every path but the group promotion is nothing.
     fn adopt_session(&mut self, session: CallSession) {
         if let Some((peer, orientation)) = session.peer_video_orientation.clone() {
-            upsert_peer_orientation(&mut self.peer_video_orientations, peer, orientation);
+            upsert_peer_orientation(&mut self.peer_video_orientations, peer, orientation, false);
         }
         self.session = session;
     }
@@ -422,11 +449,11 @@ impl CallEntry {
                 .group_invite_peer_device
                 .as_ref()
                 .map_or(0, HeapSize::heap_bytes)
-            + self.peer_video_orientations.capacity() * size_of::<(Jid, u8)>()
+            + self.peer_video_orientations.capacity() * size_of::<PeerOrientation>()
             + self
                 .peer_video_orientations
                 .iter()
-                .map(|(announcer, _)| announcer.heap_bytes())
+                .map(|entry| entry.announcer.heap_bytes())
                 .sum::<usize>()
             + size_of::<AsyncMutex<()>>() * 2
             + size_of::<event_listener::Event>()
@@ -956,9 +983,25 @@ impl CallRegistry {
                 // The engine retires its own map the same way.
                 let announced = std::mem::take(&mut entry.peer_video_orientations);
                 let mut renamed = Vec::with_capacity(announced.len());
-                for (announcer, orientation) in announced {
-                    if let Some(known) = entry.roster_name_for(&announcer) {
-                        upsert_peer_orientation(&mut renamed, known, orientation);
+                for announced in announced {
+                    match entry.roster_name_for(&announced.announcer) {
+                        Some(known) => upsert_peer_orientation(
+                            &mut renamed,
+                            known,
+                            announced.orientation,
+                            true,
+                        ),
+                        // Never named, so this roster is not evidence of a
+                        // departure -- only that the sender has not been
+                        // admitted yet. Held for the roster that admits them,
+                        // bounded by what a group call can hold.
+                        None if !announced.named_by_roster
+                            && renamed.len()
+                                < crate::types::group_call::GROUP_CALL_MAX_PARTICIPANTS =>
+                        {
+                            renamed.push(announced)
+                        }
+                        None => {}
                     }
                 }
                 entry.peer_video_orientations = renamed;
@@ -969,8 +1012,8 @@ impl CallRegistry {
                 let reassert: Vec<VideoControl> = entry
                     .peer_video_orientations
                     .iter()
-                    .map(|(announcer, orientation)| {
-                        entry.peer_orientation_control(announcer, *orientation)
+                    .map(|announced| {
+                        entry.peer_orientation_control(&announced.announcer, announced.orientation)
                     })
                     .collect();
                 if let Some(tx) = entry.video_ctl_tx.as_ref() {
@@ -1586,7 +1629,16 @@ impl CallRegistry {
             // has one, and it then outlives every negotiation rebuild.
             self_video_orientation: 0,
             // Seeded from the offer; `set_video_channels` replays it, keeping it.
-            peer_video_orientations: session.peer_video_orientation.clone().into_iter().collect(),
+            peer_video_orientations: session
+                .peer_video_orientation
+                .clone()
+                .into_iter()
+                .map(|(announcer, orientation)| PeerOrientation {
+                    announcer,
+                    orientation,
+                    named_by_roster: false,
+                })
+                .collect(),
             session,
             media_task: None,
             waiting_room_task: None,
@@ -1916,8 +1968,10 @@ impl CallRegistry {
             // Before the sender is published, so the rotation the offer
             // announced is the first thing the drive loop reads rather than
             // racing the first inbound frame.
-            for (peer, orientation) in entry.peer_video_orientations.clone() {
-                video_ctl_tx.send(entry.peer_orientation_control(&peer, orientation));
+            for announced in entry.peer_video_orientations.clone() {
+                video_ctl_tx.send(
+                    entry.peer_orientation_control(&announced.announcer, announced.orientation),
+                );
             }
             entry.video_ctl_tx = Some(video_ctl_tx);
             entry.video_teardown = Some(video_teardown);
@@ -1967,11 +2021,19 @@ impl CallRegistry {
         }
         let control = entry.peer_orientation_control(peer, orientation);
         // Kept whether or not it lands: unsent it waits for the first plane,
-        // sent it is what a replacement plane has to be told.
+        // sent it is what a replacement plane has to be told. Filed under the
+        // same name the control carries, so a participant announced once by its
+        // roster identity and once by a PN alias occupies one slot rather than
+        // two that later reconciliation would merge in whatever order they were
+        // pushed -- letting the stale alias overwrite the newest rotation. The
+        // raw JID is the key only while the roster cannot name the announcer.
+        let named_by_roster = entry.roster_name_for(peer).is_some();
+        let key = peer.clone();
         upsert_peer_orientation(
             &mut entry.peer_video_orientations,
-            peer.clone(),
+            key,
             orientation,
+            named_by_roster,
         );
         entry.video_ctl_tx.as_ref().map(|tx| tx.send(control));
         true
@@ -5135,6 +5197,67 @@ mod tests {
                 participant: joiner.clone(),
                 orientation: 1,
             })
+        );
+    }
+
+    /// A rotation can arrive before the roster admitting its sender, and an
+    /// unrelated snapshot lands in between. That snapshot is not evidence the
+    /// sender left -- only that nobody has admitted them yet -- so the rotation
+    /// waits for the roster that names them.
+    #[test]
+    fn a_rotation_waits_through_a_roster_that_does_not_name_its_sender_yet() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let other = Jid::new("444444444444444", Server::Lid);
+        let latecomer = Jid::new("222222222222222", Server::Lid);
+        let pn = Jid::new("5511999990000", Server::Pn);
+        let participant = |jid: &Jid, pn: Option<Jid>, pid: u32| GroupCallParticipant {
+            jid: jid.clone(),
+            pn,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: jid.clone().with_device(1),
+                platform: None,
+                pid: Some(pid),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        };
+
+        let mut session =
+            CallSession::new_outgoing("GID", Jid::new("GID", Server::Call), creator.clone());
+        let mut alone = group_update(1);
+        alone.call_id = "GID".to_string();
+        session.group = Some(alone);
+        let generation = reg.insert(session);
+        assert!(reg.set_peer_video_orientation("GID", generation, &pn, 3));
+
+        // Somebody else joins first.
+        let mut interim = group_update(2);
+        interim.call_id = "GID".to_string();
+        interim.participants.push(participant(&other, None, 9));
+        assert_eq!(reg.apply_group_update(interim), GroupStateApply::Applied);
+
+        // Now the announcer is admitted.
+        let mut admitted = group_update(3);
+        admitted.call_id = "GID".to_string();
+        admitted.participants.push(participant(&other, None, 9));
+        admitted
+            .participants
+            .push(participant(&latecomer, Some(pn), 1));
+        assert_eq!(reg.apply_group_update(admitted), GroupStateApply::Applied);
+
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant: latecomer,
+                orientation: 3,
+            }),
+            "the announcement survived the snapshot that could not name it"
         );
     }
 
