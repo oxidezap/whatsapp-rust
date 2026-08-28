@@ -2605,8 +2605,9 @@ impl CallEngine {
         }
         // Set by the content probe below and applied once the media borrow has ended: the switch
         // needs the whole engine, and holding both borrows would be a borrow-checker fight for no
-        // behavioural gain. The encoded path keeps its own, since it returns before the tail.
-        #[cfg(feature = "voip-mlow")]
+        // behavioural gain. The encoded path keeps its own, since it returns before the tail. Not
+        // gated on the built-in codec: the standard-Opus PCM path asks too, and it exists in a build
+        // that has no MLOW decoder at all.
         let mut probe_verdict: Option<AudioCodec> = None;
         let Some(m) = self.media.as_mut() else {
             return;
@@ -2715,6 +2716,25 @@ impl CallEngine {
             Some(SframeIn::AuthFailed | SframeIn::Plaintext) | None => payload,
         };
         let codec = m.active_format.inbound_codec(header.payload_type, &encoded);
+        // Asked HERE, before the Opus branch returns. That branch decodes inbound audio perfectly
+        // well without the call-wide format ever moving, which leaves `on_mic` encoding MLOW at a
+        // peer that speaks native Opus: inbound fine, outbound silent, and no counter describing it
+        // because nothing failed. Native CELT reaching this point is confidently native -- the
+        // escape discriminator just said so -- and it agrees with the negotiated cadence, which is
+        // exactly the corroboration the probe wants. Unauthenticated bytes are excluded as
+        // everywhere else: they are not evidence.
+        //
+        // PCM only: the encoded branch below asks for itself, and the probe must be asked ONCE per
+        // packet. Asked twice, three consecutive agreements are reached in two packets and the whole
+        // requirement is halved.
+        if m.audio.io == AudioIo::Pcm
+            && !unauthenticated
+            && codec == AudioCodec::Opus
+            && m.active_format.codec == AudioCodec::Mlow
+            && !m.active_format.payload_is_mlow_escape(&encoded)
+        {
+            probe_verdict = observe_codec_content(m, &encoded);
+        }
         if m.audio.io == AudioIo::Pcm && codec == AudioCodec::Opus {
             // The peer speaks a codec the core does not implement. With a platform decoder the
             // samples join the SAME jitter buffer the MLow path feeds, so there is one playout
@@ -2773,6 +2793,9 @@ impl CallEngine {
                             .saturating_add(drop_n as u32);
                     }
                 }
+                // This branch returns before the tail that normally applies it, and a verdict
+                // dropped here is the outbound half of the call staying on the wrong codec.
+                self.apply_codec_verdict(probe_verdict);
                 return;
             }
             // No decoder for it. Surface the payload so a shell that has one can play it, and let
@@ -2784,6 +2807,7 @@ impl CallEngine {
                 .saturating_add(1);
             self.outbox
                 .push_back(Output::Event(CallEvent::ForeignAudio(Bytes::from(encoded))));
+            self.apply_codec_verdict(probe_verdict);
             return;
         }
         if m.audio.io == AudioIo::Encoded {
@@ -2801,7 +2825,15 @@ impl CallEngine {
             let verdict = (!unauthenticated)
                 .then(|| observe_codec_content(m, &encoded))
                 .flatten();
+            // A packet the discriminator proves is native gets the native label immediately, before
+            // any verdict: the probe needs three of them, and labelling the first two with MLOW's
+            // container tells the sink to undo an escape that is not there. Waiting for
+            // corroboration is right for the call-wide SWITCH, which changes what we send; it is
+            // wrong for describing a packet whose grammar this one packet already settles.
+            let native_now =
+                codec == AudioCodec::Opus && !m.active_format.payload_is_mlow_escape(&encoded);
             let (codec, active_format) = match verdict
+                .or(native_now.then_some(AudioCodec::Opus))
                 .and_then(|c| m.active_format.sibling_for(c).map(|format| (c, format)))
             {
                 Some(pair) => pair,
@@ -7296,6 +7328,84 @@ mod tests {
                 .all(|(codec, format)| *codec == AudioCodec::Opus
                     && *format == AudioFormat::OPUS_16KHZ_60MS),
             "and every frame after it agrees"
+        );
+    }
+
+    // The probe needs three packets before the call-wide switch, but the grammar of any ONE native
+    // packet is already settled by the discriminator. Labelling the first two with MLOW's container
+    // tells the sink to undo an escape that is not there, and it loses them.
+    #[test]
+    fn an_encoded_call_labels_native_celt_natively_before_the_verdict() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        let mut native: Vec<u8> = vec![27 << 3 | 3, 3];
+        native.extend(core::iter::repeat_n(0x11u8, 60));
+        let mut peer_tx = peer_pipeline();
+        let mut delivered = Vec::new();
+        for n in 0..3u64 {
+            let packet = peer_tx.protect_audio(&native);
+            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                if let Output::EncodedAudio(frame) = output {
+                    delivered.push((frame.codec, frame.format));
+                }
+            }
+        }
+
+        assert_eq!(delivered.len(), 3);
+        assert!(
+            delivered
+                .iter()
+                .all(|(codec, format)| *codec == AudioCodec::Opus
+                    && *format == AudioFormat::OPUS_16KHZ_60MS),
+            "every one, including the two before the verdict, got {delivered:?}"
+        );
+    }
+
+    // Inbound native CELT decodes perfectly well without the call-wide format ever moving, and then
+    // `on_mic` goes on encoding MLOW at a peer that speaks native Opus: inbound fine, outbound
+    // silent, and no counter describing it because nothing failed. The probe has to be asked before
+    // that branch returns, and its verdict applied there too.
+    #[test]
+    fn native_celt_on_the_pcm_path_moves_the_call_so_the_outbound_half_follows() {
+        let mut eng = CallEngine::new(config(true), Box::new(SequentialTxIds::new()))
+            .unwrap()
+            .with_foreign_audio_codec(Box::new(StubForeignCodec { samples: 960 }));
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+        assert_eq!(eng.active_audio_codec(), Some(AudioCodec::Mlow));
+
+        // Config 27, code 3, three 20ms CELT frames: native Opus at the negotiated 60ms cadence,
+        // with a TOC in the escape's bit class.
+        let mut native: Vec<u8> = vec![27 << 3 | 3, 3];
+        native.extend(core::iter::repeat_n(0x11u8, 60));
+        let mut peer_tx = peer_pipeline();
+        for n in 0..6u64 {
+            let packet = peer_tx.protect_audio(&native);
+            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+
+        assert_eq!(
+            eng.active_audio_codec(),
+            Some(AudioCodec::Opus),
+            "the call has to move, or everything it sends stays MLOW"
+        );
+        assert_eq!(
+            eng.active_audio_format(),
+            Some(AudioFormat::OPUS_16KHZ_60MS),
+            "and onto the native format, since these bytes are not the escape"
         );
     }
 
