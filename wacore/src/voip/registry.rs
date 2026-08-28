@@ -363,13 +363,19 @@ impl CallEntry {
     /// was announced when the roster does not know it yet -- an offer parsed
     /// before its group snapshot installs.
     fn canonical_group_announcer(&self, sender: &Jid) -> Jid {
+        self.roster_name_for(sender)
+            .unwrap_or_else(|| sender.clone())
+    }
+
+    /// The roster's name for `sender`, or `None` when it cannot name it yet --
+    /// an announcement that arrived before the roster carrying its sender.
+    fn roster_name_for(&self, sender: &Jid) -> Option<Jid> {
         if sender.device != 0
             && let Some(device) = CallRegistry::canonical_group_device_for_entry(self, sender)
         {
-            return device;
+            return Some(device);
         }
         CallRegistry::canonical_group_participant_for_entry(self, sender)
-            .unwrap_or_else(|| sender.clone())
     }
 
     fn group_mut(&mut self) -> &mut GroupCallState {
@@ -940,23 +946,22 @@ impl CallRegistry {
             entry.is_group_call = true;
             entry.group = Some(preview);
             if applied == GroupStateApply::Applied {
-                // A long call outlives many participants, and every one that
-                // announced a rotation left an entry here. Retiring them with
-                // the roster keeps this bounded by who is actually on the call
-                // -- and keeps a replacement plane from being told the rotation
-                // of somebody who left. The engine retires its own map the same
-                // way.
-                let departed: Vec<Jid> = entry
-                    .peer_video_orientations
-                    .iter()
-                    .map(|(announcer, _)| announcer.clone())
-                    .filter(|announcer| {
-                        Self::canonical_group_participant_for_entry(entry, announcer).is_none()
-                    })
-                    .collect();
-                entry
-                    .peer_video_orientations
-                    .retain(|(announcer, _)| !departed.contains(announcer));
+                // Every rotation is re-read against the roster that just landed.
+                // One announced before its sender was in it is holding the name
+                // it arrived under, and this is where it gets the roster's --
+                // the only one playout looks under. One the roster can no longer
+                // name is a participant who left: a long call outlives many of
+                // them, and keeping their rotations would grow this without
+                // bound and tell a replacement plane about people who are gone.
+                // The engine retires its own map the same way.
+                let announced = std::mem::take(&mut entry.peer_video_orientations);
+                let mut renamed = Vec::with_capacity(announced.len());
+                for (announcer, orientation) in announced {
+                    if let Some(known) = entry.roster_name_for(&announcer) {
+                        upsert_peer_orientation(&mut renamed, known, orientation);
+                    }
+                }
+                entry.peer_video_orientations = renamed;
             }
             let admitted = applied == GroupStateApply::Applied
                 && entry.is_call_link
@@ -5114,6 +5119,72 @@ mod tests {
                 participant: joiner.clone(),
                 orientation: 1,
             })
+        );
+    }
+
+    /// An `<accept>` can reach the registry before the roster naming its
+    /// sender: the rotation is kept under the name it arrived with, and the
+    /// roster that lands next is what gives it the name playout reads.
+    #[test]
+    fn a_rotation_announced_before_the_roster_takes_the_rosters_name() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let lid = Jid::new("222222222222222", Server::Lid);
+        let pn = Jid::new("5511999990000", Server::Pn);
+
+        let mut session =
+            CallSession::new_outgoing("GID", Jid::new("GID", Server::Call), creator.clone());
+        let mut alone = group_update(1);
+        alone.call_id = "GID".to_string();
+        session.group = Some(alone);
+        let generation = reg.insert(session);
+
+        // Announced under a phone number the roster has never mentioned.
+        assert!(reg.set_peer_video_orientation("GID", generation, &pn, 3));
+
+        let mut joined = group_update(2);
+        joined.call_id = "GID".to_string();
+        joined.participants.push(GroupCallParticipant {
+            jid: lid.clone(),
+            pn: Some(pn.clone()),
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: lid.clone().with_device(1),
+                platform: None,
+                pid: Some(1),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        assert_eq!(reg.apply_group_update(joined), GroupStateApply::Applied);
+
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant: lid.clone(),
+                orientation: 3,
+            }),
+            "the roster renamed it rather than leaving it under the alias"
+        );
+
+        // And the two spellings are one participant: announcing under the LID
+        // now replaces that value instead of accumulating beside it.
+        assert!(reg.set_peer_video_orientation("GID", generation, &lid, 1));
+        let _ = ctl_rx.try_recv();
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (replacement_tx, replacement_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, replacement_tx, Box::new(|| {}));
+        let replayed = std::iter::from_fn(|| replacement_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            replayed,
+            vec![VideoControl::SetParticipantOrientation {
+                participant: lid,
+                orientation: 1,
+            }]
         );
     }
 
