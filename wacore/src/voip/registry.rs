@@ -962,6 +962,22 @@ impl CallRegistry {
                     }
                 }
                 entry.peer_video_orientations = renamed;
+                // Say them again. The engine prunes its own participant map on
+                // this same update and matches only roster JIDs, never an
+                // alias, so a rotation delivered under one is gone from it now
+                // -- and the rename above only put this side right.
+                let reassert: Vec<VideoControl> = entry
+                    .peer_video_orientations
+                    .iter()
+                    .map(|(announcer, orientation)| {
+                        entry.peer_orientation_control(announcer, *orientation)
+                    })
+                    .collect();
+                if let Some(tx) = entry.video_ctl_tx.as_ref() {
+                    for control in reassert {
+                        tx.send(control);
+                    }
+                }
             }
             let admitted = applied == GroupStateApply::Applied
                 && entry.is_call_link
@@ -5119,6 +5135,66 @@ mod tests {
                 participant: joiner.clone(),
                 orientation: 1,
             })
+        );
+    }
+
+    /// With the plane already up, an alias announcement reaches the engine
+    /// under the alias -- and the engine drops it on the next roster, which
+    /// knows only roster identities. The roster that renames it here has to say
+    /// it again, or those frames go upright until the peer rotates once more.
+    #[test]
+    fn a_roster_that_renames_a_rotation_says_it_again_to_the_plane() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let lid = Jid::new("222222222222222", Server::Lid);
+        let pn = Jid::new("5511999990000", Server::Pn);
+
+        let mut session =
+            CallSession::new_outgoing("GID", Jid::new("GID", Server::Call), creator.clone());
+        let mut alone = group_update(1);
+        alone.call_id = "GID".to_string();
+        session.group = Some(alone);
+        let generation = reg.insert(session);
+
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+
+        // Announced while the roster still cannot name the sender: the engine
+        // hears the alias.
+        assert!(reg.set_peer_video_orientation("GID", generation, &pn, 3));
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant: pn.clone(),
+                orientation: 3,
+            })
+        );
+
+        let mut joined = group_update(2);
+        joined.call_id = "GID".to_string();
+        joined.participants.push(GroupCallParticipant {
+            jid: lid.clone(),
+            pn: Some(pn),
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: lid.clone().with_device(1),
+                platform: None,
+                pid: Some(1),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        assert_eq!(reg.apply_group_update(joined), GroupStateApply::Applied);
+
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant: lid,
+                orientation: 3,
+            }),
+            "the rotation is restated under the name the engine keeps"
         );
     }
 
