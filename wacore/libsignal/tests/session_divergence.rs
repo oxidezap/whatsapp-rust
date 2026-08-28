@@ -891,29 +891,19 @@ mod announced {
     }
 }
 
-/// A replayed message is an expected outcome, not a session failure.
+/// Alice and Bob past the pkmsg handshake, plus one Whisper message Bob has
+/// already decrypted — the state a server redelivery arrives into.
 ///
-/// The server redelivers anything it has not seen acked, so a reconnect can
-/// hand this client a message whose counter it already consumed — which is
-/// exactly what a companion sees on startup when the previous run exited
-/// before its ack was flushed.
-///
-/// What this pins: the verdict is `DuplicatedMessage` and nothing about it is
-/// announced at error level. Why the protocol wants that is stated once, at the
-/// classification in `decrypt_message_with_record`.
-#[test]
-fn a_replayed_message_is_not_announced_as_a_session_failure() {
-    const PEER: &str = "replayed-peer";
-    announced::install();
-
-    let mut alice = Peer::new(PEER, 1);
-    let mut bob = Peer::new("replay-receiver", 1);
+/// The session has to leave its pending-prekey state before the replay: a
+/// duplicate PreKey message returns from the current-state arm and never
+/// reaches the classification under test, while a duplicate Whisper keeps
+/// searching and does. Bob's reply is what moves it, so it is part of the
+/// fixture rather than of any one test.
+fn delivered_once(sender: &str, receiver: &str) -> (Peer, Peer, CiphertextMessage) {
+    let mut alice = Peer::new(sender, 1);
+    let mut bob = Peer::new(receiver, 1);
     establish(&mut alice, &mut bob);
 
-    // The replay in the field is an `<enc type="msg">`, so the session must
-    // leave its pending-prekey state first: a duplicate PreKey message returns
-    // from the current-state arm and never reaches the classification under
-    // test, while a duplicate Whisper keeps searching and does.
     let reply = send(&mut bob, &alice.address, b"hi alice");
     assert_eq!(
         receive(&mut alice, &bob.address, &reply).expect("reply decrypts"),
@@ -930,12 +920,35 @@ fn a_replayed_message_is_not_announced_as_a_session_failure() {
         b"delivered once"
     );
 
-    // The redelivery the server makes when it never saw an ack.
-    let replay = receive(&mut bob, &alice.address, &ct)
-        .expect_err("a consumed counter cannot decrypt twice");
+    (alice, bob, ct)
+}
+
+/// The redelivery the server makes when it never saw an ack.
+fn replay(bob: &mut Peer, from: &ProtocolAddress, ct: &CiphertextMessage) -> SignalProtocolError {
+    receive(bob, from, ct).expect_err("a consumed counter cannot decrypt twice")
+}
+
+/// A replayed message is an expected outcome, not a session failure.
+///
+/// The server redelivers anything it has not seen acked, so a reconnect can
+/// hand this client a message whose counter it already consumed — which is
+/// exactly what a companion sees on startup when the previous run exited
+/// before its ack was flushed.
+///
+/// What this pins: the verdict is `DuplicatedMessage` and nothing about it is
+/// announced at error level. Why the protocol wants that is stated once, at the
+/// classification in `decrypt_message_with_record`.
+#[test]
+fn a_replayed_message_is_not_announced_as_a_session_failure() {
+    const PEER: &str = "replayed-peer";
+    announced::install();
+
+    let (alice, mut bob, ct) = delivered_once(PEER, "replay-receiver");
+
+    let verdict = replay(&mut bob, &alice.address, &ct);
     assert!(
-        matches!(replay, SignalProtocolError::DuplicatedMessage(_, _)),
-        "a replay must classify as a duplicate, not as a decryption failure: {replay:?}"
+        matches!(verdict, SignalProtocolError::DuplicatedMessage(_, _)),
+        "a replay must classify as a duplicate, not as a decryption failure: {verdict:?}"
     );
 
     let failures: Vec<_> = announced::about(PEER)
@@ -960,18 +973,7 @@ fn a_replay_stays_quiet_when_a_sibling_candidate_session_fails_first() {
     const PEER: &str = "replayed-peer-archived";
     announced::install();
 
-    let mut alice = Peer::new(PEER, 1);
-    let mut bob = Peer::new("replay-archive-receiver", 1);
-    establish(&mut alice, &mut bob);
-
-    let reply = send(&mut bob, &alice.address, b"hi alice");
-    receive(&mut alice, &bob.address, &reply).expect("reply decrypts");
-
-    let ct = send(&mut alice, &bob.address, b"delivered once");
-    assert_eq!(
-        receive(&mut bob, &alice.address, &ct).expect("first delivery decrypts"),
-        b"delivered once"
-    );
+    let (mut alice, mut bob, ct) = delivered_once(PEER, "replay-archive-receiver");
 
     // Bob rebuilds toward Alice: the state that just consumed the counter is
     // archived and a fresh current session takes its place.
@@ -979,11 +981,10 @@ fn a_replay_stays_quiet_when_a_sibling_candidate_session_fails_first() {
     let bundle = alice.bundle();
     process_bundle(&mut bob, &alice.address, &bundle);
 
-    let replay = receive(&mut bob, &alice.address, &ct)
-        .expect_err("a consumed counter cannot decrypt twice");
+    let verdict = replay(&mut bob, &alice.address, &ct);
     assert!(
-        matches!(replay, SignalProtocolError::DuplicatedMessage(_, _)),
-        "the archived state's duplicate must outrank the current state's failure: {replay:?}"
+        matches!(verdict, SignalProtocolError::DuplicatedMessage(_, _)),
+        "the archived state's duplicate must outrank the current state's failure: {verdict:?}"
     );
 
     let records = announced::about(PEER);
