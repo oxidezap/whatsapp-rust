@@ -78,17 +78,42 @@ impl SenderKeyDeviceMap {
         for (jid_str, has_key) in rows {
             match jid_str.parse::<Jid>() {
                 Ok(jid) => {
-                    let state = DeviceWarmState {
-                        device_id: jid.device,
-                        has_key: AtomicBool::new(*has_key),
-                    };
                     // `Arc<str>: Borrow<str>`, so the repeat rows of a user
                     // that already has an entry cost a lookup instead of a
                     // fresh `Arc` allocation per device.
                     match by_user.get_mut(jid.user.as_str()) {
-                        Some(states) => states.push(state),
+                        Some(states) => match device_state(states, jid.device) {
+                            // Two rows can collapse onto one (user, device):
+                            // this indexes the PARSED jid's user and device,
+                            // so rows differing only in server — the same
+                            // member left behind under both `@s.whatsapp.net`
+                            // and `@lid` by an addressing-mode migration —
+                            // land on the same slot. Conflicting
+                            // values resolve to cold, never to warm — the
+                            // whole map already reads a missing entry as cold
+                            // because redistributing a sender key nobody
+                            // needed is free, while skipping one a device did
+                            // need leaves that device unable to read the
+                            // message. Order-independent, so it cannot matter
+                            // which row the backend happened to return first.
+                            Some(existing) => {
+                                if !*has_key {
+                                    existing.has_key.store(false, Ordering::Relaxed);
+                                }
+                            }
+                            None => states.push(DeviceWarmState {
+                                device_id: jid.device,
+                                has_key: AtomicBool::new(*has_key),
+                            }),
+                        },
                         None => {
-                            by_user.insert(Arc::from(jid.user.as_str()), vec![state]);
+                            by_user.insert(
+                                Arc::from(jid.user.as_str()),
+                                vec![DeviceWarmState {
+                                    device_id: jid.device,
+                                    has_key: AtomicBool::new(*has_key),
+                                }],
+                            );
                         }
                     }
                 }
@@ -397,6 +422,44 @@ mod tests {
     /// is load-bearing: rows arrive in whatever order the DB hands them, and an
     /// unsorted slice would report a user with a warm primary as cold and
     /// redistribute their sender key on every single send.
+    /// The index keys on the parsed jid's user and device, so rows differing
+    /// only in server collapse onto one slot — the shape an addressing-mode
+    /// migration leaves behind, with the same member stored under both
+    /// `@s.whatsapp.net` and `@lid`. Whichever order they arrive in, the
+    /// collapse must land cold: a spurious redistribution costs one SKDM,
+    /// while a spurious warm reading skips a distribution the device needed
+    /// and leaves it unable to read the message.
+    #[test]
+    fn conflicting_duplicate_rows_collapse_to_cold() {
+        for rows in [
+            [
+                ("111:0@lid".to_string(), true),
+                ("111:0@s.whatsapp.net".to_string(), false),
+            ],
+            [
+                ("111:0@lid".to_string(), false),
+                ("111:0@s.whatsapp.net".to_string(), true),
+            ],
+        ] {
+            let m = SenderKeyDeviceMap::from_db_rows(&rows);
+            assert_eq!(
+                m.device_has_key("111", 0),
+                Some(false),
+                "conflicting rows {rows:?} must read cold"
+            );
+            assert!(!m.device_and_primary_warm("111", 0));
+        }
+
+        // Agreeing duplicates keep their value — the collapse must not turn a
+        // genuinely warm device cold and redistribute on every send.
+        let m = SenderKeyDeviceMap::from_db_rows(&[
+            ("111:0@lid".to_string(), true),
+            ("111:0@s.whatsapp.net".to_string(), true),
+        ]);
+        assert_eq!(m.device_has_key("111", 0), Some(true));
+        assert!(m.device_and_primary_warm("111", 0));
+    }
+
     #[test]
     fn devices_are_ordered_whatever_order_the_rows_arrive_in() {
         let m = SenderKeyDeviceMap::from_db_rows(&[
