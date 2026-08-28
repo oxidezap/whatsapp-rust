@@ -315,7 +315,7 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
 ///
 /// That leaves a window between this returning and the task running, in which
 /// a send can still read a stale snapshot. It is bounded by an uncontended
-/// lane acquisition, and it is strictly narrower than the official client's:
+/// lane acquisition and the fan-out below, and it is strictly narrower than the official client's:
 /// `handleGroupsDirtyNotificationJob` queues a persisted job and does not run
 /// it until `waitForOfflineDeliveryEnd()` and `waitForConnection()` have both
 /// resolved. Closing it entirely needs an invalidation generation the cache
@@ -330,19 +330,36 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
 /// work would throw itself away exactly when a reconnect is about to make the
 /// stale metadata reachable again.
 fn handle_groups_dirty(client: &Arc<Client>, groups: Vec<wacore_binary::Jid>) {
+    use futures::StreamExt;
+
+    // Each group's work sits behind its own per-JID lane, so entries never
+    // contend with one another; this bounds how many storage round trips — and,
+    // for a custom cache store, remote ones — are in flight at once. Draining
+    // serially would make a group's stale window the sum of every entry ahead
+    // of it, which with the parser's 10 000-group ceiling is a tail measured in
+    // whole round-trip multiples rather than one.
+    const GROUPS_DIRTY_INVALIDATE_CONCURRENCY: usize = 16;
+
     let client = Arc::clone(client);
     client
         .clone()
         .runtime
         .spawn(Box::pin(async move {
-            for jid in &groups {
-                debug!(
-                    target: "Client/Group",
-                    "groups_dirty: invalidating cached metadata for {}",
-                    jid.observe()
-                );
-                client.lock_group_metadata(jid).await.invalidate().await;
-            }
+            futures::stream::iter(groups)
+                .map(|jid| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        debug!(
+                            target: "Client/Group",
+                            "groups_dirty: invalidating cached metadata for {}",
+                            jid.observe()
+                        );
+                        client.lock_group_metadata(&jid).await.invalidate().await;
+                    }
+                })
+                .buffer_unordered(GROUPS_DIRTY_INVALIDATE_CONCURRENCY)
+                .for_each(|()| std::future::ready(()))
+                .await;
         }))
         .detach();
 }

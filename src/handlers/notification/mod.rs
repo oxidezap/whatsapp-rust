@@ -230,10 +230,19 @@ mod tests {
 
         let (client, collector) = client_with_collector().await;
 
-        let dirty: Jid = "120363000000000001@g.us".parse().unwrap();
+        // Several dirty groups, so the bounded fan-out is exercised with more
+        // than one entry rather than degenerating to the single-item case.
+        let dirty: Vec<Jid> = [
+            "120363000000000001@g.us",
+            "120363000000000003@g.us",
+            "120363000000000004@g.us",
+        ]
+        .iter()
+        .map(|jid| jid.parse().unwrap())
+        .collect();
         let untouched: Jid = "120363000000000002@g.us".parse().unwrap();
         let cache = client.get_group_cache();
-        for jid in [&dirty, &untouched] {
+        for jid in dirty.iter().chain([&untouched]) {
             cache
                 .insert(
                     jid.clone(),
@@ -251,7 +260,11 @@ mod tests {
             .attr("id", "groups-dirty-1")
             .attr("t", "1704067200")
             .children([NodeBuilder::new("groups_dirty")
-                .children([NodeBuilder::new("group").attr("jid", dirty.clone()).build()])
+                .children(
+                    dirty
+                        .iter()
+                        .map(|jid| NodeBuilder::new("group").attr("jid", jid).build()),
+                )
                 .build()])
             .build();
         handle_notification_impl(&client, node_to_arc(notif)).await;
@@ -261,12 +274,14 @@ mod tests {
         // `poll_until` takes a sync predicate and this one is async, hence a
         // bounded timeout around the poll rather than that helper.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while cache.get(&dirty).await.is_some() {
-                tokio::task::yield_now().await;
+            for jid in &dirty {
+                while cache.get(jid).await.is_some() {
+                    tokio::task::yield_now().await;
+                }
             }
         })
         .await
-        .expect("the group the server called stale must lose its cached metadata");
+        .expect("every group the server called stale must lose its cached metadata");
         assert!(
             cache.get(&untouched).await.is_some(),
             "a group the notification did not name must keep its cache"
