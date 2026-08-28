@@ -94,7 +94,7 @@ async fn test_ack_behavior_for_incoming_stanzas() {
     // status@broadcast gets the transport <ack> as a fallback so that
     // drop paths in process_group_enc_batch (expired status, missing
     // sender key, decrypt error) don't leave the server retransmitting.
-    // The success path also emits <receipt context="status">; the
+    // The success path also emits <receipt class="status">; the
     // duplicate is tolerated.
     let mut status_attrs = Attrs::new();
     status_attrs.insert("from".to_string(), "status@broadcast".to_string());

@@ -699,7 +699,7 @@ impl Client {
     /// decrypt error) intentionally skip the delivery receipt to avoid
     /// inflating the server-side offline counter for messages we'll never
     /// process. Without the transport `<ack>` from this gate, the server
-    /// would redeliver indefinitely. WA Web emits `<receipt context="status">`
+    /// would redeliver indefinitely. WA Web emits `<receipt class="status">`
     /// in the success path on top of this; the duplicate is tolerated.
     pub(crate) fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
         let tag = StanzaTag::try_from(node.tag.as_ref());

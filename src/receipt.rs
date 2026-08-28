@@ -752,8 +752,9 @@ impl Client {
     /// - Group messages — `<receipt participant=...>` to the group JID.
     /// - Peer device messages (`category="peer"`) — `<receipt type="peer_msg">`
     ///   to acknowledge self-synced messages from the primary phone.
-    /// - Status broadcasts — `<receipt context="status">` (WA Web's
-    ///   `Send/DeliveryReceiptJob.js`); these are NOT skipped anymore.
+    /// - Status broadcasts — `<receipt class="status">`; these are NOT
+    ///   skipped anymore. Why `class` and not `context` is stated once, at
+    ///   `delivery_receipt_builder`.
     /// - Newsletters and messages without an ID are skipped (newsletters are
     ///   handled by the ack gate, not here).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_delivery", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
