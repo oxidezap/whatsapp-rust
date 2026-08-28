@@ -263,8 +263,7 @@ const RETIRED_SSRC_GRACE_PACKETS: u32 = 64;
 /// to absorb. A resumed stream keeps arriving and clears this in a few packets; a lone latecomer
 /// never does. Any packet from the stream in possession resets the count, so only an uninterrupted
 /// run counts.
-/// How many previously-left SSRCs are remembered. Well past what a call plausibly cycles through,
-/// and bounded so a peer that churns SSRCs cannot grow the list without limit.
+/// How many previously-left SSRCs are remembered; see `retired_ssrcs`.
 const RETIRED_SSRC_MEMORY: usize = 4;
 
 const RETIRED_SSRC_RESUME_PACKETS: u32 = 3;
@@ -776,7 +775,7 @@ pub struct VideoPipeline {
     /// renumbered stream's restarted timestamps read as an old frame and its fragments splice onto
     /// the previous stream's.
     depacketizer_ssrc: Option<u32>,
-    /// The stream we just left, and how many packets the current one has delivered since.
+    /// Every stream this one has left, newest last.
     ///
     /// A renumbering is not instantaneous on the wire: packets from the old SSRC keep arriving for
     /// a few milliseconds after the first packet of the new one. Each of those looks like another
@@ -784,21 +783,22 @@ pub struct VideoPipeline {
     /// stream has half-assembled, and lose it again on the next new-SSRC fragment -- valid frames
     /// dropped for the whole overlap.
     ///
-    /// Bounded rather than permanent: a late packet is late by milliseconds, so a short grace is
-    /// enough, and after it any SSRC is free to claim the depacketizer again. Retiring one forever
-    /// would leave a peer that legitimately returns to a previous SSRC with no video at all.
-    retired_ssrc: Option<u32>,
-    /// Every SSRC this stream has left, not just the last one. A peer that changes SSRC twice has
-    /// two older streams that can still deliver a straggler, and one arriving from the OLDER of
-    /// them used to bypass both guards below -- the grace and the run -- because they only ever
-    /// asked about the most recent. Four is well past what a call plausibly cycles through, and the
-    /// oldest is dropped rather than grown without bound.
+    /// Every one of them, not just the last: a peer that changes SSRC twice has two older streams
+    /// that can still deliver a straggler, and one from the OLDER of them used to bypass both
+    /// guards below -- the grace and the run -- because each only ever asked about the most recent.
+    ///
+    /// Bounded rather than permanent, in both senses. A late packet is late by milliseconds, so a
+    /// short grace is enough and after it a stream may claim the depacketizer again by sustained
+    /// delivery; retiring one forever would leave a peer that legitimately returns to a previous
+    /// SSRC with no video at all. And the list itself is capped, so a peer that churns SSRCs cannot
+    /// grow it without limit -- [`RETIRED_SSRC_MEMORY`] is well past what a call plausibly cycles
+    /// through, and the oldest is dropped.
     retired_ssrcs: Vec<u32>,
     /// The retired SSRC the current run belongs to, so a run cannot be assembled out of packets
     /// from two different old streams.
     contender_ssrc: Option<u32>,
     packets_since_stream_change: u32,
-    /// Consecutive packets from `retired_ssrc` since the last one from the stream in possession.
+    /// Consecutive packets from `contender_ssrc` since the last one from the stream in possession.
     retired_ssrc_run: u32,
     pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
@@ -844,7 +844,6 @@ impl VideoPipeline {
             recv_streams: SrtpRecvStreams::default(),
             depacketizer: H264Depacketizer::default(),
             depacketizer_ssrc: None,
-            retired_ssrc: None,
             retired_ssrcs: Vec::new(),
             contender_ssrc: None,
             packets_since_stream_change: 0,
@@ -891,7 +890,6 @@ impl VideoPipeline {
         self.recv_streams = SrtpRecvStreams::default();
         self.depacketizer.reset();
         self.depacketizer_ssrc = None;
-        self.retired_ssrc = None;
         self.retired_ssrcs.clear();
         self.contender_ssrc = None;
         self.packets_since_stream_change = 0;
@@ -936,7 +934,6 @@ impl VideoPipeline {
     pub(crate) fn reset_depacketizer(&mut self) {
         self.depacketizer.reset();
         self.depacketizer_ssrc = None;
-        self.retired_ssrc = None;
         self.retired_ssrcs.clear();
         self.contender_ssrc = None;
         self.packets_since_stream_change = 0;
@@ -1008,7 +1005,7 @@ impl VideoPipeline {
             self.retired_ssrc_run = 0;
         } else {
             // A straggler from the stream we just left is not a commitment to it -- see
-            // `retired_ssrc`. Its own access unit was discarded when we switched, so there is
+            // `retired_ssrcs`. Its own access unit was discarded when we switched, so there is
             // nothing it can complete; it is counted as received and otherwise ignored.
             //
             // Past the grace it still is not a commitment on its own: reclaiming on one late packet
@@ -1020,7 +1017,7 @@ impl VideoPipeline {
             // straggler from the older one met neither guard and took reassembly on its own. A
             // never-seen SSRC is not a straggler but a genuine stream change, and still commits at
             // once -- that is how streams change at all.
-            if self.retired_ssrcs.iter().any(|ssrc| *ssrc == header.ssrc) {
+            if self.retired_ssrcs.contains(&header.ssrc) {
                 if self.contender_ssrc != Some(header.ssrc) {
                     // A different old stream: it starts its own run rather than inheriting one.
                     self.contender_ssrc = Some(header.ssrc);
@@ -1036,7 +1033,6 @@ impl VideoPipeline {
             if self.depacketizer_ssrc.is_some() {
                 self.depacketizer.reset();
             }
-            self.retired_ssrc = self.depacketizer_ssrc;
             if let Some(left) = self.depacketizer_ssrc {
                 self.retired_ssrcs.retain(|ssrc| *ssrc != left);
                 if self.retired_ssrcs.len() == RETIRED_SSRC_MEMORY {
