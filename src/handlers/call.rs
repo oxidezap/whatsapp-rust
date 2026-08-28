@@ -808,13 +808,14 @@ impl StanzaHandler for CallHandler {
                                     })
                                     .flatten()
                                     .unwrap_or(participant);
-                                registry.send_video_ctl(
+                                // Through the registry rather than straight down
+                                // the channel: a rotation the peer states once
+                                // has to survive the plane it was stated to.
+                                registry.set_peer_video_orientation(
                                     call_id,
                                     generation,
-                                    VideoControl::SetParticipantOrientation {
-                                        participant: orientation_key,
-                                        orientation: *orientation,
-                                    },
+                                    &orientation_key,
+                                    *orientation,
                                 );
                             }
                             // A group participant's `<video>` state describes only that sender.
@@ -943,10 +944,11 @@ impl StanzaHandler for CallHandler {
                         transition_current &= registry.is_current(call_id, generation);
                         if transition_current {
                             if let Some(orientation) = orientation {
-                                registry.send_video_ctl(
+                                registry.set_peer_video_orientation(
                                     call_id,
                                     generation,
-                                    VideoControl::SetOrientation(*orientation),
+                                    &routed_call_sender(&call),
+                                    *orientation,
                                 );
                             }
                             let event_delivered = event_permit.as_ref().is_some_and(|permit| {
