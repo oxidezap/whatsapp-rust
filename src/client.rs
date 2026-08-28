@@ -1860,8 +1860,8 @@ fn ack_participant<'node, 'data>(
 /// - `id`, `to` (flipped from `from`) copied from original
 /// - `participant` follows the generic or receipt-specialized policy
 /// - `from` = own device PN, only for message acks
-/// - `type` echoed when present, except `notification type="encrypt"` with
-///   an `<identity/>` child
+/// - `type` echoed when present, except `notification type="encrypt"`, whose
+///   ack WA Web builds without one
 ///
 /// For receipt acks, WA Web uses `MAYBE_CUSTOM_STRING(ackString)` where
 /// `ackString = maybeAttrString("type")` — so `type` is only included when
@@ -1886,7 +1886,14 @@ fn encode_ack_bytes(
     // Dropping it makes the server close the stream with `<stream:error><ack/>`.
     let recipient_val = node.get_attr("recipient");
 
-    let typ_val = if !is_encrypt_identity_notification(node) {
+    // Every WA Web handler for `<notification type="encrypt">` builds its ack
+    // as `wap("ack", {to, id, class: "notification"})` with no `type` at all:
+    // `WAWebHandlePreKeyLow` (`<count>`/`<pq_count>`), `WAWebHandleDigestKey`
+    // (`<digest>`) and `WAWebHandleIdentityChange` (`<identity>`) all agree,
+    // and the IR mirrors the same three ack shapes. Echoing `type="encrypt"`
+    // on the other two was a stanza this client sends and the official one
+    // never does.
+    let typ_val = if !is_encrypt_notification(node) {
         node.get_attr("type")
     } else {
         None
@@ -2017,7 +2024,7 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
     )
     .map(|value| value.to_node_value());
     let recipient = node.get_attr("recipient").map(|v| v.to_node_value());
-    let typ = if !is_encrypt_identity_notification(node) {
+    let typ = if !is_encrypt_notification(node) {
         node.get_attr("type").map(|v| v.to_node_value())
     } else {
         None
@@ -2048,12 +2055,11 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
 }
 
 /// WA Web omits `type` when ACKing `<notification type="encrypt"><identity/></notification>`.
-fn is_encrypt_identity_notification(node: &wacore_binary::NodeRef<'_>) -> bool {
+fn is_encrypt_notification(node: &wacore_binary::NodeRef<'_>) -> bool {
     node.tag == StanzaTag::Notification.as_str()
         && node
             .get_attr("type")
             .is_some_and(|value| value == NotificationType::Encrypt.as_str())
-        && node.get_optional_child("identity").is_some()
 }
 
 /// Whether the reconnect backoff counter should snap back to its 1s base after

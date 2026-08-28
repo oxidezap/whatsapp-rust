@@ -2408,9 +2408,31 @@ fn test_encrypt_identity_notification_omits_type() {
         .build();
 
     assert!(
-        is_encrypt_identity_notification(&node.as_node_ref()),
+        is_encrypt_notification(&node.as_node_ref()),
         "identity-change notification ACK must omit type to match WA Web"
     );
+}
+
+/// Every `<notification type="encrypt">` acks without a `type`, not just the
+/// identity-change one: `WAWebHandlePreKeyLow` and `WAWebHandleDigestKey` both
+/// build `wap("ack", {to, id, class: "notification"})` exactly like
+/// `WAWebHandleIdentityChange` does.
+#[test]
+fn test_encrypt_count_and_digest_notifications_also_omit_type() {
+    for child in ["count", "pq_count", "digest"] {
+        let node = NodeBuilder::new("notification")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "4128735302")
+            .attr("type", "encrypt")
+            .children([NodeBuilder::new(child).build()])
+            .build();
+
+        let ack = build_ack_node(&node.as_node_ref(), None).expect("ack");
+        assert!(
+            ack.attrs.get("type").is_none(),
+            "<{child}> encrypt notification ack must omit type to match WA Web"
+        );
+    }
 }
 
 #[test]
@@ -2423,8 +2445,8 @@ fn test_device_notification_is_not_encrypt_identity() {
         .build();
 
     assert!(
-        !is_encrypt_identity_notification(&node.as_node_ref()),
-        "device notification is not an encrypt+identity notification"
+        !is_encrypt_notification(&node.as_node_ref()),
+        "device notification is not an encrypt notification"
     );
 }
 
