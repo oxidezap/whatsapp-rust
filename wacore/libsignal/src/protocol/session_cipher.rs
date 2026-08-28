@@ -1023,8 +1023,18 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
     ));
     let log_decryption_failure =
         |message: &SignalMessage, state: &SessionState, error: &SignalProtocolError| {
-            // A warning rather than an error because we try multiple sessions.
-            log::warn!(
+            // A warning rather than an error because we try multiple sessions:
+            // one candidate failing is not yet a verdict. A replay is not even
+            // a candidate failure — the chain was recognized and its counter is
+            // simply spent — so it drops another level, to match the verdict
+            // the tail of this function is about to reach.
+            let level = if matches!(error, SignalProtocolError::DuplicatedMessage(..)) {
+                log::Level::Debug
+            } else {
+                log::Level::Warn
+            };
+            log::log!(
+                level,
                 "Failed to decrypt {:?} message with ratchet key: {} and counter: {}. \
              Session loaded for {}. Local session has base key: {} and counter: {}. {}",
                 original_message_type,
@@ -1229,8 +1239,36 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
         }
     }
 
-    // No session worked - log error and return failure
+    // No session worked. The verdict decides the log level, so it is taken
+    // BEFORE anything is written: a replay is an expected outcome, and the
+    // caller already treats it as one.
     let previous_state_count = record.previous_session_count();
+
+    // A state that recognized the exact chain and an already-consumed counter is
+    // definitive evidence of a replay; sibling sessions sharing that ratchet key
+    // derive different keys and fail their MAC as expected noise. Classifying a
+    // replay as BadMac would trigger a retry receipt for an already-processed
+    // message, so the duplicate verdict must win.
+    //
+    // It also has to win over the failure logging below. WA Web classifies this
+    // the same way and gives it its own outcome rather than a failure:
+    // `WAWebMsgProcessingDecryptionHandler` maps `errDuplicateMsg` to
+    // `DecryptionErrorType.SignalDuplicateMessage`, which is excluded from the
+    // retryable set, creates no E2E placeholder, and returns
+    // `E2EProcessResult.SIGNAL_OLD_COUNTER_ERROR`; its only log is a WARN, for
+    // group chats, sampled at 1%. Announcing a replay as "No valid session"
+    // also contradicts the record in hand — the chain was recognized, which is
+    // the only reason we know it is a replay — and every reconnect that
+    // redelivers an unacked message printed it.
+    if let Some((chain, counter)) = errs.iter().find_map(|error| match error {
+        SignalProtocolError::DuplicatedMessage(chain, counter) => Some((*chain, *counter)),
+        _ => None,
+    }) {
+        log::debug!(
+            "Replayed message from {remote_address}: chain recognized, counter {counter} already consumed (chain {chain}, {previous_state_count} previous states). Expected when a reconnect redelivers a message whose ack the server never saw."
+        );
+        return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
+    }
 
     if let Some(current_state) = record.session_state() {
         log::error!(
@@ -1253,17 +1291,6 @@ fn decrypt_message_with_record<'a, R: Rng + CryptoRng>(
         create_decryption_failure_log(remote_address, &errs, record, ciphertext.signal_message())?
     );
 
-    // A state that recognized the exact chain and an already-consumed counter is
-    // definitive evidence of a replay; sibling sessions sharing that ratchet key
-    // derive different keys and fail their MAC as expected noise. Classifying a
-    // replay as BadMac would trigger a retry receipt for an already-processed
-    // message, so the duplicate verdict must win.
-    if let Some((chain, counter)) = errs.iter().find_map(|error| match error {
-        SignalProtocolError::DuplicatedMessage(chain, counter) => Some((*chain, *counter)),
-        _ => None,
-    }) {
-        return Err(SignalProtocolError::DuplicatedMessage(chain, counter));
-    }
     if let Some(refused) = take_key_agreement_failure(&mut errs) {
         return Err(refused);
     }

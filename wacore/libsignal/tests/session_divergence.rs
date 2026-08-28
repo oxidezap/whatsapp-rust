@@ -827,3 +827,132 @@ fn pkmsg_decrypt_failure_does_not_persist_promoted_session() {
          the receiver into a session only they can write to."
     );
 }
+
+// ---- a replay is not a session failure ---------------------------------------
+
+/// Buffers the levels this crate announced, so a test can assert that an
+/// expected outcome was not announced as a failure.
+///
+/// `log`'s global logger is install-once per process. This is an integration
+/// test binary, so the slot is this file's — but its tests still run
+/// concurrently, and several of them fail decryption for real. Records are
+/// therefore matched on the asserting test's own peer name, which no other
+/// scenario in this file uses.
+mod announced {
+    use std::sync::{LazyLock, Mutex, OnceLock};
+
+    struct Capture {
+        records: Mutex<Vec<(log::Level, String)>>,
+    }
+
+    impl log::Log for Capture {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.target().starts_with("wacore_libsignal")
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            self.records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((record.level(), record.args().to_string()));
+        }
+
+        fn flush(&self) {}
+    }
+
+    static CAPTURE: LazyLock<Capture> = LazyLock::new(|| Capture {
+        records: Mutex::new(Vec::new()),
+    });
+
+    /// Idempotent per process; the verdict is cached so concurrent tests do not
+    /// race for the slot.
+    pub fn install() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            if log::set_logger(&*CAPTURE).is_ok() {
+                log::set_max_level(log::LevelFilter::Trace);
+            }
+        });
+    }
+
+    /// Every buffered record whose message names `peer`.
+    pub fn about(peer: &str) -> Vec<(log::Level, String)> {
+        CAPTURE
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, message)| message.contains(peer))
+            .cloned()
+            .collect()
+    }
+}
+
+/// A replayed message is an expected outcome, not a session failure.
+///
+/// The server redelivers anything it has not seen acked, so a reconnect can
+/// hand this client a message whose counter it already consumed — which is
+/// exactly what a companion sees on startup when the previous run exited
+/// before its ack was flushed.
+///
+/// WA Web gives that case its own classification rather than a failure:
+/// `WAWebMsgProcessingDecryptionHandler` maps `errDuplicateMsg` to
+/// `DecryptionErrorType.SignalDuplicateMessage`, which is excluded from the
+/// retryable set, creates no E2E placeholder, and returns
+/// `E2EProcessResult.SIGNAL_OLD_COUNTER_ERROR`. Its only log is a WARN, for
+/// group chats, sampled at 1%.
+///
+/// We reached the same verdict — `DuplicatedMessage`, no retry receipt — but
+/// announced it first as `ERROR ... No valid session for recipient`, because
+/// both error logs ran before the classification that was about to call it a
+/// replay. The claim is also untrue: the chain was recognized, which is the
+/// only reason we know it is a replay at all.
+#[test]
+fn a_replayed_message_is_not_announced_as_a_session_failure() {
+    const PEER: &str = "replayed-peer";
+    announced::install();
+
+    let mut alice = Peer::new(PEER, 1);
+    let mut bob = Peer::new("replay-receiver", 1);
+    establish(&mut alice, &mut bob);
+
+    // The replay in the field is an `<enc type="msg">`, so the session must
+    // leave its pending-prekey state first: a duplicate PreKey message returns
+    // from the current-state arm and never reaches the classification under
+    // test, while a duplicate Whisper keeps searching and does.
+    let reply = send(&mut bob, &alice.address, b"hi alice");
+    assert_eq!(
+        receive(&mut alice, &bob.address, &reply).expect("reply decrypts"),
+        b"hi alice"
+    );
+
+    let ct = send(&mut alice, &bob.address, b"delivered once");
+    assert!(
+        matches!(ct, CiphertextMessage::SignalMessage(_)),
+        "the replayed stanza must be a Whisper, like the `<enc type=\"msg\">` on the wire"
+    );
+    assert_eq!(
+        receive(&mut bob, &alice.address, &ct).expect("first delivery decrypts"),
+        b"delivered once"
+    );
+
+    // The redelivery the server makes when it never saw an ack.
+    let replay = receive(&mut bob, &alice.address, &ct)
+        .expect_err("a consumed counter cannot decrypt twice");
+    assert!(
+        matches!(replay, SignalProtocolError::DuplicatedMessage(_, _)),
+        "a replay must classify as a duplicate, not as a decryption failure: {replay:?}"
+    );
+
+    let failures: Vec<_> = announced::about(PEER)
+        .into_iter()
+        .filter(|(level, _)| *level <= log::Level::Error)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "a replay must not be announced as an error; got {failures:?}"
+    );
+}
