@@ -184,6 +184,37 @@ mod tests {
         );
     }
 
+    /// A client with an event collector already subscribed. Every test below
+    /// observes the dispatcher through the bus, so the wiring is shared rather
+    /// than repeated per test.
+    async fn client_with_collector() -> (Arc<Client>, Arc<TestEventCollector>) {
+        use crate::types::events::EventHandler;
+
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+        (client, collector)
+    }
+
+    /// The account this client owns, as the `from` of a notification the
+    /// server sends about it.
+    const OWN_PN: &str = "12025550199@s.whatsapp.net";
+
+    /// `<notification type="account_sync" from=OWN_PN>` wrapping one
+    /// `<disappearing_mode>` child — the envelope both arms share, so only the
+    /// child differs between them.
+    fn account_sync_disappearing_mode(id: &str, disappearing_mode: Node) -> Node {
+        NodeBuilder::new("notification")
+            .attr("type", NotificationType::AccountSync.as_str())
+            .attr("from", OWN_PN)
+            .attr("id", id)
+            .attr("t", "1704067200")
+            .children([disappearing_mode])
+            .build()
+    }
+
     // ── `w:gp2` / `<groups_dirty>` (WA Web
     // `WASmaxInGroupsGroupsDirtyNotificationRequest`)
     //
@@ -194,15 +225,10 @@ mod tests {
 
     #[tokio::test]
     async fn groups_dirty_invalidates_the_named_groups_and_names_no_group_update() {
-        use crate::types::events::EventHandler;
         use wacore::client::context::GroupInfo;
         use wacore::types::message::AddressingMode;
 
-        let client = create_test_client().await;
-        let collector = Arc::new(TestEventCollector::default());
-        client
-            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
-            .detach();
+        let (client, collector) = client_with_collector().await;
 
         let dirty: Jid = "120363000000000001@g.us".parse().unwrap();
         let untouched: Jid = "120363000000000002@g.us".parse().unwrap();
@@ -230,10 +256,17 @@ mod tests {
             .build();
         handle_notification_impl(&client, node_to_arc(notif)).await;
 
-        assert!(
-            cache.get(&dirty).await.is_none(),
-            "the group the server called stale must lose its cached metadata"
-        );
+        // The invalidation is spawned off the ack path, so it lands after the
+        // handler returns rather than inside it. `poll_until` takes a sync
+        // predicate and this one is async, so the wait is a bounded timeout
+        // around the poll rather than that helper.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while cache.get(&dirty).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the group the server called stale must lose its cached metadata");
         assert!(
             cache.get(&untouched).await.is_some(),
             "a group the notification did not name must keep its cache"
@@ -267,25 +300,15 @@ mod tests {
 
     #[tokio::test]
     async fn account_sync_disappearing_mode_reaches_the_consumer() {
-        use crate::types::events::EventHandler;
+        let (client, collector) = client_with_collector().await;
 
-        let client = create_test_client().await;
-        let collector = Arc::new(TestEventCollector::default());
-        client
-            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
-            .detach();
-
-        let own: Jid = "12025550199@s.whatsapp.net".parse().unwrap();
-        let notif = NodeBuilder::new("notification")
-            .attr("type", NotificationType::AccountSync.as_str())
-            .attr("from", own.clone())
-            .attr("id", "acct-sync-dm-1")
-            .attr("t", "1704067200")
-            .children([NodeBuilder::new("disappearing_mode")
+        let notif = account_sync_disappearing_mode(
+            "acct-sync-dm-1",
+            NodeBuilder::new("disappearing_mode")
                 .attr("duration", "604800")
                 .attr("t", "1704067200")
-                .build()])
-            .build();
+                .build(),
+        );
         handle_notification_impl(&client, node_to_arc(notif)).await;
 
         let changed = collector
@@ -296,7 +319,7 @@ mod tests {
                 _ => None,
             })
             .expect("an account_sync disappearing_mode must reach the consumer");
-        assert_eq!(changed.from, own);
+        assert_eq!(changed.from, OWN_PN.parse::<Jid>().unwrap());
         assert_eq!(changed.duration, 604_800);
     }
 
@@ -306,23 +329,14 @@ mod tests {
     /// notification never stated, so nothing is dispatched.
     #[tokio::test]
     async fn account_sync_disappearing_mode_action_reports_no_duration() {
-        use crate::types::events::EventHandler;
+        let (client, collector) = client_with_collector().await;
 
-        let client = create_test_client().await;
-        let collector = Arc::new(TestEventCollector::default());
-        client
-            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
-            .detach();
-
-        let notif = NodeBuilder::new("notification")
-            .attr("type", NotificationType::AccountSync.as_str())
-            .attr("from", "12025550199@s.whatsapp.net")
-            .attr("id", "acct-sync-dm-2")
-            .attr("t", "1704067200")
-            .children([NodeBuilder::new("disappearing_mode")
+        let notif = account_sync_disappearing_mode(
+            "acct-sync-dm-2",
+            NodeBuilder::new("disappearing_mode")
                 .attr("action", "modify")
-                .build()])
-            .build();
+                .build(),
+        );
         handle_notification_impl(&client, node_to_arc(notif)).await;
 
         assert!(
