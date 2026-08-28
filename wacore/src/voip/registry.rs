@@ -271,17 +271,19 @@ struct CallEntry {
     /// has to survive all of them or the next `<video>` announces a camera that
     /// is not the one pointing at the user.
     self_video_orientation: u8,
-    /// The rotation a peer announced on the `<offer>` or `<accept>`'s `<video>`
-    /// child, with the JID that announced it, held until the media plane exists
-    /// to receive it.
+    /// The last rotation a peer announced on an `<offer>` or `<accept>`'s
+    /// `<video>` child, with the JID that announced it, replayed onto every
+    /// media plane that attaches.
     ///
     /// A video-from-start peer announces its camera rotation once, in that
     /// stanza, and sends no `<video>` of its own until the camera actually
     /// turns. The control channel is attached with the drive loop, long after
     /// the offer is parsed, so a rotation sent through it then goes nowhere --
     /// which left every frame of a call from a sideways camera stamped upright.
-    /// [`CallRegistry::set_video_channels`] drains this the moment there is
-    /// somewhere to drain it to.
+    /// [`CallRegistry::set_video_channels`] applies this the moment there is
+    /// somewhere to apply it to -- and keeps it afterwards, because that call
+    /// can attach a replacement plane, which would otherwise start upright
+    /// again until the peer next turned its camera.
     ///
     /// The JID rides along because a group call routes rotation per
     /// participant; see [`CallEntry::peer_orientation_control`].
@@ -1802,7 +1804,7 @@ impl CallRegistry {
             // Before the sender is published, so the rotation the offer
             // announced is the first thing the drive loop reads rather than
             // racing the first inbound frame.
-            if let Some((peer, orientation)) = entry.peer_video_orientation.take() {
+            if let Some((peer, orientation)) = entry.peer_video_orientation.clone() {
                 video_ctl_tx.send(entry.peer_orientation_control(&peer, orientation));
             }
             entry.video_ctl_tx = Some(video_ctl_tx);
@@ -1852,15 +1854,10 @@ impl CallRegistry {
             return false;
         }
         let control = entry.peer_orientation_control(peer, orientation);
-        let sent = entry
-            .video_ctl_tx
-            .as_ref()
-            .is_some_and(|tx| tx.send(control));
-        if !sent {
-            // No plane yet, or the attached one is already gone: hold it
-            // for whichever `set_video_channels` comes next.
-            entry.peer_video_orientation = Some((peer.clone(), orientation));
-        }
+        // Kept whether or not it lands: unsent it waits for the first plane,
+        // sent it is what a replacement plane has to be told.
+        entry.peer_video_orientation = Some((peer.clone(), orientation));
+        entry.video_ctl_tx.as_ref().map(|tx| tx.send(control));
         true
     }
 
@@ -4968,6 +4965,17 @@ mod tests {
         assert!(
             ctl_rx.try_recv().is_err(),
             "a device that lost the answer race must not rotate the winner's picture"
+        );
+
+        // A replacement plane starts upright unless it is told, and the peer
+        // has no reason to announce a rotation it has not changed.
+        let (replacement_tx, replacement_rx) = video_control_channel();
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        reg.set_video_channels("CID", generation, event_tx, replacement_tx, Box::new(|| {}));
+        assert_eq!(
+            replacement_rx.try_recv(),
+            Ok(VideoControl::SetOrientation(1)),
+            "the rotation already delivered once is still the peer's rotation"
         );
 
         let newer = reg.insert(session("CID"));

@@ -1656,12 +1656,11 @@ mod tests {
         };
         tx.try_send(diagnostic.clone()).expect("fills the queue");
 
-        let mut outstanding = false;
         assert!(
             !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded),
             "a full queue refuses it"
         );
-        outstanding = true;
+        let mut outstanding = true;
         retry_keyframe_request(&tx, &mut outstanding);
         assert!(outstanding, "still no room, so still outstanding");
         assert_eq!(
