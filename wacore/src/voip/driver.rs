@@ -307,11 +307,10 @@ impl VideoControlSender {
             .len()
             .saturating_mul(size_of::<VideoControlMessage>())
             .saturating_add(self.orientation.len().saturating_mul(size_of::<u8>()))
-            .saturating_add(
-                pending
-                    .capacity()
-                    .saturating_mul(size_of::<(wacore_binary::Jid, u8)>()),
-            )
+            .saturating_add(crate::stats::hash_table_bytes(
+                pending.capacity(),
+                size_of::<(wacore_binary::Jid, u8)>(),
+            ))
             .saturating_add(pending.keys().map(HeapSize::heap_bytes).sum::<usize>())
     }
 }
