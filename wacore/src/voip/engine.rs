@@ -2689,6 +2689,11 @@ impl CallEngine {
             now,
             m.audio.format.rtp_clock_rate,
         );
+        // Set when the payload reaching the codec is ciphertext whose tag did not authenticate. Such
+        // bytes are passed through by contract but they are NOT evidence about anything: they are
+        // whatever the wrong key produced, and three of them structurally resembling 60ms Opus would
+        // latch a permanent codec switch that outlives the authentication failure itself.
+        let mut unauthenticated = false;
         // SFrame on: use the GCM-decrypted bytes; otherwise the SRTP payload is already plain codec.
         let encoded = match m.sframe.as_ref().map(|s| s.decrypt(&payload)) {
             Some(SframeIn::Decrypted(plain)) => {
@@ -2701,6 +2706,7 @@ impl CallEngine {
                 // ciphertext to the codec and call the result a codec problem.
                 self.media_stats.sframe_decrypt_failed =
                     self.media_stats.sframe_decrypt_failed.saturating_add(1);
+                unauthenticated = true;
                 payload
             }
             // A peer that does not SFrame-wrap at all is a supported mode, not a failure: counting
@@ -2792,7 +2798,9 @@ impl CallEngine {
             // applied yet: a sink that depacketizes by `format.rtp_profile` would otherwise treat
             // this one valid transition packet as an MLOW escape and corrupt it. Only a verdict with
             // a sibling relabels -- one without is a switch that will be refused anyway.
-            let verdict = observe_codec_content(m, &encoded);
+            let verdict = (!unauthenticated)
+                .then(|| observe_codec_content(m, &encoded))
+                .flatten();
             let (codec, active_format) = match verdict
                 .and_then(|c| m.active_format.sibling_for(c).map(|format| (c, format)))
             {
@@ -2894,6 +2902,7 @@ impl CallEngine {
         // `codec_probe`), so a run of agreements is evidence of a grammar we are not speaking.
         #[cfg(feature = "voip-mlow")]
         if decode_report.decoded == 0
+            && !unauthenticated
             && let Some(m) = self.media.as_mut()
         {
             probe_verdict = observe_codec_content(m, &encoded);
@@ -3038,23 +3047,26 @@ impl CallEngine {
                 now,
                 audio.format.rtp_clock_rate,
             );
-        let mut codec = audio
-            .format
-            .inbound_codec(participant.header.payload_type, &participant.payload);
-        // The escape marker is the only thing that makes `inbound_codec` answer Opus under an MLOW
-        // profile, so it is also what says the TOC was rewritten and has to be restored. A
-        // participant rescued by the probe below sends NATIVE Opus, which must not be.
-        let escaped =
-            codec == AudioCodec::Opus && audio.format.rtp_profile == AudioRtpProfile::Mlow;
-        let mut promoted = false;
-        if codec == AudioCodec::Mlow
-            && group
-                .foreign_participants
-                .contains(&participant.participant_id)
-        {
-            codec = AudioCodec::Opus;
-            promoted = true;
-        }
+        // The latched promotion is consulted FIRST, because the escape marker cannot tell the two
+        // apart: `is_mlow_embedded_opus` tests the top two bits, and every native Opus CELT config
+        // (24..=31) sets them -- a native 60ms CELT packet starts 0xC3. Read marker-first, a
+        // promoted participant's native packet is called an escape and has a TOC that was never
+        // rewritten rewritten again, which is a decode failure rather than a mislabel.
+        let promoted = group
+            .foreign_participants
+            .contains(&participant.participant_id);
+        let codec = if promoted {
+            AudioCodec::Opus
+        } else {
+            audio
+                .format
+                .inbound_codec(participant.header.payload_type, &participant.payload)
+        };
+        // What says the TOC was rewritten and has to be restored. Never true for a promoted
+        // participant: it was promoted precisely because its bytes are native.
+        let escaped = !promoted
+            && codec == AudioCodec::Opus
+            && audio.format.rtp_profile == AudioRtpProfile::Mlow;
         // A promoted participant sends NATIVE Opus, so the frame must not be described by the
         // container the call negotiated: a sink that depacketizes by `format.rtp_profile` would
         // read the untouched TOC as an MLOW escape and corrupt it. The escape keeps `audio.format`,
@@ -7597,6 +7609,70 @@ mod tests {
             format,
             AudioFormat::OPUS_16KHZ_60MS,
             "and native Opus must not be described by the container it is not in"
+        );
+    }
+
+    // `is_mlow_embedded_opus` tests the top two bits, and EVERY native Opus CELT config (24..=31)
+    // sets them: a native 60ms CELT packet starts 0xC3. So the escape marker cannot tell a rewritten
+    // TOC from a native CELT one, and reading it first meant a promoted participant's native packet
+    // was called an escape and had its untouched TOC rewritten anyway -- a decode failure rather
+    // than a mislabel. The latched promotion is the only thing that knows better, so it goes first.
+    #[test]
+    fn a_promoted_participant_sending_native_celt_is_not_read_as_an_escape() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).expect("engine");
+        let update = group_update("audio");
+        eng.configure_group(GroupEngineConfig {
+            call_creator: update.call_creator.clone(),
+            self_jid: SELF_LID.parse().expect("self JID"),
+            initial_update: update,
+            direct_peer: None,
+        })
+        .expect("configure group");
+        let epoch = [0x42; 32];
+        assert_eq!(
+            eng.apply_group_raw_epoch(7, &epoch).expect("install epoch"),
+            GroupEpochApply::Installed
+        );
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        // Promote the participant with unmarked SILK packets, as the probe does.
+        let silk: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        let mut peer = group_peer_audio(&epoch);
+        for n in 0..6u64 {
+            let packet = peer.protect_audio(&silk);
+            eng.handle_input(100 + n * 60, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+
+        // Now the same participant sends native CELT, whose TOC is in the escape's bit class.
+        let native_celt: Vec<u8> = core::iter::once(0xC3u8).chain(0..40u8).collect();
+        assert_eq!(native_celt[0] & 0xC0, 0xC0, "and so looks like an escape");
+        let packet = peer.protect_audio(&native_celt);
+        eng.handle_input(500, Input::RelayPacket(&packet));
+        let (outputs, _) = drain(&mut eng);
+        let frame = outputs
+            .iter()
+            .find_map(|output| match output {
+                Output::EncodedAudio(frame) => Some(frame),
+                _ => None,
+            })
+            .expect("the packet reaches the sink");
+        assert_eq!(frame.codec, AudioCodec::Opus);
+        assert_eq!(
+            frame.format,
+            AudioFormat::OPUS_16KHZ_60MS,
+            "a promoted participant's bytes are native, whatever the top bits look like"
+        );
+        assert_eq!(
+            frame.data.as_ref(),
+            native_celt.as_slice(),
+            "and must reach the sink untouched"
         );
     }
 
