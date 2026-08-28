@@ -4005,4 +4005,81 @@ mod tests {
             "the next send must retry the resolution instead of reusing the fallback"
         );
     }
+
+    // -- Retained memory --
+
+    /// A group memo of `members` users, each contributing `devices_per_user`
+    /// resolved devices in both namespaces — the shape a community group
+    /// actually parks in the cache for the life of the connection.
+    fn group_memo_fixture(members: usize, devices_per_user: usize) -> GroupDevicesMemo {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let mut participants = Vec::with_capacity(members);
+        let mut lid_to_pn = std::collections::HashMap::with_capacity(members);
+        for i in 0..members {
+            let lid_user = wacore_binary::CompactString::from(format!("1000000{i:08}"));
+            let pn_user = wacore_binary::CompactString::from(format!("5511{i:09}"));
+            participants.push(Jid::lid(lid_user.clone()));
+            lid_to_pn.insert(lid_user, Jid::pn(pn_user));
+        }
+        let group_info = Arc::new(GroupInfo::with_lid_to_pn_map(
+            participants.clone(),
+            AddressingMode::Lid,
+            lid_to_pn.clone(),
+        ));
+
+        let mut devices = Vec::with_capacity(members * devices_per_user);
+        for participant in &participants {
+            for device in 0..devices_per_user {
+                devices.push(Jid::lid_device(participant.user.clone(), device as u16));
+            }
+        }
+
+        // Exactly what `resolve_group_devices_memoized` builds: every member in
+        // both namespaces, plus the sender and every resolved device user.
+        let mut members_set =
+            std::collections::HashSet::with_capacity(participants.len() * 2 + devices.len() + 2);
+        for participant in &participants {
+            members_set.insert(participant.user.clone());
+            if let Some(pn) = lid_to_pn.get(&participant.user) {
+                members_set.insert(pn.user.clone());
+            }
+        }
+        members_set.insert(wacore_binary::CompactString::from("5511999990000"));
+        for device in &devices {
+            members_set.insert(device.user.clone());
+        }
+
+        GroupDevicesMemo {
+            group_info: Arc::downgrade(&group_info),
+            generation: 0,
+            members: Arc::new(members_set),
+            devices: Arc::new(wacore::send::ResolvedGroupDevices::new(devices)),
+        }
+        // `group_info` drops here on purpose: the memo retains only the
+        // allocation header behind its `Weak`, which is the point of the Weak
+        // and is what the bound below must be measured against.
+    }
+
+    /// The memo is per group and lives as long as the group stays warm, so its
+    /// cost has to be a bound rather than a comment. Measured per (member,
+    /// device) pair because both halves scale with it: the membership index is
+    /// keyed by user and the device list by device.
+    #[test]
+    fn group_devices_memo_retained_bytes_stay_bounded() {
+        use wacore::stats::HeapSize;
+
+        const MEMBERS: usize = 1024;
+        const DEVICES_PER_USER: usize = 3;
+
+        let memo = group_memo_fixture(MEMBERS, DEVICES_PER_USER);
+        let per_device =
+            (size_of::<GroupDevicesMemo>() + memo.heap_bytes()) / (MEMBERS * DEVICES_PER_USER);
+        assert!(
+            per_device <= 98,
+            "a warm 1024-member group memo must stay within 98 B per resolved device, \
+             got {per_device}"
+        );
+    }
 }

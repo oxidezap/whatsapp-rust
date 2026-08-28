@@ -93,6 +93,30 @@ impl SenderKeyDeviceMap {
             .is_some_and(|k| k.load(Ordering::Relaxed))
             && by_device.get(&0).is_some_and(|k| k.load(Ordering::Relaxed))
     }
+
+    /// Bytes this map retains beyond its own struct: the tables it owns plus
+    /// the user strings it keys on.
+    ///
+    /// One definition, shared by the cache's `memory_stats` and by the test
+    /// that pins the per-device bound — a second copy would let the report and
+    /// the bound drift apart, and the bound is the only thing standing between
+    /// a layout change and a silent regression.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        // Table allocations go through `hash_table_bytes` (outer and inner
+        // maps alike), which accounts for the buckets hashbrown really owns
+        // rather than the entries that fit in them; per-entry heap is summed
+        // by iteration.
+        hash_table_bytes(
+            self.devices.capacity(),
+            size_of::<(Arc<str>, HashMap<u16, AtomicBool>)>(),
+        ) + self
+            .devices
+            .iter()
+            .map(|(user, by_device)| {
+                user.len() + hash_table_bytes(by_device.capacity(), size_of::<(u16, AtomicBool)>())
+            })
+            .sum::<usize>()
+    }
 }
 
 pub(crate) struct SenderKeyDeviceCache {
@@ -180,28 +204,8 @@ impl SenderKeyDeviceCache {
 
     /// Approximate entry count plus estimated retained bytes.
     pub(crate) async fn memory_stats(&self) -> wacore::stats::CollectionStats {
-        // Table allocations go through `hash_table_bytes` (outer and inner
-        // maps alike), which accounts for the buckets hashbrown really owns
-        // rather than the entries that fit in them; per-entry heap is summed
-        // by iteration.
         self.inner
-            .memory_stats(|k, v| {
-                k.capacity()
-                    + hash_table_bytes(
-                        v.devices.capacity(),
-                        size_of::<(Arc<str>, HashMap<u16, AtomicBool>)>(),
-                    )
-                    + v.devices
-                        .iter()
-                        .map(|(user, by_device)| {
-                            user.len()
-                                + hash_table_bytes(
-                                    by_device.capacity(),
-                                    size_of::<(u16, AtomicBool)>(),
-                                )
-                        })
-                        .sum::<usize>()
-            })
+            .memory_stats(|k, v| k.capacity() + v.retained_bytes())
             .await
     }
 }
@@ -346,6 +350,32 @@ mod tests {
         // The malformed rows produced no entries at all.
         assert_eq!(m.device_has_key("not-a-jid", 0), None);
         assert_eq!(m.device_has_key("111", 1), None);
+    }
+
+    /// A group's sender-key map stays resident for as long as the group is
+    /// warm, and there is one per group, so its cost per tracked device is a
+    /// bound rather than a comment. Uses the same 1024x3 shape as the device
+    /// memo test in `device_registry`, since the two sit side by side behind
+    /// every group send.
+    #[test]
+    fn retained_bytes_per_device_stay_bounded() {
+        const USERS: usize = 1024;
+        const DEVICES_PER_USER: usize = 3;
+
+        let mut rows = Vec::with_capacity(USERS * DEVICES_PER_USER);
+        for i in 0..USERS {
+            for device in 0..DEVICES_PER_USER {
+                rows.push((format!("1000000{i:08}:{device}@lid"), true));
+            }
+        }
+        let map = SenderKeyDeviceMap::from_db_rows(&rows);
+
+        let per_device =
+            (size_of::<SenderKeyDeviceMap>() + map.retained_bytes()) / (USERS * DEVICES_PER_USER);
+        assert!(
+            per_device <= 98,
+            "a warm 1024-user sender-key map must stay within 98 B per device, got {per_device}"
+        );
     }
 
     #[tokio::test]
