@@ -198,15 +198,26 @@ fn build_played_receipt_node(
 /// `WAWebSendReadReceiptJob` + `sendAggregateReceipts`: newsletters use
 /// `read-self`, everything else `read`; status reads carry `class="status"`
 /// and, for a LID author, `peer_participant_pn` (the resolved LID->PN).
-///
-/// The status marker is the `class` attribute, not `context`:
-/// `sendAggregateReceipts` computes `h = isStatusReceipt || to == STATUS_JID
-/// ? "status" : null` and emits it as `class`, and the IR carries the same
-/// shape as the `class="status"` const in `WASmaxOutReceiptStatusClassMixin`.
-/// `context` is a `<usync>` attribute in WA Web and appears on no `<receipt>`.
 /// `read_receipts_disabled` is the `readreceipts==none` privacy gate: only a DM
 /// (not group, status, or broadcast list) then uses `read-self` (does not notify
 /// the sender), matching WA Web `ReadReceiptJob.js`.
+/// Stamps the status marker onto a `<receipt>`, on both the read and the
+/// delivery path.
+///
+/// The marker is the `class` attribute, not `context`. `sendAggregateReceipts`
+/// computes `h = isStatusReceipt || to == STATUS_JID ? "status" : null` and
+/// emits it as `class`; `WAWebSendDeliveryReceiptJob` reaches the same shape
+/// from its own flag (`class: isStatusContext ? CUSTOM_STRING("status") :
+/// DROP_ATTR`), and the IR carries the `class="status"` const of
+/// `WASmaxOutReceiptStatusClassMixin`. `context` is a `<usync>` attribute in
+/// WA Web and appears on no `<receipt>`.
+///
+/// Both builders go through here because writing the marker twice is how it
+/// came to be wrong in both places at once.
+fn with_status_class(builder: NodeBuilder) -> NodeBuilder {
+    builder.attr("class", "status")
+}
+
 fn build_read_receipt_node(
     chat: &Jid,
     sender: Option<&Jid>,
@@ -234,7 +245,7 @@ fn build_read_receipt_node(
     }
 
     if chat.is_status_broadcast() {
-        builder = builder.attr("class", "status");
+        builder = with_status_class(builder);
         if let Some(pn) = peer_participant_pn {
             builder = builder.attr("peer_participant_pn", pn);
         }
@@ -300,7 +311,7 @@ fn delivery_receipt_builder(info: &MessageInfo, active: bool) -> NodeBuilder {
     }
 
     if is_status {
-        builder = builder.attr("class", "status");
+        builder = with_status_class(builder);
     }
 
     builder
@@ -532,10 +543,8 @@ impl Client {
         // this companion device received the message.
         // For all other messages, skip receipts for our own messages.
         //
-        // status@broadcast: WA Web sends `<receipt class="status">`
-        // (`WAWebSendDeliveryReceiptJob`: the `isStatusContext` flag becomes
-        // `class: isStatusContext ? CUSTOM_STRING("status") : DROP_ATTR`).
-        // The class attribute is added in `delivery_receipt_builder` below.
+        // status@broadcast: WA Web sends `<receipt class="status">`; the
+        // marker is stamped by `with_status_class`, which says why.
         //
         // Self-fanout (own message echoed back, carrying a `recipient`) needs a
         // sender receipt to drain the offline queue; without it the server
@@ -754,7 +763,7 @@ impl Client {
     ///   to acknowledge self-synced messages from the primary phone.
     /// - Status broadcasts — `<receipt class="status">`; these are NOT
     ///   skipped anymore. Why `class` and not `context` is stated once, at
-    ///   `delivery_receipt_builder`.
+    ///   `with_status_class`.
     /// - Newsletters and messages without an ID are skipped (newsletters are
     ///   handled by the ack gate, not here).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.receipt.send_delivery", level = "debug", skip_all, fields(chat = %info.source.chat.observe(), sender = %info.source.sender.observe(), msg_id = %info.id)))]
