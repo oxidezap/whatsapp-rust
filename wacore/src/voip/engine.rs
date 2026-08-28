@@ -750,6 +750,36 @@ fn observe_codec_content(m: &mut MediaState, payload: &[u8]) -> Option<AudioCode
     )
 }
 
+/// Ask one participant's content probe whether its bytes contradict the call's negotiation.
+///
+/// The group twin of [`observe_codec_content`]. A verdict is remembered in `foreign_participants`,
+/// because native Opus carries no marker: nothing in the NEXT packet would say so again.
+fn observe_group_codec_content(
+    group: &mut GroupEngineState,
+    participant: &crate::voip::group_media::ParticipantMedia,
+    format: AudioFormat,
+) -> Option<AudioCodec> {
+    let span = group
+        .audio_reception
+        .get(&participant.participant_id)
+        .and_then(RtpReceptionStats::frame_span);
+    let verdict = group
+        .codec_probes
+        .entry(participant.participant_id.clone())
+        .or_default()
+        .observe(
+            &participant.payload,
+            AudioCodec::Mlow,
+            span,
+            format.rtp_clock_rate,
+            format.rtp_timestamp_step,
+        )?;
+    group
+        .foreign_participants
+        .insert(participant.participant_id.clone());
+    Some(verdict)
+}
+
 /// The optional media plane: the SRTP pipeline, selected audio mode, an optional SFrame session,
 /// and the PCM playout jitter buffer. One `MediaPipeline` serves both directions: protect uses its send
 /// keys/ROC/RTP state, unprotect its recv keys/ROC, and those fields are disjoint.
@@ -933,8 +963,9 @@ struct GroupEngineState {
     /// these codecs carry inter-frame state: one shared across speakers corrupts every one of them.
     foreign_decoders: HashMap<String, Box<dyn ForeignAudioCodec>>,
     /// Per participant, because in a group the question is per participant: the call negotiates one
-    /// format, and any one member may be outside the MLOW rollout and sending Opus under it.
-    #[cfg(feature = "voip-mlow")]
+    /// format, and any one member may be outside the MLOW rollout and sending Opus under it. Not
+    /// gated on the built-in codec, for the same reason the direct path's is not: an encoded group
+    /// call asks the same question and never decodes anything itself.
     codec_probes: HashMap<String, InboundCodecProbe>,
     /// Participants whose own bytes contradicted the negotiation. Native Opus carries no escape
     /// marker, so nothing about the packet says so -- only the accumulated evidence does, and it
@@ -1331,7 +1362,6 @@ impl CallEngine {
             #[cfg(feature = "voip-mlow")]
             decoders: HashMap::new(),
             foreign_decoders: HashMap::new(),
-            #[cfg(feature = "voip-mlow")]
             codec_probes: HashMap::new(),
             foreign_participants: HashSet::new(),
         };
@@ -1445,7 +1475,17 @@ impl CallEngine {
             }
             let active = group.registry.active_participant_ids();
             for participant in changed_pid_participants {
+                // A new PID is a new media session for the same participant, which is why the mixer
+                // is reset here. Every other piece of per-participant decode state is in the same
+                // position: a stateful decoder carries predictor and synthesis history from the
+                // retired session into the replacement's first packets, and the codec verdict was
+                // reached about a stream that no longer exists.
                 group.mixer.reset(&participant);
+                #[cfg(feature = "voip-mlow")]
+                group.decoders.remove(&participant);
+                group.foreign_decoders.remove(&participant);
+                group.codec_probes.remove(&participant);
+                group.foreign_participants.remove(&participant);
             }
             group.mixer.retain(active.iter().cloned());
             group
@@ -1471,7 +1511,6 @@ impl CallEngine {
             group
                 .foreign_decoders
                 .retain(|participant, _| active.contains(participant));
-            #[cfg(feature = "voip-mlow")]
             group
                 .codec_probes
                 .retain(|participant, _| active.contains(participant));
@@ -2968,6 +3007,18 @@ impl CallEngine {
             return;
         };
         self.media_stats.rtp_received = self.media_stats.rtp_received.saturating_add(1);
+        // A stream that restarts is a new stream, and the probe's three-packet requirement means
+        // nothing if agreements from the replacement can finish a streak the retired one began. The
+        // direct path retires its evidence the same way, for the same reason.
+        if group
+            .audio_reception
+            .get(&participant.participant_id)
+            .and_then(RtpReceptionStats::ssrc)
+            .is_some_and(|ssrc| ssrc != participant.header.ssrc)
+            && let Some(probe) = group.codec_probes.get_mut(&participant.participant_id)
+        {
+            probe.stream_restarted();
+        }
         group
             .audio_reception
             .entry(participant.participant_id.clone())
@@ -2987,19 +3038,48 @@ impl CallEngine {
         // participant rescued by the probe below sends NATIVE Opus, which must not be.
         let escaped =
             codec == AudioCodec::Opus && audio.format.rtp_profile == AudioRtpProfile::Mlow;
+        let mut promoted = false;
         if codec == AudioCodec::Mlow
             && group
                 .foreign_participants
                 .contains(&participant.participant_id)
         {
             codec = AudioCodec::Opus;
+            promoted = true;
         }
+        // A promoted participant sends NATIVE Opus, so the frame must not be described by the
+        // container the call negotiated: a sink that depacketizes by `format.rtp_profile` would
+        // read the untouched TOC as an MLOW escape and corrupt it. The escape keeps `audio.format`,
+        // because for it the MLOW profile is the truth.
+        let frame_format = if promoted {
+            audio
+                .format
+                .sibling_for(AudioCodec::Opus)
+                .unwrap_or(audio.format)
+        } else {
+            audio.format
+        };
         if audio.io == AudioIo::Encoded {
+            // An encoded group call decodes nothing here, so "the MLow decoder produced nothing" --
+            // the condition the PCM path probes under -- is unreachable, and the branch returns
+            // before it besides. Without asking here, a participant sending native Opus is labelled
+            // MLOW to the sink forever: the set that would correct it is only ever populated below.
+            let (codec, frame_format) = if promoted {
+                (codec, frame_format)
+            } else {
+                match observe_group_codec_content(group, &participant, audio.format) {
+                    Some(verdict) => (
+                        verdict,
+                        audio.format.sibling_for(verdict).unwrap_or(audio.format),
+                    ),
+                    None => (codec, frame_format),
+                }
+            };
             self.media_stats.audio_frames_delivered =
                 self.media_stats.audio_frames_delivered.saturating_add(1);
             self.outbox
                 .push_back(Output::EncodedAudio(EncodedAudioFrame {
-                    format: audio.format,
+                    format: frame_format,
                     codec,
                     data: Bytes::from(participant.payload),
                     payload_type: participant.header.payload_type,
@@ -3111,30 +3191,20 @@ impl CallEngine {
                 // the only way to catch NATIVE Opus here: it carries no escape marker, so classification
                 // alone will call it MLOW forever and the participant stays silent with a decoder
                 // installed and idle.
-                if report.decoded == 0 {
-                    let span = group
-                        .audio_reception
-                        .get(&participant.participant_id)
-                        .and_then(RtpReceptionStats::frame_span);
-                    let verdict = group
-                        .codec_probes
-                        .entry(participant.participant_id.clone())
-                        .or_default()
-                        .observe(
-                            &participant.payload,
-                            AudioCodec::Mlow,
-                            span,
-                            audio.format.rtp_clock_rate,
-                            audio.format.rtp_timestamp_step,
-                        );
-                    if verdict == Some(AudioCodec::Opus) {
-                        group
-                            .foreign_participants
-                            .insert(participant.participant_id.clone());
-                        // Whatever this decoder built out of the other codec's bytes is not a starting
-                        // point for anything, and the participant will not come back to it.
-                        group.decoders.remove(&participant.participant_id);
-                    }
+                let mut pcm = pcm;
+                if report.decoded == 0
+                    && observe_group_codec_content(group, &participant, audio.format)
+                        == Some(AudioCodec::Opus)
+                {
+                    // Whatever this decoder built out of the other codec's bytes is not a starting
+                    // point for anything, and the participant will not come back to it.
+                    group.decoders.remove(&participant.participant_id);
+                    // Nor is what it already queued: every one of those samples is concealment for
+                    // a packet that failed, and up to the mixer's capacity of it would play out in
+                    // front of the rescued audio. Rescuing a participant and then making them wait
+                    // out their own failure is not a rescue; the direct path clears for this too.
+                    group.mixer.reset(&participant.participant_id);
+                    pcm.clear();
                 }
                 group.mixer.push(&participant.participant_id, &pcm);
             }
@@ -7326,6 +7396,105 @@ mod tests {
         assert!(
             heard.contains(&1234),
             "and the rescued participant has to become audible"
+        );
+    }
+
+    // The failed MLow decodes that convinced the probe also queued their concealment, and up to the
+    // mixer's capacity of it would play out in front of the rescued audio. Rescuing a participant
+    // and then making them wait out their own failure is not a rescue.
+    #[test]
+    fn a_rescued_group_participant_does_not_play_out_its_own_failure() {
+        let (mut eng, epoch) = group_engine(false);
+        eng = eng.with_foreign_audio_codec_factory(Box::new(StubCodecFactory { samples: 960 }));
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        let mut peer = group_peer_audio(&epoch);
+        let mut heard = Vec::new();
+        for n in 0..8u64 {
+            let packet = peer.protect_audio(&body);
+            eng.handle_input(100 + n * 60, Input::RelayPacket(&packet));
+            for tick in 0..3u64 {
+                eng.handle_input(100 + n * 60 + tick * 20, Input::Timeout);
+                let (outputs, _) = drain(&mut eng);
+                for output in outputs {
+                    if let Output::Playout(frame) = output {
+                        heard.extend(frame);
+                    }
+                }
+            }
+        }
+
+        let first_audible = heard
+            .iter()
+            .position(|sample| *sample != 0)
+            .expect("the rescue produces audio");
+        assert_eq!(
+            heard[first_audible], 1234,
+            "what is finally heard is decoded audio"
+        );
+        // The number is the point, since concealment and priming are both silence and only their
+        // LENGTH tells them apart. Without the purge this is 5760 -- one 60ms packet of concealment
+        // from the failed decodes, queued in front of the rescue and played before it.
+        assert_eq!(
+            first_audible, 4800,
+            "the failed decodes' concealment must not be queued ahead of the rescued audio"
+        );
+    }
+
+    // The encoded group path decodes nothing, so the PCM path's trigger ("the MLow decoder produced
+    // nothing") is unreachable there and the branch returns before it anyway. Without its own ask,
+    // the set that would correct the label is never populated for an encoded call, and the sink is
+    // told MLOW about native Opus for the rest of the call.
+    #[test]
+    fn an_encoded_group_call_probes_each_participant_and_relabels_what_it_delivers() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).expect("engine");
+        let update = group_update("audio");
+        eng.configure_group(GroupEngineConfig {
+            call_creator: update.call_creator.clone(),
+            self_jid: SELF_LID.parse().expect("self JID"),
+            initial_update: update,
+            direct_peer: None,
+        })
+        .expect("configure group");
+        let epoch = [0x42; 32];
+        assert_eq!(
+            eng.apply_group_raw_epoch(7, &epoch).expect("install epoch"),
+            GroupEpochApply::Installed
+        );
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        let mut peer = group_peer_audio(&epoch);
+        let mut delivered = Vec::new();
+        for n in 0..6u64 {
+            let packet = peer.protect_audio(&body);
+            eng.handle_input(100 + n * 60, Input::RelayPacket(&packet));
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                if let Output::EncodedAudio(frame) = output {
+                    delivered.push((frame.codec, frame.format));
+                }
+            }
+        }
+
+        assert_eq!(delivered.len(), 6, "every packet still reaches the sink");
+        let (codec, format) = *delivered.last().expect("frames");
+        assert_eq!(codec, AudioCodec::Opus, "the probe has to run here too");
+        assert_eq!(
+            format,
+            AudioFormat::OPUS_16KHZ_60MS,
+            "and native Opus must not be described by the container it is not in"
         );
     }
 
