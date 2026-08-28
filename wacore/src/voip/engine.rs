@@ -1543,11 +1543,16 @@ impl CallEngine {
     /// consumer queue refused: the encoder's own periodic IDR can settle the
     /// requirement in the meantime, and a request nobody is waiting on would
     /// cost the application a keyframe for nothing.
+    ///
+    /// Sendability is part of the answer, matching what
+    /// [`Self::announce_video_keyframe`] is willing to ask for: an IDR made for
+    /// a plane that has since been downgraded or re-gated is one the engine
+    /// would drop, and whatever re-enables the plane asks again anyway.
     pub(crate) fn video_keyframe_required(&self) -> bool {
         self.media
             .as_ref()
             .and_then(|m| m.video.as_ref())
-            .is_some_and(|v| v.keyframe_required)
+            .is_some_and(|v| v.active && !v.send_gated && v.keyframe_required)
     }
 
     /// Whether the video plane is currently up (sending is possible, inbound PT-97 decodes).
@@ -6641,6 +6646,34 @@ mod tests {
                 .0
                 .iter()
                 .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded)))
+        );
+    }
+
+    /// The driver retries a refused request only while the engine could still
+    /// use the answer. A plane that was downgraded or re-gated in the meantime
+    /// would drop the IDR it asked for, and its own re-enable asks again.
+    #[test]
+    fn a_plane_that_cannot_send_reports_no_keyframe_requirement() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        assert!(eng.video_keyframe_required(), "a fresh plane is waiting");
+
+        eng.disable_video();
+        assert!(
+            !eng.video_keyframe_required(),
+            "a downgraded plane sends nothing"
+        );
+
+        assert!(eng.enable_video_gated());
+        assert!(
+            !eng.video_keyframe_required(),
+            "an upgrade the peer has not accepted sends nothing either"
+        );
+
+        assert!(eng.enable_video());
+        assert!(
+            eng.video_keyframe_required(),
+            "the ungate is a fresh requirement"
         );
     }
 
