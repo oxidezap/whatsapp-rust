@@ -476,10 +476,7 @@ impl SqliteStore {
         // concurrency keeps the two in step.
         let pool_size = config.pool_size.max(1);
         let read_pool_size = config.read_pool_size;
-        // Left as the `Option` the embedder gave, and resolved inside
-        // `pool::builder` — creating the shared management pool here would
-        // spawn threads on a platform that has none, which is a panic before
-        // the first connection is even opened.
+        // Left as the `Option` the embedder gave; `pool::builder` resolves it.
         let thread_pool = config.thread_pool;
         let read_thread_pool = thread_pool.clone();
 
