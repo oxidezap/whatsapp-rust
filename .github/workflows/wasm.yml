@@ -74,7 +74,13 @@ jobs:
       # the store once the shim exists.
       - name: Guard sqlite-storage's platform shim
         run: |
-          if grep -rn --include='*.rs' -e 'tokio::task::spawn_blocking' -e 'r2d2::Pool' \
+          # Two shapes, because an import renames the call site: the qualified call,
+          # and any `use` that could bring either name into scope unqualified.
+          if grep -rnE --include='*.rs' \
+              -e 'tokio::task::spawn_blocking' \
+              -e 'r2d2::Pool' \
+              -e '^[[:space:]]*use .*tokio::task' \
+              -e '^[[:space:]]*use .*r2d2::\{[^}]*Pool' \
               storages/sqlite-storage/src | grep -v '^storages/sqlite-storage/src/pool.rs:'; then
             echo "::error::use crate::pool (spawn_blocking / Pool) instead; only pool.rs may name the native ones"
             exit 1
