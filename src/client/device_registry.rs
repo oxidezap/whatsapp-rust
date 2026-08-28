@@ -4030,7 +4030,10 @@ mod tests {
             lid_to_pn.clone(),
         ));
 
-        let mut devices = Vec::with_capacity(members * devices_per_user);
+        // Reserved the way `get_user_devices_owned` does — two devices per
+        // input user — and then grown past it, so the fixture carries the same
+        // idle capacity a real fan-out hands the memo.
+        let mut devices = Vec::with_capacity(members * 2);
         for participant in &participants {
             for device in 0..devices_per_user {
                 devices.push(Jid::lid_device(participant.user.clone(), device as u16));

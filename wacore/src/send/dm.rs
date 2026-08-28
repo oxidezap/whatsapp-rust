@@ -38,19 +38,22 @@ pub(crate) fn partition_dm_devices(
     }
 
     PartitionedDmDevices {
-        devices: all_devices,
+        // Frozen once the partition is settled: nothing appends to it
+        // afterwards, and the fan-out build over-reserves, so the boxed slice
+        // keeps a resident DM memo from parking that slack.
+        devices: all_devices.into_boxed_slice(),
         recipient_count,
     }
 }
 
 pub(crate) struct PartitionedDmDevices {
-    devices: Vec<Jid>,
+    devices: Box<[Jid]>,
     recipient_count: usize,
 }
 
 impl crate::stats::HeapSize for PartitionedDmDevices {
     fn heap_bytes(&self) -> usize {
-        self.devices.capacity() * size_of::<Jid>()
+        self.devices.len() * size_of::<Jid>()
             + self.devices.iter().map(|j| j.heap_bytes()).sum::<usize>()
     }
 }
@@ -597,8 +600,29 @@ where
 mod partition_tests {
     use super::*;
 
+    /// Classification is in place, so a fan-out that drops nothing keeps the
+    /// caller's allocation: the freeze into a boxed slice is a no-op when the
+    /// input was already exact, and no per-partition `Vec` is ever built.
     #[test]
-    fn partition_dm_devices_reuses_input_allocation() {
+    fn partition_dm_devices_reuses_an_exact_input_allocation() {
+        let own_jid = Jid::lid_device("123456789".to_owned(), 7);
+        // `vec![]` allocates exactly three slots, so the freeze below has no
+        // slack to hand back and must leave the buffer where it is.
+        let devices = vec![
+            Jid::lid_device("987654321".to_owned(), 0),
+            Jid::lid_device("123456789".to_owned(), 0),
+            Jid::lid_device("987654321".to_owned(), 1),
+        ];
+        let allocation = devices.as_ptr();
+
+        let partitioned = partition_dm_devices(devices, &own_jid, None);
+
+        assert_eq!(partitioned.devices.as_ptr(), allocation);
+        assert_eq!(partitioned.devices.len(), 3);
+    }
+
+    #[test]
+    fn partition_dm_devices_splits_recipients_from_own_devices() {
         let own_jid = Jid::lid_device("123456789".to_owned(), 7);
         let devices = vec![
             Jid::lid_device("987654321".to_owned(), 0),
@@ -606,13 +630,12 @@ mod partition_tests {
             own_jid.clone(),
             Jid::lid_device("987654321".to_owned(), 1),
         ];
-        let allocation = devices.as_ptr();
-        let capacity = devices.capacity();
 
         let partitioned = partition_dm_devices(devices, &own_jid, None);
 
-        assert_eq!(partitioned.devices.as_ptr(), allocation);
-        assert_eq!(partitioned.devices.capacity(), capacity);
+        // The sending device is dropped, so the frozen slice holds exactly the
+        // three survivors rather than the four slots it was built in.
+        assert_eq!(partitioned.devices.len(), 3);
         assert_eq!(partitioned.valid_devices().len(), 3);
         assert_eq!(partitioned.recipient_devices().len(), 2);
         assert_eq!(partitioned.own_other_devices().len(), 1);

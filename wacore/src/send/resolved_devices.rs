@@ -19,7 +19,11 @@ use wacore_binary::jid::Jid;
 /// A phash is 10 bytes ("2:" + 8 base64 chars), inline in `CompactString`:
 /// serving a warm send costs a pointer-free copy, no allocation.
 pub struct ResolvedGroupDevices {
-    devices: Vec<Jid>,
+    /// Frozen at construction: the set never changes afterwards (a topology
+    /// change produces a new memo entry, not a mutation), so the boxed slice
+    /// hands back the growth capacity the fan-out build over-reserved instead
+    /// of parking it for the life of the group.
+    devices: Box<[Jid]>,
     /// `(sending jid, phash)`. The jid pins the only other input, so a
     /// change of sending identity (PN/LID mode flip, re-pair) can never be
     /// served a stale hash; it recomputes without overwriting.
@@ -28,7 +32,7 @@ pub struct ResolvedGroupDevices {
 
 impl crate::stats::HeapSize for ResolvedGroupDevices {
     fn heap_bytes(&self) -> usize {
-        self.devices.capacity() * size_of::<Jid>()
+        self.devices.len() * size_of::<Jid>()
             + self.devices.iter().map(|j| j.heap_bytes()).sum::<usize>()
             + self
                 .phash
@@ -40,7 +44,7 @@ impl crate::stats::HeapSize for ResolvedGroupDevices {
 impl ResolvedGroupDevices {
     pub fn new(devices: Vec<Jid>) -> Self {
         Self {
-            devices,
+            devices: devices.into_boxed_slice(),
             phash: OnceLock::new(),
         }
     }

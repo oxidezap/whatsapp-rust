@@ -1601,7 +1601,10 @@ impl Client {
                             ) {
                                 None => {
                                     self.device_memo_counters.record_skdm_targets(Outcome::Hit);
-                                    return Some((all_devices, memo.4));
+                                    // Free: the stored slice is exact, so
+                                    // reclaiming it as a `Vec` reuses its
+                                    // allocation rather than copying.
+                                    return Some((all_devices, memo.4.into_vec()));
                                 }
                                 Some(term) => self.device_memo_counters.record_skdm_targets(term),
                             }
@@ -1611,12 +1614,17 @@ impl Client {
                             .record_skdm_targets(Outcome::MissAbsent),
                     }
                 }
-                let needs_skdm = self.filter_skdm_targets(
-                    group_jid,
-                    all_devices.devices(),
-                    &cached_map,
-                    own_sending_jid,
-                );
+                // Frozen before it can be memoized: what the filter returns
+                // carries the growth capacity of a scan over every device, and
+                // the entry it lands in is retained for the life of the group.
+                let needs_skdm: Box<[Jid]> = self
+                    .filter_skdm_targets(
+                        group_jid,
+                        all_devices.devices(),
+                        &cached_map,
+                        own_sending_jid,
+                    )
+                    .into_boxed_slice();
                 // Still inside the `device_memos_enabled` guard, and still
                 // short-circuiting: a client with store-backed caches must not
                 // pay the snapshot read for a memo it will never write.
@@ -1653,7 +1661,7 @@ impl Client {
                         self.device_memo_counters.record_skdm_not_stored();
                     }
                 }
-                Some((all_devices, needs_skdm))
+                Some((all_devices, needs_skdm.into_vec()))
             }
             Err(e) => {
                 // Recorded so `SkdmTargetsMemoStats::calls()` really is one
@@ -3456,7 +3464,7 @@ mod tests {
         // The same predicate the send path applies, not a second copy of it.
         skdm_memo_entry_stale_term(&memo, &devices, &cached_map, generation, &own)
             .is_none()
-            .then_some(memo.4)
+            .then(|| memo.4.into_vec())
     }
 
     /// The premise of every "the warm group send is flat in group size" claim:

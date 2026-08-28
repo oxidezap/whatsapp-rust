@@ -353,7 +353,10 @@ pub(crate) type SkdmWarmMemoEntry = (
     std::sync::Weak<crate::sender_key_device_cache::SenderKeyDeviceMap>,
     u64,
     Jid,
-    Vec<Jid>,
+    // Frozen: the memoized targets never change once stored (a change of the
+    // inputs produces a new entry), and the steady state is empty or the own
+    // devices, so the filter's growth capacity has nothing to park here for.
+    Box<[Jid]>,
 );
 use wacore::runtime::timeout as rt_timeout;
 use waproto::whatsapp as wa;
