@@ -571,7 +571,11 @@ impl CallEntry {
 /// shedding the next entry instead -- the same shape as
 /// `CallRegistry::force_send_preserving_epoch`.
 ///
-/// `false` only when the queue is closed.
+/// `false` when the queue is closed, and when `event` did not survive the
+/// request going back: a single-slot queue has no next entry to shed instead,
+/// so the restore displaces the event just inserted. The request is the one
+/// whose loss is permanent, so it is what stays, and the caller is told its own
+/// event never reached the consumer rather than being left to assume it did.
 pub(crate) fn force_send_call_event(
     tx: &async_channel::Sender<CallEvent>,
     event: CallEvent,
@@ -579,7 +583,7 @@ pub(crate) fn force_send_call_event(
     match tx.force_send(event) {
         Ok(Some(CallEvent::VideoKeyframeNeeded)) => {
             let _ = tx.force_send(CallEvent::VideoKeyframeNeeded);
-            true
+            tx.capacity().is_none_or(|capacity| capacity > 1)
         }
         Ok(_) => true,
         Err(_) => false,
@@ -5712,6 +5716,38 @@ mod tests {
         assert!(
             ctl_rx.try_recv().is_err(),
             "a participant that left takes its rotation with it"
+        );
+    }
+
+    /// One slot cannot hold both, and the caller is owed the truth about which
+    /// of the two the consumer will see.
+    #[test]
+    fn a_single_slot_queue_keeps_the_request_and_says_the_event_was_lost() {
+        let (tx, rx) = async_channel::bounded(1);
+        assert!(force_send_call_event(&tx, CallEvent::VideoKeyframeNeeded));
+        assert!(
+            !force_send_call_event(&tx, CallEvent::RelayAllocated),
+            "the lifecycle event did not survive the request going back"
+        );
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+
+        // With room to shed something else, the request goes back at that
+        // entry's cost and the forced event really did land.
+        let (tx, rx) = async_channel::bounded(2);
+        assert!(force_send_call_event(&tx, CallEvent::VideoKeyframeNeeded));
+        assert!(force_send_call_event(
+            &tx,
+            CallEvent::GroupControlRejected {
+                control: crate::voip::engine::GroupControlKind::Update,
+            }
+        ));
+        assert!(force_send_call_event(&tx, CallEvent::RelayAllocated));
+        let kept = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            vec![CallEvent::RelayAllocated, CallEvent::VideoKeyframeNeeded],
+            "the diagnostic is what the lifecycle event cost, not the request"
         );
     }
 

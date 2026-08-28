@@ -1856,6 +1856,20 @@ impl CallEngine {
         true
     }
 
+    /// Whether outbound video could reach the wire at all right now: a plane
+    /// that is up and not gated.
+    ///
+    /// The driver's send queue can come to require an IDR on a call that has no
+    /// picture to unblock -- a relay reconnect sets that requirement whether or
+    /// not video was ever enabled -- and asking an audio-only application for a
+    /// keyframe is asking for something it has no way to produce.
+    pub(crate) fn video_send_active(&self) -> bool {
+        self.media
+            .as_ref()
+            .and_then(|m| m.video.as_ref())
+            .is_some_and(|v| v.active && !v.send_gated)
+    }
+
     /// Whether outbound video is still dropping access units for want of an IDR.
     ///
     /// The driver reads this before retrying a keyframe request a saturated

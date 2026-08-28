@@ -743,6 +743,34 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
 /// would evict this one in turn -- so the drive loop keeps offering it instead,
 /// which costs nothing on the overwhelmingly common path where it fit the
 /// first time.
+/// Ask for the IDR the SEND QUEUE is waiting on, once per requirement.
+///
+/// The queue comes to require one on its own account: a relay reconnect reopens
+/// the replacement path on an IDR, and a shed that discarded a protected access
+/// unit leaves a hole no delta can be decoded across. `enqueue_batch` then drops
+/// every delta until one arrives, and the engine's own `keyframe_required` says
+/// nothing about any of it -- so this is the only place the application can be
+/// told. Latched like the engine's own announcement, so one requirement costs
+/// one request; a refused one joins `outstanding` and is retried below.
+fn announce_send_queue_keyframe(
+    events: &async_channel::Sender<CallEvent>,
+    awaiting: bool,
+    announced: &mut bool,
+    outstanding: &mut bool,
+) {
+    if !awaiting {
+        *announced = false;
+        return;
+    }
+    if *announced {
+        return;
+    }
+    *announced = true;
+    if !publish_engine_event(events, CallEvent::VideoKeyframeNeeded) {
+        *outstanding = true;
+    }
+}
+
 fn retry_keyframe_request(
     events: &async_channel::Sender<CallEvent>,
     outstanding: &mut bool,
@@ -1020,6 +1048,9 @@ async fn run_call_with_clock_and_wallclock(
     // Video is queued per access unit so overload never leaves half an IDR on the wire.
     let mut send_queue: VecDeque<SendBatch> = VecDeque::new();
     let mut awaiting_video_keyframe = false;
+    // Whether the application has been told about the send queue's own
+    // requirement; see `announce_send_queue_keyframe`.
+    let mut send_keyframe_announced = false;
     // A keyframe request a saturated consumer queue refused, retried below.
     let mut undelivered_keyframe_request = false;
     // Idle sentinel: a terminated `Fuse` is safe to re-select every iteration and never fires until a
@@ -1124,10 +1155,21 @@ async fn run_call_with_clock_and_wallclock(
             eng.note_audio_sink_dropped(sink_dropped);
         }
 
+        let send_queue_needs_keyframe = awaiting_video_keyframe && eng.video_send_active();
+        announce_send_queue_keyframe(
+            &channels.events,
+            send_queue_needs_keyframe,
+            &mut send_keyframe_announced,
+            &mut undelivered_keyframe_request,
+        );
         retry_keyframe_request(
             &channels.events,
             &mut undelivered_keyframe_request,
-            eng.video_keyframe_required(),
+            // Either requirement keeps the request owed: an IDR the engine no
+            // longer needs can still be the one the send queue is holding the
+            // picture for, and cancelling on the engine's flag alone would
+            // leave every delta dropped with nobody asked for a keyframe.
+            eng.video_keyframe_required() || send_queue_needs_keyframe,
         );
 
         // The terminal event above must reach the consumer before transport teardown.
@@ -1805,6 +1847,58 @@ mod tests {
         // Nothing to retry once it has landed.
         retry_keyframe_request(&tx, &mut outstanding, true);
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    /// The send queue can require an IDR the engine does not: a relay
+    /// reconnect, or a shed that discarded the protected access unit. Nothing
+    /// else tells the application, and the retry must not cancel on the
+    /// engine's flag while the queue is still dropping every delta.
+    #[test]
+    fn the_send_queues_own_keyframe_requirement_is_asked_for_and_kept() {
+        let (tx, rx) = async_channel::bounded(4);
+        let mut announced = false;
+        let mut outstanding = false;
+
+        announce_send_queue_keyframe(&tx, true, &mut announced, &mut outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+        assert!(!outstanding, "it landed");
+
+        // One requirement, one request.
+        announce_send_queue_keyframe(&tx, true, &mut announced, &mut outstanding);
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+
+        // The engine can stop needing an IDR while the queue still does, and a
+        // refused request stays owed across that.
+        outstanding = true;
+        retry_keyframe_request(&tx, &mut outstanding, false || true);
+        assert!(!outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+
+        // The IDR arrives, the queue stops waiting, and the next requirement
+        // is a new one to announce.
+        announce_send_queue_keyframe(&tx, false, &mut announced, &mut outstanding);
+        assert!(!announced);
+        announce_send_queue_keyframe(&tx, true, &mut announced, &mut outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+    }
+
+    /// A refused announcement is owed, not lost.
+    #[test]
+    fn a_refused_send_queue_request_becomes_outstanding() {
+        let (tx, rx) = async_channel::bounded(1);
+        tx.try_send(CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        })
+        .expect("fills the queue");
+        let mut announced = false;
+        let mut outstanding = false;
+
+        announce_send_queue_keyframe(&tx, true, &mut announced, &mut outstanding);
+        assert!(outstanding, "refused, so still owed");
+        let _ = rx.try_recv();
+        retry_keyframe_request(&tx, &mut outstanding, true);
+        assert!(!outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
     }
 
     /// A lifecycle event makes room by displacing the queue's oldest entry,
