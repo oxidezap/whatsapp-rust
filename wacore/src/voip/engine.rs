@@ -2038,11 +2038,11 @@ impl CallEngine {
             self.started && media.audio.io == AudioIo::Pcm && now >= media.playout_deadline
         });
         if playout_due {
-            // Group mixing decodes each participant with the built-in codec, so without it there is
-            // no mixed frame -- but the per-call playout tick below still has to run.
-            #[cfg(not(feature = "voip-mlow"))]
-            let group_frame: Option<Vec<i16>> = None;
-            #[cfg(feature = "voip-mlow")]
+            // Not gated on the built-in codec: the mixer holds PCM, and since the group path gained
+            // per-participant foreign decoders it is no longer only MLOW that fills it. Gated, a
+            // `voip-libopus` group call decoded every participant into a mixer nothing ever drained
+            // and then played the empty direct-call buffer instead -- silence, from the one build
+            // whose whole purpose is that codec.
             let group_frame = self.group.as_mut().map(|group| {
                 let mut frame = Vec::with_capacity(PLAYOUT_DRAIN);
                 for _ in 0..2 {
@@ -3114,7 +3114,7 @@ impl CallEngine {
                 self.outbox
                     .push_back(Output::Event(CallEvent::ForeignGroupAudio(
                         EncodedAudioFrame {
-                            format: audio.format,
+                            format: frame_format,
                             codec,
                             data: Bytes::from(participant.payload),
                             payload_type: participant.header.payload_type,
@@ -3737,6 +3737,100 @@ mod encoded_tests {
             })
             .expect("configure group");
         engine
+    }
+
+    /// Hands each group participant its own [`DecodeToConstant`].
+    #[cfg(not(feature = "voip-mlow"))]
+    struct DecodeToConstantFactory(i16);
+
+    #[cfg(not(feature = "voip-mlow"))]
+    impl ForeignAudioCodecFactory for DecodeToConstantFactory {
+        fn create(&self) -> Option<Box<dyn ForeignAudioCodec>> {
+            Some(Box::new(DecodeToConstant(self.0)))
+        }
+    }
+
+    /// A PCM group call with an installed epoch and one remote participant, for the build without
+    /// the built-in codec. The MLOW test module has richer group helpers, but they are gated on the
+    /// very feature these tests exist to exercise the absence of.
+    #[cfg(not(feature = "voip-mlow"))]
+    fn pcm_group_engine() -> (CallEngine, [u8; 32], MediaPipeline) {
+        let relay = group_relay();
+        let mut update = group_update();
+        update.relay = Some(relay.clone());
+        let mut cfg = CallConfig::for_group(
+            CallDirection::Outgoing,
+            &update.call_id,
+            SELF_LID,
+            SELF_LID,
+            &relay,
+        )
+        .expect("group config");
+        cfg.audio = AudioConfig::OPUS_PCM;
+        let mut engine = CallEngine::new(cfg, Box::new(SequentialTxIds::new()))
+            .expect("standard Opus PCM does not need the MLOW codec")
+            .with_foreign_audio_codec_factory(Box::new(DecodeToConstantFactory(4321)));
+        engine
+            .configure_group(GroupEngineConfig {
+                call_creator: update.call_creator.clone(),
+                self_jid: Jid::new("15550001111", Server::Lid),
+                initial_update: update,
+                direct_peer: None,
+            })
+            .expect("configure group");
+        let epoch = [0x42u8; 32];
+        engine
+            .apply_group_raw_epoch(7, &epoch)
+            .expect("install epoch");
+        let peer_id = ssrc::format_e2e_srtp_participant_id(PEER_LID);
+        let peer = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &epoch,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: ssrc::derive_wasm_participant_ssrc("ENCODED-AUDIO-TEST", &peer_id, 0),
+            samples_per_packet: AudioFormat::OPUS_16KHZ_60MS.rtp_timestamp_step,
+            warp_mi_tag_len: 4,
+        })
+        .expect("peer audio pipeline");
+        (engine, epoch, peer)
+    }
+
+    // The mixer holds PCM, so what filled it is irrelevant to draining it -- but the drain was gated
+    // on the built-in codec, so a `voip-libopus` group call decoded every participant into a mixer
+    // nothing emptied and then played the empty direct-call buffer instead. Silence, from the one
+    // build whose whole purpose is that codec.
+    #[cfg(not(feature = "voip-mlow"))]
+    #[test]
+    fn a_group_call_mixes_and_plays_without_the_built_in_codec() {
+        let (mut eng, _epoch, mut peer) = pcm_group_engine();
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocation_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        let mut heard = Vec::new();
+        for n in 0..8u64 {
+            let packet = peer.protect_audio(&[0xE8u8, 0x11, 0x22, 0x33]);
+            eng.handle_input(100 + n * 60, Input::RelayPacket(&packet));
+            for tick in 0..3u64 {
+                eng.handle_input(100 + n * 60 + tick * 20, Input::Timeout);
+                for output in drain(&mut eng) {
+                    if let Output::Playout(frame) = output {
+                        heard.extend(frame);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            eng.media_stats().foreign_frames_decoded > 0,
+            "each participant is decoded by the injected factory"
+        );
+        assert!(
+            heard.contains(&4321),
+            "and the mixer has to be drained into playout, whatever filled it"
+        );
     }
 
     #[test]
