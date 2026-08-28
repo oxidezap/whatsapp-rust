@@ -2027,8 +2027,10 @@ impl CallRegistry {
         // two that later reconciliation would merge in whatever order they were
         // pushed -- letting the stale alias overwrite the newest rotation. The
         // raw JID is the key only while the roster cannot name the announcer.
-        let named_by_roster = entry.roster_name_for(peer).is_some();
-        let key = peer.clone();
+        let (key, named_by_roster) = match entry.roster_name_for(peer) {
+            Some(known) => (known, true),
+            None => (peer.clone(), false),
+        };
         upsert_peer_orientation(
             &mut entry.peer_video_orientations,
             key,
@@ -5452,6 +5454,54 @@ mod tests {
                 orientation: 1,
             }],
             "only the participant still on the call is replayed"
+        );
+    }
+
+    /// Two spellings of one participant must not occupy two retained slots: a
+    /// later snapshot renames both to the same identity and merges them in the
+    /// order they were pushed, so a stale alias would bury the newest rotation.
+    #[test]
+    fn an_alias_and_the_rosters_name_share_one_retained_rotation() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let lid = Jid::new("222222222222222", Server::Lid);
+        let pn = Jid::new("5511999990000", Server::Pn);
+        let roster = |transaction| {
+            let mut update = group_update(transaction);
+            update.call_id = "GID".to_string();
+            update.participants = vec![GroupCallParticipant {
+                jid: lid.clone(),
+                pn: Some(pn.clone()),
+                state: Some("connected".to_string()),
+                participant_type: None,
+                devices: Vec::new(),
+            }];
+            update
+        };
+        let mut session =
+            CallSession::new_outgoing("GID", Jid::new("GID", Server::Call), creator.clone());
+        session.group = Some(roster(1));
+        let generation = reg.insert(session);
+
+        // The roster's name, then the alias, then a newer word under the name.
+        assert!(reg.set_peer_video_orientation("GID", generation, &lid, 2));
+        assert!(reg.set_peer_video_orientation("GID", generation, &pn, 1));
+        assert!(reg.set_peer_video_orientation("GID", generation, &lid, 3));
+
+        // A fresh snapshot is what would merge two slots into one.
+        assert_eq!(reg.apply_group_update(roster(2)), GroupStateApply::Applied);
+
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+        let replayed = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            replayed,
+            vec![VideoControl::SetParticipantOrientation {
+                participant: lid,
+                orientation: 3,
+            }],
+            "one slot, holding the rotation announced last"
         );
     }
 
