@@ -305,20 +305,6 @@ impl StanzaHandler for CallHandler {
                         }
                         return true;
                     }
-                    // The answering device's camera rotation, announced on the
-                    // `<accept>`'s `<video>` and nowhere else until it turns.
-                    #[cfg(feature = "voip-runtime")]
-                    if matches!(&call.action, CallAction::Accept { .. })
-                        && let Some(orientation) = call.video_orientation
-                        && let Some(generation) =
-                            client.call_registry().generation_of(call.action.call_id())
-                    {
-                        client.call_registry().set_peer_video_orientation(
-                            call.action.call_id(),
-                            generation,
-                            orientation,
-                        );
-                    }
                     #[cfg(feature = "voip-runtime")]
                     if matches!(
                         &call.action,
@@ -393,6 +379,21 @@ impl StanzaHandler for CallHandler {
                         client
                             .call_registry()
                             .set_answering_device(call.action.call_id(), sender.clone());
+                        // The answering device's camera rotation, announced on
+                        // the `<accept>`'s `<video>` and nowhere else until it
+                        // turns. After `set_answering_device`, so the registry
+                        // can tell a winning answer from a late sibling's.
+                        if let Some(orientation) = call.video_orientation
+                            && let Some(generation) =
+                                client.call_registry().generation_of(call.action.call_id())
+                        {
+                            client.call_registry().set_peer_video_orientation(
+                                call.action.call_id(),
+                                generation,
+                                &sender,
+                                orientation,
+                            );
+                        }
                         client
                             .call_registry()
                             .send_rekey(call.action.call_id(), sender.to_string());

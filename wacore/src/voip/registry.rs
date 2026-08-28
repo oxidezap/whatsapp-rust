@@ -271,17 +271,21 @@ struct CallEntry {
     /// has to survive all of them or the next `<video>` announces a camera that
     /// is not the one pointing at the user.
     self_video_orientation: u8,
-    /// The peer's rotation as announced on the `<offer>` or `<accept>`'s
-    /// `<video>` child, held until the media plane exists to receive it.
+    /// The rotation a peer announced on the `<offer>` or `<accept>`'s `<video>`
+    /// child, with the JID that announced it, held until the media plane exists
+    /// to receive it.
     ///
     /// A video-from-start peer announces its camera rotation once, in that
     /// stanza, and sends no `<video>` of its own until the camera actually
     /// turns. The control channel is attached with the drive loop, long after
-    /// the offer is parsed, so a rotation sent through it then goes nowhere —
+    /// the offer is parsed, so a rotation sent through it then goes nowhere --
     /// which left every frame of a call from a sideways camera stamped upright.
-    /// `set_video_channels` drains this the moment there is somewhere to drain
-    /// it to.
-    peer_video_orientation: Option<u8>,
+    /// [`CallRegistry::set_video_channels`] drains this the moment there is
+    /// somewhere to drain it to.
+    ///
+    /// The JID rides along because a group call routes rotation per
+    /// participant; see [`CallEntry::peer_orientation_control`].
+    peer_video_orientation: Option<(Jid, u8)>,
     /// Explicit group identity exists before the first authoritative roster arrives.
     is_group_call: bool,
     /// This generation originated from a reusable call-link join and may accept waiting-room state.
@@ -305,10 +309,27 @@ impl CallEntry {
     /// announced rotation with whatever the new session happens to know, which
     /// for every path but the group promotion is nothing.
     fn adopt_session(&mut self, session: CallSession) {
-        if session.peer_video_orientation.is_some() {
-            self.peer_video_orientation = session.peer_video_orientation;
+        if let Some(orientation) = session.peer_video_orientation {
+            self.peer_video_orientation = Some((session.call_creator.clone(), orientation));
         }
         self.session = session;
+    }
+
+    /// The control that carries `peer`'s rotation to the media plane.
+    ///
+    /// A 1:1 call has one inbound video stream, so its rotation is the plane's.
+    /// A group call has one per participant and stamps each frame from a map
+    /// keyed by the sender's JID, so the same value sent as the plane-wide
+    /// `SetOrientation` would land in a slot the group path never reads.
+    fn peer_orientation_control(&self, peer: &Jid, orientation: u8) -> VideoControl {
+        if self.is_group_call {
+            VideoControl::SetParticipantOrientation {
+                participant: peer.clone(),
+                orientation,
+            }
+        } else {
+            VideoControl::SetOrientation(orientation)
+        }
     }
 
     fn group_mut(&mut self) -> &mut GroupCallState {
@@ -1451,7 +1472,9 @@ impl CallRegistry {
             // has one, and it then outlives every negotiation rebuild.
             self_video_orientation: 0,
             // Seeded from the offer, drained by `set_video_channels`.
-            peer_video_orientation: session.peer_video_orientation,
+            peer_video_orientation: session
+                .peer_video_orientation
+                .map(|orientation| (session.call_creator.clone(), orientation)),
             session,
             media_task: None,
             waiting_room_task: None,
@@ -1781,8 +1804,8 @@ impl CallRegistry {
             // Before the sender is published, so the rotation the offer
             // announced is the first thing the drive loop reads rather than
             // racing the first inbound frame.
-            if let Some(orientation) = entry.peer_video_orientation.take() {
-                video_ctl_tx.send(VideoControl::SetOrientation(orientation));
+            if let Some((peer, orientation)) = entry.peer_video_orientation.take() {
+                video_ctl_tx.send(entry.peer_orientation_control(&peer, orientation));
             }
             entry.video_ctl_tx = Some(video_ctl_tx);
             entry.video_teardown = Some(video_teardown);
@@ -1806,26 +1829,41 @@ impl CallRegistry {
         &self,
         call_id: &str,
         generation: u64,
+        peer: &Jid,
         orientation: u8,
     ) -> bool {
         if orientation > 3 {
             return false;
         }
-        self.active_calls()
+        let mut calls = self.active_calls();
+        let Some(entry) = calls
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
-            .map(|entry| {
-                let sent = entry
-                    .video_ctl_tx
-                    .as_ref()
-                    .is_some_and(|tx| tx.send(VideoControl::SetOrientation(orientation)));
-                if !sent {
-                    // No plane yet, or the attached one is already gone: hold it
-                    // for whichever `set_video_channels` comes next.
-                    entry.peer_video_orientation = Some(orientation);
-                }
-            })
-            .is_some()
+        else {
+            return false;
+        };
+        // A 1:1 call has one inbound stream, keyed to whichever callee device won
+        // the answer race. A late sibling's `<accept>` announces a camera whose
+        // frames never arrive, so letting it through would stamp the winner's
+        // picture with a rotation nobody sent. A group call has no such race: each
+        // announcer owns its own slot.
+        if !entry.is_group_call
+            && let Some(answering) = entry.session.answering_device.as_ref()
+            && answering != peer
+        {
+            return false;
+        }
+        let control = entry.peer_orientation_control(peer, orientation);
+        let sent = entry
+            .video_ctl_tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(control));
+        if !sent {
+            // No plane yet, or the attached one is already gone: hold it
+            // for whichever `set_video_channels` comes next.
+            entry.peer_video_orientation = Some((peer.clone(), orientation));
+        }
+        true
     }
 
     /// Attach the group-media control sender for this call generation.
@@ -4902,32 +4940,79 @@ mod tests {
     fn peer_orientation_waits_for_a_plane_and_goes_straight_through_once_there_is_one() {
         let reg = CallRegistry::new();
         let generation = reg.insert(session("CID"));
+        let peer = Jid::new("222222222222222", Server::Lid).with_device(3);
         let (event_tx, _event_rx) = async_channel::bounded(1);
         let (ctl_tx, ctl_rx) = video_control_channel();
 
-        assert!(reg.set_peer_video_orientation("CID", generation, 3));
+        assert!(reg.set_peer_video_orientation("CID", generation, &peer, 3));
         assert!(
             ctl_rx.try_recv().is_err(),
             "no plane yet, so nothing to send it to"
         );
         assert!(
-            !reg.set_peer_video_orientation("CID", generation, 4),
+            !reg.set_peer_video_orientation("CID", generation, &peer, 4),
             "out of range is not announced, never folded"
         );
 
         reg.set_video_channels("CID", generation, event_tx, ctl_tx, Box::new(|| {}));
         assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
 
-        assert!(reg.set_peer_video_orientation("CID", generation, 1));
+        reg.set_answering_device("CID", peer.clone());
+        assert!(reg.set_peer_video_orientation("CID", generation, &peer, 1));
         assert_eq!(
             ctl_rx.try_recv(),
             Ok(VideoControl::SetOrientation(1)),
             "the accept's rotation reaches the attached plane, not a pending slot"
         );
 
+        let sibling = Jid::new("222222222222222", Server::Lid).with_device(9);
+        assert!(!reg.set_peer_video_orientation("CID", generation, &sibling, 2));
+        assert!(
+            ctl_rx.try_recv().is_err(),
+            "a device that lost the answer race must not rotate the winner's picture"
+        );
+
         let newer = reg.insert(session("CID"));
-        assert!(!reg.set_peer_video_orientation("CID", generation, 2));
-        assert!(reg.set_peer_video_orientation("CID", newer, 2));
+        assert!(!reg.set_peer_video_orientation("CID", generation, &peer, 2));
+        assert!(reg.set_peer_video_orientation("CID", newer, &peer, 2));
+    }
+
+    /// A group call stamps each frame from a per-participant map, so the
+    /// plane-wide control would land where the group path never looks.
+    #[test]
+    fn a_group_call_routes_the_peers_rotation_to_its_participant_slot() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let mut session =
+            CallSession::new_incoming("GID", Jid::new("GID", Server::Call), creator.clone());
+        session.peer_video_orientation = Some(2);
+        session.group = Some(group_update(1));
+        let generation = reg.insert(session);
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant: creator,
+                orientation: 2,
+            }),
+            "the offerer's rotation belongs to the offerer's slot"
+        );
+
+        // No answer race to lose in a group call: every participant announces
+        // for itself.
+        let joiner = Jid::new("333333333333333", Server::Lid).with_device(2);
+        reg.set_answering_device("GID", Jid::new("444444444444444", Server::Lid));
+        assert!(reg.set_peer_video_orientation("GID", generation, &joiner, 1));
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant: joiner,
+                orientation: 1,
+            })
+        );
     }
 
     #[test]
