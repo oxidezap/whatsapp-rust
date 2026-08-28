@@ -758,6 +758,7 @@ fn observe_group_codec_content(
     group: &mut GroupEngineState,
     participant: &crate::voip::group_media::ParticipantMedia,
     format: AudioFormat,
+    classified: AudioCodec,
 ) -> Option<AudioCodec> {
     let span = group
         .audio_reception
@@ -769,7 +770,14 @@ fn observe_group_codec_content(
         .or_default()
         .observe(
             &participant.payload,
-            AudioCodec::Mlow,
+            // The packet's OWN classification, never a hard-coded MLOW. The probe abstains unless
+            // the grammar in force is MLow, and that guard is the only thing standing between it
+            // and a valid escape: an escape's payload IS an Opus packet, so at the negotiated
+            // cadence it agrees with itself, and the probe would promote the participant and then
+            // hand the sink a rewritten TOC labelled native Opus -- undecodable, for the rest of
+            // the call. The direct path is safe because its active codec is call-wide; in a group
+            // the escape is per packet, so the per-packet answer is what the guard needs.
+            classified,
             span,
             format.rtp_clock_rate,
             format.rtp_timestamp_step,
@@ -3067,7 +3075,7 @@ impl CallEngine {
             let (codec, frame_format) = if promoted {
                 (codec, frame_format)
             } else {
-                match observe_group_codec_content(group, &participant, audio.format) {
+                match observe_group_codec_content(group, &participant, audio.format, codec) {
                     Some(verdict) => (
                         verdict,
                         audio.format.sibling_for(verdict).unwrap_or(audio.format),
@@ -3193,7 +3201,7 @@ impl CallEngine {
                 // installed and idle.
                 let mut pcm = pcm;
                 if report.decoded == 0
-                    && observe_group_codec_content(group, &participant, audio.format)
+                    && observe_group_codec_content(group, &participant, audio.format, codec)
                         == Some(AudioCodec::Opus)
                 {
                     // Whatever this decoder built out of the other codec's bytes is not a starting
@@ -7590,6 +7598,110 @@ mod tests {
             AudioFormat::OPUS_16KHZ_60MS,
             "and native Opus must not be described by the container it is not in"
         );
+    }
+
+    // Promoting an escape would be a disaster -- the sink would get a rewritten TOC labelled native
+    // Opus and could not decode that participant again -- and two independent things prevent it.
+    //
+    // The one this asserts is local: the probe is asked about the packet's OWN classification, and
+    // an escape already answers Opus, so there is nothing to corroborate and it abstains.
+    //
+    // The other is arithmetic, and is why this test passes even with that argument reverted: an
+    // escape's low TOC bit means "multiple frames", not an Opus frame count, so read as Opus it is
+    // code 0 or code 1 -- one or two frames. The escape's configs are all CELT (2.5/5/10/20 ms), so
+    // the most it can claim is 40 ms, and it can never total the 960 samples the probe requires.
+    // Depending on that is depending on a coincidence between two modules; the classification makes
+    // the guarantee local, which is why the change stands on its own.
+    // A valid MLOW escape is an Opus packet with one byte rewritten, so at the negotiated cadence
+    // it agrees with itself and satisfies the probe. Promoting on that evidence relabels a payload
+    // whose TOC IS rewritten as native Opus, and the sink cannot decode that participant for the
+    // rest of the call -- the probe turned a working stream into a broken one. The packet's own
+    // classification is what stops it: it already says Opus, so there is nothing to corroborate.
+    #[test]
+    fn diag_escape_shapes() {
+        for (config, code, frames, nbody) in [
+            (24u8, 3u8, 3u8, 60usize),
+            (25, 3, 3, 60),
+            (26, 3, 3, 60),
+            (27, 3, 3, 60),
+            (28, 3, 3, 60),
+            (29, 3, 3, 60),
+            (30, 3, 3, 60),
+            (31, 3, 3, 60),
+            (24, 3, 6, 60),
+            (25, 3, 6, 60),
+            (26, 3, 2, 60),
+            (27, 3, 2, 60),
+        ] {
+            let mut p: Vec<u8> = vec![config << 3 | code, frames];
+            p.extend(core::iter::repeat_n(0x11u8, nbody));
+            let before = p.clone();
+            if crate::voip::audio::packetize_opus_for_mlow(&mut p).is_err() {
+                continue;
+            }
+            let shape = crate::voip::opus_packet_shape(&p);
+            let total = shape.and_then(|s| s.total_samples(16_000));
+            eprintln!(
+                "cfg={config} code={code} frames={frames} rfc_toc={:#04x} escape_toc={:#04x} total_at_16k={total:?}",
+                before[0], p[0]
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_group_escape_is_never_promoted_to_native_opus() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).expect("engine");
+        let update = group_update("audio");
+        eng.configure_group(GroupEngineConfig {
+            call_creator: update.call_creator.clone(),
+            self_jid: SELF_LID.parse().expect("self JID"),
+            initial_update: update,
+            direct_peer: None,
+        })
+        .expect("configure group");
+        let epoch = [0x42; 32];
+        assert_eq!(
+            eng.apply_group_raw_epoch(7, &epoch).expect("install epoch"),
+            GroupEpochApply::Installed
+        );
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        // A genuine escape, built by the function that writes them: an RFC code-3 CELT packet of
+        // three 20ms frames -- 60ms, the negotiated cadence, which is what makes it agree.
+        let mut escape: Vec<u8> = vec![0xC3, 0x03];
+        escape.extend(core::iter::repeat_n(0x11u8, 60));
+        crate::voip::audio::packetize_opus_for_mlow(&mut escape).expect("a valid escape");
+        assert_eq!(escape[0] & 0xC0, 0xC0, "the fixture really is an escape");
+
+        let mut peer = group_peer_audio(&epoch);
+        let mut delivered = Vec::new();
+        for n in 0..8u64 {
+            let packet = peer.protect_audio(&escape);
+            eng.handle_input(100 + n * 60, Input::RelayPacket(&packet));
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                if let Output::EncodedAudio(frame) = output {
+                    delivered.push((frame.codec, frame.format, frame.data.clone()));
+                }
+            }
+        }
+
+        assert_eq!(delivered.len(), 8);
+        for (codec, format, data) in &delivered {
+            assert_eq!(*codec, AudioCodec::Opus, "an escape carries Opus");
+            assert_eq!(
+                *format,
+                AudioFormat::MLOW_16KHZ_60MS,
+                "but in MLOW's container, which is what the sink needs to know to undo it"
+            );
+            assert_eq!(data.as_ref(), escape.as_slice(), "delivered unchanged");
+        }
     }
 
     #[test]
