@@ -2873,8 +2873,10 @@ impl CallEngine {
             };
             // Counted where the engine hands the frame over, which is the last point it can see. A
             // sink that refuses it is reported separately, through `note_audio_sink_dropped`.
-            self.media_stats.audio_frames_delivered =
-                self.media_stats.audio_frames_delivered.saturating_add(1);
+            // Both of these, for one reason: `audio_produced()` sums `audio_frames_delivered`, so
+            // counting a failed tag's ciphertext there reports it as produced audio in the public
+            // statistics even once the watchdog stops believing it. The frame IS handed over -- the
+            // encoded API promises that -- and `sframe_decrypt_failed` is the counter that says so.
             // Not for bytes whose tag did not authenticate. Handing them over is the encoded API's
             // contract, but they are not codec plaintext and calling them produced audio keeps
             // `window_produced` nonzero through a run of failures -- so `AudioSilent` never fires
@@ -2882,6 +2884,8 @@ impl CallEngine {
             // reached. The sink still gets the bytes; the watchdog just stops being told they are
             // audio.
             if !unauthenticated {
+                self.media_stats.audio_frames_delivered =
+                    self.media_stats.audio_frames_delivered.saturating_add(1);
                 self.health.on_audio_produced();
             }
             self.outbox
@@ -8635,6 +8639,15 @@ mod tests {
         assert!(
             reasons.contains(&AudioSilenceReason::AuthenticationFailing),
             "the alarm has to name authentication, got {reasons:?}"
+        );
+        // And the PUBLIC statistics have to agree with the watchdog. `audio_produced()` sums
+        // `audio_frames_delivered`, so counting the ciphertext there reported 161 frames of produced
+        // audio for a call that produced one -- the watchdog disbelieving the frames while the
+        // number a consumer reads still vouched for them.
+        assert_eq!(
+            eng.media_stats().audio_produced(),
+            1,
+            "only the frame that authenticated was audio"
         );
     }
 

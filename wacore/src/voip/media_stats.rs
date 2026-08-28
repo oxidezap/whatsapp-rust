@@ -414,7 +414,11 @@ fn dominant_reason(stats: &CallMediaStats) -> AudioSilenceReason {
     if stats.audio_frames_without_decoder > 0 {
         return AudioSilenceReason::NoDecoderForNegotiatedCodec;
     }
-    if stats.rtp_received == 0 && stats.srtp_unprotect_failed > 0 {
+    // Dominance, not unanimity, which is what this function is named for. Requiring every packet in
+    // the window to fail meant one that authenticated -- and was then concealed like any other
+    // undecodable frame -- handed the blame to the codec, for a window whose real problem is tags.
+    // A minority of failed tags on an otherwise healthy call still does not rename the reason.
+    if stats.srtp_unprotect_failed > stats.rtp_received {
         return AudioSilenceReason::AuthenticationFailing;
     }
     // SRTP authenticating and SFrame not is still an authentication failure, and the counter names
@@ -654,6 +658,37 @@ mod tests {
             dominant_reason,
             AudioSilenceReason::AuthenticationFailing,
             "the reason must describe this window, not the concealment two windows ago"
+        );
+    }
+
+    // Requiring EVERY packet in the window to fail meant one that authenticated -- and was then
+    // concealed like any other undecodable frame -- handed the blame to the codec, for a window
+    // whose real problem is tags. Dominance is what this function is named for.
+    #[test]
+    fn one_authenticated_packet_does_not_make_a_window_of_failing_tags_a_codec_fault() {
+        let mostly_failing = CallMediaStats {
+            rtp_received: 1,
+            srtp_unprotect_failed: 40,
+            audio_frames_concealed: 1,
+            ..CallMediaStats::default()
+        };
+        assert_eq!(
+            dominant_reason(&mostly_failing),
+            AudioSilenceReason::AuthenticationFailing,
+            "40 failed tags against one success is an authentication problem"
+        );
+
+        // And the converse still holds: a minority of failed tags does not rename a codec fault.
+        let mostly_fine = CallMediaStats {
+            rtp_received: 40,
+            srtp_unprotect_failed: 1,
+            audio_frames_concealed: 40,
+            ..CallMediaStats::default()
+        };
+        assert_eq!(
+            dominant_reason(&mostly_fine),
+            AudioSilenceReason::CodecRejectingFrames,
+            "one bad tag on an otherwise authenticating stream explains nothing"
         );
     }
 
