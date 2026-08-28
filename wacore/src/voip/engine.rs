@@ -2950,10 +2950,20 @@ impl CallEngine {
         };
         #[cfg(feature = "voip-mlow")]
         {
-            self.media_stats.audio_frames_decoded = self
-                .media_stats
-                .audio_frames_decoded
-                .saturating_add(u32::from(decode_report.decoded));
+            // Not for bytes whose tag did not authenticate, matching the gate the encoded path puts
+            // on `audio_frames_delivered` and the watchdog credit below: `audio_produced()` sums
+            // all three, so an ungated one lets the public snapshot vouch for frames the watchdog
+            // has already stopped believing. Unlike its two siblings this one is a contract kept
+            // rather than a leak observed -- measured over 7840 unauthenticated frames, MLow never
+            // once reported `decoded`, because what reaches it is the SFrame framing rather than a
+            // TOC and it answers off-point, SID or concealment. That is the decoder's behaviour,
+            // not this function's guarantee, so the gate states the guarantee here.
+            if !unauthenticated {
+                self.media_stats.audio_frames_decoded = self
+                    .media_stats
+                    .audio_frames_decoded
+                    .saturating_add(u32::from(decode_report.decoded));
+            }
             self.media_stats.audio_frames_concealed = self
                 .media_stats
                 .audio_frames_concealed
@@ -8778,6 +8788,11 @@ mod tests {
         let packet = peer_tx.protect_audio(&wrapped);
         eng.handle_input(1, Input::RelayPacket(&packet));
         let _ = drain(&mut eng);
+        // Whatever that one authenticated frame produced is the whole of the audio this call ever
+        // received. Taken as a baseline rather than pinned to a literal, because it depends on what
+        // the MLow decoder makes of the frame -- the claim under test is that the 160 that follow
+        // add nothing to it, not what this particular frame decodes to.
+        let produced_when_authenticated = eng.media_stats().audio_produced();
 
         let mut reasons = Vec::new();
         for n in 0..160u64 {
@@ -8811,6 +8826,17 @@ mod tests {
         assert!(
             reasons.contains(&AudioSilenceReason::AuthenticationFailing),
             "and the alarm has to fire and name authentication, got {reasons:?}"
+        );
+        // And the public snapshot has to agree with the watchdog: `audio_produced()` sums
+        // `audio_frames_decoded`, so an ungated increment would let a consumer's number climb
+        // through frames the watchdog above has already stopped believing. This assertion does not
+        // discriminate the gate today -- MLow answers off-point, SID or concealment for these
+        // frames and never `decoded` -- so it guards the engine's side of a contract whose other
+        // side is the decoder's behaviour. It is here to fail if that behaviour ever changes.
+        assert_eq!(
+            eng.media_stats().audio_produced(),
+            produced_when_authenticated,
+            "not one of the 160 unauthenticated frames may count as produced audio"
         );
     }
 
