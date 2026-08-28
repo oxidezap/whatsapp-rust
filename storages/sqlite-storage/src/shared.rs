@@ -87,7 +87,7 @@ impl SharedSqlite {
             .acquire_owned()
             .await
             .map_err(|e| StoreError::Database(Box::new(e)))?;
-        tokio::task::spawn_blocking(move || {
+        crate::pool::spawn_blocking(move || {
             let _permit = permit;
             let mut conn = pool
                 .get()

@@ -2,7 +2,7 @@ use crate::schema::*;
 use async_trait::async_trait;
 use bytes::Bytes;
 use diesel::prelude::*;
-use diesel::r2d2::{ConnectionManager, Pool};
+use diesel::r2d2::ConnectionManager;
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use diesel::sqlite::SqliteConnection;
 use diesel::upsert::excluded;
@@ -51,7 +51,7 @@ fn is_retriable_sqlite_error(error: &DieselError) -> bool {
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
-pub(crate) type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;
+pub(crate) type SqlitePool = crate::pool::Pool;
 
 /// Row representation for the `device` table.
 ///
@@ -434,25 +434,6 @@ fn is_shared_cache(database_url: &str) -> bool {
         .is_some_and(|(_, value)| value.eq_ignore_ascii_case("shared"))
 }
 
-/// One `ScheduledThreadPool` shared by EVERY store's r2d2 pool. By default r2d2 spawns its
-/// own pool of management threads (connection reaping/creation) per `Pool` — and with one
-/// `SqliteStore` per WhatsApp session that is ~3 idle threads PER SESSION (hundreds of
-/// threads on a busy worker, plus their stacks). Those threads only do infrequent
-/// connection housekeeping, so a single small shared pool serves all stores.
-fn shared_r2d2_thread_pool() -> Arc<scheduled_thread_pool::ScheduledThreadPool> {
-    static POOL: std::sync::OnceLock<Arc<scheduled_thread_pool::ScheduledThreadPool>> =
-        std::sync::OnceLock::new();
-    POOL.get_or_init(|| {
-        Arc::new(
-            scheduled_thread_pool::ScheduledThreadPool::builder()
-                .num_threads(2)
-                .thread_name_pattern("r2d2-shared-{}")
-                .build(),
-        )
-    })
-    .clone()
-}
-
 impl SqliteStore {
     /// Open a store with the default low-memory [`SqliteStoreConfig`].
     pub async fn new(database_url: &str) -> std::result::Result<Self, StoreError> {
@@ -495,8 +476,12 @@ impl SqliteStore {
         // concurrency keeps the two in step.
         let pool_size = config.pool_size.max(1);
         let read_pool_size = config.read_pool_size;
-        let thread_pool = config.thread_pool.unwrap_or_else(shared_r2d2_thread_pool);
-        let read_thread_pool = Arc::clone(&thread_pool);
+        // Left as the `Option` the embedder gave, and resolved inside
+        // `pool::builder` — creating the shared management pool here would
+        // spawn threads on a platform that has none, which is a panic before
+        // the first connection is even opened.
+        let thread_pool = config.thread_pool;
+        let read_thread_pool = thread_pool.clone();
 
         let options = ConnectionOptions {
             cache_size_kib: config.cache_size_kib,
@@ -522,16 +507,15 @@ impl SqliteStore {
         // pool AND run migrations inside one blocking task to keep the async runtime
         // unblocked (matters when many stores open at once).
         let db_url = database_url.to_string();
-        let (pool, journal_mode) = tokio::task::spawn_blocking(
+        let (pool, journal_mode) = crate::pool::spawn_blocking(
             move || -> std::result::Result<(SqlitePool, String), StoreError> {
                 // test_on_check_out(false): a local SQLite file connection doesn't
                 // spontaneously drop, so r2d2's per-checkout SELECT 1 liveness probe guards
                 // nothing — a real failure surfaces on the next query. The shared thread pool
-                // avoids r2d2's per-pool management threads (see shared_r2d2_thread_pool).
-                let pool = Pool::builder()
+                // avoids r2d2's per-pool management threads (see `pool::builder`).
+                let pool = crate::pool::builder(thread_pool)
                     .max_size(pool_size)
                     .test_on_check_out(false)
-                    .thread_pool(thread_pool)
                     .connection_customizer(Box::new(options))
                     .build(manager)
                     .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -548,11 +532,15 @@ impl SqliteStore {
                     journal_mode: String,
                 }
                 let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL;")
-                    .get_result::<JournalMode>(&mut conn)
+                    .get_result::<JournalMode>(&mut *conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?
                     .journal_mode;
                 conn.run_pending_migrations(MIGRATIONS)
                     .map_err(StoreError::Migration)?;
+                // Returned to the pool before the pool is: on the web the
+                // checkout is the only connection there is, and a pool moved
+                // out from under a live one would not compile there.
+                drop(conn);
 
                 Ok((pool, journal_mode))
             },
@@ -570,7 +558,12 @@ impl SqliteStore {
         // read snapshot has open fails with SQLITE_LOCKED_SHAREDCACHE — which
         // the busy handler does not retry, so `busy_timeout` cannot absorb it.
         let shared_cache = is_shared_cache(&db_url);
-        let declined = if !wal {
+        let declined = if cfg!(target_family = "wasm") {
+            // A reader pool is a second connection, and on the web there is no
+            // such thing: the pool holds the one handle the VFS will give out
+            // for that origin-private file (see `pool`'s web module).
+            Some("the web build has a single connection per database".to_string())
+        } else if !wal {
             Some(format!("journal_mode is '{journal_mode}', not WAL"))
         } else if shared_cache {
             Some("the URI opts into shared cache, whose table locks block the writer".to_string())
@@ -584,12 +577,11 @@ impl SqliteStore {
         }
         let reads = if read_pool_size > 0 && declined.is_none() {
             let manager = ConnectionManager::<SqliteConnection>::new(&db_url);
-            let pool = tokio::task::spawn_blocking(
+            let pool = crate::pool::spawn_blocking(
                 move || -> std::result::Result<SqlitePool, StoreError> {
-                    Pool::builder()
+                    crate::pool::builder(read_thread_pool)
                         .max_size(read_pool_size)
                         .test_on_check_out(false)
-                        .thread_pool(read_thread_pool)
                         .connection_customizer(Box::new(read_options))
                         .build(manager)
                         .map_err(|e| StoreError::Connection(Box::new(e)))
@@ -744,7 +736,7 @@ impl SqliteStore {
             None
         };
         let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::pool::spawn_blocking(move || {
             let _permit = permit;
             let mut conn = pool
                 .get()
@@ -775,7 +767,7 @@ impl SqliteStore {
             .acquire_owned()
             .await
             .map_err(|e| StoreError::Database(Box::new(e)))?;
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::pool::spawn_blocking(move || {
             let res = f();
             drop(permit);
             res
@@ -809,7 +801,7 @@ impl SqliteStore {
             let op = make_op();
 
             let result =
-                tokio::task::spawn_blocking(move || -> std::result::Result<T, DieselOrStore> {
+                crate::pool::spawn_blocking(move || -> std::result::Result<T, DieselOrStore> {
                     let _permit = permit;
                     let mut conn = pool
                         .get()
@@ -1246,7 +1238,7 @@ impl SqliteStore {
             let key_clone = key_vec.clone();
 
             let result =
-                tokio::task::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
+                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
                     let mut conn = pool_clone
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
@@ -1259,7 +1251,7 @@ impl SqliteStore {
                         .on_conflict((identities::address, identities::device_id))
                         .do_update()
                         .set(identities::key.eq(&key_clone[..]))
-                        .execute(&mut conn)
+                        .execute(&mut *conn)
                         .map_err(DieselOrStore::Diesel)?;
                     Ok(())
                 })
@@ -1295,7 +1287,7 @@ impl SqliteStore {
         let pool = self.pool.clone();
         let address_owned = address.to_string();
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -1304,7 +1296,7 @@ impl SqliteStore {
                     .filter(identities::address.eq(address_owned))
                     .filter(identities::device_id.eq(device_id)),
             )
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -1378,7 +1370,7 @@ impl SqliteStore {
             let session_clone = session_vec.clone();
 
             let result =
-                tokio::task::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
+                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
                     let mut conn = pool_clone
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
@@ -1391,7 +1383,7 @@ impl SqliteStore {
                         .on_conflict((sessions::address, sessions::device_id))
                         .do_update()
                         .set(sessions::record.eq(&session_clone))
-                        .execute(&mut conn)
+                        .execute(&mut *conn)
                         .map_err(DieselOrStore::Diesel)?;
                     Ok(())
                 })
@@ -1427,7 +1419,7 @@ impl SqliteStore {
         let pool = self.pool.clone();
         let address_owned = address.to_string();
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -1436,7 +1428,7 @@ impl SqliteStore {
                     .filter(sessions::address.eq(address_owned))
                     .filter(sessions::device_id.eq(device_id)),
             )
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -1455,7 +1447,7 @@ impl SqliteStore {
         let pool = self.pool.clone();
         let address = address.to_string();
         let record_vec = record.to_vec();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -1468,7 +1460,7 @@ impl SqliteStore {
                 .on_conflict((sender_keys::address, sender_keys::device_id))
                 .do_update()
                 .set(sender_keys::record.eq(&record_vec))
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -1499,7 +1491,7 @@ impl SqliteStore {
     pub async fn delete_sender_key_for_device(&self, address: &str, device_id: i32) -> Result<()> {
         let pool = self.pool.clone();
         let address = address.to_string();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -1508,7 +1500,7 @@ impl SqliteStore {
                     .filter(sender_keys::address.eq(address))
                     .filter(sender_keys::device_id.eq(device_id)),
             )
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -1536,7 +1528,7 @@ impl SqliteStore {
                     .select(app_state_keys::key_data)
                     .filter(app_state_keys::key_id.eq(&key_id))
                     .filter(app_state_keys::device_id.eq(device_id))
-                    .first(&mut conn)
+                    .first(&mut *conn)
                     .optional()
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
                 Ok(res)
@@ -1572,7 +1564,7 @@ impl SqliteStore {
         let pool = self.pool.clone();
         let key_id = key_id.to_vec();
         let data = crate::wire::encode_app_state_sync_key(&key);
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -1585,7 +1577,7 @@ impl SqliteStore {
                 .on_conflict((app_state_keys::key_id, app_state_keys::device_id))
                 .do_update()
                 .set(app_state_keys::key_data.eq(&data))
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -1616,7 +1608,7 @@ impl SqliteStore {
                     .select((app_state_keys::key_id, app_state_keys::key_data))
                     .filter(app_state_keys::device_id.eq(device_id))
                     .order(app_state_keys::key_id.desc())
-                    .load(&mut conn)
+                    .load(&mut *conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
                 let res = candidates
                     .into_iter()
@@ -1959,7 +1951,7 @@ impl SignalStore for SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let conn = &mut conn;
+            let conn = &mut *conn;
             let has_session = diesel::select(diesel::dsl::exists(
                 sessions::table
                     .filter(sessions::device_id.eq(device_id))
@@ -2049,7 +2041,7 @@ impl SignalStore for SqliteStore {
             let record_clone = record.clone();
 
             let result =
-                tokio::task::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
+                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
                     let mut conn = pool_clone
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
@@ -2066,7 +2058,7 @@ impl SignalStore for SqliteStore {
                             prekeys::key.eq(&record_clone),
                             prekeys::uploaded.eq(uploaded),
                         ))
-                        .execute(&mut conn)
+                        .execute(&mut *conn)
                         .map_err(DieselOrStore::Diesel)?;
                     Ok(())
                 })
@@ -2115,7 +2107,7 @@ impl SignalStore for SqliteStore {
             let keys_clone = keys.clone();
 
             let result =
-                tokio::task::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
+                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
                     let mut conn = pool_clone
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
@@ -2222,7 +2214,7 @@ impl SignalStore for SqliteStore {
             let pool_clone = pool.clone();
 
             let result =
-                tokio::task::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
+                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
                     let mut conn = pool_clone
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
@@ -2231,7 +2223,7 @@ impl SignalStore for SqliteStore {
                             .filter(prekeys::id.eq(id as i32))
                             .filter(prekeys::device_id.eq(device_id)),
                     )
-                    .execute(&mut conn)
+                    .execute(&mut *conn)
                     .map_err(DieselOrStore::Diesel)?;
                     Ok(())
                 })
@@ -2318,7 +2310,7 @@ impl SignalStore for SqliteStore {
             let record_clone = record.clone();
 
             let result =
-                tokio::task::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
+                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
                     let mut conn = pool_clone
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
@@ -2331,7 +2323,7 @@ impl SignalStore for SqliteStore {
                         .on_conflict((signed_prekeys::id, signed_prekeys::device_id))
                         .do_update()
                         .set(signed_prekeys::record.eq(&record_clone))
-                        .execute(&mut conn)
+                        .execute(&mut *conn)
                         .map_err(DieselOrStore::Diesel)?;
                     Ok(())
                 })
@@ -2405,7 +2397,7 @@ impl SignalStore for SqliteStore {
             let pool_clone = pool.clone();
 
             let result =
-                tokio::task::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
+                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
                     let mut conn = pool_clone
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
@@ -2414,7 +2406,7 @@ impl SignalStore for SqliteStore {
                             .filter(signed_prekeys::id.eq(id as i32))
                             .filter(signed_prekeys::device_id.eq(device_id)),
                     )
-                    .execute(&mut conn)
+                    .execute(&mut *conn)
                     .map_err(DieselOrStore::Diesel)?;
                     Ok(())
                 })
@@ -2620,7 +2612,7 @@ impl ProtocolStore for SqliteStore {
                 .select((sender_key_devices::device_jid, sender_key_devices::has_key))
                 .filter(sender_key_devices::group_jid.eq(&group_jid))
                 .filter(sender_key_devices::device_id.eq(device_id))
-                .load(&mut conn)
+                .load(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(rows
                 .into_iter()
@@ -2765,7 +2757,7 @@ impl ProtocolStore for SqliteStore {
                 ))
                 .filter(lid_pn_mapping::lid.eq(&lid))
                 .filter(lid_pn_mapping::device_id.eq(device_id))
-                .first(&mut conn)
+                .first(&mut *conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(row.map(
@@ -2801,7 +2793,7 @@ impl ProtocolStore for SqliteStore {
                 .filter(lid_pn_mapping::phone_number.eq(&phone))
                 .filter(lid_pn_mapping::device_id.eq(device_id))
                 .order(lid_pn_mapping::updated_at.desc())
-                .first(&mut conn)
+                .first(&mut *conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(row.map(
@@ -2881,7 +2873,7 @@ impl ProtocolStore for SqliteStore {
                     lid_pn_mapping::updated_at,
                 ))
                 .filter(lid_pn_mapping::device_id.eq(device_id))
-                .load(&mut conn)
+                .load(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(rows
                 .into_iter()
@@ -2908,7 +2900,7 @@ impl ProtocolStore for SqliteStore {
         let message_id = message_id.to_string();
         let base_key = base_key.to_vec();
         let now = wacore::time::now_secs() as i32;
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -2927,7 +2919,7 @@ impl ProtocolStore for SqliteStore {
                 ))
                 .do_update()
                 .set(base_keys::base_key.eq(&base_key))
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -2965,7 +2957,7 @@ impl ProtocolStore for SqliteStore {
         let device_id = self.device_id;
         let address = address.to_string();
         let message_id = message_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -2975,7 +2967,7 @@ impl ProtocolStore for SqliteStore {
                     .filter(base_keys::message_id.eq(&message_id))
                     .filter(base_keys::device_id.eq(device_id)),
             )
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -2990,7 +2982,7 @@ impl ProtocolStore for SqliteStore {
         let devices_json = serde_json::to_string(&*record.devices)
             .map_err(|e| StoreError::Serialization(Box::new(e)))?;
         let now = wacore::time::now_secs() as i32;
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3014,7 +3006,7 @@ impl ProtocolStore for SqliteStore {
                     device_registry::updated_at.eq(now),
                     device_registry::raw_id.eq(raw_id_i32),
                 ))
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -3114,7 +3106,7 @@ impl ProtocolStore for SqliteStore {
                     ))
                     .filter(device_registry::user_id.eq(&user))
                     .filter(device_registry::device_id.eq(device_id))
-                    .first(&mut conn)
+                    .first(&mut *conn)
                     .optional()
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
             match row {
@@ -3142,7 +3134,7 @@ impl ProtocolStore for SqliteStore {
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let user = user.to_string();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3151,7 +3143,7 @@ impl ProtocolStore for SqliteStore {
                     .filter(device_registry::user_id.eq(&user))
                     .filter(device_registry::device_id.eq(device_id)),
             )
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -3182,7 +3174,7 @@ impl ProtocolStore for SqliteStore {
         let group_jid = group_jid.to_string();
         let blob = blob.to_vec();
         let now = wacore::time::now_secs();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3199,7 +3191,7 @@ impl ProtocolStore for SqliteStore {
                     group_metadata::info.eq(&blob),
                     group_metadata::updated_at.eq(now),
                 ))
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -3212,7 +3204,7 @@ impl ProtocolStore for SqliteStore {
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let group_jid = group_jid.to_string();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3221,7 +3213,7 @@ impl ProtocolStore for SqliteStore {
                     .filter(group_metadata::group_jid.eq(&group_jid))
                     .filter(group_metadata::device_id.eq(device_id)),
             )
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -3251,7 +3243,7 @@ impl ProtocolStore for SqliteStore {
                 ))
                 .filter(tc_tokens::jid.eq(&jid))
                 .filter(tc_tokens::device_id.eq(device_id))
-                .first(&mut conn)
+                .first(&mut *conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(
@@ -3271,7 +3263,7 @@ impl ProtocolStore for SqliteStore {
         let jid = jid.to_string();
         let entry = entry.clone();
         let now = wacore::time::now_secs();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3292,7 +3284,7 @@ impl ProtocolStore for SqliteStore {
                     tc_tokens::sender_timestamp.eq(entry.sender_timestamp),
                     tc_tokens::updated_at.eq(now),
                 ))
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -3305,7 +3297,7 @@ impl ProtocolStore for SqliteStore {
         let pool = self.pool.clone();
         let device_id = self.device_id;
         let jid = jid.to_string();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3314,7 +3306,7 @@ impl ProtocolStore for SqliteStore {
                     .filter(tc_tokens::jid.eq(&jid))
                     .filter(tc_tokens::device_id.eq(device_id)),
             )
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -3339,7 +3331,7 @@ impl ProtocolStore for SqliteStore {
     async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
-        tokio::task::spawn_blocking(move || -> Result<u32> {
+        crate::pool::spawn_blocking(move || -> Result<u32> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3361,7 +3353,7 @@ impl ProtocolStore for SqliteStore {
                     )
                     .filter(tc_tokens::device_id.eq(device_id)),
             )
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(deleted as u32)
         })
@@ -3435,7 +3427,7 @@ impl ProtocolStore for SqliteStore {
         let device_id = self.device_id;
         let jid = jid.to_string();
         let now = wacore::time::now_secs();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3468,7 +3460,7 @@ impl ProtocolStore for SqliteStore {
                     .sql(")")),
                     tc_tokens::updated_at.eq(now),
                 ))
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
@@ -3543,7 +3535,7 @@ impl ProtocolStore for SqliteStore {
     async fn delete_expired_sent_messages(&self, cutoff_timestamp: i64) -> Result<u32> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
-        tokio::task::spawn_blocking(move || -> Result<u32> {
+        crate::pool::spawn_blocking(move || -> Result<u32> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3552,7 +3544,7 @@ impl ProtocolStore for SqliteStore {
                     .filter(sent_messages::created_at.lt(cutoff_timestamp))
                     .filter(sent_messages::device_id.eq(device_id)),
             )
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(deleted as u32)
         })
@@ -3639,7 +3631,7 @@ impl ProtocolStore for SqliteStore {
     async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
-        tokio::task::spawn_blocking(move || -> Result<u32> {
+        crate::pool::spawn_blocking(move || -> Result<u32> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3648,7 +3640,7 @@ impl ProtocolStore for SqliteStore {
                     .filter(pending_inbound_messages::inserted_at.lt(cutoff_timestamp))
                     .filter(pending_inbound_messages::device_id.eq(device_id)),
             )
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(deleted as u32)
         })
@@ -3838,7 +3830,7 @@ impl MsgSecretStore for SqliteStore {
                 .filter(msg_secrets::sender.eq(&sender))
                 .filter(msg_secrets::msg_id.eq(&msg_id))
                 .filter(msg_secrets::device_id.eq(device_id))
-                .first(&mut conn)
+                .first(&mut *conn)
                 .optional()
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(row)
@@ -3929,7 +3921,7 @@ impl DeviceStore for SqliteStore {
         let db_path = self.database_path.clone();
         let extra_data = extra_content.map(|b| b.to_vec());
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        crate::pool::spawn_blocking(move || -> Result<()> {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
@@ -3944,7 +3936,7 @@ impl DeviceStore for SqliteStore {
             let query = format!("VACUUM INTO '{}'", target_path.replace("'", "''"));
 
             diesel::sql_query(query)
-                .execute(&mut conn)
+                .execute(&mut *conn)
                 .map_err(|e| StoreError::Database(Box::new(e)))?;
 
             // Save extra content if provided
@@ -3985,7 +3977,7 @@ impl DeviceStore for SqliteStore {
         // pool's, so a report that counted only one pool would under-state a
         // read-enabled store by the whole reader side.
         let read_pool = self.reads.as_ref().map(|reads| reads.pool.clone());
-        tokio::task::spawn_blocking(move || {
+        crate::pool::spawn_blocking(move || {
             // Non-blocking checkout: this report is best-effort, so contention
             // (e.g. a long write holding the only connection) degrades to "not
             // reported" immediately instead of blocking up to r2d2's connection
@@ -4147,10 +4139,10 @@ mod tests {
             "SELECT cs.cache_size AS cache, sy.synchronous AS sync \
              FROM pragma_cache_size cs, pragma_synchronous sy",
         )
-        .get_result(&mut conn)
+        .get_result(&mut *conn)
         .unwrap();
         let busy: Busy = diesel::sql_query("PRAGMA busy_timeout")
-            .get_result(&mut conn)
+            .get_result(&mut *conn)
             .unwrap();
         assert_eq!(cs.cache, -4096, "cache_size_kib applied as negative KiB");
         assert_eq!(cs.sync, 2, "synchronous = FULL");
@@ -4183,7 +4175,7 @@ mod tests {
             "SELECT sy.synchronous AS sync, ts.temp_store AS temp_store, cs.cache_size AS cache \
              FROM pragma_synchronous sy, pragma_temp_store ts, pragma_cache_size cs",
         )
-        .get_result(&mut conn)
+        .get_result(&mut *conn)
         .unwrap();
 
         // NORMAL is the chosen default because the store runs its file-backed
@@ -5817,7 +5809,7 @@ mod tests {
             }
             let mut conn = store.pool.get().unwrap();
             diesel::sql_query("PRAGMA mmap_size")
-                .get_result::<M>(&mut conn)
+                .get_result::<M>(&mut *conn)
                 .map(|m| m.mmap_size)
                 .unwrap_or(-1)
         };
@@ -6714,7 +6706,7 @@ mod read_routing_tests {
 impl SqliteStore {
     pub async fn get_something_new(&self) -> Result<()> {
         let pool = self.pool.clone();
-        tokio::task::spawn_blocking(move || Ok(())).await
+        crate::pool::spawn_blocking(move || Ok(())).await
     }
 
     async fn get_something_routed(&self) -> Result<()> {

@@ -56,6 +56,29 @@ jobs:
           cargo build -p whatsapp-rust --lib --release
           --target wasm32-unknown-unknown
           --no-default-features
+      # The SQLite store reaches wasm through `storages/sqlite-storage/src/pool.rs`,
+      # which swaps r2d2 and tokio's blocking pool for a single connection behind a
+      # lock. Both of those type-check on wasm and only fail when a thread is actually
+      # spawned, so this build cannot observe the regression it guards against — the
+      # grep step below is what does. This step guards the rest: a dependency or an API
+      # that does not exist on wasm at all.
+      - name: Build sqlite-storage for wasm32 (release)
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: >
+          cargo build -p whatsapp-rust-sqlite-storage --lib --release
+          --target wasm32-unknown-unknown
+          --no-default-features --features wacore/js
+      # r2d2's pool and tokio's `spawn_blocking` both panic on a page, and both
+      # compile there, so nothing but this check keeps them from creeping back into
+      # the store once the shim exists.
+      - name: Guard sqlite-storage's platform shim
+        run: |
+          if grep -rn --include='*.rs' -e 'tokio::task::spawn_blocking' -e 'r2d2::Pool' \
+              storages/sqlite-storage/src | grep -v '^storages/sqlite-storage/src/pool.rs:'; then
+            echo "::error::use crate::pool (spawn_blocking / Pool) instead; only pool.rs may name the native ones"
+            exit 1
+          fi
       # The sans-IO VoIP core (wacore::voip: the CallEngine, the portable run_call driver,
       # the RelayTransport seam, the MLow codec, SRTP/SFrame crypto) must stay wasm-buildable
       # so the WASM bridge can drive 1:1 calls. whatsapp-rust's `voip` feature compile-errors on
