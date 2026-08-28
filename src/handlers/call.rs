@@ -304,6 +304,25 @@ impl StanzaHandler for CallHandler {
                         }
                         return true;
                     }
+                    // The answering device's camera rotation, announced on the
+                    // `<accept>`'s `<video>` and nowhere else until it turns.
+                    // Held on the entry rather than sent as a control: on an
+                    // outgoing call the media plane does not exist yet, so a
+                    // control sent now would be dropped.
+                    #[cfg(feature = "voip-runtime")]
+                    if let CallAction::Accept {
+                        video_orientation: Some(orientation),
+                        ..
+                    } = &call.action
+                        && let Some(generation) =
+                            client.call_registry().generation_of(call.action.call_id())
+                    {
+                        client.call_registry().set_peer_video_orientation_pending(
+                            call.action.call_id(),
+                            generation,
+                            *orientation,
+                        );
+                    }
                     #[cfg(feature = "voip-runtime")]
                     if matches!(
                         &call.action,

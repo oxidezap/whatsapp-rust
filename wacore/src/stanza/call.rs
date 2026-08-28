@@ -210,6 +210,22 @@ pub fn find_relay<'a, 'b>(nr: &'b NodeRef<'a>) -> Option<&'b NodeRef<'a>> {
     nr.children().and_then(|cs| cs.iter().find_map(find_relay))
 }
 
+/// The `device_orientation` a `<video>` advertisement child carries, in quarter
+/// turns.
+///
+/// One definition for the offer and the accept, and deliberately the same
+/// filter the mid-call `<video>` parser applies: a value outside `0..=3` is a
+/// peer counting something other than quarter turns, and folding it into range
+/// would stamp every frame with a rotation nobody announced. `None` there means
+/// "not announced", which the caller already has to handle for a `<video>` that
+/// carries no rotation at all.
+fn parse_video_orientation(node: &NodeRef<'_>) -> Option<u8> {
+    node.attrs()
+        .optional_string("device_orientation")
+        .and_then(|s| s.parse::<u8>().ok())
+        .filter(|orientation| *orientation <= 3)
+}
+
 fn parse_audio_codec(node: &NodeRef<'_>) -> Result<CallAudioCodec> {
     let mut a = node.attrs();
     let enc = a
@@ -274,7 +290,9 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             attrs.finish().map_err(|e| anyhow!("<offer> attrs: {e}"))?;
 
             let children = node.children().unwrap_or_default();
-            let is_video = children.iter().any(|c| c.tag == "video");
+            let video = children.iter().find(|c| c.tag == "video");
+            let is_video = video.is_some();
+            let video_orientation = video.and_then(|v| parse_video_orientation(v));
             let audio = children
                 .iter()
                 .filter(|c| c.tag == "audio")
@@ -289,6 +307,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
                 device_class,
                 joinable,
                 is_video,
+                video_orientation,
                 audio,
                 group_jid,
             }
@@ -351,9 +370,12 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
         }
         CallActionTag::Accept => {
             attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
-            let audio = node
-                .children()
-                .unwrap_or_default()
+            let children = node.children().unwrap_or_default();
+            let video_orientation = children
+                .iter()
+                .find(|child| child.tag == "video")
+                .and_then(|child| parse_video_orientation(child));
+            let audio = children
                 .iter()
                 .filter(|child| child.tag == "audio")
                 .map(parse_audio_codec)
@@ -361,6 +383,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             CallAction::Accept {
                 call_id,
                 call_creator,
+                video_orientation,
                 audio,
             }
         }
@@ -1388,10 +1411,12 @@ mod tests {
                 device_class,
                 joinable,
                 is_video,
+                video_orientation,
                 audio,
                 group_jid,
             } => {
                 assert_eq!(call_id, "CALL-ID-0001");
+                assert_eq!(video_orientation, None, "this fixture carries no <video>");
                 assert_eq!(call_creator, fake_caller_lid());
                 assert_eq!(caller_pn, Some(fake_caller_pn()));
                 assert_eq!(caller_country_code.as_deref(), Some("BR"));
@@ -2562,6 +2587,110 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The rotation a video-from-start peer announces rides the `<offer>`'s and
+    /// `<accept>`'s `<video>` child, not only the mid-call `<video>` stanza.
+    /// Both were parsed for `is_video` alone, so a caller holding the phone
+    /// sideways had every frame stamped upright until they happened to turn it.
+    ///
+    /// The offer shape is the one a real Android client sent us; the accept
+    /// mirrors what we ourselves send.
+    #[test]
+    fn offer_and_accept_carry_the_peers_device_orientation() {
+        let offer = NodeBuilder::new("call")
+            .attr("from", "5511999990000@lid")
+            .attr("id", "STANZA-1")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("offer")
+                .attr("call-id", "CID")
+                .attr("call-creator", "5511999990000@lid")
+                .children([
+                    NodeBuilder::new("audio")
+                        .attr("rate", "16000")
+                        .attr("enc", "opus")
+                        .build(),
+                    NodeBuilder::new("video")
+                        .attr("screen_width", "1280")
+                        .attr("dec", "H264,H265,AV1")
+                        .attr("screen_height", "2772")
+                        .attr("device_orientation", "1")
+                        .attr("enc", "h.264")
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let parsed = parse_call_stanza(&offer.as_node_ref())
+            .expect("parse")
+            .expect("a call");
+        match parsed.action {
+            CallAction::Offer {
+                is_video,
+                video_orientation,
+                ..
+            } => {
+                assert!(is_video);
+                assert_eq!(video_orientation, Some(1));
+            }
+            other => panic!("expected an offer, got {other:?}"),
+        }
+
+        let accept = NodeBuilder::new("call")
+            .attr("from", "5511999990000:3@lid")
+            .attr("id", "STANZA-2")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("accept")
+                .attr("call-id", "CID")
+                .attr("call-creator", "5511999990000@lid")
+                .children([NodeBuilder::new("video")
+                    .attr("dec", "H264")
+                    .attr("device_orientation", "3")
+                    .build()])
+                .build()])
+            .build();
+        let parsed = parse_call_stanza(&accept.as_node_ref())
+            .expect("parse")
+            .expect("a call");
+        match parsed.action {
+            CallAction::Accept {
+                video_orientation, ..
+            } => assert_eq!(video_orientation, Some(3)),
+            other => panic!("expected an accept, got {other:?}"),
+        }
+    }
+
+    /// Out of range is "not announced", never a folded-in value: `4` is a peer
+    /// counting something other than quarter turns, and answering it with `0`
+    /// would stamp an upright picture that stays wrong for the whole call.
+    #[test]
+    fn an_out_of_range_offer_orientation_is_dropped_not_folded() {
+        let offer = NodeBuilder::new("call")
+            .attr("from", "5511999990000@lid")
+            .attr("id", "STANZA-3")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("offer")
+                .attr("call-id", "CID")
+                .attr("call-creator", "5511999990000@lid")
+                .children([NodeBuilder::new("video")
+                    .attr("dec", "H264")
+                    .attr("device_orientation", "4")
+                    .build()])
+                .build()])
+            .build();
+        let parsed = parse_call_stanza(&offer.as_node_ref())
+            .expect("parse")
+            .expect("a call");
+        match parsed.action {
+            CallAction::Offer {
+                is_video,
+                video_orientation,
+                ..
+            } => {
+                assert!(is_video, "the <video> child still means a video offer");
+                assert_eq!(video_orientation, None);
+            }
+            other => panic!("expected an offer, got {other:?}"),
+        }
     }
 
     #[test]

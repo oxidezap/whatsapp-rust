@@ -68,6 +68,11 @@ pub struct CallSession {
     pub answering_device: Option<Jid>,
     /// Initial group snapshot for a native group call or active-call invitation.
     pub group: Option<GroupCallUpdate>,
+    /// The rotation the peer announced on the `<offer>`'s `<video>` child, to be
+    /// applied once this call has a media plane. Rides the session for the same
+    /// reason [`Self::is_video`] does: both are facts the offer states and the
+    /// engine needs, and the engine does not exist when the offer is parsed.
+    pub peer_video_orientation: Option<u8>,
     phase: CallPhase,
 }
 
@@ -83,6 +88,7 @@ impl CallSession {
             ring_devices: Vec::new(),
             answering_device: None,
             group: None,
+            peer_video_orientation: None,
             phase: CallPhase::Idle,
         }
     }
@@ -98,6 +104,7 @@ impl CallSession {
             ring_devices: Vec::new(),
             answering_device: None,
             group: None,
+            peer_video_orientation: None,
             phase: CallPhase::Ringing,
         }
     }

@@ -271,6 +271,17 @@ struct CallEntry {
     /// has to survive all of them or the next `<video>` announces a camera that
     /// is not the one pointing at the user.
     self_video_orientation: u8,
+    /// The peer's rotation as announced on the `<offer>` or `<accept>`'s
+    /// `<video>` child, held until the media plane exists to receive it.
+    ///
+    /// A video-from-start peer announces its camera rotation once, in that
+    /// stanza, and sends no `<video>` of its own until the camera actually
+    /// turns. The control channel is attached with the drive loop, long after
+    /// the offer is parsed, so a rotation sent through it then goes nowhere —
+    /// which left every frame of a call from a sideways camera stamped upright.
+    /// `set_video_channels` drains this the moment there is somewhere to drain
+    /// it to.
+    peer_video_orientation: Option<u8>,
     /// Explicit group identity exists before the first authoritative roster arrives.
     is_group_call: bool,
     /// This generation originated from a reusable call-link join and may accept waiting-room state.
@@ -1426,6 +1437,8 @@ impl CallRegistry {
             // A fresh call starts upright; the app announces a rotation when it
             // has one, and it then outlives every negotiation rebuild.
             self_video_orientation: 0,
+            // Seeded from the offer, drained by `set_video_channels`.
+            peer_video_orientation: session.peer_video_orientation,
             session,
             media_task: None,
             waiting_room_task: None,
@@ -1752,9 +1765,36 @@ impl CallRegistry {
             && entry.generation == generation
         {
             entry.event_tx = Some(CallEventQueue::new(event_tx));
+            // Before the sender is published, so the rotation the offer
+            // announced is the first thing the drive loop reads rather than
+            // racing the first inbound frame.
+            if let Some(orientation) = entry.peer_video_orientation.take() {
+                video_ctl_tx.send(VideoControl::SetOrientation(orientation));
+            }
             entry.video_ctl_tx = Some(video_ctl_tx);
             entry.video_teardown = Some(video_teardown);
         }
+    }
+
+    /// Record the rotation a peer announced on its `<offer>` or `<accept>`, to
+    /// be applied when the media plane comes up. Rejects an out-of-range value
+    /// for the same reason [`Self::set_local_video_orientation`] does.
+    ///
+    /// `false` when the value is out of range or the call is gone.
+    pub fn set_peer_video_orientation_pending(
+        &self,
+        call_id: &str,
+        generation: u64,
+        orientation: u8,
+    ) -> bool {
+        if orientation > 3 {
+            return false;
+        }
+        self.active_calls()
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.peer_video_orientation = Some(orientation))
+            .is_some()
     }
 
     /// Attach the group-media control sender for this call generation.

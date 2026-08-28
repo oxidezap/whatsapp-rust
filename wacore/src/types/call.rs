@@ -148,6 +148,14 @@ pub enum CallAction {
         device_class: Option<String>,
         joinable: bool,
         is_video: bool,
+        /// The offerer's camera rotation at call start, from the `<video>`
+        /// child's `device_orientation`. `None` when the offer carried no
+        /// `<video>` or an out-of-range value.
+        ///
+        /// A video-from-start peer announces this once, in the offer, and sends
+        /// no further `<video>` until it actually turns — so dropping it leaves
+        /// every frame of a call from a rotated camera stamped upright.
+        video_orientation: Option<u8>,
         audio: Vec<CallAudioCodec>,
         /// Set on group calls. Primary group signal per `WAWebVoipGatingUtils`.
         group_jid: Option<Jid>,
@@ -173,6 +181,11 @@ pub enum CallAction {
     Accept {
         call_id: String,
         call_creator: Jid,
+        /// The answering device's camera rotation, from the `<video>` child's
+        /// `device_orientation`. Same contract as [`CallAction::Offer`]'s: the
+        /// callee of a video-from-start call announces it here and nowhere else
+        /// until it turns.
+        video_orientation: Option<u8>,
         audio: Vec<CallAudioCodec>,
     },
     #[wire = "reject"]
