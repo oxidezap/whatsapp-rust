@@ -1019,8 +1019,13 @@ async fn run_call_with_clock_and_wallclock(
                 }
                 Output::Event(ev) => {
                     let keyframe_request = matches!(ev, CallEvent::VideoKeyframeNeeded);
-                    if !publish_engine_event(&channels.events, ev) && keyframe_request {
-                        undelivered_keyframe_request = true;
+                    let delivered = publish_engine_event(&channels.events, ev);
+                    if keyframe_request {
+                        // Assigned, not just set: a request that lands retires
+                        // whatever an earlier refusal left outstanding, which by
+                        // then is a requirement the consumer has heard about or
+                        // one the encoder already satisfied on its own.
+                        undelivered_keyframe_request = !delivered;
                     }
                 }
                 Output::ReconnectRelay(endpoint) => {
@@ -1643,11 +1648,7 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 
-    /// The keyframe request is the one event that cannot be lost: the engine
-    /// latches `keyframe_required` before publishing it, so a request the
-    /// consumer never sees is never reissued while every delta the application
-    /// sends keeps being dropped. It is also not worth evicting anything for --
-    /// the next forced event would evict it right back -- so it waits instead.
+    /// A refused request survives without displacing what the queue holds.
     #[test]
     fn a_refused_keyframe_request_waits_rather_than_evicting_or_vanishing() {
         let (tx, rx) = async_channel::bounded(1);
@@ -1676,6 +1677,32 @@ mod tests {
         // Nothing to retry once it has landed.
         retry_keyframe_request(&tx, &mut outstanding);
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    /// The refusal is about one requirement. If the encoder satisfies that one
+    /// on its own and a later request lands, retrying the first would ask for a
+    /// keyframe nothing is waiting on.
+    #[test]
+    fn a_delivered_request_retires_an_earlier_refusal() {
+        let (tx, rx) = async_channel::bounded(1);
+        tx.try_send(CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        })
+        .expect("fills the queue");
+        let mut outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded);
+        assert!(outstanding);
+
+        let _ = rx.try_recv();
+        outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded);
+        assert!(!outstanding, "the later request landed, so nothing is owed");
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+
+        retry_keyframe_request(&tx, &mut outstanding);
+        assert_eq!(
+            rx.try_recv(),
+            Err(async_channel::TryRecvError::Empty),
+            "and no second copy follows it"
+        );
     }
 
     #[test]

@@ -2492,7 +2492,12 @@ impl CallEngine {
             // Everything here is discarded, an IDR included -- so a request the
             // application has already answered has to be made again once the
             // epoch installs, or the requirement outlives every request for it.
-            if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) {
+            // Only for an IDR: a delta was never an answer, so discarding one
+            // costs nothing that has to be asked for a second time.
+            if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut())
+                && video.keyframe_required
+                && au_has_idr(au)
+            {
                 video.keyframe_announced = false;
             }
             return;
@@ -3299,6 +3304,89 @@ mod encoded_tests {
             )),
             "the first video frame under a new group epoch must be an IDR"
         );
+    }
+
+    /// The gate discards deltas too, and a delta was never an answer to the
+    /// standing request. Treating one as if it were would ask a second time for
+    /// a requirement the application is already working on.
+    #[test]
+    fn a_gated_delta_does_not_re_ask_for_a_keyframe_already_requested() {
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let idr = [0, 0, 0, 1, 0x65, 1, 2, 3];
+        let delta = [0, 0, 0, 1, 0x41, 4, 5, 6];
+        engine.handle_input(1, Input::VideoFrame(&idr));
+        let _ = drain(&mut engine);
+
+        let mut expanded = group_update();
+        expanded.transaction_id = 8;
+        expanded.media = "video".to_string();
+        expanded.relay = Some(group_relay());
+        expanded.rekey_requested = true;
+        let participant = Jid::new("15550003333", Server::Lid);
+        expanded.participants.push(GroupCallParticipant {
+            jid: participant.clone(),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: participant,
+                platform: None,
+                pid: Some(3),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        assert_eq!(
+            engine.apply_group_update(3, &expanded).unwrap(),
+            GroupRosterApply::Applied
+        );
+        assert_eq!(
+            keyframe_requests(&drain(&mut engine)),
+            1,
+            "the rekey asks once for the IDR it needs"
+        );
+
+        // Only deltas arrive while the epoch is pending, and a delta was never
+        // an answer to that request.
+        engine.handle_input(4, Input::VideoFrame(&delta));
+        assert_eq!(keyframe_requests(&drain(&mut engine)), 0);
+        assert_eq!(
+            engine.apply_group_raw_epoch(8, &[0x48; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        assert_eq!(
+            keyframe_requests(&drain(&mut engine)),
+            0,
+            "the request already standing is not made a second time"
+        );
+
+        // Still owed, though: the plane keeps dropping until it arrives.
+        engine.handle_input(5, Input::VideoFrame(&delta));
+        assert!(drain(&mut engine).iter().all(|output| !matches!(
+            output,
+            Output::Transmit(packet)
+                if parse_rtp_header(packet)
+                    .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+        )));
+        engine.handle_input(6, Input::VideoFrame(&idr));
+        assert!(drain(&mut engine).iter().any(|output| matches!(
+            output,
+            Output::Transmit(packet)
+                if parse_rtp_header(packet)
+                    .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+        )));
+    }
+
+    fn keyframe_requests(outputs: &[Output]) -> usize {
+        outputs
+            .iter()
+            .filter(|output| matches!(output, Output::Event(CallEvent::VideoKeyframeNeeded)))
+            .count()
     }
 
     /// The keyframe an application produces for a rekey it cannot yet encrypt

@@ -73,7 +73,8 @@ pub struct CallSession {
     /// device, so the bare user JID would hand the same rotation to every
     /// sibling. Rides the session for the same reason [`Self::is_video`] does:
     /// both are facts the offer states and the engine needs. What happens to it
-    /// afterwards is the registry entry's field of the same name.
+    /// afterwards is `CallEntry::peer_video_orientations`, which holds one such
+    /// pair per announcer.
     pub peer_video_orientation: Option<(Jid, u8)>,
     phase: CallPhase,
 }

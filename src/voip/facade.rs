@@ -291,7 +291,7 @@ impl<'a> AcceptCall<'a> {
             wacore::voip::CallSession::new_incoming(call_id, peer_jid, call_creator.clone());
         session.audio_format = Some(audio_config.format);
         session.is_video = has_video;
-        // Why this has to survive registration: `CallEntry::peer_video_orientation`.
+        // Why this has to survive registration: `CallEntry::peer_video_orientations`.
         // Keyed by the offering device, which for a group offer rides the outer
         // `<call participant>` rather than its group-wrapper `from`.
         session.peer_video_orientation = self.incoming.video_orientation.map(|orientation| {

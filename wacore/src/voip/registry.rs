@@ -1521,7 +1521,7 @@ impl CallRegistry {
             // A fresh call starts upright; the app announces a rotation when it
             // has one, and it then outlives every negotiation rebuild.
             self_video_orientation: 0,
-            // Seeded from the offer, drained by `set_video_channels`.
+            // Seeded from the offer; `set_video_channels` replays it, keeping it.
             peer_video_orientations: session.peer_video_orientation.clone().into_iter().collect(),
             session,
             media_task: None,
