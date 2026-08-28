@@ -359,9 +359,29 @@ impl CallEntry {
     /// for every path but the group promotion is nothing.
     fn adopt_session(&mut self, session: CallSession) {
         if let Some((peer, orientation)) = session.peer_video_orientation.clone() {
-            upsert_peer_orientation(&mut self.peer_video_orientations, peer, orientation, false);
+            self.retain_peer_orientation(peer, orientation);
         }
         self.session = session;
+    }
+
+    /// File one announced rotation, under the roster's name for its announcer
+    /// whenever this entry can already resolve one.
+    ///
+    /// The name decides more than where the rotation lands: an entry the roster
+    /// has never named is held through reconciliation as a sender not admitted
+    /// yet, so filing a roster-known participant as unnamed would make its later
+    /// departure indistinguishable from that, and its rotation would outlive it.
+    fn retain_peer_orientation(&mut self, announcer: Jid, orientation: u8) {
+        let (key, named_by_roster) = match self.roster_name_for(&announcer) {
+            Some(known) => (known, true),
+            None => (announcer, false),
+        };
+        upsert_peer_orientation(
+            &mut self.peer_video_orientations,
+            key,
+            orientation,
+            named_by_roster,
+        );
     }
 
     /// The control that carries `peer`'s rotation to the media plane.
@@ -1653,21 +1673,14 @@ impl CallRegistry {
             let _ = state.apply_update(update.clone());
             state
         });
-        CallEntry {
+        let announced = session.peer_video_orientation.clone();
+        let mut entry = CallEntry {
             // A fresh call starts upright; the app announces a rotation when it
             // has one, and it then outlives every negotiation rebuild.
             self_video_orientation: 0,
-            // Seeded from the offer; `set_video_channels` replays it, keeping it.
-            peer_video_orientations: session
-                .peer_video_orientation
-                .clone()
-                .into_iter()
-                .map(|(announcer, orientation)| PeerOrientation {
-                    announcer,
-                    orientation,
-                    named_by_roster: false,
-                })
-                .collect(),
+            // Seeded below, once the entry can resolve its own roster;
+            // `set_video_channels` replays what lands here.
+            peer_video_orientations: Vec::new(),
             session,
             media_task: None,
             waiting_room_task: None,
@@ -1691,7 +1704,11 @@ impl CallRegistry {
             group_invite_peer_device: None,
             group_invite_peer_selected: false,
             on_terminal: None,
+        };
+        if let Some((announcer, orientation)) = announced {
+            entry.retain_peer_orientation(announcer, orientation);
         }
+        entry
     }
 
     /// Promote a previously registered active-group invitation into media setup without replacing
@@ -2054,18 +2071,8 @@ impl CallRegistry {
         // same name the control carries, so a participant announced once by its
         // roster identity and once by a PN alias occupies one slot rather than
         // two that later reconciliation would merge in whatever order they were
-        // pushed -- letting the stale alias overwrite the newest rotation. The
-        // raw JID is the key only while the roster cannot name the announcer.
-        let (key, named_by_roster) = match entry.roster_name_for(peer) {
-            Some(known) => (known, true),
-            None => (peer.clone(), false),
-        };
-        upsert_peer_orientation(
-            &mut entry.peer_video_orientations,
-            key,
-            orientation,
-            named_by_roster,
-        );
+        // pushed -- letting the stale alias overwrite the newest rotation.
+        entry.retain_peer_orientation(peer.clone(), orientation);
         entry.video_ctl_tx.as_ref().map(|tx| tx.send(control));
         true
     }
@@ -5483,6 +5490,51 @@ mod tests {
                 orientation: 1,
             }],
             "only the participant still on the call is replayed"
+        );
+    }
+
+    /// A group offer names its announcer in the roster it carries, so the
+    /// rotation it seeds is a roster-known one. Filed as never-named, its
+    /// owner's departure would read as a sender not admitted yet and the
+    /// rotation would outlive the call it belongs to.
+    #[test]
+    fn a_rotation_seeded_by_the_offer_retires_with_its_participant() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let leaver = Jid::new("222222222222222", Server::Lid);
+        let roster = |present: Vec<&Jid>, transaction| {
+            let mut update = group_update(transaction);
+            update.call_id = "GID".to_string();
+            update.participants = present
+                .into_iter()
+                .map(|jid| GroupCallParticipant {
+                    jid: jid.clone(),
+                    pn: None,
+                    state: Some("connected".to_string()),
+                    participant_type: None,
+                    devices: Vec::new(),
+                })
+                .collect();
+            update
+        };
+
+        let mut session =
+            CallSession::new_outgoing("GID", Jid::new("GID", Server::Call), creator.clone());
+        session.group = Some(roster(vec![&creator, &leaver], 1));
+        session.peer_video_orientation = Some((leaver.clone(), 2));
+        let generation = reg.insert(session);
+
+        assert_eq!(
+            reg.apply_group_update(roster(vec![&creator], 2)),
+            GroupStateApply::Applied
+        );
+
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+        assert!(
+            ctl_rx.try_recv().is_err(),
+            "a participant that left takes its rotation with it"
         );
     }
 
