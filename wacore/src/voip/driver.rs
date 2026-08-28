@@ -711,8 +711,21 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
 /// would evict this one in turn -- so the drive loop keeps offering it instead,
 /// which costs nothing on the overwhelmingly common path where it fit the
 /// first time.
-fn retry_keyframe_request(events: &async_channel::Sender<CallEvent>, outstanding: &mut bool) {
-    if *outstanding && events.try_send(CallEvent::VideoKeyframeNeeded).is_ok() {
+fn retry_keyframe_request(
+    events: &async_channel::Sender<CallEvent>,
+    outstanding: &mut bool,
+    still_required: bool,
+) {
+    if !*outstanding {
+        return;
+    }
+    if !still_required {
+        // The encoder's own periodic IDR reached the wire while the request was
+        // waiting for room. Asking now would buy a keyframe nobody needs.
+        *outstanding = false;
+        return;
+    }
+    if events.try_send(CallEvent::VideoKeyframeNeeded).is_ok() {
         *outstanding = false;
     }
 }
@@ -1057,7 +1070,11 @@ async fn run_call_with_clock_and_wallclock(
             }
         }
 
-        retry_keyframe_request(&channels.events, &mut undelivered_keyframe_request);
+        retry_keyframe_request(
+            &channels.events,
+            &mut undelivered_keyframe_request,
+            eng.video_keyframe_required(),
+        );
 
         // The terminal event above must reach the consumer before transport teardown.
         if eng.is_terminated() {
@@ -1662,7 +1679,7 @@ mod tests {
             "a full queue refuses it"
         );
         let mut outstanding = true;
-        retry_keyframe_request(&tx, &mut outstanding);
+        retry_keyframe_request(&tx, &mut outstanding, true);
         assert!(outstanding, "still no room, so still outstanding");
         assert_eq!(
             rx.try_recv(),
@@ -1670,12 +1687,32 @@ mod tests {
             "and the event it would have evicted is still there"
         );
 
-        retry_keyframe_request(&tx, &mut outstanding);
+        retry_keyframe_request(&tx, &mut outstanding, true);
         assert!(!outstanding);
         assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
 
         // Nothing to retry once it has landed.
-        retry_keyframe_request(&tx, &mut outstanding);
+        retry_keyframe_request(&tx, &mut outstanding, true);
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    /// The engine settles its own requirement when an IDR reaches the wire, and
+    /// the driver's outstanding request is about that same requirement: retrying
+    /// it afterwards would buy a keyframe nobody is waiting on.
+    #[test]
+    fn an_idr_that_settled_the_requirement_cancels_the_retry() {
+        let (tx, rx) = async_channel::bounded(1);
+        tx.try_send(CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        })
+        .expect("fills the queue");
+        let mut outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded);
+        assert!(outstanding);
+
+        // Room returns, but so did the encoder's own IDR.
+        let _ = rx.try_recv();
+        retry_keyframe_request(&tx, &mut outstanding, false);
+        assert!(!outstanding);
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 
@@ -1697,7 +1734,7 @@ mod tests {
         assert!(!outstanding, "the later request landed, so nothing is owed");
         assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
 
-        retry_keyframe_request(&tx, &mut outstanding);
+        retry_keyframe_request(&tx, &mut outstanding, true);
         assert_eq!(
             rx.try_recv(),
             Err(async_channel::TryRecvError::Empty),

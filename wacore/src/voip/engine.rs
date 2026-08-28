@@ -1537,6 +1537,19 @@ impl CallEngine {
         true
     }
 
+    /// Whether outbound video is still dropping access units for want of an IDR.
+    ///
+    /// The driver reads this before retrying a keyframe request a saturated
+    /// consumer queue refused: the encoder's own periodic IDR can settle the
+    /// requirement in the meantime, and a request nobody is waiting on would
+    /// cost the application a keyframe for nothing.
+    pub(crate) fn video_keyframe_required(&self) -> bool {
+        self.media
+            .as_ref()
+            .and_then(|m| m.video.as_ref())
+            .is_some_and(|v| v.keyframe_required)
+    }
+
     /// Whether the video plane is currently up (sending is possible, inbound PT-97 decodes).
     pub fn is_video_enabled(&self) -> bool {
         self.media
