@@ -290,11 +290,8 @@ mod tests {
         !server_has_prekeys(client).await
     }
 
-    /// A `<count>` child refills the classic pool wherever it sits among the
-    /// children. Routing on `<count>`-first alone dropped the whole stanza when
-    /// the server led with `<pq_count>`, and the one-time prekey pool then never
-    /// refilled — peers can no longer fetch a bundle to open a session with this
-    /// device, so they stop being able to message it.
+    /// Every child arrangement that carries `<count>` must reach the prekey-low
+    /// path, whatever the tag order.
     #[tokio::test]
     async fn a_pq_count_first_encrypt_notification_still_refills_the_classic_pool() {
         let client = create_test_client().await;
@@ -309,15 +306,13 @@ mod tests {
         );
         assert!(
             dispatch_encrypt(&client, &["pq_count", "count"]).await,
-            "WA Web routes a pq_count-first notification to the same handler, \
-             which finds <count> by tag and refills the classic pool"
+            "<count> after <pq_count> must reach the prekey-low path"
         );
     }
 
-    /// The other half of `hasLegacyCount`: with no `<count>` anywhere there is
-    /// no classic pool to refill, and this client uploads no Kyber prekeys, so
-    /// the stanza is acked and nothing else happens. Without this the fix would
-    /// be free to upload on every PQ-only notification, which WA Web does not do.
+    /// A notification with no `<count>` anywhere must reach nothing. This one
+    /// holds on both sides of the fix; it is here to pin the other half of the
+    /// routing condition, not to demonstrate the bug.
     #[tokio::test]
     async fn a_pq_count_only_encrypt_notification_uploads_nothing() {
         let client = create_test_client().await;
