@@ -3038,6 +3038,45 @@ mod encoded_tests {
         ));
     }
 
+    /// The registry restates a retained rotation on the video-control channel
+    /// and the roster travels on the group-control channel, so the driver can
+    /// install the rotation before applying the roster. That is safe because
+    /// the restated key is the roster's own name for the announcer: the prune
+    /// below reads the same snapshot the key came from. Only a participant the
+    /// snapshot no longer carries loses its rotation.
+    #[test]
+    fn a_rotation_installed_before_its_roster_survives_the_prune() {
+        let mut engine = group_engine();
+        let peer = group_update().participants[1].jid.clone();
+        let departed = Jid::new("15550003333", Server::Lid);
+        engine.set_participant_video_orientation(peer.clone(), 3);
+        engine.set_participant_video_orientation(departed.clone(), 2);
+
+        let mut update = group_update();
+        update.media = "video".to_string();
+        update.relay = Some(group_relay());
+        update.transaction_id = 8;
+        assert_eq!(
+            engine.apply_group_update(1, &update).unwrap(),
+            GroupRosterApply::Applied
+        );
+
+        let orientations = &engine
+            .group
+            .as_ref()
+            .expect("group state")
+            .video_orientations;
+        assert_eq!(
+            orientations.get(&peer),
+            Some(&3),
+            "a rotation keyed by the roster survives the roster landing after it"
+        );
+        assert!(
+            !orientations.contains_key(&departed),
+            "a rotation the snapshot cannot name is still retired"
+        );
+    }
+
     #[test]
     fn participant_pid_change_discards_queued_audio_from_the_old_session() {
         let mut engine = group_engine();
