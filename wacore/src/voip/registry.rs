@@ -416,6 +416,12 @@ impl CallEntry {
                 .group_invite_peer_device
                 .as_ref()
                 .map_or(0, HeapSize::heap_bytes)
+            + self.peer_video_orientations.capacity() * size_of::<(Jid, u8)>()
+            + self
+                .peer_video_orientations
+                .iter()
+                .map(|(announcer, _)| announcer.heap_bytes())
+                .sum::<usize>()
             + size_of::<AsyncMutex<()>>() * 2
             + size_of::<event_listener::Event>()
             + queued_bytes

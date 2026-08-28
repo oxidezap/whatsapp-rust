@@ -168,6 +168,10 @@ impl crate::stats::HeapSize for CallSession {
                 .answering_device
                 .as_ref()
                 .map_or(0, HeapSize::heap_bytes)
+            + self
+                .peer_video_orientation
+                .as_ref()
+                .map_or(0, |(announcer, _)| announcer.heap_bytes())
             + self.group.as_ref().map_or(0, HeapSize::heap_bytes)
     }
 }
