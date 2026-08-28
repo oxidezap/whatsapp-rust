@@ -148,14 +148,6 @@ pub enum CallAction {
         device_class: Option<String>,
         joinable: bool,
         is_video: bool,
-        /// The offerer's camera rotation at call start, from the `<video>`
-        /// child's `device_orientation`. `None` when the offer carried no
-        /// `<video>` or an out-of-range value.
-        ///
-        /// A video-from-start peer announces this once, in the offer, and sends
-        /// no further `<video>` until it actually turns — so dropping it leaves
-        /// every frame of a call from a rotated camera stamped upright.
-        video_orientation: Option<u8>,
         audio: Vec<CallAudioCodec>,
         /// Set on group calls. Primary group signal per `WAWebVoipGatingUtils`.
         group_jid: Option<Jid>,
@@ -181,11 +173,6 @@ pub enum CallAction {
     Accept {
         call_id: String,
         call_creator: Jid,
-        /// The answering device's camera rotation, from the `<video>` child's
-        /// `device_orientation`. Same contract as [`CallAction::Offer`]'s: the
-        /// callee of a video-from-start call announces it here and nowhere else
-        /// until it turns.
-        video_orientation: Option<u8>,
         audio: Vec<CallAudioCodec>,
     },
     #[wire = "reject"]
@@ -327,6 +314,24 @@ pub struct IncomingCall {
     pub timestamp: DateTime<Utc>,
     pub offline: bool,
     pub action: CallAction,
+    /// The rotation the sending device announced on this stanza's `<video>`
+    /// child, in `0..=3`. Only an `<offer>` and an `<accept>` carry one; `None`
+    /// everywhere else, and for a stanza whose value was out of range.
+    ///
+    /// A video-from-start peer announces its camera rotation exactly once, in
+    /// that stanza, and sends no `<video>` of its own until the camera actually
+    /// turns -- so dropping this leaves every frame of a call from a sideways
+    /// camera stamped upright.
+    ///
+    /// On the payload rather than inside [`CallAction::Offer`] / [`Accept`]:
+    /// those variants are plain struct variants, so a new field there breaks
+    /// every consumer that destructures them without a `..` rest. This struct is
+    /// `#[non_exhaustive]` with a `bon` builder, which is exactly the shape the
+    /// `Event` stability policy reserves for a payload that has to grow.
+    ///
+    /// [`Accept`]: CallAction::Accept
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_orientation: Option<u8>,
     /// Group snapshot embedded in an initial offer or active-call invitation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<Box<GroupCallUpdate>>,

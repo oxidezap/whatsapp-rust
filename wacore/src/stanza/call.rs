@@ -60,6 +60,17 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
     attrs.finish().map_err(|e| anyhow!("<call> attrs: {e}"))?;
 
     let is_offer = action_tag == CallActionTag::Offer;
+    // Read before `parse_action` consumes the child: an <offer> and an <accept>
+    // are the only actions whose <video> child announces the sending device's
+    // camera rotation, and the value belongs on the payload rather than in
+    // either action variant (see `IncomingCall::video_orientation`).
+    let video_orientation = matches!(action_tag, CallActionTag::Offer | CallActionTag::Accept)
+        .then(|| {
+            child
+                .get_optional_child("video")
+                .and_then(|video| parse_video_orientation(video))
+        })
+        .flatten();
     let action = parse_action(child, action_tag)?;
     let group = if is_offer {
         super::group_call::parse_group_invite_snapshot(child)?.map(Box::new)
@@ -83,6 +94,7 @@ pub fn parse_call_stanza(node: &NodeRef<'_>) -> Result<Option<IncomingCall>> {
         .timestamp(timestamp)
         .offline(offline)
         .action(action)
+        .maybe_video_orientation(video_orientation)
         .maybe_group(group);
     let call = call.build();
     // The media facade (decrypt callKey + connect relay) needs the offer's <enc>/<relay>;
@@ -290,9 +302,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             attrs.finish().map_err(|e| anyhow!("<offer> attrs: {e}"))?;
 
             let children = node.children().unwrap_or_default();
-            let video = children.iter().find(|c| c.tag == "video");
-            let is_video = video.is_some();
-            let video_orientation = video.and_then(|v| parse_video_orientation(v));
+            let is_video = children.iter().any(|c| c.tag == "video");
             let audio = children
                 .iter()
                 .filter(|c| c.tag == "audio")
@@ -307,7 +317,6 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
                 device_class,
                 joinable,
                 is_video,
-                video_orientation,
                 audio,
                 group_jid,
             }
@@ -371,10 +380,6 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
         CallActionTag::Accept => {
             attrs.finish().map_err(|e| anyhow!("<accept> attrs: {e}"))?;
             let children = node.children().unwrap_or_default();
-            let video_orientation = children
-                .iter()
-                .find(|child| child.tag == "video")
-                .and_then(|child| parse_video_orientation(child));
             let audio = children
                 .iter()
                 .filter(|child| child.tag == "audio")
@@ -383,7 +388,6 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
             CallAction::Accept {
                 call_id,
                 call_creator,
-                video_orientation,
                 audio,
             }
         }
@@ -404,10 +408,7 @@ fn parse_action(node: &NodeRef<'_>, action_tag: CallActionTag) -> Result<CallAct
                 .optional_string("state")
                 .and_then(|s| s.parse::<i32>().ok())
                 .ok_or_else(|| anyhow!("<video> missing or non-numeric 'state'"))?;
-            let orientation = attrs
-                .optional_string("device_orientation")
-                .and_then(|s| s.parse::<u8>().ok())
-                .filter(|orientation| *orientation <= 3);
+            let orientation = parse_video_orientation(node);
             let dec = attrs.optional_string("dec").map(|s| s.into_owned());
             // The upgrade-request marker attr and the server-enriched knobs; consumed (their
             // semantics ride on `state`), plus a possible `<voip_settings>` blob child we ignore.
@@ -1411,12 +1412,14 @@ mod tests {
                 device_class,
                 joinable,
                 is_video,
-                video_orientation,
                 audio,
                 group_jid,
             } => {
                 assert_eq!(call_id, "CALL-ID-0001");
-                assert_eq!(video_orientation, None, "this fixture carries no <video>");
+                assert_eq!(
+                    call.video_orientation, None,
+                    "this fixture carries no <video>"
+                );
                 assert_eq!(call_creator, fake_caller_lid());
                 assert_eq!(caller_pn, Some(fake_caller_pn()));
                 assert_eq!(caller_country_code.as_deref(), Some("BR"));
@@ -2623,15 +2626,9 @@ mod tests {
         let parsed = parse_call_stanza(&offer.as_node_ref())
             .expect("parse")
             .expect("a call");
+        assert_eq!(parsed.video_orientation, Some(1));
         match parsed.action {
-            CallAction::Offer {
-                is_video,
-                video_orientation,
-                ..
-            } => {
-                assert!(is_video);
-                assert_eq!(video_orientation, Some(1));
-            }
+            CallAction::Offer { is_video, .. } => assert!(is_video),
             other => panic!("expected an offer, got {other:?}"),
         }
 
@@ -2651,12 +2648,8 @@ mod tests {
         let parsed = parse_call_stanza(&accept.as_node_ref())
             .expect("parse")
             .expect("a call");
-        match parsed.action {
-            CallAction::Accept {
-                video_orientation, ..
-            } => assert_eq!(video_orientation, Some(3)),
-            other => panic!("expected an accept, got {other:?}"),
-        }
+        assert_eq!(parsed.video_orientation, Some(3));
+        assert!(matches!(parsed.action, CallAction::Accept { .. }));
     }
 
     /// Out of range is "not announced", never a folded-in value: `4` is a peer
@@ -2680,14 +2673,10 @@ mod tests {
         let parsed = parse_call_stanza(&offer.as_node_ref())
             .expect("parse")
             .expect("a call");
+        assert_eq!(parsed.video_orientation, None);
         match parsed.action {
-            CallAction::Offer {
-                is_video,
-                video_orientation,
-                ..
-            } => {
-                assert!(is_video, "the <video> child still means a video offer");
-                assert_eq!(video_orientation, None);
+            CallAction::Offer { is_video, .. } => {
+                assert!(is_video, "the <video> child still means a video offer")
             }
             other => panic!("expected an offer, got {other:?}"),
         }

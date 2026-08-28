@@ -295,12 +295,7 @@ impl<'a> AcceptCall<'a> {
         // video-from-start caller states this once and sends no `<video>` until
         // the camera turns, so losing it here leaves their whole stream stamped
         // upright.
-        session.peer_video_orientation = match &self.incoming.action {
-            CallAction::Offer {
-                video_orientation, ..
-            } => *video_orientation,
-            _ => None,
-        };
+        session.peer_video_orientation = self.incoming.video_orientation;
         session.group = group.clone();
         // Register BEFORE the decrypt await. A peer <terminate> can now reap this generation during
         // setup, instead of falling through terminate_call as an unknown call and letting us accept
@@ -4751,7 +4746,6 @@ mod tests {
                 device_class: None,
                 joinable: false,
                 is_video: false,
-                video_orientation: None,
                 audio: vec![wacore::types::call::CallAudioCodec {
                     enc: "opus".into(),
                     rate: 8_000,
@@ -4788,7 +4782,6 @@ mod tests {
                 device_class: None,
                 joinable: false,
                 is_video: video,
-                video_orientation: None,
                 audio: vec![wacore::types::call::CallAudioCodec {
                     enc: "opus".into(),
                     rate: 16_000,

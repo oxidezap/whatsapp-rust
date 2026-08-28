@@ -298,6 +298,19 @@ struct CallEntry {
 }
 
 impl CallEntry {
+    /// Install a replacement session, carrying over the facts an entry holds
+    /// outside it. A re-offer, a glare resolution and a group promotion all
+    /// rebuild the session, and the peer's rotation is stated on the offer and
+    /// drained when the plane attaches -- so a bare assignment would replace an
+    /// announced rotation with whatever the new session happens to know, which
+    /// for every path but the group promotion is nothing.
+    fn adopt_session(&mut self, session: CallSession) {
+        if session.peer_video_orientation.is_some() {
+            self.peer_video_orientation = session.peer_video_orientation;
+        }
+        self.session = session;
+    }
+
     fn group_mut(&mut self) -> &mut GroupCallState {
         self.is_group_call = true;
         let call_id = self.session.call_id.clone();
@@ -1318,7 +1331,7 @@ impl CallRegistry {
                     .and_then(GroupCallState::snapshot)
                     .cloned();
                 entry.video = VideoNegotiation::new(session.is_video);
-                entry.session = session;
+                entry.adopt_session(session);
                 ringing.insert(call_id);
                 entry.generation
             } else {
@@ -1489,7 +1502,7 @@ impl CallRegistry {
                 session.group = Some(latest);
             }
             entry.video = VideoNegotiation::new(session.is_video);
-            entry.session = session;
+            entry.adopt_session(session);
             entry.generation
         };
         self.take_ringing(&call_id);
@@ -1525,7 +1538,7 @@ impl CallRegistry {
             session.group = Some(latest);
         }
         entry.video = VideoNegotiation::new(session.is_video);
-        entry.session = session;
+        entry.adopt_session(session);
         ringing.remove(&call_id);
         true
     }
@@ -1776,12 +1789,20 @@ impl CallRegistry {
         }
     }
 
-    /// Record the rotation a peer announced on its `<offer>` or `<accept>`, to
-    /// be applied when the media plane comes up. Rejects an out-of-range value
-    /// for the same reason [`Self::set_local_video_orientation`] does.
+    /// Apply the rotation a peer announced on its `<offer>` or `<accept>`.
+    /// Rejects an out-of-range value for the same reason
+    /// [`Self::set_local_video_orientation`] does.
+    ///
+    /// Which of the two arms runs depends on which side dialed. An incoming
+    /// call parses the offer before there is any media plane, so the rotation
+    /// waits on the entry for [`Self::set_video_channels`]. An outgoing one has
+    /// already attached its channels before the offer went out, so the peer's
+    /// `<accept>` arrives with a live control sender and nothing left to drain
+    /// it -- send it straight through instead, or the answering device's whole
+    /// stream stays stamped upright until it happens to rotate.
     ///
     /// `false` when the value is out of range or the call is gone.
-    pub fn set_peer_video_orientation_pending(
+    pub fn set_peer_video_orientation(
         &self,
         call_id: &str,
         generation: u64,
@@ -1793,7 +1814,17 @@ impl CallRegistry {
         self.active_calls()
             .get_mut(call_id)
             .filter(|entry| entry.generation == generation)
-            .map(|entry| entry.peer_video_orientation = Some(orientation))
+            .map(|entry| {
+                let sent = entry
+                    .video_ctl_tx
+                    .as_ref()
+                    .is_some_and(|tx| tx.send(VideoControl::SetOrientation(orientation)));
+                if !sent {
+                    // No plane yet, or the attached one is already gone: hold it
+                    // for whichever `set_video_channels` comes next.
+                    entry.peer_video_orientation = Some(orientation);
+                }
+            })
             .is_some()
     }
 
@@ -4860,6 +4891,43 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(reg.remove_if_current("CID", generation));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Both directions of the same fact. An incoming call learns the peer's
+    /// rotation from the `<offer>`, long before there is a plane to apply it
+    /// to; an outgoing one learns it from the `<accept>`, by which time
+    /// `set_video_channels` has already run and there is nothing left to drain
+    /// the pending value. Storing it in the second case is silently losing it.
+    #[test]
+    fn peer_orientation_waits_for_a_plane_and_goes_straight_through_once_there_is_one() {
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+
+        assert!(reg.set_peer_video_orientation("CID", generation, 3));
+        assert!(
+            ctl_rx.try_recv().is_err(),
+            "no plane yet, so nothing to send it to"
+        );
+        assert!(
+            !reg.set_peer_video_orientation("CID", generation, 4),
+            "out of range is not announced, never folded"
+        );
+
+        reg.set_video_channels("CID", generation, event_tx, ctl_tx, Box::new(|| {}));
+        assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
+
+        assert!(reg.set_peer_video_orientation("CID", generation, 1));
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetOrientation(1)),
+            "the accept's rotation reaches the attached plane, not a pending slot"
+        );
+
+        let newer = reg.insert(session("CID"));
+        assert!(!reg.set_peer_video_orientation("CID", generation, 2));
+        assert!(reg.set_peer_video_orientation("CID", newer, 2));
     }
 
     #[test]
