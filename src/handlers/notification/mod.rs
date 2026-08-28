@@ -256,17 +256,16 @@ mod tests {
             .build();
         handle_notification_impl(&client, node_to_arc(notif)).await;
 
-        // The invalidation is spawned off the ack path, so it lands after the
-        // handler returns rather than inside it. `poll_until` takes a sync
-        // predicate and this one is async, so the wait is a bounded timeout
-        // around the poll rather than that helper.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while cache.get(&dirty).await.is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the group the server called stale must lose its cached metadata");
+        // Awaited, not eventual: a lookup defaults to `CachePreferred` and
+        // outgoing sends are not ordered behind incoming processing, so a
+        // snapshot still readable when the handler returns is one a concurrent
+        // send can encrypt against. Deferring the eviction would leave that
+        // window open, and this assertion is what closes it.
+        assert!(
+            cache.get(&dirty).await.is_none(),
+            "the group the server called stale must lose its cached snapshot \
+             before the handler returns"
+        );
         assert!(
             cache.get(&untouched).await.is_some(),
             "a group the notification did not name must keep its cache"

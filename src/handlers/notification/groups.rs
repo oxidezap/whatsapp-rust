@@ -127,7 +127,7 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
     // notification would name the server as the group in every event it
     // produced, so it is routed out before that can happen.
     if let Some(groups) = wacore::stanza::groups::parse_groups_dirty(node.get()) {
-        handle_groups_dirty(client, groups);
+        handle_groups_dirty(client, groups).await;
         client
             .core
             .event_bus
@@ -287,44 +287,57 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
 
 /// The server named these groups' cached metadata stale.
 ///
-/// Dropping the cached blob is what every other staleness signal in this file
-/// does (see the `Remove` / expired-cache arms above); the next send or
+/// Dropping the group's snapshot is what every other staleness signal in this
+/// file does (see the `Remove` / expired-cache arms above); the next send or
 /// `group_info` query re-fetches. Doing nothing would leave a group's
 /// participant list wrong for as long as the cache lives, which is a message
 /// encrypted to a device set the group no longer has.
 ///
-/// Spawned rather than awaited, because the work is unbounded in a way the
-/// rest of this file's is not. `Client::process_node` defers this stanza's
-/// transport `<ack>` until the router's dispatch returns, and one notification
-/// may name up to 10 000 groups — WA Web's parser bounds the `<group>`
-/// children at `1..1e4`. Draining that many lock acquisitions and metadata
-/// deletes inline would hold the ack long enough for the server to retransmit
-/// the notification, and the retransmission would repeat the whole loop. WA
-/// Web does not do it inline either: `handleGroupsDirtyNotificationJob` queues
-/// a persisted job and runs it after `waitForOfflineDeliveryEnd()`.
+/// The two halves of that invalidation run at different times on purpose.
 ///
-/// Deliberately unguarded, unlike the dirty-bit resync in `handlers/ib.rs`.
-/// That one sends an IQ whose result belongs to the connection that asked for
-/// it, so it checks both the connection generation and `is_shutting_down`.
-/// This does no I/O: it drops local cache entries, which is idempotent and
-/// correct on any generation, and the worst a late run costs is one refetch.
-/// `is_shutting_down` would be actively wrong here — it is
-/// `expected_disconnect || !is_running`, so it reads true between connections
-/// as well as at the end of one, and the work would throw itself away exactly
-/// when a reconnect is about to make the stale metadata reachable again.
-fn handle_groups_dirty(client: &Arc<Client>, groups: Vec<wacore_binary::Jid>) {
+/// The cache eviction is awaited here. A lookup defaults to
+/// `Freshness::CachePreferred` and outgoing sends are deliberately not ordered
+/// behind incoming processing, so anything that runs while a stale snapshot is
+/// still readable — a consumer reacting to the raw notification dispatched
+/// just below, or an unrelated send already in flight — can encrypt to the
+/// participant set this notification exists to retire. Deferring it would
+/// leave exactly that window open.
+///
+/// The persisted deletes are spawned. `Client::process_node` defers this
+/// stanza's transport `<ack>` until the router's dispatch returns, and one
+/// notification may name up to 10 000 groups — WA Web's parser bounds the
+/// `<group>` children at `1..1e4`. Holding the ack for that many round trips
+/// to storage, each behind a per-group lock, is long enough for the server to
+/// retransmit and start the work over. The blob is only read on a cache miss,
+/// so it can lag without a send ever seeing it. WA Web defers here too:
+/// `handleGroupsDirtyNotificationJob` queues a persisted job and runs it after
+/// `waitForOfflineDeliveryEnd()`.
+///
+/// The spawned half is deliberately unguarded, unlike the dirty-bit resync in
+/// `handlers/ib.rs`. That one sends an IQ whose result belongs to the
+/// connection that asked for it, so it checks the connection generation and
+/// `is_shutting_down`. A storage delete is idempotent and correct on any
+/// generation, and `is_shutting_down` would be actively wrong: it is
+/// `expected_disconnect || !is_running`, true between connections as well as
+/// at the end of one, so the work would throw itself away exactly when a
+/// reconnect is about to make the stale metadata reachable again.
+async fn handle_groups_dirty(client: &Arc<Client>, groups: Vec<wacore_binary::Jid>) {
+    for jid in &groups {
+        debug!(
+            target: "Client/Group",
+            "groups_dirty: invalidating cached metadata for {}",
+            jid.observe()
+        );
+        client.evict_group_metadata_cache(jid).await;
+    }
+
     let client = Arc::clone(client);
     client
         .clone()
         .runtime
         .spawn(Box::pin(async move {
-            for jid in groups {
-                debug!(
-                    target: "Client/Group",
-                    "groups_dirty: invalidating cached metadata for {}",
-                    jid.observe()
-                );
-                client.lock_group_metadata(&jid).await.invalidate().await;
+            for jid in &groups {
+                client.delete_persisted_group_metadata(jid).await;
             }
         }))
         .detach();
