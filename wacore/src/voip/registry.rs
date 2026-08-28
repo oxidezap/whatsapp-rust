@@ -346,12 +346,30 @@ impl CallEntry {
     fn peer_orientation_control(&self, peer: &Jid, orientation: u8) -> VideoControl {
         if self.is_group_call {
             VideoControl::SetParticipantOrientation {
-                participant: peer.clone(),
+                // Resolved against the roster the same way the mid-call `<video>`
+                // path resolves it, because the engine's orientation map is keyed
+                // by roster identities: a PN alias, or any other spelling of the
+                // same device, would file the rotation where playout never looks.
+                participant: self.canonical_group_announcer(peer),
                 orientation,
             }
         } else {
             VideoControl::SetOrientation(orientation)
         }
+    }
+
+    /// The roster's name for `sender`: its device JID when the roster carries
+    /// that device, otherwise the participant it belongs to. Falls back to what
+    /// was announced when the roster does not know it yet -- an offer parsed
+    /// before its group snapshot installs.
+    fn canonical_group_announcer(&self, sender: &Jid) -> Jid {
+        if sender.device != 0
+            && let Some(device) = CallRegistry::canonical_group_device_for_entry(self, sender)
+        {
+            return device;
+        }
+        CallRegistry::canonical_group_participant_for_entry(self, sender)
+            .unwrap_or_else(|| sender.clone())
     }
 
     fn group_mut(&mut self) -> &mut GroupCallState {
@@ -1205,6 +1223,10 @@ impl CallRegistry {
         let entry = map.get(call_id).filter(|entry| {
             entry.generation == generation && entry.session.call_creator == *call_creator
         })?;
+        Self::canonical_group_device_for_entry(entry, sender)
+    }
+
+    fn canonical_group_device_for_entry(entry: &CallEntry, sender: &Jid) -> Option<Jid> {
         let snapshot = entry.group.as_ref().and_then(GroupCallState::snapshot)?;
         snapshot
             .participants
@@ -5042,6 +5064,60 @@ mod tests {
             Ok(VideoControl::SetParticipantOrientation {
                 participant: joiner.clone(),
                 orientation: 1,
+            })
+        );
+    }
+
+    /// The engine files rotation under the roster's identities, so a rotation
+    /// announced by any other spelling of the same participant -- a PN alias on
+    /// the `<accept>`'s routing, say -- has to be translated on the way in or it
+    /// lands in a slot playout never reads.
+    #[test]
+    fn a_group_rotation_is_filed_under_the_rosters_name_for_the_announcer() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let lid = Jid::new("222222222222222", Server::Lid);
+        let pn = Jid::new("5511999990000", Server::Pn);
+        let mut update = group_update(1);
+        update.call_id = "GID".to_string();
+        update.participants.push(GroupCallParticipant {
+            jid: lid.clone(),
+            pn: Some(pn.clone()),
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: lid.clone().with_device(4),
+                platform: None,
+                pid: Some(4),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        let mut session =
+            CallSession::new_outgoing("GID", Jid::new("GID", Server::Call), creator.clone());
+        session.group = Some(update);
+        let generation = reg.insert(session);
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+
+        // A device the roster carries: keyed by that device.
+        assert!(reg.set_peer_video_orientation("GID", generation, &lid.clone().with_device(4), 1));
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant: lid.clone().with_device(4),
+                orientation: 1,
+            })
+        );
+
+        // The same participant under its phone number: keyed by the roster's LID.
+        assert!(reg.set_peer_video_orientation("GID", generation, &pn, 2));
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant: lid,
+                orientation: 2,
             })
         );
     }
