@@ -381,7 +381,7 @@ fn group_notification_action_serializes_every_field_present() {
         serde_json::to_value(GroupNotificationAction::Subject {
             subject: "Team".into(),
             subject_owner: Some("271060335329480@lid".parse::<Jid>().unwrap()),
-            subject_owner_pn: Some("555000111@s.whatsapp.net".parse::<Jid>().unwrap()),
+            subject_owner_pn: Some("12025550111@s.whatsapp.net".parse::<Jid>().unwrap()),
             subject_owner_username: Some("team-admin".into()),
             subject_time: Some(1_704_067_200),
         })
@@ -397,7 +397,7 @@ fn group_notification_action_serializes_every_field_present() {
                 "integrator": 0,
             },
             "subject_owner_pn": {
-                "user": "555000111",
+                "user": "12025550111",
                 "server": "s.whatsapp.net",
                 "agent": 0,
                 "device": 0,
@@ -522,7 +522,7 @@ fn group_notification_action_declares_exact_field_count() {
         GroupNotificationAction::Subject {
             subject: "Team".into(),
             subject_owner: Some("271060335329480@lid".parse::<Jid>().unwrap()),
-            subject_owner_pn: Some("555000111@s.whatsapp.net".parse::<Jid>().unwrap()),
+            subject_owner_pn: Some("12025550111@s.whatsapp.net".parse::<Jid>().unwrap()),
             subject_owner_username: Some("team-admin".into()),
             subject_time: Some(1_704_067_200),
         },
