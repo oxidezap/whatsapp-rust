@@ -678,39 +678,26 @@ impl GroupMetadataGuard<'_> {
         self.cache(info).await;
     }
 
+    /// Drop this group's snapshot, in memory and on disk.
+    ///
+    /// The cache goes first. A lookup defaults to `Freshness::CachePreferred`
+    /// and a send does not take this lane, so for as long as the snapshot is
+    /// readable a concurrent send can encrypt to a participant set the group no
+    /// longer has — and the persisted delete is an `await` on storage, which is
+    /// exactly the pause that would let one through.
     pub(crate) async fn invalidate(&self) {
-        self.client.delete_persisted_group_metadata(self.jid).await;
-        self.client.evict_group_metadata_cache(self.jid).await;
-    }
-}
-
-impl Client {
-    /// Drop a group's cached snapshot, leaving the persisted blob alone.
-    ///
-    /// Split out of [`GroupMetadataGuard::invalidate`] because the two halves
-    /// have different urgency. This one closes a correctness window: a lookup
-    /// defaults to [`Freshness::CachePreferred`], and outgoing sends are
-    /// deliberately not ordered behind incoming processing (see AGENTS.md), so
-    /// for as long as the snapshot is readable a concurrent send can encrypt to
-    /// a participant set the group no longer has. Callers that learn a group is
-    /// stale should do this before they let anything else run.
-    pub(crate) async fn evict_group_metadata_cache(&self, jid: &Jid) {
-        self.get_group_cache().invalidate(jid).await;
-    }
-
-    /// Delete a group's persisted metadata, leaving the cache alone.
-    ///
-    /// The other half. The blob is only read on a cache miss, so this can lag
-    /// behind the eviction above without a send ever seeing stale state — which
-    /// is what lets a bulk invalidation defer it off the acknowledgement path.
-    pub(crate) async fn delete_persisted_group_metadata(&self, jid: &Jid) {
+        self.client.get_group_cache().invalidate(self.jid).await;
         if let Err(error) = self
+            .client
             .persistence_manager
             .backend()
-            .delete_group_metadata(&jid.to_string())
+            .delete_group_metadata(&self.jid.to_string())
             .await
         {
-            log::warn!("Failed to invalidate persisted group metadata for {jid}: {error}");
+            log::warn!(
+                "Failed to invalidate persisted group metadata for {}: {error}",
+                self.jid
+            );
         }
     }
 }
