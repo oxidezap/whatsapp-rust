@@ -1511,6 +1511,15 @@ impl CallEngine {
                 group.foreign_decoders.remove(&participant);
                 group.codec_probes.remove(&participant);
                 group.foreign_participants.remove(&participant);
+                // The reception stats too, and this one is not merely stale but actively harmful.
+                // A group SSRC is derived from the device identity, not the PID, so the replacement
+                // session keeps it and its sequence numbers can restart BELOW the retired session's
+                // maximum. Every one of those packets then reads as reordered, which clears the
+                // frame span rather than measuring one -- and the probe abstains without a span. A
+                // participant that needs probing to be heard at all would stay silent until the new
+                // sequence climbed past the old maximum.
+                group.audio_reception.remove(&participant);
+                group.video_reception.remove(&participant);
             }
             group.mixer.retain(active.iter().cloned());
             group
@@ -5319,6 +5328,7 @@ mod encoded_tests {
 
         let mut migrated = group_update();
         migrated.transaction_id = 8;
+
         migrated.participants[1].devices[0].pid = Some(9);
         engine
             .apply_group_update(1, &migrated)
@@ -7952,6 +7962,61 @@ mod tests {
         assert_eq!(
             first_audible, 960,
             "the concealment from before the latch must not sit in front of the rescued audio"
+        );
+    }
+
+    // A group SSRC comes from the device identity, not the PID, so a replacement session keeps it
+    // and its sequence numbers restart BELOW the retired session's maximum. Reception stats left
+    // behind then read every replacement packet as reordered, which CLEARS the frame span rather
+    // than measuring one -- and the probe abstains without a span. A participant that needs probing
+    // to be heard stays silent until the new sequence climbs past the old maximum.
+    #[test]
+    fn a_pid_migration_clears_the_reception_stats_so_the_probe_can_still_measure() {
+        let (mut eng, epoch) = group_engine(false);
+        eng = eng.with_foreign_audio_codec_factory(Box::new(StubCodecFactory { samples: 960 }));
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        // The retired session climbs to a high sequence number.
+        let silk: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        let mut retired = group_peer_audio(&epoch);
+        for n in 0..40u64 {
+            let packet = retired.protect_audio(&silk);
+            eng.handle_input(100 + n * 60, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+
+        // The participant comes back under a new PID.
+        let mut migrated = group_update("audio");
+        migrated.transaction_id = 8;
+        migrated.participants[1].devices[0].pid = Some(99);
+        eng.apply_group_update(3_000, &migrated)
+            .expect("the roster applies");
+        let _ = drain(&mut eng);
+
+        // A fresh pipeline: same SSRC (it comes from the LID), sequence numbers from the start.
+        let mut replacement = group_peer_audio(&epoch);
+        let mut heard = Vec::new();
+        for n in 0..8u64 {
+            let packet = replacement.protect_audio(&silk);
+            eng.handle_input(4_000 + n * 60, Input::RelayPacket(&packet));
+            for tick in 0..3u64 {
+                eng.handle_input(4_000 + n * 60 + tick * 20, Input::Timeout);
+                let (outputs, _) = drain(&mut eng);
+                for output in outputs {
+                    if let Output::Playout(frame) = output {
+                        heard.extend(frame);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            heard.contains(&1234),
+            "the replacement session has to be probed and heard, not wait out the old sequence"
         );
     }
 
