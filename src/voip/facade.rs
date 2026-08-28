@@ -291,10 +291,7 @@ impl<'a> AcceptCall<'a> {
             wacore::voip::CallSession::new_incoming(call_id, peer_jid, call_creator.clone());
         session.audio_format = Some(audio_config.format);
         session.is_video = has_video;
-        // The peer's camera rotation as the offer announced it. A
-        // video-from-start caller states this once and sends no `<video>` until
-        // the camera turns, so losing it here leaves their whole stream stamped
-        // upright.
+        // Why this has to survive registration: `CallEntry::peer_video_orientation`.
         session.peer_video_orientation = self.incoming.video_orientation;
         session.group = group.clone();
         // Register BEFORE the decrypt await. A peer <terminate> can now reap this generation during
