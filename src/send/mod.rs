@@ -1601,9 +1601,14 @@ impl Client {
                             ) {
                                 None => {
                                     self.device_memo_counters.record_skdm_targets(Outcome::Hit);
-                                    // Free: the stored slice is exact, so
+                                    // `Cache::get` already cloned the stored
+                                    // slice, and that clone is exact, so
                                     // reclaiming it as a `Vec` reuses its
-                                    // allocation rather than copying.
+                                    // buffer instead of adding a second one.
+                                    // The hit still pays that one clone —
+                                    // same as the `Vec` this replaced; what
+                                    // the boxed form buys is retention, not a
+                                    // cheaper hit.
                                     return Some((all_devices, memo.4.into_vec()));
                                 }
                                 Some(term) => self.device_memo_counters.record_skdm_targets(term),
