@@ -1,12 +1,20 @@
 //! MLow RED ("SplitRed") depacketization: the OUTERMOST wire layer of a WhatsApp MLow RTP audio
-//! payload. It is OPTIONAL: applied only when the call negotiated `mlow_red_redundancy_level > 0`.
-//! When off (the common case, and our captures), the RTP payload is a single BARE MLow frame with no
-//! wrapper and this MUST NOT be applied (a bare frame's first byte has its high bit set and would be
-//! misread as a redundant block header).
+//! payload.
+//!
+//! **The payload type selects this, not the redundancy level.** The shipped client applies the
+//! wrapper to everything it sends on the `mlow-red-1` payload type, and a redundancy level of zero
+//! still gets one: a single `0x00` marker byte and then the frame. Only a payload arriving on the
+//! bare MLow payload type is unwrapped, and applying this to one would misread its TOC (whose high
+//! bit is set) as a redundant block header.
+//!
+//! The engine keys off the payload type for exactly that reason; the level is a bitrate decision,
+//! not a framing one, and treating it as framing means a zero-redundancy stream on the RED payload
+//! type loses its first byte to the TOC.
 //!
 //! On-wire (N = redundancy): `[ red_hdr[0..N] (2B each) ][ main_marker (1B) ][ red_payloads ][ main_payload ]`.
 //! `red_hdr[i]`: byte0 = `0x80 | (time_code & 0x7f)`, byte1 = payload size. `main_marker`: high bit
-//! clear, low 7 bits = main time offset.
+//! clear, low 7 bits = main time offset. It is not RFC 2198: no block carries a payload type, and
+//! every block is decoded by the codec the payload type already selected.
 
 /// One frame extracted from a SplitRed payload: raw MLow frame bytes (TOC + body) plus RED metadata.
 /// `data` borrows the input payload (no copy).

@@ -456,9 +456,9 @@ pub struct CallChannels {
     pub encoded_audio_in: async_channel::Receiver<Bytes>,
     pub encoded_audio_out: async_channel::Sender<EncodedAudioFrame>,
     pub events: async_channel::Sender<CallEvent>,
-    /// Caller-only: the answering device's LID, delivered once the callee's `<accept>` is received so
-    /// the drive loop can rekey the recv path before media flows. `None` on the callee side and esp32.
-    pub rekey: Option<async_channel::Receiver<String>>,
+    /// Caller-only: what the callee's `<accept>` taught us, delivered once so the drive loop can
+    /// apply it before media flows. `None` on the callee side and esp32.
+    pub rekey: Option<async_channel::Receiver<PeerAnswer>>,
     /// Outbound video: one pre-encoded H.264 Annex-B access unit per item.
     pub video_in: async_channel::Receiver<Vec<u8>>,
     /// Inbound video: reassembled peer access units (dropped on sink overflow, like the speaker).
@@ -467,6 +467,23 @@ pub struct CallChannels {
     pub video_ctl: VideoControlReceiver,
     /// Group roster and decrypted epoch transitions. `None` for a 1:1 call.
     pub group_ctl: Option<async_channel::Receiver<GroupControl>>,
+    /// Where the drive loop publishes media counters for `CallHandle::media_stats`.
+    pub media_stats: Arc<crate::voip::media_stats::MediaStatsCell>,
+}
+
+/// What the caller learned from the callee's `<accept>`, as one message.
+///
+/// Both facts land at the same instant and both must be applied before the first inbound packet, so
+/// they travel together rather than racing down two channels. The callee needs no equivalent: its
+/// peer's capability arrives in the `<offer>`, before the engine exists, so it simply starts with
+/// the right format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAnswer {
+    /// The answering device's LID. Recv keys are re-derived from it.
+    pub answering_lid: String,
+    /// The audio codec the peer's capability selects, or `None` when it announced nothing and the
+    /// negotiated choice stands.
+    pub audio_codec: Option<crate::voip::audio::AudioCodec>,
 }
 
 /// Bound slow relay writes without truncating a complete video access unit.
@@ -682,13 +699,24 @@ fn apply_group_epoch_control(
 
 /// `false` when a saturated queue swallowed the event.
 ///
-/// A diagnostic is worth less than a relay lifecycle transition, so those
-/// displace the queue's oldest entry rather than being dropped -- through
-/// [`force_send_call_event`], which never sheds a keyframe request to do it,
-/// here or from the registry's own publishers. Everything else, the request
-/// included, is offered without evicting anything; see
-/// [`retry_keyframe_request`] for how the one event that cannot be lost
-/// survives being refused outright.
+/// Force-sent: an event that is emitted ONCE and that the consumer has to act on. Both halves are
+/// required, and they are what keeps this list from growing to everything.
+///
+/// Said once matters because a `try_send` that loses the race with a slow consumer loses the fact
+/// itself rather than a copy of it -- unlike a re-alarming `AudioSilent` or a per-frame drop
+/// report, which will be said again. Actionable matters because displacing a queued event is a
+/// real cost, worth paying only when the consumer must do something: a call stays deaf, or keeps
+/// sending audio its peer cannot decode, until it does.
+///
+/// `AudioCodecSwitched` deliberately stays on the ordinary path even though it is also said once:
+/// the engine has already re-pointed its own decoder, so nothing is asked of the consumer. Where a
+/// switch DOES demand action -- an encoded source that cannot follow it -- the demand rides on
+/// `AudioCodecSourceIsFixed`, which carries both codecs and is force-sent.
+///
+/// Forcing goes through [`force_send_call_event`], which never sheds a keyframe request to make
+/// room, here or from the registry's own publishers. Everything else, the request included, is
+/// offered without evicting anything; see [`retry_keyframe_request`] for how the one event that
+/// cannot be lost survives being refused outright.
 fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) -> bool {
     if matches!(
         &event,
@@ -696,6 +724,8 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
             | CallEvent::RelayAllocateFailed(_)
             | CallEvent::RelayAllocateTimedOut
             | CallEvent::RelayReconnectTimedOut
+            | CallEvent::AudioReceptionStalled { .. }
+            | CallEvent::AudioCodecSourceIsFixed { .. }
     ) {
         force_send_call_event(events, event)
     } else {
@@ -1000,10 +1030,20 @@ async fn run_call_with_clock_and_wallclock(
     let mut timer: DeadlineTimer = Fuse::terminated();
     let mut armed_deadline: Option<engine::Millis> = None;
 
+    // Only republished when a counter actually moved: comparing fifteen `u32`s is cheaper than
+    // taking the lock, and on a healthy call only `rtp_received` and one decode counter ever move.
+    let mut published_stats = crate::voip::media_stats::CallMediaStats::default();
+
     'drive: loop {
+        let stats = eng.media_stats();
+        if stats != published_stats {
+            channels.media_stats.publish(stats);
+            published_stats = stats;
+        }
         // Drain every intent the last mutation produced; stop at the terminal Timeout.
         let mut pending_video = Vec::new();
         let mut reconnect_to = None;
+        let mut sink_dropped = 0u32;
         loop {
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
@@ -1021,12 +1061,18 @@ async fn run_call_with_clock_and_wallclock(
                         });
                     }
                 }
-                // Loss tolerant: drop the frame if the speaker can't keep up.
+                // Loss tolerant: drop the frame if the speaker can't keep up. Counted, because the
+                // engine has already recorded the frame as produced and this is the only place that
+                // can tell "the application did not take it" from "the call carried nothing".
                 Output::Playout(pcm) => {
-                    let _ = channels.speaker.try_send(pcm);
+                    if channels.speaker.try_send(pcm).is_err() {
+                        sink_dropped = sink_dropped.saturating_add(1);
+                    }
                 }
                 Output::EncodedAudio(frame) => {
-                    let _ = channels.encoded_audio_out.try_send(frame);
+                    if channels.encoded_audio_out.try_send(frame).is_err() {
+                        sink_dropped = sink_dropped.saturating_add(1);
+                    }
                 }
                 // Same policy for video: a stalled sink sheds frames, never the drive loop.
                 Output::VideoPlayout(frame) => {
@@ -1070,6 +1116,12 @@ async fn run_call_with_clock_and_wallclock(
                     break;
                 }
             }
+        }
+        // Reported after the drain rather than per frame: the engine only reads its counters
+        // between mutations, and one fold per iteration keeps a stalled sink from costing a call
+        // that is already behind anything per packet.
+        if sink_dropped != 0 {
+            eng.note_audio_sink_dropped(sink_dropped);
         }
 
         retry_keyframe_request(
@@ -1238,12 +1290,49 @@ async fn run_call_with_clock_and_wallclock(
                 }
             },
             // Rekey recv to the device that answered, before its media reaches the relay arm below.
-            lid = rekey_fut => {
-                rekey_open = false; // one-shot: a LID or the sender closing both disable the arm
-                if let Some(lid) = lid
-                    && !eng.rekey_recv(&lid)
-                {
-                    break 'drive; // malformed stored call_key (a setup invariant violated)
+            answer = rekey_fut => {
+                rekey_open = false; // one-shot: an answer or the sender closing both disable the arm
+                if let Some(answer) = answer {
+                    // Codec first: rekeying decides which keys decrypt the next packet, and this
+                    // decides what the plaintext under them means. Getting either wrong is silence,
+                    // and both have to be right before the first inbound packet either way.
+                    if let Some(codec) = answer.audio_codec {
+                        // Compared as FORMATS: a peer clearing the capability moves an escape-profile
+                        // call from MLOW's container to native Opus without changing the codec name,
+                        // and codec equality reads that real change as no change -- leaving queued
+                        // packets with rewritten TOCs to reach a peer that cannot parse them.
+                        let before = eng.active_audio_format();
+                        if let Err(e) = eng.switch_audio_codec(codec, engine::CodecDecisionSource::Negotiated) {
+                            log::debug!("voip: peer capability selected {codec:?}, not switching: {e}");
+                        } else if eng.active_audio_format() != before {
+                            // Whatever is queued was protected under the grammar the peer has just
+                            // told us it does not speak, so sending it delays the audio it CAN
+                            // decode behind bytes that will only feed its decoder garbage. Retire
+                            // the unstarted audio; video is unaffected by an audio codec change, and
+                            // control must survive. A batch already begun is left alone: the write
+                            // is mid-flight and cancelling it is delivery-ambiguous, so at most one
+                            // packet of the old grammar reaches the peer.
+                            let dropped = purge_queued(
+                                &mut send_queue,
+                                &mut pending_video,
+                                &mut awaiting_video_keyframe,
+                                |batch| !batch.started && batch.kind == SendBatchKind::Media,
+                            );
+                            if dropped.packets != 0 {
+                                let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                    video_access_units: dropped.video_access_units,
+                                    packets: dropped.packets,
+                                });
+                            }
+                        }
+                    }
+                    // The `<accept>` is also the caller's proof that the callee picked up, which
+                    // is what arms the health watchdog: the relay was allocated back when the
+                    // server acked the offer, long before anyone answered.
+                    eng.peer_answered(now_ms());
+                    if !eng.rekey_recv(&answer.answering_lid) {
+                        break 'drive; // malformed stored call_key (a setup invariant violated)
+                    }
                 }
             },
             group = group_ctl_fut => {
@@ -1407,6 +1496,20 @@ async fn run_call_with_clock_and_wallclock(
                         eng.handle_input(now, Input::Timeout);
                     }
                 }
+                Ok(RelayTransportEvent::InboundDropped(packets)) => {
+                    eng.note_inbound_dropped(packets);
+                    // Same overdue-timer check the packet arm does. This arm has priority over the
+                    // timer arm, so a sustained run of drop reports -- exactly what a call under
+                    // backpressure produces -- would otherwise starve playout and the keepalive
+                    // while reporting that it is starving.
+                    let now = now_ms();
+                    if let Some(at) = eng.poll_timeout()
+                        && at != engine::NEVER
+                        && now >= at
+                    {
+                        eng.handle_input(now, Input::Timeout);
+                    }
+                }
                 // The channel is already open by the time we run; Connected is a redundant confirm.
                 Ok(RelayTransportEvent::Connected) => {}
                 Ok(RelayTransportEvent::Disconnected(_)) | Err(_) => break 'drive,
@@ -1465,6 +1568,11 @@ async fn run_call_with_clock_and_wallclock(
         }
     }
 
+    // The loop publishes at the TOP of each iteration, so whatever the last one counted -- and the
+    // last iteration is where a failing call does most of its counting -- would never be published.
+    // Publish once more on the way out, so the final snapshot is the final state.
+    channels.media_stats.publish(eng.media_stats());
+
     // Any local exit (relay disconnect or send failure -- not a closed mic, which only disables its
     // arm) tears down the transport so the platform's relay read pump -- which may be parked in recv()
     // with no packet coming -- sees the channel close, returns, and releases its task and socket.
@@ -1481,6 +1589,7 @@ mod tests {
         GroupCallDevice, GroupCallParticipant, GroupCallRelay, GroupCallRelayEndpoint,
         GroupCallUpdate,
     };
+    use crate::voip::AudioCodec;
     use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
     use crate::voip::engine::{CallConfig, GroupEngineConfig, SequentialTxIds};
     use crate::voip::mlow::MlowEncoder;
@@ -1765,13 +1874,24 @@ mod tests {
         );
     }
 
+    // A slow consumer fills the event queue exactly when a call goes wrong. An event that is said
+    // ONCE and is lost there is lost for good: the two audio ones below mean a call is deaf, or is
+    // sending audio its peer cannot decode, and neither repeats.
     #[test]
-    fn relay_lifecycle_events_replace_saturated_diagnostics() {
-        for lifecycle in [
+    fn events_that_are_said_once_replace_saturated_diagnostics() {
+        for said_once in [
             CallEvent::RelayAllocated,
             CallEvent::RelayAllocateFailed(486),
             CallEvent::RelayAllocateTimedOut,
             CallEvent::RelayReconnectTimedOut,
+            CallEvent::AudioReceptionStalled {
+                silent_for_ms: 3_000,
+            },
+            CallEvent::AudioCodecSourceIsFixed {
+                sending: AudioCodec::Mlow,
+                peer_expects: AudioCodec::Opus,
+                source: engine::CodecDecisionSource::Negotiated,
+            },
         ] {
             let (tx, rx) = async_channel::bounded(1);
             tx.try_send(CallEvent::GroupControlRejected {
@@ -1779,11 +1899,35 @@ mod tests {
             })
             .expect("diagnostic fills the event queue");
 
-            let _ = publish_engine_event(&tx, lifecycle.clone());
+            let _ = publish_engine_event(&tx, said_once.clone());
 
-            assert_eq!(rx.try_recv(), Ok(lifecycle));
+            assert_eq!(rx.try_recv(), Ok(said_once));
             assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
         }
+    }
+
+    // The other half of the rule: an event that repeats yields to the queue, because it will be
+    // said again and displacing something else to say it early buys nothing.
+    #[test]
+    fn a_repeating_diagnostic_yields_to_a_full_queue() {
+        let (tx, rx) = async_channel::bounded(1);
+        let queued = CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        };
+        tx.try_send(queued.clone()).expect("fills the queue");
+
+        publish_engine_event(
+            &tx,
+            CallEvent::AudioSilent {
+                silent_for_ms: 2_000,
+                rtp_received: 40,
+                frames_produced: 0,
+                dominant_reason: crate::voip::media_stats::AudioSilenceReason::Unknown,
+            },
+        );
+
+        assert_eq!(rx.try_recv(), Ok(queued));
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 
     #[test]
@@ -1916,6 +2060,7 @@ mod tests {
             video_out: vout_tx,
             video_ctl: vctl_rx,
             group_ctl: None,
+            media_stats: Arc::new(crate::voip::media_stats::MediaStatsCell::default()),
         }
     }
 
@@ -3010,6 +3155,7 @@ mod tests {
                 video_out: vout_tx,
                 video_ctl: vctl_rx,
                 group_ctl: None,
+                media_stats: Arc::new(crate::voip::media_stats::MediaStatsCell::default()),
             },
             eng,
         ));
@@ -3401,11 +3547,17 @@ mod tests {
         relay: Arc<ScheduleRelay>,
         speaker: async_channel::Receiver<Vec<i16>>,
         video_out: async_channel::Receiver<VideoFrame>,
+        media_stats: Arc<crate::voip::media_stats::MediaStatsCell>,
     }
 
     /// Drive one audio-only call over virtual time until `horizon_ms`, with the video plane wired but
     /// never enabled.
     fn drive_schedule(horizon_ms: u64) -> ScheduleHarness {
+        drive_schedule_with_speaker(horizon_ms, None)
+    }
+
+    /// The same call with a bounded speaker, so the sink can be made to refuse playout.
+    fn drive_schedule_with_speaker(horizon_ms: u64, speaker_cap: Option<usize>) -> ScheduleHarness {
         let clock = Arc::new(AtomicU64::new(0));
         let arms = Arc::new(Mutex::new(Vec::new()));
         let (relay_tx, relay_rx) = async_channel::unbounded();
@@ -3422,11 +3574,15 @@ mod tests {
             allocates: AtomicUsize::new(0),
         });
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
-        let (spk_tx, spk_rx) = async_channel::unbounded();
+        let (spk_tx, spk_rx) = match speaker_cap {
+            Some(cap) => async_channel::bounded(cap),
+            None => async_channel::unbounded(),
+        };
         let (ev_tx, _ev_rx) = async_channel::unbounded();
         let (vout_tx, vout_rx) = async_channel::unbounded::<VideoFrame>();
         let mut channels = test_channels(mic_rx, spk_tx, ev_tx);
         channels.video_out = vout_tx;
+        let media_stats = channels.media_stats.clone();
 
         let eng = CallEngine::new(config(), Box::new(SequentialTxIds::new())).unwrap();
         let drive_relay = relay.clone();
@@ -3448,7 +3604,26 @@ mod tests {
             relay,
             speaker: spk_rx,
             video_out: vout_rx,
+            media_stats,
         }
+    }
+
+    // Playout the application never takes is a real loss, and it is the one loss on this path that
+    // belongs to the application rather than to the call. The engine counts a frame as produced
+    // when it hands it over, so without this the counters describe a healthy call while the
+    // consumer hears nothing, and no alarm distinguishes the two.
+    #[test]
+    fn playout_a_stalled_sink_refuses_is_counted() {
+        const HORIZON_MS: u64 = 2_600;
+        // One slot, never drained: the first playout frame fills it and every later one is refused.
+        let harness = drive_schedule_with_speaker(HORIZON_MS, Some(1));
+        let ticks = HORIZON_MS / engine::PLAYOUT_MS;
+        let stats = harness.media_stats.snapshot();
+        assert_eq!(
+            u64::from(stats.audio_sink_dropped),
+            ticks - 1,
+            "every playout tick past the one the sink took is a counted drop"
+        );
     }
 
     // The happy path for the hoisted deadline timer: an armed sleep that survives across iterations

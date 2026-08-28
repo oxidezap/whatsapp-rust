@@ -260,7 +260,110 @@ impl SrtcpReplayState {
     }
 }
 
+/// How long a just-retired video SSRC stays ignorable, in authenticated packets of either stream.
+///
+/// The window a renumbering's stragglers arrive in is a network reordering window -- milliseconds --
+/// and 15fps video puts a handful of packets in one. Sized well above that and far below any real
+/// gap, so it covers the overlap without outliving it: a stream still arriving after this many
+/// packets is not a straggler, it is the peer's current stream, and it takes the depacketizer back.
+const RETIRED_SSRC_GRACE_PACKETS: u32 = 64;
+
+/// Consecutive packets a retired SSRC must deliver, once its grace has expired, before it takes the
+/// depacketizer back.
+///
+/// Expiring the grace must not turn ONE very late packet into a commitment to its stream: reclaiming
+/// on a single straggler makes the peer's actual current stream the retired one, and it is then
+/// ignored for a whole fresh grace window -- a video freeze caused by the straggler the grace exists
+/// to absorb. A resumed stream keeps arriving and clears this in a few packets; a lone latecomer
+/// never does. Any packet from the stream in possession resets the count, so only an uninterrupted
+/// run counts.
+/// How many previously-left SSRCs are remembered; see `retired_ssrcs`.
+const RETIRED_SSRC_MEMORY: usize = 4;
+
+const RETIRED_SSRC_RESUME_PACKETS: u32 = 3;
+
 const SRTP_REPLAY_WINDOW_BITS: u64 = 64;
+/// Concurrent inbound RTP streams tracked per pipeline, matching [`SRTCP_REPLAY_STREAM_CAP`].
+///
+/// One is the norm. A peer that renumbers its SSRC mid-call adds a second, and the bound keeps a
+/// peer that renumbers on every packet from growing this without limit.
+const SRTP_REPLAY_STREAM_CAP: usize = 16;
+
+/// Per-SSRC inbound RTP state: rollover counter and replay window.
+///
+/// Both are indexed by sequence number, and a sequence number only means something within one
+/// stream. Sharing them across SSRCs is what the RTCP side already avoids: two interleaved streams
+/// would each look to the other like a huge jump backwards, so roughly half the packets would fail
+/// their tag or be rejected as replays. Silently, and only for a peer that happens to use two
+/// SSRCs.
+#[derive(Default)]
+struct SrtpRecvStreams {
+    /// The first stream, held inline.
+    ///
+    /// A 1:1 call has exactly one inbound SSRC, so this is the case that runs on every packet of
+    /// every call. Spilling it to the heap to serve a second stream that usually never arrives puts
+    /// an allocation on the first packet of every call, and measured, that allocation was the entire
+    /// cost of making this per-SSRC in the first place.
+    primary: Option<(u32, RecvRocTracker, SrtpReplayWindow)>,
+    /// Streams past the first, allocated only if a peer really does renumber or use several SSRCs.
+    overflow: Vec<(u32, RecvRocTracker, SrtpReplayWindow)>,
+}
+
+impl SrtpRecvStreams {
+    /// The rollover counter to authenticate `seq` against, WITHOUT allocating anything.
+    ///
+    /// A stream never seen before estimates from a fresh counter, which is what one would answer
+    /// anyway. Nothing is allocated here on purpose; see [`Self::commit_mut`].
+    fn estimate_roc(&self, ssrc: u32, seq: u16) -> u32 {
+        self.primary
+            .iter()
+            .chain(self.overflow.iter())
+            .find(|(known, _, _)| *known == ssrc)
+            .map_or_else(
+                || RecvRocTracker::default().estimate_roc(seq),
+                |(_, roc, _)| roc.estimate_roc(seq),
+            )
+    }
+
+    /// Borrow the state for an AUTHENTICATED packet's SSRC, creating it on first sight.
+    ///
+    /// Called only after the WARP MI tag verifies, which is the point: the SSRC comes from the
+    /// unauthenticated RTP header, so allocating on sight would let anyone able to inject datagrams
+    /// spend the whole table on forged SSRCs before the peer's first real packet and leave the call
+    /// permanently deaf.
+    ///
+    /// `None` once the stream cap is reached, which drops the packet rather than evicting a live
+    /// stream: evicting would reset a rollover counter that a real stream is still using. Reaching
+    /// the cap now requires that many distinct SSRCs to have each produced a packet with a valid tag.
+    fn commit_mut(&mut self, ssrc: u32) -> Option<(&mut RecvRocTracker, &mut SrtpReplayWindow)> {
+        // `matches!` before the borrow: taking `&mut self.primary` inside the condition would hold
+        // it across the fallthrough and the borrow checker would reject the overflow path below.
+        if self.primary.is_none() || matches!(self.primary, Some((known, _, _)) if known == ssrc) {
+            let (_, roc, replay) = self.primary.get_or_insert((
+                ssrc,
+                RecvRocTracker::default(),
+                SrtpReplayWindow::default(),
+            ));
+            return Some((roc, replay));
+        }
+        if let Some(index) = self
+            .overflow
+            .iter()
+            .position(|(known, _, _)| *known == ssrc)
+        {
+            let (_, roc, replay) = &mut self.overflow[index];
+            return Some((roc, replay));
+        }
+        // The cap counts every tracked stream, the inline one included.
+        if self.overflow.len() + 1 >= SRTP_REPLAY_STREAM_CAP {
+            return None;
+        }
+        self.overflow
+            .push((ssrc, RecvRocTracker::default(), SrtpReplayWindow::default()));
+        let (_, roc, replay) = self.overflow.last_mut().expect("just pushed");
+        Some((roc, replay))
+    }
+}
 
 #[derive(Default)]
 struct SrtpReplayWindow {
@@ -393,8 +496,7 @@ pub struct MediaPipeline {
     warp_mi_tag_len: usize,
     rtp: RtpStream,
     send_roc: RocTracker,
-    recv_roc: RecvRocTracker,
-    recv_rtp_replay: SrtpReplayWindow,
+    recv_streams: SrtpRecvStreams,
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
     recv_srtcp_replay: SrtcpReplayState,
@@ -448,8 +550,7 @@ impl MediaPipeline {
             warp_mi_tag_len: p.warp_mi_tag_len,
             rtp: RtpStream::new(p.ssrc, p.samples_per_packet, false),
             send_roc: RocTracker::default(),
-            recv_roc: RecvRocTracker::default(),
-            recv_rtp_replay: SrtpReplayWindow::default(),
+            recv_streams: SrtpRecvStreams::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, false)?,
             recv_srtcp_keys: derive_srtcp_keys(
                 p.call_key,
@@ -509,8 +610,7 @@ impl MediaPipeline {
         };
         self.recv_keys = keys;
         self.recv_srtcp_keys = srtcp_keys;
-        self.recv_roc = RecvRocTracker::default();
-        self.recv_rtp_replay = SrtpReplayWindow::default();
+        self.recv_streams = SrtpRecvStreams::default();
         self.recv_srtcp_replay = SrtcpReplayState::default();
         true
     }
@@ -579,8 +679,7 @@ impl MediaPipeline {
     pub fn unprotect_audio(&mut self, packet: &[u8]) -> Option<(RtpHeader, Vec<u8>)> {
         unprotect_srtp_packet(
             &self.recv_keys,
-            &mut self.recv_roc,
-            &mut self.recv_rtp_replay,
+            &mut self.recv_streams,
             self.warp_mi_tag_len,
             packet,
         )
@@ -630,8 +729,7 @@ fn protect_srtp_packet(
 /// desync the receiver.
 fn unprotect_srtp_packet(
     recv_keys: &E2eSrtpKeys,
-    recv_roc: &mut RecvRocTracker,
-    recv_replay: &mut SrtpReplayWindow,
+    recv_streams: &mut SrtpRecvStreams,
     warp_mi_tag_len: usize,
     packet: &[u8],
 ) -> Option<(RtpHeader, Vec<u8>)> {
@@ -646,7 +744,10 @@ fn unprotect_srtp_packet(
     if without_tag.len() <= header_len {
         return None;
     }
-    let roc = recv_roc.estimate_roc(header.sequence_number);
+    // Estimate against this SSRC's own counter without allocating for it. The SSRC is read from the
+    // unauthenticated header, so committing state before the tag verifies would let anyone able to
+    // inject datagrams fill the stream table with forged SSRCs and leave the call deaf.
+    let roc = recv_streams.estimate_roc(header.ssrc, header.sequence_number);
     if !verify_warp_mi_tag(
         &recv_keys.auth_key,
         without_tag,
@@ -656,11 +757,12 @@ fn unprotect_srtp_packet(
     ) {
         return None;
     }
+    // Authenticated: only now is it safe to allocate state for this SSRC and advance its counter.
+    let (recv_roc, recv_replay) = recv_streams.commit_mut(header.ssrc)?;
     let index = (u64::from(roc) << 16) | u64::from(header.sequence_number);
     if !recv_replay.accept(index) {
         return None;
     }
-    // Authenticated: now it's safe to advance the rollover counter.
     recv_roc.commit_roc(roc, header.sequence_number);
     let cipher = &without_tag[header_len..];
     let plain = crypt_payload(recv_keys, header.ssrc, header.sequence_number, roc, cipher);
@@ -677,9 +779,41 @@ pub struct VideoPipeline {
     warp_mi_tag_len: usize,
     rtp: VideoRtpStream,
     send_roc: RocTracker,
-    recv_roc: RecvRocTracker,
-    recv_rtp_replay: SrtpReplayWindow,
+    recv_streams: SrtpRecvStreams,
     depacketizer: H264Depacketizer,
+    /// SSRC whose fragments the depacketizer currently holds, once one has authenticated.
+    ///
+    /// The receive table tracks several SSRCs so a renumbering peer keeps its own rollover counter
+    /// and replay window, but reassembly is one state machine keyed on sequence number and
+    /// timestamp -- neither of which means anything across a stream boundary. Without this, a
+    /// renumbered stream's restarted timestamps read as an old frame and its fragments splice onto
+    /// the previous stream's.
+    depacketizer_ssrc: Option<u32>,
+    /// Every stream this one has left, newest last.
+    ///
+    /// A renumbering is not instantaneous on the wire: packets from the old SSRC keep arriving for
+    /// a few milliseconds after the first packet of the new one. Each of those looks like another
+    /// stream commitment, so without this they take the depacketizer back, discard whatever the new
+    /// stream has half-assembled, and lose it again on the next new-SSRC fragment -- valid frames
+    /// dropped for the whole overlap.
+    ///
+    /// Every one of them, not just the last: a peer that changes SSRC twice has two older streams
+    /// that can still deliver a straggler, and one from the OLDER of them used to bypass both
+    /// guards below -- the grace and the run -- because each only ever asked about the most recent.
+    ///
+    /// Bounded rather than permanent, in both senses. A late packet is late by milliseconds, so a
+    /// short grace is enough and after it a stream may claim the depacketizer again by sustained
+    /// delivery; retiring one forever would leave a peer that legitimately returns to a previous
+    /// SSRC with no video at all. And the list itself is capped, so a peer that churns SSRCs cannot
+    /// grow it without limit -- [`RETIRED_SSRC_MEMORY`] is well past what a call plausibly cycles
+    /// through, and the oldest is dropped.
+    retired_ssrcs: Vec<u32>,
+    /// The retired SSRC the current run belongs to, so a run cannot be assembled out of packets
+    /// from two different old streams.
+    contender_ssrc: Option<u32>,
+    packets_since_stream_change: u32,
+    /// Consecutive packets from `contender_ssrc` since the last one from the stream in possession.
+    retired_ssrc_run: u32,
     pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
 }
@@ -721,9 +855,13 @@ impl VideoPipeline {
             warp_mi_tag_len: p.warp_mi_tag_len,
             rtp: VideoRtpStream::new(p.ssrc, p.ts_stride)?,
             send_roc: RocTracker::default(),
-            recv_roc: RecvRocTracker::default(),
-            recv_rtp_replay: SrtpReplayWindow::default(),
+            recv_streams: SrtpRecvStreams::default(),
             depacketizer: H264Depacketizer::default(),
+            depacketizer_ssrc: None,
+            retired_ssrcs: Vec::new(),
+            contender_ssrc: None,
+            packets_since_stream_change: 0,
+            retired_ssrc_run: 0,
             pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
         })
@@ -763,9 +901,13 @@ impl VideoPipeline {
             return false;
         };
         self.recv_keys = keys;
-        self.recv_roc = RecvRocTracker::default();
-        self.recv_rtp_replay = SrtpReplayWindow::default();
+        self.recv_streams = SrtpRecvStreams::default();
         self.depacketizer.reset();
+        self.depacketizer_ssrc = None;
+        self.retired_ssrcs.clear();
+        self.contender_ssrc = None;
+        self.packets_since_stream_change = 0;
+        self.retired_ssrc_run = 0;
         true
     }
 
@@ -805,6 +947,11 @@ impl VideoPipeline {
 
     pub(crate) fn reset_depacketizer(&mut self) {
         self.depacketizer.reset();
+        self.depacketizer_ssrc = None;
+        self.retired_ssrcs.clear();
+        self.contender_ssrc = None;
+        self.packets_since_stream_change = 0;
+        self.retired_ssrc_run = 0;
     }
 
     /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
@@ -852,11 +999,68 @@ impl VideoPipeline {
     ) -> Option<(RtpHeader, Vec<Vec<u8>>)> {
         let (header, payload) = unprotect_srtp_packet(
             &self.recv_keys,
-            &mut self.recv_roc,
-            &mut self.recv_rtp_replay,
+            &mut self.recv_streams,
             self.warp_mi_tag_len,
             packet,
         )?;
+        // Counted BEFORE the grace check, and for every authenticated packet including the ones that
+        // check ignores. Counting only the stream that replaced the retired one would never expire
+        // the grace in the case that matters: a peer that sends one packet on a new SSRC and then
+        // goes back to the old one delivers nothing but ignored packets, so the window would stay
+        // open and its video would be frozen for the rest of the call -- the permanent failure the
+        // bound exists to avoid, arrived at from the other side.
+        self.packets_since_stream_change = self.packets_since_stream_change.saturating_add(1);
+        // Committing to a new stream discards what the previous one left half-assembled. Dropping a
+        // partial access unit is the correct trade: the alternative is emitting one spliced from two
+        // encoders' fragments, which decodes to garbage rather than to nothing.
+        if self.depacketizer_ssrc == Some(header.ssrc) {
+            // The stream in possession is still speaking, so whatever run the retired one had built
+            // is not a resumption.
+            self.retired_ssrc_run = 0;
+        } else {
+            // A straggler from the stream we just left is not a commitment to it -- see
+            // `retired_ssrcs`. Its own access unit was discarded when we switched, so there is
+            // nothing it can complete; it is counted as received and otherwise ignored.
+            //
+            // Past the grace it still is not a commitment on its own: reclaiming on one late packet
+            // would make the peer's ACTUAL stream the retired one and freeze its video for a whole
+            // new window. Only an uninterrupted run reclaims, which a resumed stream produces in a
+            // few packets and a lone latecomer never does.
+            //
+            // Asked of EVERY stream this one has left, not only the last: with two older streams a
+            // straggler from the older one met neither guard and took reassembly on its own. A
+            // never-seen SSRC is not a straggler but a genuine stream change, and still commits at
+            // once -- that is how streams change at all.
+            if self.retired_ssrcs.contains(&header.ssrc) {
+                if self.contender_ssrc != Some(header.ssrc) {
+                    // A different old stream: it starts its own run rather than inheriting one.
+                    self.contender_ssrc = Some(header.ssrc);
+                    self.retired_ssrc_run = 0;
+                }
+                self.retired_ssrc_run = self.retired_ssrc_run.saturating_add(1);
+                if self.packets_since_stream_change <= RETIRED_SSRC_GRACE_PACKETS
+                    || self.retired_ssrc_run < RETIRED_SSRC_RESUME_PACKETS
+                {
+                    return Some((header, Vec::new()));
+                }
+            }
+            if self.depacketizer_ssrc.is_some() {
+                self.depacketizer.reset();
+            }
+            if let Some(left) = self.depacketizer_ssrc {
+                self.retired_ssrcs.retain(|ssrc| *ssrc != left);
+                if self.retired_ssrcs.len() == RETIRED_SSRC_MEMORY {
+                    self.retired_ssrcs.remove(0);
+                }
+                self.retired_ssrcs.push(left);
+            }
+            // The stream taking possession is no longer retired, whatever it was before.
+            self.retired_ssrcs.retain(|ssrc| *ssrc != header.ssrc);
+            self.depacketizer_ssrc = Some(header.ssrc);
+            self.packets_since_stream_change = 0;
+            self.retired_ssrc_run = 0;
+            self.contender_ssrc = None;
+        }
         let first = self.depacketizer.push(
             header.sequence_number,
             header.timestamp,
@@ -871,6 +1075,71 @@ impl VideoPipeline {
             completed.push(au);
         }
         Some((header, completed))
+    }
+}
+
+#[cfg(test)]
+mod replay_stream_tests {
+    use super::*;
+
+    // A sequence number only means something inside one stream. With a shared window two
+    // interleaved SSRCs each look to the other like a huge jump, and roughly half the packets are
+    // rejected as replays -- silently, and only for a peer that happens to use two SSRCs.
+    #[test]
+    fn interleaved_ssrcs_do_not_reject_each_other() {
+        let mut streams = SrtpRecvStreams::default();
+        for seq in 0..64u64 {
+            for ssrc in [0xAAAA_0001u32, 0xBBBB_0002] {
+                let (_, replay) = streams.commit_mut(ssrc).expect("within the cap");
+                assert!(
+                    replay.accept(seq),
+                    "ssrc {ssrc:#x} seq {seq} must be accepted on its own timeline"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_replay_within_one_stream_is_still_rejected() {
+        let mut streams = SrtpRecvStreams::default();
+        let (_, replay) = streams.commit_mut(1).expect("first stream");
+        assert!(replay.accept(10));
+        assert!(!replay.accept(10), "a repeat is a replay");
+        assert!(replay.accept(11));
+    }
+
+    // Dropping past the cap rather than evicting: eviction would reset a rollover counter a live
+    // stream is still using, turning a bounded resource into a correctness bug.
+    #[test]
+    fn the_stream_table_is_bounded_and_refuses_rather_than_evicting() {
+        let mut streams = SrtpRecvStreams::default();
+        for ssrc in 0..SRTP_REPLAY_STREAM_CAP as u32 {
+            assert!(streams.commit_mut(ssrc).is_some());
+        }
+        assert!(
+            streams.commit_mut(9999).is_none(),
+            "past the cap the packet is dropped"
+        );
+        assert!(
+            streams.commit_mut(0).is_some(),
+            "an established stream keeps its state"
+        );
+    }
+
+    // Each stream keeps its own rollover counter, so one stream wrapping cannot move another's.
+    #[test]
+    fn each_stream_keeps_its_own_rollover_counter() {
+        let mut streams = SrtpRecvStreams::default();
+        let (roc_a, _) = streams.commit_mut(1).expect("stream a");
+        roc_a.commit_roc(0, 0xffff);
+        let (roc_a, _) = streams.commit_mut(1).expect("stream a again");
+        assert_eq!(roc_a.estimate_roc(0x0001), 1, "stream a wrapped");
+        let (roc_b, _) = streams.commit_mut(2).expect("stream b");
+        assert_eq!(
+            roc_b.estimate_roc(0x0001),
+            0,
+            "stream b must not inherit another stream's wrap"
+        );
     }
 }
 
@@ -1594,6 +1863,234 @@ mod tests {
         let packets2 = tx.protect_video(&au2);
         assert_eq!(packets2.len(), 1);
         assert_eq!(rx.unprotect_video(&packets2[0]), Some(vec![au2]));
+    }
+
+    // The receive table authenticates a renumbered stream on its own rollover counter and replay
+    // window, but reassembly is keyed on the RTP timestamp, which restarts with the stream. Without
+    // committing the depacketizer to one SSRC at a time, the replacement stream's first frames read
+    // as reordered packets of the old one and the video freezes for as long as the peer keeps its
+    // new numbering -- which is forever.
+    #[test]
+    fn video_renumbering_peer_is_reassembled_on_its_own_timeline() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut tx = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut renumbered = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        // Three AUs on the original stream carry its clock well past zero.
+        for _ in 0..3 {
+            let au = video_au(60);
+            let packet = tx.protect_video(&au).pop().expect("one packet");
+            assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+        }
+        // The replacement stream starts its own clock at zero.
+        let au = video_au(60);
+        let packet = renumbered.protect_video(&au).pop().expect("one packet");
+        assert_eq!(
+            rx.unprotect_video(&packet),
+            Some(vec![au]),
+            "a renumbered stream's first AU must not read as a reordered packet of the old one"
+        );
+    }
+
+    // A renumbering is not instantaneous: packets from the old SSRC keep arriving while the new
+    // stream is already sending. Each straggler used to look like another stream commitment, taking
+    // the depacketizer back and discarding the fragments the new stream had assembled -- so the
+    // frames spanning the overlap were lost, on a stream whose packets all authenticated.
+    #[test]
+    fn a_straggler_from_the_retired_stream_does_not_discard_the_new_one() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut old = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut new = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        // The old stream is established, and has one AU still in flight on the wire.
+        let established = video_au(60);
+        let packet = old.protect_video(&established).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![established]));
+        let straggler = old
+            .protect_video(&video_au(60))
+            .pop()
+            .expect("the packet still in flight when the peer renumbers");
+
+        // The new stream sends an AU large enough to span several packets.
+        let au = video_au(4_000);
+        let fragments = new.protect_video(&au);
+        assert!(
+            fragments.len() > 2,
+            "the AU must span packets for the overlap to be observable"
+        );
+
+        // Its first fragments arrive, then the straggler, then the rest.
+        for fragment in &fragments[..fragments.len() - 1] {
+            assert_eq!(rx.unprotect_video(fragment), None, "still assembling");
+        }
+        assert_eq!(
+            rx.unprotect_video(&straggler),
+            None,
+            "the straggler completes nothing: its own AU went with the stream it belonged to"
+        );
+        assert_eq!(
+            rx.unprotect_video(fragments.last().expect("marker packet")),
+            Some(vec![au]),
+            "the new stream's access unit must survive the overlap intact"
+        );
+    }
+
+    // The grace has to end even when nothing but the retired stream arrives. A peer that sends one
+    // packet on a new SSRC and then goes back to the old one delivers only ignored packets, so a
+    // window counted in packets of the REPLACEMENT stream would never expire and that peer's video
+    // would be frozen for the rest of the call -- the permanent failure the bound exists to avoid.
+    #[test]
+    fn a_stream_that_resumes_past_the_grace_reclaims_reassembly() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut original = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut replacement = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        let au = video_au(60);
+        let packet = original.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+
+        // One packet on the replacement SSRC, then the peer goes back to the original stream.
+        let au = video_au(60);
+        let packet = replacement.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+
+        let mut delivered = 0;
+        for _ in 0..(RETIRED_SSRC_GRACE_PACKETS + 4) {
+            let au = video_au(60);
+            let packet = original.protect_video(&au).pop().expect("one packet");
+            if rx.unprotect_video(&packet) == Some(vec![au]) {
+                delivered += 1;
+            }
+        }
+        assert!(
+            delivered >= 3,
+            "the resumed stream must take reassembly back rather than stay ignored forever,              got {delivered} of {} delivered",
+            RETIRED_SSRC_GRACE_PACKETS + 4
+        );
+    }
+
+    // Expiring the grace must not turn ONE very late packet into a commitment to its stream. It
+    // would make the peer's actual stream the retired one, and that stream is then ignored for a
+    // whole fresh window -- a freeze caused by exactly the straggler the grace exists to absorb,
+    // arrived at from a third side.
+    #[test]
+    fn a_lone_straggler_past_the_grace_does_not_take_reassembly_from_the_live_stream() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut original = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut replacement = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        let au = video_au(60);
+        let packet = original.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+
+        // The peer renumbers and stays there, well past the grace.
+        for _ in 0..(RETIRED_SSRC_GRACE_PACKETS + 4) {
+            let au = video_au(60);
+            let packet = replacement.protect_video(&au).pop().expect("one packet");
+            let _ = rx.unprotect_video(&packet);
+        }
+
+        // One very late packet from the retired stream, then the live stream continues.
+        let au = video_au(60);
+        let straggler = original.protect_video(&au).pop().expect("one packet");
+        let _ = rx.unprotect_video(&straggler);
+
+        let mut delivered = 0;
+        for _ in 0..8 {
+            let au = video_au(60);
+            let packet = replacement.protect_video(&au).pop().expect("one packet");
+            if rx.unprotect_video(&packet) == Some(vec![au]) {
+                delivered += 1;
+            }
+        }
+        assert_eq!(
+            delivered, 8,
+            "the live stream must keep reassembly; one latecomer is not a resumption"
+        );
+    }
+
+    // The guard asked only about the MOST RECENTLY retired SSRC, so a peer that renumbered twice had
+    // an older stream that met neither the grace nor the run: one straggler from it took reassembly
+    // outright, and the live stream then froze for a whole fresh grace window.
+    #[test]
+    fn a_straggler_from_an_older_stream_does_not_take_reassembly_either() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut first = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut second = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut third = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x00FF_00FF;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        let au = video_au(60);
+        let packet = first.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+
+        // Renumber once, then again, so `first` is now two streams back.
+        for _ in 0..4 {
+            let au = video_au(60);
+            let packet = second.protect_video(&au).pop().expect("one packet");
+            let _ = rx.unprotect_video(&packet);
+        }
+        for _ in 0..(RETIRED_SSRC_GRACE_PACKETS + 4) {
+            let au = video_au(60);
+            let packet = third.protect_video(&au).pop().expect("one packet");
+            let _ = rx.unprotect_video(&packet);
+        }
+
+        // One very late packet from the OLDEST stream.
+        let au = video_au(60);
+        let straggler = first.protect_video(&au).pop().expect("one packet");
+        let _ = rx.unprotect_video(&straggler);
+
+        let mut delivered = 0;
+        for _ in 0..8 {
+            let au = video_au(60);
+            let packet = third.protect_video(&au).pop().expect("one packet");
+            if rx.unprotect_video(&packet) == Some(vec![au]) {
+                delivered += 1;
+            }
+        }
+        assert_eq!(
+            delivered, 8,
+            "an older stream's latecomer is no more a resumption than the last one's"
+        );
     }
 
     #[test]

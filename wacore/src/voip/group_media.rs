@@ -125,6 +125,20 @@ pub(crate) enum GroupMediaStream {
     Video,
 }
 
+/// Why an inbound group audio packet produced nothing.
+///
+/// Two different things, and only one of them is a fault: a packet whose SSRC is not in the roster
+/// never reaches SRTP at all, so calling it an authentication failure reports a key problem for a
+/// packet no key was tried on. A straggler from a participant an authoritative update just removed
+/// is the ordinary way that happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupAudioReject {
+    /// No route for this SSRC: not addressed to anyone this call still knows.
+    Unroutable,
+    /// Routed, and the tag did not authenticate.
+    Unprotect,
+}
+
 /// Per-call participant receiver registry with transaction-ordered shared epochs.
 pub struct GroupMediaRegistry {
     call_id: String,
@@ -414,12 +428,26 @@ impl GroupMediaRegistry {
         Ok(GroupEpochApply::Installed)
     }
 
-    pub fn unprotect_audio(&mut self, packet: &[u8]) -> Option<ParticipantMedia> {
-        let ssrc = parse_rtp_header(packet)?.ssrc;
-        let participant_id = self.audio_routes.get(&ssrc)?.clone();
-        let receiver = self.receivers.get_mut(&participant_id)?;
-        let (header, payload) = receiver.audio.as_mut()?.unprotect_audio(packet)?;
-        Some(ParticipantMedia {
+    pub fn unprotect_audio(&mut self, packet: &[u8]) -> Result<ParticipantMedia, GroupAudioReject> {
+        let ssrc = parse_rtp_header(packet)
+            .ok_or(GroupAudioReject::Unroutable)?
+            .ssrc;
+        let participant_id = self
+            .audio_routes
+            .get(&ssrc)
+            .ok_or(GroupAudioReject::Unroutable)?
+            .clone();
+        let receiver = self
+            .receivers
+            .get_mut(&participant_id)
+            .ok_or(GroupAudioReject::Unroutable)?;
+        let (header, payload) = receiver
+            .audio
+            .as_mut()
+            .ok_or(GroupAudioReject::Unroutable)?
+            .unprotect_audio(packet)
+            .ok_or(GroupAudioReject::Unprotect)?;
+        Ok(ParticipantMedia {
             participant_id,
             user_jid: receiver.user_jid.clone(),
             device_jid: receiver.device_jid.clone(),
@@ -920,7 +948,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&unknown.protect_audio(&payload))
-                .is_none()
+                .is_err()
         );
     }
 
@@ -936,7 +964,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x50; 20]))
-                .is_some(),
+                .is_ok(),
             "the direct fallback is active before the first roster"
         );
 
@@ -947,7 +975,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x51; 20]))
-                .is_none(),
+                .is_err(),
             "the first authoritative roster must revoke a departed direct peer"
         );
     }
@@ -964,7 +992,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x50; 20]))
-                .is_some()
+                .is_ok()
         );
 
         registry
@@ -976,7 +1004,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x51; 20]))
-                .is_some(),
+                .is_ok(),
             "None-to-Some PID adoption must retain the authenticated direct receiver"
         );
     }
@@ -1050,7 +1078,7 @@ mod tests {
             .unwrap();
         registry.apply_raw_epoch(2, &epoch).unwrap();
         let first = sender.protect_audio(&[0x50; 20]);
-        assert!(registry.unprotect_audio(&first).is_some());
+        assert!(registry.unprotect_audio(&first).is_ok());
 
         registry
             .apply_group_update(&update(
@@ -1063,7 +1091,7 @@ mod tests {
             ))
             .unwrap();
         let second = sender.protect_audio(&[0x51; 20]);
-        assert!(registry.unprotect_audio(&second).is_some());
+        assert!(registry.unprotect_audio(&second).is_ok());
 
         registry
             .apply_group_update(&update(4, vec![device("100001", 1, 1)]))
@@ -1071,7 +1099,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x52; 20]))
-                .is_none()
+                .is_err()
         );
     }
 
@@ -1090,7 +1118,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&first_session.protect_audio(&[0x50; 20]))
-                .is_some()
+                .is_ok()
         );
 
         let mut migrated = participants;
@@ -1103,7 +1131,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&replacement_session.protect_audio(&[0x51; 20]))
-                .is_some(),
+                .is_ok(),
             "a new PID must start with fresh ROC, replay, and depacketization state"
         );
     }

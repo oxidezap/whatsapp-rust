@@ -66,7 +66,25 @@ the reference decoder, one record per frame, compared byte-for-byte by the Rust 
 | `pulse_vectors.json` | `smpl_pulse.rs` |
 | `gains_vectors.json` | `smpl_gains.rs` |
 | `rc_vectors.json` | `rangecoder.rs::range_decoder_matches_*` |
-| `toc_vectors.json` | `toc.rs::toc_matches_*` (full 256-TOC table, input-independent) |
+| `toc_vectors.json` | `toc.rs::toc_matches_*` (256-TOC table, input-independent; see the caveat below) |
+
+### `toc_vectors.json`: the escape range is stale, deliberately
+
+The `ms` column is authoritative for the 192 in-profile bytes and **obsolete for the 64 escape bytes**
+(`0xC0..=0xFF`). It records the RFC 6716 reading (`config = b >> 3`), which is not the layout MLOW's
+in-profile CELT escape uses: that is `0xC0 | mode << 2 | stereo << 1 | multi`, as
+`packetize_opus_for_mlow` writes it and `opus_smpl_decode_TOC` in the shipped module reads it. The
+two disagree on the duration for 56 of the 64.
+
+The fixture was **not** edited to agree with the corrected parser. `toc_matches_go_all_256` skips the
+`ms` assertion over that range and names why, and `escape_durations_agree_with_the_escape_writer`
+covers it instead by round-tripping every CELT configuration through this crate's own escape writer —
+an independent statement rather than the parser checking itself.
+
+Editing an oracle until it agrees with the code is the most expensive failure mode this directory
+has: a silence fixture in here had been zeroed to match a buggy decoder, and the test over it passed
+for months. Regenerate from the pinned oracle or narrow the assertion and say so; never split the
+difference.
 
 ## External-encoder frames
 
@@ -78,3 +96,48 @@ the reference decoder, one record per frame, compared byte-for-byte by the Rust 
 exact wire bytes (config-1 `0x10` and config-2 `0x12` frames included). The tripwire test asserts the
 committed stream still carries `0x10`, `0x12`, and `0x50` TOCs so the per-config decode branches stay
 covered; regenerating it requires the external encoder above on `synth_mic.raw`.
+
+## Multi-frame (120 ms) packets — regenerable in one command
+
+| fixture | consumer / test | oracle recipe |
+| --- | --- | --- |
+| `mlow_120ms_frames.json` | `decoder.rs::multi_frame_decode_matches_the_reference` | `scripts/regenerate-mlow-vectors.sh` |
+| `ref_120ms_expected.raw` | same test | same run of the same script |
+| `mlow_dtx_off_frames.json` | `decoder.rs::dtx_off_frames_decode_to_audio` | same script, DTX-off pass |
+| `ref_dtx_off_expected.raw` | same test | same run of the same script |
+
+The DTX-off pair is what pins that a coded-inactive frame carries a decodable body rather than
+silence: the same script emits it in the same run, so regenerating one regenerates all four.
+
+```sh
+MLOW_REFERENCE=/path/to/opus_mlow scripts/regenerate-mlow-vectors.sh
+```
+
+The harness it builds lives in `scripts/mlow-vectors/mlow_frames.c`: it encodes `synth_mic.raw` at
+the requested duration through the `smpl` C reference and decodes each packet back, emitting both
+halves of the vector in one pass.
+
+The committed bytes were produced against one specific oracle —
+`github.com/edgardmessias/opus_mlow` at `84b076e0809412df22e8a0d26f944610c4a3e40f`. Reproduction is
+byte for byte **against that revision**, which is what makes a changed fixture a real change rather
+than tool drift; against a different checkout the reference itself may have moved, so the script
+prints the revision it built with and warns when it does not match.
+
+The committed vector is an intentional 8-packet prefix, not the whole input: `synth_mic.raw` chunked
+into 120 ms frames would yield ~55 packets, which is far more than the decode path needs and 7x the
+bytes. A regeneration that produces more is the script defaulting to the whole file — pass the
+packet count, as the script does.
+
+Both halves must be regenerated together — `decoder.rs::multi_frame_fixture_halves_stay_in_step`
+fails if the PCM length stops matching the frame count, and asserts every frame is still TOC `0x58`
+so the fixture cannot quietly drift off the multi-frame path.
+
+## What is still not reproducible, and why
+
+The fixtures above the multi-frame section predate the harness and were produced by tools that no
+longer exist here. The harness reproduces their SHAPE — run at 60 ms with DTX off it emits the same
+TOC mix as `inbound_capture_frames.json` (13x `0x10`, 2x `0x12`, 95x `0x50`) — but not their exact
+bytes: packet sizes bracket the committed ones without landing on them, so the original run used an
+encoder configuration (or reference build) that was not recorded. Regenerating them would therefore
+REPLACE those vectors rather than reproduce them, which is a deliberate decision to make with the
+correlation thresholds in hand, not a mechanical refresh.

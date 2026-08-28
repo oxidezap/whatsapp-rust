@@ -8,9 +8,10 @@ use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 #[cfg(feature = "voip-runtime")]
 use wacore::stanza::call::{
-    REJECT_REASON_BUSY, TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
+    CAPABILITY_INDEX_MLOW_V1, CapabilityBit, REJECT_REASON_BUSY,
+    TERMINATE_REASON_ACCEPTED_ELSEWHERE, TERMINATE_REASON_GROUP_CALL_ENDED,
     TERMINATE_REASON_REJECTED_ELSEWHERE, TERMINATE_REASON_TIMEOUT, TerminateParams,
-    VideoStateParams, build_call_video_ack, build_terminate, build_video_state,
+    VideoStateParams, build_call_video_ack, build_terminate, build_video_state, capability_bit,
 };
 use wacore::stanza::call::{build_offer_ack_receipt, parse_call_stanza};
 use wacore::stanza::group_call::build_call_control_ack;
@@ -307,6 +308,10 @@ impl StanzaHandler for CallHandler {
                         }
                         return true;
                     }
+                    // Defaults to Unknown, which is "the peer said nothing" and resets nothing:
+                    // a `<preaccept>`/`<accept>` we never parsed must not look like a refusal.
+                    #[cfg(feature = "voip-runtime")]
+                    let mut peer_mlow_bit = CapabilityBit::Unknown;
                     #[cfg(feature = "voip-runtime")]
                     if matches!(
                         &call.action,
@@ -322,6 +327,26 @@ impl StanzaHandler for CallHandler {
                                 })
                             })
                             .and_then(|action| action.get_optional_child("capability"));
+                        // Only an ABSENT node is `Unknown`; a present one reads through
+                        // `capability_bit`, which owns what an unreadable `ver` means.
+                        peer_mlow_bit = capability.map_or(CapabilityBit::Unknown, |capability| {
+                            let version = capability
+                                .get_attr("ver")
+                                .and_then(|version| version.as_str().parse::<u32>().ok());
+                            let bytes = capability.content_bytes().unwrap_or_default();
+                            capability_bit(version, bytes, CAPABILITY_INDEX_MLOW_V1)
+                        });
+                        // A device states its codec capability in the `<preaccept>` and its
+                        // `<accept>` need not repeat it -- a video answer omits the child by
+                        // construction. Retained per device so the accept below reads what THIS
+                        // device said rather than treating the omission as "the peer said nothing",
+                        // which would leave MLow on against a peer outside the rollout.
+                        client.call_registry().note_peer_capability(
+                            call.action.call_id(),
+                            generation,
+                            &routed_call_sender(&call),
+                            peer_mlow_bit,
+                        );
                         let device = if let Some(capability) = capability
                             && let Some(bytes) =
                                 capability.content_bytes().filter(|bytes| !bytes.is_empty())
@@ -396,9 +421,24 @@ impl StanzaHandler for CallHandler {
                                 orientation,
                             );
                         }
-                        client
+                        // The peer's capability and the answering device land in the same stanza
+                        // and both have to be applied before the first inbound packet, so they
+                        // travel as one message rather than racing.
+                        let peer_mlow_bit = client.call_registry().resolve_peer_capability(
+                            call.action.call_id(),
+                            &sender,
+                            peer_mlow_bit,
+                        );
+                        let audio_codec = client
                             .call_registry()
-                            .send_rekey(call.action.call_id(), sender.to_string());
+                            .peer_selected_audio_codec(call.action.call_id(), peer_mlow_bit);
+                        client.call_registry().send_rekey(
+                            call.action.call_id(),
+                            wacore::voip::driver::PeerAnswer {
+                                answering_lid: sender.to_string(),
+                                audio_codec,
+                            },
+                        );
                         if let Some(generation) =
                             client.call_registry().generation_of(call.action.call_id())
                         {
@@ -3201,10 +3241,16 @@ mod tests {
                 .answering_device_if_current("CALL-ID-0001", generation),
             Some(routed_participant.clone())
         );
+        let answer = rekey_rx
+            .try_recv()
+            .expect("the receive pipeline must rekey to the actual answering device");
+        assert_eq!(answer.answering_lid, routed_participant.to_string());
+        // The other half of what an `<accept>` teaches the caller. This fixture's peer announces the
+        // MLow capability, so the negotiated choice stands and nothing is asked to change; asserting
+        // it explicitly is what keeps the capability read from silently becoming a no-op.
         assert_eq!(
-            rekey_rx.try_recv(),
-            Ok(routed_participant.to_string()),
-            "the receive pipeline must rekey to the actual answering device"
+            answer.audio_codec, None,
+            "a peer that announced MLow changes nothing"
         );
         client
             .call_registry()

@@ -5,6 +5,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// 10 ms at the native 16 kHz mono playout rate.
 pub const GROUP_MIX_CHUNK_SAMPLES: usize = 160;
 /// Two 60 ms codec frames before a participant joins playout.
+///
+/// A FLOOR, not the target: both this and the capacity below are written in units of the 60 ms
+/// frame, and a participant sending 120 ms packets would reach a fixed 1920 with its very first one
+/// -- playable with no cushion at all, and drained again before the next packet arrives, so ordinary
+/// relay jitter becomes recurring gaps. The queue scales both to the cadence it actually sees,
+/// keeping the intent (two packets before playing, four queued at most) whatever the packet size,
+/// and never dropping below what a 60 ms stream gets today.
 pub const GROUP_MIX_PREFILL_SAMPLES: usize = 1_920;
 /// Bound partial-buffer priming to roughly 200 ms (20 mixer chunks at 10 ms each). A participant
 /// that speaks briefly and then enters DTX must not have that utterance retained until later speech.
@@ -18,6 +25,10 @@ struct ParticipantQueue {
     samples: VecDeque<i16>,
     primed: bool,
     priming_chunks: u32,
+    /// The largest packet this participant has delivered, which is what its prefill and capacity are
+    /// measured in. Largest rather than latest so a stream alternating sizes settles on the cushion
+    /// its longest packet needs instead of flapping.
+    packet_samples: usize,
 }
 
 impl ParticipantQueue {
@@ -26,7 +37,23 @@ impl ParticipantQueue {
             samples: VecDeque::with_capacity(GROUP_MIX_QUEUE_CAPACITY),
             primed: false,
             priming_chunks: 0,
+            packet_samples: 0,
         }
+    }
+
+    /// Two packets, floored at the 60 ms default so no stream primes faster than today's.
+    fn prefill(&self) -> usize {
+        self.packet_samples
+            .saturating_mul(2)
+            .max(GROUP_MIX_PREFILL_SAMPLES)
+    }
+
+    /// Four packets, on the same footing: the capacity has to stay above the prefill or a queue
+    /// could never reach it, and overflow would drop the very samples priming waits for.
+    fn capacity(&self) -> usize {
+        self.packet_samples
+            .saturating_mul(4)
+            .max(GROUP_MIX_QUEUE_CAPACITY)
     }
 }
 
@@ -65,6 +92,11 @@ impl ParticipantAudioMixer {
 
     /// Queue owned PCM for one participant. Returns false for a departed or
     /// otherwise non-authoritative participant.
+    ///
+    /// `pcm` is ONE decoded packet. That is what every caller passes, and it is what lets the queue
+    /// size its prefill and capacity to this participant's cadence rather than to a 60 ms frame it
+    /// may not be sending; handing it several packets at once would read as one long packet and ask
+    /// for a correspondingly long cushion.
     pub fn push(&mut self, participant: &str, pcm: &[i16]) -> bool {
         if pcm.is_empty()
             || self
@@ -78,11 +110,13 @@ impl ParticipantAudioMixer {
             .queues
             .entry(participant.to_string())
             .or_insert_with(ParticipantQueue::new);
+        queue.packet_samples = queue.packet_samples.max(pcm.len());
         queue.samples.extend(pcm.iter().copied());
-        while queue.samples.len() > GROUP_MIX_QUEUE_CAPACITY {
+        let capacity = queue.capacity();
+        while queue.samples.len() > capacity {
             queue.samples.pop_front();
         }
-        if queue.samples.len() >= GROUP_MIX_PREFILL_SAMPLES {
+        if queue.samples.len() >= queue.prefill() {
             queue.primed = true;
             queue.priming_chunks = 0;
         }
@@ -207,19 +241,56 @@ mod tests {
         assert!(mixer.mix_chunk().is_none());
     }
 
+    // Both bounds are written in units of the 60 ms frame, so a participant on the newly supported
+    // 120 ms packets reached a fixed 1920 prefill with its FIRST packet -- playable with no cushion,
+    // and drained again before the next one arrives, which turns ordinary relay jitter into
+    // recurring gaps. The cushion has to be measured in that participant's packets.
+    #[test]
+    fn a_participant_on_longer_packets_still_gets_a_packet_of_cushion() {
+        const LONG: usize = 1_920; // 120 ms at 16 kHz
+
+        let mut mixer = ParticipantAudioMixer::new();
+        mixer.push("alice", &vec![50; LONG]);
+        assert!(
+            mixer.mix_chunk().is_none(),
+            "one 120ms packet is the whole prefill under a fixed bound, and no cushion at all"
+        );
+
+        mixer.push("alice", &vec![50; LONG]);
+        assert_eq!(
+            mixer.mix_chunk().unwrap(),
+            vec![50; GROUP_MIX_CHUNK_SAMPLES],
+            "the second packet is what makes it playable"
+        );
+
+        // And a 60 ms participant is unchanged: two of its packets, as before.
+        let mut short = ParticipantAudioMixer::new();
+        short.push("bob", &vec![70; GROUP_MIX_OUTPUT_SAMPLES]);
+        assert!(short.mix_chunk().is_none());
+        short.push("bob", &vec![70; GROUP_MIX_OUTPUT_SAMPLES]);
+        assert_eq!(
+            short.mix_chunk().unwrap(),
+            vec![70; GROUP_MIX_CHUNK_SAMPLES]
+        );
+    }
+
     #[test]
     fn simultaneous_speakers_sum_and_saturate() {
         let mut mixer = ParticipantAudioMixer::new();
-        mixer.push("alice", &vec![20_000; GROUP_MIX_PREFILL_SAMPLES]);
-        mixer.push("bob", &vec![20_000; GROUP_MIX_PREFILL_SAMPLES]);
+        for _ in 0..2 {
+            mixer.push("alice", &vec![20_000; GROUP_MIX_OUTPUT_SAMPLES]);
+            mixer.push("bob", &vec![20_000; GROUP_MIX_OUTPUT_SAMPLES]);
+        }
         assert_eq!(
             mixer.mix_chunk().unwrap(),
             vec![i16::MAX; GROUP_MIX_CHUNK_SAMPLES]
         );
 
         let mut negative = ParticipantAudioMixer::new();
-        negative.push("alice", &vec![-20_000; GROUP_MIX_PREFILL_SAMPLES]);
-        negative.push("bob", &vec![-20_000; GROUP_MIX_PREFILL_SAMPLES]);
+        for _ in 0..2 {
+            negative.push("alice", &vec![-20_000; GROUP_MIX_OUTPUT_SAMPLES]);
+            negative.push("bob", &vec![-20_000; GROUP_MIX_OUTPUT_SAMPLES]);
+        }
         assert_eq!(
             negative.mix_chunk().unwrap(),
             vec![i16::MIN; GROUP_MIX_CHUNK_SAMPLES]
@@ -229,8 +300,10 @@ mod tests {
     #[test]
     fn authoritative_roster_removes_and_blocks_departed_participants() {
         let mut mixer = ParticipantAudioMixer::new();
-        mixer.push("alice", &vec![100; GROUP_MIX_PREFILL_SAMPLES]);
-        mixer.push("bob", &vec![200; GROUP_MIX_PREFILL_SAMPLES]);
+        for _ in 0..2 {
+            mixer.push("alice", &vec![100; GROUP_MIX_OUTPUT_SAMPLES]);
+            mixer.push("bob", &vec![200; GROUP_MIX_OUTPUT_SAMPLES]);
+        }
         mixer.retain(["alice"]);
         assert!(!mixer.push("bob", &[200; GROUP_MIX_CHUNK_SAMPLES]));
         assert_eq!(
@@ -242,7 +315,9 @@ mod tests {
     #[test]
     fn overflow_discards_oldest_audio() {
         let mut mixer = ParticipantAudioMixer::new();
-        mixer.push("alice", &vec![1; GROUP_MIX_QUEUE_CAPACITY]);
+        for _ in 0..(GROUP_MIX_QUEUE_CAPACITY / GROUP_MIX_OUTPUT_SAMPLES) {
+            mixer.push("alice", &vec![1; GROUP_MIX_OUTPUT_SAMPLES]);
+        }
         mixer.push("alice", &vec![2; GROUP_MIX_CHUNK_SAMPLES]);
         assert_eq!(mixer.mix_chunk().unwrap(), vec![1; GROUP_MIX_CHUNK_SAMPLES]);
         for _ in 0..(GROUP_MIX_QUEUE_CAPACITY / GROUP_MIX_CHUNK_SAMPLES - 2) {

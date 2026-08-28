@@ -34,9 +34,10 @@ use wacore::types::group_call::{
 use wacore::voip::relay_parse::RelayData;
 use wacore::voip::transport::RelayTransportFactory;
 use wacore::voip::{
-    AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection, CallEngine,
-    CallEvent, CallPhase, EncodedAudioFrame, GroupEngineConfig, VideoControl, VideoControlReceiver,
-    VideoControlSender, VideoFrame, VideoUpgradeToken, video_control_channel,
+    AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection,
+    CallEngine, CallEvent, CallPhase, CodecDecisionSource, EncodedAudioFrame, GroupEngineConfig,
+    VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame, VideoUpgradeToken,
+    video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -92,6 +93,24 @@ macro_rules! impl_media_builder_methods {
         }
 
         /// Send and receive complete codec payloads instead of using the built-in PCM adapter.
+        ///
+        /// `format` is a promise about the bytes the source will emit, and the negotiation can
+        /// disagree with it: MLow needs both sides to have asked for it. Answering a call whose
+        /// peer selects the other codec fails with
+        /// [`CallError::EncodedAudioCodecNotNegotiated`](crate::CallError::EncodedAudioCodecNotNegotiated),
+        /// naming both codecs so the call can be retried on the right one.
+        ///
+        /// On an outgoing call the peer's answer arrives after media is up, so there is nothing to
+        /// refuse: the receive side switches -- inbound frames carry their own codec -- and the
+        /// send side stops, because this source emits the codec it was built with and the engine
+        /// cannot re-point it. The frames it keeps producing are dropped and counted in
+        /// `outbound_frames_without_encoder` rather than sent under a profile that would accept
+        /// them and leave the peer hearing noise. Both events fire, in this order:
+        /// [`AudioCodecSwitched`](wacore::voip::CallEvent::AudioCodecSwitched) and
+        /// [`AudioCodecSourceIsFixed`](wacore::voip::CallEvent::AudioCodecSourceIsFixed). Recovery
+        /// is to end this call and place a new one on the codec the peer named -- re-encoding in
+        /// place does not resume the outbound audio, since the format this call was built with is
+        /// what the engine compares against for its lifetime.
         pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
         where
             S: EncodedAudioSource,
@@ -179,17 +198,29 @@ impl<'a> AcceptCall<'a> {
         // Take the audio endpoints out first; the offline setup (decrypt + config + addr) only
         // borrows `&self`, so move the fields before those borrows to avoid a partial-move clash.
         let audio = self.audio.take().ok_or(CallError::MissingAudio)?;
-        let audio_config = audio.config();
+        let mut audio_config = audio.config();
+        // The callee learns the peer's capability in the `<offer>`, before anything is fixed, so it
+        // simply starts on the right codec: no mutable format, no mid-call switch, no first packet
+        // decoded under the wrong grammar. MLow survives only if we asked for it and the peer
+        // announced index 31; a peer outside that rollout emits standard Opus on the same payload
+        // type, and decoding it as MLow is what makes the call silent (issue #1105).
+        let selected = peer_selected_codec_from_offer(self.incoming, audio_config.format);
+        let plan = negotiated_audio_plan(
+            audio_config.format,
+            matches!(&audio, AudioEndpoints::Encoded { .. }),
+            selected,
+        )?;
+        audio_config.format = plan.engine_format;
+        let wire_format = plan.wire_format;
+        let engine_switch = plan.engine_switch;
+        let audio_config = audio_config;
         if let CallAction::Offer { audio, .. } = &self.incoming.action
             && !audio.is_empty()
             && !audio.iter().any(|codec| {
-                codec.enc.eq_ignore_ascii_case("opus")
-                    && codec.rate == audio_config.format.signaling_rate
+                codec.enc.eq_ignore_ascii_case("opus") && codec.rate == wire_format.signaling_rate
             })
         {
-            return Err(CallError::AudioFormatNotOffered(
-                audio_config.format.signaling_rate,
-            ));
+            return Err(CallError::AudioFormatNotOffered(wire_format.signaling_rate));
         }
         let CallAction::Offer {
             call_id,
@@ -289,7 +320,7 @@ impl<'a> AcceptCall<'a> {
         };
         let mut session =
             wacore::voip::CallSession::new_incoming(call_id, peer_jid, call_creator.clone());
-        session.audio_format = Some(audio_config.format);
+        session.audio_format = Some(wire_format);
         session.is_video = has_video;
         // Why this has to survive registration: `CallEntry::peer_video_orientations`.
         // Keyed by the offering device, which for a group offer rides the outer
@@ -320,13 +351,13 @@ impl<'a> AcceptCall<'a> {
         let accept_id = self.client.generate_request_id();
         let (preaccept, accept) = build_answer_signaling(
             self.incoming,
-            audio_config.format,
+            wire_format,
             has_video,
             is_group,
             &preaccept_id,
             &accept_id,
         )?;
-        let (engine, built_call_id, addr) = send_preaccept_then_prepare(
+        let (mut engine, built_call_id, addr) = send_preaccept_then_prepare(
             self.client,
             &registration,
             &mut teardown,
@@ -334,6 +365,17 @@ impl<'a> AcceptCall<'a> {
             self.build_engine(has_video, audio_config, group),
         )
         .await?;
+        // Before a single packet: the escape and native Opus share every timing field, so this
+        // changes no RTP header and nothing that was signaled above, only which grammar the engine
+        // puts on the wire -- while `audio.format` keeps describing what the source hands it.
+        if let Some(codec) = engine_switch
+            && let Err(e) = engine.switch_audio_codec(codec, CodecDecisionSource::Negotiated)
+        {
+            log::debug!("voip: the offer selected {codec:?} and the engine refused it: {e}");
+            return Err(CallError::Media(
+                "the audio codec the peer selected could not be installed",
+            ));
+        }
         debug_assert_eq!(built_call_id, registration.call_id);
         // The decrypt above may await on the network (prekey fetch). If the connection dropped
         // meanwhile, cleanup_connection_state reaped the pending registration. Preserve the
@@ -361,7 +403,7 @@ impl<'a> AcceptCall<'a> {
                 &handle.call_id,
                 handle.generation,
                 GroupCallDevice::new(own_lid)
-                    .with_capability(1, offer_capability(has_video, audio_config.format)),
+                    .with_capability(1, offer_capability(has_video, wire_format)),
             );
             if let Some(peer_device) = peer_invite_device {
                 self.client.call_registry().set_group_invite_peer_device(
@@ -414,6 +456,7 @@ impl<'a> AcceptCall<'a> {
             config.enable_video = enable_video;
             let addr = socket_addr_from_config(&config)?;
             let mut engine = CallEngine::new(config, Box::new(RandTxIds))
+                .map(with_platform_audio_codec)
                 .map_err(|error| CallError::Setup(error.to_string()))?;
             engine
                 .configure_group(GroupEngineConfig {
@@ -468,6 +511,7 @@ impl<'a> AcceptCall<'a> {
         // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
         let addr = socket_addr_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
+            .map(with_platform_audio_codec)
             .map_err(|e| CallError::Setup(e.to_string()))?;
         Ok((engine, call_id.clone(), addr))
     }
@@ -891,6 +935,7 @@ impl<'a> OutgoingGroupCall<'a> {
         config.enable_video = video.is_some();
         let addr = socket_addr_from_config(&config)?;
         let mut engine = CallEngine::new(config, Box::new(RandTxIds))
+            .map(with_platform_audio_codec)
             .map_err(|error| CallError::Setup(error.to_string()))?;
         engine
             .configure_group(GroupEngineConfig {
@@ -1100,6 +1145,7 @@ impl<'a> CallLinkCall<'a> {
         config.enable_video = video.is_some();
         let addr = socket_addr_from_config(&config)?;
         let mut engine = CallEngine::new(config, Box::new(RandTxIds))
+            .map(with_platform_audio_codec)
             .map_err(|error| CallError::Setup(error.to_string()))?;
         engine
             .configure_group(GroupEngineConfig {
@@ -1174,6 +1220,136 @@ pub(crate) fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8]
         (true, false) => &CAPABILITY_VIDEO_OFFER,
         (false, false) => &CAPABILITY_OFFER,
     }
+}
+
+/// Give the engine the platform's standard-Opus codec, when this build has one.
+///
+/// A no-op without `voip-libopus`, and that is the honest outcome: the call still runs, and if the
+/// peer turns out to speak Opus the engine reports `CallEvent::AudioSilent` with
+/// `NoDecoderForNegotiatedCodec` rather than a call that looks connected and carries nothing.
+fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
+    #[cfg(feature = "voip-libopus")]
+    {
+        // Both seams, because a call can be either shape: the instance decodes the direct path, the
+        // factory gives each group participant their own (one decoder cannot serve several
+        // speakers -- it carries inter-frame state).
+        let engine = engine
+            .with_foreign_audio_codec_factory(Box::new(crate::voip::audio::LibopusCodecFactory));
+        match crate::voip::audio::LibopusAudioCodec::new() {
+            Ok(codec) => engine.with_foreign_audio_codec(Box::new(codec)),
+            Err(e) => {
+                log::warn!("voip: libopus unavailable for this call, Opus will not decode: {e}");
+                engine
+            }
+        }
+    }
+    #[cfg(not(feature = "voip-libopus"))]
+    engine
+}
+
+/// The codec the offering peer's `<capability>` selects, or `None` when the local choice stands.
+///
+/// Mirrors `reset_voip_params_if_no_capability`: a peer that announced nothing resets nothing, a
+/// peer whose blob is unreadable resets everything, and MLow needs both sides to have asked for it.
+/// Only the MLow/Opus pair at one RTP timing is swappable, so a locally-selected profile outside
+/// that pair (the 48 kHz RFC 7587 one) is left exactly as the consumer configured it.
+/// What the peer's capability decides about a call that has not started yet.
+///
+/// Three facts come out of one selection and they are not the same fact: which format the ENGINE is
+/// built with, which one the SIGNALING announces, and whether the engine has to be switched after
+/// construction. They coincide for a PCM endpoint and part company for an encoded one, whose format
+/// is a promise the APPLICATION made about the bytes it will hand us -- the source is already built
+/// and carries no per-frame codec, so nothing can tell it the call chose the other one.
+#[derive(Debug, PartialEq, Eq)]
+struct NegotiatedAudioPlan {
+    /// What the engine is constructed with. For an encoded endpoint this stays the source's own
+    /// format, because that is what `audio.format` means to the engine: what arrives from the
+    /// application, not what goes on the wire. Overwriting it is what let escape-profile bytes
+    /// reach a native-Opus peer with their rewritten TOCs intact -- the engine compares the two to
+    /// decide whether to translate, and had been told they agreed.
+    engine_format: AudioFormat,
+    /// What the peer is told, and what the wire actually carries.
+    wire_format: AudioFormat,
+    /// Set when the engine must be moved off the format it was built with, before media flows.
+    engine_switch: Option<AudioCodec>,
+}
+
+fn negotiated_audio_plan(
+    configured: AudioFormat,
+    encoded_endpoint: bool,
+    selected: Option<AudioCodec>,
+) -> Result<NegotiatedAudioPlan, CallError> {
+    let unchanged = NegotiatedAudioPlan {
+        engine_format: configured,
+        wire_format: configured,
+        engine_switch: None,
+    };
+    let Some(codec) = selected else {
+        return Ok(unchanged);
+    };
+    // A codec with no sibling at this timing cannot be reached without re-signalling, so the call
+    // stays as configured rather than silently changing what the peer was told.
+    let Some(format) = configured.sibling_for(codec) else {
+        return Ok(unchanged);
+    };
+    // Only a change of CODEC is unanswerable: the source emits one grammar and cannot be told to
+    // emit another, so the application has to pick again. A change of container is answerable --
+    // the escape profile and native Opus carry the same Opus bytes, and the engine is what stops
+    // rewriting their TOCs.
+    if encoded_endpoint && configured.codec != codec {
+        return Err(CallError::EncodedAudioCodecNotNegotiated {
+            configured: configured.codec,
+            selected: codec,
+        });
+    }
+    Ok(NegotiatedAudioPlan {
+        engine_format: if encoded_endpoint { configured } else { format },
+        wire_format: format,
+        engine_switch: encoded_endpoint.then_some(codec),
+    })
+}
+
+fn peer_selected_codec_from_offer(
+    incoming: &IncomingCall,
+    format: AudioFormat,
+) -> Option<AudioCodec> {
+    use wacore::stanza::call::{CAPABILITY_INDEX_MLOW_V1, CapabilityBit, capability_bit};
+    use wacore::voip::{AudioCodec, AudioFormat};
+
+    // 1:1 only, and the guard lives here rather than at the call site because the question itself
+    // does not have a call-wide answer for a group. A group offer carries the capability of the ONE
+    // device that invited us, while the engine applies the call's format to every participant: read
+    // as a decision, it decodes the whole roster under one member's grammar and every member still
+    // on negotiated MLOW goes silent. A group answers per participant instead, which the engine's
+    // own classification and probe provide.
+    if incoming.group.is_some() {
+        return None;
+    }
+    if format != AudioFormat::MLOW_16KHZ_60MS
+        && format != AudioFormat::OPUS_16KHZ_60MS
+        && format != AudioFormat::OPUS_MLOW_16KHZ_60MS
+    {
+        return None;
+    }
+    let peer = incoming
+        .media()
+        .and_then(|media| media.peer_device.as_ref())
+        .map_or(CapabilityBit::Unknown, |device| {
+            capability_bit(
+                device.capability_version,
+                device.capability(),
+                CAPABILITY_INDEX_MLOW_V1,
+            )
+        });
+    // The capability gates MLOW's CONTAINER, not the codec inside it -- the escape profile carries
+    // standard Opus in MLOW's framing, and a peer that cleared the bit cannot parse that either.
+    let local_mlow = format.rtp_profile == AudioRtpProfile::Mlow;
+    let effective_mlow = wacore::stanza::call::mlow_after_peer_capability(local_mlow, peer);
+    (effective_mlow != local_mlow).then_some(if effective_mlow {
+        AudioCodec::Mlow
+    } else {
+        AudioCodec::Opus
+    })
 }
 
 fn ensure_group_offer_media(
@@ -1780,6 +1956,9 @@ async fn place_call(
     );
 
     let muted = Arc::new(AtomicBool::new(false));
+    // Created here, before the relay is even dialled, so the handle this returns and the drive loop
+    // that starts minutes of signaling later publish into the SAME cell.
+    let media_stats = Arc::new(wacore::voip::MediaStatsCell::default());
     let ended = Arc::new(EndedFlag::default());
     // Wake wait_ended() whenever this registry entry is removed -- including a terminal stanza or a
     // disconnect that lands while we're still dialing the relay (no media task yet to carry the notify).
@@ -1793,7 +1972,7 @@ async fn place_call(
     // relay still lands: the sender lives on the registry from this point; the receiver is parked on
     // the pending entry and handed to the drive loop when the relay arrives (the bounded(1) buffers a
     // pre-engine rekey). One slot is enough — the rekey is one-shot (first answerer wins).
-    let (rekey_tx, rekey_rx) = async_channel::bounded::<String>(1);
+    let (rekey_tx, rekey_rx) = async_channel::bounded::<wacore::voip::driver::PeerAnswer>(1);
     registry.set_rekey_sender(&call_id, generation, rekey_tx);
 
     // Video plumbing exists for EVERY call (idle channels cost nothing): the signaling handler and
@@ -1827,6 +2006,7 @@ async fn place_call(
                 ended: ended.clone(),
                 ev_tx,
                 rekey_rx,
+                media_stats: media_stats.clone(),
             },
         );
 
@@ -1868,6 +2048,7 @@ async fn place_call(
         video: video_shared,
         events: ev_rx,
         ended,
+        media_stats,
     })
 }
 
@@ -2040,7 +2221,10 @@ pub(crate) struct PendingOutgoing {
     ev_tx: async_channel::Sender<CallEvent>,
     /// Receiver half of the one-shot recv-rekey channel (sender lives on the registry). Handed to the
     /// drive loop when the relay arrives so a `<accept>` that beat the relay is still applied (buffered).
-    rekey_rx: async_channel::Receiver<String>,
+    rekey_rx: async_channel::Receiver<wacore::voip::driver::PeerAnswer>,
+    /// Shared with the handle this call already returned, so the counters the drive loop publishes
+    /// once the relay lands reach a consumer that has been holding the handle since before it did.
+    media_stats: Arc<wacore::voip::MediaStatsCell>,
 }
 
 /// The relay socket address to dial, read off a built config's already-parsed endpoint (avoids
@@ -2103,6 +2287,7 @@ pub(crate) async fn attach_outgoing_relay(
         // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
         let addr = socket_addr_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
+            .map(with_platform_audio_codec)
             .map_err(|e| CallError::Setup(e.to_string()))?;
         Ok::<_, CallError>((
             engine,
@@ -2136,6 +2321,7 @@ pub(crate) async fn attach_outgoing_relay(
         // Outgoing: hand the drive loop the recv-rekey receiver so a callee `<accept>` rekeys recv to
         // the answering device (buffered if the accept beat this relay).
         Some(pending.rekey_rx),
+        pending.media_stats,
     )
     .await?;
     Ok(true)
@@ -2542,6 +2728,7 @@ async fn spawn_registered_call(
     registration.ensure_current()?;
     let registry = &registration.registry;
     let muted = Arc::new(AtomicBool::new(false));
+    let media_stats = Arc::new(wacore::voip::MediaStatsCell::default());
     let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
     let video_shared = Arc::new(VideoShared::new());
     registry.set_video_channels(
@@ -2566,6 +2753,7 @@ async fn spawn_registered_call(
         ev_tx,
         // Incoming (callee): no recv-rekey — the callee already keys recv on its own self LID.
         None,
+        media_stats.clone(),
     )
     .await?;
     Ok(CallHandle {
@@ -2580,6 +2768,7 @@ async fn spawn_registered_call(
         video: video_shared,
         events: ev_rx,
         ended: registration.ended.clone(),
+        media_stats,
     })
 }
 
@@ -2635,7 +2824,8 @@ async fn attach_engine(
     ev_tx: async_channel::Sender<CallEvent>,
     // Caller-only recv-rekey receiver; `None` for an incoming call (the callee keys recv on its own
     // self LID and never rekeys).
-    rekey_rx: Option<async_channel::Receiver<String>>,
+    rekey_rx: Option<async_channel::Receiver<wacore::voip::driver::PeerAnswer>>,
+    media_stats: Arc<wacore::voip::MediaStatsCell>,
 ) -> Result<(), CallError> {
     let (group_tx, group_rx) = async_channel::bounded(GROUP_CONTROL_CHANNEL_CAPACITY);
     if !client.call_registry().set_group_control_sender(
@@ -2754,6 +2944,14 @@ async fn attach_engine(
         video_shared.send_control(VideoControl::Enable);
     }
 
+    // One cell, three readers: the drive loop publishes into it, the consumer's `CallHandle` holds
+    // it directly, and the registry hands it to anyone who has only a call id. The handle's own
+    // reference is what makes the FINAL counters readable: the registry entry is removed before
+    // `wait_ended()` fires, which is exactly when a consumer inspects a call that failed.
+    client
+        .call_registry()
+        .set_media_stats(call_id, generation, media_stats.clone());
+
     let channels = CallChannels {
         mic: mic_rx,
         speaker,
@@ -2765,6 +2963,7 @@ async fn attach_engine(
         video_out: video_out_tx,
         video_ctl: video_ctl_rx,
         group_ctl,
+        media_stats,
     };
 
     let registry = client.call_registry();
@@ -3083,6 +3282,10 @@ pub struct CallHandle {
     video: Arc<VideoShared>,
     events: async_channel::Receiver<CallEvent>,
     ended: Arc<EndedFlag>,
+    /// The same cell the drive loop publishes into. Held here rather than looked up by call id: the
+    /// registry entry is gone by the time `wait_ended()` returns, and the counters of a call that
+    /// just failed are the ones most worth reading.
+    media_stats: Arc<wacore::voip::MediaStatsCell>,
 }
 
 fn ensure_group_invite_capacity(
@@ -3198,6 +3401,21 @@ impl CallHandle {
     /// The call-id this handle controls.
     pub fn call_id(&self) -> &str {
         &self.call_id
+    }
+
+    /// Media counters for this call: what arrived, what was discarded, and where.
+    ///
+    /// All-zero until the media plane attaches, and additive after that; sample twice and subtract
+    /// for a rate. Pair it with [`wacore::voip::CallEvent::AudioSilent`], which fires on its own
+    /// when packets keep arriving and none of them becomes sound: the event says a call is silent
+    /// and these counters say why.
+    ///
+    /// **Readable after the call ends**, which is the point: the drive loop publishes once more on
+    /// its way out, and this handle holds the cell itself, so the natural moment to inspect a call
+    /// that carried nothing -- right after [`wait_ended`](Self::wait_ended) -- returns the final
+    /// counters rather than zeroes.
+    pub fn media_stats(&self) -> wacore::voip::CallMediaStats {
+        self.media_stats.snapshot()
     }
 
     /// The peer this call is with, as the `<terminate>` target. For an outgoing call this is the
@@ -4807,6 +5025,241 @@ mod tests {
         RegisteredCall::new(client, session).await
     }
 
+    /// An `<offer>` whose `<capability>` carries the given blob, or none at all.
+    fn offer_with_capability(capability: Option<(u32, Vec<u8>)>) -> IncomingCall {
+        let peer_device = capability
+            .map(|(version, bytes)| GroupCallDevice::new(caller()).with_capability(version, bytes));
+        incoming_offer(false).with_peer_device_for_test(peer_device)
+    }
+
+    // The callee half of the #1105 fix, and the cheaper of the two: the peer's capability is in the
+    // offer, before anything is fixed, so the call simply starts on the right codec. It had no test.
+    #[test]
+    fn a_callee_starts_on_opus_when_the_offer_clears_the_mlow_bit() {
+        use wacore::stanza::call::{CAPABILITY_OFFER, CAPABILITY_STANDARD_OPUS_OFFER};
+        use wacore::voip::AudioCodec;
+
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&outside_rollout, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus),
+            "a peer that cannot decode MLOW must not be sent it"
+        );
+
+        let inside_rollout = offer_with_capability(Some((1, CAPABILITY_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&inside_rollout, AudioFormat::MLOW_16KHZ_60MS),
+            None,
+            "both sides asked for MLOW, so nothing changes"
+        );
+
+        assert_eq!(
+            peer_selected_codec_from_offer(
+                &offer_with_capability(None),
+                AudioFormat::MLOW_16KHZ_60MS
+            ),
+            None,
+            "a peer that announced nothing resets nothing"
+        );
+    }
+
+    // A group offer carries the capability of the ONE device that invited us, while the engine
+    // applies the call's format to EVERY participant. Read as a call-wide decision, one member
+    // outside the MLOW rollout silences every member still inside it -- the roster decoded under a
+    // grammar only the inviter uses. A group answers per participant instead, which the engine's
+    // classification and probe already provide.
+    #[test]
+    fn a_group_offer_never_picks_the_roster_codec_from_the_inviting_device() {
+        use wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER;
+        use wacore::voip::AudioCodec;
+
+        let mut incoming =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&incoming, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus),
+            "the same capability decides a 1:1 call, which is the case it is for"
+        );
+
+        let group = GroupCallUpdate::builder()
+            .call_id(incoming.action.call_id().to_string())
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        incoming.group = Some(Box::new(group));
+        assert_eq!(
+            peer_selected_codec_from_offer(&incoming, AudioFormat::MLOW_16KHZ_60MS),
+            None,
+            "but one device cannot answer it for a roster"
+        );
+    }
+
+    // A consumer that deliberately configured a profile whose TIMING differs keeps it: the RFC 7587
+    // clock is not something a capability bit may silently change under a live stream.
+    #[test]
+    fn a_profile_with_its_own_timing_is_left_exactly_as_configured() {
+        use wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER;
+
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        for format in [
+            AudioFormat::OPUS_RFC7587_16KHZ_60MS,
+            AudioFormat::OPUS_RFC7587_48KHZ_60MS,
+        ] {
+            assert_eq!(
+                peer_selected_codec_from_offer(&outside_rollout, format),
+                None,
+                "{format:?} has its own timing and must be preserved"
+            );
+        }
+    }
+
+    // MLOW's escape profile carries standard Opus inside MLOW's container, so what the capability
+    // gates is the container, not the codec name. A peer that cleared the bit registers native Opus
+    // on the same payload type and cannot parse the escape's rewritten TOC -- and because the two
+    // formats agree on every timing field, dropping the escape costs nothing and changes no RTP
+    // header byte. Read as "the codec is already Opus, nothing to do", the call would keep sending
+    // a container the peer does not speak.
+    #[test]
+    fn the_mlow_escape_is_dropped_for_a_peer_outside_the_rollout() {
+        use wacore::stanza::call::{CAPABILITY_OFFER, CAPABILITY_STANDARD_OPUS_OFFER};
+        use wacore::voip::AudioCodec;
+
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&outside_rollout, AudioFormat::OPUS_MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus),
+            "the escape has to give way to native Opus"
+        );
+        assert_eq!(
+            AudioFormat::OPUS_MLOW_16KHZ_60MS.sibling_for(AudioCodec::Opus),
+            Some(AudioFormat::OPUS_16KHZ_60MS),
+            "and the timing lets it, so nothing is re-signalled"
+        );
+
+        // A peer inside the rollout speaks the container: the escape stays.
+        let inside_rollout = offer_with_capability(Some((1, CAPABILITY_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&inside_rollout, AudioFormat::OPUS_MLOW_16KHZ_60MS),
+            None
+        );
+    }
+
+    // Which format the ENGINE gets and which one the WIRE gets are two answers, and for an encoded
+    // endpoint they differ. Collapsing them told the engine its source was already native Opus,
+    // which is exactly the comparison it uses to decide whether the escape's TOCs need translating
+    // -- so it translated nothing and the peer got bytes it cannot parse.
+    #[test]
+    fn an_encoded_endpoint_keeps_its_own_format_while_the_wire_moves() {
+        use wacore::voip::AudioCodec;
+
+        let plan = negotiated_audio_plan(
+            AudioFormat::OPUS_MLOW_16KHZ_60MS,
+            true,
+            Some(AudioCodec::Opus),
+        )
+        .expect("a container change is answerable");
+        assert_eq!(
+            plan.engine_format,
+            AudioFormat::OPUS_MLOW_16KHZ_60MS,
+            "the engine has to keep knowing what the source emits"
+        );
+        assert_eq!(plan.wire_format, AudioFormat::OPUS_16KHZ_60MS);
+        assert_eq!(
+            plan.engine_switch,
+            Some(AudioCodec::Opus),
+            "so the move onto the wire format is a switch, applied before any packet"
+        );
+
+        // A PCM endpoint has no fixed source, so the engine is simply built on the wire format and
+        // there is nothing to switch.
+        let plan =
+            negotiated_audio_plan(AudioFormat::MLOW_16KHZ_60MS, false, Some(AudioCodec::Opus))
+                .expect("PCM follows the negotiation");
+        assert_eq!(plan.engine_format, AudioFormat::OPUS_16KHZ_60MS);
+        assert_eq!(plan.wire_format, AudioFormat::OPUS_16KHZ_60MS);
+        assert_eq!(plan.engine_switch, None);
+
+        // A codec the source cannot emit is still refused: nothing can tell it to encode MLow.
+        assert!(matches!(
+            negotiated_audio_plan(AudioFormat::OPUS_16KHZ_60MS, true, Some(AudioCodec::Mlow)),
+            Err(CallError::EncodedAudioCodecNotNegotiated { .. })
+        ));
+
+        // Nothing selected changes nothing, for either kind of endpoint.
+        for encoded in [true, false] {
+            let plan = negotiated_audio_plan(AudioFormat::MLOW_16KHZ_60MS, encoded, None)
+                .expect("no selection is not a failure");
+            assert_eq!(plan.engine_format, AudioFormat::MLOW_16KHZ_60MS);
+            assert_eq!(plan.wire_format, AudioFormat::MLOW_16KHZ_60MS);
+            assert_eq!(plan.engine_switch, None);
+        }
+    }
+
+    // A blob the peer sent that cannot be read resets everything, unlike a blob it never sent. The
+    // two are opposite directions and getting them the same way round is the shape of #1105.
+    #[test]
+    fn an_unreadable_offer_capability_downgrades_but_an_absent_one_does_not() {
+        use wacore::voip::AudioCodec;
+
+        // Present, valid `ver`, but no bitmask at all.
+        let empty = offer_with_capability(Some((1, Vec::new())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&empty, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus)
+        );
+        // A version below the one index 31 belongs to answers false for everything.
+        let stale =
+            offer_with_capability(Some((0, vec![0x00, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13])));
+        assert_eq!(
+            peer_selected_codec_from_offer(&stale, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus)
+        );
+    }
+
+    // An `EncodedAudioSource` emits one codec for the life of the call and has nothing to be told
+    // a switch on, so a call whose negotiation lands on the other one is refused rather than
+    // answered: taking it would send MLow bytes in a profile that accepts any nonempty payload, and
+    // the peer would hear noise with nothing on this side noticing.
+    #[tokio::test]
+    async fn accept_refuses_a_fixed_encoded_codec_the_peer_did_not_negotiate() {
+        use wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER;
+        use wacore::voip::AudioCodec;
+
+        let client = make_client().await;
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+
+        let result = client
+            .voip()
+            .accept(&outside_rollout)
+            .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+            .start()
+            .await;
+
+        let error = result.err().expect("the mismatch must be refused");
+        assert!(
+            matches!(
+                error,
+                CallError::EncodedAudioCodecNotNegotiated {
+                    configured: AudioCodec::Mlow,
+                    selected: AudioCodec::Opus,
+                }
+            ),
+            "expected the mismatch to be refused, got {error:?}"
+        );
+    }
+
     #[tokio::test]
     async fn audio_offer_rejects_from_start_video_endpoints() {
         let client = make_client().await;
@@ -5426,6 +5879,7 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         };
         assert_eq!(handle.peer_jid(), caller(), "bare peer before any accept");
         let device = caller().with_device(2);
@@ -5678,7 +6132,48 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         }
+    }
+
+    // The counters of a call that carried nothing are the ones worth reading, and the natural moment
+    // to read them is right after `wait_ended()` -- by which point the registry entry is already
+    // gone. A handle that looked its stats up by call id answered that question with zeroes.
+    #[tokio::test]
+    async fn media_stats_survive_the_end_of_the_call() {
+        let client = make_client().await;
+        let generation = client.call_registry().insert(mk_session());
+        let (_ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
+        let media_stats = Arc::new(wacore::voip::MediaStatsCell::default());
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: client.call_registry(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
+            client: std::sync::Weak::new(),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: Arc::new(VideoShared::new()),
+            events: ev_rx,
+            ended: Arc::new(EndedFlag::default()),
+            media_stats: media_stats.clone(),
+        };
+        // What the drive loop publishes on its way out: a call that heard nothing and said why.
+        let mut final_stats = wacore::voip::CallMediaStats::default();
+        assert_eq!(handle.media_stats(), final_stats, "nothing published yet");
+        final_stats.rtp_received = 120;
+        final_stats.audio_frames_without_decoder = 120;
+        media_stats.publish(final_stats);
+        client
+            .call_registry()
+            .remove_if_current("CID-FACADE", generation);
+        let stats = handle.media_stats();
+        assert_eq!(
+            (stats.rtp_received, stats.audio_frames_without_decoder),
+            (120, 120),
+            "the final counters must outlive the registry entry"
+        );
     }
 
     // The reported symptom: ending a call from the handle used to be local-only, so the peer kept
@@ -7809,6 +8304,7 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: ended.clone(),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         };
 
         // Drive attach_engine in the background; it parks in the gated connect.
@@ -7830,6 +8326,7 @@ mod tests {
                     ended,
                     ev_tx,
                     None,
+                    Arc::new(wacore::voip::MediaStatsCell::default()),
                 )
                 .await
             }
@@ -7908,6 +8405,7 @@ mod tests {
                     ended,
                     ev_tx,
                     None,
+                    Arc::new(wacore::voip::MediaStatsCell::default()),
                 )
                 .await
             }
@@ -7980,6 +8478,7 @@ mod tests {
                     ended,
                     ev_tx,
                     None,
+                    Arc::new(wacore::voip::MediaStatsCell::default()),
                 )
                 .await
             }
@@ -9731,6 +10230,7 @@ mod tests {
             video: video_shared.clone(),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         };
 
         let (vsrc, vsink) = video_endpoints();
@@ -9811,6 +10311,7 @@ mod tests {
             video: video.clone(),
             events,
             ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         };
 
         let request = peer_upgrade_request(&handle).await;
@@ -9901,6 +10402,7 @@ mod tests {
             video: video.clone(),
             events,
             ended: Arc::new(EndedFlag::default()),
+            media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
         };
 
         let drops = Arc::new(AtomicUsize::new(0));

@@ -555,7 +555,7 @@ pub(crate) fn synth_internal_frame(
 }
 
 /// Cross-frame decoder state (the persistent LSF/pitch predictor, prev NLSF, CELP synthesis).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct SmplDecoderState {
     pub(crate) lstate: super::smpl_decode::SmplLsfState,
     pub(crate) prev_nlsf: Vec<f32>,
@@ -563,4 +563,52 @@ pub(crate) struct SmplDecoderState {
     pub(crate) celp: super::smpl_celpdec::CelpDecState,
     /// Per-packet harmonic postfilter state (runs once per packet after all internal frames).
     pub(crate) harm: super::smpl_harm_postfilter::HarmPostfilterState,
+}
+
+/// The cross-frame state one packet's internal-frame loop advances, snapshotted so a malformed body
+/// can be undone instead of seeding the next packet with parameters invented past its end.
+///
+/// `harm` is deliberately not here. The harmonic postfilter runs once per packet AFTER the endpoint
+/// check, so a concealed packet cannot have advanced it — and its comb state is 9 KB, larger than
+/// everything in this struct put together. Carrying it would be 9 KB of `memcpy` per packet to
+/// restore a value that provably did not change.
+///
+/// Owned by the decoder and reused across packets, because `#[derive(Clone)]` generates only
+/// `clone` and the trait's default `clone_from` is `*self = source.clone()`: that is why the fields
+/// below are copied through hand-written `clone_from`/`copy_state_from` impls rather than assigned.
+/// The snapshot is written on every packet and read only on a malformed one, so it must neither
+/// allocate nor copy more than it has to.
+pub(crate) struct SmplDecodeRollback {
+    lstate: super::smpl_decode::SmplLsfState,
+    prev_nlsf: Vec<f32>,
+    celp: super::smpl_celpdec::CelpDecState,
+}
+
+impl Default for SmplDecodeRollback {
+    /// The NLSF vector is sized up front for the same reason the snapshot is owned rather than
+    /// taken fresh: its length is the LPC order for every packet, so a decoder whose first packet
+    /// grows this buffer would pay an allocation on the decode path for a size known here.
+    fn default() -> Self {
+        Self {
+            lstate: super::smpl_decode::SmplLsfState::default(),
+            prev_nlsf: Vec::with_capacity(SMPL_ORDER),
+            celp: super::smpl_celpdec::CelpDecState::default(),
+        }
+    }
+}
+
+impl SmplDecodeRollback {
+    /// Take the pre-decode copy, into the buffers this snapshot already owns.
+    pub(crate) fn save(&mut self, state: &SmplDecoderState) {
+        self.lstate = state.lstate.clone();
+        self.prev_nlsf.clone_from(&state.prev_nlsf);
+        self.celp.clone_from(&state.celp);
+    }
+
+    /// Put the saved state back, undoing what the internal-frame loop advanced.
+    pub(crate) fn restore(&self, state: &mut SmplDecoderState) {
+        state.lstate = self.lstate.clone();
+        state.prev_nlsf.clone_from(&self.prev_nlsf);
+        state.celp.clone_from(&self.celp);
+    }
 }

@@ -64,6 +64,25 @@ impl Default for HpPostfilterState {
     }
 }
 
+impl HpPostfilterState {
+    /// Copy the persistent filter state out of `src`, leaving this value's scratch buffers alone.
+    ///
+    /// Named rather than folded into `clone_from` because it is deliberately not a full copy: the
+    /// `scratch_*` buffers are 5 KB of the 6.4 KB this struct occupies and each is fully
+    /// overwritten (`[..n]`) before it is read, so a rollback has nothing to restore in them. The
+    /// decoder's concealment snapshot runs on every packet while the rollback it protects is rare,
+    /// which is what makes 5 KB of `memcpy` worth not doing.
+    pub(crate) fn copy_state_from(&mut self, src: &Self) {
+        self.state_lo_emph1 = src.state_lo_emph1;
+        self.state_lo_emph2 = src.state_lo_emph2;
+        self.state_hp = src.state_hp;
+        self.lag_old = src.lag_old;
+        self.x_old = src.x_old;
+        self.coef_ma = src.coef_ma;
+        self.coef_ar = src.coef_ar;
+    }
+}
+
 /// Small-angle cosine `cos_approx(x) = 1 - 0.5*x^2`.
 #[inline]
 fn cos_approx(x: f32) -> f32 {

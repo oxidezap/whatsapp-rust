@@ -87,6 +87,7 @@ pub(crate) fn decode_smpl_lsf(
     st: &mut SmplLsfState,
     config: usize,
     intf: usize,
+    coded_as_active_voice: bool,
 ) -> SmplLsfIndices {
     let mut idx = SmplLsfIndices {
         stage1: 0,
@@ -95,8 +96,13 @@ pub(crate) fn decode_smpl_lsf(
         extra: 0,
     };
 
-    // Read 1: stage-1 selector. The first internal frame uses the dedicated row 0; later frames
-    // pick row 1/2 by the previous frame's stage-1 result.
+    // Read 1: the voicing symbol, whose value doubles as the stage-1 selector. The first internal
+    // frame uses the dedicated row 0; later frames pick row 1/2 by the previous frame's result.
+    //
+    // It is only on the wire when the frame was coded as active voice. A frame coded inactive
+    // (DTX off, so the encoder still sends background noise) carries no voicing symbol at all and
+    // is unvoiced by definition; reading one would consume a symbol that was never written and
+    // desync every field after it.
     let sel = if intf == 0 {
         0
     } else if st.prev_stage1 != 0 {
@@ -104,7 +110,11 @@ pub(crate) fn decode_smpl_lsf(
     } else {
         1
     };
-    let stage1 = dec.decode_cdf(&t.lsf_sel[sel]);
+    let stage1 = if coded_as_active_voice {
+        dec.decode_cdf(&t.lsf_sel[sel])
+    } else {
+        0
+    };
     idx.stage1 = stage1;
 
     // match := enter_match && stage1 == prev_stage1. enter_match is false for the first internal
@@ -143,8 +153,13 @@ pub(crate) fn decode_smpl_lsf(
         idx.stage2[k] = dec.decode_cdf(c);
     }
 
-    // "Extra" LSF read: a 3-symbol static CDF, always fires for our path (p4=1, num_subfr>=2).
-    idx.extra = dec.decode_cdf(&t.lsf_extra);
+    // The LSF interpolation index, on the wire only for an active-voice frame with more than one
+    // subframe (the reference gates it on the same flag as the voicing symbol).
+    idx.extra = if coded_as_active_voice {
+        dec.decode_cdf(&t.lsf_extra)
+    } else {
+        0
+    };
 
     log::trace!(
         "mlow LSF intf={intf} sel={sel} m={m}: stage1={stage1} grid={grid} extra={} stage2={:?}",
@@ -172,7 +187,7 @@ mod tests {
             let frame = hex::decode(rec["frame"].as_str().unwrap()).unwrap();
             let mut st = SmplLsfState::default();
             let mut dec = RangeDecoder::new(&frame[1..]);
-            let idx = decode_smpl_lsf(&mut dec, t, &mut st, 0, 0);
+            let idx = decode_smpl_lsf(&mut dec, t, &mut st, 0, 0, true);
             assert_eq!(idx.stage1, rec["stage1"].as_i64().unwrap() as i32, "stage1");
             assert_eq!(idx.grid, rec["grid"].as_i64().unwrap() as i32, "grid");
             assert_eq!(idx.extra, rec["extra"].as_i64().unwrap() as i32, "extra");

@@ -792,6 +792,8 @@ async fn relay_driver(
 ) {
     let mut buf = vec![0u8; RELAY_DATAGRAM_BUF];
     let mut announced = false;
+    // Media discarded under backpressure since the last report. See `deliver`.
+    let mut dropped_inbound = 0u32;
     let mut hung_up = false;
     loop {
         // Flush, deliver, announce: everything the stack produced since the last wakeup, before
@@ -799,12 +801,12 @@ async fn relay_driver(
         while let Some(datagram) = stack.poll_transmit() {
             if let Err(e) = socket.send(&datagram).await {
                 let reason = RelayDisconnectReason::ReadError(format!("relay socket send: {e}"));
-                finish(&events, &open, announced, reason).await;
+                finish(&events, &open, announced, dropped_inbound, reason).await;
                 return;
             }
         }
         while let Some(packet) = stack.poll_inbound() {
-            if !deliver(&events, packet).await {
+            if !deliver(&events, packet, &mut dropped_inbound).await {
                 return; // the call dropped its receiver
             }
         }
@@ -851,7 +853,7 @@ async fn relay_driver(
 
         if let Err(e) = step {
             debug!("voip: relay media channel ended: {e}");
-            finish(&events, &open, announced, e.into()).await;
+            finish(&events, &open, announced, dropped_inbound, e.into()).await;
             return;
         }
     }
@@ -867,8 +869,28 @@ async fn sleep_until(deadline: Option<Instant>) {
 
 /// Push one inbound packet to the call, dropping media (but never STUN) under backpressure. Returns
 /// `false` once the call has dropped its receiver and the driver should stop.
-async fn deliver(events: &async_channel::Sender<RelayTransportEvent>, packet: Bytes) -> bool {
+///
+/// `dropped` accumulates media discarded here. It cannot be reported at the moment of the drop: the
+/// queue being full is precisely why the packet is going away, so a notification sent right then
+/// would be discarded too. It is flushed BEFORE the next packet, not after: sustained backpressure
+/// where the call drains one slot per packet would otherwise refill that slot with the packet
+/// itself every time, and the report -- the one number that explains the overload -- would stay
+/// pending for the life of the call. A pending report only exists after a drop, so in a healthy
+/// call this costs nothing; when it does take the slot, the packet behind it is media (lossy by
+/// design here) or STUN, which waits for a slot rather than being dropped.
+async fn deliver(
+    events: &async_channel::Sender<RelayTransportEvent>,
+    packet: Bytes,
+    dropped: &mut u32,
+) -> bool {
     let kind = classify_relay_packet(&packet);
+    if *dropped > 0
+        && events
+            .try_send(RelayTransportEvent::InboundDropped(*dropped))
+            .is_ok()
+    {
+        *dropped = 0;
+    }
     match events.try_send(RelayTransportEvent::PacketReceived(packet)) {
         Ok(()) => true,
         // Media is loss tolerant, but STUN control is NOT: dropping a Binding Request means the
@@ -882,6 +904,7 @@ async fn deliver(events: &async_channel::Sender<RelayTransportEvent>, packet: By
         // dead one. Past the bound the STUN goes the way of the media.
         Err(async_channel::TrySendError::Full(event)) => {
             if kind != RelayPacketKind::Stun {
+                *dropped = dropped.saturating_add(1);
                 return true;
             }
             match tokio::time::timeout(RELAY_STUN_HOLD, events.send(event)).await {
@@ -899,8 +922,19 @@ async fn finish(
     events: &async_channel::Sender<RelayTransportEvent>,
     open: &async_channel::Sender<Result<(), String>>,
     announced: bool,
+    dropped: u32,
     reason: RelayDisconnectReason,
 ) {
+    // Ahead of the disconnect, because the disconnect is the last thing the driver will ever send:
+    // media discarded under backpressure is only reported when a LATER packet arrives, so a relay
+    // that fails right after an overload would take the final burst with it and the call's closing
+    // `media_stats()` would show the loss as if it never happened. Overload immediately before a
+    // failure is precisely the overload worth attributing.
+    if announced && dropped > 0 {
+        let _ = events
+            .send(RelayTransportEvent::InboundDropped(dropped))
+            .await;
+    }
     if announced {
         let _ = events.send(RelayTransportEvent::Disconnected(reason)).await;
     } else {
@@ -954,8 +988,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_maps_packets_to_events() {
         let (tx, rx) = async_channel::unbounded();
-        assert!(deliver(&tx, Bytes::from_static(&[1, 2, 3])).await);
-        assert!(deliver(&tx, Bytes::from_static(&[4, 5])).await);
+        assert!(deliver(&tx, Bytes::from_static(&[1, 2, 3]), &mut 0).await);
+        assert!(deliver(&tx, Bytes::from_static(&[4, 5]), &mut 0).await);
         match rx.try_recv() {
             Ok(RelayTransportEvent::PacketReceived(b)) => assert_eq!(b.as_ref(), &[1u8, 2, 3][..]),
             other => panic!("expected first packet, got {other:?}"),
@@ -966,13 +1000,66 @@ mod tests {
         }
     }
 
+    // A drop report is only ever sent when a LATER packet arrives, so a relay that fails right after
+    // an overload would carry the final burst away with it: the call's closing `media_stats()` would
+    // show that loss as if it had never happened. Overload immediately before a failure is exactly
+    // the overload worth attributing.
+    #[tokio::test]
+    async fn the_last_drop_burst_survives_the_disconnect() {
+        let (tx, rx) = async_channel::unbounded();
+        let (open_tx, _open_rx) = async_channel::unbounded();
+
+        finish(&tx, &open_tx, true, 7, RelayDisconnectReason::Closed).await;
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            matches!(events.first(), Some(RelayTransportEvent::InboundDropped(7))),
+            "the pending count goes out ahead of the disconnect, got {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(RelayTransportEvent::Disconnected(_))),
+            "and the disconnect is still the last thing said, got {events:?}"
+        );
+    }
+
+    // The drop report is the one number that explains an overload, and it used to be sent AFTER the
+    // packet that had just refilled the only free slot. Under exactly the backpressure it exists to
+    // describe -- the call draining one slot per arriving packet -- it could stay pending for the
+    // whole call, leaving `inbound_pipe_dropped` at zero while media was being discarded.
+    #[tokio::test]
+    async fn a_pending_drop_report_reaches_the_call_under_sustained_backpressure() {
+        let (tx, rx) = async_channel::bounded(1);
+        let mut dropped = 0;
+        // Fills the single slot.
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2]), &mut dropped).await);
+        // Nowhere to go: media, so discarded and counted.
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 3, 4]), &mut dropped).await);
+        assert_eq!(dropped, 1, "the discarded media is pending a report");
+
+        // The call takes one event and one more packet arrives -- the steady state of a call that
+        // is behind. The slot must go to the report first, or it never goes anywhere.
+        let _ = rx.recv().await.unwrap();
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 5, 6]), &mut dropped).await);
+        match rx.try_recv() {
+            Ok(RelayTransportEvent::InboundDropped(n)) => assert_eq!(n, 1),
+            other => panic!("expected the drop report, got {other:?}"),
+        }
+        // The packet behind the report found the channel full and became the next pending report:
+        // under sustained overload the count arrives one round late, which is what a counter can
+        // honestly do here. What matters is that it arrives at all.
+        assert_eq!(
+            dropped, 1,
+            "the media displaced by the report is itself counted"
+        );
+    }
+
     // A closed receiver (the call dropped it) stops the driver promptly via the try_send Closed arm.
     #[tokio::test]
     async fn deliver_reports_a_closed_receiver() {
         let (tx, rx) = async_channel::unbounded();
         rx.close();
         assert!(
-            !deliver(&tx, Bytes::from_static(&[1])).await,
+            !deliver(&tx, Bytes::from_static(&[1]), &mut 0).await,
             "a closed event receiver must stop the driver"
         );
     }
@@ -984,12 +1071,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deliver_bounds_how_long_stun_can_hold_the_driver() {
         let (tx, _rx) = async_channel::bounded(1);
-        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2])).await);
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2]), &mut 0).await);
         let held = tokio::time::Instant::now();
         // The outer bound is what makes an unbounded hold fail here rather than hang the suite.
         let kept_going = tokio::time::timeout(
             RELAY_STUN_HOLD * 50,
-            deliver(&tx, Bytes::from_static(&[0x00, 0x01, 5, 6])),
+            deliver(&tx, Bytes::from_static(&[0x00, 0x01, 5, 6]), &mut 0),
         )
         .await
         .expect("the STUN hold must give up, or the driver's timers never run again");
@@ -1013,9 +1100,9 @@ mod tests {
     async fn deliver_preserves_stun_but_drops_media_under_backpressure() {
         let (tx, rx) = async_channel::bounded(1);
         let feed = tokio::spawn(async move {
-            assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2])).await);
-            assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 3, 4])).await);
-            assert!(deliver(&tx, Bytes::from_static(&[0x00, 0x01, 5, 6])).await);
+            assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 1, 2]), &mut 0).await);
+            assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 3, 4]), &mut 0).await);
+            assert!(deliver(&tx, Bytes::from_static(&[0x00, 0x01, 5, 6]), &mut 0).await);
         });
 
         // Receiving the first media frees the slot the held STUN send is waiting on.
@@ -1031,6 +1118,40 @@ mod tests {
             "the STUN must be preserved while the media behind the first was dropped, got {second:?}"
         );
         feed.await.unwrap();
+    }
+
+    // A media packet dropped under backpressure is indistinguishable from a peer who stopped
+    // sending unless it is counted, and the count cannot be reported at the moment of the drop --
+    // the queue being full is precisely why the packet is going away. It is flushed on the next
+    // delivery that succeeds, which is the first instant the channel has room for it.
+    #[tokio::test]
+    async fn a_dropped_media_packet_is_counted_and_reported_on_the_next_delivery() {
+        let (tx, rx) = async_channel::bounded(4);
+        let mut dropped = 0u32;
+
+        // Fill the channel, then two media packets that have nowhere to go.
+        for n in 0..4u8 {
+            assert!(deliver(&tx, Bytes::from(vec![0x90, 0x78, n]), &mut dropped).await);
+        }
+        assert_eq!(dropped, 0, "nothing was dropped while there was room");
+        for n in 0..2u8 {
+            assert!(deliver(&tx, Bytes::from(vec![0x90, 0x78, 100 + n]), &mut dropped).await);
+        }
+        assert_eq!(dropped, 2, "both media packets were discarded and counted");
+
+        // Draining makes room; the next successful delivery flushes the count.
+        let _ = rx.recv().await.unwrap();
+        let _ = rx.recv().await.unwrap();
+        assert!(deliver(&tx, Bytes::from_static(&[0x90, 0x78, 9]), &mut dropped).await);
+        assert_eq!(dropped, 0, "the count was handed over, not kept");
+
+        let reported = core::iter::from_fn(|| rx.try_recv().ok())
+            .find_map(|event| match event {
+                RelayTransportEvent::InboundDropped(n) => Some(n),
+                _ => None,
+            })
+            .expect("the drop must reach the call, not die at the crate boundary");
+        assert_eq!(reported, 2);
     }
 }
 
@@ -1262,7 +1383,10 @@ mod loopback_relay {
             match event {
                 RelayTransportEvent::PacketReceived(p) => return Some(p),
                 RelayTransportEvent::Disconnected(_) => return None,
-                RelayTransportEvent::Connected => {}
+                // `_`, not an exhaustive list: the event stream is `#[non_exhaustive]` precisely so
+                // the media plane can learn to report something new without breaking a consumer
+                // that only forwards packets, and this helper is one such consumer.
+                _ => {}
             }
         }
         None
@@ -1775,6 +1899,7 @@ mod udp_relay_e2e {
                     video_out: async_channel::bounded(1).0,
                     video_ctl: video_control_channel().1,
                     group_ctl: None,
+                    media_stats: Arc::new(wacore::voip::MediaStatsCell::default()),
                 },
                 eng,
             ));

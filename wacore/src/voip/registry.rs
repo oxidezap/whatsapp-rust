@@ -38,6 +38,10 @@ const PENDING_INITIAL_GROUP_CONTROL_TTL: Duration = Duration::from_secs(10);
 const MAX_CALL_EVENT_QUEUE_BYTES: usize = 1024 * 1024;
 const MAX_GROUP_CONTROL_QUEUE_BYTES: usize = 1024 * 1024;
 const DEFAULT_CALL_EVENT_QUEUE_CAPACITY: usize = 64;
+/// Peer devices whose `<capability>` statement one call retains. A peer answers from one device;
+/// this is headroom for its siblings preaccepting first, and a bound on what an unsolicited stream
+/// of `<preaccept>`s can make this call allocate.
+const PEER_CAPABILITY_DEVICE_CAP: usize = 8;
 const MAX_RINGING_GROUP_CALLS: usize = 64;
 const MAX_RINGING_GROUP_CALL_BYTES: usize = 1024 * 1024;
 
@@ -225,6 +229,10 @@ fn retained_epoch(control: GroupControl) -> Option<GroupRawEpoch> {
 struct CallEntry {
     session: CallSession,
     media_task: Option<AbortHandle>,
+    /// Media counters published by the drive loop, readable through the consumer's `CallHandle`.
+    /// Installed when the engine attaches; absent before that, which reads as all-zero rather than
+    /// as an error, because a call with no media plane genuinely has no media to count.
+    media_stats: Option<Arc<crate::voip::media_stats::MediaStatsCell>>,
     /// Keeps a pending call-link admission alive. Cleared on admission and aborted with the entry.
     waiting_room_task: Option<AbortHandle>,
     /// Monotonic token distinguishing this registration from a later same-call-id replacement, so a
@@ -232,7 +240,7 @@ struct CallEntry {
     generation: u64,
     /// Caller-only, one-shot: delivers the answering device LID to the drive loop so it can rekey
     /// recv. Taken on first use (a duplicate `<accept>` finds `None`); dropped with the entry.
-    rekey_tx: Option<async_channel::Sender<String>>,
+    rekey_tx: Option<async_channel::Sender<crate::voip::driver::PeerAnswer>>,
     /// The call's consumer-facing event queue (same channel `CallHandle::events()` reads), so the
     /// SIGNALING handler can surface `<video state>` changes next to the engine's events.
     event_tx: Option<CallEventQueue>,
@@ -305,6 +313,14 @@ struct CallEntry {
     group_invite_peer_device: Option<GroupCallDevice>,
     /// Once an `<accept>` selects a device, delayed sibling preaccepts cannot replace it.
     group_invite_peer_selected: bool,
+    /// What each peer device stated about `use_mlow_codec_v1` in a `<preaccept>`, kept so a later
+    /// `<accept>` from the same device that omits the `<capability>` child is still read against
+    /// what that device said. A video `<accept>` omits it by construction, and reading that as
+    /// "the peer said nothing" leaves MLow on against a peer outside the rollout, which is the
+    /// silence of issue #1105 arriving through the other door. Bounded: a peer with more devices
+    /// than this is not answering from all of them, and an unbounded list is a free allocation for
+    /// anyone who can send a `<preaccept>`.
+    peer_announced_capability: Vec<(Jid, crate::stanza::call::CapabilityBit)>,
     /// Wakes this call's `wait_ended()` waiter on removal, even before a media task exists. Fires from
     /// `EndedNotify`'s Drop whenever the entry leaves the map.
     on_terminal: Option<EndedNotify>,
@@ -514,6 +530,22 @@ impl CallEntry {
                 .peer_video_orientations
                 .iter()
                 .map(|entry| entry.announcer.heap_bytes())
+                .sum::<usize>()
+            + self
+                .media_stats
+                .as_ref()
+                // Fixed-size and behind one Arc: the counters are all integers, so the allocation
+                // is the whole cost. Counted anyway -- a per-call allocation that no report
+                // mentions is how an estimate drifts from the heap it claims to describe.
+                .map_or(0, |_| size_of::<crate::voip::media_stats::MediaStatsCell>())
+            + self
+                .peer_announced_capability
+                .capacity()
+                .saturating_mul(size_of::<(Jid, crate::stanza::call::CapabilityBit)>())
+            + self
+                .peer_announced_capability
+                .iter()
+                .map(|(device, _)| device.heap_bytes())
                 .sum::<usize>()
             + size_of::<AsyncMutex<()>>() * 2
             + size_of::<event_listener::Event>()
@@ -1697,6 +1729,7 @@ impl CallRegistry {
             peer_orientation_seq: 0,
             session,
             media_task: None,
+            media_stats: None,
             waiting_room_task: None,
             generation,
             rekey_tx: None,
@@ -1717,6 +1750,7 @@ impl CallRegistry {
             group_invite_self_device: None,
             group_invite_peer_device: None,
             group_invite_peer_selected: false,
+            peer_announced_capability: Vec::new(),
             on_terminal: None,
         };
         if let Some((announcer, orientation)) = announced {
@@ -1788,6 +1822,32 @@ impl CallRegistry {
         entry.adopt_session(session);
         ringing.remove(&call_id);
         true
+    }
+
+    /// Install the cell the drive loop publishes media counters into.
+    pub fn set_media_stats(
+        &self,
+        call_id: &str,
+        generation: u64,
+        cell: Arc<crate::voip::media_stats::MediaStatsCell>,
+    ) {
+        if let Some(entry) = self
+            .active_calls()
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.media_stats = Some(cell);
+        }
+    }
+
+    /// Media counters for one call generation, or all-zero before the engine attaches.
+    pub fn media_stats(&self, call_id: &str, generation: u64) -> crate::voip::CallMediaStats {
+        self.active_calls()
+            .get(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.media_stats.as_ref())
+            .map(|cell| cell.snapshot())
+            .unwrap_or_default()
     }
 
     /// Attach (or replace) the media task for the call registered under `generation`. If the call
@@ -2000,7 +2060,7 @@ impl CallRegistry {
         &self,
         call_id: &str,
         generation: u64,
-        tx: async_channel::Sender<String>,
+        tx: async_channel::Sender<crate::voip::driver::PeerAnswer>,
     ) {
         if let Some(entry) = self.active_calls().get_mut(call_id)
             && entry.generation == generation
@@ -2766,16 +2826,119 @@ impl CallRegistry {
             .is_some_and(|entry| entry.generation == generation)
     }
 
-    /// Caller side: rekey recv to the device that answered. One-shot — the sender is TAKEN, so a
-    /// duplicate/late `<accept>` from another device is a no-op (first answerer wins, matching WA Web).
-    /// Silently ignored when absent (no engine yet, an incoming call, or the call is torn down).
-    pub fn send_rekey(&self, call_id: &str, answering_lid: String) {
+    /// Remember what one peer device stated about `use_mlow_codec_v1`.
+    ///
+    /// [`CapabilityBit::Unknown`](crate::stanza::call::CapabilityBit::Unknown) is not recorded and
+    /// never overwrites a statement: it means the
+    /// stanza carried no `<capability>` at all, which is the absence this exists to fill in. A
+    /// device that states the bit twice keeps its latest statement.
+    pub fn note_peer_capability(
+        &self,
+        call_id: &str,
+        generation: u64,
+        device: &Jid,
+        peer: crate::stanza::call::CapabilityBit,
+    ) {
+        use crate::stanza::call::CapabilityBit;
+
+        if peer == CapabilityBit::Unknown {
+            return;
+        }
+        let mut calls = self.active_calls();
+        // Generation-guarded like every other asynchronous write here: a delayed `<preaccept>` from
+        // a superseded call would otherwise write its statement into the retry that replaced it,
+        // and a later capability-less `<accept>` from that same device would resolve against it and
+        // pick the wrong codec for a call that never said anything of the sort.
+        let Some(entry) = calls
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return;
+        };
+        if let Some(slot) = entry
+            .peer_announced_capability
+            .iter_mut()
+            .find(|(known, _)| known == device)
+        {
+            slot.1 = peer;
+        } else if entry.peer_announced_capability.len() < PEER_CAPABILITY_DEVICE_CAP {
+            entry.peer_announced_capability.push((device.clone(), peer));
+        }
+    }
+
+    /// What `device` has stated about `use_mlow_codec_v1`, preferring what THIS stanza carried.
+    ///
+    /// A stanza that carries a `<capability>` is the peer speaking now and always wins, including
+    /// when it clears the bit. Only an absent one falls back, and only to the same device: two
+    /// devices of one account can sit on opposite sides of a rollout, so another device's statement
+    /// is not evidence about this one.
+    #[must_use]
+    pub fn resolve_peer_capability(
+        &self,
+        call_id: &str,
+        device: &Jid,
+        stated: crate::stanza::call::CapabilityBit,
+    ) -> crate::stanza::call::CapabilityBit {
+        use crate::stanza::call::CapabilityBit;
+
+        if stated != CapabilityBit::Unknown {
+            return stated;
+        }
+        self.active_calls()
+            .get(call_id)
+            .and_then(|entry| {
+                entry
+                    .peer_announced_capability
+                    .iter()
+                    .find(|(known, _)| known == device)
+                    .map(|(_, bit)| *bit)
+            })
+            .unwrap_or(CapabilityBit::Unknown)
+    }
+
+    /// The audio codec a peer's `<capability>` selects for a live call, or `None` when the
+    /// negotiated choice already stands.
+    ///
+    /// The gate is mutual: MLow survives only if we asked for it **and** the peer announced it. A
+    /// peer that announced nothing changes nothing, which is what the official client does with a
+    /// participant that sent no blob.
+    pub fn peer_selected_audio_codec(
+        &self,
+        call_id: &str,
+        peer: crate::stanza::call::CapabilityBit,
+    ) -> Option<crate::voip::audio::AudioCodec> {
+        use crate::voip::audio::AudioCodec;
+
+        let format = self
+            .active_calls()
+            .get(call_id)
+            .and_then(|entry| entry.session.audio_format)?;
+        // What the capability gates is MLOW's CONTAINER, not the codec inside it: the escape
+        // profile carries standard Opus in MLOW's framing, so a peer that cleared the bit cannot
+        // parse it either. Keyed on the codec, an escape call would sail past this check and put a
+        // rewritten TOC on the wire for a peer that registered native Opus on the same payload type.
+        let local_mlow = format.rtp_profile == crate::voip::audio::AudioRtpProfile::Mlow;
+        let effective_mlow = crate::stanza::call::mlow_after_peer_capability(local_mlow, peer);
+        (effective_mlow != local_mlow).then_some(if effective_mlow {
+            AudioCodec::Mlow
+        } else {
+            AudioCodec::Opus
+        })
+    }
+
+    /// Caller side: deliver what the callee's `<accept>` taught us — the answering device's LID and
+    /// the codec its capability selects — so the drive loop applies both before media flows.
+    ///
+    /// One-shot: the sender is TAKEN, so a duplicate or late `<accept>` from another device is a
+    /// no-op (first answerer wins, matching WA Web). Silently ignored when absent (no engine yet, an
+    /// incoming call, or the call is torn down).
+    pub fn send_rekey(&self, call_id: &str, answer: crate::voip::driver::PeerAnswer) {
         let tx = self
             .active_calls()
             .get_mut(call_id)
             .and_then(|e| e.rekey_tx.take());
         if let Some(tx) = tx {
-            let _ = tx.try_send(answering_lid);
+            let _ = tx.try_send(answer);
         }
     }
 
@@ -5923,6 +6086,13 @@ mod tests {
         );
     }
 
+    fn peer_answer(lid: &str) -> crate::voip::driver::PeerAnswer {
+        crate::voip::driver::PeerAnswer {
+            answering_lid: lid.to_string(),
+            audio_codec: None,
+        }
+    }
+
     /// An abort handle that flips a shared flag, so a test can assert the registry actually aborts
     /// the stored handle (the runtime-agnostic analog of asserting a tokio task was cancelled).
     fn flag_handle(flag: &Arc<AtomicBool>) -> AbortHandle {
@@ -5930,23 +6100,164 @@ mod tests {
         AbortHandle::new(move || flag.store(true, Ordering::SeqCst))
     }
 
+    // The caller-side half of the #1105 fix: a peer that answers without announcing MLow selects
+    // standard Opus, and the drive loop applies it before the first inbound packet.
+    #[test]
+    fn a_peer_that_clears_the_mlow_bit_selects_opus_for_a_live_call() {
+        use crate::stanza::call::CapabilityBit;
+        use crate::voip::audio::{AudioCodec, AudioFormat};
+
+        let reg = CallRegistry::new();
+        let mut s = session("CID");
+        s.audio_format = Some(AudioFormat::MLOW_16KHZ_60MS);
+        reg.insert(s);
+        assert_eq!(
+            reg.peer_selected_audio_codec("CID", CapabilityBit::Clear),
+            Some(AudioCodec::Opus)
+        );
+        assert_eq!(
+            reg.peer_selected_audio_codec("CID", CapabilityBit::Set),
+            None,
+            "both sides asked for MLow, so nothing changes"
+        );
+        assert_eq!(
+            reg.peer_selected_audio_codec("CID", CapabilityBit::Unknown),
+            None,
+            "a peer that announced nothing resets nothing"
+        );
+    }
+
+    // A consumer that deliberately configured native Opus must not be dragged back to MLow just
+    // because the peer happens to support it. The gate is an AND, and we are one of its inputs.
+    #[test]
+    fn a_locally_chosen_opus_call_is_never_pulled_back_to_mlow() {
+        use crate::stanza::call::CapabilityBit;
+        use crate::voip::audio::AudioFormat;
+
+        let reg = CallRegistry::new();
+        let mut s = session("CID");
+        s.audio_format = Some(AudioFormat::OPUS_16KHZ_60MS);
+        reg.insert(s);
+        for peer in [
+            CapabilityBit::Set,
+            CapabilityBit::Clear,
+            CapabilityBit::Unknown,
+        ] {
+            assert_eq!(reg.peer_selected_audio_codec("CID", peer), None);
+        }
+    }
+
+    // Every other asynchronous write here is generation-guarded, and this one holds the statement a
+    // later capability-less `<accept>` is resolved against -- so an unguarded write lets a delayed
+    // stanza from a superseded call choose the codec of the retry that replaced it.
+    #[test]
+    fn a_superseded_generation_cannot_state_a_capability_for_its_replacement() {
+        use crate::stanza::call::CapabilityBit;
+
+        let reg = CallRegistry::new();
+        let stale = reg.insert(session("CID"));
+        let device = Jid::new("222222222222222", Server::Lid).with_device(2);
+        // A same-id retry replaces the entry; the delayed `<preaccept>` belongs to the old one.
+        let current = reg.insert(session("CID"));
+        assert_ne!(stale, current);
+
+        reg.note_peer_capability("CID", stale, &device, CapabilityBit::Clear);
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &device, CapabilityBit::Unknown),
+            CapabilityBit::Unknown,
+            "the replacement has heard nothing from this device"
+        );
+        // The live generation is recorded as usual.
+        reg.note_peer_capability("CID", current, &device, CapabilityBit::Clear);
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &device, CapabilityBit::Unknown),
+            CapabilityBit::Clear
+        );
+    }
+
+    // A video `<accept>` omits the `<capability>` child by construction, so the accept alone reads
+    // as "the peer said nothing" and leaves MLow on -- against the same device that just said, in
+    // its `<preaccept>`, that it does not speak it.
+    #[test]
+    fn an_accept_without_a_capability_reads_the_same_device_preaccept() {
+        use crate::stanza::call::CapabilityBit;
+
+        let reg = CallRegistry::new();
+        let generation = reg.insert(session("CID"));
+        let answering = Jid::new("222222222222222", Server::Lid).with_device(2);
+        let sibling = Jid::new("222222222222222", Server::Lid).with_device(3);
+
+        reg.note_peer_capability("CID", generation, &answering, CapabilityBit::Clear);
+        reg.note_peer_capability("CID", generation, &sibling, CapabilityBit::Set);
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &answering, CapabilityBit::Unknown),
+            CapabilityBit::Clear,
+            "the accept's own device is the one whose earlier statement applies"
+        );
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &sibling, CapabilityBit::Unknown),
+            CapabilityBit::Set,
+            "two devices of one account can sit on opposite sides of a rollout"
+        );
+        // A stanza that carries the child is the peer speaking now, and always wins.
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &answering, CapabilityBit::Set),
+            CapabilityBit::Set
+        );
+        // Unknown is an absence, not a statement: it never overwrites one.
+        reg.note_peer_capability("CID", generation, &answering, CapabilityBit::Unknown);
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &answering, CapabilityBit::Unknown),
+            CapabilityBit::Clear
+        );
+        // A device nobody has heard from stays unknown, as does an unknown call.
+        let stranger = Jid::new("333333333333333", Server::Lid).with_device(1);
+        assert_eq!(
+            reg.resolve_peer_capability("CID", &stranger, CapabilityBit::Unknown),
+            CapabilityBit::Unknown
+        );
+        assert_eq!(
+            reg.resolve_peer_capability("NOPE", &answering, CapabilityBit::Unknown),
+            CapabilityBit::Unknown
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_negotiated_format_selects_nothing() {
+        use crate::stanza::call::CapabilityBit;
+
+        let reg = CallRegistry::new();
+        reg.insert(session("CID"));
+        assert_eq!(
+            reg.peer_selected_audio_codec("CID", CapabilityBit::Clear),
+            None
+        );
+        assert_eq!(
+            reg.peer_selected_audio_codec("UNKNOWN", CapabilityBit::Clear),
+            None
+        );
+    }
+
     #[test]
     fn send_rekey_is_one_shot_and_generation_guarded() {
         let reg = CallRegistry::new();
         let g = reg.insert(session("CID"));
-        let (tx, rx) = async_channel::bounded::<String>(1);
+        let (tx, rx) = async_channel::bounded::<crate::voip::driver::PeerAnswer>(1);
         // A stale generation is ignored (no sender stored).
         reg.set_rekey_sender("CID", g + 99, tx.clone());
-        reg.send_rekey("CID", "x".into());
+        reg.send_rekey("CID", peer_answer("x"));
         assert!(
             rx.try_recv().is_err(),
             "stale-generation sender must not fire"
         );
         // The live generation stores it; the first send fires, the second is a no-op (taken).
         reg.set_rekey_sender("CID", g, tx);
-        reg.send_rekey("CID", "222222222222222:2@lid".into());
-        assert_eq!(rx.try_recv().ok().as_deref(), Some("222222222222222:2@lid"));
-        reg.send_rekey("CID", "again".into());
+        reg.send_rekey("CID", peer_answer("222222222222222:2@lid"));
+        assert_eq!(
+            rx.try_recv().ok().map(|answer| answer.answering_lid),
+            Some("222222222222222:2@lid".to_string())
+        );
+        reg.send_rekey("CID", peer_answer("again"));
         assert!(rx.try_recv().is_err(), "rekey sender is one-shot");
     }
 

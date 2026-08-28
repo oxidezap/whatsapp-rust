@@ -928,6 +928,18 @@ pub enum CallError {
     #[cfg(feature = "voip-runtime")]
     #[error("incoming offer does not advertise the selected audio rate {0}")]
     AudioFormatNotOffered(u32),
+    /// The peer's `<capability>` selected the audio codec the fixed encoded endpoint is not
+    /// producing. An [`EncodedAudioSource`](crate::voip::EncodedAudioSource) emits one codec for
+    /// the life of the call, so a call that would have to send the other one is refused instead of
+    /// answered one-way.
+    #[cfg(feature = "voip-runtime")]
+    #[error(
+        "encoded audio is fixed at {configured:?} but the peer's capability selects {selected:?}"
+    )]
+    EncodedAudioCodecNotNegotiated {
+        configured: wacore::voip::AudioCodec,
+        selected: wacore::voip::AudioCodec,
+    },
     /// Video endpoints were supplied for an offer that only advertised audio.
     #[cfg(feature = "voip-runtime")]
     #[error("incoming offer did not advertise video; use start_video() after answering")]

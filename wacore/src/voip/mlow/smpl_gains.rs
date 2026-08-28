@@ -94,7 +94,7 @@ mod tests {
             let frame = hex::decode(rec["frame"].as_str().unwrap()).unwrap();
             let mut st = SmplLsfState::default();
             let mut dec = RangeDecoder::new(&frame[1..]);
-            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut st, 0, 0);
+            let lsf = decode_smpl_lsf(&mut dec, tbl, &mut st, 0, 0, true);
             let pulses = decode_smpl_pulses(&mut dec, cc, 320, 4, 1, 0, lsf.stage1);
             let g = decode_smpl_gains(&mut dec, cc, 4, pulses.subfr);
             assert_eq!(g.gain_q.to_vec(), as_i32(&rec["gain_q"]), "gain_q");

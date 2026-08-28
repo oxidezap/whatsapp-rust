@@ -7,7 +7,7 @@ use bytes::Bytes;
 use opus::{Application, Bandwidth, Bitrate, Channels, Decoder, Encoder};
 use wacore::voip::EncodedAudioFrame;
 #[cfg(feature = "voip-libopus")]
-use wacore::voip::{depacketize_opus_from_mlow, packetize_opus_for_mlow};
+use wacore::voip::{ForeignCodecError, depacketize_opus_from_mlow, packetize_opus_for_mlow};
 
 /// A microphone source for a call: 60 ms / 960-sample mono i16 frames at 16 kHz. The media facade
 /// pulls frames from the returned channel and feeds them to the engine; a closed channel (e.g. the
@@ -192,6 +192,95 @@ impl WaOpusDecoder {
         depacketize_opus_from_mlow(&mut self.packet_scratch)
             .map_err(|e| anyhow!("depacketize Opus from MLOW: {e}"))?;
         Self::decode_packet(&mut self.dec, &mut self.pcm_scratch, &self.packet_scratch)
+    }
+}
+
+/// The platform's standard-Opus codec, handed to the engine so a call whose peer turns out to
+/// speak Opus is decoded instead of reported silent.
+///
+/// `wacore` cannot link libopus: it builds for wasm32 and ESP32. This is the seam that keeps the
+/// core portable while a native build still rescues the call. One instance per call, driven from
+/// the drive-loop task, so no synchronisation is needed.
+#[cfg(feature = "voip-libopus")]
+pub(crate) struct LibopusAudioCodec {
+    decoder: WaOpusDecoder,
+    /// `None` for an instance the group factory built. A group decoder only ever decodes: outbound
+    /// audio is encoded once, by the call-wide instance, so building an encoder per participant
+    /// would multiply libopus setup and native state across the roster for something no call path
+    /// can reach. `encode` reports it as a refusal, which is the honest answer for a decoder.
+    encoder: Option<WaOpusEncoder>,
+}
+
+#[cfg(feature = "voip-libopus")]
+impl LibopusAudioCodec {
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            decoder: WaOpusDecoder::new()?,
+            encoder: Some(WaOpusEncoder::new()?),
+        })
+    }
+
+    /// The half a group participant needs, and the only half it can use.
+    pub(crate) fn new_decoder_only() -> Result<Self> {
+        Ok(Self {
+            decoder: WaOpusDecoder::new()?,
+            encoder: None,
+        })
+    }
+}
+
+/// Mints one decoder-only [`LibopusAudioCodec`] per group participant.
+///
+/// Zero-sized: every decoder is built from scratch, which is the point -- one shared instance would
+/// carry one speaker's inter-frame state into the next. Decoder-only because outbound audio is
+/// encoded once by the call-wide instance, so an encoder here is per-participant cost for a path
+/// that does not exist.
+#[cfg(feature = "voip-libopus")]
+pub(crate) struct LibopusCodecFactory;
+
+#[cfg(feature = "voip-libopus")]
+impl wacore::voip::ForeignAudioCodecFactory for LibopusCodecFactory {
+    fn create(&self) -> Option<Box<dyn wacore::voip::ForeignAudioCodec>> {
+        match LibopusAudioCodec::new_decoder_only() {
+            Ok(codec) => Some(Box::new(codec)),
+            Err(e) => {
+                // Reported as absence rather than as an error: the engine's answer to "no decoder"
+                // is already an honest `AudioSilent`, and this participant gets exactly that.
+                log::warn!("voip: libopus unavailable for a group participant: {e}");
+                None
+            }
+        }
+    }
+}
+
+#[cfg(feature = "voip-libopus")]
+impl wacore::voip::ForeignAudioCodec for LibopusAudioCodec {
+    fn decode(&mut self, payload: &[u8], out: &mut Vec<i16>) -> Result<(), ForeignCodecError> {
+        let pcm = self
+            .decoder
+            .decode(payload)
+            .map_err(|_| ForeignCodecError::InvalidPayload)?;
+        out.extend_from_slice(pcm);
+        Ok(())
+    }
+
+    fn conceal(&mut self, samples: usize, out: &mut Vec<i16>) {
+        // Opus packet-loss concealment needs the decoder's own state, and asking libopus for it
+        // costs an extra call per lost frame. Silence is the honest fallback here: the engine
+        // already counts the concealment, so a stream that is mostly concealed is visible as such
+        // rather than smoothed into something that sounds almost fine.
+        out.resize(out.len() + samples, 0);
+    }
+
+    fn encode(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), ForeignCodecError> {
+        let payload = self
+            .encoder
+            .as_mut()
+            .ok_or(ForeignCodecError::BadFrameSize)?
+            .encode(pcm)
+            .map_err(|_| ForeignCodecError::BadFrameSize)?;
+        out.extend_from_slice(&payload);
+        Ok(())
     }
 }
 

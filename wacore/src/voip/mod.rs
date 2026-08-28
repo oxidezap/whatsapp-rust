@@ -7,6 +7,12 @@
 
 pub mod app_data;
 pub mod audio;
+// The content corroborator is an internal decision, not API: exposing it would invite a consumer to
+// make codec choices from payload bytes, which is the reflex this whole module exists to avoid. Not
+// gated on the MLOW codec: the stream it rescues is one that NEGOTIATED MLOW, and an encoded call
+// does that without needing the decoder -- it hands the bytes to the application. A build with only
+// `voip` reaches the branch that consults it.
+pub(crate) mod codec_probe;
 pub mod demux;
 pub mod driver;
 pub mod e2e_srtp;
@@ -16,8 +22,10 @@ pub mod group_audio;
 pub mod group_media;
 pub mod h264;
 pub mod hbh_srtp;
+pub mod media_stats;
 #[cfg(feature = "voip-mlow")]
 pub mod mlow;
+pub mod opus_packet;
 pub mod registry;
 pub mod relay_parse;
 pub mod rtcp;
@@ -26,9 +34,11 @@ pub mod session;
 pub mod sframe;
 pub mod ssrc;
 pub mod stun;
-// Internal packet-capture facility. Now `pub(crate)` and wired by no non-test consumer, so its
-// only live callers are its own tests; retained as a debugging primitive rather than deleted.
-#[allow(dead_code)]
+// Packet-capture facility: decorate a `RelayTransportFactory` with `TappedFactory` and every relay
+// datagram in both directions reaches your `PacketTap`. Public so that seam exists at all -- it was
+// `pub(crate)` with no consumer, which is why the last media incident was an investigation instead
+// of a dump. Note that the runtime does not yet expose a factory injection point for a live call,
+// so today this is reachable from a shell that builds its own transport, not from `CallHandle`.
 pub mod tap;
 pub mod transport;
 pub mod warp;
@@ -39,7 +49,8 @@ pub mod warp;
 pub use app_data::{AppDataError, CallReaction};
 pub use audio::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
-    OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
+    ForeignAudioCodec, ForeignAudioCodecFactory, ForeignCodecError, OpusMlowPacketError,
+    depacketize_opus_from_mlow, packetize_opus_for_mlow,
 };
 pub use demux::{
     GroupForwardingError, RelayPacket, RelayPacketKind, classify_relay_packet,
@@ -50,8 +61,9 @@ pub use driver::{
     VideoControlSender, run_call, video_control_channel,
 };
 pub use engine::{
-    CallConfig, CallEngine, CallEvent, DirectPeer, EngineError, GroupControlKind,
-    GroupEngineConfig, Input, Millis, NEVER, Output, SetupError, TxIdSource,
+    CallConfig, CallEngine, CallEvent, CodecDecisionSource, CodecSwitchError, DirectPeer,
+    EngineError, GroupControlKind, GroupEngineConfig, Input, Millis, NEVER, Output, SetupError,
+    TxIdSource,
 };
 pub use group::{GroupCallState, GroupStateApply};
 pub use group_audio::{
@@ -63,13 +75,16 @@ pub use group_media::{
     ParticipantVideo,
 };
 pub use h264::{AnnexBAuSplitter, VideoFrame};
+pub use media_stats::{AudioSilenceReason, CallMediaStats, MediaStatsCell};
 #[cfg(feature = "voip-mlow")]
 pub use mlow::{MlowDecoder, MlowEncoder};
+pub use opus_packet::{OpusBandwidth, OpusMode, OpusPacketShape, opus_packet_shape};
 pub use registry::{CallRegistry, PeerVideoTransition, VideoUpgradeToken};
 pub use session::{
     CallDirection, CallPhase, CallSession, MediaPipeline, MediaPipelineParams, VideoPipeline,
     VideoPipelineParams,
 };
+pub use tap::{InMemoryTap, PacketDir, PacketTap, TappedFactory, TappedTransport};
 pub use transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
 };

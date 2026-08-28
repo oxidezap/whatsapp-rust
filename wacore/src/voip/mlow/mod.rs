@@ -11,6 +11,7 @@ mod analysis;
 mod decoder;
 mod encode;
 mod golden;
+mod multiframe;
 mod param_decode_match;
 mod params;
 mod quality_metrics;
@@ -47,5 +48,5 @@ mod toc;
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub use analysis::stage_bench;
-pub use decoder::MlowDecoder;
+pub use decoder::{MlowDecoder, MlowFrameReport};
 pub use encode::{MlowEncoder, MlowError};
