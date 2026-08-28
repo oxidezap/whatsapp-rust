@@ -26,8 +26,8 @@ use super::codec_probe::InboundCodecProbe;
 use super::demux::{RelayPacketKind, classify_relay_packet, unwrap_group_forwarding_packet};
 use super::group_audio::ParticipantAudioMixer;
 use super::group_media::{
-    GroupEpochApply, GroupMediaError, GroupMediaRegistry, GroupMediaStream, GroupRosterApply,
-    group_device_is_local,
+    GroupAudioReject, GroupEpochApply, GroupMediaError, GroupMediaRegistry, GroupMediaStream,
+    GroupRosterApply, group_device_is_local,
 };
 use super::h264::{VideoFrame, au_has_idr, au_is_keyframe};
 use super::media_stats::{
@@ -2806,9 +2806,18 @@ impl CallEngine {
                 match foreign.decode(&encoded, &mut m.foreign_pcm) {
                     Ok(()) => {
                         decoded_ok = true;
-                        self.media_stats.foreign_frames_decoded =
-                            self.media_stats.foreign_frames_decoded.saturating_add(1);
-                        self.health.on_audio_produced();
+                        // Not credited when the tag did not authenticate, for the reason the other
+                        // production sites are not: these bytes are whatever the wrong key produced,
+                        // and a decoder succeeding on them says nothing about the peer. The samples
+                        // still reach playout -- silencing them is a behaviour change this finding
+                        // did not ask for -- but they must not reset the silence window or count
+                        // toward `audio_produced()`, which is what let a sustained tag failure
+                        // suppress the alarm that names it.
+                        if !unauthenticated {
+                            self.media_stats.foreign_frames_decoded =
+                                self.media_stats.foreign_frames_decoded.saturating_add(1);
+                            self.health.on_audio_produced();
+                        }
                     }
                     Err(e) => {
                         log::debug!("voip: foreign audio decode failed: {e}");
@@ -2961,7 +2970,11 @@ impl CallEngine {
             // is a healthy stream, not a call that cannot turn packets into sound. Counted as
             // production so the silence alarm does not fire through a long mute -- the failures
             // this alarm exists for report `off_point` or concealment, never `inactive_or_sid`.
-            if decode_report.decoded > 0 || decode_report.inactive_or_sid > 0 {
+            // `!unauthenticated` for the reason the encoded path has it: random ciphertext can be
+            // classified as a SID or even decode to something, and crediting that resets the silence
+            // window, so a sustained tag failure would suppress the very alarm that names it.
+            if !unauthenticated && (decode_report.decoded > 0 || decode_report.inactive_or_sid > 0)
+            {
                 self.health.on_audio_produced();
             }
             // A SID counts as decoded here too: the peer told us it is silent and the decoder
@@ -3109,10 +3122,28 @@ impl CallEngine {
                 .saturating_add(1);
             return;
         }
-        let Some(participant) = group.registry.unprotect_audio(pkt) else {
-            self.media_stats.srtp_unprotect_failed =
-                self.media_stats.srtp_unprotect_failed.saturating_add(1);
-            return;
+        // `unprotect_audio` answers `None` for two different things, and only one of them is a
+        // failing tag: a packet from an SSRC absent from the roster -- a straggler from a
+        // participant an authoritative update just removed -- is turned away at the route lookup
+        // before SRTP is asked anything. Counting that as `srtp_unprotect_failed` reports a key
+        // problem for a packet no key was ever tried on, and now that the silence reason weighs
+        // that counter against `rtp_received`, a departing participant's tail could name the whole
+        // window an authentication failure.
+        let participant = match group.registry.unprotect_audio(pkt) {
+            Ok(participant) => participant,
+            Err(GroupAudioReject::Unprotect) => {
+                self.media_stats.srtp_unprotect_failed =
+                    self.media_stats.srtp_unprotect_failed.saturating_add(1);
+                return;
+            }
+            // Deliberately uncounted rather than given a counter of its own. A packet with no route
+            // is the ordinary tail of a participant an authoritative update just removed -- an
+            // expected event, not a fault -- and the finding here is that it must not be reported as
+            // a failing tag, which it no longer is. A counter for expected drops is its own change.
+            Err(GroupAudioReject::Unroutable) => {
+                log::trace!("voip: group audio for an SSRC no longer on the roster");
+                return;
+            }
         };
         self.media_stats.rtp_received = self.media_stats.rtp_received.saturating_add(1);
         // A stream that restarts is a new stream, and the probe's three-packet requirement means
@@ -8715,6 +8746,71 @@ mod tests {
             eng.media_stats().audio_produced(),
             1,
             "only the frame that authenticated was audio"
+        );
+    }
+
+    // The PCM twin of the encoded case, and the third site that credited unauthenticated bytes as
+    // audio. Random ciphertext reaching the MLow decoder can be classified as a SID -- the peer
+    // telling us it is silent -- which counts as production and resets the silence window, so a
+    // sustained tag failure suppresses the very alarm that would name it.
+    #[test]
+    fn failed_sframe_ciphertext_does_not_credit_the_pcm_path_with_audio() {
+        let mut cfg = config(true);
+        cfg.enable_sframe = true;
+        let call_key = cfg.call_key.clone();
+        // A decoder is installed so the ciphertext that happens to classify as Opus cannot raise
+        // `NoDecoderForNegotiatedCodec`, which outranks every other reason and would answer a
+        // different question than this test asks.
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new()))
+            .unwrap()
+            .with_foreign_audio_codec(Box::new(StubForeignCodec { samples: 960 }));
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        let mut peer_tx = peer_pipeline();
+        let mut peer_sframe = SframeSession::new(&call_key, PEER_LID, SELF_LID).unwrap();
+
+        // One frame that authenticates, without which a failure is not attributable at all.
+        let wrapped = peer_sframe.encrypt(&[0x90; 20]);
+        let packet = peer_tx.protect_audio(&wrapped);
+        eng.handle_input(1, Input::RelayPacket(&packet));
+        let _ = drain(&mut eng);
+
+        let mut reasons = Vec::new();
+        for n in 0..160u64 {
+            // A byte in the middle of the ciphertext. Not the first -- flipping that makes
+            // classification read the frame as Opus and the alarm names the missing decoder, a
+            // different finding -- and not the last, which is the SFrame trailer the parser needs to
+            // recognise the frame as wrapped at all. The grammar has to stay MLOW and the frame has
+            // to stay recognisably SFrame for this to be about authentication.
+            let mut wrapped = peer_sframe.encrypt(&[0x90; 20]);
+            let middle = wrapped.len() / 2;
+            wrapped[middle] ^= 0xFF;
+            let packet = peer_tx.protect_audio(&wrapped);
+            let now = 100 + n * 60;
+            eng.handle_input(now, Input::RelayPacket(&packet));
+            eng.handle_input(now, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                if let Output::Event(CallEvent::AudioSilent {
+                    dominant_reason, ..
+                }) = output
+                {
+                    reasons.push(dominant_reason);
+                }
+            }
+        }
+
+        assert!(
+            eng.media_stats().sframe_decrypt_failed >= 160,
+            "every one is counted as a tag that failed"
+        );
+        assert!(
+            reasons.contains(&AudioSilenceReason::AuthenticationFailing),
+            "and the alarm has to fire and name authentication, got {reasons:?}"
         );
     }
 
