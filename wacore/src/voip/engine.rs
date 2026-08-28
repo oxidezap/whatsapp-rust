@@ -932,7 +932,7 @@ impl CallEngine {
             None
         };
 
-        Ok(Self {
+        let mut engine = Self {
             call_id: config.call_id,
             direction: config.direction,
             relay_token: config.relay_token,
@@ -956,7 +956,13 @@ impl CallEngine {
             media,
             peer_video_orientation: 0,
             outbox: VecDeque::new(),
-        })
+        };
+        // A video-from-start call builds its plane here, already requiring an
+        // IDR, and the application may never call `enable_video` on a plane that
+        // is up before it asks. Announced now so the request does not depend on
+        // one arriving; the flag makes a later `enable_video` a no-op.
+        engine.announce_video_keyframe();
+        Ok(engine)
     }
 
     pub fn call_id(&self) -> &str {
@@ -1640,9 +1646,6 @@ impl CallEngine {
             Some(mut v) => {
                 v.send_gated = send_gated;
                 m.video = Some(v);
-                // A fresh plane is born requiring an IDR, so an ungated one is
-                // dropping frames from its first moment. A gated one has nowhere
-                // to put one yet, which `announce_video_keyframe` knows.
                 self.announce_video_keyframe();
                 true
             }
@@ -6501,13 +6504,12 @@ mod tests {
         let mut cfg = config(true);
         cfg.enable_video = true;
         let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).expect("engine");
-        assert!(eng.enable_video());
         assert!(
             drain(&mut eng)
                 .0
                 .iter()
                 .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
-            "a plane born requiring an IDR must say so"
+            "a plane born requiring an IDR must say so, without waiting to be enabled"
         );
 
         // Satisfying the requirement ends the request; a plane already asked
