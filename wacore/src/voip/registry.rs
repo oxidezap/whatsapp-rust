@@ -397,12 +397,41 @@ impl CallEntry {
     /// The roster's name for `sender`, or `None` when it cannot name it yet --
     /// an announcement that arrived before the roster carrying its sender.
     fn roster_name_for(&self, sender: &Jid) -> Option<Jid> {
-        if sender.device != 0
-            && let Some(device) = CallRegistry::canonical_group_device_for_entry(self, sender)
-        {
-            return Some(device);
+        if sender.device != 0 {
+            if let Some(device) = CallRegistry::canonical_group_device_for_entry(self, sender) {
+                return Some(device);
+            }
+            if let Some(device) = self.roster_name_for_pn_device(sender) {
+                return Some(device);
+            }
         }
         CallRegistry::canonical_group_participant_for_entry(self, sender)
+    }
+
+    /// The roster's name for a device-qualified PN alias, such as an `<accept>`
+    /// routed as `number:3@s.whatsapp.net`. The roster spells its devices in
+    /// LID, so no exact-device match can succeed; the participant carrying that
+    /// phone number owns the device, and a device id is the same on both
+    /// spellings of one account. Falls back to the participant when the roster
+    /// does not carry that device -- still a name playout reads, unlike the
+    /// alias itself.
+    fn roster_name_for_pn_device(&self, sender: &Jid) -> Option<Jid> {
+        let snapshot = self.group.as_ref().and_then(GroupCallState::snapshot)?;
+        let sender_user = sender.to_non_ad();
+        let participant = snapshot.participants.iter().find(|participant| {
+            participant.is_connected()
+                && participant
+                    .pn
+                    .as_ref()
+                    .is_some_and(|pn| pn.to_non_ad() == sender_user)
+        })?;
+        Some(
+            participant
+                .devices
+                .iter()
+                .find(|device| device.jid.device == sender.device)
+                .map_or_else(|| participant.jid.to_non_ad(), |device| device.jid.clone()),
+        )
     }
 
     fn group_mut(&mut self) -> &mut GroupCallState {
@@ -5454,6 +5483,59 @@ mod tests {
                 orientation: 1,
             }],
             "only the participant still on the call is replayed"
+        );
+    }
+
+    /// A companion device can be routed by phone number -- `number:3@s.whatsapp.net`
+    /// -- while the roster spells the same device in LID. The rotation has to
+    /// reach the LID device slot, the only one playout reads.
+    #[test]
+    fn a_device_qualified_pn_alias_lands_on_the_rosters_device() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let lid = Jid::new("222222222222222", Server::Lid);
+        let pn = Jid::new("5511999990000", Server::Pn);
+        let mut update = group_update(1);
+        update.call_id = "GID".to_string();
+        update.participants.push(GroupCallParticipant {
+            jid: lid.clone(),
+            pn: Some(pn.clone()),
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: lid.clone().with_device(3),
+                platform: None,
+                pid: Some(3),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        let mut session =
+            CallSession::new_outgoing("GID", Jid::new("GID", Server::Call), creator.clone());
+        session.group = Some(update);
+        let generation = reg.insert(session);
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+
+        assert!(reg.set_peer_video_orientation("GID", generation, &pn.clone().with_device(3), 1));
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant: lid.clone().with_device(3),
+                orientation: 1,
+            })
+        );
+
+        // A device the roster does not carry still reaches the participant it
+        // belongs to, rather than staying under a key nothing reads.
+        assert!(reg.set_peer_video_orientation("GID", generation, &pn.with_device(9), 2));
+        assert_eq!(
+            ctl_rx.try_recv(),
+            Ok(VideoControl::SetParticipantOrientation {
+                participant: lid,
+                orientation: 2,
+            })
         );
     }
 
