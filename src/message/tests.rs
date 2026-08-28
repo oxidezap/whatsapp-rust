@@ -7009,7 +7009,8 @@ struct SentReceipt {
     typ: Option<String>,
     recipient: Option<String>,
     participant: Option<String>,
-    context: Option<String>,
+    /// The `class` attr — WA Web's status marker on a `<receipt>`.
+    class_attr: Option<String>,
     category: Option<String>,
     has_keys: bool,
 }
@@ -7053,7 +7054,7 @@ fn find_receipt_details(frames: &[bytes::Bytes], id: &str) -> Option<SentReceipt
                 typ: node.get_attr("type").map(|v| v.as_str().to_string()),
                 recipient: node.get_attr("recipient").map(|v| v.as_str().to_string()),
                 participant: node.get_attr("participant").map(|v| v.as_str().to_string()),
-                context: node.get_attr("context").map(|v| v.as_str().to_string()),
+                class_attr: node.get_attr("class").map(|v| v.as_str().to_string()),
                 category: node.get_attr("category").map(|v| v.as_str().to_string()),
                 has_keys: node.get_optional_child("keys").is_some(),
             });
@@ -8328,7 +8329,11 @@ async fn status_skdm_only_session_uses_one_status_receipt() {
     let sender_str = alice.jid.to_string();
     assert_eq!(receipt.to, status.to_string());
     assert_eq!(receipt.participant.as_deref(), Some(sender_str.as_str()));
-    assert_eq!(receipt.context.as_deref(), Some("status"));
+    assert_eq!(
+        receipt.class_attr.as_deref(),
+        Some("status"),
+        "WA Web marks a status receipt with class=\"status\"          (WAWebSendDeliveryReceiptJob), not with a context attr"
+    );
     assert_eq!(
         message_events_for_id(&rx, id),
         (0, 0),
