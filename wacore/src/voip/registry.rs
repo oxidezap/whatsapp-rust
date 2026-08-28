@@ -309,8 +309,8 @@ impl CallEntry {
     /// announced rotation with whatever the new session happens to know, which
     /// for every path but the group promotion is nothing.
     fn adopt_session(&mut self, session: CallSession) {
-        if let Some(orientation) = session.peer_video_orientation {
-            self.peer_video_orientation = Some((session.call_creator.clone(), orientation));
+        if let Some(announced) = session.peer_video_orientation.clone() {
+            self.peer_video_orientation = Some(announced);
         }
         self.session = session;
     }
@@ -1472,9 +1472,7 @@ impl CallRegistry {
             // has one, and it then outlives every negotiation rebuild.
             self_video_orientation: 0,
             // Seeded from the offer, drained by `set_video_channels`.
-            peer_video_orientation: session
-                .peer_video_orientation
-                .map(|orientation| (session.call_creator.clone(), orientation)),
+            peer_video_orientation: session.peer_video_orientation.clone(),
             session,
             media_task: None,
             waiting_room_task: None,
@@ -4985,7 +4983,8 @@ mod tests {
         let creator = Jid::new("111111111111111", Server::Lid);
         let mut session =
             CallSession::new_incoming("GID", Jid::new("GID", Server::Call), creator.clone());
-        session.peer_video_orientation = Some(2);
+        let offering_device = creator.clone().with_device(4);
+        session.peer_video_orientation = Some((offering_device.clone(), 2));
         session.group = Some(group_update(1));
         let generation = reg.insert(session);
         let (event_tx, _event_rx) = async_channel::bounded(1);
@@ -4995,10 +4994,10 @@ mod tests {
         assert_eq!(
             ctl_rx.try_recv(),
             Ok(VideoControl::SetParticipantOrientation {
-                participant: creator,
+                participant: offering_device,
                 orientation: 2,
             }),
-            "the offerer's rotation belongs to the offerer's slot"
+            "the rotation belongs to the device that announced it, not its user"
         );
 
         // No answer race to lose in a group call: every participant announces

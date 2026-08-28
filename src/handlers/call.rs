@@ -224,7 +224,9 @@ impl StanzaHandler for CallHandler {
                             );
                             session.is_video =
                                 matches!(&call.action, CallAction::Offer { is_video: true, .. });
-                            session.peer_video_orientation = call.video_orientation;
+                            session.peer_video_orientation = call
+                                .video_orientation
+                                .map(|orientation| (routed_call_sender(&call), orientation));
                             session.group = Some(group.clone());
                             duplicate_active_group_offer = match client
                                 .call_registry()
