@@ -680,23 +680,40 @@ fn apply_group_epoch_control(
     }
 }
 
-fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) {
+/// `false` when a saturated queue swallowed the event.
+///
+/// A diagnostic is worth less than a relay lifecycle transition, so those
+/// displace the oldest entry rather than being dropped. Everything else,
+/// including the keyframe request, is offered without evicting anything --
+/// see [`retry_keyframe_request`] for how the one event that cannot be lost
+/// survives being refused.
+fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) -> bool {
     if matches!(
         &event,
         CallEvent::RelayAllocated
             | CallEvent::RelayAllocateFailed(_)
             | CallEvent::RelayAllocateTimedOut
             | CallEvent::RelayReconnectTimedOut
-            // One-shot and actionable: the engine has already set
-            // `keyframe_required`, so every later request is suppressed until an
-            // IDR arrives. Dropping this one under backpressure would leave the
-            // application waiting for a request that never comes again while the
-            // engine drops every delta it sends.
-            | CallEvent::VideoKeyframeNeeded
     ) {
-        let _ = events.force_send(event);
+        events.force_send(event).is_ok()
     } else {
-        let _ = events.try_send(event);
+        events.try_send(event).is_ok()
+    }
+}
+
+/// Re-offer a keyframe request the consumer has not taken yet, clearing
+/// `outstanding` once it lands.
+///
+/// The request is one-shot and actionable: the engine sets `keyframe_required`
+/// before publishing, so a request that never arrives is never reissued while
+/// every delta the application sends keeps being dropped. Evicting an older
+/// event to force room would only move the loss, and the next forced event
+/// would evict this one in turn -- so the drive loop keeps offering it instead,
+/// which costs nothing on the overwhelmingly common path where it fit the
+/// first time.
+fn retry_keyframe_request(events: &async_channel::Sender<CallEvent>, outstanding: &mut bool) {
+    if *outstanding && events.try_send(CallEvent::VideoKeyframeNeeded).is_ok() {
+        *outstanding = false;
     }
 }
 
@@ -958,6 +975,8 @@ async fn run_call_with_clock_and_wallclock(
     // Video is queued per access unit so overload never leaves half an IDR on the wire.
     let mut send_queue: VecDeque<SendBatch> = VecDeque::new();
     let mut awaiting_video_keyframe = false;
+    // A keyframe request a saturated consumer queue refused, retried below.
+    let mut undelivered_keyframe_request = false;
     // Idle sentinel: a terminated `Fuse` is safe to re-select every iteration and never fires until a
     // real send replaces it; on completion it terminates itself, so no manual reset / re-poll hazard.
     // `BoxFuture` is `Send` natively but `?Send` on wasm (the transport is single-threaded there).
@@ -999,7 +1018,10 @@ async fn run_call_with_clock_and_wallclock(
                     let _ = channels.video_out.try_send(frame);
                 }
                 Output::Event(ev) => {
-                    publish_engine_event(&channels.events, ev);
+                    let keyframe_request = matches!(ev, CallEvent::VideoKeyframeNeeded);
+                    if !publish_engine_event(&channels.events, ev) && keyframe_request {
+                        undelivered_keyframe_request = true;
+                    }
                 }
                 Output::ReconnectRelay(endpoint) => {
                     // Anything queued before this intent targets the retired relay. Later outputs in
@@ -1029,6 +1051,8 @@ async fn run_call_with_clock_and_wallclock(
                 }
             }
         }
+
+        retry_keyframe_request(&channels.events, &mut undelivered_keyframe_request);
 
         // The terminal event above must reach the consumer before transport teardown.
         if eng.is_terminated() {
@@ -1619,10 +1643,42 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 
-    /// The keyframe request rides with the relay lifecycle rather than the
-    /// diagnostics: the engine has already latched `keyframe_required` by the
-    /// time it is published, so a dropped request is never reissued while every
-    /// delta the application sends keeps being dropped.
+    /// The keyframe request is the one event that cannot be lost: the engine
+    /// latches `keyframe_required` before publishing it, so a request the
+    /// consumer never sees is never reissued while every delta the application
+    /// sends keeps being dropped. It is also not worth evicting anything for --
+    /// the next forced event would evict it right back -- so it waits instead.
+    #[test]
+    fn a_refused_keyframe_request_waits_rather_than_evicting_or_vanishing() {
+        let (tx, rx) = async_channel::bounded(1);
+        let diagnostic = CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        };
+        tx.try_send(diagnostic.clone()).expect("fills the queue");
+
+        let mut outstanding = false;
+        assert!(
+            !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded),
+            "a full queue refuses it"
+        );
+        outstanding = true;
+        retry_keyframe_request(&tx, &mut outstanding);
+        assert!(outstanding, "still no room, so still outstanding");
+        assert_eq!(
+            rx.try_recv(),
+            Ok(diagnostic),
+            "and the event it would have evicted is still there"
+        );
+
+        retry_keyframe_request(&tx, &mut outstanding);
+        assert!(!outstanding);
+        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
+
+        // Nothing to retry once it has landed.
+        retry_keyframe_request(&tx, &mut outstanding);
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
     #[test]
     fn relay_lifecycle_events_replace_saturated_diagnostics() {
         for lifecycle in [
@@ -1630,7 +1686,6 @@ mod tests {
             CallEvent::RelayAllocateFailed(486),
             CallEvent::RelayAllocateTimedOut,
             CallEvent::RelayReconnectTimedOut,
-            CallEvent::VideoKeyframeNeeded,
         ] {
             let (tx, rx) = async_channel::bounded(1);
             tx.try_send(CallEvent::GroupControlRejected {
