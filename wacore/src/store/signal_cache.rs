@@ -1913,10 +1913,9 @@ impl SignalStoreCache {
     ///
     /// One residual overlap is accepted rather than tracked: an address
     /// evicted while still pending is charged both as a pending-only key and
-    /// in the removal window that named it. The window holds
-    /// [`RECENT_REMOVALS`] entries, which bounds the overstatement to a
-    /// handful of addresses — cheaper to state than to reconcile on a report
-    /// that is an estimate by contract.
+    /// in the removal window that named it. That window holds 64 entries,
+    /// which bounds the overstatement to a handful of addresses — cheaper to
+    /// state than to reconcile on a report that is an estimate by contract.
     pub async fn memory_stats(
         &self,
     ) -> (
