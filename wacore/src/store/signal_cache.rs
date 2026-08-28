@@ -1,6 +1,8 @@
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasher;
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard};
+use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, OnceLock};
 
 use anyhow::Result;
 use async_lock::Mutex;
@@ -188,6 +190,20 @@ fn user_of_protocol_address(address: &str) -> &str {
     }
 }
 
+/// One `RandomState` for the whole process, drawn once. The user index only
+/// ever compares a fingerprint against its own set, so nothing requires a
+/// shared seed — but sharing one keeps the hasher out of every cache, and
+/// drawing it randomly keeps a peer from choosing identifiers that collide.
+fn fingerprint_hasher() -> &'static RandomState {
+    static HASHER: OnceLock<RandomState> = OnceLock::new();
+    HASHER.get_or_init(RandomState::new)
+}
+
+/// The 64-bit stand-in for a user identifier in [`UserIndexedCache::users`].
+fn user_fingerprint(user: &str) -> u64 {
+    fingerprint_hasher().hash_one(user)
+}
+
 /// A cache map that can answer "is any address here owned by this user?"
 /// without scanning every key.
 ///
@@ -197,9 +213,14 @@ fn user_of_protocol_address(address: &str) -> &str {
 /// user that has some, which is the direction that would silently skip a
 /// migration. `insert` is the only way in, so an entry cannot reach the map
 /// without registering its user.
+///
+/// Because a false `true` is already the accepted error, the set holds
+/// 64-bit fingerprints rather than the identifiers: a hash collision produces
+/// exactly that same error and nothing else, and the index stops duplicating
+/// every user string the three Signal stores already key on.
 struct UserIndexedCache<V> {
     map: HashMap<Arc<str>, V>,
-    users: HashSet<Arc<str>>,
+    users: HashSet<u64>,
     /// Counts removal events. A cold reader that saw a slot absent, released
     /// the lock, and finds it absent again cannot otherwise tell "never
     /// written" from "written, flushed, and evicted": a clean removal keeps the
@@ -227,10 +248,8 @@ impl<V> UserIndexedCache<V> {
     }
 
     fn insert(&mut self, key: Arc<str>, value: V) -> Option<V> {
-        let user = user_of_protocol_address(&key);
-        if !self.users.contains(user) {
-            self.users.insert(Arc::from(user));
-        }
+        self.users
+            .insert(user_fingerprint(user_of_protocol_address(&key)));
         self.map.insert(key, value)
     }
 
@@ -273,19 +292,22 @@ impl<V> UserIndexedCache<V> {
         // address begins with `user`, so a separator inside `user` is also the
         // address's first one and both collapse to the same key: an addressed
         // `19995551006:5` and a bare `19995551006` are one entry here.
-        self.users.contains(user_of_protocol_address(user))
+        self.users
+            .contains(&user_fingerprint(user_of_protocol_address(user)))
     }
 
     /// Drop users no longer backed by an entry. Bounds the superset's drift
     /// after eviction; callers gate it on a watermark so it stays amortized.
     fn compact_users(&mut self) {
         self.users.clear();
-        let users: Vec<Arc<str>> = self
-            .map
-            .keys()
-            .map(|key| Arc::from(user_of_protocol_address(key)))
-            .collect();
-        self.users.extend(users);
+        // Fingerprints are `Copy`, so the rebuild reads straight off the live
+        // keys — no intermediate `Vec` and no `Arc<str>` per surviving user,
+        // which is what this used to allocate under the store's global mutex.
+        self.users.extend(
+            self.map
+                .keys()
+                .map(|key| user_fingerprint(user_of_protocol_address(key))),
+        );
     }
 
     fn users_len(&self) -> usize {
@@ -297,7 +319,7 @@ impl<V> UserIndexedCache<V> {
     /// name and so are owned solely here. Keeps `memory_stats` from reporting
     /// only the map.
     fn overhead_bytes(&self) -> usize {
-        self.users.iter().map(|user| user.len()).sum::<usize>()
+        crate::stats::hash_table_bytes(self.users.capacity(), size_of::<u64>())
             + self
                 .recent_removals
                 .iter()
