@@ -293,6 +293,8 @@ struct CallEntry {
     /// registration and the media plane attaching -- a single slot would keep
     /// only the last of them.
     peer_video_orientations: Vec<PeerOrientation>,
+    /// Announcement order for the list above; see `PeerOrientation::announced_at`.
+    peer_orientation_seq: u64,
     /// Explicit group identity exists before the first authoritative roster arrives.
     is_group_call: bool,
     /// This generation originated from a reusable call-link join and may accept waiting-room state.
@@ -318,6 +320,13 @@ struct CallEntry {
 struct PeerOrientation {
     announcer: Jid,
     orientation: u8,
+    /// When this rotation was announced, in this entry's own order.
+    ///
+    /// Two spellings of one participant can both be held while the roster can
+    /// name neither, and the roster that finally names them merges the two into
+    /// one slot. Position cannot decide which value wins there: an update lands
+    /// in place, so the older entry can be the one that moved last.
+    announced_at: u64,
     /// Whether a roster has ever named this announcer.
     ///
     /// It is what separates the two reasons a roster cannot name one now. An
@@ -328,25 +337,20 @@ struct PeerOrientation {
     named_by_roster: bool,
 }
 
-fn upsert_peer_orientation(
-    orientations: &mut Vec<PeerOrientation>,
-    announcer: Jid,
-    orientation: u8,
-    named_by_roster: bool,
-) {
+fn upsert_peer_orientation(orientations: &mut Vec<PeerOrientation>, announced: PeerOrientation) {
     match orientations
         .iter_mut()
-        .find(|entry| entry.announcer == announcer)
+        .find(|entry| entry.announcer == announced.announcer)
     {
         Some(entry) => {
-            entry.orientation = orientation;
-            entry.named_by_roster |= named_by_roster;
+            entry.named_by_roster |= announced.named_by_roster;
+            // Whichever of the two was announced last is the peer's camera now.
+            if announced.announced_at >= entry.announced_at {
+                entry.orientation = announced.orientation;
+                entry.announced_at = announced.announced_at;
+            }
         }
-        None => orientations.push(PeerOrientation {
-            announcer,
-            orientation,
-            named_by_roster,
-        }),
+        None => orientations.push(announced),
     }
 }
 
@@ -372,15 +376,19 @@ impl CallEntry {
     /// yet, so filing a roster-known participant as unnamed would make its later
     /// departure indistinguishable from that, and its rotation would outlive it.
     fn retain_peer_orientation(&mut self, announcer: Jid, orientation: u8) {
-        let (key, named_by_roster) = match self.roster_name_for(&announcer) {
+        let (announcer, named_by_roster) = match self.roster_name_for(&announcer) {
             Some(known) => (known, true),
             None => (announcer, false),
         };
+        self.peer_orientation_seq = self.peer_orientation_seq.saturating_add(1);
         upsert_peer_orientation(
             &mut self.peer_video_orientations,
-            key,
-            orientation,
-            named_by_roster,
+            PeerOrientation {
+                announcer,
+                orientation,
+                named_by_roster,
+                announced_at: self.peer_orientation_seq,
+            },
         );
     }
 
@@ -445,13 +453,16 @@ impl CallEntry {
                     .as_ref()
                     .is_some_and(|pn| pn.to_non_ad() == sender_user)
         })?;
-        Some(
-            participant
-                .devices
-                .iter()
-                .find(|device| device.jid.device == sender.device)
-                .map_or_else(|| participant.jid.to_non_ad(), |device| device.jid.clone()),
-        )
+        // Only the device itself. The bare participant is what group playout
+        // falls back to for every one of its devices, so filing an unadmitted
+        // device there would turn one camera's rotation into all of them --
+        // and, being a name the roster does know, it would never be moved onto
+        // the right device once that device is admitted. The alias waits.
+        participant
+            .devices
+            .iter()
+            .find(|device| device.jid.device == sender.device)
+            .map(|device| device.jid.clone())
     }
 
     fn group_mut(&mut self) -> &mut GroupCallState {
@@ -1036,9 +1047,11 @@ impl CallRegistry {
                     match entry.roster_name_for(&announced.announcer) {
                         Some(known) => upsert_peer_orientation(
                             &mut renamed,
-                            known,
-                            announced.orientation,
-                            true,
+                            PeerOrientation {
+                                announcer: known,
+                                named_by_roster: true,
+                                ..announced
+                            },
                         ),
                         // Never named, so this roster is not evidence of a
                         // departure -- only that the sender has not been
@@ -1681,6 +1694,7 @@ impl CallRegistry {
             // Seeded below, once the entry can resolve its own roster;
             // `set_video_channels` replays what lands here.
             peer_video_orientations: Vec::new(),
+            peer_orientation_seq: 0,
             session,
             media_task: None,
             waiting_room_task: None,
@@ -5538,6 +5552,54 @@ mod tests {
         );
     }
 
+    /// Both spellings of one participant can be held at once while the roster
+    /// can name neither. The roster that names them merges the two, and the
+    /// merge has to keep the rotation announced last -- which is not the one
+    /// that sits later in the list, since an update lands in place.
+    #[test]
+    fn merging_two_pre_roster_aliases_keeps_the_newest_rotation() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let lid = Jid::new("222222222222222", Server::Lid);
+        let pn = Jid::new("5511999990000", Server::Pn);
+        let mut session =
+            CallSession::new_outgoing("GID", Jid::new("GID", Server::Call), creator.clone());
+        let mut empty = group_update(1);
+        empty.call_id = "GID".to_string();
+        empty.participants.clear();
+        session.group = Some(empty);
+        let generation = reg.insert(session);
+
+        // Neither spelling is in the roster yet, so both are held as announced.
+        assert!(reg.set_peer_video_orientation("GID", generation, &lid, 1));
+        assert!(reg.set_peer_video_orientation("GID", generation, &pn, 2));
+        assert!(reg.set_peer_video_orientation("GID", generation, &lid, 3));
+
+        let mut admitted = group_update(2);
+        admitted.call_id = "GID".to_string();
+        admitted.participants = vec![GroupCallParticipant {
+            jid: lid.clone(),
+            pn: Some(pn),
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: Vec::new(),
+        }];
+        assert_eq!(reg.apply_group_update(admitted), GroupStateApply::Applied);
+
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+        let replayed = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            replayed,
+            vec![VideoControl::SetParticipantOrientation {
+                participant: lid,
+                orientation: 3,
+            }],
+            "one slot, holding what the participant announced last"
+        );
+    }
+
     /// A companion device can be routed by phone number -- `number:3@s.whatsapp.net`
     /// -- while the roster spells the same device in LID. The rotation has to
     /// reach the LID device slot, the only one playout reads.
@@ -5579,15 +5641,45 @@ mod tests {
             })
         );
 
-        // A device the roster does not carry still reaches the participant it
-        // belongs to, rather than staying under a key nothing reads.
-        assert!(reg.set_peer_video_orientation("GID", generation, &pn.with_device(9), 2));
+        // A device the roster does not carry yet keeps its own identity: the
+        // bare participant is every sibling's fallback slot, so borrowing it
+        // would rotate cameras nobody announced for.
+        assert!(reg.set_peer_video_orientation("GID", generation, &pn.clone().with_device(9), 2));
         assert_eq!(
             ctl_rx.try_recv(),
             Ok(VideoControl::SetParticipantOrientation {
-                participant: lid,
+                participant: pn.clone().with_device(9),
                 orientation: 2,
             })
+        );
+
+        // And it moves onto the roster's device once that device is admitted.
+        let mut admitted = group_update(2);
+        admitted.call_id = "GID".to_string();
+        admitted.participants.push(GroupCallParticipant {
+            jid: lid.clone(),
+            pn: Some(pn),
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: [3u16, 9]
+                .into_iter()
+                .map(|device| GroupCallDevice {
+                    jid: lid.clone().with_device(device),
+                    platform: None,
+                    pid: Some(u32::from(device)),
+                    capability_version: None,
+                    capability: Vec::new(),
+                })
+                .collect(),
+        });
+        assert_eq!(reg.apply_group_update(admitted), GroupStateApply::Applied);
+        let replayed = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            replayed.contains(&VideoControl::SetParticipantOrientation {
+                participant: lid.clone().with_device(9),
+                orientation: 2,
+            }),
+            "the admitted device takes over the rotation its alias was holding: {replayed:?}"
         );
     }
 
