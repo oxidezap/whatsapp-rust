@@ -687,6 +687,12 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
             | CallEvent::RelayAllocateFailed(_)
             | CallEvent::RelayAllocateTimedOut
             | CallEvent::RelayReconnectTimedOut
+            // One-shot and actionable: the engine has already set
+            // `keyframe_required`, so every later request is suppressed until an
+            // IDR arrives. Dropping this one under backpressure would leave the
+            // application waiting for a request that never comes again while the
+            // engine drops every delta it sends.
+            | CallEvent::VideoKeyframeNeeded
     ) {
         let _ = events.force_send(event);
     } else {
@@ -1613,6 +1619,10 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 
+    /// The keyframe request rides with the relay lifecycle rather than the
+    /// diagnostics: the engine has already latched `keyframe_required` by the
+    /// time it is published, so a dropped request is never reissued while every
+    /// delta the application sends keeps being dropped.
     #[test]
     fn relay_lifecycle_events_replace_saturated_diagnostics() {
         for lifecycle in [
@@ -1620,6 +1630,7 @@ mod tests {
             CallEvent::RelayAllocateFailed(486),
             CallEvent::RelayAllocateTimedOut,
             CallEvent::RelayReconnectTimedOut,
+            CallEvent::VideoKeyframeNeeded,
         ] {
             let (tx, rx) = async_channel::bounded(1);
             tx.try_send(CallEvent::GroupControlRejected {

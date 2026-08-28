@@ -1456,12 +1456,16 @@ impl CallEngine {
             video.pipe.commit_send_rekey(rekey);
             // A new group epoch may be the first decryptable media for a recently admitted
             // participant, so never begin that epoch with a dependent frame.
-            let newly_required = !video.keyframe_required;
             video.keyframe_required = true;
-            if newly_required {
-                self.outbox
-                    .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
-            }
+            // Announced unconditionally, unlike the other sites. A rekey that
+            // began before this epoch was installable already required a
+            // keyframe, and `on_video` dropped the IDR the application produced
+            // for it behind the epoch gate without clearing the flag -- so a
+            // `newly_required` test here would swallow the one request that can
+            // still be served, and outbound video would stall until the
+            // encoder's own keyframe interval came around.
+            self.outbox
+                .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
         }
         group.app_data.commit_send_rekey(app_data_rekey);
         media.call_key.zeroize();
@@ -3260,6 +3264,84 @@ mod encoded_tests {
                         .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
             )),
             "the first video frame under a new group epoch must be an IDR"
+        );
+    }
+
+    /// The keyframe an application produces for a rekey it cannot yet encrypt
+    /// under is dropped by the epoch gate, and dropping it does not clear the
+    /// requirement. Installing the epoch must therefore ask again even though
+    /// the flag was already set, or the requirement outlives every request for
+    /// it and outbound video stays dark until the encoder's own IDR interval.
+    #[test]
+    fn installing_a_gated_epoch_asks_again_for_the_keyframe_it_swallowed() {
+        let mut engine = group_engine();
+        assert_eq!(
+            engine.apply_group_raw_epoch(7, &[0x42; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        engine.start(0, 1_700_000_000_000);
+        let idr = [0, 0, 0, 1, 0x65, 1, 2, 3];
+        engine.handle_input(1, Input::VideoFrame(&idr));
+        let _ = drain(&mut engine);
+
+        let mut expanded = group_update();
+        expanded.transaction_id = 8;
+        expanded.media = "video".to_string();
+        expanded.relay = Some(group_relay());
+        expanded.rekey_requested = true;
+        let participant = Jid::new("15550003333", Server::Lid);
+        expanded.participants.push(GroupCallParticipant {
+            jid: participant.clone(),
+            pn: None,
+            state: Some("connected".to_string()),
+            participant_type: None,
+            devices: vec![GroupCallDevice {
+                jid: participant,
+                platform: None,
+                pid: Some(3),
+                capability_version: None,
+                capability: Vec::new(),
+            }],
+        });
+        assert_eq!(
+            engine.apply_group_update(3, &expanded).unwrap(),
+            GroupRosterApply::Applied
+        );
+        let _ = drain(&mut engine);
+
+        // The application answers the rekey with an IDR the gate discards.
+        engine.handle_input(4, Input::VideoFrame(&idr));
+        let gated = drain(&mut engine);
+        assert!(
+            gated.iter().all(|output| !matches!(
+                output,
+                Output::Transmit(packet)
+                    if parse_rtp_header(packet)
+                        .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+            )),
+            "media under a requested-but-uninstalled epoch stays off the wire"
+        );
+
+        assert_eq!(
+            engine.apply_group_raw_epoch(8, &[0x48; 32]).unwrap(),
+            GroupEpochApply::Installed
+        );
+        assert!(
+            drain(&mut engine)
+                .iter()
+                .any(|output| matches!(output, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "the request the gate swallowed has to be raised again on install"
+        );
+
+        engine.handle_input(5, Input::VideoFrame(&idr));
+        assert!(
+            drain(&mut engine).iter().any(|output| matches!(
+                output,
+                Output::Transmit(packet)
+                    if parse_rtp_header(packet)
+                        .is_some_and(|header| header.payload_type == RTP_PAYLOAD_TYPE_H264)
+            )),
+            "and the IDR that answers it resumes video"
         );
     }
 
