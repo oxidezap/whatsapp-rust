@@ -9,6 +9,7 @@ use std::sync::Arc;
 use wacore_binary::{Jid, JidExt as _, Server};
 
 use super::Client;
+use super::member_index::MemberIndex;
 
 const SIGNAL_NAMESPACE_COUNT: usize = 4;
 
@@ -25,7 +26,7 @@ pub(crate) struct GroupDevicesMemo {
     /// Member identifiers in BOTH namespaces (participant users, their mapped
     /// counterparts, resolved device users): the scoped-invalidation check
     /// tests the topology log's touched users against this set.
-    pub(crate) members: Arc<std::collections::HashSet<wacore_binary::CompactString>>,
+    pub(crate) members: Arc<MemberIndex>,
     pub(crate) devices: Arc<wacore::send::ResolvedGroupDevices>,
 }
 
@@ -33,12 +34,7 @@ impl wacore::stats::HeapSize for GroupDevicesMemo {
     fn heap_bytes(&self) -> usize {
         // The Weak keeps only the GroupInfo allocation header alive; the memo
         // does not retain its payload.
-        self.members.iter().map(|m| m.heap_bytes()).sum::<usize>()
-            + wacore::stats::hash_table_bytes(
-                self.members.capacity(),
-                size_of::<wacore_binary::CompactString>(),
-            )
-            + self.devices.heap_bytes()
+        self.members.heap_bytes() + self.devices.heap_bytes()
     }
 }
 
@@ -58,7 +54,7 @@ pub(crate) struct DmDevicesMemo {
     /// BOTH namespaces (recipient, self, and every resolved device user, each
     /// with its mapped counterpart): the scoped-invalidation check tests the
     /// topology log's touched users against this set.
-    pub(crate) members: Arc<std::collections::HashSet<wacore_binary::CompactString>>,
+    pub(crate) members: Arc<MemberIndex>,
     pub(crate) devices: Arc<wacore::send::ResolvedDmDevices>,
 }
 
@@ -66,11 +62,7 @@ impl wacore::stats::HeapSize for DmDevicesMemo {
     fn heap_bytes(&self) -> usize {
         self.own_pn.heap_bytes()
             + self.own_lid.as_ref().map_or(0, |lid| lid.heap_bytes())
-            + self.members.iter().map(|m| m.heap_bytes()).sum::<usize>()
-            + wacore::stats::hash_table_bytes(
-                self.members.capacity(),
-                size_of::<wacore_binary::CompactString>(),
-            )
+            + self.members.heap_bytes()
             + self.devices.heap_bytes()
     }
 }
@@ -245,23 +237,23 @@ impl Client {
         // this set carries each member's group-facing identity (participant
         // user + mapped counterpart) plus the namespace the resolved device
         // JIDs ended up in.
-        let mut members = std::collections::HashSet::with_capacity(
-            group_info.participants.len() * 2 + devices.len() + 2,
-        );
+        let mut members =
+            MemberIndex::builder(group_info.participants.len() * 2 + devices.len() + 2);
         for participant in &group_info.participants {
-            members.insert(participant.user.clone());
+            members.insert(&participant.user);
             if participant.is_lid()
                 && let Some(pn) = group_info.phone_jid_for_lid_user(&participant.user)
             {
-                members.insert(pn.user.clone());
+                members.insert(&pn.user);
             } else if let Some(lid) = group_info.lid_user_for_phone_user(&participant.user) {
-                members.insert(lid.clone());
+                members.insert(lid);
             }
         }
-        members.insert(own_sending_jid.user.clone());
+        members.insert(&own_sending_jid.user);
         for device in &devices {
-            members.insert(device.user.clone());
+            members.insert(&device.user);
         }
+        let members = members.build();
 
         let devices = Arc::new(wacore::send::ResolvedGroupDevices::new(devices));
         self.group_devices_memo
@@ -566,29 +558,38 @@ impl Client {
         own_jid: &Jid,
         own_lid: Option<&Jid>,
         devices: &[Jid],
-    ) -> std::collections::HashSet<wacore_binary::CompactString> {
-        let mut members = std::collections::HashSet::with_capacity(devices.len() + 6);
+    ) -> MemberIndex {
+        let mut members = MemberIndex::builder(devices.len() + 6);
+        // The skip below is control flow, so it dedups on the identifiers
+        // themselves and not on their fingerprints: a collision that skipped a
+        // distinct user would leave that user's mapped counterpart out of the
+        // index entirely, which is the one error direction the index must not
+        // have. The set is one fan-out's worth of devices, so a linear scan
+        // over borrowed strs beats a hash set.
+        let mut probed: Vec<&str> = Vec::with_capacity(devices.len() + 3);
         for user in [recipient_bare.user.as_str(), own_jid.user.as_str()]
             .into_iter()
             .chain(own_lid.map(|lid| lid.user.as_str()))
             .chain(devices.iter().map(|d| d.user.as_str()))
         {
-            if !members.insert(wacore_binary::CompactString::from(user)) {
+            members.insert(user);
+            if probed.contains(&user) {
                 // Already probed on an earlier pass; the mapping relation is
                 // symmetric, so its counterpart is in too.
                 continue;
             }
+            probed.push(user);
             // Probe BOTH directions instead of trusting the jid's namespace:
             // a hosted or unmapped identity can be keyed either way, and a
             // mapping missed here is a change we could not prove unrelated.
             if let Some(pn) = self.lid_pn_cache.get_phone_number(user).await {
-                members.insert(wacore_binary::CompactString::from(pn.as_str()));
+                members.insert(pn.as_str());
             }
             if let Some(lid) = self.lid_pn_cache.get_current_lid(user).await {
-                members.insert(lid);
+                members.insert(&lid);
             }
         }
-        members
+        members.build()
     }
 
     /// Resolve a user identifier to its lookup keys with type information.
@@ -4038,23 +4039,22 @@ mod tests {
 
         // Exactly what `resolve_group_devices_memoized` builds: every member in
         // both namespaces, plus the sender and every resolved device user.
-        let mut members_set =
-            std::collections::HashSet::with_capacity(participants.len() * 2 + devices.len() + 2);
+        let mut member_index = MemberIndex::builder(participants.len() * 2 + devices.len() + 2);
         for participant in &participants {
-            members_set.insert(participant.user.clone());
+            member_index.insert(&participant.user);
             if let Some(pn) = lid_to_pn.get(&participant.user) {
-                members_set.insert(pn.user.clone());
+                member_index.insert(&pn.user);
             }
         }
-        members_set.insert(wacore_binary::CompactString::from("5511999990000"));
+        member_index.insert("5511999990000");
         for device in &devices {
-            members_set.insert(device.user.clone());
+            member_index.insert(&device.user);
         }
 
         GroupDevicesMemo {
             group_info: Arc::downgrade(&group_info),
             generation: 0,
-            members: Arc::new(members_set),
+            members: Arc::new(member_index.build()),
             devices: Arc::new(wacore::send::ResolvedGroupDevices::new(devices)),
         }
         // `group_info` drops here on purpose: the memo retains only the
@@ -4077,8 +4077,8 @@ mod tests {
         let per_device =
             (size_of::<GroupDevicesMemo>() + memo.heap_bytes()) / (MEMBERS * DEVICES_PER_USER);
         assert!(
-            per_device <= 98,
-            "a warm 1024-member group memo must stay within 98 B per resolved device, \
+            per_device <= 37,
+            "a warm 1024-member group memo must stay within 37 B per resolved device, \
              got {per_device}"
         );
     }

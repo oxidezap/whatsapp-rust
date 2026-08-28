@@ -15,6 +15,7 @@ pub mod interceptor;
 mod iq_ops;
 mod lid_pn;
 mod lifecycle;
+pub(crate) mod member_index;
 mod messaging;
 mod node_io;
 pub(crate) mod offline_resume;
