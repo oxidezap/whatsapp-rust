@@ -1619,17 +1619,12 @@ impl Client {
                             .record_skdm_targets(Outcome::MissAbsent),
                     }
                 }
-                // Frozen before it can be memoized: what the filter returns
-                // carries the growth capacity of a scan over every device, and
-                // the entry it lands in is retained for the life of the group.
-                let needs_skdm: Box<[Jid]> = self
-                    .filter_skdm_targets(
-                        group_jid,
-                        all_devices.devices(),
-                        &cached_map,
-                        own_sending_jid,
-                    )
-                    .into_boxed_slice();
+                let needs_skdm = self.filter_skdm_targets(
+                    group_jid,
+                    all_devices.devices(),
+                    &cached_map,
+                    own_sending_jid,
+                );
                 // Still inside the `device_memos_enabled` guard, and still
                 // short-circuiting: a client with store-backed caches must not
                 // pay the snapshot read for a memo it will never write.
@@ -1651,7 +1646,17 @@ impl Client {
                                     std::sync::Arc::downgrade(&cached_map),
                                     cached_map_gen,
                                     own_sending_jid.clone(),
-                                    needs_skdm.clone(),
+                                    // Frozen only here, on the one path that
+                                    // retains it: what the filter returns
+                                    // carries the growth capacity of a scan
+                                    // over every device, and the entry keeps
+                                    // it for the life of the group. Built
+                                    // straight from the slice, so storing
+                                    // costs the one exact allocation a
+                                    // `Vec` clone would have cost anyway —
+                                    // and the send keeps its own `Vec`
+                                    // untouched.
+                                    Box::from(needs_skdm.as_slice()),
                                 ),
                             )
                             .await;
@@ -1666,7 +1671,7 @@ impl Client {
                         self.device_memo_counters.record_skdm_not_stored();
                     }
                 }
-                Some((all_devices, needs_skdm.into_vec()))
+                Some((all_devices, needs_skdm))
             }
             Err(e) => {
                 // Recorded so `SkdmTargetsMemoStats::calls()` really is one
