@@ -657,10 +657,18 @@ impl SenderKeyStoreState {
     }
 
     fn key_for(&self, address: &str) -> Arc<str> {
-        match self.cache.get_key_value(address) {
-            Some((existing, _)) => existing.clone(),
-            None => Arc::from(address),
+        if let Some((existing, _)) = self.cache.get_key_value(address) {
+            return existing.clone();
         }
+        // The other place this address may already own an `Arc`: a
+        // distribution is retained when its durability gate fails, which can
+        // happen before the record itself reaches the cache. Reusing that key
+        // keeps one allocation per address instead of two, and keeps
+        // `memory_stats` from charging a string the store holds twice.
+        if let Some((existing, _)) = self.pending_distributions.get_key_value(address) {
+            return existing.clone();
+        }
+        Arc::from(address)
     }
 
     fn put(&mut self, address: &str, mut record: SenderKeyRecord) {
@@ -1896,6 +1904,19 @@ impl SignalStoreCache {
     /// their addresses are the cache's `Arc<str>` keys, which eviction cannot
     /// drop while an address is dirty, deleted or pending, so charging the
     /// payloads again would double-count them.
+    ///
+    /// The sender-key figure additionally covers `pending_distributions`: its
+    /// table slots, its distribution payloads, and the key bytes of entries
+    /// the cache no longer holds (a pending entry whose record is in the cache
+    /// shares that key, which `key_for` canonicalizes, so it is charged once).
+    /// Its entry count includes those pending-only addresses.
+    ///
+    /// One residual overlap is accepted rather than tracked: an address
+    /// evicted while still pending is charged both as a pending-only key and
+    /// in the removal window that named it. The window holds
+    /// [`RECENT_REMOVALS`] entries, which bounds the overstatement to a
+    /// handful of addresses — cheaper to state than to reconcile on a report
+    /// that is an estimate by contract.
     pub async fn memory_stats(
         &self,
     ) -> (
@@ -2332,6 +2353,53 @@ mod sender_key_lock_tests {
              got {}",
             identities.bytes
         );
+    }
+
+    /// A distribution is retained when its durability gate fails, which can
+    /// land before the record itself reaches the cache. Both orders must end
+    /// up sharing one `Arc<str>`: two allocations for one address is a real
+    /// (if small) waste, and it also makes `memory_stats` charge the string
+    /// once for storage it holds twice.
+    #[tokio::test]
+    async fn pending_distribution_and_cache_share_one_key() {
+        for pending_first in [true, false] {
+            let cache = SignalStoreCache::new();
+            let name =
+                SenderKeyName::from_parts("19995550001@g.us", "19995550002@s.whatsapp.net:0");
+
+            let retain = || async {
+                cache
+                    .cache_pending_sender_key_distribution(&name, Arc::from(&[1u8, 2, 3][..]))
+                    .await
+            };
+            let store = || async {
+                cache
+                    .put_sender_key(&name, sender_key_record_with_chain(3))
+                    .await
+            };
+
+            if pending_first {
+                retain().await;
+                store().await;
+            } else {
+                store().await;
+                retain().await;
+            }
+
+            let state = cache.sender_keys.lock().await;
+            let (cache_key, _) = state
+                .cache
+                .get_key_value(name.cache_key())
+                .expect("record cached");
+            let (pending_key, _) = state
+                .pending_distributions
+                .get_key_value(name.cache_key())
+                .expect("distribution retained");
+            assert!(
+                Arc::ptr_eq(cache_key, pending_key),
+                "pending_first={pending_first}: the two sides must share one allocation"
+            );
+        }
     }
 
     #[tokio::test]

@@ -162,7 +162,13 @@ figures come from the `wacore::stats::HeapSize` trait:
   beside it. Those sets are charged for their **slots only**: their addresses
   are the cache's own `Arc<str>` keys, which eviction cannot drop while an
   address is dirty, deleted or pending, so charging the payloads again would
-  double-count them.
+  double-count them. `sender_keys.bytes` additionally covers
+  `pending_distributions` — table slots, distribution payloads, and the key
+  bytes of pending entries the cache no longer holds — and `sender_keys.entries`
+  counts those pending-only addresses. One overlap is accepted rather than
+  tracked: an address evicted while still pending is charged both as a
+  pending-only key and in the 64-entry removal window that named it, which
+  bounds the overstatement to a handful of addresses.
   `wacore/tests/hash_table_bytes_matches_the_allocator.rs` checks the conversion
   against a counting `GlobalAlloc`. After removals the figure is a lower bound
   rather than exact: hashbrown leaves tombstones that consume growth slots
