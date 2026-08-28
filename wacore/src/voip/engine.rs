@@ -2099,8 +2099,10 @@ impl CallEngine {
                 let frame = if let Some(frame) = group_frame {
                     frame
                 } else if let Some(pcm) = m.pcm.as_mut() {
-                    pcm.playout_cap =
-                        effective_playout_cap(pcm.playout_cap, pcm.packet_samps, pcm.jitter.len());
+                    // NOT recomputed here. The ceiling gives up one packet's worth per PACKET --
+                    // its own contract -- and the arriving-packet sites are what maintain it.
+                    // Recomputing on the 20ms tick as well is a second caller of a per-packet
+                    // decision, which is inconsistent whether or not a fixture can catch it.
                     drain_playout(
                         &mut pcm.jitter,
                         &mut pcm.priming,

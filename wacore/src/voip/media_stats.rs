@@ -429,7 +429,9 @@ fn dominant_reason(stats: &CallMediaStats) -> AudioSilenceReason {
     if stats.sframe_decrypt_failed > 0 {
         return AudioSilenceReason::AuthenticationFailing;
     }
-    if stats.rtp_received == 0 && stats.rtp_payload_type_unexpected > 0 {
+    // Dominance here too, for the reason the SRTP branch above gives: one packet that authenticated
+    // and was then concealed must not hand a window of profile mismatches to the codec.
+    if stats.rtp_payload_type_unexpected > stats.rtp_received {
         return AudioSilenceReason::UnexpectedPayloadType;
     }
     if stats.codec_switches >= CODEC_FLAP_LIMIT {
@@ -689,6 +691,21 @@ mod tests {
             dominant_reason(&mostly_fine),
             AudioSilenceReason::CodecRejectingFrames,
             "one bad tag on an otherwise authenticating stream explains nothing"
+        );
+
+        // The payload-type branch beside it had the same unanimity requirement, and the same
+        // consequence: a window of profile mismatches handed to the codec on the strength of one
+        // packet that authenticated and was then concealed.
+        let mostly_wrong_profile = CallMediaStats {
+            rtp_received: 1,
+            rtp_payload_type_unexpected: 40,
+            audio_frames_concealed: 1,
+            ..CallMediaStats::default()
+        };
+        assert_eq!(
+            dominant_reason(&mostly_wrong_profile),
+            AudioSilenceReason::UnexpectedPayloadType,
+            "40 packets on the wrong payload type is a profile problem"
         );
     }
 

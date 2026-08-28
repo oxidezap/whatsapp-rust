@@ -183,10 +183,15 @@ impl AudioFormat {
     /// The format carrying `codec` within this one's RTP timing, if one exists.
     ///
     /// Two formats are interchangeable mid-call only when every timing field matches: payload type,
-    /// clock rate, timestamp step, sample rate, channels and samples per frame. Swapping such a pair
-    /// changes no RTP header byte, so the peer has nothing to recover from and there is nothing to
-    /// re-signal. Exactly one pair qualifies today, and the comparison below is what keeps that
-    /// honest if a profile is ever added.
+    /// clock rate, timestamp step, sample rate, channels, samples per frame -- and the signalling
+    /// rate. Swapping such a pair changes no RTP header byte, so the peer has nothing to recover
+    /// from and there is nothing to re-signal. Exactly one pair qualifies today, and the comparison
+    /// below is what keeps that honest if a profile is ever added.
+    ///
+    /// The signalling rate belongs in that list even though it is not RTP timing: it is the
+    /// `<audio rate>` the peer was told, so a pair differing there is precisely the case
+    /// "nothing to re-signal" cannot claim. Omitting it let a format built on this payload type but
+    /// signalled at another rate be switched live to the built-in 16 kHz sibling.
     #[must_use]
     pub fn sibling_for(self, codec: AudioCodec) -> Option<Self> {
         // Exhaustive on purpose: a new codec has to declare which format carries it instead of
@@ -200,7 +205,8 @@ impl AudioFormat {
             && candidate.rtp_timestamp_step == self.rtp_timestamp_step
             && candidate.samples_per_frame == self.samples_per_frame
             && candidate.sample_rate == self.sample_rate
-            && candidate.channels == self.channels;
+            && candidate.channels == self.channels
+            && candidate.signaling_rate == self.signaling_rate;
         same_timing.then_some(candidate)
     }
 
@@ -553,6 +559,31 @@ pub struct EncodedAudioFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The comparison exists so that "nothing to re-signal" stays true of any pair it admits. It
+    // checked every RTP timing field and not the signalling rate -- which is the one thing in an
+    // `AudioFormat` the peer learns from the `<audio rate>` rather than from the packets. A format
+    // on this payload type signalled at another rate could therefore be switched live to the
+    // built-in 16 kHz sibling, mid-call, against a peer that was told something else.
+    #[test]
+    fn a_sibling_has_to_agree_on_the_rate_the_peer_was_signalled() {
+        let standard = AudioFormat::MLOW_16KHZ_60MS;
+        assert_eq!(
+            standard.sibling_for(AudioCodec::Opus),
+            Some(AudioFormat::OPUS_16KHZ_60MS),
+            "the one documented interchangeable pair still swaps"
+        );
+
+        let resignalled = AudioFormat {
+            signaling_rate: 8_000,
+            ..AudioFormat::MLOW_16KHZ_60MS
+        };
+        assert_eq!(
+            resignalled.sibling_for(AudioCodec::Opus),
+            None,
+            "but not into a format the peer was never told about"
+        );
+    }
 
     #[test]
     fn native_opus_codec_selection_is_independent_from_rtp_clock_profile() {
