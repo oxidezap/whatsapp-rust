@@ -1430,6 +1430,17 @@ fn spawn_call_event_listener(
                     }
                     other => info!("🎥 peer video state: {other:?}"),
                 },
+                // Outbound video is dropping every frame until an IDR reaches
+                // the wire, and only the encoder can make one. This example
+                // cannot: its source is a spawned ffmpeg whose GOP is fixed at
+                // launch, with no runtime input that forces a keyframe. Saying
+                // so beats leaving someone to wonder why their picture froze
+                // for up to `GOP_SECONDS`; a real client wires this to its
+                // encoder's force-IDR control.
+                CallEvent::VideoKeyframeNeeded => info!(
+                    "🎥 engine wants a keyframe; this encoder makes one every {}s and cannot be asked",
+                    video::GOP_SECONDS
+                ),
                 // CallEvent is #[non_exhaustive]: ignore variants newer core versions may add.
                 _ => {}
             }

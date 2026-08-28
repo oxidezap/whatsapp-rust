@@ -56,7 +56,7 @@ const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 1980;
 const VIDEO_VBV_WINDOW_MS: u32 = 250;
 /// Raw-H.264 fallback when the bitstream carries no timing; preview timestamps follow arrival time.
 const DEFAULT_SINK_FPS: u32 = 15;
-const GOP_SECONDS: u32 = 3;
+pub const GOP_SECONDS: u32 = 3;
 const H264_LEVEL_31_MAX_FRAME_MBS: u32 = 3600;
 const H264_LEVEL_31_MAX_MBS_PER_SECOND: u32 = 108_000;
 const H264_BASELINE_LEVEL_31_MAX_KBPS: u32 = 14_000;
