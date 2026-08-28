@@ -256,6 +256,82 @@ mod tests {
         assert_eq!(adv_secret(&client).await, before);
     }
 
+    // ── `<notification type="encrypt">` prekey-low routing
+    //
+    // WA Web's stanza router reads the FIRST child tag and sends both `count`
+    // and `pq_count` to `WAWebHandlePreKeyLow`
+    // (`case"count":case"pq_count":return yield r("WAWebHandlePreKeyLow")(e,t)`).
+    // That handler then decides what to refill by TAG, not by position:
+    // `hasLegacyCount = maybeChild("count") != null` is what drives the classic
+    // one-time-prekey upload. So WA Web refills the classic pool for
+    // `<count><pq_count>` and `<pq_count><count>` alike.
+
+    fn encrypt_notif(children: &[&'static str]) -> Node {
+        NodeBuilder::new("notification")
+            .attr("type", "encrypt")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "prekey-low-1")
+            .children(children.iter().map(|c| NodeBuilder::new(c).build()))
+            .build()
+    }
+
+    /// `handle_prekey_low` clears `server_has_prekeys` synchronously, before it
+    /// spawns the upload, so the flag is the observable that says the stanza was
+    /// routed to the prekey-low path at all.
+    async fn server_has_prekeys(client: &Arc<Client>) -> bool {
+        client
+            .persistence_manager
+            .get_device_snapshot()
+            .server_has_prekeys
+    }
+
+    async fn dispatch_encrypt(client: &Arc<Client>, children: &[&'static str]) -> bool {
+        client
+            .persistence_manager
+            .modify_device(|d| d.server_has_prekeys = true)
+            .await;
+        handle_notification_impl(client, node_to_arc(encrypt_notif(children))).await;
+        !server_has_prekeys(client).await
+    }
+
+    /// A `<count>` child refills the classic pool wherever it sits among the
+    /// children. Routing on `<count>`-first alone dropped the whole stanza when
+    /// the server led with `<pq_count>`, and the one-time prekey pool then never
+    /// refilled — peers can no longer fetch a bundle to open a session with this
+    /// device, so they stop being able to message it.
+    #[tokio::test]
+    async fn a_pq_count_first_encrypt_notification_still_refills_the_classic_pool() {
+        let client = create_test_client().await;
+
+        assert!(
+            dispatch_encrypt(&client, &["count"]).await,
+            "<count> alone must reach the prekey-low path"
+        );
+        assert!(
+            dispatch_encrypt(&client, &["count", "pq_count"]).await,
+            "<count> first must reach the prekey-low path"
+        );
+        assert!(
+            dispatch_encrypt(&client, &["pq_count", "count"]).await,
+            "WA Web routes a pq_count-first notification to the same handler, \
+             which finds <count> by tag and refills the classic pool"
+        );
+    }
+
+    /// The other half of `hasLegacyCount`: with no `<count>` anywhere there is
+    /// no classic pool to refill, and this client uploads no Kyber prekeys, so
+    /// the stanza is acked and nothing else happens. Without this the fix would
+    /// be free to upload on every PQ-only notification, which WA Web does not do.
+    #[tokio::test]
+    async fn a_pq_count_only_encrypt_notification_uploads_nothing() {
+        let client = create_test_client().await;
+
+        assert!(
+            !dispatch_encrypt(&client, &["pq_count"]).await,
+            "a PQ-only prekey-low notification must not trigger the classic upload"
+        );
+    }
+
     /// Regression: the displayed-code window and the pending-link window are not
     /// the same. A `primary_hello` accepted near the end of the 180s validity
     /// leaves `companion_finish` waiting up to another minute for pair-success,

@@ -20,7 +20,30 @@ pub(crate) async fn handle_encrypt_notification(client: &Arc<Client>, nr: &NodeR
             .children()
             .and_then(|c| c.first().map(|n| n.tag.as_ref()));
         match first_child_tag {
-            Some("count") => handle_prekey_low(client).await,
+            // WA Web's stanza router sends BOTH `count` and `pq_count` to
+            // `WAWebHandlePreKeyLow` (`case"count":case"pq_count"` in
+            // `Comms.handleStanza`), and that handler then decides what to
+            // refill by *tag*, not by position: `hasLegacyCount =
+            // maybeChild("count") != null` drives the classic one-time-prekey
+            // upload, while `hasPqCount` drives a separate Kyber upload that is
+            // additionally gated on `isPqKeysUploadEnabled()`.
+            //
+            // Matching only `count` here dropped the whole notification
+            // whenever the server put `<pq_count>` first — including when the
+            // same stanza also carried `<count>`, so the one-time prekey pool
+            // never refilled and peers eventually could not fetch a bundle to
+            // start a session with this device.
+            Some("count" | "pq_count") => {
+                if nr.get_optional_child("count").is_some() {
+                    handle_prekey_low(client).await;
+                } else {
+                    // PQ-only: this client uploads no Kyber prekeys, so there
+                    // is nothing to refill. The stanza is still acked by the
+                    // router, which is what WA Web does when its own PQ gate
+                    // is off.
+                    debug!("encrypt notification carried only <pq_count>; no PQ prekeys to upload");
+                }
+            }
             Some("digest") => handle_digest_key(client),
             other => warn!("Unhandled encrypt notification child: {:?}", other),
         }
