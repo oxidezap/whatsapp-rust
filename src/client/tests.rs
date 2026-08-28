@@ -2435,7 +2435,7 @@ fn test_encrypt_count_and_digest_notifications_also_omit_type() {
 }
 
 #[test]
-fn test_device_notification_is_not_encrypt_identity() {
+fn test_device_notification_is_not_an_encrypt_notification() {
     let node = NodeBuilder::new("notification")
         .attr("from", "186303081611421@lid")
         .attr("id", "269488578")
