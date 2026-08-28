@@ -221,6 +221,18 @@ pub trait ForeignAudioCodec: crate::sync_marker::MaybeSend {
     fn encode(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), ForeignCodecError>;
 }
 
+/// Makes one [`ForeignAudioCodec`] per stream that needs one.
+///
+/// A group call needs a decoder PER PARTICIPANT: these codecs carry inter-frame state, so feeding
+/// two speakers through one instance corrupts both. A single injected codec cannot serve them, and
+/// the engine cannot clone one, so a runtime that has libopus supplies this instead and the engine
+/// mints a decoder the first time each participant is heard from.
+pub trait ForeignAudioCodecFactory: crate::sync_marker::MaybeSend {
+    /// A fresh decoder, or `None` if one cannot be built right now. `None` is reported the same way
+    /// a missing codec is on the direct path: honest silence, never a pretend decode.
+    fn create(&self) -> Option<Box<dyn ForeignAudioCodec>>;
+}
+
 /// Why an injected codec refused a frame. Deliberately opaque: the engine counts and conceals, and
 /// the specific complaint belongs in the implementation's own log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

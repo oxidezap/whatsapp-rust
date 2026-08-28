@@ -20,7 +20,7 @@ use bytes::Bytes;
 use super::app_data;
 use super::audio::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
-    ForeignAudioCodec, depacketize_opus_from_mlow,
+    ForeignAudioCodec, ForeignAudioCodecFactory, depacketize_opus_from_mlow,
 };
 use super::codec_probe::InboundCodecProbe;
 use super::demux::{RelayPacketKind, classify_relay_packet, unwrap_group_forwarding_packet};
@@ -929,6 +929,9 @@ struct GroupEngineState {
     video_reception: HashMap<String, RtpReceptionStats>,
     #[cfg(feature = "voip-mlow")]
     decoders: HashMap<String, mlow::MlowDecoder>,
+    /// One injected decoder per participant speaking standard Opus. Separate instances because
+    /// these codecs carry inter-frame state: one shared across speakers corrupts every one of them.
+    foreign_decoders: HashMap<String, Box<dyn ForeignAudioCodec>>,
 }
 
 struct ReactionWatermark {
@@ -975,6 +978,10 @@ pub struct CallEngine {
     /// stream SSRC. Retained so the STUN allocate announces this call's live SSRCs.
     self_participant_id: String,
     group: Option<GroupEngineState>,
+    /// Mints the per-participant decoders the group path needs. Held on the engine rather than in
+    /// `GroupEngineState` because it outlives any one group session and is installed at
+    /// construction, before there is one.
+    foreign_audio_factory: Option<Box<dyn ForeignAudioCodecFactory>>,
     // Media plane (None = control plane only, e.g. esp32).
     media: Option<MediaState>,
     /// Peer device orientation (0..3, ×90°) from the last `<video device_orientation>`; stamped on
@@ -1141,6 +1148,7 @@ impl CallEngine {
             started: false,
             terminated: false,
             self_participant_id: ssrc::format_e2e_srtp_participant_id(&config.self_lid),
+            foreign_audio_factory: None,
             group: None,
             media,
             peer_video_orientation: 0,
@@ -1314,6 +1322,7 @@ impl CallEngine {
             video_reception: HashMap::new(),
             #[cfg(feature = "voip-mlow")]
             decoders: HashMap::new(),
+            foreign_decoders: HashMap::new(),
         };
         group.mixer.retain(group.registry.active_participant_ids());
         self.group = Some(group);
@@ -1447,6 +1456,9 @@ impl CallEngine {
             #[cfg(feature = "voip-mlow")]
             group
                 .decoders
+                .retain(|participant, _| active.contains(participant));
+            group
+                .foreign_decoders
                 .retain(|participant, _| active.contains(participant));
             let current_pids = group.registry.active_pids();
             let subscriptions_changed = current_pids != previous_pids;
@@ -2035,6 +2047,21 @@ impl CallEngine {
         if let Some(m) = self.media.as_mut() {
             m.foreign_audio = Some(codec);
         }
+        self
+    }
+
+    /// Supply a source of decoders for a group call, where one instance cannot serve everyone.
+    ///
+    /// [`Self::with_foreign_audio_codec`] hands over a single decoder, which is right for a 1:1
+    /// call and impossible for a group: these codecs carry inter-frame state, so each participant
+    /// needs their own. A runtime installs both -- the instance decodes the direct path, the
+    /// factory mints one per participant as they are first heard.
+    #[must_use]
+    pub fn with_foreign_audio_codec_factory(
+        mut self,
+        factory: Box<dyn ForeignAudioCodecFactory>,
+    ) -> Self {
+        self.foreign_audio_factory = Some(factory);
         self
     }
 
@@ -2956,14 +2983,23 @@ impl CallEngine {
                     device: Some(participant.device_jid),
                     pid: participant.pid,
                 }));
-            #[cfg(feature = "voip-mlow")]
             return;
         }
-        #[cfg(feature = "voip-mlow")]
-        {
-            if codec == AudioCodec::Opus {
-                // The core has no standard-Opus decoder: the frame reaches a shell that may have
-                // one, exactly as `ForeignAudio` does on the direct path, and is counted the same.
+        if codec == AudioCodec::Opus {
+            // Decoded with this participant's OWN injected decoder, not the direct path's single
+            // instance: these codecs carry inter-frame state and two speakers through one corrupts
+            // both. Only when no decoder can be made does the frame go out as an event -- the same
+            // honest answer `ForeignAudio` gives on the direct path. Reporting that while a codec
+            // WAS installed left the speaker silent for that participant with the counter naming a
+            // cause that was not true.
+            let participant_id = participant.participant_id.clone();
+            if !group.foreign_decoders.contains_key(&participant_id)
+                && let Some(factory) = self.foreign_audio_factory.as_ref()
+                && let Some(codec) = factory.create()
+            {
+                group.foreign_decoders.insert(participant_id.clone(), codec);
+            }
+            let Some(decoder) = group.foreign_decoders.get_mut(&participant_id) else {
                 self.media_stats.audio_frames_without_decoder = self
                     .media_stats
                     .audio_frames_without_decoder
@@ -2984,37 +3020,69 @@ impl CallEngine {
                         },
                     )));
                 return;
+            };
+            // The escape's first byte is not an RFC TOC; restore it before a stock decoder sees it,
+            // exactly as the direct path does.
+            let mut encoded = participant.payload;
+            if audio.format.rtp_profile == AudioRtpProfile::Mlow
+                && let Err(e) = depacketize_opus_from_mlow(&mut encoded)
+            {
+                log::debug!("voip: malformed MLOW Opus escape from a participant: {e}");
+                self.media_stats.audio_frames_concealed =
+                    self.media_stats.audio_frames_concealed.saturating_add(1);
+                return;
             }
-            let decoder = group
-                .decoders
-                .entry(participant.participant_id.clone())
-                .or_insert_with(mlow::MlowDecoder::new);
-            decoder.set_redundancy(i32::from(
-                participant.header.payload_type == RTP_PAYLOAD_TYPE_MLOW_RED,
-            ));
-            let pcm = decoder
-                .decode(&participant.payload)
-                .iter()
-                .map(|sample| (sample * 32767.0).clamp(-32768.0, 32767.0) as i16)
-                .collect::<Vec<_>>();
-            let report = decoder.take_frame_report();
-            self.media_stats.audio_frames_decoded = self
-                .media_stats
-                .audio_frames_decoded
-                .saturating_add(u32::from(report.decoded));
-            self.media_stats.audio_frames_concealed = self
-                .media_stats
-                .audio_frames_concealed
-                .saturating_add(u32::from(report.concealed));
-            self.media_stats.mlow_off_point_dropped = self
-                .media_stats
-                .mlow_off_point_dropped
-                .saturating_add(u32::from(report.off_point));
-            self.media_stats.mlow_inactive_or_sid = self
-                .media_stats
-                .mlow_inactive_or_sid
-                .saturating_add(u32::from(report.inactive_or_sid));
-            group.mixer.push(&participant.participant_id, &pcm);
+            let mut pcm = Vec::new();
+            match decoder.decode(&encoded, &mut pcm) {
+                Ok(()) => {
+                    self.media_stats.foreign_frames_decoded =
+                        self.media_stats.foreign_frames_decoded.saturating_add(1);
+                }
+                Err(e) => {
+                    log::debug!("voip: participant foreign audio decode failed: {e}");
+                    pcm.clear();
+                    decoder.conceal(audio.format.samples_per_frame as usize, &mut pcm);
+                    self.media_stats.audio_frames_concealed =
+                        self.media_stats.audio_frames_concealed.saturating_add(1);
+                }
+            }
+            group.mixer.push(&participant_id, &pcm);
+            // Not a `return`: without the built-in codec nothing follows, and clippy denies the
+            // dead one. The MLOW branch below is the whole remainder either way.
+        } else {
+            #[cfg(feature = "voip-mlow")]
+            {
+                let decoder = group
+                    .decoders
+                    .entry(participant.participant_id.clone())
+                    .or_insert_with(mlow::MlowDecoder::new);
+                decoder.set_redundancy(i32::from(
+                    participant.header.payload_type == RTP_PAYLOAD_TYPE_MLOW_RED,
+                ));
+                let pcm = decoder
+                    .decode(&participant.payload)
+                    .iter()
+                    .map(|sample| (sample * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                    .collect::<Vec<_>>();
+                let report = decoder.take_frame_report();
+                self.media_stats.audio_frames_decoded = self
+                    .media_stats
+                    .audio_frames_decoded
+                    .saturating_add(u32::from(report.decoded));
+                self.media_stats.audio_frames_concealed = self
+                    .media_stats
+                    .audio_frames_concealed
+                    .saturating_add(u32::from(report.concealed));
+                self.media_stats.mlow_off_point_dropped = self
+                    .media_stats
+                    .mlow_off_point_dropped
+                    .saturating_add(u32::from(report.off_point));
+                self.media_stats.mlow_inactive_or_sid = self
+                    .media_stats
+                    .mlow_inactive_or_sid
+                    .saturating_add(u32::from(report.inactive_or_sid));
+                group.mixer.push(&participant.participant_id, &pcm);
+            }
         }
     }
 
@@ -7101,6 +7169,65 @@ mod tests {
             Output::Event(CallEvent::ForeignAudio(payload)) if payload.as_ref() == embedded_opus
         )));
         assert_eq!(eng.jitter_len(), 0);
+    }
+
+    /// Hands out a fresh [`StubForeignCodec`] per participant, standing in for the libopus factory.
+    struct StubCodecFactory {
+        samples: usize,
+    }
+
+    impl ForeignAudioCodecFactory for StubCodecFactory {
+        fn create(&self) -> Option<Box<dyn ForeignAudioCodec>> {
+            Some(Box::new(StubForeignCodec {
+                samples: self.samples,
+            }))
+        }
+    }
+
+    // A group participant outside the MLOW rollout speaks the escape, exactly as a 1:1 peer does.
+    // The direct path decodes that with the installed adapter; the group path announced it as
+    // undecodable and mixed nothing, so the speaker stayed silent for that participant while
+    // `audio_frames_without_decoder` named a cause that was not true -- a decoder WAS installed.
+    #[test]
+    fn a_group_participant_on_opus_is_decoded_by_the_installed_factory() {
+        let (mut eng, epoch) = group_engine(false);
+        eng = eng.with_foreign_audio_codec_factory(Box::new(StubCodecFactory { samples: 960 }));
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        let mut peer = group_peer_audio(&epoch);
+        let mut heard = Vec::new();
+        for n in 0..6u64 {
+            let packet = peer.protect_audio(&[0xF8u8, 0xFF, 0xFE]);
+            eng.handle_input(100 + n * 60, Input::RelayPacket(&packet));
+            for tick in 0..3u64 {
+                eng.handle_input(100 + n * 60 + tick * 20, Input::Timeout);
+                let (outputs, _) = drain(&mut eng);
+                for output in outputs {
+                    match output {
+                        Output::Playout(frame) => heard.extend(frame),
+                        Output::Event(CallEvent::ForeignGroupAudio(_)) => {
+                            panic!("a decoder was installed, so nothing should be handed back")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert!(eng.media_stats().foreign_frames_decoded > 0, "it decodes");
+        assert_eq!(
+            eng.media_stats().audio_frames_without_decoder,
+            0,
+            "and does not claim a missing decoder while holding one"
+        );
+        assert!(
+            heard.contains(&1234),
+            "what it decoded has to reach the mixer and the speaker"
+        );
     }
 
     #[test]

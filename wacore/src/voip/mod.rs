@@ -49,8 +49,8 @@ pub mod warp;
 pub use app_data::{AppDataError, CallReaction};
 pub use audio::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
-    ForeignAudioCodec, ForeignCodecError, OpusMlowPacketError, depacketize_opus_from_mlow,
-    packetize_opus_for_mlow,
+    ForeignAudioCodec, ForeignAudioCodecFactory, ForeignCodecError, OpusMlowPacketError,
+    depacketize_opus_from_mlow, packetize_opus_for_mlow,
 };
 pub use demux::{
     GroupForwardingError, RelayPacket, RelayPacketKind, classify_relay_packet,

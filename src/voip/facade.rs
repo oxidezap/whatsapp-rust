@@ -1219,13 +1219,20 @@ pub(crate) fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8]
 fn with_platform_audio_codec(engine: CallEngine) -> CallEngine {
     #[cfg(feature = "voip-libopus")]
     {
+        // Both seams, because a call can be either shape: the instance decodes the direct path, the
+        // factory gives each group participant their own (one decoder cannot serve several
+        // speakers -- it carries inter-frame state).
+        let engine = engine
+            .with_foreign_audio_codec_factory(Box::new(crate::voip::audio::LibopusCodecFactory));
         match crate::voip::audio::LibopusAudioCodec::new() {
-            Ok(codec) => return engine.with_foreign_audio_codec(Box::new(codec)),
+            Ok(codec) => engine.with_foreign_audio_codec(Box::new(codec)),
             Err(e) => {
                 log::warn!("voip: libopus unavailable for this call, Opus will not decode: {e}");
+                engine
             }
         }
     }
+    #[cfg(not(feature = "voip-libopus"))]
     engine
 }
 

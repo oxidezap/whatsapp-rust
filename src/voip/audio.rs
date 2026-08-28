@@ -217,6 +217,28 @@ impl LibopusAudioCodec {
     }
 }
 
+/// Mints one [`LibopusAudioCodec`] per group participant.
+///
+/// Zero-sized: every decoder is built from scratch, which is the point -- one shared instance would
+/// carry one speaker's inter-frame state into the next.
+#[cfg(feature = "voip-libopus")]
+pub(crate) struct LibopusCodecFactory;
+
+#[cfg(feature = "voip-libopus")]
+impl wacore::voip::ForeignAudioCodecFactory for LibopusCodecFactory {
+    fn create(&self) -> Option<Box<dyn wacore::voip::ForeignAudioCodec>> {
+        match LibopusAudioCodec::new() {
+            Ok(codec) => Some(Box::new(codec)),
+            Err(e) => {
+                // Reported as absence rather than as an error: the engine's answer to "no decoder"
+                // is already an honest `AudioSilent`, and this participant gets exactly that.
+                log::warn!("voip: libopus unavailable for a group participant: {e}");
+                None
+            }
+        }
+    }
+}
+
 #[cfg(feature = "voip-libopus")]
 impl wacore::voip::ForeignAudioCodec for LibopusAudioCodec {
     fn decode(&mut self, payload: &[u8], out: &mut Vec<i16>) -> Result<(), ForeignCodecError> {
