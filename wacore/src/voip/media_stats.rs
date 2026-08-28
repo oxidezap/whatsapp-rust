@@ -417,6 +417,14 @@ fn dominant_reason(stats: &CallMediaStats) -> AudioSilenceReason {
     if stats.rtp_received == 0 && stats.srtp_unprotect_failed > 0 {
         return AudioSilenceReason::AuthenticationFailing;
     }
+    // SRTP authenticating and SFrame not is still an authentication failure, and the counter names
+    // it exactly. It needs its own condition because the one above cannot fire for it: SRTP
+    // succeeded, so `rtp_received` is not zero. Ahead of the codec reasons because the ciphertext is
+    // handed to the codec and shows up there as concealment -- the symptom, reported by the layer
+    // that did nothing wrong.
+    if stats.sframe_decrypt_failed > 0 {
+        return AudioSilenceReason::AuthenticationFailing;
+    }
     if stats.rtp_received == 0 && stats.rtp_payload_type_unexpected > 0 {
         return AudioSilenceReason::UnexpectedPayloadType;
     }

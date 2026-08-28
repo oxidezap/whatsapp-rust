@@ -801,7 +801,7 @@ async fn relay_driver(
         while let Some(datagram) = stack.poll_transmit() {
             if let Err(e) = socket.send(&datagram).await {
                 let reason = RelayDisconnectReason::ReadError(format!("relay socket send: {e}"));
-                finish(&events, &open, announced, reason).await;
+                finish(&events, &open, announced, dropped_inbound, reason).await;
                 return;
             }
         }
@@ -853,7 +853,7 @@ async fn relay_driver(
 
         if let Err(e) = step {
             debug!("voip: relay media channel ended: {e}");
-            finish(&events, &open, announced, e.into()).await;
+            finish(&events, &open, announced, dropped_inbound, e.into()).await;
             return;
         }
     }
@@ -922,8 +922,19 @@ async fn finish(
     events: &async_channel::Sender<RelayTransportEvent>,
     open: &async_channel::Sender<Result<(), String>>,
     announced: bool,
+    dropped: u32,
     reason: RelayDisconnectReason,
 ) {
+    // Ahead of the disconnect, because the disconnect is the last thing the driver will ever send:
+    // media discarded under backpressure is only reported when a LATER packet arrives, so a relay
+    // that fails right after an overload would take the final burst with it and the call's closing
+    // `media_stats()` would show the loss as if it never happened. Overload immediately before a
+    // failure is precisely the overload worth attributing.
+    if announced && dropped > 0 {
+        let _ = events
+            .send(RelayTransportEvent::InboundDropped(dropped))
+            .await;
+    }
     if announced {
         let _ = events.send(RelayTransportEvent::Disconnected(reason)).await;
     } else {
@@ -987,6 +998,28 @@ mod tests {
             Ok(RelayTransportEvent::PacketReceived(b)) => assert_eq!(b.as_ref(), &[4u8, 5][..]),
             other => panic!("expected second packet, got {other:?}"),
         }
+    }
+
+    // A drop report is only ever sent when a LATER packet arrives, so a relay that fails right after
+    // an overload would carry the final burst away with it: the call's closing `media_stats()` would
+    // show that loss as if it had never happened. Overload immediately before a failure is exactly
+    // the overload worth attributing.
+    #[tokio::test]
+    async fn the_last_drop_burst_survives_the_disconnect() {
+        let (tx, rx) = async_channel::unbounded();
+        let (open_tx, _open_rx) = async_channel::unbounded();
+
+        finish(&tx, &open_tx, true, 7, RelayDisconnectReason::Closed).await;
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            matches!(events.first(), Some(RelayTransportEvent::InboundDropped(7))),
+            "the pending count goes out ahead of the disconnect, got {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(RelayTransportEvent::Disconnected(_))),
+            "and the disconnect is still the last thing said, got {events:?}"
+        );
     }
 
     // The drop report is the one number that explains an overload, and it used to be sent AFTER the

@@ -353,6 +353,14 @@ impl RtpReceptionStats {
                 self.frame_span = (delta > 0 && delta <= clock_rate).then_some(delta);
             }
             self.last_rtp_timestamp = Some(rtp_timestamp);
+        } else {
+            // The same rule as above, for the same reason: this packet arrived out of order, so the
+            // difference between it and the newest one is not a statement about the peer's pacing.
+            // Left set, the previous packet's span would be lent to it, and a reordered packet that
+            // happens to parse as Opus could supply the third agreement the probe requires -- a
+            // permanent codec switch on two packets that stated the cadence and one that did not.
+            // The baseline is deliberately NOT touched: it still tracks the newest packet.
+            self.frame_span = None;
         }
     }
 

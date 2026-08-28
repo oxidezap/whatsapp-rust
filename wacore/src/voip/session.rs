@@ -254,6 +254,17 @@ impl SrtcpReplayState {
 /// packets is not a straggler, it is the peer's current stream, and it takes the depacketizer back.
 const RETIRED_SSRC_GRACE_PACKETS: u32 = 64;
 
+/// Consecutive packets a retired SSRC must deliver, once its grace has expired, before it takes the
+/// depacketizer back.
+///
+/// Expiring the grace must not turn ONE very late packet into a commitment to its stream: reclaiming
+/// on a single straggler makes the peer's actual current stream the retired one, and it is then
+/// ignored for a whole fresh grace window -- a video freeze caused by the straggler the grace exists
+/// to absorb. A resumed stream keeps arriving and clears this in a few packets; a lone latecomer
+/// never does. Any packet from the stream in possession resets the count, so only an uninterrupted
+/// run counts.
+const RETIRED_SSRC_RESUME_PACKETS: u32 = 3;
+
 const SRTP_REPLAY_WINDOW_BITS: u64 = 64;
 /// Concurrent inbound RTP streams tracked per pipeline, matching [`SRTCP_REPLAY_STREAM_CAP`].
 ///
@@ -774,6 +785,8 @@ pub struct VideoPipeline {
     /// would leave a peer that legitimately returns to a previous SSRC with no video at all.
     retired_ssrc: Option<u32>,
     packets_since_stream_change: u32,
+    /// Consecutive packets from `retired_ssrc` since the last one from the stream in possession.
+    retired_ssrc_run: u32,
     pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
 }
@@ -820,6 +833,7 @@ impl VideoPipeline {
             depacketizer_ssrc: None,
             retired_ssrc: None,
             packets_since_stream_change: 0,
+            retired_ssrc_run: 0,
             pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
         })
@@ -864,6 +878,7 @@ impl VideoPipeline {
         self.depacketizer_ssrc = None;
         self.retired_ssrc = None;
         self.packets_since_stream_change = 0;
+        self.retired_ssrc_run = 0;
         true
     }
 
@@ -906,6 +921,7 @@ impl VideoPipeline {
         self.depacketizer_ssrc = None;
         self.retired_ssrc = None;
         self.packets_since_stream_change = 0;
+        self.retired_ssrc_run = 0;
     }
 
     /// Outbound: packetize one Annex-B access unit and protect each RTP packet.
@@ -967,15 +983,26 @@ impl VideoPipeline {
         // Committing to a new stream discards what the previous one left half-assembled. Dropping a
         // partial access unit is the correct trade: the alternative is emitting one spliced from two
         // encoders' fragments, which decodes to garbage rather than to nothing.
-        if self.depacketizer_ssrc != Some(header.ssrc) {
+        if self.depacketizer_ssrc == Some(header.ssrc) {
+            // The stream in possession is still speaking, so whatever run the retired one had built
+            // is not a resumption.
+            self.retired_ssrc_run = 0;
+        } else {
             // A straggler from the stream we just left is not a commitment to it -- see
             // `retired_ssrc`. Its own access unit was discarded when we switched, so there is
-            // nothing it can complete; it is counted as received and otherwise ignored. A stream
-            // that keeps arriving past the grace is not a straggler and reclaims below.
-            if self.retired_ssrc == Some(header.ssrc)
-                && self.packets_since_stream_change <= RETIRED_SSRC_GRACE_PACKETS
-            {
-                return Some((header, Vec::new()));
+            // nothing it can complete; it is counted as received and otherwise ignored.
+            //
+            // Past the grace it still is not a commitment on its own: reclaiming on one late packet
+            // would make the peer's ACTUAL stream the retired one and freeze its video for a whole
+            // new window. Only an uninterrupted run reclaims, which a resumed stream produces in a
+            // few packets and a lone latecomer never does.
+            if self.retired_ssrc == Some(header.ssrc) {
+                self.retired_ssrc_run = self.retired_ssrc_run.saturating_add(1);
+                if self.packets_since_stream_change <= RETIRED_SSRC_GRACE_PACKETS
+                    || self.retired_ssrc_run < RETIRED_SSRC_RESUME_PACKETS
+                {
+                    return Some((header, Vec::new()));
+                }
             }
             if self.depacketizer_ssrc.is_some() {
                 self.depacketizer.reset();
@@ -983,6 +1010,7 @@ impl VideoPipeline {
             self.retired_ssrc = self.depacketizer_ssrc;
             self.depacketizer_ssrc = Some(header.ssrc);
             self.packets_since_stream_change = 0;
+            self.retired_ssrc_run = 0;
         }
         let first = self.depacketizer.push(
             header.sequence_number,
@@ -1910,6 +1938,53 @@ mod tests {
             delivered >= 3,
             "the resumed stream must take reassembly back rather than stay ignored forever,              got {delivered} of {} delivered",
             RETIRED_SSRC_GRACE_PACKETS + 4
+        );
+    }
+
+    // Expiring the grace must not turn ONE very late packet into a commitment to its stream. It
+    // would make the peer's actual stream the retired one, and that stream is then ignored for a
+    // whole fresh window -- a freeze caused by exactly the straggler the grace exists to absorb,
+    // arrived at from a third side.
+    #[test]
+    fn a_lone_straggler_past_the_grace_does_not_take_reassembly_from_the_live_stream() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut original = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut replacement = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        let au = video_au(60);
+        let packet = original.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+
+        // The peer renumbers and stays there, well past the grace.
+        for _ in 0..(RETIRED_SSRC_GRACE_PACKETS + 4) {
+            let au = video_au(60);
+            let packet = replacement.protect_video(&au).pop().expect("one packet");
+            let _ = rx.unprotect_video(&packet);
+        }
+
+        // One very late packet from the retired stream, then the live stream continues.
+        let au = video_au(60);
+        let straggler = original.protect_video(&au).pop().expect("one packet");
+        let _ = rx.unprotect_video(&straggler);
+
+        let mut delivered = 0;
+        for _ in 0..8 {
+            let au = video_au(60);
+            let packet = replacement.protect_video(&au).pop().expect("one packet");
+            if rx.unprotect_video(&packet) == Some(vec![au]) {
+                delivered += 1;
+            }
+        }
+        assert_eq!(
+            delivered, 8,
+            "the live stream must keep reassembly; one latecomer is not a resumption"
         );
     }
 
