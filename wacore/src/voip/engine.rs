@@ -487,6 +487,22 @@ pub enum CallEvent {
         /// were already resolved by the signaling state machine.
         upgrade_token: Option<super::VideoUpgradeToken>,
     },
+    /// Outbound video needs an IDR before anything can go on the wire, and the
+    /// engine cannot make one — it transports encoded access units and never
+    /// touches pixels, so only the application's encoder can.
+    ///
+    /// Raised the moment the requirement appears, not once per dropped frame:
+    /// an upgrade being ungated, a group epoch commit, a source switch, or the
+    /// peer's own RTCP asking for one. Until an access unit carrying an IDR
+    /// arrives, every frame handed to the engine is dropped — so a consumer
+    /// that ignores this event sends nothing until its encoder's own keyframe
+    /// period comes round, which for a mid-call upgrade is the difference
+    /// between a picture appearing at once and appearing seconds later.
+    ///
+    /// The shipped client does the same thing at the same moments
+    /// (`pjmedia_vid_stream_request_keyframe`, and its "requesting keyframe
+    /// after dropped frames" / "will request keyframe on resume" paths).
+    VideoKeyframeNeeded,
     /// A newer authoritative group membership/relay snapshot was committed.
     GroupUpdated(Box<GroupCallUpdate>),
     /// A newer authoritative call-link admission snapshot was committed.
@@ -538,6 +554,8 @@ impl CallEvent {
         use crate::stats::HeapSize;
 
         match self {
+            // A unit variant: no heap behind it.
+            Self::VideoKeyframeNeeded => 0,
             Self::ForeignAudio(data) => data.len(),
             Self::ForeignGroupAudio(frame) => {
                 frame.data.len()
@@ -1438,7 +1456,12 @@ impl CallEngine {
             video.pipe.commit_send_rekey(rekey);
             // A new group epoch may be the first decryptable media for a recently admitted
             // participant, so never begin that epoch with a dependent frame.
+            let newly_required = !video.keyframe_required;
             video.keyframe_required = true;
+            if newly_required {
+                self.outbox
+                    .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
+            }
         }
         group.app_data.commit_send_rekey(app_data_rekey);
         media.call_key.zeroize();
@@ -1509,7 +1532,12 @@ impl CallEngine {
     /// Re-arm outbound H.264 recovery after the application switches camera/screen sources.
     pub fn require_video_keyframe(&mut self) {
         if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) {
+            let newly_required = !video.keyframe_required;
             video.keyframe_required = true;
+            if newly_required {
+                self.outbox
+                    .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
+            }
         }
     }
 
@@ -1555,6 +1583,18 @@ impl CallEngine {
             v.active = true;
             v.send_gated = send_gated;
             v.keyframe_required |= needs_recovery;
+            // Ungating an upgrade is a resume, and a resumed plane drops every
+            // frame until an IDR arrives. Say so rather than waiting the
+            // encoder's own keyframe period out in silence.
+            //
+            // On `needs_recovery`, not on the flag changing: a gated plane is
+            // built with the requirement already set, so the ungate — the
+            // moment the peer can finally receive — would otherwise be the one
+            // resume that never asked.
+            if needs_recovery {
+                self.outbox
+                    .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
+            }
             return true;
         }
         let rtcp_cname = build_whatsapp_rtcp_cname(&self.tx_ids.next_tx_id());
@@ -1918,7 +1958,12 @@ impl CallEngine {
                 && requests_keyframe(&summary.feedback, video_ssrc)
                 && let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut())
             {
+                let newly_required = !video.keyframe_required;
                 video.keyframe_required = true;
+                if newly_required {
+                    self.outbox
+                        .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
+                }
             }
             if let Some((sender, ntp_seconds, ntp_fraction)) =
                 parse_sender_report_timing(&participant.payload)
@@ -1954,6 +1999,7 @@ impl CallEngine {
                 }));
             return;
         }
+        let mut newly_needs_keyframe = false;
         let event = {
             let Some(m) = self.media.as_mut() else {
                 return;
@@ -1970,6 +2016,7 @@ impl CallEngine {
                 && requests_keyframe(&summary.feedback, video_ssrc)
                 && let Some(video) = m.video.as_mut()
             {
+                newly_needs_keyframe = !video.keyframe_required;
                 video.keyframe_required = true;
             }
             if let Some((sender, ntp_seconds, ntp_fraction)) = parse_sender_report_timing(&plain) {
@@ -1991,6 +2038,12 @@ impl CallEngine {
                 feedback: summary.feedback,
             }
         };
+        // After the media borrow ends: the peer's RTCP asked for a keyframe, and
+        // only the application's encoder can make one.
+        if newly_needs_keyframe {
+            self.outbox
+                .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
+        }
         self.outbox.push_back(Output::Event(event));
     }
 
@@ -6275,6 +6328,52 @@ mod tests {
             count_transmits(&drain(&mut eng).0),
             1,
             "the next IDR resumes outbound video"
+        );
+    }
+
+    /// Ungating an upgrade drops every frame until an IDR arrives, and the
+    /// engine cannot make one — it never touches pixels. Saying so is the
+    /// difference between the peer's picture appearing at once and appearing a
+    /// keyframe period later, which for a three-second GOP is most of a short
+    /// call. The shipped client requests one at the same moment.
+    #[test]
+    fn ungating_an_upgrade_asks_the_application_for_a_keyframe() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video_gated());
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+
+        assert!(eng.enable_video());
+        let events = drain(&mut eng).0;
+        assert!(
+            events
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "ungating must ask for the IDR it is about to start dropping frames for"
+        );
+
+        // Raised once for the requirement, not once per dropped frame: a
+        // consumer that reacts by asking its encoder must not be asked again
+        // for every delta that arrives before the IDR does.
+        eng.handle_input(2, Input::VideoFrame(&video_delta_au(200)));
+        assert!(
+            !drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "a dropped delta must not re-raise the request"
+        );
+
+        // Satisfied, and the next requirement raises it again.
+        eng.handle_input(3, Input::VideoFrame(&video_au(200)));
+        let _ = drain(&mut eng);
+        eng.require_video_keyframe();
+        assert!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "a fresh requirement is a fresh request"
         );
     }
 
