@@ -12,7 +12,7 @@
 //! logic so the Tokio driver, the WASM bridge, and (for the control plane) embedded consumers all
 //! drive one implementation.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use bytes::Bytes;
@@ -932,6 +932,14 @@ struct GroupEngineState {
     /// One injected decoder per participant speaking standard Opus. Separate instances because
     /// these codecs carry inter-frame state: one shared across speakers corrupts every one of them.
     foreign_decoders: HashMap<String, Box<dyn ForeignAudioCodec>>,
+    /// Per participant, because in a group the question is per participant: the call negotiates one
+    /// format, and any one member may be outside the MLOW rollout and sending Opus under it.
+    #[cfg(feature = "voip-mlow")]
+    codec_probes: HashMap<String, InboundCodecProbe>,
+    /// Participants whose own bytes contradicted the negotiation. Native Opus carries no escape
+    /// marker, so nothing about the packet says so -- only the accumulated evidence does, and it
+    /// has to be remembered or every packet after the verdict would be classified MLOW again.
+    foreign_participants: HashSet<String>,
 }
 
 struct ReactionWatermark {
@@ -1323,6 +1331,9 @@ impl CallEngine {
             #[cfg(feature = "voip-mlow")]
             decoders: HashMap::new(),
             foreign_decoders: HashMap::new(),
+            #[cfg(feature = "voip-mlow")]
+            codec_probes: HashMap::new(),
+            foreign_participants: HashSet::new(),
         };
         group.mixer.retain(group.registry.active_participant_ids());
         self.group = Some(group);
@@ -1460,6 +1471,13 @@ impl CallEngine {
             group
                 .foreign_decoders
                 .retain(|participant, _| active.contains(participant));
+            #[cfg(feature = "voip-mlow")]
+            group
+                .codec_probes
+                .retain(|participant, _| active.contains(participant));
+            group
+                .foreign_participants
+                .retain(|participant| active.contains(participant));
             let current_pids = group.registry.active_pids();
             let subscriptions_changed = current_pids != previous_pids;
             let current_devices = group.registry.active_device_ids();
@@ -1525,10 +1543,7 @@ impl CallEngine {
         app_data_ssrc: u32,
     ) -> Result<[u32; 9], EngineError> {
         let mut stream_ssrcs = ssrc::derive_wasm_relay_stream_ssrcs(&self.call_id, participant_id);
-        let mut used = stream_ssrcs[..6]
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
+        let mut used = stream_ssrcs[..6].iter().copied().collect::<HashSet<_>>();
         used.insert(app_data_ssrc);
         for stream_ssrc in &mut stream_ssrcs[6..] {
             let mut selected = None;
@@ -2964,9 +2979,21 @@ impl CallEngine {
                 now,
                 audio.format.rtp_clock_rate,
             );
-        let codec = audio
+        let mut codec = audio
             .format
             .inbound_codec(participant.header.payload_type, &participant.payload);
+        // The escape marker is the only thing that makes `inbound_codec` answer Opus under an MLOW
+        // profile, so it is also what says the TOC was rewritten and has to be restored. A
+        // participant rescued by the probe below sends NATIVE Opus, which must not be.
+        let escaped =
+            codec == AudioCodec::Opus && audio.format.rtp_profile == AudioRtpProfile::Mlow;
+        if codec == AudioCodec::Mlow
+            && group
+                .foreign_participants
+                .contains(&participant.participant_id)
+        {
+            codec = AudioCodec::Opus;
+        }
         if audio.io == AudioIo::Encoded {
             self.media_stats.audio_frames_delivered =
                 self.media_stats.audio_frames_delivered.saturating_add(1);
@@ -3024,9 +3051,7 @@ impl CallEngine {
             // The escape's first byte is not an RFC TOC; restore it before a stock decoder sees it,
             // exactly as the direct path does.
             let mut encoded = participant.payload;
-            if audio.format.rtp_profile == AudioRtpProfile::Mlow
-                && let Err(e) = depacketize_opus_from_mlow(&mut encoded)
-            {
+            if escaped && let Err(e) = depacketize_opus_from_mlow(&mut encoded) {
                 log::debug!("voip: malformed MLOW Opus escape from a participant: {e}");
                 self.media_stats.audio_frames_concealed =
                     self.media_stats.audio_frames_concealed.saturating_add(1);
@@ -3081,6 +3106,36 @@ impl CallEngine {
                     .media_stats
                     .mlow_inactive_or_sid
                     .saturating_add(u32::from(report.inactive_or_sid));
+                // Nothing became audio, so ask this participant's own two statements about the packet
+                // whether the negotiation describes it -- the same question the direct path asks, and
+                // the only way to catch NATIVE Opus here: it carries no escape marker, so classification
+                // alone will call it MLOW forever and the participant stays silent with a decoder
+                // installed and idle.
+                if report.decoded == 0 {
+                    let span = group
+                        .audio_reception
+                        .get(&participant.participant_id)
+                        .and_then(RtpReceptionStats::frame_span);
+                    let verdict = group
+                        .codec_probes
+                        .entry(participant.participant_id.clone())
+                        .or_default()
+                        .observe(
+                            &participant.payload,
+                            AudioCodec::Mlow,
+                            span,
+                            audio.format.rtp_clock_rate,
+                            audio.format.rtp_timestamp_step,
+                        );
+                    if verdict == Some(AudioCodec::Opus) {
+                        group
+                            .foreign_participants
+                            .insert(participant.participant_id.clone());
+                        // Whatever this decoder built out of the other codec's bytes is not a starting
+                        // point for anything, and the participant will not come back to it.
+                        group.decoders.remove(&participant.participant_id);
+                    }
+                }
                 group.mixer.push(&participant.participant_id, &pcm);
             }
         }
@@ -7227,6 +7282,50 @@ mod tests {
         assert!(
             heard.contains(&1234),
             "what it decoded has to reach the mixer and the speaker"
+        );
+    }
+
+    // NATIVE Opus from a group participant carries no escape marker, so classification alone calls
+    // it MLOW forever: it went to the MLow decoder, decoded to nothing, and that participant stayed
+    // silent with an Opus decoder installed and idle. The direct path has the content probe for
+    // exactly this; the group needs it per participant, because the call negotiates one format and
+    // any one member may be the one outside the rollout.
+    #[test]
+    fn a_group_participant_sending_native_opus_is_rescued_by_the_probe() {
+        let (mut eng, epoch) = group_engine(false);
+        eng = eng.with_foreign_audio_codec_factory(Box::new(StubCodecFactory { samples: 960 }));
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        // TOC 0x58 with no MLOW escape marker: 60 ms of SILK wideband read as Opus, paced at the
+        // negotiated 960-sample step so the peer's two statements about the packet agree.
+        let body: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        let mut peer = group_peer_audio(&epoch);
+        let mut heard = Vec::new();
+        for n in 0..8u64 {
+            let packet = peer.protect_audio(&body);
+            eng.handle_input(100 + n * 60, Input::RelayPacket(&packet));
+            for tick in 0..3u64 {
+                eng.handle_input(100 + n * 60 + tick * 20, Input::Timeout);
+                let (outputs, _) = drain(&mut eng);
+                for output in outputs {
+                    if let Output::Playout(frame) = output {
+                        heard.extend(frame);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            eng.media_stats().foreign_frames_decoded > 0,
+            "the probe has to reach the same verdict it reaches on the direct path"
+        );
+        assert!(
+            heard.contains(&1234),
+            "and the rescued participant has to become audible"
         );
     }
 
