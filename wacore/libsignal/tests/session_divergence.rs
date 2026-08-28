@@ -954,8 +954,7 @@ fn a_replayed_message_is_not_announced_as_a_session_failure() {
 /// A rebuild archives the state that consumed the counter and installs a fresh
 /// one, so the replay now fails the current session before the archived one
 /// recognizes it. The duplicate verdict still has to win, and still has to keep
-/// the failure logging quiet — that is the ordering this pins, and it is the
-/// case a reviewer flagged as the one that could still leak an error record.
+/// the failure logging quiet — that ordering is what this pins.
 #[test]
 fn a_replay_stays_quiet_when_a_sibling_candidate_session_fails_first() {
     const PEER: &str = "replayed-peer-archived";
