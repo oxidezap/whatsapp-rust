@@ -863,6 +863,17 @@ struct PcmAudioState {
     /// Playout emits silence (without draining) while the jitter buffer fills to `PLAYOUT_TARGET`, so
     /// a late packet costs one re-prime instead of a silence gap every 20ms tick. Re-armed on underrun.
     priming: bool,
+    /// Whether the most recent packet became audio rather than concealment.
+    ///
+    /// The content-switch purge was written when the probe only ever ran after packets STOPPED
+    /// becoming audio, so everything queued was manufactured silence and clearing it lost nothing.
+    /// Native CELT breaks that: it decodes correctly and is queued as real speech while the probe
+    /// corroborates it, so purging throws away the corroboration window of what the peer said.
+    ///
+    /// The MOST RECENT packet, not "any so far", because the queue is what the last few packets put
+    /// there: a call that decoded fine an hour ago and is concealing now still has a queue full of
+    /// concealment, and "any so far" would keep it forever.
+    last_packet_decoded: bool,
     /// Consecutive playout ticks spent priming; bounds the wait so a partial buffer (the peer sent one
     /// frame then went DTX) is flushed after `MAX_PRIME_TICKS` instead of being held silent forever.
     priming_ticks: u32,
@@ -1165,6 +1176,7 @@ impl CallEngine {
                     encoded: Vec::with_capacity(MLOW_ENCODED_CAPACITY),
                     jitter: VecDeque::new(),
                     priming: true,
+                    last_packet_decoded: false,
                     priming_ticks: 0,
                     packet_samps: OPUS_FRAME_SAMPS_60MS,
                     playout_cap: playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
@@ -2187,7 +2199,7 @@ impl CallEngine {
             // the first correctly decoded frame. Rescuing a call and then making it wait out its
             // own failure is not a rescue. A negotiated switch keeps its buffer: nothing there
             // failed, and it is real audio the peer sent.
-            if source == CodecDecisionSource::Content {
+            if source == CodecDecisionSource::Content && !pcm.last_packet_decoded {
                 pcm.jitter.clear();
                 pcm.priming = true;
                 pcm.priming_ticks = 0;
@@ -2762,8 +2774,10 @@ impl CallEngine {
                     .and_then(|shape| shape.total_samples(m.active_format.rtp_clock_rate))
                     .unwrap_or(m.active_format.samples_per_frame)
                     as usize;
+                let mut decoded_ok = false;
                 match foreign.decode(&encoded, &mut m.foreign_pcm) {
                     Ok(()) => {
+                        decoded_ok = true;
                         self.media_stats.foreign_frames_decoded =
                             self.media_stats.foreign_frames_decoded.saturating_add(1);
                         self.health.on_audio_produced();
@@ -2778,6 +2792,7 @@ impl CallEngine {
                 }
                 if let Some(pcm) = m.pcm.as_mut() {
                     pcm.packet_samps = samples.max(1);
+                    pcm.last_packet_decoded = decoded_ok;
                     pcm.jitter.extend(m.foreign_pcm.iter().copied());
                     // Same feed-side ceiling the MLOW path enforces below. A rescued stream is
                     // still a stream: a burst arriving between two playout ticks must not grow the
@@ -2909,6 +2924,10 @@ impl CallEngine {
             if decode_report.decoded > 0 || decode_report.inactive_or_sid > 0 {
                 self.health.on_audio_produced();
             }
+            // A SID counts as decoded here too: the peer told us it is silent and the decoder
+            // honoured it, so the queue holds what the peer meant rather than a failure's residue.
+            pcm.last_packet_decoded =
+                decode_report.decoded > 0 || decode_report.inactive_or_sid > 0;
         }
         // Bound the buffer on the feed side too: a burst of inbound packets arriving between two 20ms
         // playout ticks must not grow `jitter` without limit (drain_playout's cap only runs on a
@@ -3102,6 +3121,16 @@ impl CallEngine {
         // classified MLOW, so the probe would never see it: without this it would be corrupted for
         // the whole call with nothing able to notice.
         let escaped = !promoted && audio.format.payload_is_mlow_escape(&participant.payload);
+        // A packet the discriminator proved native latches the participant immediately, without the
+        // probe: the probe abstains on it (its grammar is already Opus) and would never latch, so
+        // this participant's FIRST SILK packet -- carrying no CELT marker, classified MLOW -- would
+        // be dropped, and an encoder alternating modes would keep re-losing it. An escape latches
+        // nothing: it is MLOW's container and says nothing about what the peer negotiated.
+        if codec == AudioCodec::Opus && !escaped {
+            group
+                .foreign_participants
+                .insert(participant.participant_id.clone());
+        }
         // A promoted participant sends NATIVE Opus, so the frame must not be described by the
         // container the call negotiated: a sink that depacketizes by `format.rtp_profile` would
         // read the untouched TOC as an MLOW escape and corrupt it. The escape keeps `audio.format`,
@@ -3299,6 +3328,16 @@ impl CallEngine {
             let mut encoded = core::mem::take(&mut m.foreign_encoded);
             encoded.clear();
             let sent = foreign.encode(pcm, &mut encoded);
+            if let Err(e) = &sent {
+                // Counted like the missing encoder above, and for the same reason: an encoder that
+                // refuses a well-formed frame stops the peer hearing us, and every other counter
+                // here watches the inbound direction.
+                log::debug!("voip: foreign audio encode failed: {e}");
+                self.media_stats.outbound_frames_without_encoder = self
+                    .media_stats
+                    .outbound_frames_without_encoder
+                    .saturating_add(1);
+            }
             let packet = sent.is_ok().then(|| m.pipe.protect_audio(&encoded));
             m.foreign_encoded = encoded;
             if let Some(packet) = packet {
@@ -7370,6 +7409,51 @@ mod tests {
         );
     }
 
+    // The purge exists for a queue full of concealment, which is what the probe used to imply. It
+    // does not imply that any more: native CELT decodes correctly while the probe corroborates it,
+    // so the queue holds the corroboration window of real speech and purging loses all of it.
+    #[test]
+    fn the_corroboration_window_of_decoded_celt_survives_the_switch() {
+        let mut eng = CallEngine::new(config(true), Box::new(SequentialTxIds::new()))
+            .unwrap()
+            .with_foreign_audio_codec(Box::new(StubForeignCodec { samples: 960 }));
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        let mut native: Vec<u8> = vec![27 << 3 | 3, 3];
+        native.extend(core::iter::repeat_n(0x11u8, 60));
+        let mut peer_tx = peer_pipeline();
+        for n in 0..6u64 {
+            let packet = peer_tx.protect_audio(&native);
+            eng.handle_input(1 + n * 60, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+        assert_eq!(eng.active_audio_codec(), Some(AudioCodec::Opus));
+
+        let mut heard = Vec::new();
+        for tick in 0..24u64 {
+            eng.handle_input(400 + tick * 20, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                if let Output::Playout(frame) = output {
+                    heard.extend(frame);
+                }
+            }
+        }
+        // The number is the assertion because the loss is a prefix of the buffer, not a failure:
+        // purging unconditionally gives 1920 here, keeping what decoded gives 2400. Two 60ms packets
+        // of real speech in this fixture -- less than an unconditional purge costs a call whose
+        // buffer is fuller, and enough to fail if the condition is dropped.
+        let decoded = heard.iter().filter(|s| **s == 1234).count();
+        assert_eq!(
+            decoded, 2400,
+            "the packets decoded before the verdict have to survive it"
+        );
+    }
+
     // Inbound native CELT decodes perfectly well without the call-wide format ever moving, and then
     // `on_mic` goes on encoding MLOW at a peer that speaks native Opus: inbound fine, outbound
     // silent, and no counter describing it because nothing failed. The probe has to be asked before
@@ -7723,6 +7807,63 @@ mod tests {
             AudioFormat::OPUS_16KHZ_60MS,
             "and native Opus must not be described by the container it is not in"
         );
+    }
+
+    // A standard Opus encoder switches modes with the signal: CELT for music-like frames, SILK for
+    // speech. Only the CELT ones carry the top bits the discriminator reads, so without latching the
+    // participant, its first SILK packet is classified MLOW and dropped -- and an encoder that
+    // alternates keeps re-losing them, since the probe abstains on the CELT ones and never latches.
+    #[test]
+    fn a_group_participant_latched_by_native_celt_keeps_its_grammar_through_silk() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).expect("engine");
+        let update = group_update("audio");
+        eng.configure_group(GroupEngineConfig {
+            call_creator: update.call_creator.clone(),
+            self_jid: SELF_LID.parse().expect("self JID"),
+            initial_update: update,
+            direct_peer: None,
+        })
+        .expect("configure group");
+        let epoch = [0x42; 32];
+        assert_eq!(
+            eng.apply_group_raw_epoch(7, &epoch).expect("install epoch"),
+            GroupEpochApply::Installed
+        );
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        let mut peer = group_peer_audio(&epoch);
+        let mut celt: Vec<u8> = vec![27 << 3 | 3, 3];
+        celt.extend(core::iter::repeat_n(0x11u8, 60));
+        let packet = peer.protect_audio(&celt);
+        eng.handle_input(100, Input::RelayPacket(&packet));
+        let _ = drain(&mut eng);
+
+        // The same participant's next frame is SILK: no marker, so classification alone says MLOW.
+        let silk: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        assert_ne!(silk[0] & 0xC0, 0xC0, "SILK carries no marker at all");
+        let packet = peer.protect_audio(&silk);
+        eng.handle_input(160, Input::RelayPacket(&packet));
+        let (outputs, _) = drain(&mut eng);
+        let frame = outputs
+            .iter()
+            .find_map(|output| match output {
+                Output::EncodedAudio(frame) => Some(frame),
+                _ => None,
+            })
+            .expect("the SILK packet reaches the sink");
+        assert_eq!(
+            frame.codec,
+            AudioCodec::Opus,
+            "one native packet settles the participant's grammar; the next need not re-prove it"
+        );
+        assert_eq!(frame.format, AudioFormat::OPUS_16KHZ_60MS);
+        assert_eq!(frame.data.as_ref(), silk.as_slice(), "and is untouched");
     }
 
     // A participant whose native Opus stream is CELT from its FIRST packet is never classified MLOW,
