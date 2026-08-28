@@ -692,12 +692,39 @@ const INITIAL_DEVICE_ORIENTATION: &str = "0";
 const VIDEO_SCREEN_WIDTH: &str = "1920";
 const VIDEO_SCREEN_HEIGHT: &str = "1080";
 
-/// `<video>` for an `<offer>`: full decoder + geometry advertisement (the initiator side).
+/// The codec names a `<video>` advertisement carries. The two attributes use
+/// *different* spellings of the same codec, which is not a typo on either side.
+///
+/// `enc` names an encoding, and WA Web's `<video>` parser (`fill_video`, in
+/// `call_xml_utils.h`) accepts exactly `h.264` and `vp8/h.264` — anything else
+/// takes its `fill_video: unknown video encoding %s` path. The dotless `h264`
+/// we used to send is one of those anything-elses.
+///
+/// `dec` names decoder *capabilities*, built by
+/// `vid_codec_bitmask_to_capability_string` (`codec_utils.cc`) as a
+/// comma-joined list over a five-entry table: `H264`, `VP8`, `VP9`, `H265`,
+/// `AV1`. Upper-case, no dot. We list only `H264`, because a callee that takes
+/// a wider list at its word and encodes H.265 leaves us with a stream we cannot
+/// decode.
+const VIDEO_ENC_H264: &str = "h.264";
+const VIDEO_DEC_H264: &str = "H264";
+
+/// `<video>` for an `<offer>`: codec + geometry advertisement (the initiator side).
+///
+/// Rebuilt against WA Web's own `<video>` reader after the hand-written version
+/// was found to be silently discarded: a video offer carrying it was delivered
+/// and acked and then never rang, while an audio offer to the same callee —
+/// byte-identical apart from this child — was answered in three seconds.
+///
+/// The attribute set is `fill_video`'s: `enc`/`dec` (at least one is required),
+/// `device_orientation`, `screen_width`, `screen_height`, `enc_supported`.
+/// There is no `orientation` — the rotation rides `device_orientation`, and the
+/// spare attribute we used to send is not in the grammar at all. See
+/// [`VIDEO_ENC_H264`] for why the two codec attributes are spelled differently.
 fn video_offer_node() -> Node {
     NodeBuilder::new("video")
-        .attr("enc", "h264")
-        .attr("dec", "h264")
-        .attr("orientation", "0")
+        .attr("enc", VIDEO_ENC_H264)
+        .attr("dec", VIDEO_DEC_H264)
         .attr("screen_width", VIDEO_SCREEN_WIDTH)
         .attr("screen_height", VIDEO_SCREEN_HEIGHT)
         .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
@@ -707,7 +734,7 @@ fn video_offer_node() -> Node {
 /// `<video>` byte-matching a captured from-start video callee.
 fn video_accept_node() -> Node {
     NodeBuilder::new("video")
-        .attr("dec", "H264")
+        .attr("dec", VIDEO_DEC_H264)
         .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .build()
 }
@@ -716,7 +743,7 @@ fn video_accept_node() -> Node {
 /// `device_orientation` + `screen_width="0" screen_height="0"` (the real client sends zero here).
 fn video_preaccept_node() -> Node {
     NodeBuilder::new("video")
-        .attr("dec", "H264")
+        .attr("dec", VIDEO_DEC_H264)
         .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .attr("screen_width", "0")
         .attr("screen_height", "0")
@@ -2610,7 +2637,11 @@ mod tests {
         );
         assert_eq!(vr.attrs().optional_string("screen_width"), None);
 
-        // The offer's <video> carries the decoder/geometry advertisement (WaCalls reference form).
+        // The offer's <video> carries the codec/geometry advertisement in the
+        // shape WA Web's `fill_video` reads: `enc` one of the two encodings it
+        // accepts, `dec` from its five-name capability table, and no
+        // `orientation` — the hand-written form had all three the other way and
+        // its offers were delivered, acked and never rung.
         let ovnode = offer.as_node_ref().children().unwrap()[0]
             .children()
             .unwrap()
@@ -2619,8 +2650,17 @@ mod tests {
             .unwrap()
             .to_owned();
         let ovr = ovnode.as_node_ref();
-        assert_eq!(ovr.attrs().optional_string("enc").as_deref(), Some("h264"));
-        assert_eq!(ovr.attrs().optional_string("dec").as_deref(), Some("h264"));
+        assert_eq!(ovr.attrs().optional_string("enc").as_deref(), Some("h.264"));
+        assert_eq!(ovr.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            ovr.attrs().optional_string("orientation"),
+            None,
+            "the real client sends no `orientation`; the rotation rides `device_orientation`"
+        );
+        assert_eq!(
+            ovr.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
 
         let accept = build_accept(&AcceptParams {
             call_id: "CID",
