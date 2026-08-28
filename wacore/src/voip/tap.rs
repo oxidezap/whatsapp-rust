@@ -197,6 +197,19 @@ async fn tap_forward(
                     | RelayTransportEvent::Disconnected(_) => true,
                 };
                 if is_control {
+                    // A terminal event is the last thing the driver will ever read, so the report
+                    // has to precede it rather than trail it -- the same ordering the native pump's
+                    // `finish` keeps, and for the same reason: after this, nothing arrives to carry
+                    // the count and the call's closing stats would omit the burst that preceded the
+                    // failure. Awaited, not best-effort: the driver is draining, so a full queue is
+                    // a moment to wait out, and only a closed one ends this.
+                    if matches!(ev, RelayTransportEvent::Disconnected(_)) && local_drops > 0 {
+                        let report = RelayTransportEvent::InboundDropped(local_drops);
+                        if out_tx.send(report).await.is_err() {
+                            break;
+                        }
+                        local_drops = 0;
+                    }
                     if out_tx.send(ev).await.is_err() {
                         break;
                     }
@@ -207,11 +220,14 @@ async fn tap_forward(
             Err(async_channel::TrySendError::Closed(_)) => break,
         }
     }
-    // Best effort on the way out: the driver may still be draining, and a report that arrives with
-    // the last packets is worth more than one that is never made. A closed or full channel here is
-    // the end of the call, where nothing is left to diagnose.
+    // Awaited rather than best-effort: the loop can also end because the inner relay simply stopped,
+    // with the driver still draining a full queue. `try_send` failed there and the count went with
+    // it -- an overload immediately before a failure being exactly the one worth attributing. A
+    // closed channel still ends it, which is the only case where nothing is left to diagnose.
     if local_drops > 0 {
-        let _ = out_tx.try_send(RelayTransportEvent::InboundDropped(local_drops));
+        let _ = out_tx
+            .send(RelayTransportEvent::InboundDropped(local_drops))
+            .await;
     }
 }
 
@@ -596,10 +612,53 @@ mod tests {
             matches!(seen.last(), Some(RelayTransportEvent::Disconnected(_))),
             "and arrives after the media ahead of it, not instead of it, got {seen:?}"
         );
-        // Nothing asserts the pending drop report here: at teardown it is best effort by design
-        // (see `tap_forward`), and the disconnect legitimately takes the last slot. What must not
-        // happen is the disconnect being counted AS the lost media, which the assertion above
-        // rules out -- a counted disconnect is a dropped one.
+        // The report is no longer best effort at teardown: a terminal event is the last thing the
+        // driver reads, so a count that trails it is a count nobody sees.
+        let report = seen
+            .iter()
+            .position(|ev| matches!(ev, RelayTransportEvent::InboundDropped(_)));
+        let disconnect = seen
+            .iter()
+            .position(|ev| matches!(ev, RelayTransportEvent::Disconnected(_)));
+        assert!(
+            report.is_some() && report < disconnect,
+            "the drop report has to precede the disconnect, got {seen:?}"
+        );
+    }
+
+    // The other way the forwarder ends: the inner relay simply stops, with no `Disconnected` to
+    // hang the flush on and the driver still draining a full queue. `try_send` failed there and
+    // took the count with it -- and an overload immediately before a failure is exactly the one
+    // worth attributing.
+    #[test]
+    fn tap_forward_flushes_its_last_drops_when_the_relay_just_stops() {
+        let media = || RelayTransportEvent::PacketReceived(Bytes::from_static(b"\x90\x78\x01\x02"));
+        let (inner_tx, inner_rx) = async_channel::unbounded();
+        for _ in 0..3 {
+            inner_tx.try_send(media()).unwrap();
+        }
+        inner_tx.close();
+        let (out_tx, out_rx) = async_channel::bounded(1);
+        let tap = Arc::new(InMemoryTap::default());
+
+        let seen = futures::executor::block_on(async {
+            let fwd = tap_forward(inner_rx, out_tx, tap);
+            let drive = async {
+                let mut seen = Vec::new();
+                while let Ok(ev) = out_rx.recv().await {
+                    seen.push(ev);
+                }
+                seen
+            };
+            let (_, seen) = futures::join!(fwd, drive);
+            seen
+        });
+
+        assert!(
+            seen.iter()
+                .any(|ev| matches!(ev, RelayTransportEvent::InboundDropped(n) if *n > 0)),
+            "the media dropped before the relay stopped has to be reported, got {seen:?}"
+        );
     }
 
     // The steady state of a tapped call that is behind: the driver frees exactly one slot before
