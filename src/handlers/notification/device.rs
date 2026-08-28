@@ -37,14 +37,39 @@ pub(crate) async fn handle_account_sync_notification(client: &Arc<Client>, nr: &
     if let Some(devices_node) = nr.get_optional_child_by_tag(&["devices"]) {
         handle_account_sync_devices(client, nr, devices_node).await;
     }
-    // WA Web's account_sync parser reads a `<disappearing_mode duration t>`
-    // child alongside `<devices>`. It is the same child the standalone
-    // `type="disappearing_mode"` notification carries, so it goes through the
-    // same parser — the difference is only whose setting it is: `from` on an
-    // account_sync is our own account, so this is the account default changed
-    // from another device rather than a contact changing theirs.
-    if nr.get_optional_child("disappearing_mode").is_some() {
-        super::groups::handle_disappearing_mode_notification(client, nr);
+    // WA Web's account_sync parser reads a `<disappearing_mode>` child
+    // alongside `<devices>`, and both arms end at the same place the standalone
+    // `type="disappearing_mode"` notification does —
+    // `updateDisappearingModeForContact({contactId: from, ...})` — so the
+    // difference is only whose setting it is: `from` on an account_sync is our
+    // own account.
+    //
+    // The two arms are mutually exclusive, and the parser makes that explicit:
+    //
+    //     h.hasAttr("action") ? y = h.attrString("action")
+    //                         : (C = h.attrInt("duration"), b = h.attrInt("t"))
+    //
+    // With `action` present the stanza carries no duration/`t` at all, and WA
+    // Web answers `action === "modify"` by re-querying the server
+    // (`getDisappearingMode(from, DM_FORCE_REFRESH)`) and applying the answer.
+    // That needs a `disappearing_mode` *get* this client does not have — only
+    // `SetDefaultDisappearingModeSpec`, the set — so the action arm is logged
+    // rather than guessed at.
+    //
+    // Splitting the arms changes no outcome: the parser below already declines
+    // an action-only stanza, because it requires `t`. What it does is stop that
+    // decline being announced as `warn!("… missing or invalid 't' …")` on a
+    // stanza that is perfectly well formed, which is a false lead for whoever
+    // reads the log next.
+    if let Some(dm) = nr.get_optional_child("disappearing_mode") {
+        if dm.attrs().optional_string("action").is_some() {
+            debug!(
+                "account_sync disappearing_mode carried an action and no duration; \
+                 re-querying the account default is not implemented"
+            );
+        } else {
+            super::groups::handle_disappearing_mode_notification(client, nr);
+        }
     }
 }
 

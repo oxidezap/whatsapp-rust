@@ -221,7 +221,7 @@ mod tests {
 
         let notif = NodeBuilder::new("notification")
             .attr("type", NotificationType::WGp2.as_str())
-            .attr("from", "s.whatsapp.net")
+            .attr("from", "g.us")
             .attr("id", "groups-dirty-1")
             .attr("t", "1704067200")
             .children([NodeBuilder::new("groups_dirty")
@@ -260,6 +260,10 @@ mod tests {
     // another device. We read only `pushname` and `<devices>` out of this
     // notification, so the change was dropped without even the raw-event
     // fallback, which the matched `account_sync` arm skips.
+    //
+    // WA Web's parser makes `action` and `duration`/`t` mutually exclusive
+    // (`h.hasAttr("action") ? … : (duration, t)`), so the two shapes are
+    // tested apart: only the second carries a timer to report.
 
     #[tokio::test]
     async fn account_sync_disappearing_mode_reaches_the_consumer() {
@@ -278,7 +282,6 @@ mod tests {
             .attr("id", "acct-sync-dm-1")
             .attr("t", "1704067200")
             .children([NodeBuilder::new("disappearing_mode")
-                .attr("action", "update")
                 .attr("duration", "604800")
                 .attr("t", "1704067200")
                 .build()])
@@ -295,6 +298,40 @@ mod tests {
             .expect("an account_sync disappearing_mode must reach the consumer");
         assert_eq!(changed.from, own);
         assert_eq!(changed.duration, 604_800);
+    }
+
+    /// The other arm. `action` present means the stanza carries no timer at
+    /// all — WA Web goes back to the server for it. Reporting a
+    /// `DisappearingModeChanged` here would be inventing a duration the
+    /// notification never stated, so nothing is dispatched.
+    #[tokio::test]
+    async fn account_sync_disappearing_mode_action_reports_no_duration() {
+        use crate::types::events::EventHandler;
+
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+
+        let notif = NodeBuilder::new("notification")
+            .attr("type", NotificationType::AccountSync.as_str())
+            .attr("from", "12025550199@s.whatsapp.net")
+            .attr("id", "acct-sync-dm-2")
+            .attr("t", "1704067200")
+            .children([NodeBuilder::new("disappearing_mode")
+                .attr("action", "modify")
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::DisappearingModeChanged(_))),
+            "an action-only disappearing_mode states no duration, so none may be reported"
+        );
     }
 
     /// A type a subsystem claims must not be shadowed by a core arm. The seam

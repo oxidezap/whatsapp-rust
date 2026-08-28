@@ -31,12 +31,26 @@ const GROUPS_DIRTY_TAG: &str = "groups_dirty";
 /// WA Web gives this shape a parser of its own
 /// (`WASmaxInGroupsGroupsDirtyNotificationRequest`) rather than routing it
 /// through the group-notification parser, because it is the one `w:gp2`
-/// stanza whose `from` is the server instead of a group — the groups it
-/// speaks about are named by the `<group jid>` children. Returns `None` for
-/// an ordinary group update, which [`GroupNotification::try_from_node_ref`]
-/// handles.
+/// stanza whose `from` is the group *server* — the parser pins it with
+/// `literalJid(attrDomainJid, "from", "g.us")` — instead of one group's JID.
+/// The groups it speaks about are named by the `<group jid>` children.
+///
+/// The discriminator is the **first** child's tag, matching
+/// `WAWebHandleGroupNotification`, which branches before its own parser runs:
+///
+/// ```js
+/// var r = t[0], a = r.tag;
+/// if (a === "groups_dirty")
+///   return handleGroupsDirtyNotificationJob(e)
+/// ```
+///
+/// Returns `None` for an ordinary group update, which
+/// [`GroupNotification::try_from_node_ref`] handles.
 pub fn parse_groups_dirty(node: &NodeRef<'_>) -> Option<Vec<Jid>> {
-    let dirty = node.get_optional_child(GROUPS_DIRTY_TAG)?;
+    let dirty = node
+        .children()
+        .and_then(|children| children.first())
+        .filter(|first| first.tag.as_ref() == GROUPS_DIRTY_TAG)?;
     Some(
         dirty
             .get_children_by_tag("group")
@@ -1155,7 +1169,7 @@ mod tests {
         let b: Jid = "120363000000000002@g.us".parse().unwrap();
         let node = NodeBuilder::new("notification")
             .attr("type", "w:gp2")
-            .attr("from", "s.whatsapp.net")
+            .attr("from", "g.us")
             .attr("id", "GD-1")
             .attr("t", "1704067200")
             .children(vec![
