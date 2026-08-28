@@ -6,6 +6,8 @@
 #[wire(kind = "int")]
 #[allow(dead_code)]
 pub enum NackReason {
+    #[wire = 415]
+    UnsupportedMessage,
     #[wire = 421]
     StaleGroupAddressingMode,
     #[wire = 475]
@@ -49,6 +51,7 @@ mod tests {
     /// can't silently break server compatibility.
     #[test]
     fn nack_reason_codes_match_wa_web() {
+        assert_eq!(NackReason::UnsupportedMessage.code(), 415);
         assert_eq!(NackReason::StaleGroupAddressingMode.code(), 421);
         assert_eq!(NackReason::NewChatMessagesCapped.code(), 475);
         assert_eq!(NackReason::ParsingError.code(), 487);

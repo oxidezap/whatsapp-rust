@@ -380,7 +380,9 @@ fn group_notification_action_serializes_every_field_present() {
     assert_eq!(
         serde_json::to_value(GroupNotificationAction::Subject {
             subject: "Team".into(),
-            subject_owner: Some("555000111@s.whatsapp.net".parse::<Jid>().unwrap()),
+            subject_owner: Some("271060335329480@lid".parse::<Jid>().unwrap()),
+            subject_owner_pn: Some("555000111@s.whatsapp.net".parse::<Jid>().unwrap()),
+            subject_owner_username: Some("team-admin".into()),
             subject_time: Some(1_704_067_200),
         })
         .unwrap(),
@@ -388,12 +390,20 @@ fn group_notification_action_serializes_every_field_present() {
             "type": "subject",
             "subject": "Team",
             "subject_owner": {
+                "user": "271060335329480",
+                "server": "lid",
+                "agent": 0,
+                "device": 0,
+                "integrator": 0,
+            },
+            "subject_owner_pn": {
                 "user": "555000111",
                 "server": "s.whatsapp.net",
                 "agent": 0,
                 "device": 0,
                 "integrator": 0,
             },
+            "subject_owner_username": "team-admin",
             "subject_time": 1_704_067_200,
         })
     );
@@ -435,6 +445,8 @@ fn group_notification_action_omits_none_fields() {
         serde_json::to_value(GroupNotificationAction::Subject {
             subject: "Team".into(),
             subject_owner: None,
+            subject_owner_pn: None,
+            subject_owner_username: None,
             subject_time: None,
         })
         .unwrap(),
@@ -509,17 +521,23 @@ fn group_notification_action_declares_exact_field_count() {
         // Mixed constant + optional, both present and absent.
         GroupNotificationAction::Subject {
             subject: "Team".into(),
-            subject_owner: Some("555000111@s.whatsapp.net".parse::<Jid>().unwrap()),
+            subject_owner: Some("271060335329480@lid".parse::<Jid>().unwrap()),
+            subject_owner_pn: Some("555000111@s.whatsapp.net".parse::<Jid>().unwrap()),
+            subject_owner_username: Some("team-admin".into()),
             subject_time: Some(1_704_067_200),
         },
         GroupNotificationAction::Subject {
             subject: "Team".into(),
             subject_owner: None,
+            subject_owner_pn: None,
+            subject_owner_username: None,
             subject_time: Some(1_704_067_200),
         },
         GroupNotificationAction::Subject {
             subject: "Team".into(),
             subject_owner: None,
+            subject_owner_pn: None,
+            subject_owner_username: None,
             subject_time: None,
         },
         // Only-optional, only-skipped, unit and fallback variants.

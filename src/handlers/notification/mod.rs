@@ -184,6 +184,119 @@ mod tests {
         );
     }
 
+    // ── `w:gp2` / `<groups_dirty>` (WA Web
+    // `WASmaxInGroupsGroupsDirtyNotificationRequest`)
+    //
+    // The one `w:gp2` stanza whose `from` is the server rather than a group.
+    // We ran it through the ordinary group-notification parser, which named
+    // `s.whatsapp.net` as the group in the event it produced and left the
+    // groups the server had actually called stale still cached.
+
+    #[tokio::test]
+    async fn groups_dirty_invalidates_the_named_groups_and_names_no_group_update() {
+        use crate::types::events::EventHandler;
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+
+        let dirty: Jid = "120363000000000001@g.us".parse().unwrap();
+        let untouched: Jid = "120363000000000002@g.us".parse().unwrap();
+        let cache = client.get_group_cache();
+        for jid in [&dirty, &untouched] {
+            cache
+                .insert(
+                    jid.clone(),
+                    Arc::new(GroupInfo::new(
+                        vec!["12025550101@s.whatsapp.net".parse().unwrap()],
+                        AddressingMode::Pn,
+                    )),
+                )
+                .await;
+        }
+
+        let notif = NodeBuilder::new("notification")
+            .attr("type", NotificationType::WGp2.as_str())
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "groups-dirty-1")
+            .attr("t", "1704067200")
+            .children([NodeBuilder::new("groups_dirty")
+                .children([NodeBuilder::new("group").attr("jid", dirty.clone()).build()])
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert!(
+            cache.get(&dirty).await.is_none(),
+            "the group the server called stale must lose its cached metadata"
+        );
+        assert!(
+            cache.get(&untouched).await.is_some(),
+            "a group the notification did not name must keep its cache"
+        );
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::GroupUpdate(_))),
+            "groups_dirty must not be reported as an update to a group named by `from`"
+        );
+        assert!(
+            collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::Notification(_))),
+            "the stanza must still reach the consumer raw"
+        );
+    }
+
+    // ── `account_sync` / `<disappearing_mode>` (WA Web's account_sync parser)
+    //
+    // Our own account's default disappearing-messages timer, changed from
+    // another device. We read only `pushname` and `<devices>` out of this
+    // notification, so the change was dropped without even the raw-event
+    // fallback, which the matched `account_sync` arm skips.
+
+    #[tokio::test]
+    async fn account_sync_disappearing_mode_reaches_the_consumer() {
+        use crate::types::events::EventHandler;
+
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+
+        let own: Jid = "12025550199@s.whatsapp.net".parse().unwrap();
+        let notif = NodeBuilder::new("notification")
+            .attr("type", NotificationType::AccountSync.as_str())
+            .attr("from", own.clone())
+            .attr("id", "acct-sync-dm-1")
+            .attr("t", "1704067200")
+            .children([NodeBuilder::new("disappearing_mode")
+                .attr("action", "update")
+                .attr("duration", "604800")
+                .attr("t", "1704067200")
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        let changed = collector
+            .events()
+            .into_iter()
+            .find_map(|event| match event.as_ref() {
+                Event::DisappearingModeChanged(changed) => Some(changed.clone()),
+                _ => None,
+            })
+            .expect("an account_sync disappearing_mode must reach the consumer");
+        assert_eq!(changed.from, own);
+        assert_eq!(changed.duration, 604_800);
+    }
+
     /// A type a subsystem claims must not be shadowed by a core arm. The seam
     /// is consulted only in the fallthrough, so an arm added here later would
     /// take the stanza and the subsystem would silently stop seeing it. The

@@ -122,6 +122,19 @@ pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef
     tracing::instrument(name = "wa.notif.group", level = "debug", skip_all)
 )]
 pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<OwnedNodeRef>) {
+    // `<groups_dirty>` is the one `w:gp2` stanza the server sends about itself:
+    // `from` is `s.whatsapp.net`, not a group. Parsing it as an ordinary group
+    // notification would name the server as the group in every event it
+    // produced, so it is routed out before that can happen.
+    if let Some(groups) = wacore::stanza::groups::parse_groups_dirty(node.get()) {
+        handle_groups_dirty(client, &groups).await;
+        client
+            .core
+            .event_bus
+            .dispatch(Event::Notification(Arc::clone(&node)));
+        return;
+    }
+
     let mut notification = match GroupNotification::try_from_node_ref(node.get()) {
         Some(n) => n,
         None => {
@@ -270,6 +283,25 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
         .core
         .event_bus
         .dispatch(Event::Notification(Arc::clone(&node)));
+}
+
+/// The server named these groups' cached metadata stale.
+///
+/// Dropping the cached blob is what every other staleness signal in this file
+/// does (see the `Remove` / expired-cache arms above); the next send or
+/// `group_info` query re-fetches. Doing nothing would leave a group's
+/// participant list wrong for as long as the cache lives, which is a message
+/// encrypted to a device set the group no longer has.
+async fn handle_groups_dirty(client: &Arc<Client>, groups: &[wacore_binary::Jid]) {
+    for jid in groups {
+        debug!(
+            target: "Client/Group",
+            "groups_dirty: invalidating cached metadata for {}",
+            jid.observe()
+        );
+        let metadata = client.lock_group_metadata(jid).await;
+        metadata.invalidate().await;
+    }
 }
 
 /// Handle `<notification type="newsletter">` — live updates with reaction counts.

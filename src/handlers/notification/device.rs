@@ -37,6 +37,15 @@ pub(crate) async fn handle_account_sync_notification(client: &Arc<Client>, nr: &
     if let Some(devices_node) = nr.get_optional_child_by_tag(&["devices"]) {
         handle_account_sync_devices(client, nr, devices_node).await;
     }
+    // WA Web's account_sync parser reads a `<disappearing_mode duration t>`
+    // child alongside `<devices>`. It is the same child the standalone
+    // `type="disappearing_mode"` notification carries, so it goes through the
+    // same parser — the difference is only whose setting it is: `from` on an
+    // account_sync is our own account, so this is the account default changed
+    // from another device rather than a contact changing theirs.
+    if nr.get_optional_child("disappearing_mode").is_some() {
+        super::groups::handle_disappearing_mode_notification(client, nr);
+    }
 }
 
 /// Handle encrypt/count notification (PreKey Low).
