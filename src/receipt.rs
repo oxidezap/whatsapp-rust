@@ -1138,9 +1138,7 @@ mod tests {
 
     #[test]
     fn delivery_receipt_for_status_broadcast_carries_class_status_and_participant() {
-        // WA Web's gate is `(isGroup || isBroadcast) && participant` for the
-        // participant attr, and `isStatus && gating` for context — see
-        // `Send/DeliveryReceiptJob.js`. Status broadcasts must carry BOTH so
+        // Status broadcasts must carry BOTH the class and the participant, so
         // the server can map the ack back to the status owner.
         let info = info_with("status@broadcast", "12345@s.whatsapp.net", false);
         let node = build_delivery_receipt_node(&info, true);
@@ -1148,6 +1146,10 @@ mod tests {
         assert_eq!(
             node.attrs.get("class").map(|v| v.as_str()).as_deref(),
             Some("status")
+        );
+        assert!(
+            node.attrs.get("context").is_none(),
+            "the marker moved to `class`; emitting both would let the old attr survive"
         );
         assert_eq!(
             node.attrs.get("participant").map(|v| v.as_str()).as_deref(),
@@ -3197,7 +3199,7 @@ mod tests {
     }
 
     #[test]
-    fn read_receipt_dm_is_read_without_context() {
+    fn read_receipt_dm_is_read_without_class() {
         let node = build_read_receipt_node(
             &jid("456@s.whatsapp.net"),
             None,
@@ -3242,6 +3244,10 @@ mod tests {
         assert_eq!(
             node.attrs.get("class").map(|v| v.as_str()).as_deref(),
             Some("status")
+        );
+        assert!(
+            node.attrs.get("context").is_none(),
+            "the marker moved to `class`; emitting both would let the old attr survive"
         );
         assert_eq!(
             node.attrs

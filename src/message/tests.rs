@@ -7011,6 +7011,9 @@ struct SentReceipt {
     participant: Option<String>,
     /// The `class` attr — WA Web's status marker on a `<receipt>`.
     class_attr: Option<String>,
+    /// The attr the marker used to be spelled as, captured so a regression
+    /// that emits both cannot pass.
+    context_attr: Option<String>,
     category: Option<String>,
     has_keys: bool,
 }
@@ -7055,6 +7058,7 @@ fn find_receipt_details(frames: &[bytes::Bytes], id: &str) -> Option<SentReceipt
                 recipient: node.get_attr("recipient").map(|v| v.as_str().to_string()),
                 participant: node.get_attr("participant").map(|v| v.as_str().to_string()),
                 class_attr: node.get_attr("class").map(|v| v.as_str().to_string()),
+                context_attr: node.get_attr("context").map(|v| v.as_str().to_string()),
                 category: node.get_attr("category").map(|v| v.as_str().to_string()),
                 has_keys: node.get_optional_child("keys").is_some(),
             });
@@ -8333,6 +8337,10 @@ async fn status_skdm_only_session_uses_one_status_receipt() {
         receipt.class_attr.as_deref(),
         Some("status"),
         "WA Web marks a status receipt with class=\"status\"          (WAWebSendDeliveryReceiptJob), not with a context attr"
+    );
+    assert_eq!(
+        receipt.context_attr, None,
+        "emitting both attrs would let the old spelling survive on the wire"
     );
     assert_eq!(
         message_events_for_id(&rx, id),

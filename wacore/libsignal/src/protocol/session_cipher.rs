@@ -1566,11 +1566,18 @@ fn decrypt_with_message_keys(
     if !mac_valid {
         // A MAC failure here is not exceptional: the decrypt path probes the
         // current session and then each archived one, and every miss lands
-        // exactly here. Formatting through `Hex` defers the three allocations
-        // to `log::error!`'s own argument formatting, so a probe that the next
-        // candidate session goes on to satisfy pays nothing, and a build with
-        // the level filtered out pays nothing either.
-        log::error!(
+        // exactly here. So this is a candidate diagnostic, not a verdict, and
+        // it is logged at the same level as the caller's per-candidate line —
+        // one session failing is not yet a failure, and a replay reaches this
+        // site for every sibling that shares the ratchet key before the
+        // archived state recognizes its spent counter. A genuine dead end
+        // still gets its `log::error!` from the verdict at the end of
+        // `decrypt_message_with_record`, so nothing is lost by not shouting
+        // here. Formatting through `Hex` defers the three allocations to the
+        // macro's own argument formatting, so a probe that the next candidate
+        // session goes on to satisfy pays nothing, and a build with the level
+        // filtered out pays nothing either.
+        log::warn!(
             "MAC verification failed for message from {}. \
              Remote Identity: {}, \
              Local Identity: {}, \

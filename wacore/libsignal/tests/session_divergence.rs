@@ -898,18 +898,9 @@ mod announced {
 /// exactly what a companion sees on startup when the previous run exited
 /// before its ack was flushed.
 ///
-/// WA Web gives that case its own classification rather than a failure:
-/// `WAWebMsgProcessingDecryptionHandler` maps `errDuplicateMsg` to
-/// `DecryptionErrorType.SignalDuplicateMessage`, which is excluded from the
-/// retryable set, creates no E2E placeholder, and returns
-/// `E2EProcessResult.SIGNAL_OLD_COUNTER_ERROR`. Its only log is a WARN, for
-/// group chats, sampled at 1%.
-///
-/// We reached the same verdict — `DuplicatedMessage`, no retry receipt — but
-/// announced it first as `ERROR ... No valid session for recipient`, because
-/// both error logs ran before the classification that was about to call it a
-/// replay. The claim is also untrue: the chain was recognized, which is the
-/// only reason we know it is a replay at all.
+/// What this pins: the verdict is `DuplicatedMessage` and nothing about it is
+/// announced at error level. Why the protocol wants that is stated once, at the
+/// classification in `decrypt_message_with_record`.
 #[test]
 fn a_replayed_message_is_not_announced_as_a_session_failure() {
     const PEER: &str = "replayed-peer";
@@ -954,5 +945,57 @@ fn a_replayed_message_is_not_announced_as_a_session_failure() {
     assert!(
         failures.is_empty(),
         "a replay must not be announced as an error; got {failures:?}"
+    );
+}
+
+/// The same guarantee when the replay has to be recognized across more than one
+/// candidate session.
+///
+/// A rebuild archives the state that consumed the counter and installs a fresh
+/// one, so the replay now fails the current session before the archived one
+/// recognizes it. The duplicate verdict still has to win, and still has to keep
+/// the failure logging quiet — that is the ordering this pins, and it is the
+/// case a reviewer flagged as the one that could still leak an error record.
+#[test]
+fn a_replay_stays_quiet_when_a_sibling_candidate_session_fails_first() {
+    const PEER: &str = "replayed-peer-archived";
+    announced::install();
+
+    let mut alice = Peer::new(PEER, 1);
+    let mut bob = Peer::new("replay-archive-receiver", 1);
+    establish(&mut alice, &mut bob);
+
+    let reply = send(&mut bob, &alice.address, b"hi alice");
+    receive(&mut alice, &bob.address, &reply).expect("reply decrypts");
+
+    let ct = send(&mut alice, &bob.address, b"delivered once");
+    assert_eq!(
+        receive(&mut bob, &alice.address, &ct).expect("first delivery decrypts"),
+        b"delivered once"
+    );
+
+    // Bob rebuilds toward Alice: the state that just consumed the counter is
+    // archived and a fresh current session takes its place.
+    alice.rotate_one_time_prekey();
+    let bundle = alice.bundle();
+    process_bundle(&mut bob, &alice.address, &bundle);
+
+    let replay = receive(&mut bob, &alice.address, &ct)
+        .expect_err("a consumed counter cannot decrypt twice");
+    assert!(
+        matches!(replay, SignalProtocolError::DuplicatedMessage(_, _)),
+        "the archived state's duplicate must outrank the current state's failure: {replay:?}"
+    );
+
+    let records = announced::about(PEER);
+    // The current session really did fail on its own terms first — without this
+    // the test could pass on a single-candidate path and prove nothing new.
+    assert!(
+        records.iter().any(|(level, _)| *level == log::Level::Warn),
+        "expected a candidate-failure warning from the fresh session; got {records:?}"
+    );
+    assert!(
+        records.iter().all(|(level, _)| *level > log::Level::Error),
+        "a replay must stay out of the error log even when a sibling candidate fails; got {records:?}"
     );
 }

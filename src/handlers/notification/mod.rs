@@ -258,13 +258,9 @@ mod tests {
 
     // ── `<notification type="encrypt">` prekey-low routing
     //
-    // WA Web's stanza router reads the FIRST child tag and sends both `count`
-    // and `pq_count` to `WAWebHandlePreKeyLow`
-    // (`case"count":case"pq_count":return yield r("WAWebHandlePreKeyLow")(e,t)`).
-    // That handler then decides what to refill by TAG, not by position:
-    // `hasLegacyCount = maybeChild("count") != null` is what drives the classic
-    // one-time-prekey upload. So WA Web refills the classic pool for
-    // `<count><pq_count>` and `<pq_count><count>` alike.
+    // What these pin: a `<count>` child reaches the prekey-low path wherever it
+    // sits among the children, and a PQ-only notification reaches nothing. Why
+    // WA Web splits it that way is stated once, at `handle_encrypt_notification`.
 
     fn encrypt_notif(children: &[&'static str]) -> Node {
         NodeBuilder::new("notification")

@@ -2414,9 +2414,8 @@ fn test_encrypt_identity_notification_omits_type() {
 }
 
 /// Every `<notification type="encrypt">` acks without a `type`, not just the
-/// identity-change one: `WAWebHandlePreKeyLow` and `WAWebHandleDigestKey` both
-/// build `wap("ack", {to, id, class: "notification"})` exactly like
-/// `WAWebHandleIdentityChange` does.
+/// identity-change one. The three WA Web handlers this mirrors are named at
+/// `encode_ack_bytes`.
 #[test]
 fn test_encrypt_count_and_digest_notifications_also_omit_type() {
     for child in ["count", "pq_count", "digest"] {
