@@ -2730,7 +2730,7 @@ impl CallEngine {
                 // of the wrong bits. Restore the RFC header first, exactly as the consumer-side
                 // `decode_mlow_escape` used to before the engine took this over.
                 let mut encoded = encoded;
-                if m.active_format.rtp_profile == AudioRtpProfile::Mlow
+                if m.active_format.payload_is_mlow_escape(&encoded)
                     && let Err(e) = depacketize_opus_from_mlow(&mut encoded)
                 {
                     log::debug!("voip: malformed MLOW Opus escape: {e}");
@@ -3063,15 +3063,18 @@ impl CallEngine {
                 .inbound_codec(participant.header.payload_type, &participant.payload)
         };
         // What says the TOC was rewritten and has to be restored. Never true for a promoted
-        // participant: it was promoted precisely because its bytes are native.
-        let escaped = !promoted
-            && codec == AudioCodec::Opus
-            && audio.format.rtp_profile == AudioRtpProfile::Mlow;
+        // participant -- it was promoted precisely because its bytes are native -- and decided for
+        // everyone else by `payload_is_mlow_escape`, because the marker alone cannot tell an escape
+        // from native CELT and calling native CELT an escape rewrites a TOC that was never
+        // rewritten. A participant sending native CELT from its very first packet is never
+        // classified MLOW, so the probe would never see it: without this it would be corrupted for
+        // the whole call with nothing able to notice.
+        let escaped = !promoted && audio.format.payload_is_mlow_escape(&participant.payload);
         // A promoted participant sends NATIVE Opus, so the frame must not be described by the
         // container the call negotiated: a sink that depacketizes by `format.rtp_profile` would
         // read the untouched TOC as an MLOW escape and corrupt it. The escape keeps `audio.format`,
         // because for it the MLOW profile is the truth.
-        let frame_format = if promoted {
+        let frame_format = if codec == AudioCodec::Opus && !escaped {
             audio
                 .format
                 .sibling_for(AudioCodec::Opus)
@@ -7609,6 +7612,73 @@ mod tests {
             format,
             AudioFormat::OPUS_16KHZ_60MS,
             "and native Opus must not be described by the container it is not in"
+        );
+    }
+
+    // A participant whose native Opus stream is CELT from its FIRST packet is never classified MLOW,
+    // so the probe never sees it: the marker calls it an escape, its untouched TOC is rewritten, and
+    // it is corrupted for the whole call with nothing able to notice. The promotion fix does not
+    // reach this -- there is nothing to promote it. What separates the two is arithmetic: an escape
+    // cannot parse as Opus at the negotiated cadence and native CELT at that cadence parses exactly.
+    #[test]
+    fn native_celt_from_an_unpromoted_participant_is_not_read_as_an_escape() {
+        let mut cfg = config(true);
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).expect("engine");
+        let update = group_update("audio");
+        eng.configure_group(GroupEngineConfig {
+            call_creator: update.call_creator.clone(),
+            self_jid: SELF_LID.parse().expect("self JID"),
+            initial_update: update,
+            direct_peer: None,
+        })
+        .expect("configure group");
+        let epoch = [0x42; 32];
+        assert_eq!(
+            eng.apply_group_raw_epoch(7, &epoch).expect("install epoch"),
+            GroupEpochApply::Installed
+        );
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        // Config 27, code 3, three 20ms CELT frames: 60ms, the negotiated cadence. Its TOC 0xDB is
+        // in the escape's bit class, which is the whole difficulty.
+        let mut native: Vec<u8> = vec![27 << 3 | 3, 3];
+        native.extend(core::iter::repeat_n(0x11u8, 60));
+        assert_eq!(native[0] & 0xC0, 0xC0, "and so looks like an escape");
+
+        let mut peer = group_peer_audio(&epoch);
+        let packet = peer.protect_audio(&native);
+        eng.handle_input(100, Input::RelayPacket(&packet));
+        let (outputs, _) = drain(&mut eng);
+        let frame = outputs
+            .iter()
+            .find_map(|output| match output {
+                Output::EncodedAudio(frame) => Some(frame),
+                _ => None,
+            })
+            .expect("the packet reaches the sink");
+        assert_eq!(frame.codec, AudioCodec::Opus);
+        assert_eq!(
+            frame.format,
+            AudioFormat::OPUS_16KHZ_60MS,
+            "native CELT is native Opus, not MLOW's container, from the first packet"
+        );
+
+        // And the escape of that same packet is still an escape: the rule separates them, it does
+        // not simply stop believing the marker.
+        let mut escape = native.clone();
+        crate::voip::audio::packetize_opus_for_mlow(&mut escape).expect("a valid escape");
+        assert!(
+            AudioFormat::MLOW_16KHZ_60MS.payload_is_mlow_escape(&escape),
+            "the escape of the same packet must still read as one"
+        );
+        assert!(
+            !AudioFormat::MLOW_16KHZ_60MS.payload_is_mlow_escape(&native),
+            "and the native packet must not"
         );
     }
 

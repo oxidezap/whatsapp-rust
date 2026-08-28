@@ -149,6 +149,27 @@ impl AudioFormat {
         }
     }
 
+    /// Whether this payload is MLOW's escape, as opposed to native Opus that merely looks like one.
+    ///
+    /// The marker alone cannot answer it: `is_mlow_embedded_opus` tests the top two bits, and every
+    /// native Opus CELT config (24..=31) sets them -- a native 60 ms CELT packet starts 0xC3. Read
+    /// on the marker alone, native CELT is called an escape and has a TOC that was never rewritten
+    /// rewritten again, which does not decode.
+    ///
+    /// What separates them is the same arithmetic the content probe rests on. An escape's low TOC
+    /// bit means "multiple frames", not an Opus frame count, so read back as Opus it is code 0 or
+    /// code 1 -- one or two CELT frames, at most 40 ms. It can therefore never claim the negotiated
+    /// packet duration, while native CELT at that duration claims it exactly. Parsing as Opus at
+    /// this format's own cadence is thus a property only the native packet has.
+    #[must_use]
+    pub fn payload_is_mlow_escape(self, payload: &[u8]) -> bool {
+        matches!(self.rtp_profile, AudioRtpProfile::Mlow)
+            && is_mlow_embedded_opus(payload)
+            && crate::voip::opus_packet_shape(payload)
+                .and_then(|shape| shape.total_samples(self.rtp_clock_rate))
+                != Some(self.rtp_timestamp_step)
+    }
+
     /// Reject raw Opus that the MLOW receiver would parse as proprietary codec data.
     pub fn accepts_encoded_payload(self, payload: &[u8]) -> bool {
         !payload.is_empty()
