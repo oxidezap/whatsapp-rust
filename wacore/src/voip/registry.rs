@@ -156,7 +156,7 @@ impl CallEventQueue {
         }
         self.max_payload_bytes
             .fetch_max(payload_bytes, Ordering::Relaxed);
-        self.tx.force_send(event).is_ok()
+        force_send_call_event(&self.tx, event)
     }
 
     fn retained_bytes(&self) -> usize {
@@ -434,6 +434,30 @@ impl CallEntry {
             .saturating_add(call_id.heap_bytes())
             .saturating_add(size_of::<CallEntry>())
             .saturating_add(self.heap_bytes())
+    }
+}
+
+/// Make room for `event` without losing a keyframe request.
+///
+/// Displacing the queue's oldest entry is the right trade for the events that
+/// come through here, with one exception: the engine latches its keyframe
+/// requirement before publishing, so a request the consumer never sees is never
+/// made again while every delta keeps being dropped. A displaced one goes back,
+/// shedding the next entry instead -- the same shape as
+/// `CallRegistry::force_send_preserving_epoch`.
+///
+/// `false` only when the queue is closed.
+pub(crate) fn force_send_call_event(
+    tx: &async_channel::Sender<CallEvent>,
+    event: CallEvent,
+) -> bool {
+    match tx.force_send(event) {
+        Ok(Some(CallEvent::VideoKeyframeNeeded)) => {
+            let _ = tx.force_send(CallEvent::VideoKeyframeNeeded);
+            true
+        }
+        Ok(_) => true,
+        Err(_) => false,
     }
 }
 

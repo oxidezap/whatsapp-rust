@@ -27,6 +27,7 @@ use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
 use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
 use crate::voip::group_media::GroupMediaError;
 use crate::voip::h264::VideoFrame;
+use crate::voip::registry::force_send_call_event;
 use crate::voip::rtp::{RTP_PAYLOAD_TYPE_H264, VIDEO_MEDIA_FRAME_INFO_IDR, parse_rtp_header};
 use crate::voip::transport::{RelayTransport, RelayTransportEvent};
 
@@ -680,22 +681,16 @@ fn apply_group_epoch_control(
     }
 }
 
-/// What became of an event offered to the consumer.
-#[derive(Default)]
-struct Published {
-    /// Whether it reached the queue.
-    delivered: bool,
-    /// Whether making room for it displaced a keyframe request, which the
-    /// engine will not raise again on its own.
-    evicted_keyframe_request: bool,
-}
-
+/// `false` when a saturated queue swallowed the event.
+///
 /// A diagnostic is worth less than a relay lifecycle transition, so those
-/// displace the oldest entry rather than being dropped. Everything else,
-/// including the keyframe request, is offered without evicting anything -- see
+/// displace the queue's oldest entry rather than being dropped -- through
+/// [`force_send_call_event`], which never sheds a keyframe request to do it,
+/// here or from the registry's own publishers. Everything else, the request
+/// included, is offered without evicting anything; see
 /// [`retry_keyframe_request`] for how the one event that cannot be lost
-/// survives being refused, or being the entry a lifecycle event displaced.
-fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) -> Published {
+/// survives being refused outright.
+fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEvent) -> bool {
     if matches!(
         &event,
         CallEvent::RelayAllocated
@@ -703,18 +698,9 @@ fn publish_engine_event(events: &async_channel::Sender<CallEvent>, event: CallEv
             | CallEvent::RelayAllocateTimedOut
             | CallEvent::RelayReconnectTimedOut
     ) {
-        match events.force_send(event) {
-            Ok(displaced) => Published {
-                delivered: true,
-                evicted_keyframe_request: matches!(displaced, Some(CallEvent::VideoKeyframeNeeded)),
-            },
-            Err(_) => Published::default(),
-        }
+        force_send_call_event(events, event)
     } else {
-        Published {
-            delivered: events.try_send(event).is_ok(),
-            evicted_keyframe_request: false,
-        }
+        events.try_send(event).is_ok()
     }
 }
 
@@ -1049,16 +1035,13 @@ async fn run_call_with_clock_and_wallclock(
                 }
                 Output::Event(ev) => {
                     let keyframe_request = matches!(ev, CallEvent::VideoKeyframeNeeded);
-                    let published = publish_engine_event(&channels.events, ev);
+                    let delivered = publish_engine_event(&channels.events, ev);
                     if keyframe_request {
                         // Assigned, not just set: a request that lands retires
                         // whatever an earlier refusal left outstanding, which by
                         // then is a requirement the consumer has heard about or
                         // one the encoder already satisfied on its own.
-                        undelivered_keyframe_request = !published.delivered;
-                    }
-                    if published.evicted_keyframe_request {
-                        undelivered_keyframe_request = true;
+                        undelivered_keyframe_request = !delivered;
                     }
                 }
                 Output::ReconnectRelay(endpoint) => {
@@ -1695,7 +1678,7 @@ mod tests {
         tx.try_send(diagnostic.clone()).expect("fills the queue");
 
         assert!(
-            !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded).delivered,
+            !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded),
             "a full queue refuses it"
         );
         let mut outstanding = true;
@@ -1716,29 +1699,25 @@ mod tests {
         assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
     }
 
-    /// A lifecycle event makes room by displacing the oldest entry, which can be
-    /// the keyframe request itself. It is the one event whose loss is permanent,
-    /// so being displaced puts it back in the queue of things owed.
+    /// A lifecycle event makes room by displacing the queue's oldest entry,
+    /// which can be the keyframe request -- the one event whose loss is
+    /// permanent. It goes back, and the next entry is shed in its place.
     #[test]
-    fn a_displaced_keyframe_request_becomes_outstanding_again() {
-        let (tx, rx) = async_channel::bounded(1);
-        let mut outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded).delivered;
-        assert!(!outstanding, "it fit");
+    fn a_lifecycle_event_sheds_something_other_than_the_keyframe_request() {
+        let (tx, rx) = async_channel::bounded(2);
+        assert!(publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded));
+        let diagnostic = CallEvent::GroupControlRejected {
+            control: engine::GroupControlKind::Update,
+        };
+        assert!(publish_engine_event(&tx, diagnostic.clone()));
 
-        let published = publish_engine_event(&tx, CallEvent::RelayAllocated);
-        assert!(published.delivered);
-        assert!(
-            published.evicted_keyframe_request,
-            "it displaced the request"
+        assert!(publish_engine_event(&tx, CallEvent::RelayAllocated));
+        let kept = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            vec![CallEvent::RelayAllocated, CallEvent::VideoKeyframeNeeded],
+            "the diagnostic is what the lifecycle event cost, not the request"
         );
-        if published.evicted_keyframe_request {
-            outstanding = true;
-        }
-        assert_eq!(rx.try_recv(), Ok(CallEvent::RelayAllocated));
-
-        retry_keyframe_request(&tx, &mut outstanding, true);
-        assert!(!outstanding);
-        assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
     }
 
     /// The engine settles its own requirement when an IDR reaches the wire, and
@@ -1751,7 +1730,7 @@ mod tests {
             control: engine::GroupControlKind::Update,
         })
         .expect("fills the queue");
-        let mut outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded).delivered;
+        let mut outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded);
         assert!(outstanding);
 
         // Room returns, but so did the encoder's own IDR.
@@ -1771,11 +1750,11 @@ mod tests {
             control: engine::GroupControlKind::Update,
         })
         .expect("fills the queue");
-        let mut outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded).delivered;
+        let mut outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded);
         assert!(outstanding);
 
         let _ = rx.try_recv();
-        outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded).delivered;
+        outstanding = !publish_engine_event(&tx, CallEvent::VideoKeyframeNeeded);
         assert!(!outstanding, "the later request landed, so nothing is owed");
         assert_eq!(rx.try_recv(), Ok(CallEvent::VideoKeyframeNeeded));
 
