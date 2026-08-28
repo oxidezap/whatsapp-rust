@@ -1479,7 +1479,12 @@ impl SignalStoreCache {
             // the chain resume an iteration that has already been published.
             if state.incarnation == incarnation && !state.cache.removed_since(key, since) {
                 let record = decoded?;
-                state.cache.insert(Arc::from(key), record.clone());
+                // Through `key_for`, not `Arc::from`: a distribution retained
+                // for this address while the record was still cold already
+                // owns a key, and allocating a second one for the same string
+                // is what the canonicalization exists to avoid.
+                let addr = state.key_for(key);
+                state.cache.insert(addr, record.clone());
                 state.evict_if_needed(self.max_entries);
                 return Ok(record);
             }
@@ -1497,7 +1502,8 @@ impl SignalStoreCache {
             )?)),
             None => None,
         };
-        state.cache.insert(Arc::from(key), record.clone());
+        let addr = state.key_for(key);
+        state.cache.insert(addr, record.clone());
         state.evict_if_needed(self.max_entries);
         Ok(record)
     }
@@ -2399,6 +2405,51 @@ mod sender_key_lock_tests {
                 "pending_first={pending_first}: the two sides must share one allocation"
             );
         }
+    }
+
+    /// The third way a record reaches the cache: not a `put`, but a cold read
+    /// populating it from the backend. It has to canonicalize too, or a
+    /// distribution retained while the record was still cold leaves the store
+    /// holding two keys for one address.
+    #[tokio::test]
+    async fn a_cold_load_reuses_a_pending_distribution_key() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("19995550001@g.us", "19995550002@s.whatsapp.net:0");
+        backend
+            .put_sender_key(
+                name.cache_key(),
+                &sender_key_record_with_chain(5)
+                    .serialize()
+                    .expect("serialize record"),
+            )
+            .await
+            .expect("seed backend");
+
+        // Retained first, so the pending map owns the only key for this
+        // address when the cold load goes to insert its own.
+        cache
+            .cache_pending_sender_key_distribution(&name, Arc::from(&[9u8, 8][..]))
+            .await;
+        cache
+            .get_sender_key(&name, &backend)
+            .await
+            .expect("cold load")
+            .expect("record present");
+
+        let state = cache.sender_keys.lock().await;
+        let (cache_key, _) = state
+            .cache
+            .get_key_value(name.cache_key())
+            .expect("record cached");
+        let (pending_key, _) = state
+            .pending_distributions
+            .get_key_value(name.cache_key())
+            .expect("distribution retained");
+        assert!(
+            Arc::ptr_eq(cache_key, pending_key),
+            "the cold load must adopt the pending key, not allocate a second"
+        );
     }
 
     #[tokio::test]
