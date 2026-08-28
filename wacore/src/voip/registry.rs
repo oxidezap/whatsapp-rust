@@ -287,7 +287,12 @@ struct CallEntry {
     ///
     /// The JID rides along because a group call routes rotation per
     /// participant; see [`CallEntry::peer_orientation_control`].
-    peer_video_orientation: Option<(Jid, u8)>,
+    ///
+    /// A list rather than one value, because a group call has one announcer per
+    /// participant and several `<accept>`s can land in the window between
+    /// registration and the media plane attaching -- a single slot would keep
+    /// only the last of them.
+    peer_video_orientations: Vec<(Jid, u8)>,
     /// Explicit group identity exists before the first authoritative roster arrives.
     is_group_call: bool,
     /// This generation originated from a reusable call-link join and may accept waiting-room state.
@@ -303,6 +308,21 @@ struct CallEntry {
     on_terminal: Option<EndedNotify>,
 }
 
+/// Record `peer`'s rotation, replacing whatever it announced before.
+///
+/// Linear because the list holds one entry per participant that has announced a
+/// rotation, which is a handful even in a large group call, and a map's fixed
+/// cost would be paid by every 1:1 call for a single entry.
+fn upsert_peer_orientation(orientations: &mut Vec<(Jid, u8)>, peer: Jid, orientation: u8) {
+    match orientations
+        .iter_mut()
+        .find(|(announcer, _)| *announcer == peer)
+    {
+        Some(entry) => entry.1 = orientation,
+        None => orientations.push((peer, orientation)),
+    }
+}
+
 impl CallEntry {
     /// Install a replacement session, carrying over the facts an entry holds
     /// outside it. A re-offer, a glare resolution and a group promotion all
@@ -311,8 +331,8 @@ impl CallEntry {
     /// announced rotation with whatever the new session happens to know, which
     /// for every path but the group promotion is nothing.
     fn adopt_session(&mut self, session: CallSession) {
-        if let Some(announced) = session.peer_video_orientation.clone() {
-            self.peer_video_orientation = Some(announced);
+        if let Some((peer, orientation)) = session.peer_video_orientation.clone() {
+            upsert_peer_orientation(&mut self.peer_video_orientations, peer, orientation);
         }
         self.session = session;
     }
@@ -1474,7 +1494,7 @@ impl CallRegistry {
             // has one, and it then outlives every negotiation rebuild.
             self_video_orientation: 0,
             // Seeded from the offer, drained by `set_video_channels`.
-            peer_video_orientation: session.peer_video_orientation.clone(),
+            peer_video_orientations: session.peer_video_orientation.clone().into_iter().collect(),
             session,
             media_task: None,
             waiting_room_task: None,
@@ -1804,7 +1824,7 @@ impl CallRegistry {
             // Before the sender is published, so the rotation the offer
             // announced is the first thing the drive loop reads rather than
             // racing the first inbound frame.
-            if let Some((peer, orientation)) = entry.peer_video_orientation.clone() {
+            for (peer, orientation) in entry.peer_video_orientations.clone() {
                 video_ctl_tx.send(entry.peer_orientation_control(&peer, orientation));
             }
             entry.video_ctl_tx = Some(video_ctl_tx);
@@ -1856,7 +1876,11 @@ impl CallRegistry {
         let control = entry.peer_orientation_control(peer, orientation);
         // Kept whether or not it lands: unsent it waits for the first plane,
         // sent it is what a replacement plane has to be told.
-        entry.peer_video_orientation = Some((peer.clone(), orientation));
+        upsert_peer_orientation(
+            &mut entry.peer_video_orientations,
+            peer.clone(),
+            orientation,
+        );
         entry.video_ctl_tx.as_ref().map(|tx| tx.send(control));
         true
     }
@@ -5016,10 +5040,44 @@ mod tests {
         assert_eq!(
             ctl_rx.try_recv(),
             Ok(VideoControl::SetParticipantOrientation {
-                participant: joiner,
+                participant: joiner.clone(),
                 orientation: 1,
             })
         );
+    }
+
+    /// Several participants can answer in the window between registration and
+    /// the media plane attaching, and one slot would keep only the last.
+    #[test]
+    fn every_group_participant_that_announced_early_is_replayed_to_the_plane() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let mut session =
+            CallSession::new_outgoing("GID", Jid::new("GID", Server::Call), creator.clone());
+        session.group = Some(group_update(1));
+        let generation = reg.insert(session);
+
+        let first = Jid::new("222222222222222", Server::Lid).with_device(1);
+        let second = Jid::new("333333333333333", Server::Lid).with_device(5);
+        assert!(reg.set_peer_video_orientation("GID", generation, &first, 1));
+        assert!(reg.set_peer_video_orientation("GID", generation, &second, 3));
+        // The later word from one participant replaces its own, nobody else's.
+        assert!(reg.set_peer_video_orientation("GID", generation, &first, 2));
+
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+
+        let mut delivered = Vec::new();
+        while let Ok(VideoControl::SetParticipantOrientation {
+            participant,
+            orientation,
+        }) = ctl_rx.try_recv()
+        {
+            delivered.push((participant, orientation));
+        }
+        delivered.sort_by_key(|(announcer, _)| announcer.to_string());
+        assert_eq!(delivered, vec![(first, 2), (second, 3)]);
     }
 
     #[test]
