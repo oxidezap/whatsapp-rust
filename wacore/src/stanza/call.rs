@@ -547,6 +547,22 @@ pub fn capability_bit(version: Option<u32>, bytes: &[u8], index: u32) -> Capabil
     if version < CAPABILITY_VERSION {
         return CapabilityBit::Clear;
     }
+    // The blob's OWN version, which is not the attribute's: the header is `[version][len]`, and a
+    // client that cannot write a blob it believes in writes one that reads as nothing. Skipping this
+    // let `[0, 5, ..]` answer `Set` for index 31 -- MLOW kept enabled against a peer that had fallen
+    // back to native Opus, which is then sent MLOW and hears silence. The exact shape of #1105,
+    // reached through the one byte the parse did not look at.
+    // The blob's OWN version, which is not the attribute's: the header is `[version][len]`, and a
+    // client that cannot write a blob it believes in writes one that reads as nothing. Skipping this
+    // let `[0, 5, ..]` answer `Set` for index 31 -- MLOW kept enabled against a peer that had fallen
+    // back to native Opus, which is then sent MLOW and hears silence. The exact shape of #1105,
+    // reached through the one byte the parse did not look at.
+    let Some(&embedded_version) = bytes.first() else {
+        return CapabilityBit::Clear;
+    };
+    if u32::from(embedded_version) != CAPABILITY_VERSION {
+        return CapabilityBit::Clear;
+    }
     let Some(&declared_len) = bytes.get(1) else {
         return CapabilityBit::Clear;
     };
@@ -1372,6 +1388,34 @@ mod tests {
                 ),
                 CapabilityBit::Clear,
                 "an unreadable blob must reset, not be mistaken for absence"
+            );
+        }
+    }
+
+    // The blob's header is `[version][len]`, and only the second byte was ever read. A client that
+    // cannot build a capability it believes in writes one that must read as nothing -- but a blob
+    // whose own version byte is wrong still answered `Set` for index 31, keeping MLOW enabled
+    // against a peer that had fallen back to native Opus. That peer is then sent MLOW and hears
+    // silence: #1105 again, reached through the one byte the parse did not look at.
+    #[test]
+    fn a_blob_whose_embedded_version_is_wrong_reads_as_nothing() {
+        // A well-formed mask with index 31 set, under each embedded version byte.
+        let mut mask = [0u8; 4];
+        mask[(CAPABILITY_INDEX_MLOW_V1 / 8) as usize] = 1 << (CAPABILITY_INDEX_MLOW_V1 % 8);
+
+        let good: Vec<u8> = [1u8, 4].iter().copied().chain(mask).collect();
+        assert_eq!(
+            capability_bit(Some(1), &good, CAPABILITY_INDEX_MLOW_V1),
+            CapabilityBit::Set,
+            "the version the header declares is the one this crate writes"
+        );
+
+        for wrong in [0u8, 2, 255] {
+            let blob: Vec<u8> = [wrong, 4].iter().copied().chain(mask).collect();
+            assert_eq!(
+                capability_bit(Some(1), &blob, CAPABILITY_INDEX_MLOW_V1),
+                CapabilityBit::Clear,
+                "embedded version {wrong} is not one we can read, so the blob resets"
             );
         }
     }

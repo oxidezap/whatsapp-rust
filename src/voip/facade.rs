@@ -1305,6 +1305,15 @@ fn peer_selected_codec_from_offer(
     use wacore::stanza::call::{CAPABILITY_INDEX_MLOW_V1, CapabilityBit, capability_bit};
     use wacore::voip::{AudioCodec, AudioFormat};
 
+    // 1:1 only, and the guard lives here rather than at the call site because the question itself
+    // does not have a call-wide answer for a group. A group offer carries the capability of the ONE
+    // device that invited us, while the engine applies the call's format to every participant: read
+    // as a decision, it decodes the whole roster under one member's grammar and every member still
+    // on negotiated MLOW goes silent. A group answers per participant instead, which the engine's
+    // own classification and probe provide.
+    if incoming.group.is_some() {
+        return None;
+    }
     if format != AudioFormat::MLOW_16KHZ_60MS
         && format != AudioFormat::OPUS_16KHZ_60MS
         && format != AudioFormat::OPUS_MLOW_16KHZ_60MS
@@ -5041,6 +5050,43 @@ mod tests {
             ),
             None,
             "a peer that announced nothing resets nothing"
+        );
+    }
+
+    // A group offer carries the capability of the ONE device that invited us, while the engine
+    // applies the call's format to EVERY participant. Read as a call-wide decision, one member
+    // outside the MLOW rollout silences every member still inside it -- the roster decoded under a
+    // grammar only the inviter uses. A group answers per participant instead, which the engine's
+    // classification and probe already provide.
+    #[test]
+    fn a_group_offer_never_picks_the_roster_codec_from_the_inviting_device() {
+        use wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER;
+        use wacore::voip::AudioCodec;
+
+        let mut incoming =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&incoming, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus),
+            "the same capability decides a 1:1 call, which is the case it is for"
+        );
+
+        let group = GroupCallUpdate::builder()
+            .call_id(incoming.action.call_id().to_string())
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        incoming.group = Some(Box::new(group));
+        assert_eq!(
+            peer_selected_codec_from_offer(&incoming, AudioFormat::MLOW_16KHZ_60MS),
+            None,
+            "but one device cannot answer it for a roster"
         );
     }
 

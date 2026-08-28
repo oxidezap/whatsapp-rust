@@ -1027,6 +1027,10 @@ pub struct CallEngine {
     /// Subscription-only refreshes keep `allocated` true so established media remains live.
     allocate_pending: bool,
     allocated: bool,
+    /// Whether the peer has picked up. The watchdog needs this AND [`Self::allocated`], in whichever
+    /// order they arrive: inbound media cannot flow before the relay answers our allocate, so arming
+    /// on the accept alone reports the allocation interval itself as lost reception.
+    peer_has_answered: bool,
     started: bool,
     /// A terminal relay-allocate failure was surfaced; the engine goes inert (no keepalive, no
     /// timer, no further transmits) so the driver tears the call down instead of keepaliving a
@@ -1204,6 +1208,7 @@ impl CallEngine {
             allocate_deadline: 0,
             allocate_pending: false,
             allocated: false,
+            peer_has_answered: false,
             started: false,
             terminated: false,
             self_participant_id: ssrc::format_e2e_srtp_participant_id(&config.self_lid),
@@ -1812,7 +1817,14 @@ impl CallEngine {
     /// reporting a stall three seconds into every ordinary ring. Idempotent, and a no-op for a
     /// callee, which was answered before its media plane existed and armed at allocate.
     pub fn peer_answered(&mut self, now: Millis) {
-        if self.group.is_none() {
+        self.peer_has_answered = true;
+        // Both facts, not just this one. An outgoing peer can accept before the relay finishes
+        // allocating -- a buffered accept consumed as soon as a delayed attachment starts makes it
+        // ordinary rather than rare -- and inbound media cannot flow until the allocate response
+        // arrives. Arming here alone reports a slow allocation as a reception stall, blaming the
+        // peer for silence the relay had not yet made possible. Allocation arms the other side of
+        // this, so whichever lands second does the arming.
+        if self.group.is_none() && self.allocated {
             self.health.media_started(now);
         }
     }
@@ -2571,7 +2583,12 @@ impl CallEngine {
                     // production side of the watchdog -- a mixer with several participants is a
                     // different question from "is this stream carrying audio" -- so arming it there
                     // would report every healthy group call as stalled.
-                    if self.group.is_none() && self.direction == CallDirection::Incoming {
+                    // An incoming call was answered before its media plane existed, so allocation
+                    // is the whole condition. An outgoing one arms here too when the accept already
+                    // arrived -- see `peer_answered`, which handles the other order.
+                    if self.group.is_none()
+                        && (self.direction == CallDirection::Incoming || self.peer_has_answered)
+                    {
                         self.health.media_started(now);
                     }
                     self.announce_audio_rtcp_session();
@@ -2858,7 +2875,15 @@ impl CallEngine {
             // sink that refuses it is reported separately, through `note_audio_sink_dropped`.
             self.media_stats.audio_frames_delivered =
                 self.media_stats.audio_frames_delivered.saturating_add(1);
-            self.health.on_audio_produced();
+            // Not for bytes whose tag did not authenticate. Handing them over is the encoded API's
+            // contract, but they are not codec plaintext and calling them produced audio keeps
+            // `window_produced` nonzero through a run of failures -- so `AudioSilent` never fires
+            // and `AuthenticationFailing`, the one reason that names the real cause, can never be
+            // reached. The sink still gets the bytes; the watchdog just stops being told they are
+            // audio.
+            if !unauthenticated {
+                self.health.on_audio_produced();
+            }
             self.outbox
                 .push_back(Output::EncodedAudio(EncodedAudioFrame {
                     format: active_format,
@@ -3126,10 +3151,21 @@ impl CallEngine {
         // this participant's FIRST SILK packet -- carrying no CELT marker, classified MLOW -- would
         // be dropped, and an encoder alternating modes would keep re-losing it. An escape latches
         // nothing: it is MLOW's container and says nothing about what the peer negotiated.
-        if codec == AudioCodec::Opus && !escaped {
-            group
+        if codec == AudioCodec::Opus
+            && !escaped
+            && group
                 .foreign_participants
-                .insert(participant.participant_id.clone());
+                .insert(participant.participant_id.clone())
+        {
+            // Newly latched, so the same cleanup the probe's verdict does. A native-Opus
+            // participant whose first packets happen to be SILK was classified MLOW until this
+            // moment, and those packets left two things behind: a decoder holding predictor state
+            // built from another codec's bytes, and their concealment queued in the mixer. Without
+            // this, the CELT audio that settled the question plays out behind that manufactured
+            // silence -- the participant is rescued and then made to wait out its own failure.
+            #[cfg(feature = "voip-mlow")]
+            group.decoders.remove(&participant.participant_id);
+            group.mixer.reset(&participant.participant_id);
         }
         // A promoted participant sends NATIVE Opus, so the frame must not be described by the
         // container the call negotiated: a sink that depacketizes by `format.rtp_profile` would
@@ -3383,12 +3419,19 @@ impl CallEngine {
         pcm_state
             .scratch
             .extend(pcm.iter().map(|&s| s as f32 / 32768.0));
-        // A transient encode failure drops just this frame; the next one resyncs.
+        // A transient encode failure drops just this frame; the next one resyncs. Counted the same
+        // way the foreign encoder's refusal is: a run of them stops outbound RTP, and every other
+        // counter here watches the inbound direction, so without this the peer stops hearing us
+        // while `media_stats()` reports a healthy call.
         if pcm_state
             .encoder
             .encode_into(&pcm_state.scratch, &mut pcm_state.encoded)
             .is_err()
         {
+            self.media_stats.outbound_frames_without_encoder = self
+                .media_stats
+                .outbound_frames_without_encoder
+                .saturating_add(1);
             return;
         }
         // No SFrame on send by design: the encoded frame goes plain into WAHKDF SRTP, which the peer
@@ -7077,6 +7120,49 @@ mod tests {
         );
     }
 
+    // The accept can land BEFORE the relay answers our allocate -- a buffered accept consumed as
+    // soon as a delayed attachment starts makes that ordinary. Inbound media cannot flow until the
+    // allocation completes, so arming on the accept alone reports the allocation interval itself as
+    // lost reception, and the alarm arrives before `RelayAllocated` does.
+    #[test]
+    fn an_accept_before_allocation_does_not_start_the_stall_clock() {
+        let mut eng = CallEngine::new(config(true), Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        assert!(!eng.is_allocated(), "the relay has not answered yet");
+
+        // The peer picks up first, then the relay takes its time.
+        eng.peer_answered(0);
+        for tick in 1..=12u64 {
+            eng.handle_input(tick * 500, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            assert!(
+                !outputs
+                    .iter()
+                    .any(|o| matches!(o, Output::Event(CallEvent::AudioReceptionStalled { .. }))),
+                "nothing can arrive before the relay allocates, so nothing is late, got {outputs:?}"
+            );
+        }
+
+        // Allocation completes: only now does the peer's silence mean anything.
+        let success = allocate_success(&eng);
+        eng.handle_input(6_000, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+        let mut stalls = 0;
+        for tick in 13..=32u64 {
+            eng.handle_input(6_000 + tick * 500, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            stalls += outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(CallEvent::AudioReceptionStalled { .. })))
+                .count();
+        }
+        assert_eq!(
+            stalls, 1,
+            "and once both have happened the alarm still works, it is only deferred"
+        );
+    }
+
     // Reception that never starts is a transport problem, and it gets its own event: conflating it
     // with a codec problem is how #1105 was mis-triaged.
     #[test]
@@ -7809,6 +7895,62 @@ mod tests {
         );
     }
 
+    // A native-Opus participant whose first packets happen to be SILK is classified MLOW until its
+    // first CELT packet settles the question. Those packets leave a decoder full of another codec's
+    // predictor state and their concealment queued in the mixer, so without the same cleanup the
+    // probe's verdict does, the CELT audio plays out behind that manufactured silence.
+    #[test]
+    fn a_group_participant_latched_late_does_not_wait_out_its_own_concealment() {
+        let (mut eng, epoch) = group_engine(false);
+        eng = eng.with_foreign_audio_codec_factory(Box::new(StubCodecFactory { samples: 960 }));
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        let mut peer = group_peer_audio(&epoch);
+        // Two SILK packets first: no marker, so classified MLOW and concealed into the mixer.
+        let silk: Vec<u8> = core::iter::once(0x58u8).chain(0..80u8).collect();
+        for n in 0..2u64 {
+            let packet = peer.protect_audio(&silk);
+            eng.handle_input(100 + n * 60, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+        // Then CELT, which settles the participant's grammar outright.
+        let mut celt: Vec<u8> = vec![27 << 3 | 3, 3];
+        celt.extend(core::iter::repeat_n(0x11u8, 60));
+        let mut heard = Vec::new();
+        for n in 0..6u64 {
+            let packet = peer.protect_audio(&celt);
+            eng.handle_input(220 + n * 60, Input::RelayPacket(&packet));
+            for tick in 0..3u64 {
+                eng.handle_input(220 + n * 60 + tick * 20, Input::Timeout);
+                let (outputs, _) = drain(&mut eng);
+                for output in outputs {
+                    if let Output::Playout(frame) = output {
+                        heard.extend(frame);
+                    }
+                }
+            }
+        }
+
+        let first_audible = heard
+            .iter()
+            .position(|sample| *sample != 0)
+            .expect("the latched participant becomes audible");
+        assert_eq!(
+            heard[first_audible], 1234,
+            "what is heard is decoded audio, not the concealment the MLOW attempts queued"
+        );
+        // The number is the assertion for the same reason as the direct path's: concealment and
+        // playout priming are both silence, and only their length tells them apart.
+        assert_eq!(
+            first_audible, 960,
+            "the concealment from before the latch must not sit in front of the rescued audio"
+        );
+    }
+
     // A standard Opus encoder switches modes with the signal: CELT for music-like frames, SILK for
     // speech. Only the CELT ones carry the top bits the discriminator reads, so without latching the
     // participant, its first SILK packet is classified MLOW and dropped -- and an encoder that
@@ -8424,6 +8566,75 @@ mod tests {
         assert!(
             peak > 0,
             "SFrame-wrapped peer audio must decrypt, MLow-decode, and reach playout"
+        );
+    }
+
+    // An encoded call hands the ciphertext of a failed tag to its sink by contract -- but calling
+    // that produced audio keeps `window_produced` nonzero through a whole run of failures, so
+    // `AudioSilent` never fires and `AuthenticationFailing`, the one reason naming the real cause,
+    // is unreachable. The sink still gets the bytes; the watchdog stops being told they are audio.
+    #[test]
+    fn failed_sframe_ciphertext_is_delivered_but_is_not_produced_audio() {
+        let mut cfg = config(true);
+        cfg.enable_sframe = true;
+        cfg.audio = AudioConfig::encoded(AudioFormat::MLOW_16KHZ_60MS);
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        let success = allocate_success(&eng);
+        eng.handle_input(0, Input::RelayPacket(&success));
+        let _ = drain(&mut eng);
+
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let mut peer_tx = MediaPipeline::new(&MediaPipelineParams {
+            call_key: &call_key,
+            self_lid: PEER_LID,
+            peer_lid: SELF_LID,
+            ssrc: SSRC,
+            samples_per_packet: SAMPLES,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap();
+        let mut peer_sframe = SframeSession::new(&call_key, PEER_LID, SELF_LID).unwrap();
+
+        // One frame that authenticates: the proof the peer wraps, without which a failure is not
+        // attributable to authentication at all.
+        let wrapped = peer_sframe.encrypt(&[0x50, 1, 2, 3]);
+        let packet = peer_tx.protect_audio(&wrapped);
+        eng.handle_input(1, Input::RelayPacket(&packet));
+        let _ = drain(&mut eng);
+
+        // Then a run whose tags do not: same wrapping, one byte of ciphertext flipped. Sent as a
+        // real stream would be -- packets arriving THROUGH the health windows, since a window with
+        // no arrivals at all is a reception stall rather than a call that receives and stays silent.
+        let mut delivered = 0;
+        let mut reasons = Vec::new();
+        for n in 0..160u64 {
+            let mut wrapped = peer_sframe.encrypt(&[0x50, 4, 5, 6]);
+            wrapped[0] ^= 0xFF;
+            let packet = peer_tx.protect_audio(&wrapped);
+            let now = 100 + n * 60;
+            eng.handle_input(now, Input::RelayPacket(&packet));
+            eng.handle_input(now, Input::Timeout);
+            let (outputs, _) = drain(&mut eng);
+            for output in outputs {
+                match output {
+                    Output::EncodedAudio(_) => delivered += 1,
+                    Output::Event(CallEvent::AudioSilent {
+                        dominant_reason, ..
+                    }) => reasons.push(dominant_reason),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(delivered, 160, "the contract still hands the bytes over");
+        assert!(
+            eng.media_stats().sframe_decrypt_failed >= 160,
+            "and every one is counted as a tag that failed"
+        );
+        assert!(
+            reasons.contains(&AudioSilenceReason::AuthenticationFailing),
+            "the alarm has to name authentication, got {reasons:?}"
         );
     }
 
