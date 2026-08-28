@@ -915,6 +915,25 @@ impl CallRegistry {
             // `group_mut()`'s side effect: any update claims the call as group media, applied or not.
             entry.is_group_call = true;
             entry.group = Some(preview);
+            if applied == GroupStateApply::Applied {
+                // A long call outlives many participants, and every one that
+                // announced a rotation left an entry here. Retiring them with
+                // the roster keeps this bounded by who is actually on the call
+                // -- and keeps a replacement plane from being told the rotation
+                // of somebody who left. The engine retires its own map the same
+                // way.
+                let departed: Vec<Jid> = entry
+                    .peer_video_orientations
+                    .iter()
+                    .map(|(announcer, _)| announcer.clone())
+                    .filter(|announcer| {
+                        Self::canonical_group_participant_for_entry(entry, announcer).is_none()
+                    })
+                    .collect();
+                entry
+                    .peer_video_orientations
+                    .retain(|(announcer, _)| !departed.contains(announcer));
+            }
             let admitted = applied == GroupStateApply::Applied
                 && entry.is_call_link
                 && entry.session.phase() == CallPhase::WaitingRoom
@@ -5071,6 +5090,74 @@ mod tests {
                 participant: joiner.clone(),
                 orientation: 1,
             })
+        );
+    }
+
+    /// A call that runs long enough sees participants come and go, and a
+    /// rotation kept for somebody who left is both unbounded growth and a
+    /// rotation a replacement plane would be told about.
+    #[test]
+    fn a_departed_participants_rotation_retires_with_the_roster() {
+        let reg = CallRegistry::new();
+        let creator = Jid::new("111111111111111", Server::Lid);
+        let stayer = Jid::new("222222222222222", Server::Lid);
+        let leaver = Jid::new("333333333333333", Server::Lid);
+        let roster = |present: Vec<&Jid>, transaction| {
+            let mut update = group_update(transaction);
+            update.call_id = "GID".to_string();
+            update.participants = present
+                .into_iter()
+                .enumerate()
+                .map(|(index, jid)| GroupCallParticipant {
+                    jid: jid.clone(),
+                    pn: None,
+                    state: Some("connected".to_string()),
+                    participant_type: None,
+                    devices: vec![GroupCallDevice {
+                        jid: jid.clone().with_device(1),
+                        platform: None,
+                        pid: Some(index as u32 + 1),
+                        capability_version: None,
+                        capability: Vec::new(),
+                    }],
+                })
+                .collect();
+            update
+        };
+
+        let mut session =
+            CallSession::new_outgoing("GID", Jid::new("GID", Server::Call), creator.clone());
+        session.group = Some(roster(vec![&creator, &stayer, &leaver], 1));
+        let generation = reg.insert(session);
+        assert!(reg.set_peer_video_orientation(
+            "GID",
+            generation,
+            &stayer.clone().with_device(1),
+            1
+        ));
+        assert!(reg.set_peer_video_orientation(
+            "GID",
+            generation,
+            &leaver.clone().with_device(1),
+            2
+        ));
+
+        assert_eq!(
+            reg.apply_group_update(roster(vec![&creator, &stayer], 2)),
+            GroupStateApply::Applied
+        );
+
+        let (event_tx, _event_rx) = async_channel::bounded(1);
+        let (ctl_tx, ctl_rx) = video_control_channel();
+        reg.set_video_channels("GID", generation, event_tx, ctl_tx, Box::new(|| {}));
+        let replayed = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            replayed,
+            vec![VideoControl::SetParticipantOrientation {
+                participant: stayer.with_device(1),
+                orientation: 1,
+            }],
+            "only the participant still on the call is replayed"
         );
     }
 
