@@ -167,6 +167,14 @@ impl PendingWireGate {
         self.addresses.iter()
     }
 
+    /// Bytes the gate's table allocates. The addresses themselves are the
+    /// cache's own `Arc<str>` keys — the gate is always a subset of `dirty` +
+    /// `deleted`, which eviction cannot drop — so charging their payloads here
+    /// would count them twice.
+    fn table_bytes(&self) -> usize {
+        crate::stats::hash_table_bytes(self.addresses.capacity(), size_of::<Arc<str>>())
+    }
+
     /// `Release` so a reader whose `Acquire` load sees the lowered flag also
     /// sees the removals that emptied the set.
     fn publish(&self) {
@@ -314,16 +322,22 @@ impl<V> UserIndexedCache<V> {
         self.users.len()
     }
 
-    /// Retained bytes of the bookkeeping beside the primary map: the user
-    /// index, plus the removal window, whose keys outlive the entries they
-    /// name and so are owned solely here. Keeps `memory_stats` from reporting
-    /// only the map.
+    /// Retained bytes of everything this cache allocates except the entry
+    /// payloads: the primary map's buckets, the user index, the removal ring,
+    /// and the removal window's keys — which outlive the entries they name and
+    /// so are owned solely here.
+    ///
+    /// Slots, not entries: a `HashMap` holding n entries owns more buckets than
+    /// n (see [`crate::stats::hash_table_bytes`]), and it is the buckets the
+    /// allocator is holding. `memory_stats` adds the keys and payloads on top.
     fn overhead_bytes(&self) -> usize {
-        crate::stats::hash_table_bytes(self.users.capacity(), size_of::<u64>())
+        crate::stats::hash_table_bytes(self.map.capacity(), size_of::<(Arc<str>, V)>())
+            + crate::stats::hash_table_bytes(self.users.capacity(), size_of::<u64>())
+            + self.recent_removals.capacity() * size_of::<(u64, Arc<str>)>()
             + self
                 .recent_removals
                 .iter()
-                .map(|(_, key)| key.len() + size_of::<u64>())
+                .map(|(_, key)| key.len())
                 .sum::<usize>()
     }
 
@@ -1874,6 +1888,14 @@ impl SignalStoreCache {
     /// Session entry counts include negative (`Absent`) and checked-out slots
     /// — they occupy the map. Byte totals include the key length for every
     /// slot, but the estimated record payload only for `Present` entries.
+    ///
+    /// Structural allocations are charged too, through
+    /// [`crate::stats::hash_table_bytes`]: each cache's own tables (see
+    /// `UserIndexedCache::overhead_bytes`) plus the dirty/deleted sets and the
+    /// pre-wire gates beside it. Those sets are charged for their slots only —
+    /// their addresses are the cache's `Arc<str>` keys, which eviction cannot
+    /// drop while an address is dirty, deleted or pending, so charging the
+    /// payloads again would double-count them.
     pub async fn memory_stats(
         &self,
     ) -> (
@@ -1902,7 +1924,10 @@ impl SignalStoreCache {
                     }
                 })
                 .collect();
-            keys_len += s.cache.overhead_bytes();
+            keys_len += s.cache.overhead_bytes()
+                + crate::stats::hash_table_bytes(s.dirty.capacity(), size_of::<Arc<str>>())
+                + crate::stats::hash_table_bytes(s.deleted.capacity(), size_of::<Arc<str>>())
+                + s.reservation_pending.table_bytes();
             (s.cache.len() as u64, keys_len, recs)
         };
         let session_bytes: usize = session_keys_len
@@ -1919,7 +1944,9 @@ impl SignalStoreCache {
                 .iter()
                 .map(|(k, v)| k.len() + v.as_ref().map_or(0, |b| b.len()))
                 .sum::<usize>()
-                + i.cache.overhead_bytes();
+                + i.cache.overhead_bytes()
+                + crate::stats::hash_table_bytes(i.dirty.capacity(), size_of::<Arc<str>>())
+                + crate::stats::hash_table_bytes(i.deleted.capacity(), size_of::<Arc<str>>());
             CollectionStats::new(i.cache.len() as u64, bytes as u64)
         };
 
@@ -1946,7 +1973,14 @@ impl SignalStoreCache {
                 .fold((0usize, 0usize), |(count, bytes), key| {
                     (count + 1, bytes + key.len())
                 });
-            keys_len += pending_only_key_bytes + sk.cache.overhead_bytes();
+            keys_len += pending_only_key_bytes
+                + sk.cache.overhead_bytes()
+                + crate::stats::hash_table_bytes(sk.dirty.capacity(), size_of::<Arc<str>>())
+                + sk.wire_gate_pending.table_bytes()
+                + crate::stats::hash_table_bytes(
+                    sk.pending_distributions.capacity(),
+                    size_of::<(Arc<str>, Arc<[u8]>)>(),
+                );
             (
                 (sk.cache.len() + pending_only_count) as u64,
                 keys_len,
@@ -2268,6 +2302,36 @@ mod sender_key_lock_tests {
             .sender_key_state()
             .expect("record must carry a state")
             .chain_id()
+    }
+
+    /// The report has to charge what the allocator is holding, not what the
+    /// entries measure: a `HashMap` of n identities owns more buckets than n,
+    /// and the dirty set, the user index and the pre-wire gate beside it are
+    /// allocations too. Before these were counted the identity store reported
+    /// only its keys and payloads — which is exactly the figure that stays
+    /// quiet while the tables are what is growing.
+    #[tokio::test]
+    async fn identity_report_charges_the_tables_not_just_the_entries() {
+        const IDENTITIES: usize = 200;
+
+        let cache = SignalStoreCache::new();
+        let mut entry_bytes = 0usize;
+        for i in 0..IDENTITIES {
+            let address = format!("1999555{i:04}:0");
+            entry_bytes += address.len() + 32;
+            cache
+                .put_identity(&ProtocolAddress::new(&address, 0.into()), &[7u8; 32])
+                .await;
+        }
+
+        let (_, identities, _) = cache.memory_stats().await;
+        assert_eq!(identities.entries, IDENTITIES as u64);
+        assert!(
+            identities.bytes > entry_bytes as u64,
+            "the report must exceed the {entry_bytes} B of keys and payloads it holds, \
+             got {}",
+            identities.bytes
+        );
     }
 
     #[tokio::test]
