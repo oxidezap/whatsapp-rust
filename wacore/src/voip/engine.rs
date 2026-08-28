@@ -1615,6 +1615,14 @@ impl CallEngine {
             Some(mut v) => {
                 v.send_gated = send_gated;
                 m.video = Some(v);
+                // A fresh plane is born requiring an IDR, so an ungated one is
+                // dropping frames from its first moment. Same reason as the
+                // resume above -- except a gated plane has nowhere to send one
+                // yet, and its ungate asks then.
+                if !send_gated {
+                    self.outbox
+                        .push_back(Output::Event(CallEvent::VideoKeyframeNeeded));
+                }
                 true
             }
             None => false,
@@ -6456,6 +6464,42 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
             "a fresh requirement is a fresh request"
+        );
+    }
+
+    /// A video-from-start call brings the plane up ungated and immediately
+    /// drops every access unit until an IDR arrives. Nothing else asks for one
+    /// on that path -- the resume arm only fires for a plane that already
+    /// exists -- so the caller's picture would appear a keyframe period late.
+    #[test]
+    fn a_video_plane_that_starts_ungated_asks_for_its_first_keyframe() {
+        let mut eng = engine(true);
+        assert!(eng.enable_video());
+        assert!(
+            drain(&mut eng)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "a plane born requiring an IDR must say so"
+        );
+
+        // A gated plane has nowhere to put one, so it stays quiet until the
+        // ungate, which asks on its own.
+        let mut gated = engine(true);
+        assert!(gated.enable_video_gated());
+        assert!(
+            !drain(&mut gated)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded))),
+            "an upgrade initiator cannot send video yet, so it must not ask"
+        );
+        assert!(gated.enable_video());
+        assert!(
+            drain(&mut gated)
+                .0
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::VideoKeyframeNeeded)))
         );
     }
 
