@@ -454,6 +454,15 @@ pub struct EncryptFanoutSummary {
     pub includes_prekey_message: bool,
     /// True if any device returned 406 (unregistered) during prekey fetch.
     pub had_unregistered_device: bool,
+    /// How many of the fan-out's devices produced a `<to><enc>` node. Compared
+    /// against the device count the caller passed in, this is the only thing
+    /// that separates a complete fan-out from one that dropped devices and
+    /// still built a stanza.
+    pub encrypted_devices: usize,
+    /// A device 0 was addressed and produced nothing. For a DM this is the
+    /// recipient's own phone, so the stanza reaches the server, gets acked, and
+    /// arrives nowhere the recipient can read it.
+    pub skipped_primary: bool,
     /// First failure of the fan-out (session, prekey fetch or spawn), or `None`
     /// when every device produced a node. Already collected for the group
     /// path's detailed attempt, so a caller that turns "nothing encrypted"
@@ -465,11 +474,12 @@ pub struct EncryptFanoutSummary {
 /// belong in.
 ///
 /// [`EncryptResult`] is shaped for the group path, which needs the encrypted
-/// device list to tell a partial SKDM distribution from a complete one. A DM
-/// never asks that question and knows up front how many participants it can
-/// have, so it sizes one vector and lets each fan-out append into it: the
-/// per-fan-out node vector and the device list it would otherwise carry are
-/// both work done only to be moved and dropped.
+/// device list by name to pick the users whose device list to refresh. A DM
+/// only needs to know how many of its devices made it and whether the primary
+/// was one of them, which [`EncryptFanoutSummary`] answers without a list, so
+/// it sizes one vector and lets each fan-out append into it: the per-fan-out
+/// node vector and the device list it would otherwise carry are both work done
+/// only to be moved and dropped.
 #[allow(clippy::too_many_arguments)]
 pub async fn encrypt_for_devices_into(
     runtime: &dyn Runtime,
@@ -495,6 +505,13 @@ pub async fn encrypt_for_devices_into(
     .await?;
     report_encrypt_drops(resolver, raw.unkeyed_at_encrypt);
 
+    let encrypted_devices = raw.devices.len();
+    // Gated on the counts disagreeing so the send that keyed everyone -- every
+    // send, until one does not -- pays a single comparison and neither scan.
+    let skipped_primary = encrypted_devices < devices.len()
+        && !raw.devices.iter().any(|one| one.device_jid.device == 0)
+        && devices.iter().any(|jid| jid.device == 0);
+
     participant_nodes.reserve(raw.devices.len());
     for one in raw.devices {
         participant_nodes.push(encrypted_device_to_participant_node(
@@ -507,6 +524,8 @@ pub async fn encrypt_for_devices_into(
     Ok(EncryptFanoutSummary {
         includes_prekey_message: raw.includes_prekey_message,
         had_unregistered_device: raw.had_unregistered_device,
+        encrypted_devices,
+        skipped_primary,
         first_error,
     })
 }

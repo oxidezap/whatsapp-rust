@@ -2741,7 +2741,8 @@ impl Client {
                             ..Default::default()
                         },
                     )
-                    .await
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
                 }
                 .await;
                 (device, result)

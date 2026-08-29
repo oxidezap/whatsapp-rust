@@ -359,7 +359,8 @@ impl Client {
                 ..Default::default()
             },
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.recv.skdm", level = "debug", skip_all, fields(group = %group_jid.observe(), sender = %sender_jid.observe())))]

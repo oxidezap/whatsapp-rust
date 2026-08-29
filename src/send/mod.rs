@@ -10,7 +10,7 @@ use crate::types::message::EditAttribute;
 use anyhow::anyhow;
 use log::debug;
 use wacore::libsignal::protocol::SignalProtocolError;
-use wacore::send::StanzaType;
+use wacore::send::{RecipientFanout, StanzaType};
 use wacore::types::jid::JidExt;
 use wacore::types::message::AddressingMode;
 #[cfg(test)]
@@ -220,6 +220,8 @@ struct SendBranchOutput {
     /// its own on the ack and a disagreement is the only signal a send gets
     /// that its participant device set is stale.
     ack_phash: Option<wacore_binary::CompactString>,
+    /// DM branch only: what the recipient half of the fan-out reached.
+    recipient_fanout: Option<RecipientFanout>,
 }
 
 struct GroupBranchRequest<'a> {
@@ -318,6 +320,7 @@ impl SendBranchOutput {
             distribution_guard: None,
             issue_tc_token_after_send: false,
             ack_phash: None,
+            recipient_fanout: None,
         }
     }
 }
@@ -482,6 +485,17 @@ pub(crate) struct SendPipelineOptions<'a> {
 pub struct SendResult {
     pub message_id: String,
     pub to: Jid,
+    /// For a DM, what the recipient half of the fan-out actually encrypted for.
+    /// `None` for every other send shape: a group, a status, a peer sync and a
+    /// newsletter plaintext each answer a different question about who was
+    /// reached, and answering it with a DM's numbers would be a lie the caller
+    /// cannot see through.
+    ///
+    /// A send that dropped devices still returns `Ok`, matching what WA Web
+    /// itself sends, so a caller that treats delivery as more than "the server
+    /// took it" reads [`RecipientFanout::is_partial`] and
+    /// [`RecipientFanout::skipped_primary`] here and decides its own policy.
+    pub recipient_fanout: Option<RecipientFanout>,
 }
 
 impl SendResult {
@@ -1086,6 +1100,7 @@ impl Client {
             return Ok(SendResult {
                 message_id: request_id,
                 to: result_to,
+                recipient_fanout: None,
             });
         }
 
@@ -1098,25 +1113,27 @@ impl Client {
         // frame (prologue + epilogue) embeds here without a second box; the
         // shim's Box::pin above still keeps `send_message`'s future
         // pointer-sized for callers embedding it in their own futures.
-        self.send_message_impl(
-            to,
-            &message,
-            SendPipelineOptions {
-                sent_at: Some(sent_at),
-                request_id: Some(&request_id),
-                edit,
-                extra_stanza_nodes: extra_nodes,
-                stanza_type: stanza_type_override,
-                group_metadata_freshness,
-                device_freshness,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(SendError::from_anyhow)?;
+        let recipient_fanout = self
+            .send_message_impl(
+                to,
+                &message,
+                SendPipelineOptions {
+                    sent_at: Some(sent_at),
+                    request_id: Some(&request_id),
+                    edit,
+                    extra_stanza_nodes: extra_nodes,
+                    stanza_type: stanza_type_override,
+                    group_metadata_freshness,
+                    device_freshness,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(SendError::from_anyhow)?;
         Ok(SendResult {
             message_id: request_id,
             to: result_to,
+            recipient_fanout,
         })
     }
 
@@ -1392,6 +1409,7 @@ impl Client {
         Ok(SendResult {
             message_id: request_id,
             to,
+            recipient_fanout: None,
         })
     }
 
@@ -1817,7 +1835,7 @@ impl Client {
         to: Jid,
         message: &wa::Message,
         options: SendPipelineOptions<'_>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<Option<RecipientFanout>, anyhow::Error> {
         let SendPipelineOptions {
             sent_at,
             request_id: request_id_override,
@@ -1899,6 +1917,7 @@ impl Client {
             distribution_guard,
             issue_tc_token_after_send: should_issue_tc_token_after_send,
             ack_phash,
+            recipient_fanout,
         } = if peer && !to.is_group() {
             box_send_branch(self.send_peer_branch(to, message, request_id)).await?
         } else if to.is_group() {
@@ -2031,7 +2050,7 @@ impl Client {
             }
         }
 
-        Ok(())
+        Ok(recipient_fanout)
     }
 
     /// Peer branch of [`Self::send_message_impl`]: own-device sync messages,
@@ -2450,6 +2469,7 @@ impl Client {
             distribution_guard,
             issue_tc_token_after_send: false,
             ack_phash: group_ack_phash,
+            recipient_fanout: None,
         })
     }
 
@@ -2606,6 +2626,7 @@ impl Client {
             distribution_guard: None,
             issue_tc_token_after_send: should_issue_tc_token_after_send,
             ack_phash: prepared.phash,
+            recipient_fanout: Some(prepared.recipient_fanout),
         })
     }
 
@@ -7154,6 +7175,7 @@ mod tests {
         // through to send_message_impl which calls persist_outbound_msg_secret.
         let prepared = wacore::send::PreparedDmStanza {
             node: NodeBuilder::new("message").build(),
+            recipient_fanout: Default::default(),
             phash: None,
             message_secret: Some(result.message_secret),
         };
@@ -7206,6 +7228,38 @@ mod tests {
             secret.is_some(),
             "the outbound messageSecret must be bound to the same id"
         );
+    }
+
+    /// A DM's `SendResult` carries the recipient fan-out; every other send
+    /// shape leaves it `None` rather than reporting a DM's numbers for a
+    /// question it did not ask. The count itself is covered in wacore, against
+    /// the real fan-out; what this pins is that it survives the trip out
+    /// through `send_message_impl` instead of being dropped at the boundary.
+    #[tokio::test]
+    async fn a_dm_result_carries_its_recipient_fanout() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+
+        let result = client
+            .send_message(
+                peer_pn.clone(),
+                wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("connected test client should complete the send");
+
+        let fanout = result
+            .recipient_fanout
+            .expect("a DM must report what its recipient half reached");
+        assert_eq!(
+            fanout.encrypted, fanout.addressed,
+            "this fixture keys every device, so nothing was lost"
+        );
+        assert!(!fanout.is_partial());
+        assert!(!fanout.skipped_primary);
     }
 
     /// The waiter is installed before the stanza reaches the socket (a fast ack

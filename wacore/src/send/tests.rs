@@ -5803,6 +5803,134 @@ mod local_identity_change_on_send {
                 vec![reachable.to_string(), own_companion.to_string()],
                 "the stanza carries what encrypted, recipients first"
             );
+            let fanout = prepared.recipient_fanout;
+            assert_eq!(
+                (fanout.addressed, fanout.encrypted),
+                (2, 1),
+                "the caller must be able to see one recipient device was dropped"
+            );
+            assert!(fanout.is_partial());
+            assert!(
+                !fanout.skipped_primary,
+                "the device that dropped was a companion, not the phone"
+            );
+        }
+
+        /// Regression (issue #1361): the recipient's phone drops out of the
+        /// fan-out and a companion does not, so the stanza is built, acked and
+        /// returned as `Ok`. Nothing the recipient can read was sent (the
+        /// chat lives on the phone) and before this the return value was
+        /// identical to a send that reached every device.
+        #[tokio::test]
+        async fn a_dm_that_lost_the_recipients_phone_says_so() {
+            let own_jid: Jid = "5511900000050:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000050:1@s.whatsapp.net".parse().unwrap();
+            let recipient_primary: Jid = "5511900000051:0@s.whatsapp.net".parse().unwrap();
+            let recipient_companion: Jid = "5511900000051:2@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &recipient_primary.to_non_ad(),
+                &devices,
+                &[recipient_companion.clone(), own_companion.clone()],
+                std::slice::from_ref(&recipient_primary),
+                "DM_SINK_10",
+            )
+            .await
+            .expect("a companion still encrypted, so the stanza is built");
+
+            let fanout = prepared.recipient_fanout;
+            assert_eq!((fanout.addressed, fanout.encrypted), (2, 1));
+            assert!(
+                fanout.skipped_primary,
+                "the one device whose absence means undelivered must be named"
+            );
+            assert!(fanout.is_partial());
+        }
+
+        /// The happy path answers the same question, and answers it "nobody was
+        /// lost": a caller reading `is_partial` must not have to special-case
+        /// a complete send.
+        #[tokio::test]
+        async fn a_dm_that_reached_every_device_reports_no_loss() {
+            let own_jid: Jid = "5511900000060:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000060:1@s.whatsapp.net".parse().unwrap();
+            let recipient_primary: Jid = "5511900000061:0@s.whatsapp.net".parse().unwrap();
+            let recipient_companion: Jid = "5511900000061:2@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &recipient_primary.to_non_ad(),
+                &devices,
+                &[
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                ],
+                &[],
+                "DM_SINK_11",
+            )
+            .await
+            .expect("every device has a session");
+
+            let fanout = prepared.recipient_fanout;
+            assert_eq!((fanout.addressed, fanout.encrypted), (2, 2));
+            assert!(!fanout.is_partial());
+            assert!(!fanout.skipped_primary);
+            assert!(!fanout.had_unregistered_device);
+        }
+
+        /// A note to self has no recipient half, so the fan-out it reports is
+        /// the empty one. `is_partial` must read false there: nothing was
+        /// addressed, so nothing was lost.
+        #[tokio::test]
+        async fn a_self_chat_reports_an_empty_recipient_fanout() {
+            let own_jid: Jid = "5511900000070:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000070:1@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![own_companion.clone(), own_jid.clone()],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &own_jid.to_non_ad(),
+                &devices,
+                std::slice::from_ref(&own_companion),
+                &[],
+                "DM_SINK_12",
+            )
+            .await
+            .expect("a note to self is its own-devices copy");
+
+            let fanout = prepared.recipient_fanout;
+            assert_eq!((fanout.addressed, fanout.encrypted), (0, 0));
+            assert!(!fanout.is_partial());
+            assert!(!fanout.skipped_primary);
         }
 
         /// A note to self has no recipient half at all: every resolved device is
