@@ -1680,11 +1680,13 @@ impl Client {
             .is_some()
             .then(|| node.get_attr("id").map(|id| id.as_str().to_string()))
             .flatten();
+        let unreached = waiter.dm_unreached;
         self.runtime.spawn_detached(Box::pin(async move {
             let resend = match (message_id.as_deref(), waiter.dm_devices) {
-                (Some(message_id), Some(covered)) => Some(crate::send::DmDeltaResend {
+                (Some(message_id), Some(addressed)) => Some(crate::send::DmDeltaResend {
                     message_id,
-                    covered,
+                    addressed,
+                    unreached,
                 }),
                 _ => None,
             };

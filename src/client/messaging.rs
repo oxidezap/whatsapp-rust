@@ -396,6 +396,7 @@ impl Client {
         jid: Jid,
         invalidate_group_cache: bool,
         dm_devices: Option<Arc<wacore::send::ResolvedDmDevices>>,
+        dm_unreached: Vec<Jid>,
     ) {
         let mut waiters = self.response_waiters_guard();
         // Stamped with the sweep epoch under the lock the insert already holds:
@@ -409,6 +410,7 @@ impl Client {
                 jid,
                 invalidate_group_cache,
                 dm_devices,
+                dm_unreached,
                 registered_epoch,
             }),
         );

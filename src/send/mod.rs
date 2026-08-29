@@ -237,6 +237,8 @@ struct SendBranchOutput {
     /// DM branch only: the device set the stanza covered, shared with the memo
     /// entry it came from. Handed to the phash waiter as its exclude list.
     dm_devices: Option<std::sync::Arc<wacore::send::ResolvedDmDevices>>,
+    /// Of those, the ones that produced no `<enc>`. Empty on a complete fan-out.
+    dm_unreached: Vec<Jid>,
 }
 
 struct GroupBranchRequest<'a> {
@@ -337,6 +339,7 @@ impl SendBranchOutput {
             ack_phash: None,
             recipient_fanout: None,
             dm_devices: None,
+            dm_unreached: Vec::new(),
         }
     }
 }
@@ -500,12 +503,12 @@ pub(crate) struct SendPipelineOptions<'a> {
 /// The other direction is deliberately not reported: a device the send covered
 /// and the refresh dropped has already received its copy, and the refresh is
 /// the whole repair it needs.
-fn devices_missed_by_send(covered: &[Jid], fresh: &[Jid]) -> Vec<Jid> {
-    // Linear scan rather than a set: both sides are one user's devices plus our
+fn devices_missed_by_send(addressed: &[Jid], unreached: &[Jid], fresh: &[Jid]) -> Vec<Jid> {
+    // Linear scans rather than sets: both sides are one user's devices plus our
     // own, which is single digits, and this runs only on a mismatch.
     fresh
         .iter()
-        .filter(|device| !covered.contains(device))
+        .filter(|device| !addressed.contains(device) || unreached.contains(device))
         .cloned()
         .collect()
 }
@@ -514,7 +517,9 @@ fn devices_missed_by_send(covered: &[Jid], fresh: &[Jid]) -> Vec<Jid> {
 /// stanza missed: the id to resend under, and the set it already covered.
 pub(crate) struct DmDeltaResend<'a> {
     pub(crate) message_id: &'a str,
-    pub(crate) covered: std::sync::Arc<wacore::send::ResolvedDmDevices>,
+    pub(crate) addressed: std::sync::Arc<wacore::send::ResolvedDmDevices>,
+    /// The subset of `addressed` that produced no `<enc>`, so holds no copy.
+    pub(crate) unreached: Vec<Jid>,
 }
 
 /// Result of a successfully sent message.
@@ -1427,7 +1432,7 @@ impl Client {
             .optional_string("phash")
             .map(|s| wacore_binary::CompactString::from(s.as_ref()));
         if let Some(phash) = ack.clone() {
-            self.register_phash_waiter(&request_id, phash, to.clone(), true, None);
+            self.register_phash_waiter(&request_id, phash, to.clone(), true, None, Vec::new());
         }
 
         if let Err(e) = self.send_node(stanza).await {
@@ -1878,10 +1883,11 @@ impl Client {
     ) {
         let DmDeltaResend {
             message_id,
-            covered,
+            addressed,
+            unreached,
         } = resend;
         let device_snapshot = self.persistence_manager.get_device_snapshot();
-        let Some(own_jid) = device_snapshot.pn.clone() else {
+        let Some(own_jid) = device_snapshot.pn.as_ref() else {
             return;
         };
         let recipient_bare = self.resolve_dm_wire_jid(chat).await;
@@ -1889,7 +1895,7 @@ impl Client {
             .resolve_dm_devices_memoized(
                 chat,
                 &recipient_bare,
-                &own_jid,
+                own_jid,
                 device_snapshot.lid.as_ref(),
                 crate::cache::Freshness::Refresh,
             )
@@ -1905,7 +1911,7 @@ impl Client {
             }
         };
 
-        let uncovered = devices_missed_by_send(covered.devices(), fresh.devices());
+        let uncovered = devices_missed_by_send(addressed.devices(), &unreached, fresh.devices());
         if uncovered.is_empty() {
             // The set disagreed with the server's without gaining a device:
             // the divergence was a device we sent to and the server no longer
@@ -1922,20 +1928,31 @@ impl Client {
             chat.observe(),
             uncovered.len()
         );
+        // Read once, after the refresh: repairing the device list is worth
+        // doing even when the plaintext has aged out of the retry cache.
+        let Some(bytes) = self.recent_message_bytes(chat, message_id).await else {
+            log::debug!(
+                "phash mismatch for {}: message {message_id} is no longer held; \
+                 the device list is refreshed, so the next send reaches everyone",
+                chat.observe()
+            );
+            return;
+        };
+
         for device in uncovered {
-            // Decoded per device rather than cloned once and copied: a
-            // `wa::Message` clone is its own ~66 KiB of instantiated code, and
-            // this path runs only on a mismatch, so the decode the retry cache
-            // already does is the cheaper of the two to pay for. Read inside
-            // the loop for the same reason, which also keeps the device-list
-            // refresh above worth doing when the plaintext has aged out.
-            let Some((owned, _)) = self.peek_recent_message(chat, message_id).await else {
-                log::debug!(
-                    "phash mismatch for {}: message {message_id} is no longer cached; \
-                     the device list is refreshed, so the next send reaches everyone",
-                    chat.observe()
-                );
-                return;
+            // Decoded per device rather than cloned: a `wa::Message` clone is
+            // its own ~66 KiB of instantiated code, while the decode is code
+            // the retry cache already instantiates, and this runs only on a
+            // mismatch.
+            let owned = match waproto::codec::message_decode(bytes.as_slice()) {
+                Ok(message) => message,
+                Err(e) => {
+                    log::warn!(
+                        "phash mismatch for {}: cached {message_id} does not decode: {e}",
+                        chat.observe()
+                    );
+                    return;
+                }
             };
             // Our own companion needs the chat named as the recipient, or the
             // copy it receives has no destination to file itself under; a peer
@@ -1964,7 +1981,7 @@ impl Client {
                     retry_count: 1,
                     recipient: is_own.then(|| chat.clone()),
                     group_info: None,
-                    pre_encoded: None,
+                    pre_encoded: Some(std::sync::Arc::clone(&bytes)),
                 })
                 .await;
             if let Err(e) = outcome {
@@ -2081,6 +2098,7 @@ impl Client {
             ack_phash,
             recipient_fanout,
             dm_devices: covered_dm_devices,
+            dm_unreached,
         } = if peer && !to.is_group() {
             box_send_branch(self.send_peer_branch(to, message, request_id)).await?
         } else if to.is_group() {
@@ -2144,6 +2162,7 @@ impl Client {
                 tc_issue_target.clone(),
                 invalidate_group,
                 covered_dm_devices,
+                dm_unreached,
             );
             Some(request_id)
         } else {
@@ -2635,6 +2654,7 @@ impl Client {
             ack_phash: group_ack_phash,
             recipient_fanout: None,
             dm_devices: None,
+            dm_unreached: Vec::new(),
         })
     }
 
@@ -2799,6 +2819,11 @@ impl Client {
             // status message rather than to the device it names.
             recipient_fanout: (!is_status_addon).then_some(prepared.recipient_fanout),
             dm_devices: (!is_status_addon).then_some(dm_devices),
+            dm_unreached: if is_status_addon {
+                Vec::new()
+            } else {
+                prepared.unreached_devices
+            },
         })
     }
 
@@ -7563,7 +7588,7 @@ mod tests {
     }
 
     /// The exclude list: only what the refresh added is resent. A device the
-    /// send covered has its copy, and one the refresh dropped is not worth a
+    /// send reached has its copy, and one the refresh dropped is not worth a
     /// second attempt, so neither belongs in the delta.
     #[test]
     fn only_the_devices_a_refresh_adds_are_resent() {
@@ -7572,7 +7597,7 @@ mod tests {
         let peer_gone: Jid = "5511900000090:9@s.whatsapp.net".parse().unwrap();
         let own_companion: Jid = "5511900000091:2@s.whatsapp.net".parse().unwrap();
 
-        let covered = [peer_primary.clone(), peer_gone.clone()];
+        let addressed = [peer_primary.clone(), peer_gone.clone()];
         let fresh = [
             peer_primary.clone(),
             peer_new.clone(),
@@ -7580,17 +7605,40 @@ mod tests {
         ];
 
         assert_eq!(
-            devices_missed_by_send(&covered, &fresh),
+            devices_missed_by_send(&addressed, &[], &fresh),
             vec![peer_new, own_companion],
-            "a device the send covered stays out, and one it lost is not chased"
+            "a device the send reached stays out, and one it lost is not chased"
         );
         assert!(
-            devices_missed_by_send(&covered, &covered).is_empty(),
+            devices_missed_by_send(&addressed, &[], &addressed).is_empty(),
             "an unchanged list resends nothing"
         );
         assert!(
-            devices_missed_by_send(&fresh, &[]).is_empty(),
+            devices_missed_by_send(&fresh, &[], &[]).is_empty(),
             "a refresh that found nothing resends nothing"
+        );
+    }
+
+    /// Addressed is not reached. A device the fan-out named but could not
+    /// encrypt for holds no copy of the message, so excluding it from the
+    /// delta would leave it with nothing on exactly the send this PR exists
+    /// to make visible.
+    #[test]
+    fn a_device_the_fanout_could_not_encrypt_for_is_still_resent() {
+        let peer_primary: Jid = "5511900000092:0@s.whatsapp.net".parse().unwrap();
+        let peer_companion: Jid = "5511900000092:5@s.whatsapp.net".parse().unwrap();
+
+        let addressed = [peer_primary.clone(), peer_companion.clone()];
+        let unreached = [peer_primary.clone()];
+
+        assert_eq!(
+            devices_missed_by_send(&addressed, &unreached, &addressed),
+            vec![peer_primary],
+            "the device that never got ciphertext is the one to resend to"
+        );
+        assert!(
+            devices_missed_by_send(&addressed, &[], &addressed).is_empty(),
+            "and it is excluded again once it has encrypted"
         );
     }
 

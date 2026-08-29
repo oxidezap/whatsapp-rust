@@ -467,6 +467,12 @@ pub struct EncryptFanoutSummary {
     /// recipient's own phone, so the stanza reaches the server, gets acked, and
     /// arrives nowhere the recipient can read it.
     pub skipped_primary: bool,
+    /// The devices that were addressed and produced no node, by name. Empty
+    /// whenever the fan-out was complete, which is every send until one is
+    /// not, so the common path allocates nothing. Named rather than counted
+    /// because a repair has to tell a device that holds the message from one
+    /// that was only addressed.
+    pub dropped_devices: Vec<Jid>,
     /// First failure of the fan-out (session, prekey fetch or spawn), or `None`
     /// when every device produced a node. Already collected for the group
     /// path's detailed attempt, so a caller that turns "nothing encrypted"
@@ -511,10 +517,17 @@ pub async fn encrypt_for_devices_into(
 
     let encrypted_devices = raw.devices.len();
     // Gated on the counts disagreeing so the send that keyed everyone -- every
-    // send, until one does not -- pays a single comparison and neither scan.
-    let skipped_primary = encrypted_devices < devices.len()
-        && !raw.devices.iter().any(|one| one.device_jid.device == 0)
-        && devices.iter().any(|jid| jid.device == 0);
+    // send, until one does not -- pays a single comparison, no scan and no
+    // allocation.
+    let mut dropped_devices = Vec::new();
+    if encrypted_devices < devices.len() {
+        dropped_devices = devices
+            .iter()
+            .filter(|jid| !raw.devices.iter().any(|one| one.device_jid == **jid))
+            .cloned()
+            .collect();
+    }
+    let skipped_primary = dropped_devices.iter().any(|jid| jid.device == 0);
 
     participant_nodes.reserve(raw.devices.len());
     for one in raw.devices {
@@ -530,6 +543,7 @@ pub async fn encrypt_for_devices_into(
         had_unregistered_device: raw.had_unregistered_device,
         encrypted_devices,
         skipped_primary,
+        dropped_devices,
         first_error,
     })
 }

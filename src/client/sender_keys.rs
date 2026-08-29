@@ -386,6 +386,30 @@ impl Client {
         }
     }
 
+    /// The canonical bytes of a sent message still held for retry, or `None`
+    /// when neither the cache nor the DB has it any more.
+    ///
+    /// `peek_recent_message` misses in DB-only mode (`recent_messages` capacity
+    /// 0), where the row exists and no L1 entry does, so this takes and re-adds
+    /// the way the retry path does rather than reporting the message gone on
+    /// every default cache config. Returns bytes because its callers want a
+    /// fresh `wa::Message` per device: decoding N times is cheaper in
+    /// instantiated code than one `Message::clone`, which is ~66 KiB of it.
+    pub(crate) async fn recent_message_bytes(
+        &self,
+        to: &Jid,
+        id: &str,
+    ) -> Option<std::sync::Arc<Vec<u8>>> {
+        if let Some((msg, _)) = self.peek_recent_message(to, id).await {
+            return Some(std::sync::Arc::new(waproto::codec::message_to_vec(&msg)));
+        }
+        let (msg, _) = self.take_recent_message(to, id).await?;
+        let bytes = std::sync::Arc::new(waproto::codec::message_to_vec(&msg));
+        self.add_recent_message(to, id, &msg, Some(std::sync::Arc::clone(&bytes)))
+            .await;
+        Some(bytes)
+    }
+
     /// Store a sent message for retry handling. Always writes to DB; when L1 cache
     /// is enabled (capacity > 0) also stores in-memory for fast retrieval.
     /// In DB-only mode (capacity = 0), the DB write is awaited to guarantee persistence.
