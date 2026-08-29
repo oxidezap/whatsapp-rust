@@ -176,6 +176,11 @@ pub struct PreparedDmStanza {
     pub node: Node,
     /// What the recipient half of the fan-out reached. See [`RecipientFanout`].
     pub recipient_fanout: RecipientFanout,
+    /// Every device, either half, that was addressed and produced no `<enc>`.
+    /// Empty on a complete fan-out. These hold no copy of the message, so a
+    /// repair driven by a later device-list disagreement has to treat them as
+    /// unreached even though the send named them.
+    pub unreached_devices: Vec<Jid>,
     /// Locally computed phash from the sent device set. Not sent on the
     /// wire (WA Web only sends phash for groups). Used by the caller to
     /// compare against the server's ACK phash for device-list drift detection.
@@ -295,6 +300,7 @@ pub async fn prepare_dm_stanza(
     let mut participant_nodes = Vec::with_capacity(total_devices);
     let mut includes_prekey_message = false;
     let mut recipient_fanout = RecipientFanout::default();
+    let mut unreached_devices: Vec<Jid> = Vec::new();
 
     let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit, message);
 
@@ -327,6 +333,7 @@ pub async fn prepare_dm_stanza(
             skipped_primary: summary.skipped_primary,
             had_unregistered_device: summary.had_unregistered_device,
         };
+        unreached_devices = summary.dropped_devices;
         // The recipient half wrote into an empty buffer, so an emptiness test
         // here is a recipient-node count without walking anything. Bailing
         // before the own half also keeps a companion's sender chain from
@@ -358,6 +365,7 @@ pub async fn prepare_dm_stanza(
         )
         .await?;
         includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
+        unreached_devices.extend(summary.dropped_devices);
     }
 
     // Only reachable for a self-chat now (the recipient half returns above):
@@ -420,6 +428,7 @@ pub async fn prepare_dm_stanza(
     Ok(PreparedDmStanza {
         node: stanza,
         recipient_fanout,
+        unreached_devices,
         phash,
         message_secret: reporting_result.map(|r| r.message_secret),
     })

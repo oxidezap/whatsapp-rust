@@ -5272,6 +5272,7 @@ fn phash_waiter_sweep_drops_only_entries_that_lived_through_a_sweep() {
             jid: "13135550100@s.whatsapp.net".parse().expect("valid jid"),
             invalidate_group_cache: false,
             dm_devices: None,
+            dm_unreached: Vec::new(),
             registered_epoch,
         })
     };

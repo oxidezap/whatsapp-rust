@@ -1074,6 +1074,11 @@ pub(crate) struct PhashWaiter {
     /// devices a refreshed list holds and this one does not, which is what the
     /// `excludeList` in WA Web's `resendUserMsg` job amounts to.
     pub(crate) dm_devices: Option<Arc<wacore::send::ResolvedDmDevices>>,
+    /// Of those, the ones that produced no `<enc>`. Empty on a complete
+    /// fan-out, so the common send stores nothing: a device the stanza named
+    /// but could not encrypt for holds no copy, and the repair has to resend
+    /// to it rather than count it as already covered.
+    pub(crate) dm_unreached: Vec<Jid>,
     /// Sweep epoch this waiter was registered in. Expiry is counted in sweeps
     /// rather than seconds: a wall deadline is subject to clock jumps (see
     /// wacore::time) and would have to be derived from an instant sampled well

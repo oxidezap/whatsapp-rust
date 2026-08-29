@@ -5857,6 +5857,11 @@ mod local_identity_change_on_send {
                 "the one device whose absence means undelivered must be named"
             );
             assert!(fanout.is_partial());
+            assert_eq!(
+                prepared.unreached_devices,
+                vec![recipient_primary],
+                "a repair has to know which device holds no copy, not just how many"
+            );
         }
 
         /// The happy path answers the same question, and answers it "nobody was
@@ -5900,6 +5905,10 @@ mod local_identity_change_on_send {
             assert!(!fanout.is_partial());
             assert!(!fanout.skipped_primary);
             assert!(!fanout.had_unregistered_device);
+            assert!(
+                prepared.unreached_devices.is_empty(),
+                "a complete fan-out names nobody, and allocates for nobody"
+            );
         }
 
         /// A note to self has no recipient half, so the fan-out it reports is
