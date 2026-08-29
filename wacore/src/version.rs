@@ -37,8 +37,14 @@ fn direct_member_value<'a>(object: &'a str, key: &str) -> Option<&'a str> {
                 while end < bytes.len() && bytes[end] != b'"' {
                     end += if bytes[end] == b'\\' { 2 } else { 1 };
                 }
-                if depth == 0 && object.get(start..end) == Some(key) {
-                    return object.get(end + 1..);
+                // A member separator has to follow, or this is a value that
+                // merely reads like the key and the real member is still ahead.
+                if depth == 0
+                    && object.get(start..end) == Some(key)
+                    && let Some(after) = object.get(end + 1..)
+                    && after.trim_start().starts_with(':')
+                {
+                    return Some(after);
                 }
                 i = end + 1;
             }
@@ -216,6 +222,14 @@ mod tests {
     #[test]
     fn test_parse_meta_sdk_js_prefers_the_direct_member_over_a_nested_namesake() {
         let s = r#"a={"JSSDKRuntimeConfig":{"nested":{"revision":"7"},"revision":"1046341789"}};"#;
+        assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
+    }
+
+    /// A value that reads like the key is not the key, and the real member is
+    /// still ahead of it.
+    #[test]
+    fn test_parse_meta_sdk_js_skips_a_value_that_looks_like_the_key() {
+        let s = r#"a={"JSSDKRuntimeConfig":{"label":"revision","revision":"1046341789"}};"#;
         assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
     }
 
