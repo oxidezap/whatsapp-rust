@@ -29,16 +29,30 @@ fn revision_after(s: &str, key: &str) -> Option<u32> {
 /// The body of the JSON object `anchor` names. Bounding the lookup this way is
 /// the point of the anchor: were the field renamed inside the object, an
 /// unbounded search would run on and adopt an unrelated `revision` from further
-/// down the bundle instead of reporting that the source changed shape. An
-/// unbalanced or unterminated object yields nothing, which fails the same way.
+/// down the bundle instead of reporting that the source changed shape. Anything
+/// but a balanced object yields nothing, which fails the same way.
+///
+/// Braces are counted only outside string values, because a brace inside one
+/// would otherwise move the boundary: a `{` extends the window past the object
+/// and readmits the unrelated field this exists to exclude.
 fn object_after<'a>(s: &'a str, anchor: &str) -> Option<&'a str> {
     let after = &s[s.find(anchor)? + anchor.len()..];
-    let body = &after[after.find('{')? + 1..];
+    let body = after
+        .trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+        .strip_prefix('{')?;
     let mut depth = 1usize;
+    let mut in_string = false;
+    let mut escaped = false;
     for (i, c) in body.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match c {
-            '{' => depth += 1,
-            '}' => {
+            '\\' => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(&body[..i]);
@@ -176,6 +190,39 @@ mod tests {
     fn test_parse_meta_sdk_js_does_not_escape_the_config_object() {
         let s = r#"a={"JSSDKRuntimeConfig":{"locale":"en_US","rev":"1046341789"}};
                    b={"revision":"7"};"#;
+        assert_eq!(parse_meta_sdk_js(s), None);
+    }
+
+    /// A brace inside a string value is text, not structure. An opening one is
+    /// the dangerous case: counted as structure it holds the object open and
+    /// lets the lookup reach a later, unrelated field.
+    #[test]
+    fn test_parse_meta_sdk_js_ignores_braces_inside_string_values() {
+        let s = r#"a={"JSSDKRuntimeConfig":{"sdkns":"a{b","revision":"1046341789"}};"#;
+        assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
+
+        let closing = r#"a={"JSSDKRuntimeConfig":{"sdkns":"a}b","revision":"1046341789"}};"#;
+        assert_eq!(parse_meta_sdk_js(closing), Some((2, 3000, 1046341789)));
+    }
+
+    /// The open brace must not hold past the object when the field is gone.
+    #[test]
+    fn test_parse_meta_sdk_js_string_brace_does_not_extend_the_window() {
+        let s = r#"a={"JSSDKRuntimeConfig":{"sdkns":"a{b","rev":"1"}};
+                   b={"revision":"7"};"#;
+        assert_eq!(parse_meta_sdk_js(s), None);
+    }
+
+    #[test]
+    fn test_parse_meta_sdk_js_escaped_quote_in_a_string_value() {
+        let s = r#"a={"JSSDKRuntimeConfig":{"sdkns":"a\"}b","revision":"1046341789"}};"#;
+        assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
+    }
+
+    /// A non-object value is not an object to search.
+    #[test]
+    fn test_parse_meta_sdk_js_non_object_value() {
+        let s = r#"a={"JSSDKRuntimeConfig":null};b={"revision":"7"};"#;
         assert_eq!(parse_meta_sdk_js(s), None);
     }
 
