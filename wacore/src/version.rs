@@ -10,16 +10,51 @@ const ASSETS_KEY: &str = "assets-manifest-";
 /// search starts at the object that owns the field we mean. The key is quoted
 /// because the bundle also names the object from minified code, where it is not.
 const SDK_CONFIG_ANCHOR: &str = "\"JSSDKRuntimeConfig\"";
-const SDK_REVISION_KEY: &str = "\"revision\"";
+const SDK_REVISION_KEY: &str = "revision";
 
-/// Reads the integer that `key` names, tolerating the JSON punctuation that may
-/// sit between a key and its value in a bundle (`:`, quotes, and the
+/// The text following `key` where it appears as a direct member of `object`,
+/// skipping any nested object or array. A namesake nested inside the config is
+/// not the config's own field, and taking the first one found would let it
+/// stand in for the value we mean.
+fn direct_member_value<'a>(object: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = object.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'"' => {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != b'"' {
+                    end += if bytes[end] == b'\\' { 2 } else { 1 };
+                }
+                if depth == 0 && object.get(start..end) == Some(key) {
+                    return object.get(end + 1..);
+                }
+                i = end + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Reads the integer a member's value holds, tolerating the JSON punctuation
+/// that may sit between a key and its value in a bundle (`:`, quotes, and the
 /// backslashes of a string-embedded JSON blob). Anything else between the two
 /// means the value is not a number, and that is a miss rather than a guess.
-fn revision_after(s: &str, key: &str) -> Option<u32> {
-    let after = &s[s.find(key)? + key.len()..];
+fn revision_value(after_key: &str) -> Option<u32> {
     let value =
-        after.trim_start_matches(|c: char| matches!(c, ':' | '"' | '\\') || c.is_whitespace());
+        after_key.trim_start_matches(|c: char| matches!(c, ':' | '"' | '\\') || c.is_whitespace());
     let end = value
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(value.len());
@@ -69,16 +104,26 @@ fn object_after<'a>(s: &'a str, anchor: &str) -> Option<&'a str> {
 /// sources carry the same number, since it is the revision of Meta's shared
 /// `www` build rather than anything specific to one property.
 pub fn parse_meta_sdk_js(s: &str) -> Option<(u32, u32, u32)> {
-    // Every match, not just the first: the anchor can also appear inside a
-    // string the bundle emits for its own error reporting.
+    // Every match, not just the first: the anchor also appears in minified code
+    // that names the object, and could appear in a string the bundle carries.
+    // Telling those from the real config would take a JS lexer, which is far
+    // more than a heuristic over a minified bundle is worth, so candidates that
+    // disagree are treated as not knowing rather than as a winner to pick. That
+    // turns the worst outcome, a confidently wrong version, into a reported
+    // fallback.
+    let mut found: Option<u32> = None;
     for (index, _) in s.match_indices(SDK_CONFIG_ANCHOR) {
         if let Some(config) = object_after(&s[index..], SDK_CONFIG_ANCHOR)
-            && let Some(revision) = revision_after(config, SDK_REVISION_KEY)
+            && let Some(after_key) = direct_member_value(config, SDK_REVISION_KEY)
+            && let Some(revision) = revision_value(after_key)
         {
-            return Some((2, 3000, revision));
+            match found {
+                Some(seen) if seen != revision => return None,
+                _ => found = Some(revision),
+            }
         }
     }
-    None
+    found.map(|revision| (2, 3000, revision))
 }
 
 /// Parses the WhatsApp Web version from sw.js content.
@@ -163,6 +208,45 @@ mod tests {
     #[test]
     fn test_parse_meta_sdk_js_nested_object_before_the_field() {
         let s = r#"a={"JSSDKRuntimeConfig":{"sdkab":{"x":1},"revision":"1046341789"}};"#;
+        assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
+    }
+
+    /// A nested namesake is not the config's own revision, and it appears
+    /// first, so taking the first match would return the wrong build.
+    #[test]
+    fn test_parse_meta_sdk_js_prefers_the_direct_member_over_a_nested_namesake() {
+        let s = r#"a={"JSSDKRuntimeConfig":{"nested":{"revision":"7"},"revision":"1046341789"}};"#;
+        assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
+    }
+
+    /// Two anchors that disagree mean the bundle no longer says one thing, and
+    /// guessing between them would be a confidently wrong version.
+    #[test]
+    fn test_parse_meta_sdk_js_disagreeing_candidates_are_a_miss() {
+        let s = r#"m='"JSSDKRuntimeConfig":{"revision":"7"}';
+                   x={"JSSDKRuntimeConfig":{"revision":"1046341789"}};"#;
+        assert_eq!(parse_meta_sdk_js(s), None);
+    }
+
+    /// Repeating the same answer is not a disagreement.
+    #[test]
+    fn test_parse_meta_sdk_js_agreeing_candidates_resolve() {
+        let s = r#"m={"JSSDKRuntimeConfig":{"revision":"1046341789"}};
+                   x={"JSSDKRuntimeConfig":{"revision":"1046341789"}};"#;
+        assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
+    }
+
+    /// Only nested namesakes means the field we mean is gone, which is a miss.
+    #[test]
+    fn test_parse_meta_sdk_js_ignores_a_nested_only_namesake() {
+        let s = r#"a={"JSSDKRuntimeConfig":{"nested":{"revision":"7"},"rev":"8"}};"#;
+        assert_eq!(parse_meta_sdk_js(s), None);
+    }
+
+    /// Same rule for an array element.
+    #[test]
+    fn test_parse_meta_sdk_js_ignores_a_namesake_inside_an_array() {
+        let s = r#"a={"JSSDKRuntimeConfig":{"xs":[{"revision":"7"}],"revision":"1046341789"}};"#;
         assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
     }
 
