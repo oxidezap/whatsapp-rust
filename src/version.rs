@@ -5,42 +5,108 @@ use anyhow::{Context as _, Result, anyhow};
 use log::debug;
 use std::sync::Arc;
 
-pub use wacore::version::{WA_WEB_VERSION, WA_WEB_VERSION_STR, parse_sw_js};
+pub use wacore::version::{WA_WEB_VERSION, WA_WEB_VERSION_STR, parse_meta_sdk_js, parse_sw_js};
 
-const SW_URL: &str = "https://web.whatsapp.com/sw.js";
+/// Where the client revision is read from on one target.
+struct VersionSource {
+    url: &'static str,
+    headers: &'static [(&'static str, &'static str)],
+    parse: fn(&str) -> Option<(u32, u32, u32)>,
+    /// The field the parser looks for, so a parse failure can name it.
+    field: &'static str,
+}
+
+/// WhatsApp Web's own service worker: the most direct source, and the one used
+/// wherever the request is not made by a browser.
+///
+/// It answers 200 only to a request carrying `Sec-Fetch-Site: none`; any other
+/// value, or none at all, is a 400. That header, `Connection` and `User-Agent`
+/// are all forbidden header names under the Fetch spec, and no response from
+/// `web.whatsapp.com` carries `Access-Control-Allow-Origin`, so this source is
+/// doubly unreachable from a page. That is the whole reason for [`SDK_SOURCE`].
+// Both are referenced: one by this target's build, the other by the other
+// target's and by the source-selection tests.
+#[allow(dead_code)]
+const SW_SOURCE: VersionSource = VersionSource {
+    url: "https://web.whatsapp.com/sw.js",
+    // `Connection: close` because this fetch runs at most once a day per
+    // device: a pooled idle TLS connection would be retained for the rest of
+    // the session and buys nothing back before it is purged.
+    headers: &[
+        ("sec-fetch-site", "none"),
+        ("connection", "close"),
+        (
+            "user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        ),
+    ],
+    parse: parse_sw_js,
+    field: "client_revision",
+};
+
+/// The Facebook JS SDK bundle, used on wasm because it is the one place Meta
+/// publishes this revision for cross-origin loading (`Access-Control-Allow-Origin: *`,
+/// no fetch-metadata gate). The number is the revision of Meta's shared `www`
+/// build, so it is the same one `sw.js` reports.
+///
+/// It is not a published contract: the field can be renamed or dropped, and a
+/// failure here reaches the caller as an ordinary network failure. No headers
+/// are sent because a browser sets its own and discards anything set here.
+#[allow(dead_code)]
+const SDK_SOURCE: VersionSource = VersionSource {
+    url: "https://connect.facebook.net/en_US/sdk.js",
+    headers: &[],
+    parse: parse_meta_sdk_js,
+    field: "JSSDKRuntimeConfig.revision",
+};
+
+/// One source per target, not a fallback chain: falling back would hide a real
+/// break of the primary source, which is the thing worth hearing about.
+const fn version_source() -> VersionSource {
+    #[cfg(target_family = "wasm")]
+    {
+        SDK_SOURCE
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        SW_SOURCE
+    }
+}
 
 pub async fn fetch_latest_app_version(
     http_client: &Arc<dyn HttpClient>,
 ) -> Result<(u32, u32, u32)> {
-    // `Connection: close` because this fetch runs at most once a day per
-    // device: a pooled idle TLS connection would be retained for the rest of
-    // the session and buys nothing back before it is purged.
-    let request = HttpRequest::get(SW_URL).with_header("sec-fetch-site", "none")
-    .with_header("connection", "close")
-    .with_header(
-        "user-agent",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-    );
+    let source = version_source();
+    let mut request = HttpRequest::get(source.url);
+    for (key, value) in source.headers {
+        request = request.with_header(*key, *value);
+    }
     let response = http_client
         .execute(request)
         .await
-        .map_err(|e| anyhow!("HTTP request to {} failed: {}", SW_URL, e))?;
+        .map_err(|e| anyhow!("HTTP request to {} failed: {}", source.url, e))?;
 
     // `HttpClient` returns a non-2xx as a response, so name the status here
-    // instead of letting an error page fall through to a "no client_revision"
-    // parse failure.
+    // instead of letting an error page fall through to a parse failure.
     if response.status_code >= HTTP_STATUS_REDIRECTION_START {
         let status = response.status_code;
-        return Err(crate::http::HttpStatusError { status }
-            .into_error(format!("HTTP request to {SW_URL} returned status {status}")));
+        return Err(crate::http::HttpStatusError { status }.into_error(format!(
+            "HTTP request to {} returned status {status}",
+            source.url
+        )));
     }
 
     let body_str = response
         .body_string()
         .map_err(|e| anyhow!("Failed to decode response body: {}", e))?;
 
-    parse_sw_js(&body_str)
-        .ok_or_else(|| anyhow!("Could not find 'client_revision' version in sw.js response"))
+    (source.parse)(&body_str).ok_or_else(|| {
+        anyhow!(
+            "Could not find '{}' in the response from {}",
+            source.field,
+            source.url
+        )
+    })
 }
 
 pub async fn resolve_and_update_version(
@@ -105,11 +171,13 @@ mod tests {
     #[derive(Default)]
     struct HeaderCapturingHttpClient {
         seen: std::sync::Mutex<Option<std::collections::HashMap<String, String>>>,
+        url: std::sync::Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
     impl HttpClient for HeaderCapturingHttpClient {
         async fn execute(&self, request: HttpRequest) -> Result<HttpResponse> {
+            *self.url.lock().unwrap() = Some(request.url.clone());
             *self.seen.lock().unwrap() = Some(request.headers);
             Ok(HttpResponse {
                 status_code: 200,
@@ -194,6 +262,98 @@ mod tests {
             headers.get("connection").map(String::as_str),
             Some("close"),
             "got: {headers:?}"
+        );
+    }
+
+    /// Every header name the Fetch spec forbids a page from setting. A source
+    /// that depends on one of these cannot work in a browser, whatever the
+    /// server answers.
+    const FORBIDDEN_HEADER_PREFIXES: &[&str] = &[
+        "sec-fetch-",
+        "connection",
+        "user-agent",
+        "origin",
+        "host",
+        "referer",
+    ];
+
+    /// The wasm source exists precisely because the default one cannot be
+    /// requested from a page, so it must not repeat the mistake.
+    #[test]
+    fn the_browser_source_sends_no_header_a_page_is_forbidden_to_set() {
+        for (key, _) in SDK_SOURCE.headers {
+            let key = key.to_ascii_lowercase();
+            assert!(
+                !FORBIDDEN_HEADER_PREFIXES
+                    .iter()
+                    .any(|forbidden| key.starts_with(forbidden)),
+                "the wasm version source cannot depend on '{key}'"
+            );
+        }
+    }
+
+    /// The saving header is what turns a 400 into a 200, so pin that the
+    /// non-browser source still sends it.
+    #[test]
+    fn the_default_source_is_the_service_worker_with_its_fetch_metadata_header() {
+        assert_eq!(SW_SOURCE.url, "https://web.whatsapp.com/sw.js");
+        assert!(
+            SW_SOURCE.headers.contains(&("sec-fetch-site", "none")),
+            "got: {:?}",
+            SW_SOURCE.headers
+        );
+    }
+
+    /// The choice of source is a compile-time fact, so assert it as one.
+    #[test]
+    fn the_source_is_chosen_by_target() {
+        let source = version_source();
+        if cfg!(target_family = "wasm") {
+            assert_eq!(source.url, SDK_SOURCE.url);
+        } else {
+            assert_eq!(source.url, SW_SOURCE.url);
+        }
+    }
+
+    /// A source that fails must not spend the 24 h cache: the next connect has
+    /// to be free to try again, and a still-valid stamp has to survive.
+    #[tokio::test]
+    async fn a_failed_fetch_leaves_a_valid_cache_stamp_alone() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("in-memory persistence"),
+        );
+        let fresh_stamp = wacore::time::now_utc().timestamp_millis();
+        persistence_manager
+            .process_command(DeviceCommand::SetAppVersion((2, 3000, 111)))
+            .await;
+        let stamp_after_success = persistence_manager
+            .get_device_snapshot()
+            .app_version_last_fetched_ms;
+        assert!(
+            stamp_after_success >= fresh_stamp,
+            "a successful resolve stamps the cache"
+        );
+
+        let http_client: Arc<dyn HttpClient> = Arc::new(StatusOnlyHttpClient(500));
+        resolve_and_update_version(&persistence_manager, &http_client, None)
+            .await
+            .expect("a valid cache is used without fetching");
+
+        let device = persistence_manager.get_device_snapshot();
+        assert_eq!(
+            device.app_version_last_fetched_ms, stamp_after_success,
+            "the cached stamp must survive"
+        );
+        assert_eq!(
+            (
+                device.app_version_primary,
+                device.app_version_secondary,
+                device.app_version_tertiary
+            ),
+            (2, 3000, 111),
+            "the cached version must survive"
         );
     }
 
