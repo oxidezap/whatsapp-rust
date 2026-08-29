@@ -7,8 +7,9 @@ const ASSETS_KEY: &str = "assets-manifest-";
 
 /// The object that carries the build revision in the Facebook JS SDK bundle.
 /// `revision` alone is far too common a word to look for in a JS blob, so the
-/// search starts at the object that owns the field we mean.
-const SDK_CONFIG_ANCHOR: &str = "JSSDKRuntimeConfig";
+/// search starts at the object that owns the field we mean. The key is quoted
+/// because the bundle also names the object from minified code, where it is not.
+const SDK_CONFIG_ANCHOR: &str = "\"JSSDKRuntimeConfig\"";
 const SDK_REVISION_KEY: &str = "\"revision\"";
 
 /// Reads the integer that `key` names, tolerating the JSON punctuation that may
@@ -25,13 +26,45 @@ fn revision_after(s: &str, key: &str) -> Option<u32> {
     value[..end].parse().ok()
 }
 
+/// The body of the JSON object `anchor` names. Bounding the lookup this way is
+/// the point of the anchor: were the field renamed inside the object, an
+/// unbounded search would run on and adopt an unrelated `revision` from further
+/// down the bundle instead of reporting that the source changed shape. An
+/// unbalanced or unterminated object yields nothing, which fails the same way.
+fn object_after<'a>(s: &'a str, anchor: &str) -> Option<&'a str> {
+    let after = &s[s.find(anchor)? + anchor.len()..];
+    let body = &after[after.find('{')? + 1..];
+    let mut depth = 1usize;
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&body[..i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Parses the Meta build revision from a Facebook JS SDK bundle.
 /// Returns the same `(2, 3000, revision)` shape as [`parse_sw_js`]: the two
 /// sources carry the same number, since it is the revision of Meta's shared
 /// `www` build rather than anything specific to one property.
 pub fn parse_meta_sdk_js(s: &str) -> Option<(u32, u32, u32)> {
-    let anchored = &s[s.find(SDK_CONFIG_ANCHOR)?..];
-    Some((2, 3000, revision_after(anchored, SDK_REVISION_KEY)?))
+    // Every match, not just the first: the anchor can also appear inside a
+    // string the bundle emits for its own error reporting.
+    for (index, _) in s.match_indices(SDK_CONFIG_ANCHOR) {
+        if let Some(config) = object_after(&s[index..], SDK_CONFIG_ANCHOR)
+            && let Some(revision) = revision_after(config, SDK_REVISION_KEY)
+        {
+            return Some((2, 3000, revision));
+        }
+    }
+    None
 }
 
 /// Parses the WhatsApp Web version from sw.js content.
@@ -103,6 +136,22 @@ mod tests {
         assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
     }
 
+    /// The live bundle names this object twice: once from minified code, and
+    /// once as the JSON literal that actually carries the revision. Stopping at
+    /// the first match finds an object that has no revision in it.
+    #[test]
+    fn test_parse_meta_sdk_js_skips_a_config_object_without_the_field() {
+        let s = r#"catch(e){var C=a.JSSDKRuntimeConfig,b=C.revision;L({error:"LOAD",extra:{revision:b}})}
+                   x={"JSSDKRuntimeConfig":{"locale":"en_US","revision":"1046341789","rtl":false}};"#;
+        assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
+    }
+
+    #[test]
+    fn test_parse_meta_sdk_js_nested_object_before_the_field() {
+        let s = r#"a={"JSSDKRuntimeConfig":{"sdkab":{"x":1},"revision":"1046341789"}};"#;
+        assert_eq!(parse_meta_sdk_js(s), Some((2, 3000, 1046341789)));
+    }
+
     #[test]
     fn test_parse_meta_sdk_js_missing_field() {
         let s = r#"a={"JSSDKRuntimeConfig":{"locale":"en_US","rtl":false}};"#;
@@ -121,8 +170,23 @@ mod tests {
         assert_eq!(parse_meta_sdk_js(s), None);
     }
 
+    /// A rename inside the config object has to read as "source changed shape",
+    /// not as a licence to adopt whatever number appears next in the bundle.
+    #[test]
+    fn test_parse_meta_sdk_js_does_not_escape_the_config_object() {
+        let s = r#"a={"JSSDKRuntimeConfig":{"locale":"en_US","rev":"1046341789"}};
+                   b={"revision":"7"};"#;
+        assert_eq!(parse_meta_sdk_js(s), None);
+    }
+
+    #[test]
+    fn test_parse_meta_sdk_js_unterminated_config_object() {
+        let s = r#"a={"JSSDKRuntimeConfig":{"locale":"en_US","#;
+        assert_eq!(parse_meta_sdk_js(s), None);
+    }
+
     /// The anchor exists because the bare word appears elsewhere in the bundle:
-    /// the first occurrence is not the one we mean.
+    /// neither the occurrences before it nor the ones after it are the one we mean.
     #[test]
     fn test_parse_meta_sdk_js_ignores_earlier_unrelated_revisions() {
         let s = r#"var a={"revision":"1"};var b={"x":{"revision":"2"}};
