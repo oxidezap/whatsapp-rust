@@ -108,12 +108,17 @@ pub async fn fetch_latest_app_version(
         )));
     }
 
-    let body_str = response
-        .body_string()
-        .map_err(|e| anyhow!("Failed to decode response body: {}", e))?;
+    // A body that will not decode still came from a source that answered, so
+    // it is the source's shape being wrong, not the source being out of reach.
+    let body_str = response.body_string().map_err(|e| {
+        anyhow::Error::new(VersionShapeError::Body {
+            url: source.url,
+            detail: e.to_string(),
+        })
+    })?;
 
     (source.parse)(&body_str).ok_or_else(|| {
-        anyhow::Error::new(VersionShapeError {
+        anyhow::Error::new(VersionShapeError::Field {
             field: source.field,
             url: source.url,
         })
@@ -124,10 +129,14 @@ pub async fn fetch_latest_app_version(
 /// Typed so the resolution can tell it from a source it never reached: one is
 /// routine, the other is the source having changed shape.
 #[derive(Debug, thiserror::Error)]
-#[error("could not find '{field}' in the response from {url}")]
-struct VersionShapeError {
-    field: &'static str,
-    url: &'static str,
+enum VersionShapeError {
+    #[error("could not decode the response body from {url}: {detail}")]
+    Body { url: &'static str, detail: String },
+    #[error("could not find '{field}' in the response from {url}")]
+    Field {
+        field: &'static str,
+        url: &'static str,
+    },
 }
 
 /// What a session settles for when a survivable source fails: the version the
@@ -486,12 +495,20 @@ mod tests {
     /// never answers is routine. Both survive, and they must not look alike.
     #[test]
     fn a_shape_failure_is_reported_apart_from_an_unreachable_source() {
-        let shape = anyhow::Error::new(VersionShapeError {
+        let missing_field = anyhow::Error::new(VersionShapeError::Field {
             field: "JSSDKRuntimeConfig.revision",
             url: "https://example.invalid/sdk.js",
         })
         .context("Failed to fetch latest WhatsApp version");
-        assert!(shape.chain().any(|c| c.is::<VersionShapeError>()));
+        assert!(missing_field.chain().any(|c| c.is::<VersionShapeError>()));
+
+        // A body that will not decode is the same class: the source answered.
+        let bad_body = anyhow::Error::new(VersionShapeError::Body {
+            url: "https://example.invalid/sdk.js",
+            detail: "invalid utf-8".to_owned(),
+        })
+        .context("Failed to fetch latest WhatsApp version");
+        assert!(bad_body.chain().any(|c| c.is::<VersionShapeError>()));
 
         let unreachable = anyhow!("HTTP request to https://example.invalid/sdk.js failed: refused")
             .context("Failed to fetch latest WhatsApp version");
