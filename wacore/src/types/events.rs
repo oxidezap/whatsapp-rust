@@ -1513,11 +1513,29 @@ pub struct Connected {
 pub struct AppVersionFallback {
     /// The version the session actually connected with.
     pub version: (u32, u32, u32),
-    /// True when that version is the one compiled into this library, meaning
-    /// this device has never resolved one and its staleness is the release's
-    /// age. False when it is a version this device resolved earlier, which is
-    /// stale only by however long the source has been unreachable.
+    /// True when that version is the one compiled into this library, so its
+    /// staleness is the release's age. False when the device already carried a
+    /// different one, whose provenance this does not claim to know: it may have
+    /// been resolved earlier or supplied by the caller.
     pub compiled_default: bool,
+    /// What stopped the resolution. Worth distinguishing, because one is
+    /// routine and the other is news.
+    pub reason: AppVersionFallbackReason,
+}
+
+/// Why a version could not be resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum AppVersionFallbackReason {
+    /// The source could not be reached, or answered with an error status. The
+    /// routine case: the browser source is on the common tracker blocklists, so
+    /// this is what a content blocker or a DNS sinkhole looks like, and it says
+    /// nothing about the source itself.
+    SourceUnreachable,
+    /// The source answered, but the version was not where it should be. This is
+    /// the source having changed shape, which is worth acting on rather than
+    /// waiting out: it will not fix itself on the next connect.
+    SourceUnparsable,
 }
 
 /// Localized text the server wants shown when it forces a logout, from

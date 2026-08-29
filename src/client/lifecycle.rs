@@ -1094,12 +1094,20 @@ impl Client {
         debug!("Connecting WebSocket and fetching latest client version in parallel...");
         let (version_result, transport_result) = futures::join!(version_future, transport_future);
 
-        let version_fallback = version_result
-            .map_err(|_| ConnectError::Timeout {
+        let version_fallback = match version_result {
+            Ok(resolved) => resolved.map_err(ConnectError::Version)?,
+            // A source that hangs until the timeout is unreachable, just more
+            // slowly, so it settles for the same fallback a refused one does
+            // rather than failing the connect a blocked host would survive.
+            Err(_) => crate::version::fallback_for_unreachable_source(
+                &self.persistence_manager.get_device_snapshot(),
+            )
+            .ok_or(ConnectError::Timeout {
                 stage: ConnectStage::VersionFetch,
                 timeout: TRANSPORT_CONNECT_TIMEOUT,
-            })?
-            .map_err(ConnectError::Version)?;
+            })
+            .map(Some)?,
+        };
         *self
             .app_version_fallback
             .lock()

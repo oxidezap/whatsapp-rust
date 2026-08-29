@@ -4,7 +4,7 @@ use crate::store::persistence_manager::PersistenceManager;
 use anyhow::{Context as _, Result, anyhow};
 use log::debug;
 use std::sync::Arc;
-use wacore::types::events::AppVersionFallback;
+use wacore::types::events::{AppVersionFallback, AppVersionFallbackReason};
 
 pub use wacore::version::{WA_WEB_VERSION, WA_WEB_VERSION_STR, parse_meta_sdk_js, parse_sw_js};
 
@@ -113,30 +113,54 @@ pub async fn fetch_latest_app_version(
         .map_err(|e| anyhow!("Failed to decode response body: {}", e))?;
 
     (source.parse)(&body_str).ok_or_else(|| {
-        anyhow!(
-            "Could not find '{}' in the response from {}",
-            source.field,
-            source.url
-        )
+        anyhow::Error::new(VersionShapeError {
+            field: source.field,
+            url: source.url,
+        })
     })
 }
 
-/// What a session settles for when a survivable source cannot be reached: the
-/// version the device already holds, and whether that is the compiled-in one.
-/// A device that never recorded a fetch is still on the compiled version, whose
-/// staleness is the release's age rather than the length of the outage.
+/// A source that answered but did not carry the version where it should be.
+/// Typed so the resolution can tell it from a source it never reached: one is
+/// routine, the other is the source having changed shape.
+#[derive(Debug, thiserror::Error)]
+#[error("could not find '{field}' in the response from {url}")]
+struct VersionShapeError {
+    field: &'static str,
+    url: &'static str,
+}
+
+/// What a session settles for when a survivable source fails: the version the
+/// device already holds, and whether that is the compiled-in one.
 fn fallback_to_device_version(
     device: &wacore::store::Device,
-    last_fetched_ms: i64,
+    reason: AppVersionFallbackReason,
 ) -> AppVersionFallback {
+    let version = (
+        device.app_version_primary,
+        device.app_version_secondary,
+        device.app_version_tertiary,
+    );
     AppVersionFallback::builder()
-        .version((
-            device.app_version_primary,
-            device.app_version_secondary,
-            device.app_version_tertiary,
-        ))
-        .compiled_default(last_fetched_ms == 0)
+        .version(version)
+        // Compared, not inferred from the fetch stamp: `with_version` also
+        // stamps one, so a device that only ever carried an override would
+        // otherwise be reported as having resolved a version.
+        .compiled_default(version == WA_WEB_VERSION)
+        .reason(reason)
         .build()
+}
+
+/// The fallback a resolution that never finished settles for, or `None` when
+/// this target's source is one whose failure is fatal. A request left hanging
+/// is unreachability with a longer wait, so it has to reach the same answer as
+/// a refused one rather than becoming a connect timeout.
+pub(crate) fn fallback_for_unreachable_source(
+    device: &wacore::store::Device,
+) -> Option<AppVersionFallback> {
+    version_source()
+        .fallback_on_failure
+        .then(|| fallback_to_device_version(device, AppVersionFallbackReason::SourceUnreachable))
 }
 
 /// Resolves the app version and persists it, returning the fallback the
@@ -183,10 +207,20 @@ pub async fn resolve_and_update_version(
         let (p, s, t) = match fetched {
             Ok(version) => version,
             Err(e) if version_source().fallback_on_failure => {
+                // A source that answered with the wrong shape is not the same
+                // as one that never answered, and burying that would undo the
+                // parser's fail-closed behaviour, so the two are reported
+                // apart. Both stay survivable: a DNS sinkhole that serves a
+                // page rather than refusing the request lands here too.
+                let reason = if e.chain().any(|c| c.is::<VersionShapeError>()) {
+                    AppVersionFallbackReason::SourceUnparsable
+                } else {
+                    AppVersionFallbackReason::SourceUnreachable
+                };
                 // The stamp is deliberately left alone, so the next connect
                 // tries the source again instead of waiting out a 24 h cache
                 // that no successful fetch ever filled.
-                let fallback = fallback_to_device_version(&device, last_fetched_ms);
+                let fallback = fallback_to_device_version(&device, reason);
                 debug!(
                     "Version source unreachable, connecting on {:?}: {e:#}",
                     fallback.version
@@ -409,18 +443,75 @@ mod tests {
             device.app_version_tertiary,
         );
 
-        let fallback = fallback_to_device_version(&device, 0);
+        let fallback =
+            fallback_to_device_version(&device, AppVersionFallbackReason::SourceUnreachable);
         assert_eq!(fallback.version, compiled);
+        assert_eq!(fallback.version, WA_WEB_VERSION);
         assert!(
             fallback.compiled_default,
-            "a device that never resolved one is on the compiled version"
+            "a device still on the compiled version says so"
+        );
+        assert_eq!(fallback.reason, AppVersionFallbackReason::SourceUnreachable);
+    }
+
+    /// `compiled_default` is a comparison, not an inference from the fetch
+    /// stamp: `with_version` stamps one too, so a device carrying only an
+    /// override must not be reported as running the compiled version.
+    #[tokio::test]
+    async fn an_overridden_version_is_not_reported_as_the_compiled_default() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("in-memory persistence"),
+        );
+        let override_version = (WA_WEB_VERSION.0, WA_WEB_VERSION.1, WA_WEB_VERSION.2 + 1);
+        persistence_manager
+            .process_command(DeviceCommand::SetAppVersion(override_version))
+            .await;
+
+        let device = persistence_manager.get_device_snapshot();
+        assert_ne!(
+            device.app_version_last_fetched_ms, 0,
+            "the command stamps a fetch time even for an override, which is why \
+             the flag cannot be read off it"
         );
 
-        // A device that resolved a version earlier is stale by the outage, not
-        // by the release's age, and a consumer weighs those differently.
-        let resolved_earlier = fallback_to_device_version(&device, 1);
-        assert!(!resolved_earlier.compiled_default);
-        assert_eq!(resolved_earlier.version, compiled);
+        let fallback =
+            fallback_to_device_version(&device, AppVersionFallbackReason::SourceUnreachable);
+        assert_eq!(fallback.version, override_version);
+        assert!(!fallback.compiled_default);
+    }
+
+    /// A source that answers with the wrong shape is news, and a source that
+    /// never answers is routine. Both survive, and they must not look alike.
+    #[test]
+    fn a_shape_failure_is_reported_apart_from_an_unreachable_source() {
+        let shape = anyhow::Error::new(VersionShapeError {
+            field: "JSSDKRuntimeConfig.revision",
+            url: "https://example.invalid/sdk.js",
+        })
+        .context("Failed to fetch latest WhatsApp version");
+        assert!(shape.chain().any(|c| c.is::<VersionShapeError>()));
+
+        let unreachable = anyhow!("HTTP request to https://example.invalid/sdk.js failed: refused")
+            .context("Failed to fetch latest WhatsApp version");
+        assert!(!unreachable.chain().any(|c| c.is::<VersionShapeError>()));
+    }
+
+    /// A hung source is unreachability with a longer wait, so the fatal source
+    /// still refuses and the survivable one still settles for a version.
+    #[test]
+    fn a_timed_out_source_falls_back_exactly_where_a_refused_one_does() {
+        let device = wacore::store::Device::default();
+        let timed_out = fallback_for_unreachable_source(&device);
+        assert_eq!(
+            timed_out.is_some(),
+            version_source().fallback_on_failure,
+            "the timeout path must not disagree with the source policy"
+        );
+        if let Some(fallback) = timed_out {
+            assert_eq!(fallback.reason, AppVersionFallbackReason::SourceUnreachable);
+        }
     }
 
     /// Every header name the Fetch spec forbids a page from setting. A source
