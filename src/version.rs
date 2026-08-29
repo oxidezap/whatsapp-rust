@@ -4,6 +4,7 @@ use crate::store::persistence_manager::PersistenceManager;
 use anyhow::{Context as _, Result, anyhow};
 use log::debug;
 use std::sync::Arc;
+use wacore::types::events::AppVersionFallback;
 
 pub use wacore::version::{WA_WEB_VERSION, WA_WEB_VERSION_STR, parse_meta_sdk_js, parse_sw_js};
 
@@ -14,6 +15,8 @@ struct VersionSource {
     parse: fn(&str) -> Option<(u32, u32, u32)>,
     /// The field the parser looks for, so a parse failure can name it.
     field: &'static str,
+    /// Whether an unreachable source is survivable or fatal to the connect.
+    fallback_on_failure: bool,
 }
 
 /// WhatsApp Web's own service worker: the most direct source, and the one used
@@ -42,6 +45,9 @@ const SW_SOURCE: VersionSource = VersionSource {
     ],
     parse: parse_sw_js,
     field: "client_revision",
+    // Fatal: this host serves WhatsApp Web itself, so a client that cannot
+    // reach it has hit a real break, and connecting anyway would bury it.
+    fallback_on_failure: false,
 };
 
 /// The Facebook JS SDK bundle, used on wasm because it is the one place Meta
@@ -58,6 +64,12 @@ const SDK_SOURCE: VersionSource = VersionSource {
     headers: &[],
     parse: parse_meta_sdk_js,
     field: "JSSDKRuntimeConfig.revision",
+    // Survivable, unlike the source above: this host is on the common
+    // tracker blocklists, so content blockers and corporate DNS refuse it by
+    // default. That is the expected condition for a large share of browser
+    // users, not evidence anything broke, and failing closed on it would turn
+    // an ad blocker into a client that never connects.
+    fallback_on_failure: true,
 };
 
 /// One source per target, not a fallback chain: falling back would hide a real
@@ -109,17 +121,38 @@ pub async fn fetch_latest_app_version(
     })
 }
 
+/// What a session settles for when a survivable source cannot be reached: the
+/// version the device already holds, and whether that is the compiled-in one.
+/// A device that never recorded a fetch is still on the compiled version, whose
+/// staleness is the release's age rather than the length of the outage.
+fn fallback_to_device_version(
+    device: &wacore::store::Device,
+    last_fetched_ms: i64,
+) -> AppVersionFallback {
+    AppVersionFallback::builder()
+        .version((
+            device.app_version_primary,
+            device.app_version_secondary,
+            device.app_version_tertiary,
+        ))
+        .compiled_default(last_fetched_ms == 0)
+        .build()
+}
+
+/// Resolves the app version and persists it, returning the fallback the
+/// session settled for, if any. `Ok(None)` is the normal outcome: freshly
+/// fetched, served from the 24 h cache, or supplied by the caller.
 pub async fn resolve_and_update_version(
     persistence_manager: &Arc<PersistenceManager>,
     http_client: &Arc<dyn HttpClient>,
     override_version: Option<(u32, u32, u32)>,
-) -> Result<()> {
+) -> Result<Option<AppVersionFallback>> {
     if let Some((p, s, t)) = override_version {
         debug!("Using user-provided override version: {}.{}.{}", p, s, t);
         persistence_manager
             .process_command(DeviceCommand::SetAppVersion((p, s, t)))
             .await;
-        return Ok(());
+        return Ok(None);
     }
 
     let device = persistence_manager.get_device_snapshot();
@@ -143,9 +176,26 @@ pub async fn resolve_and_update_version(
         // and drops the chain, so the `HttpStatusError` the fetch attached
         // would never reach a caller holding a `ConnectError::Version`. The
         // message is the same either way; only the recoverability differs.
-        let (p, s, t) = fetch_latest_app_version(http_client)
+        let fetched = fetch_latest_app_version(http_client)
             .await
-            .context("Failed to fetch latest WhatsApp version")?;
+            .context("Failed to fetch latest WhatsApp version");
+
+        let (p, s, t) = match fetched {
+            Ok(version) => version,
+            Err(e) if version_source().fallback_on_failure => {
+                // The stamp is deliberately left alone, so the next connect
+                // tries the source again instead of waiting out a 24 h cache
+                // that no successful fetch ever filled.
+                let fallback = fallback_to_device_version(&device, last_fetched_ms);
+                debug!(
+                    "Version source unreachable, connecting on {:?}: {e:#}",
+                    fallback.version
+                );
+                return Ok(Some(fallback));
+            }
+            Err(e) => return Err(e),
+        };
+
         debug!("Fetched latest version: {}.{}.{}", p, s, t);
         persistence_manager
             .process_command(DeviceCommand::SetAppVersion((p, s, t)))
@@ -157,7 +207,7 @@ pub async fn resolve_and_update_version(
         );
     }
 
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -241,7 +291,10 @@ mod tests {
     }
 
     /// The header is the whole saving, so pin both halves: that the fetch
-    /// sends it, and that a version still resolves with it set.
+    /// sends it, and that a version still resolves with it set. Gated off wasm,
+    /// where the source is the SDK bundle and neither the header nor this body
+    /// applies.
+    #[cfg(not(target_family = "wasm"))]
     #[tokio::test]
     async fn the_version_fetch_declines_to_leave_a_pooled_connection() {
         let capturing = Arc::new(HeaderCapturingHttpClient::default());
@@ -263,6 +316,111 @@ mod tests {
             Some("close"),
             "got: {headers:?}"
         );
+        // The chosen source has to be the one actually requested, not just the
+        // one the constant names.
+        assert_eq!(
+            capturing.url.lock().unwrap().as_deref(),
+            Some(version_source().url)
+        );
+    }
+
+    /// The asymmetry is the design: an unreachable `sw.js` is a real break and
+    /// must stay fatal, while the browser source is blocked by default by
+    /// common content blockers, so failing closed there would turn an ad
+    /// blocker into a client that never connects.
+    #[test]
+    fn only_the_browser_source_falls_back() {
+        let by_source = [
+            (SW_SOURCE.url, SW_SOURCE.fallback_on_failure),
+            (SDK_SOURCE.url, SDK_SOURCE.fallback_on_failure),
+        ];
+        assert_eq!(
+            by_source.map(|(_, falls_back)| falls_back),
+            [false, true],
+            "got: {by_source:?}"
+        );
+    }
+
+    /// The failure path of the fatal source: an unreachable source is an error,
+    /// and no fallback is reported in its place.
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn a_fatal_source_failure_resolves_no_version() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("in-memory persistence"),
+        );
+        let http_client: Arc<dyn HttpClient> = Arc::new(StatusOnlyHttpClient(500));
+
+        resolve_and_update_version(&persistence_manager, &http_client, None)
+            .await
+            .expect_err("a source that cannot answer must not resolve a version");
+    }
+
+    /// The happy path reports no fallback, so `Some` stays the whole signal.
+    #[tokio::test]
+    async fn a_resolved_version_reports_no_fallback() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("in-memory persistence"),
+        );
+        let http_client: Arc<dyn HttpClient> = Arc::new(HeaderCapturingHttpClient::default());
+
+        let fallback = resolve_and_update_version(&persistence_manager, &http_client, None)
+            .await
+            .expect("a 200 resolves a version");
+        assert!(fallback.is_none(), "got: {fallback:?}");
+    }
+
+    /// An override is the caller's own answer, not a fallback.
+    #[tokio::test]
+    async fn an_override_reports_no_fallback() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("in-memory persistence"),
+        );
+        let http_client: Arc<dyn HttpClient> = Arc::new(StatusOnlyHttpClient(500));
+
+        let fallback =
+            resolve_and_update_version(&persistence_manager, &http_client, Some((2, 3000, 7)))
+                .await
+                .expect("an override resolves without fetching");
+        assert!(fallback.is_none(), "got: {fallback:?}");
+    }
+
+    /// The whole point of the browser fallback: a blocked source still yields a
+    /// connectable session, and says so in a way a consumer can act on rather
+    /// than a log line. Driven through the source description so it runs on
+    /// every target, since the wasm target this describes has no test runner.
+    #[tokio::test]
+    async fn a_survivable_source_failure_reports_the_version_it_settled_for() {
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("in-memory persistence"),
+        );
+        let device = persistence_manager.get_device_snapshot();
+        let compiled = (
+            device.app_version_primary,
+            device.app_version_secondary,
+            device.app_version_tertiary,
+        );
+
+        let fallback = fallback_to_device_version(&device, 0);
+        assert_eq!(fallback.version, compiled);
+        assert!(
+            fallback.compiled_default,
+            "a device that never resolved one is on the compiled version"
+        );
+
+        // A device that resolved a version earlier is stale by the outage, not
+        // by the release's age, and a consumer weighs those differently.
+        let resolved_earlier = fallback_to_device_version(&device, 1);
+        assert!(!resolved_earlier.compiled_default);
+        assert_eq!(resolved_earlier.version, compiled);
     }
 
     /// Every header name the Fetch spec forbids a page from setting. A source

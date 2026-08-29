@@ -1715,6 +1715,12 @@ pub struct Client {
     /// Version override for testing or manual specification
     pub(crate) override_version: Option<(u32, u32, u32)>,
 
+    /// The fallback the latest connect attempt settled for, reported on
+    /// [`Event::Connected`]. Rewritten by every attempt, so a reconnect that
+    /// reaches the source clears what a blocked one recorded.
+    pub(crate) app_version_fallback:
+        std::sync::Mutex<Option<wacore::types::events::AppVersionFallback>>,
+
     /// When true, history sync notifications are acknowledged but not downloaded
     /// or processed. Set via `BotBuilder::skip_history_sync()`.
     pub(crate) skip_history_sync: AtomicBool,

@@ -1496,7 +1496,29 @@ pub struct ClientOutdated {
 /// believing never opened.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
-pub struct Connected {}
+pub struct Connected {
+    /// Present when version resolution could not reach its source and the
+    /// session connected on the version the device already held. Absent on
+    /// every normal connect, so `Some` is the whole signal: a consumer that
+    /// cares can warn, refuse, or pin a version of its own.
+    pub app_version_fallback: Option<AppVersionFallback>,
+}
+
+/// Why, and with what, a session connected without a freshly resolved version.
+///
+/// Only the browser version source falls back this way; see the source
+/// constants in the client crate's `version` module for the reason.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct AppVersionFallback {
+    /// The version the session actually connected with.
+    pub version: (u32, u32, u32),
+    /// True when that version is the one compiled into this library, meaning
+    /// this device has never resolved one and its staleness is the release's
+    /// age. False when it is a version this device resolved earlier, which is
+    /// stale only by however long the source has been unreachable.
+    pub compiled_default: bool,
+}
 
 /// Localized text the server wants shown when it forces a logout, from
 /// `logout_message_header` / `logout_message_subtext` on `<failure>`.

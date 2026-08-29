@@ -292,8 +292,15 @@ impl Client {
     fn publish_connected(&self) {
         self.is_ready.store(true, Ordering::Relaxed);
         wacore::telemetry::set_connected(true);
+        let app_version_fallback = self
+            .app_version_fallback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         self.core.event_bus.dispatch(Event::Connected(
-            crate::types::events::Connected::builder().build(),
+            crate::types::events::Connected::builder()
+                .maybe_app_version_fallback(app_version_fallback)
+                .build(),
         ));
         self.connected_notifier.notify(usize::MAX);
     }
@@ -577,6 +584,7 @@ impl Client {
             synchronous_ack: false,
             http_client,
             override_version,
+            app_version_fallback: std::sync::Mutex::new(None),
             skip_history_sync: AtomicBool::new(false),
             wanted_pre_key_count: AtomicUsize::new(crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT),
             cache_config,
@@ -1086,12 +1094,16 @@ impl Client {
         debug!("Connecting WebSocket and fetching latest client version in parallel...");
         let (version_result, transport_result) = futures::join!(version_future, transport_future);
 
-        version_result
+        let version_fallback = version_result
             .map_err(|_| ConnectError::Timeout {
                 stage: ConnectStage::VersionFetch,
                 timeout: TRANSPORT_CONNECT_TIMEOUT,
             })?
             .map_err(ConnectError::Version)?;
+        *self
+            .app_version_fallback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = version_fallback;
         let (transport, mut transport_events) = transport_result
             .map_err(|_| ConnectError::Timeout {
                 stage: ConnectStage::Transport,
