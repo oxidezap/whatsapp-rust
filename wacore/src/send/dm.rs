@@ -98,6 +98,28 @@ pub enum NoRecipientDeviceError {
     Unresolved,
 }
 
+/// The server named a device 0 as gone while the send was establishing
+/// sessions for it.
+///
+/// Kept apart from [`NoRecipientDeviceError`] because it can name our own
+/// primary as easily as the peer's, and the two ask for different things: this
+/// says one identity's device list is stale on a device that owns its chat, so
+/// the stanza is not built at all. Nothing was on the wire, and the useful
+/// retry is one that resolves devices again.
+#[derive(Debug, thiserror::Error)]
+#[error("the server rejected the primary device with code {code}")]
+#[non_exhaustive]
+pub struct PrimaryDeviceRejected {
+    /// The `<error code>` the server attached to it.
+    pub code: u16,
+}
+
+impl PrimaryDeviceRejected {
+    pub fn new(code: u16) -> Self {
+        Self { code }
+    }
+}
+
 impl NoRecipientDeviceError {
     fn encryption_failed(attempted: usize, source: Option<anyhow::Error>) -> Self {
         Self::EncryptionFailed {
@@ -114,9 +136,10 @@ impl NoRecipientDeviceError {
 ///
 /// A DM whose fan-out lost some but not all of the recipient's devices still
 /// builds a stanza, is acked, and returns a real message id, so this is the
-/// only place the loss is visible. `skipped_primary` is the case that costs
-/// the recipient the message outright: their phone holds the chat, so a stanza
-/// that reaches only their companions renders as "waiting for this message".
+/// only place the loss is visible. `skipped_primary` is called out separately
+/// because a recipient's phone holds the chat whether or not they have a
+/// companion linked and open: a stanza that reached only companions is the one
+/// a recipient is most likely to never see.
 ///
 /// Zero-valued for a self-chat, which has no recipient half at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -126,7 +149,9 @@ pub struct RecipientFanout {
     pub addressed: usize,
     /// Of those, how many produced a `<to><enc>` node.
     pub encrypted: usize,
-    /// The recipient's device 0 was addressed and encrypted for nothing.
+    /// The recipient's device 0 was among the devices that encrypted for
+    /// nothing. Says nothing about how many others were skipped; `addressed`
+    /// against `encrypted` answers that.
     pub skipped_primary: bool,
     /// The server answered 406 (unregistered) for at least one of them.
     pub had_unregistered_device: bool,
@@ -142,6 +167,11 @@ impl RecipientFanout {
 
 /// Result of `prepare_dm_stanza` — carries the stanza node and the
 /// locally computed phash for server ACK validation.
+///
+/// Sealed: it is a return type, and every field it has grown was a fact the
+/// send already knew and threw away. Sealing it means the next one costs
+/// nobody a compile error.
+#[non_exhaustive]
 pub struct PreparedDmStanza {
     pub node: Node,
     /// What the recipient half of the fan-out reached. See [`RecipientFanout`].

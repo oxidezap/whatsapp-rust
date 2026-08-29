@@ -15,6 +15,7 @@ use wacore_binary::Jid;
 
 use super::Client;
 use crate::types::events::{Event, OfflineSyncCompleted};
+use wacore::send::PrimaryDeviceRejected;
 
 /// Waiter side of an in-flight ensure: it never receives a value, only the
 /// close that the leader's drop produces. A leader that panics or is cancelled
@@ -836,6 +837,22 @@ impl Client {
                 );
                 self.invalidate_device_caches_for(&rejected).await;
             }
+            // A 406 naming a device 0 fails the whole fetch, mirroring WA Web's
+            // `ensureE2ESessions`, whose 406 catch resolves quietly only while
+            // `x.every(e => e.device !== DEFAULT_DEVICE_ID)` holds and rethrows
+            // otherwise. The device the server says is gone owns the chat, so
+            // continuing builds a stanza that is acked and read by nobody; the
+            // send fails against a list that has just been refreshed, and the
+            // retry resolves the peer again. Only 406: every other code says
+            // the server could not answer, not that the device is gone, which
+            // is the same line the refresh above draws.
+            if prekey_bundles
+                .rejected
+                .iter()
+                .any(|device| device.jid.device == 0 && device.code == UNREGISTERED_DEVICE_CODE)
+            {
+                return Err(PrimaryDeviceRejected::new(UNREGISTERED_DEVICE_CODE).into());
+            }
         }
 
         let mut adapter = self.signal_adapter();
@@ -1015,11 +1032,14 @@ mod tests {
     /// The non-406 half also pins the behavior decision: a code that does not
     /// claim the device is gone is counted and nothing else, so a server-side
     /// failure cannot trigger a device-list refresh storm.
+    ///
+    /// A companion, because a 406 naming a primary now fails the fetch instead
+    /// of returning zero; that gate has its own tests below.
     #[tokio::test]
     async fn a_rejected_device_is_counted_on_the_stats_snapshot() {
         for code in ["406", "503"] {
             let (client, transport) = crate::test_utils::create_iq_test_client().await;
-            let gone = Jid::pn_device("5511900000060", 0);
+            let gone = Jid::pn_device("5511900000060", 4);
 
             let fetch = tokio::spawn({
                 let client = client.clone();
@@ -1059,6 +1079,120 @@ mod tests {
             );
             assert_eq!(stats.devices_unkeyed_total(), 1);
         }
+    }
+
+    /// A 406 naming the primary is the server saying the device that owns the
+    /// chat is gone. Continuing would key the companions and build a stanza the
+    /// recipient cannot read, so the fetch fails and the caller retries against
+    /// the list this call just refreshed. Mirrors `ensureE2ESessions`, whose
+    /// 406 catch rethrows unless every requested wid is a companion.
+    #[tokio::test]
+    async fn a_406_naming_the_primary_fails_the_fetch() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let primary = Jid::pn_device("5511900000061", 0);
+        let companion = Jid::pn_device("5511900000061", 2);
+
+        let fetch = tokio::spawn({
+            let client = client.clone();
+            let jids = vec![primary.clone(), companion.clone()];
+            async move { client.fetch_and_establish_sessions(&jids).await }
+        });
+
+        answer_prekey_fetch(
+            &client,
+            &transport,
+            vec![
+                NodeBuilder::new("user")
+                    .attr("jid", NodeValue::Jid(primary.clone()))
+                    .children([NodeBuilder::new("error")
+                        .attr("code", "406")
+                        .attr("text", "not-acceptable")
+                        .build()])
+                    .build(),
+            ],
+        )
+        .await;
+
+        let err = fetch
+            .await
+            .expect("join")
+            .expect_err("a rejected primary must not be reported as a clean fetch");
+        assert!(
+            err.downcast_ref::<PrimaryDeviceRejected>().is_some(),
+            "the caller must be able to match on this, not parse it: {err}"
+        );
+    }
+
+    /// The same rejection on a companion still lets the send through: the
+    /// device that owns the chat answered, so the message is readable.
+    #[tokio::test]
+    async fn a_406_naming_only_a_companion_does_not_fail_the_fetch() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let companion = Jid::pn_device("5511900000062", 3);
+
+        let fetch = tokio::spawn({
+            let client = client.clone();
+            let jids = vec![companion.clone()];
+            async move { client.fetch_and_establish_sessions(&jids).await }
+        });
+
+        answer_prekey_fetch(
+            &client,
+            &transport,
+            vec![
+                NodeBuilder::new("user")
+                    .attr("jid", NodeValue::Jid(companion.clone()))
+                    .children([NodeBuilder::new("error")
+                        .attr("code", "406")
+                        .attr("text", "not-acceptable")
+                        .build()])
+                    .build(),
+            ],
+        )
+        .await;
+
+        let established = fetch
+            .await
+            .expect("join")
+            .expect("a companion 406 is survivable");
+        assert_eq!(established, 0);
+    }
+
+    /// A code that does not claim the device is gone never fails the fetch,
+    /// primary or not: a 5xx says the server could not answer, and turning
+    /// that into a failed send would make a server wobble look like a stale
+    /// device list.
+    #[tokio::test]
+    async fn a_non_406_rejection_of_the_primary_does_not_fail_the_fetch() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let primary = Jid::pn_device("5511900000063", 0);
+
+        let fetch = tokio::spawn({
+            let client = client.clone();
+            let jids = vec![primary.clone()];
+            async move { client.fetch_and_establish_sessions(&jids).await }
+        });
+
+        answer_prekey_fetch(
+            &client,
+            &transport,
+            vec![
+                NodeBuilder::new("user")
+                    .attr("jid", NodeValue::Jid(primary.clone()))
+                    .children([NodeBuilder::new("error")
+                        .attr("code", "503")
+                        .attr("text", "service-unavailable")
+                        .build()])
+                    .build(),
+            ],
+        )
+        .await;
+
+        let established = fetch
+            .await
+            .expect("join")
+            .expect("a 503 is not the server saying the device is gone");
+        assert_eq!(established, 0);
     }
 
     /// A batch-wide 406 answers for every device at once and fails the send, so

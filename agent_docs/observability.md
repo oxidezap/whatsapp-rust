@@ -74,8 +74,8 @@ between "the session repair worked" and a screenshot of a chat stuck on
 These are process-wide totals, so they say a device went unkeyed somewhere but
 never which message lost it. The per-message question is answered by
 `SendResult::recipient_fanout` (`RecipientFanout`), which a DM fills in with how
-many recipient devices it addressed, how many encrypted, and whether the one
-that dropped was the recipient's phone.
+many recipient devices it addressed, how many encrypted, and whether the
+recipient's primary device was among the ones that did not.
 
 **Per attempt, not per delivered stanza**, and the distinction is not academic:
 a batch-wide `406` and a `Required` distribution that cannot reach every target

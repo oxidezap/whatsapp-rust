@@ -1069,6 +1069,11 @@ pub(crate) struct PhashWaiter {
     pub(crate) expected: wacore_binary::CompactString,
     pub(crate) jid: Jid,
     pub(crate) invalidate_group_cache: bool,
+    /// DM sends only: the device set this stanza actually covered, shared with
+    /// the send's own memo entry rather than copied. A mismatch resends to the
+    /// devices a refreshed list holds and this one does not, which is what the
+    /// `excludeList` in WA Web's `resendUserMsg` job amounts to.
+    pub(crate) dm_devices: Option<Arc<wacore::send::ResolvedDmDevices>>,
     /// Sweep epoch this waiter was registered in. Expiry is counted in sweeps
     /// rather than seconds: a wall deadline is subject to clock jumps (see
     /// wacore::time) and would have to be derived from an instant sampled well

@@ -450,6 +450,10 @@ pub(crate) fn report_encrypt_drops(resolver: &dyn SendContextResolver, unkeyed_a
 
 /// What a fan-out reports back when its `<to><enc>` nodes went straight into
 /// the caller's stanza buffer instead of a per-fan-out [`EncryptResult`].
+///
+/// Sealed for the same reason as [`super::PreparedDmStanza`]: nothing outside
+/// the fan-out builds one, and the set of facts worth reporting still grows.
+#[non_exhaustive]
 pub struct EncryptFanoutSummary {
     pub includes_prekey_message: bool,
     /// True if any device returned 406 (unregistered) during prekey fetch.

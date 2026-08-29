@@ -1673,13 +1673,28 @@ impl Client {
         }
         let client = Arc::clone(self);
         let server = server.as_str().to_string();
+        // Read off the ack rather than stored on the waiter: the id is only
+        // needed on this path, and a copy per send is a copy per send.
+        let message_id = waiter
+            .dm_devices
+            .is_some()
+            .then(|| node.get_attr("id").map(|id| id.as_str().to_string()))
+            .flatten();
         self.runtime.spawn_detached(Box::pin(async move {
+            let resend = match (message_id.as_deref(), waiter.dm_devices) {
+                (Some(message_id), Some(covered)) => Some(crate::send::DmDeltaResend {
+                    message_id,
+                    covered,
+                }),
+                _ => None,
+            };
             client
                 .handle_phash_mismatch(
                     &waiter.jid,
                     &waiter.expected,
                     &server,
                     waiter.invalidate_group_cache,
+                    resend,
                 )
                 .await;
         }));

@@ -61,6 +61,12 @@ pub enum SendError {
     /// ([`crate::cache::Freshness::Refresh`]) rather than an immediate resend.
     #[error("{0}")]
     NoRecipientDevice(#[source] wacore::send::NoRecipientDeviceError),
+    /// The server rejected a primary device (device 0) while the send was
+    /// establishing its sessions, so nothing was built or sent. The device
+    /// lists it names have been refreshed by the time this returns, so an
+    /// immediate retry resolves them again rather than repeating the question.
+    #[error("{0}")]
+    PrimaryDeviceRejected(#[source] wacore::send::PrimaryDeviceRejected),
     /// Catch-all for internal send failures (Signal encrypt, protobuf, group
     /// resolution) that have no dedicated variant yet. `Display` forwards to
     /// the inner error while `source()` still exposes it for downcast.
@@ -87,6 +93,12 @@ impl SendError {
         // it must be able to match on it instead of parsing a message.
         let err = match err.downcast::<wacore::send::NoRecipientDeviceError>() {
             Ok(no_recipient) => return SendError::NoRecipientDevice(no_recipient),
+            Err(other) => other,
+        };
+        // Same reasoning one layer down: the send never reached the wire, and
+        // the caller's answer is a device-refreshing retry rather than a resend.
+        let err = match err.downcast::<wacore::send::PrimaryDeviceRejected>() {
+            Ok(rejected) => return SendError::PrimaryDeviceRejected(rejected),
             Err(other) => other,
         };
         // A group-metadata IQ in the send path (e.g. query_info) bubbles up as
@@ -222,6 +234,9 @@ struct SendBranchOutput {
     ack_phash: Option<wacore_binary::CompactString>,
     /// DM branch only: what the recipient half of the fan-out reached.
     recipient_fanout: Option<RecipientFanout>,
+    /// DM branch only: the device set the stanza covered, shared with the memo
+    /// entry it came from. Handed to the phash waiter as its exclude list.
+    dm_devices: Option<std::sync::Arc<wacore::send::ResolvedDmDevices>>,
 }
 
 struct GroupBranchRequest<'a> {
@@ -321,6 +336,7 @@ impl SendBranchOutput {
             issue_tc_token_after_send: false,
             ack_phash: None,
             recipient_fanout: None,
+            dm_devices: None,
         }
     }
 }
@@ -477,6 +493,28 @@ pub(crate) struct SendPipelineOptions<'a> {
     /// Without this, the borrowed id clobbers the original message's retry
     /// content and outbound secret.
     pub(crate) borrowed_message_id: bool,
+}
+
+/// The devices a freshly resolved fan-out holds that the sent stanza did not.
+///
+/// The other direction is deliberately not reported: a device the send covered
+/// and the refresh dropped has already received its copy, and the refresh is
+/// the whole repair it needs.
+fn devices_missed_by_send(covered: &[Jid], fresh: &[Jid]) -> Vec<Jid> {
+    // Linear scan rather than a set: both sides are one user's devices plus our
+    // own, which is single digits, and this runs only on a mismatch.
+    fresh
+        .iter()
+        .filter(|device| !covered.contains(device))
+        .cloned()
+        .collect()
+}
+
+/// What a DM phash mismatch needs to deliver the message to the devices its
+/// stanza missed: the id to resend under, and the set it already covered.
+pub(crate) struct DmDeltaResend<'a> {
+    pub(crate) message_id: &'a str,
+    pub(crate) covered: std::sync::Arc<wacore::send::ResolvedDmDevices>,
 }
 
 /// Result of a successfully sent message.
@@ -1034,6 +1072,7 @@ impl Client {
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
 
+        let to = canonical_user_server(to);
         validate_extra_stanza_nodes(&options.extra_stanza_nodes)?;
         if options.message_id.as_ref().is_some_and(String::is_empty) {
             return Err(SendError::InvalidRequest(
@@ -1388,7 +1427,7 @@ impl Client {
             .optional_string("phash")
             .map(|s| wacore_binary::CompactString::from(s.as_ref()));
         if let Some(phash) = ack.clone() {
-            self.register_phash_waiter(&request_id, phash, to.clone(), true);
+            self.register_phash_waiter(&request_id, phash, to.clone(), true, None);
         }
 
         if let Err(e) = self.send_node(stanza).await {
@@ -1756,16 +1795,17 @@ impl Client {
     /// the common path costs a string comparison on the read loop.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.phash_mismatch", level = "debug", skip_all, fields(jid = %jid.observe())))]
     pub(crate) async fn handle_phash_mismatch(
-        &self,
+        self: &std::sync::Arc<Self>,
         jid: &Jid,
         our_phash: &str,
         server_phash: &str,
         invalidate_group_cache: bool,
+        resend: Option<DmDeltaResend<'_>>,
     ) {
         // The one signal a bot gets that its participant device set disagrees
-        // with the server's, whatever the cause. What follows repairs a
-        // participant-level divergence; a device-level one only gets logged
-        // here, so keep the line saying what happened and not what was fixed.
+        // with the server's, whatever the cause. What follows repairs the
+        // participant-level divergence and, for a DM, delivers the message to
+        // the devices the divergence hid.
         log::warn!(
             "Phash mismatch for {}: ours={our_phash}, server={server_phash}",
             jid.observe()
@@ -1814,6 +1854,112 @@ impl Client {
         if invalidate_group_cache {
             self.lock_group_metadata(jid).await.invalidate().await;
         }
+        // Last, so the re-resolve below reads through the invalidations above
+        // rather than racing them.
+        if let Some(resend) = resend {
+            self.resend_dm_to_uncovered_devices(jid, resend).await;
+        }
+    }
+
+    /// Deliver a DM to the devices a refreshed list holds and the sent stanza
+    /// did not.
+    ///
+    /// The mismatch says the server saw a device set we did not, and the caller
+    /// already has an `Ok` for this message id, so the repair is a resend to
+    /// the difference rather than an error or a full re-send: WA Web answers
+    /// the same ack by enqueueing `resendUserMsg` with an `excludeList` of the
+    /// devices that already hold a copy. Each device is retransmitted
+    /// pairwise, under the original message id, so a device that receives both
+    /// copies deduplicates on it.
+    async fn resend_dm_to_uncovered_devices(
+        self: &std::sync::Arc<Self>,
+        chat: &Jid,
+        resend: DmDeltaResend<'_>,
+    ) {
+        let DmDeltaResend {
+            message_id,
+            covered,
+        } = resend;
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let Some(own_jid) = device_snapshot.pn.clone() else {
+            return;
+        };
+        let recipient_bare = self.resolve_dm_wire_jid(chat).await;
+        let fresh = match self
+            .resolve_dm_devices_memoized(
+                chat,
+                &recipient_bare,
+                &own_jid,
+                device_snapshot.lid.as_ref(),
+                crate::cache::Freshness::Refresh,
+            )
+            .await
+        {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                log::warn!(
+                    "phash mismatch for {}: could not re-resolve devices: {e:?}",
+                    chat.observe()
+                );
+                return;
+            }
+        };
+
+        let uncovered = devices_missed_by_send(covered.devices(), fresh.devices());
+        if uncovered.is_empty() {
+            // The set disagreed with the server's without gaining a device:
+            // the divergence was a device we sent to and the server no longer
+            // counts, which the refresh above has already fixed.
+            log::debug!(
+                "phash mismatch for {}: refreshed list holds no device the send missed",
+                chat.observe()
+            );
+            return;
+        }
+
+        // Looked up after the refresh, not before: repairing the device list is
+        // worth doing whether or not the plaintext is still around to resend.
+        let Some((message, _)) = self.peek_recent_message(chat, message_id).await else {
+            log::debug!(
+                "phash mismatch for {}: message {message_id} is no longer cached; \
+                 the device list is refreshed, so the next send reaches everyone",
+                chat.observe()
+            );
+            return;
+        };
+
+        log::info!(
+            "phash mismatch for {}: resending {message_id} to {} device(s) the send missed",
+            chat.observe(),
+            uncovered.len()
+        );
+        for device in uncovered {
+            // Our own companion needs the chat named as the recipient, or the
+            // copy it receives has no destination to file itself under; a peer
+            // device is its own routing identity.
+            let is_own = device.user == own_jid.user
+                || device_snapshot
+                    .lid
+                    .as_ref()
+                    .is_some_and(|lid| device.user == lid.user);
+            let mut request = crate::features::MessageRetransmission::new(
+                chat.clone(),
+                device.clone(),
+                message.clone(),
+                message_id.to_string(),
+                1,
+            );
+            if is_own {
+                request = request.with_recipient(chat.clone());
+            }
+            if let Err(e) = self.retransmit_message(request).await {
+                log::warn!(
+                    "phash mismatch for {}: resend of {message_id} to {} failed: {e}",
+                    chat.observe(),
+                    device.observe()
+                );
+            }
+        }
     }
 
     /// Ensure the status stanza has a <participants> node listing all recipient
@@ -1847,6 +1993,7 @@ impl Client {
             device_freshness,
             borrowed_message_id,
         } = options;
+        let to = canonical_user_server(to);
         // Callers that already stamped their message hand the instant down; the
         // rest sample here so the pipeline below still has exactly one.
         let sent_at = sent_at.unwrap_or_else(SendInstant::now);
@@ -1918,6 +2065,7 @@ impl Client {
             issue_tc_token_after_send: should_issue_tc_token_after_send,
             ack_phash,
             recipient_fanout,
+            dm_devices: covered_dm_devices,
         } = if peer && !to.is_group() {
             box_send_branch(self.send_peer_branch(to, message, request_id)).await?
         } else if to.is_group() {
@@ -1980,6 +2128,7 @@ impl Client {
                 phash,
                 tc_issue_target.clone(),
                 invalidate_group,
+                covered_dm_devices,
             );
             Some(request_id)
         } else {
@@ -2470,6 +2619,7 @@ impl Client {
             issue_tc_token_after_send: false,
             ack_phash: group_ack_phash,
             recipient_fanout: None,
+            dm_devices: None,
         })
     }
 
@@ -2491,7 +2641,7 @@ impl Client {
             borrowed_message_id,
         } = request;
         let mut should_issue_tc_token_after_send = false;
-        let prepared = {
+        let (prepared, dm_devices) = {
             // Per-device locking to match decrypt path (message.rs:684),
             // preventing ratchet desync on concurrent send/receive.
 
@@ -2599,7 +2749,7 @@ impl Client {
 
             let mut stores = store_adapter.as_signal_stores();
 
-            wacore::send::prepare_dm_stanza(
+            let prepared = wacore::send::prepare_dm_stanza(
                 &*self.runtime,
                 &mut stores,
                 self,
@@ -2616,7 +2766,8 @@ impl Client {
                     pre_encoded: shared_content.as_deref().map(Vec::as_slice),
                 },
             )
-            .await?
+            .await?;
+            (prepared, dm_devices)
         };
         Ok(SendBranchOutput {
             node: prepared.node,
@@ -2626,7 +2777,13 @@ impl Client {
             distribution_guard: None,
             issue_tc_token_after_send: should_issue_tc_token_after_send,
             ack_phash: prepared.phash,
-            recipient_fanout: Some(prepared.recipient_fanout),
+            // A status reaction borrows this branch but keeps `status@broadcast`
+            // as the result's `to`, and the devices below are the status
+            // author's. Reporting either would describe a status send in a DM's
+            // terms, and the delta resend would route the retransmission as a
+            // status message rather than to the device it names.
+            recipient_fanout: (!is_status_addon).then_some(prepared.recipient_fanout),
+            dm_devices: (!is_status_addon).then_some(dm_devices),
         })
     }
 
@@ -2762,9 +2919,28 @@ pub(crate) fn is_self_dm_recipient(
 ) -> bool {
     match recipient_bare.server {
         Server::Lid => own_lid.is_some_and(|lid| recipient_bare.user == lid.user),
-        Server::Pn => recipient_bare.user == own_pn.user,
+        // `Legacy` alongside `Pn` for the same reason `canonical_user_server`
+        // exists: both name a phone user, and reading one as "not me" sends a
+        // note to self down the third-party path.
+        Server::Pn | Server::Legacy => recipient_bare.user == own_pn.user,
         _ => false,
     }
+}
+
+/// `@c.us` is not a namespace of its own: it is what WA Web calls a phone user
+/// in memory, mapped to `s.whatsapp.net` only when a wid is serialized
+/// (`WAWebWid`: `this.server==="c.us"?"s.whatsapp.net":this.server`). We take
+/// `Server::Pn` as the canonical spelling instead, so a `to` that arrives the
+/// other way is rewritten here rather than travelling the send path as a
+/// namespace nothing recognises: `is_pn()` is false for it, so it misses the
+/// self-chat check, the PN-to-LID usync, the LID resolution and, worst, the
+/// pre-key fetch, whose response is matched back by whole-`Jid` equality and
+/// so reports every bundle the server did return as absent.
+pub(crate) fn canonical_user_server(mut jid: Jid) -> Jid {
+    if jid.server == Server::Legacy {
+        jid.server = Server::Pn;
+    }
+    jid
 }
 
 /// The outer `<message to>`, the DeviceSentMessage destinationJid, and the
@@ -4130,7 +4306,7 @@ mod tests {
 
         fixture
             .client
-            .handle_phash_mismatch(&fixture.group, "2:ours", "2:theirs", true)
+            .handle_phash_mismatch(&fixture.group, "2:ours", "2:theirs", true, None)
             .await;
 
         let after = fixture.client.skdm_device_map(&group_str).await;
@@ -4371,6 +4547,7 @@ mod tests {
     const SELF_LID: &str = "111111111111111";
     const SELF_DEVICE: u16 = 7;
     const OTHER_LID: &str = "222222222222222";
+    const OTHER_PN: &str = "5500000000001";
 
     #[test]
     fn self_dm_lid_recipient_matches_own_lid() {
@@ -4398,6 +4575,47 @@ mod tests {
         let recipient = Jid::pn(SELF_PN);
 
         assert!(is_self_dm_recipient(&recipient, &own_pn, None));
+    }
+
+    /// A note to self addressed in the legacy namespace is still a note to
+    /// self. Read as a third party it takes the recipient path and asks the
+    /// server for our own pre-key bundles, which is the shape the reporter of
+    /// #1361 saw on every failing send.
+    #[test]
+    fn self_dm_legacy_recipient_matches_own_pn() {
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
+        let recipient = Jid::new(SELF_PN, Server::Legacy);
+
+        assert!(is_self_dm_recipient(&recipient, &own_pn, Some(&own_lid)));
+    }
+
+    #[test]
+    fn non_self_legacy_recipient_is_not_self_dm() {
+        let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
+        let recipient = Jid::new(OTHER_PN, Server::Legacy);
+
+        assert!(!is_self_dm_recipient(&recipient, &own_pn, None));
+    }
+
+    /// `Legacy` is a spelling of the phone-user namespace, not a namespace of
+    /// its own, and only that one is rewritten: nothing else may be quietly
+    /// re-pointed at a different server.
+    #[test]
+    fn canonical_user_server_rewrites_only_legacy() {
+        assert_eq!(
+            canonical_user_server(Jid::new(OTHER_PN, Server::Legacy).with_device(3)),
+            Jid::pn_device(OTHER_PN, 3),
+            "the device survives the rewrite"
+        );
+        for untouched in [
+            Jid::pn(OTHER_PN),
+            Jid::lid(OTHER_LID),
+            Jid::group("120363000000000000"),
+            Jid::status_broadcast(),
+        ] {
+            assert_eq!(canonical_user_server(untouched.clone()), untouched);
+        }
     }
 
     #[test]
@@ -7170,16 +7388,9 @@ mod tests {
             "ordinary text messages must produce a reporting token + secret"
         );
         let result = result.unwrap();
+        // PreparedDmStanza/PreparedGroupStanza carry this exact array through to
+        // send_message_impl, which calls persist_outbound_msg_secret with it.
         assert_eq!(result.message_secret.len(), 32);
-        // PreparedDmStanza/PreparedGroupStanza now carry this exact array
-        // through to send_message_impl which calls persist_outbound_msg_secret.
-        let prepared = wacore::send::PreparedDmStanza {
-            node: NodeBuilder::new("message").build(),
-            recipient_fanout: Default::default(),
-            phash: None,
-            message_secret: Some(result.message_secret),
-        };
-        assert_eq!(prepared.message_secret.as_ref().unwrap().len(), 32);
     }
 
     /// A send names its message once and every downstream stage reads that same
@@ -7260,6 +7471,217 @@ mod tests {
         );
         assert!(!fanout.is_partial());
         assert!(!fanout.skipped_primary);
+    }
+
+    /// A status reaction borrows the DM branch but keeps `status@broadcast` as
+    /// the result's chat, so the fan-out it happens to compute describes the
+    /// status author's devices and not the send the caller made. Reporting it
+    /// would invite a caller to apply a DM's delivery policy to a status.
+    #[tokio::test]
+    async fn a_status_reaction_reports_no_recipient_fanout() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+
+        let reaction = wa::Message {
+            reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+                key: buffa::MessageField::some(wa::MessageKey {
+                    remote_jid: Some(Jid::status_broadcast().to_string()),
+                    from_me: Some(false),
+                    id: Some("STATUSPOST1".into()),
+                    participant: Some(peer_pn.to_string()),
+                }),
+                text: Some("\u{1f44d}".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = client
+            .send_message(Jid::status_broadcast(), reaction)
+            .await
+            .expect("a status reaction fans out to the author's devices");
+
+        assert_eq!(result.to, Jid::status_broadcast(), "the chat is the status");
+        assert!(
+            result.recipient_fanout.is_none(),
+            "a status send must not describe itself in a DM's terms"
+        );
+    }
+
+    /// `@c.us` is the namespace WA Web keeps a phone user in; a caller that
+    /// spells a recipient that way is naming a PN user, and the send must treat
+    /// it as one. Left alone it misses `is_pn()` everywhere that matters, most
+    /// damagingly in the pre-key fetch, whose response is matched back by whole
+    /// jid and so reports every bundle as absent.
+    #[tokio::test]
+    async fn a_legacy_namespace_recipient_is_sent_as_a_phone_user() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+        let legacy = Jid::new(peer_pn.user.as_str(), Server::Legacy);
+
+        let message_id = "LEGACYNSDM1";
+        client
+            .send_message_with_options(
+                legacy,
+                wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+                SendOptions::default().with_message_id(message_id),
+            )
+            .await
+            .expect("a legacy-spelled recipient is a recipient");
+
+        let stanza = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let stanza = stanza.get();
+        assert_eq!(stanza.tag, "message");
+        let to = stanza
+            .attrs()
+            .optional_jid("to")
+            .expect("the stanza names its chat");
+        assert_ne!(
+            to.server,
+            Server::Legacy,
+            "the legacy spelling must not reach the wire: {to}"
+        );
+        assert_eq!(to.user, peer_pn.user, "and it must still be the same user");
+    }
+
+    /// The exclude list: only what the refresh added is resent. A device the
+    /// send covered has its copy, and one the refresh dropped is not worth a
+    /// second attempt, so neither belongs in the delta.
+    #[test]
+    fn only_the_devices_a_refresh_adds_are_resent() {
+        let peer_primary: Jid = "5511900000090:0@s.whatsapp.net".parse().unwrap();
+        let peer_new: Jid = "5511900000090:4@s.whatsapp.net".parse().unwrap();
+        let peer_gone: Jid = "5511900000090:9@s.whatsapp.net".parse().unwrap();
+        let own_companion: Jid = "5511900000091:2@s.whatsapp.net".parse().unwrap();
+
+        let covered = [peer_primary.clone(), peer_gone.clone()];
+        let fresh = [
+            peer_primary.clone(),
+            peer_new.clone(),
+            own_companion.clone(),
+        ];
+
+        assert_eq!(
+            devices_missed_by_send(&covered, &fresh),
+            vec![peer_new, own_companion],
+            "a device the send covered stays out, and one it lost is not chased"
+        );
+        assert!(
+            devices_missed_by_send(&covered, &covered).is_empty(),
+            "an unchanged list resends nothing"
+        );
+        assert!(
+            devices_missed_by_send(&fresh, &[]).is_empty(),
+            "a refresh that found nothing resends nothing"
+        );
+    }
+
+    /// A DM whose ack disagrees on the phash re-resolves the peer's device list
+    /// from the server, which is the first half of the repair: WA Web answers
+    /// the same ack with `fetchResendMissingKeys` + `syncDeviceListJob` before
+    /// enqueueing its resend. Before this the mismatch only dropped caches, so
+    /// the divergence was not acted on until some later send happened to
+    /// re-resolve.
+    #[tokio::test]
+    async fn a_dm_phash_mismatch_re_resolves_the_peer_device_list() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+
+        let message_id = "DMPHASHMISMATCH1";
+        client
+            .send_message_with_options(
+                peer_pn.clone(),
+                wa::Message {
+                    conversation: Some("hi".into()),
+                    ..Default::default()
+                },
+                SendOptions::default().with_message_id(message_id),
+            )
+            .await
+            .expect("the send itself succeeds");
+
+        assert!(
+            deliver_dm_ack(&client, message_id, "2:notwhatwesent"),
+            "the send's waiter must claim its own ack"
+        );
+
+        let usync = wait_for_usync_request(&transport, 8).await;
+        assert!(
+            usync,
+            "a disagreeing phash must ask the server for the device list again"
+        );
+    }
+
+    /// The mismatch handler is only armed for a DM. A group answers its own
+    /// mismatch by re-querying metadata, and a status reaction keeps
+    /// `status@broadcast` as its chat, so neither may enter the pairwise
+    /// resend: it would address a retransmission to the wrong route.
+    #[tokio::test]
+    async fn a_group_phash_mismatch_arms_no_dm_resend() {
+        let fixture = GroupSendFixture::new().await;
+        let message_id = "GROUPPHASHNODMRESEND";
+        fixture.send_with_id(message_id).await;
+
+        let waiter = fixture
+            .client
+            .response_waiters_guard()
+            .remove(message_id)
+            .expect("the group send registered its phash waiter");
+        let crate::client::ResponseWaiter::Phash(waiter) = waiter else {
+            panic!("a phash send registers a phash waiter");
+        };
+        assert!(
+            waiter.dm_devices.is_none(),
+            "a group send must not carry a DM exclude list"
+        );
+    }
+
+    /// Deliver an ack carrying `phash` to whatever waiter claims `message_id`.
+    fn deliver_dm_ack(client: &Arc<Client>, message_id: &str, phash: &str) -> bool {
+        let node = NodeBuilder::new("ack")
+            .attr("id", message_id)
+            .attr("from", "s.whatsapp.net")
+            .attr("phash", phash)
+            .build();
+        let marshaled =
+            wacore_binary::marshal::marshal_ref(&node.as_node_ref()).expect("valid node");
+        let owned = wacore_binary::OwnedNodeRef::new(
+            wacore_binary::util::unpack(&marshaled)
+                .expect("packed payload")
+                .into_owned(),
+        )
+        .expect("valid node");
+        client.handle_ack_response_arc(&Arc::new(owned))
+    }
+
+    /// True once one of the first `limit` frames the client wrote is a usync
+    /// device query. Frames decrypt in order, so they are read in order.
+    async fn wait_for_usync_request(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        limit: usize,
+    ) -> bool {
+        for index in 0..limit {
+            let Ok(node) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::test_utils::decode_sent_iq(transport, index),
+            )
+            .await
+            else {
+                return false;
+            };
+            let node = node.get();
+            if node.tag == "iq"
+                && node
+                    .get_attr("xmlns")
+                    .is_some_and(|ns| ns.as_str() == "usync")
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// The waiter is installed before the stanza reaches the socket (a fast ack
