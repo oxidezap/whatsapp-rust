@@ -43,7 +43,7 @@ fn get_bytes_content_ref<'a>(node: &'a NodeRef<'_>) -> Option<&'a [u8]> {
 const RECREATE_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 #[derive(Clone, Copy)]
-enum RetransmissionRoute {
+pub(crate) enum RetransmissionRoute {
     Direct,
     Group,
     Status,
@@ -62,20 +62,20 @@ fn is_own_account_jid(jid: &Jid, own_pn: Option<&Jid>, own_lid: Option<&Jid>) ->
         || own_lid.is_some_and(|lid| jid.is_same_user_as(lid))
 }
 
-struct PreparedRetransmission {
-    route: RetransmissionRoute,
-    chat: Jid,
-    wire_requester: Jid,
-    encryption_jid: Jid,
-    message: wa::Message,
-    message_id: String,
-    retry_count: u8,
-    recipient: Option<Jid>,
-    group_info: Option<Arc<wacore::client::context::GroupInfo>>,
+pub(crate) struct PreparedRetransmission {
+    pub(crate) route: RetransmissionRoute,
+    pub(crate) chat: Jid,
+    pub(crate) wire_requester: Jid,
+    pub(crate) encryption_jid: Jid,
+    pub(crate) message: wa::Message,
+    pub(crate) message_id: String,
+    pub(crate) retry_count: u8,
+    pub(crate) recipient: Option<Jid>,
+    pub(crate) group_info: Option<Arc<wacore::client::context::GroupInfo>>,
     /// Canonical unpadded protobuf bytes shared with the recent-message cache.
     /// Public retransmissions provide them; the automatic path may fall back
     /// to its already-decoded message when the cache bytes are unavailable.
-    pre_encoded: Option<Arc<Vec<u8>>>,
+    pub(crate) pre_encoded: Option<Arc<Vec<u8>>>,
 }
 
 fn validate_retransmission(
@@ -829,7 +829,7 @@ impl Client {
         Ok(())
     }
 
-    async fn retransmit_message_prepared(
+    pub(crate) async fn retransmit_message_prepared(
         &self,
         request: PreparedRetransmission,
     ) -> Result<(), anyhow::Error> {

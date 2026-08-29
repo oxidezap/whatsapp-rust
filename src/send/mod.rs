@@ -1917,23 +1917,26 @@ impl Client {
             return;
         }
 
-        // Looked up after the refresh, not before: repairing the device list is
-        // worth doing whether or not the plaintext is still around to resend.
-        let Some((message, _)) = self.peek_recent_message(chat, message_id).await else {
-            log::debug!(
-                "phash mismatch for {}: message {message_id} is no longer cached; \
-                 the device list is refreshed, so the next send reaches everyone",
-                chat.observe()
-            );
-            return;
-        };
-
         log::info!(
             "phash mismatch for {}: resending {message_id} to {} device(s) the send missed",
             chat.observe(),
             uncovered.len()
         );
         for device in uncovered {
+            // Decoded per device rather than cloned once and copied: a
+            // `wa::Message` clone is its own ~66 KiB of instantiated code, and
+            // this path runs only on a mismatch, so the decode the retry cache
+            // already does is the cheaper of the two to pay for. Read inside
+            // the loop for the same reason, which also keeps the device-list
+            // refresh above worth doing when the plaintext has aged out.
+            let Some((owned, _)) = self.peek_recent_message(chat, message_id).await else {
+                log::debug!(
+                    "phash mismatch for {}: message {message_id} is no longer cached; \
+                     the device list is refreshed, so the next send reaches everyone",
+                    chat.observe()
+                );
+                return;
+            };
             // Our own companion needs the chat named as the recipient, or the
             // copy it receives has no destination to file itself under; a peer
             // device is its own routing identity.
@@ -1942,17 +1945,29 @@ impl Client {
                     .lid
                     .as_ref()
                     .is_some_and(|lid| device.user == lid.user);
-            let mut request = crate::features::MessageRetransmission::new(
-                chat.clone(),
-                device.clone(),
-                message.clone(),
-                message_id.to_string(),
-                1,
-            );
-            if is_own {
-                request = request.with_recipient(chat.clone());
-            }
-            if let Err(e) = self.retransmit_message(request).await {
+            // Straight to the prepared form rather than through
+            // `retransmit_message`: its validation guards a caller-supplied
+            // request, and every jid here was built from our own resolved
+            // device list. The route is known to be `Direct`, so its
+            // group-metadata query would answer a question this cannot ask.
+            let outcome = self
+                .retransmit_message_prepared(crate::retry::PreparedRetransmission {
+                    route: crate::retry::RetransmissionRoute::Direct,
+                    chat: chat.clone(),
+                    wire_requester: device.clone(),
+                    // The session address, which is LID wherever a mapping is
+                    // known: the same rule `retransmit_message` applies for
+                    // this route, and the one the fan-out encrypted under.
+                    encryption_jid: self.resolve_encryption_jid(&device).await,
+                    message: owned,
+                    message_id: message_id.to_string(),
+                    retry_count: 1,
+                    recipient: is_own.then(|| chat.clone()),
+                    group_info: None,
+                    pre_encoded: None,
+                })
+                .await;
+            if let Err(e) = outcome {
                 log::warn!(
                     "phash mismatch for {}: resend of {message_id} to {} failed: {e}",
                     chat.observe(),
