@@ -384,7 +384,13 @@ mod tests {
         client
             .persistence_manager
             .backend()
-            .set_version(WAPatchName::Regular.as_str(), HashState::default())
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                HashState {
+                    bootstrapped: true,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("the test backend should accept a version");
 
