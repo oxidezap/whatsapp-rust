@@ -57,6 +57,14 @@ pub use wacore::voip::{
     OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
 };
 pub use wacore::voip::{CallEvent, GroupCallState, GroupStateApply, VideoUpgradeToken};
+// The platform transport seam, beside the facade that consults it: a consumer installing one
+// through `Client::set_relay_transport_provider` reaches for all three, and having to name `wacore`
+// for them while naming `whatsapp_rust` for the call is a paper cut on the one path this crate now
+// asks a platform to implement.
+pub use wacore::voip::{
+    RelayEndpointParams, RelayTransport, RelayTransportEvent, RelayTransportFactory,
+    RelayTransportProvider,
+};
 // `CallEvent::VideoStateChanged` carries this; surface it next to CallEvent (it lives in wacore).
 pub use wacore::types::call::VideoState;
 pub use wacore::types::group_call::{
