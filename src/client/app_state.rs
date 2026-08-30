@@ -2420,14 +2420,7 @@ impl Client {
         if stored.is_none() {
             full_sync = true;
         }
-        let had_record = stored.is_some();
         let mut state = stored.unwrap_or_default();
-        // Whether this run put anything of the server's into `state`. A bootstrap
-        // that was deferred before applying a single page has nothing to write,
-        // and writing version 0 anyway would hand the next sync a record saying
-        // the collection had synced -- so it would ask for patches, and a
-        // non-genesis first patch over an empty ltHash is refused.
-        let mut applied_anything = false;
 
         let mut has_more = true;
         let mut want_snapshot = full_sync;
@@ -2615,27 +2608,20 @@ impl Client {
             }
 
             state = new_state;
-            applied_anything = true;
             has_more = list.has_more_patches;
             // After the first batch, never request a snapshot again — only incremental patches.
             want_snapshot = false;
             debug!(target: "Client/AppState", "After processing batch name={:?} has_more={has_more} new_version={}", name, state.version);
         }
 
-        // A completed run records the collection even when the server had nothing
-        // to send: that is the bootstrap, and the record is what stops the next
-        // sync asking for a snapshot again. A deferred one only writes what it
-        // actually applied.
-        if had_record || applied_anything || outcome == SyncOutcome::Completed {
-            backend.set_version(name.as_str(), state.clone()).await?;
-        } else {
-            debug!(
-                target: "Client/AppState",
-                "{name:?} was deferred before it applied anything; leaving it unsynced \
-                 rather than recording a version it never reached"
-            );
-        }
-
+        // No version write here. `process_patch_list` persists each page as it
+        // applies it, the snapshot branch persists its baseline, and a bootstrap
+        // the server answered with nothing persists its zero -- all inside the
+        // same section that writes the mutation MACs. A second write from out
+        // here would carry a `state` read before several awaits, and could land
+        // after a replacement connection had already moved the collection,
+        // putting the older version back next to the newer MACs. The batched
+        // path removed its own copy of this write for exactly that reason.
         debug!(target: "Client/AppState", "Finished app state sync for {name:?} as {outcome:?} (final version={})", state.version);
         Ok(outcome)
     }
@@ -3153,6 +3139,20 @@ impl Client {
             }
         };
 
+        // What the recovery has to move. Read before it runs, compared after:
+        // "the sync completed" is not "the collection advanced", and only the
+        // second one makes another send worth its round trip. A conflict the
+        // server answers with `has_more: false`, a re-sync that returns nothing
+        // new, and a patch list the processor refuses all end the same way --
+        // the base exactly where the refused patch was built.
+        let backend = self.persistence_manager.backend();
+        let base_before = backend
+            .get_version(collection_name)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.version);
+
         // `has_more` means the server held patches back, so even a clean apply
         // leaves the base short of the head.
         if !applied || has_more {
@@ -3190,6 +3190,24 @@ impl Client {
                 }
                 Ok(SyncOutcome::Completed) => {}
             }
+        }
+
+        let base_after = backend
+            .get_version(collection_name)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.version);
+        if base_after == base_before {
+            warn!(
+                target: "Client/AppState",
+                "Recovering {collection_name} left the base at {base_before:?}; \
+                 rebuilding would send the same patch again"
+            );
+            return Recovery::Failed(anyhow::anyhow!(
+                "recovering {collection_name} did not move it past v{}",
+                base_before.unwrap_or(0)
+            ));
         }
         Recovery::Recovered
     }
@@ -3625,7 +3643,34 @@ mod send_patch_response_tests {
                 Some(code) => collection_error_result(&id, response_collection, code),
                 None => empty_sync_result(&id, response_collection),
             };
+            let clean_resync = attempt == 0 && matches!(reply(attempt), None);
             crate::test_utils::answer_iq(client, &id, &response).await;
+            // A re-sync the server answers cleanly is one that found it ahead of
+            // us, so it moves the base -- which is what makes the next patch a
+            // different request rather than the same one. The real
+            // `process_patch_list` does this from the patches it applies; the
+            // empty fixture has none, so the harness stands in for it. Without
+            // this the mock says "your base is stale" and then "nothing new",
+            // which no server does, and the retry it provoked was measuring an
+            // impossible sequence.
+            if clean_resync {
+                let backend = client.persistence_manager.backend();
+                let current = backend
+                    .get_version(COLLECTION)
+                    .await
+                    .expect("the test backend should be readable")
+                    .unwrap_or_default();
+                backend
+                    .set_version(
+                        COLLECTION,
+                        wacore::appstate::hash::HashState {
+                            version: current.version + 1,
+                            ..current
+                        },
+                    )
+                    .await
+                    .expect("the test backend should accept a version");
+            }
             frame += 1;
         }
     }
@@ -3809,6 +3854,23 @@ mod send_patch_response_tests {
         );
     }
 
+    /// A conflict the server says has nothing more coming is not a recovery
+    /// either. It is the benign shape -- the scheduler should not burn its retry
+    /// budget rediscovering it -- but it applies nothing, so the base is exactly
+    /// where the refused patch was built and re-sending is the same request.
+    #[tokio::test]
+    async fn a_conflict_whose_resync_also_conflicts_stops_at_the_first_attempt() {
+        let (result, patches) = send_against(|_| Some("409")).await;
+        let err = result.expect_err("a re-sync that applied nothing is not a recovery");
+        assert!(
+            format!("{err:#}").contains("could not be recovered"),
+            "the error should say the collection could not be recovered, got: {err:#}"
+        );
+        assert_eq!(
+            patches, 1,
+            "a base that did not move makes the next attempt the same request"
+        );
+    }
     /// Production shape, and review of #1365: a re-sync whose collection comes
     /// back with an error advances nothing, but the loop around it still ends,
     /// so `SyncOutcome::Completed` said "recovered" and the send re-tried the
