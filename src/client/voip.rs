@@ -46,6 +46,14 @@ use super::{Client, ClientError};
 
 #[cfg(feature = "voip-runtime")]
 const CALL_SERVICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an installed [`RelayTransportProvider`](wacore::voip::RelayTransportProvider) has to
+/// hand back a factory before the call gives up on it.
+///
+/// Generous, because building one may involve a real device or a permission prompt, and short
+/// enough that a provider which never answers fails the call instead of parking its setup task
+/// forever.
+#[cfg(feature = "voip-runtime")]
+const RELAY_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(feature = "voip-runtime")]
 const WAITING_ROOM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(feature = "voip-runtime")]
@@ -446,10 +454,33 @@ impl Client {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         if let Some(provider) = installed {
-            return provider
-                .factory(relay)
-                .await
-                .map_err(|e| CallError::Setup(format!("relay transport for {addr}: {e}")));
+            // Bounded, because this await is new and a stalled one is worse than it looks. The
+            // native dialer this replaced was a synchronous constructor, so nothing on the call
+            // setup path could park here; an installed provider is somebody else's code doing
+            // somebody else's I/O -- a browser building an `RTCPeerConnection` is a call into JS --
+            // and one that never resolves leaves the outgoing relay waiter holding a pending call
+            // it has already removed from the map, where a hangup can no longer find it to end it.
+            //
+            // A timeout rather than a race against the call's own `ended`: this is the one place
+            // every path goes through, so bounding it here covers the answer, the group join and
+            // the call-link join as well as the outgoing waiter that made it visible. It also
+            // mirrors what the native factory already does one layer down with
+            // `RELAY_CONNECT_TIMEOUT`, rather than inventing a second shape for the same problem.
+            return match wacore::runtime::timeout(
+                &*self.runtime,
+                RELAY_PROVIDER_TIMEOUT,
+                provider.factory(relay),
+            )
+            .await
+            {
+                Ok(built) => {
+                    built.map_err(|e| CallError::Setup(format!("relay transport for {addr}: {e}")))
+                }
+                Err(_) => Err(CallError::Setup(format!(
+                    "the installed relay transport provider did not answer for {addr} within \
+                     {RELAY_PROVIDER_TIMEOUT:?}"
+                ))),
+            };
         }
         #[cfg(feature = "voip-relay-native")]
         {

@@ -6184,6 +6184,44 @@ mod tests {
         assert!(printed.contains("UFRAG"), "got: {printed}");
     }
 
+    /// A provider that never answers fails the call rather than parking its setup forever.
+    ///
+    /// The await this bounds is new: the native dialer it replaced was a synchronous constructor,
+    /// so nothing on the setup path could stall here. An installed provider is somebody else's I/O,
+    /// and on the outgoing path the pending entry has already been taken out of the map by the time
+    /// it is awaited -- so a hangup can no longer find the call to end it, and `wait_ended()` would
+    /// wait on the provider rather than on the call.
+    #[tokio::test(start_paused = true)]
+    async fn a_provider_that_never_answers_does_not_park_the_call() {
+        struct NeverAnswers;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for NeverAnswers {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                std::future::pending().await
+            }
+        }
+
+        let client = make_client().await;
+        client.set_relay_transport_provider(Arc::new(NeverAnswers));
+        let endpoint = wacore::voip::RelayEndpointParams {
+            addr: "203.0.113.7:3478".parse().expect("addr"),
+            ice_ufrag: String::new(),
+            ice_pwd: String::new(),
+        };
+
+        let error = match client.relay_transport_factory(&endpoint).await {
+            Ok(_) => panic!("a provider that never answers must not resolve"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("did not answer"),
+            "the timeout has to say what it gave up on, got: {error}"
+        );
+    }
+
     /// A provider that refuses fails the call with its reason, rather than falling back to a dialer
     /// the platform may not have. A browser with no `RTCPeerConnection` is exactly this case, and
     /// the reason is the only thing a person ever sees of it.
