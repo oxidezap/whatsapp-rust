@@ -1994,7 +1994,7 @@ impl Client {
                 // could be either. The flag is what separates them, and it is
                 // false on every row that predates it -- so those bootstrap once
                 // more, which is the safe direction.
-                let want_snapshot = !stored.as_ref().is_some_and(|s| s.has_bootstrapped());
+                let want_snapshot = !stored.as_ref().is_some_and(|s| s.has_baseline());
                 let state = stored.unwrap_or_default();
                 if want_snapshot {
                     replaying_snapshot.insert(name);
@@ -2263,7 +2263,7 @@ impl Client {
                             } else if backend
                                 .get_version(name.as_str())
                                 .await?
-                                .is_some_and(|s| s.has_bootstrapped())
+                                .is_some_and(|s| s.has_baseline())
                             {
                                 // Conflict without has_more: WA Web reads this as
                                 // success once it has nothing left to push.
@@ -2425,7 +2425,7 @@ impl Client {
         // See the batched builder: a completed bootstrap is a fact the record
         // carries, not one its presence implies.
         let stored = backend.get_version(name.as_str()).await?;
-        if !stored.as_ref().is_some_and(|s| s.has_bootstrapped()) {
+        if !stored.as_ref().is_some_and(|s| s.has_baseline()) {
             full_sync = true;
         }
         let mut state = stored.unwrap_or_default();
@@ -2953,7 +2953,7 @@ impl Client {
             if !backend
                 .get_version(collection_name)
                 .await?
-                .is_some_and(|s| s.has_bootstrapped())
+                .is_some_and(|s| s.bootstrapped)
             {
                 debug!(
                     target: "Client/AppState",
@@ -2968,7 +2968,7 @@ impl Client {
                     || !backend
                         .get_version(collection_name)
                         .await?
-                        .is_some_and(|s| s.has_bootstrapped())
+                        .is_some_and(|s| s.bootstrapped)
                 {
                     return Err(anyhow::anyhow!(
                         "app-state patch for {collection_name} not attempted: \

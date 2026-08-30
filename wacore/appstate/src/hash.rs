@@ -28,7 +28,13 @@ pub struct HashState {
     /// to be trusted again.
     #[serde(default)]
     pub mac_mismatch_fatal: bool,
-    /// Whether this collection has completed a bootstrap.
+    /// Whether a bootstrap reached its terminal page.
+    ///
+    /// Set only when the run that persisted this state was not still paging, so
+    /// a partial bootstrap -- page five of sixty, then a deferral -- leaves it
+    /// false even though the version has moved. That is what makes it safe to
+    /// ask before building an outgoing patch, where a cursor behind the head
+    /// earns a 409 that the send has to unwind.
     ///
     /// Presence of a record cannot answer that on its own: a collection that has
     /// never synced and one that synced and is legitimately empty are both
@@ -55,15 +61,21 @@ impl Default for HashState {
 }
 
 impl HashState {
-    /// Whether this collection has completed a bootstrap.
+    /// Whether there is a real ltHash here to apply patches on top of.
     ///
-    /// A version past zero proves it: patches only apply on top of a baseline,
-    /// so reaching v7 means one was established. Only version zero is ambiguous
-    /// -- never synced and synced-but-empty are byte-identical there -- and that
-    /// is the case [`HashState::bootstrapped`] exists to decide. Reading the flag
-    /// alone would make every account re-download a snapshot per collection on
-    /// upgrade, for a question the version already answers.
-    pub fn has_bootstrapped(&self) -> bool {
+    /// This is the question `return_snapshot` answers: a version past zero proves
+    /// a baseline was established, since patches only apply over one. Only
+    /// version zero is ambiguous -- never synced and synced-but-empty are
+    /// byte-identical there -- and that is the case [`HashState::bootstrapped`]
+    /// decides. Asking for the flag alone would make every account re-download a
+    /// snapshot per collection on upgrade, for something the version already
+    /// answers.
+    ///
+    /// It is deliberately *not* the question to ask before building an outgoing
+    /// patch. A run that persisted page five of sixty and then stopped has a
+    /// baseline and is still behind the head; [`HashState::bootstrapped`] is what
+    /// says a bootstrap actually finished.
+    pub fn has_baseline(&self) -> bool {
         self.bootstrapped || self.version > 0
     }
 }
@@ -678,6 +690,55 @@ mod tests {
             state.hash, expected,
             "a repeated index must contribute only its last value MAC, as WA Web's Map does"
         );
+    }
+
+    /// Review of #1365: a bootstrap that persisted page five of sixty and then
+    /// stopped has a baseline and is still behind the head. Reading a positive
+    /// version as a finished bootstrap let the send guard skip its preflight and
+    /// build the user's patch on that cursor.
+    #[test]
+    fn a_partial_bootstrap_has_a_baseline_but_has_not_bootstrapped() {
+        let partial = HashState {
+            version: 5,
+            ..Default::default()
+        };
+        assert!(
+            partial.has_baseline(),
+            "page five established a baseline, so patches apply over it"
+        );
+        assert!(
+            !partial.bootstrapped,
+            "but the run never reached its terminal page"
+        );
+    }
+
+    /// The upgrade case the baseline question exists for: a row written before
+    /// the flag existed, sitting on real data.
+    #[test]
+    fn a_legacy_row_past_zero_still_counts_as_having_a_baseline() {
+        let legacy = HashState {
+            version: 7,
+            ..Default::default()
+        };
+        assert!(
+            legacy.has_baseline(),
+            "asking such a row for a snapshot would re-download one per collection \
+             on upgrade, for something the version already answers"
+        );
+    }
+
+    /// Version zero is the ambiguous case, and the only one the flag decides.
+    #[test]
+    fn at_version_zero_only_the_flag_separates_never_synced_from_empty() {
+        let never = HashState::default();
+        let empty_but_synced = HashState {
+            bootstrapped: true,
+            ..Default::default()
+        };
+        assert_eq!(never.version, empty_but_synced.version);
+        assert_eq!(never.hash, empty_but_synced.hash);
+        assert!(!never.has_baseline());
+        assert!(empty_but_synced.has_baseline());
     }
 
     /// The branch production actually takes. `MAC_DEDUP_SCAN_LIMIT` counts
