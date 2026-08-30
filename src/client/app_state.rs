@@ -3638,12 +3638,15 @@ mod send_patch_response_tests {
             } else {
                 0
             };
-            let response = match reply(attempt) {
+            // Evaluated once: `reply` is `FnMut`, so asking it twice for the same
+            // frame is asking a different question.
+            let verdict = reply(attempt);
+            let response = match verdict {
                 Some("iq-error") => iq_error_result(&id),
                 Some(code) => collection_error_result(&id, response_collection, code),
                 None => empty_sync_result(&id, response_collection),
             };
-            let clean_resync = attempt == 0 && matches!(reply(attempt), None);
+            let clean_resync = attempt == 0 && verdict.is_none();
             crate::test_utils::answer_iq(client, &id, &response).await;
             // A re-sync the server answers cleanly is one that found it ahead of
             // us, so it moves the base -- which is what makes the next patch a
