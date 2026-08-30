@@ -2208,6 +2208,39 @@ fn publish_setup_failure(events: &async_channel::Sender<CallEvent>, reason: Stri
     let _ = events.force_send(CallEvent::MediaSetupFailed(reason));
 }
 
+/// Why a setup path stopped, which is not the same question as what went wrong.
+///
+/// [`CallEvent::MediaSetupFailed`] means the media never came up *and nobody asked for that*, so
+/// it may not be published for a call that was hung up while its media was still being built:
+/// there the person who pressed the button would be told the setup they cancelled had failed, and
+/// a front end drawing the event has nothing to tell the two apart with. The distinction is only
+/// in what is published -- every stop here is still an `Err` to whoever is awaiting it, because a
+/// cancelled setup did not produce a call either.
+enum SetupStop {
+    /// Nothing came up: no relay in the ack, an engine that would not build, a provider that
+    /// refused or never answered. Published, because this is the whole reason the event exists.
+    Failed(CallError),
+    /// The call ended underneath the setup -- a local hangup, a peer `<terminate>`, a disconnect.
+    /// Not published: whoever ended it already knows, and the ordinary end is not a failure.
+    Cancelled(CallError),
+}
+
+impl SetupStop {
+    /// The error to propagate, having published the reason if there was one to publish.
+    ///
+    /// Takes the sender rather than being called beside `publish_setup_failure` so the choice is
+    /// made once, at the one exit both kinds leave through.
+    fn into_error(self, events: &async_channel::Sender<CallEvent>) -> CallError {
+        match self {
+            Self::Failed(e) => {
+                publish_setup_failure(events, e.to_string());
+                e
+            }
+            Self::Cancelled(e) => e,
+        }
+    }
+}
+
 fn fail_pending_outgoing(client: &Client, call_id: &str, generation: u64) {
     fail_pending_outgoing_with(client, call_id, generation, None);
 }
@@ -2377,15 +2410,15 @@ pub(crate) async fn attach_outgoing_relay(
             pending.call_key.clone(),
             relay,
         )
-        .map_err(|e| CallError::Setup(e.to_string()))?;
+        .map_err(|e| SetupStop::Failed(CallError::Setup(e.to_string())))?;
         config.audio = pending.audio.config();
         config.enable_video = pending.video.is_some();
         // Read the dial endpoint off the config before CallEngine::new consumes it (no second relay
         // walk).
-        let relay_endpoint = relay_endpoint_from_config(&config)?;
+        let relay_endpoint = relay_endpoint_from_config(&config).map_err(SetupStop::Failed)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
-            .map_err(|e| CallError::Setup(e.to_string()))?;
+            .map_err(|e| SetupStop::Failed(CallError::Setup(e.to_string())))?;
         // Raced against the call's own ending, not merely bounded by
         // `RELAY_PROVIDER_TIMEOUT`. The timeout is the floor -- it stops a provider that never
         // answers from parking any setup path -- but this one path can be *cancelled* rather than
@@ -2401,19 +2434,22 @@ pub(crate) async fn attach_outgoing_relay(
         )
         .await
         {
-            futures::future::Either::Left((built, _)) => built?,
+            futures::future::Either::Left((built, _)) => built.map_err(SetupStop::Failed)?,
+            // Cancelled, not failed: the call ended underneath us. Still an `Err`, because no
+            // engine attached -- but `MediaSetupFailed` here would tell whoever hung up that the
+            // setup they had just stopped was broken.
             futures::future::Either::Right(((), _)) => {
-                return Err(CallError::Connect(
+                return Err(SetupStop::Cancelled(CallError::Connect(
                     "the call ended while the relay transport was being built".into(),
-                ));
+                )));
             }
         };
-        Ok::<_, CallError>((engine, factory))
+        Ok::<_, SetupStop>((engine, factory))
     }
     .await;
     let (engine, factory) = match build {
         Ok(pair) => pair,
-        Err(e) => {
+        Err(stop) => {
             client
                 .call_registry()
                 .remove_if_current(call_id, pending.generation);
@@ -2425,10 +2461,13 @@ pub(crate) async fn attach_outgoing_relay(
             // path a browser with no WebRTC takes on every outgoing call, which is precisely the
             // one the event exists for.
             //
+            // Whether there is anything to say is `SetupStop`'s to answer: a call hung up while
+            // its transport was being built stops here too, and is not a setup failure.
+            //
             // Before `ended`, for the reason it is ordered that way there: a caller racing
             // `wait_ended()` against the stream would otherwise see the call end and then the
             // explanation.
-            publish_setup_failure(&pending.ev_tx, e.to_string());
+            let e = stop.into_error(&pending.ev_tx);
             pending.ended.notify();
             return Err(e);
         }
@@ -2968,10 +3007,19 @@ async fn attach_engine(
                 .call_registry()
                 .remove_if_current(call_id, generation);
         }
-        ended.notify();
-        return Err(CallError::Setup(
+        // Every exit below that *fails* says why through `ev_tx`, and the one that is merely
+        // cancelled does not. It has to be said here: for an outgoing call
+        // `attach_outgoing_relay` removed the `PendingOutgoing` before calling this, so the
+        // relay waiter's `fail_pending_outgoing_with` finds nothing and drops the reason with
+        // the sender it needed -- this function is the last owner of it. A caller that awaits
+        // the `Err` directly gets the reason twice and pays one queued event for it; a dormant
+        // outgoing handle gets it once instead of never.
+        let e = CallError::Setup(
             "group relay WARP tag length changed during media attachment".to_string(),
-        ));
+        );
+        publish_setup_failure(&ev_tx, e.to_string());
+        ended.notify();
+        return Err(e);
     }
     let group_ctl = Some(group_rx);
     // The registry entry already exists. Re-check is_connected NOW (after insert, before connect) so a
@@ -2985,8 +3033,10 @@ async fn attach_engine(
                 .call_registry()
                 .remove_if_current(call_id, generation);
         }
+        let e = CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into());
+        publish_setup_failure(&ev_tx, e.to_string());
         ended.notify();
-        return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
+        return Err(e);
     }
 
     // Connect failure leaves the call already visible (registry entry inserted before connect; for an
@@ -3029,25 +3079,35 @@ async fn attach_engine(
                         .call_registry()
                         .remove_if_current(call_id, generation);
                 }
-                ended.notify();
-                return Err(CallError::Connect(format!(
+                let e = CallError::Connect(format!(
                     "the relay transport did not connect within {RELAY_DIAL_CEILING:?}"
-                )));
+                ));
+                publish_setup_failure(&ev_tx, e.to_string());
+                ended.notify();
+                return Err(e);
             }
         }
     };
     let (transport, relay_events) = match dialed {
         Some(Ok(pair)) => pair,
-        Some(Err(e)) => {
+        Some(Err(dial_err)) => {
             if failure_cleanup == FailureCleanup::Here {
                 client
                     .call_registry()
                     .remove_if_current(call_id, generation);
             }
+            let e = CallError::Connect(dial_err.to_string());
+            publish_setup_failure(&ev_tx, e.to_string());
             ended.notify();
-            return Err(CallError::Connect(e.to_string()));
+            return Err(e);
         }
         // The generation was already reaped by whoever ended us; reap defensively and stop.
+        //
+        // No `MediaSetupFailed` on this one arm, and it is the reason the two are told apart at
+        // all: reaching here means `ended` won the race above, so the call was hung up,
+        // terminated by the peer, or disconnected while the dial was in flight. That is an
+        // ordinary ending, and publishing a terminal setup failure for it would tell whoever
+        // ended the call that its media had broken.
         None => {
             client
                 .call_registry()
@@ -6299,7 +6359,7 @@ mod tests {
         );
     }
 
-    /// A hangup during relay setup cancels the provider rather than waiting it out.    /// A hangup during relay setup cancels the provider rather than waiting it out.
+    /// A hangup during relay setup cancels the provider rather than waiting it out.
     ///
     /// The timeout beside this is the floor and not the answer: `attach_outgoing_relay` takes the
     /// pending entry out of the map on its way in, so a hangup arriving while the provider is
@@ -6348,7 +6408,129 @@ mod tests {
         );
     }
 
-    /// A provider that never answers fails the call rather than parking its setup forever.    /// A provider that never answers fails the call rather than parking its setup forever.
+    /// A hangup while the transport is being built is not a media setup failure.
+    ///
+    /// The two stop the same way -- no engine attaches and the caller gets a `Connect` error --
+    /// and they are not the same event. `MediaSetupFailed` is terminal and means the media never
+    /// came up *and nobody asked for that*, so publishing it for a call somebody just hung up
+    /// tells the person who pressed the button that the setup they cancelled had broken, with
+    /// nothing on the stream to tell them apart. `SetupStop` is that distinction; this is the arm
+    /// that must stay silent.
+    #[tokio::test]
+    async fn a_hangup_during_relay_setup_is_not_a_setup_failure() {
+        /// Never answers, so the hangup is what ends the setup.
+        struct NeverAnswers;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for NeverAnswers {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                std::future::pending().await
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        client.set_relay_transport_provider(Arc::new(NeverAnswers));
+
+        let attaching = {
+            let client = client.clone();
+            let call_id = call_id.clone();
+            tokio::spawn(
+                async move { attach_outgoing_relay(&client, &call_id, &sample_relay()).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        handle.hangup_local().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), attaching)
+            .await
+            .expect("the hangup must end the attach")
+            .expect("task");
+        assert!(
+            matches!(result, Err(CallError::Connect(_))),
+            "a call that ended during setup is still a Connect error, got {result:?}"
+        );
+
+        // Whatever the stream carries, none of it may claim the media setup failed.
+        while let Ok(event) = handle.events().try_recv() {
+            assert!(
+                !matches!(event, CallEvent::MediaSetupFailed(_)),
+                "a hangup published a setup failure: {event:?}"
+            );
+        }
+    }
+
+    /// A dial that fails reaches a dormant outgoing handle, rather than only its caller.
+    ///
+    /// `attach_outgoing_relay` removes the `PendingOutgoing` on its way in, so by the time
+    /// `attach_engine` gives up on the dial there is no pending entry left for the relay waiter's
+    /// `fail_pending_outgoing_with` to publish through -- it finds nothing and drops the reason
+    /// with the sender it needed. `attach_engine` is the last owner of `ev_tx`, so the reason is
+    /// said there or nowhere, and every exit of it that *fails* says one.
+    ///
+    /// Through a `connect()` that refuses rather than one that stalls, deliberately. The stalling
+    /// version tests `RELAY_DIAL_CEILING` and cannot be written here: under a paused clock this
+    /// path carries a shorter timer of its own, which fires first, ends the call, and sends the
+    /// dial into its *cancelled* arm -- so the test would pass or fail on a mechanism it is not
+    /// about. The ceiling has its own test through `spawn_call`
+    /// (`a_factory_that_never_connects_fails_the_call`); what is under test here is the
+    /// publication, and a refusing dial reaches the same exit with no clock involved.
+    #[tokio::test]
+    async fn a_failed_dial_reaches_a_dormant_handle() {
+        struct RefusesToConnect;
+        #[async_trait]
+        impl RelayTransportFactory for RefusesToConnect {
+            async fn connect(
+                &self,
+            ) -> anyhow::Result<(
+                Arc<dyn RelayTransport>,
+                async_channel::Receiver<RelayTransportEvent>,
+            )> {
+                anyhow::bail!("ICE gathering produced no candidates")
+            }
+        }
+        /// Hands back a factory promptly; it is the dial behind it that refuses.
+        struct Hands;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for Hands {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                Ok(Arc::new(RefusesToConnect))
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        client.set_relay_transport_provider(Arc::new(Hands));
+
+        let res = attach_outgoing_relay(&client, &call_id, &sample_relay()).await;
+        assert!(
+            matches!(res, Err(CallError::Connect(_))),
+            "a dial that refuses must fail the attach, got {res:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), handle.events().recv())
+            .await
+            .expect("the dial's reason must reach the handle, not only its caller")
+            .expect("the event stream must carry it before it closes");
+        match event {
+            CallEvent::MediaSetupFailed(reason) => assert!(
+                reason.contains("ICE gathering produced no candidates"),
+                "the dial's own reason has to survive to the caller, got: {reason}"
+            ),
+            other => panic!("expected MediaSetupFailed, got {other:?}"),
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
+            .await
+            .expect("and the call must still end rather than hang");
+    }
+
+    /// A provider that never answers fails the call rather than parking its setup forever.
     ///
     /// The await this bounds is new: the native dialer it replaced was a synchronous constructor,
     /// so nothing on the setup path could stall here. An installed provider is somebody else's I/O,

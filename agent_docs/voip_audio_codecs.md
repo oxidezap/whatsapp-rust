@@ -161,9 +161,11 @@ An application that already produces raw Opus packets needs only `voip-encoded`.
 
 ## Calls off the native stack
 
-`voip-relay-native` is the only VoIP feature that does not build on wasm32 or espidf, and it is the
-only one that owns a socket: one UDP endpoint per call, with DTLS, SCTP and a pre-negotiated
-DataChannel over it. Everything above it -- the offer, the answer, the engine, `CallHandle` -- is
+`voip-relay-native` is the only VoIP feature that owns a socket: one UDP endpoint per call, with
+DTLS, SCTP and a pre-negotiated DataChannel over it. It is native-only for that reason, and it is
+not the only native-only one -- `voip-libopus` is too, because libopus is C (see below). What
+separates them is that a portable target has an answer for the codec and needs one supplied for the
+transport. Everything above it -- the offer, the answer, the engine, `CallHandle` -- is
 portable, drives `wacore`'s sans-IO engine over the client's own `Arc<dyn Runtime>`, and reads no
 clock of its own.
 
