@@ -2078,6 +2078,14 @@ const GROUP_CONTROL_CHANNEL_CAPACITY: usize = 64;
 /// Returned by `CallError::Connect` when the socket drops mid-setup, before the engine is attached.
 const ERR_DISCONNECTED_DURING_SETUP: &str = "connection dropped during call setup";
 
+/// How long *any* relay factory has to hand back a connected transport.
+///
+/// Above the native dialer's own `RELAY_CONNECT_TIMEOUT`, deliberately: that one is more specific
+/// and names the endpoints it tried, so it should be the error a native call gets. This is the
+/// backstop for a factory an installed provider returned, which carries whatever bound its author
+/// gave it and, in a browser whose ICE never settles, may carry none.
+const RELAY_DIAL_CEILING: Duration = Duration::from_secs(20);
+
 /// Spawn the task that turns the offer's `<ack>` into a connected media engine: await the ack-waiter
 /// (bounded), and on a node carrying a `<relay>` attach the engine via [`attach_outgoing_relay`]
 /// (reusing its for_outgoing + generation handling). On timeout / no relay / closed channel the call
@@ -2989,30 +2997,64 @@ async fn attach_engine(
     // Race the dial against the call ending. A hangup, a peer <terminate>, or a disconnect landing in
     // this window all remove our registry entry, and its `on_terminal` hook notifies `ended` even
     // though no media task exists yet -- so selecting on `ended` drops the in-flight connect future to
-    // abort the unwanted DTLS/SCTP dial instead of letting it run to success or the 12s timeout while
-    // wait_ended() stays parked.
-    let dial = factory.connect();
-    let (transport, relay_events) =
-        match futures::future::select(dial, std::pin::pin!(ended.wait())).await {
-            futures::future::Either::Left((Ok(pair), _)) => pair,
-            futures::future::Either::Left((Err(e), _)) => {
+    // abort the unwanted DTLS/SCTP dial instead of letting it run to success while wait_ended() stays
+    // parked.
+    //
+    // And bounded, which the race alone is not. The native factory carries its own
+    // `RELAY_CONNECT_TIMEOUT` and so needed nothing here; a factory an installed provider returned
+    // carries whatever its author gave it, and a browser whose ICE never settles gives it nothing.
+    // Ending is not a floor either -- an incoming `accept()` or a group `start()` is *awaited* by
+    // its caller, so with no peer terminate there is nothing to notify `ended` and the call would
+    // hang rather than fail. This ceiling sits above the native one, so a native dial still fails
+    // with its own more specific message and only a stalled provider reaches this.
+    // Scoped, because the pinned `ended.wait()` borrows a flag this function later moves into the
+    // driver task's guard: what leaves the block is the dial's own answer, or nothing.
+    let dialed = {
+        let dial = factory.connect();
+        let ending = ended.wait();
+        futures::pin_mut!(ending);
+        match wacore::runtime::timeout(
+            &*client.runtime,
+            RELAY_DIAL_CEILING,
+            futures::future::select(dial, ending),
+        )
+        .await
+        {
+            Ok(futures::future::Either::Left((result, _))) => Some(result),
+            // Ended mid-dial: the loser `dial` future drops here, aborting the connect.
+            Ok(futures::future::Either::Right(((), _dial))) => None,
+            Err(_) => {
                 if failure_cleanup == FailureCleanup::Here {
                     client
                         .call_registry()
                         .remove_if_current(call_id, generation);
                 }
                 ended.notify();
-                return Err(CallError::Connect(e.to_string()));
+                return Err(CallError::Connect(format!(
+                    "the relay transport did not connect within {RELAY_DIAL_CEILING:?}"
+                )));
             }
-            // Ended mid-dial: the loser `dial` future drops here, aborting the connect. The generation
-            // was already reaped by whoever ended us; reap defensively and stop.
-            futures::future::Either::Right(((), _dial)) => {
+        }
+    };
+    let (transport, relay_events) = match dialed {
+        Some(Ok(pair)) => pair,
+        Some(Err(e)) => {
+            if failure_cleanup == FailureCleanup::Here {
                 client
                     .call_registry()
                     .remove_if_current(call_id, generation);
-                return Err(CallError::Connect("call ended during relay connect".into()));
             }
-        };
+            ended.notify();
+            return Err(CallError::Connect(e.to_string()));
+        }
+        // The generation was already reaped by whoever ended us; reap defensively and stop.
+        None => {
+            client
+                .call_registry()
+                .remove_if_current(call_id, generation);
+            return Err(CallError::Connect("call ended during relay connect".into()));
+        }
+    };
 
     // Only the selected I/O pair stays open. Closed inactive channels make their driver select arms
     // retire immediately without per-frame branching or idle tasks.
@@ -6203,7 +6245,61 @@ mod tests {
         assert!(printed.contains("UFRAG"), "got: {printed}");
     }
 
-    /// A hangup during relay setup cancels the provider rather than waiting it out.
+    /// A factory whose `connect()` never resolves fails the call rather than hanging it.
+    ///
+    /// The native dialer carries its own `RELAY_CONNECT_TIMEOUT`, so nothing here needed a ceiling
+    /// before a provider could supply a factory. One that an installed provider returns carries
+    /// whatever bound its author gave it -- a browser whose ICE never settles gives it none -- and
+    /// racing `ended` is not a floor on this path: an `accept()` is *awaited* by its caller, so
+    /// with no peer terminate there is nothing to notify `ended` and the await would never return.
+    #[tokio::test(start_paused = true)]
+    async fn a_factory_that_never_connects_fails_the_call() {
+        struct NeverConnects;
+        #[async_trait]
+        impl RelayTransportFactory for NeverConnects {
+            async fn connect(
+                &self,
+            ) -> anyhow::Result<(
+                Arc<dyn RelayTransport>,
+                async_channel::Receiver<RelayTransportEvent>,
+            )> {
+                std::future::pending().await
+            }
+        }
+        // Through `spawn_call` rather than the outgoing relay waiter, deliberately: that path also
+        // carries `OFFER_ACK_RELAY_TIMEOUT`, which under a paused clock fires first and ends the
+        // call before this ceiling can. Real, and a different mechanism -- what is under test here
+        // is the one that has to hold when nothing else ends the call, which is exactly an
+        // `accept()` awaiting its own setup.
+        let client = make_client().await;
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let error = match spawn_call(
+            &client,
+            mk_session(),
+            engine(),
+            &NeverConnects,
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a factory that never connects must not succeed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("did not connect within"),
+            "the ceiling has to say what it gave up on, got: {error}"
+        );
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "and the generation it registered must not be left behind"
+        );
+    }
+
+    /// A hangup during relay setup cancels the provider rather than waiting it out.    /// A hangup during relay setup cancels the provider rather than waiting it out.
     ///
     /// The timeout beside this is the floor and not the answer: `attach_outgoing_relay` takes the
     /// pending entry out of the map on its way in, so a hangup arriving while the provider is

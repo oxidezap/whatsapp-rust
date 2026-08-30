@@ -110,10 +110,19 @@ pub trait RelayTransport: crate::sync_marker::MaybeSendSync {
 /// carry credentials the relay will actually validate -- so the two ICE fields travel with the
 /// address rather than being looked up from a `RelayData` no transport is handed.
 ///
-/// Both are derived rather than invented: `ice_ufrag` is
-/// [`token_to_ice_ufrag`](crate::voip::relay_parse::token_to_ice_ufrag) of the relay token, and
-/// `ice_pwd` is the relay `<key>` in the ASCII base64 form it arrived in -- the same bytes the
-/// engine keys STUN MESSAGE-INTEGRITY with.
+/// Both are derived rather than invented, and *which* credential is which matters: the relay block
+/// carries two separately indexed token sets and swapping them is a call that will not connect.
+///
+/// - `ice_ufrag` is [`token_to_ice_ufrag`](crate::voip::relay_parse::token_to_ice_ufrag) of the
+///   selected endpoint's `<auth_token>`, indexed by its `auth_token_id`.
+/// - `ice_pwd` is the relay `<key>` in the ASCII base64 form it arrived in -- the same bytes the
+///   engine keys STUN MESSAGE-INTEGRITY with.
+///
+/// The `<token>` beside them, indexed by `token_id`, is the STUN *allocation* credential and goes
+/// on the wire as `RELAY-TOKEN`. It is never a ufrag. A ufrag built from it is refused at the
+/// browser's first connectivity check, which surfaces as a call that will not connect rather than
+/// as anything resembling a bad credential -- so it is worth naming here rather than leaving to be
+/// inferred from a neighbouring field name.
 #[derive(Clone)]
 pub struct RelayEndpointParams {
     /// Where the relay is.
