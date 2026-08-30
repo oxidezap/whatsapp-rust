@@ -299,11 +299,16 @@ yourself if you need it.
 VoIP media tasks: the **call driver** is covered. It runs on the client's own
 `Arc<dyn Runtime>` — it has to, since that is the only executor a browser build
 has — so an installed instrument meters it like any other client task. Do not
-add separate attribution for it, or the work is counted twice. What is still
-outside the hook is the native relay transport's own I/O
-(`voip-relay-native`: the UDP socket's read task and the DTLS/SCTP retransmit
-timers), which spawns on Tokio directly. A platform that installs its own
-`RelayTransportProvider` decides that side for itself.
+add separate attribution for it, or the work is counted twice.
+
+The native relay transport's own I/O is covered too, which this section used to
+deny: `voip-relay-native`'s UDP read task and DTLS/SCTP retransmit timers run
+under `relay_driver`, and `connect_relay_media` spawns it through the runtime
+`RelayMediaChannelFactory` was built with — the client's own, both before and
+after the transport-provider split. So an installed instrument already meters
+the relay, and attributing it separately double-counts it. The only VoIP work
+outside the hook is a transport an installed `RelayTransportProvider` supplies,
+which spawns wherever its author chose.
 
 ## `Client::resource_report()` — out-of-client resource attribution (on demand)
 

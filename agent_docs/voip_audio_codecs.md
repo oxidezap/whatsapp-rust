@@ -157,7 +157,12 @@ A build with no decoder for the negotiated codec does not pretend. It reports `A
 | `wacore/voip` | Runtime-agnostic media engine and encoded I/O |
 | `wacore/voip-mlow` | Core media engine plus MLOW |
 
-An application that already produces raw Opus packets needs only `voip-encoded`.
+An application that already produces raw Opus packets needs `voip-encoded` for
+the codec side and, on a native target, `voip-relay-native` for the transport --
+`voip-encoded` expands to `voip-runtime`, which carries no dialer, so on its own
+every call fails at setup with "no relay media transport". The alternative to
+that feature is installing a `RelayTransportProvider`, which is what a target
+with no UDP socket does instead.
 
 ## Calls off the native stack
 

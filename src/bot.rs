@@ -902,11 +902,13 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// Runtime-agnostic: the hook wraps whatever runtime the client uses, so
     /// every task spawned through the `Runtime` trait is covered, and
     /// [`Bot::run`] meters the main run loop itself — the read loop reports
-    /// on either launch path. The VoIP **call driver** is covered too: it runs
-    /// on the client's runtime, so do not attribute it separately or its work
-    /// is counted twice. What is not covered is the native relay transport's
-    /// own socket and timer tasks (`voip-relay-native`), which spawn on Tokio
-    /// directly. Pass a
+    /// on either launch path. The VoIP **call driver** is covered too, and so is
+    /// the native relay transport's own socket and timer work
+    /// (`voip-relay-native`): `RelayMediaChannelFactory` is constructed with the
+    /// client's `Arc<dyn Runtime>` and spawns its driver through it. So do not
+    /// attribute either separately, or the work is counted twice. A platform
+    /// that installs its own `RelayTransportProvider` decides that side for
+    /// itself. Pass a
     /// [`CpuMeter`](wacore::stats::CpuMeter) for per-session CPU accounting
     /// (keep a clone to read snapshots), or a custom hook to scope
     /// allocator-attribution or platform samplers to this client's work.
