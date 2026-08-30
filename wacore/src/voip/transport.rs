@@ -77,20 +77,32 @@ pub trait RelayTransport: crate::sync_marker::MaybeSendSync {
     /// Platforms that cannot redial return an error, causing the driver to end the call instead of
     /// silently sending allocation traffic to the retired relay.
     ///
-    /// # What an address is enough for
+    /// # What an address does not carry, and what that costs
     ///
-    /// Only the endpoint changes here, and that is the whole of what a migration is: the call's
-    /// relay `<key>` is per call, not per endpoint, so a transport that needed ICE credentials to
-    /// build its channel -- a browser's, whose synthetic SDP answer carries them -- already holds
-    /// the ones it was constructed with and should reuse them against this address rather than
-    /// refusing. Refusing is what ends a call over a routine migration.
+    /// This seam carries the new endpoint and nothing else, and a group call can rotate the
+    /// credentials that [`RelayEndpointParams`] calls ICE ones. A `<relay>` in a group update
+    /// may carry a new `<key>` (the `ice_pwd`) and new `tokens`/`auth_tokens` (the `ice_ufrag`),
+    /// and `group_relay_credential_refresh_rearms_allocation_on_the_same_endpoint` in
+    /// `wacore::voip::engine` is a test that rotates all three.
     ///
-    /// The one thing this seam does not carry is a change of `ice_ufrag`. That is the relay
-    /// *token*, which `RelayEndpoint::token_id` indexes per endpoint, so a migration that also
-    /// moves the token index is one an implementation cannot follow from here. It has not been
-    /// observed in a live migration, and closing it means carrying a whole
-    /// [`RelayEndpointParams`] out of the engine rather than a `SocketAddr` -- a change to the
-    /// engine's own `Output`, which is why it is written down here instead of guessed at.
+    /// The engine answers such an update by rebuilding its STUN allocate with the new key and
+    /// token, which is the whole of what a *native* transport needs: it ships opaque datagrams,
+    /// so the credentials only ever appear inside the payloads the engine builds. A transport
+    /// that instead bakes them into the channel itself -- a browser's, whose synthetic SDP answer
+    /// names `ice-ufrag` and `ice-pwd` -- is not so served, and there are two distinct gaps:
+    ///
+    /// - **Credentials rotate, endpoint unchanged.** No `Output::ReconnectRelay` is emitted at
+    ///   all (that same test asserts it: "unchanged relay coordinates must not reconnect the
+    ///   socket"), so this method is never called and such a transport is never told.
+    /// - **Endpoint and credentials both change.** This method is called with the address alone,
+    ///   so an implementation can only redial carrying whatever it was constructed with.
+    ///
+    /// So an implementation should reuse its existing credentials against the new address rather
+    /// than refusing -- refusing ends a call over a routine migration -- while knowing they may
+    /// be the retired relay's. Closing either gap means the engine saying more than a
+    /// `SocketAddr`: a whole [`RelayEndpointParams`] on this output, and a second output for the
+    /// refresh that emits none. Both are changes to `Output`'s contract, which is why this is
+    /// written down rather than guessed at here.
     async fn reconnect(
         &self,
         endpoint: SocketAddr,
