@@ -86,8 +86,8 @@ pub use session::{
 };
 pub use tap::{InMemoryTap, PacketDir, PacketTap, TappedFactory, TappedTransport};
 pub use transport::{
-    RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
-    RelayTransportProvider,
+    RelayDisconnectReason, RelayEndpointParams, RelayTransport, RelayTransportEvent,
+    RelayTransportFactory, RelayTransportProvider,
 };
 
 // Internal crypto/framing primitives (`crypt_payload`, `derive_e2e_keys`, `SframeSession`,

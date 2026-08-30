@@ -436,8 +436,9 @@ impl Client {
     #[cfg(feature = "voip-runtime")]
     pub(crate) async fn relay_transport_factory(
         &self,
-        relay: std::net::SocketAddr,
+        relay: &wacore::voip::RelayEndpointParams,
     ) -> Result<Arc<dyn wacore::voip::RelayTransportFactory>, CallError> {
+        let addr = relay.addr;
         let installed = self
             .voip_state()
             .relay_transport_provider
@@ -448,18 +449,18 @@ impl Client {
             return provider
                 .factory(relay)
                 .await
-                .map_err(|e| CallError::Setup(format!("relay transport for {relay}: {e}")));
+                .map_err(|e| CallError::Setup(format!("relay transport for {addr}: {e}")));
         }
         #[cfg(feature = "voip-relay-native")]
         {
             Ok(Arc::new(
-                crate::voip::transport::RelayMediaChannelFactory::new(relay, self.runtime.clone()),
+                crate::voip::transport::RelayMediaChannelFactory::new(addr, self.runtime.clone()),
             ))
         }
         #[cfg(not(feature = "voip-relay-native"))]
         {
             Err(CallError::Setup(format!(
-                "no relay media transport for {relay}: this build has no native relay dialler \
+                "no relay media transport for {addr}: this build has no native relay dialler \
                  (`voip-relay-native`), so it needs one installed with \
                  `Client::set_relay_transport_provider`"
             )))

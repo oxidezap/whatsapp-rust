@@ -356,7 +356,7 @@ impl<'a> AcceptCall<'a> {
             &preaccept_id,
             &accept_id,
         )?;
-        let (mut engine, built_call_id, addr) = send_preaccept_then_prepare(
+        let (mut engine, built_call_id, relay_endpoint) = send_preaccept_then_prepare(
             self.client,
             &registration,
             &mut teardown,
@@ -383,7 +383,7 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         registration.ensure_current()?;
-        let factory = self.client.relay_transport_factory(addr).await?;
+        let factory = self.client.relay_transport_factory(&relay_endpoint).await?;
         // Final acceptance waits until media setup succeeded and the registered generation is still
         // current; only then may the caller apply the participant keys and enter the call.
         send_answer_node(self.client, &registration, &mut teardown, accept).await?;
@@ -423,7 +423,7 @@ impl<'a> AcceptCall<'a> {
         enable_video: bool,
         audio: AudioConfig,
         group: Option<GroupCallUpdate>,
-    ) -> Result<(CallEngine, String, SocketAddr), CallError> {
+    ) -> Result<(CallEngine, String, wacore::voip::RelayEndpointParams), CallError> {
         let CallAction::Offer {
             call_id,
             call_creator,
@@ -453,7 +453,7 @@ impl<'a> AcceptCall<'a> {
             .map_err(|error| CallError::Setup(error.to_string()))?;
             config.audio = audio;
             config.enable_video = enable_video;
-            let addr = socket_addr_from_config(&config)?;
+            let relay_endpoint = relay_endpoint_from_config(&config)?;
             let mut engine = CallEngine::new(config, Box::new(RandTxIds))
                 .map(with_platform_audio_codec)
                 .map_err(|error| CallError::Setup(error.to_string()))?;
@@ -465,7 +465,7 @@ impl<'a> AcceptCall<'a> {
                     direct_peer: None,
                 })
                 .map_err(|error| CallError::Setup(error.to_string()))?;
-            return Ok((engine, call_id.clone(), addr));
+            return Ok((engine, call_id.clone(), relay_endpoint));
         }
 
         let media = self
@@ -508,11 +508,11 @@ impl<'a> AcceptCall<'a> {
         config.audio = audio;
         config.enable_video = enable_video;
         // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
-        let addr = socket_addr_from_config(&config)?;
+        let relay_endpoint = relay_endpoint_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
             .map_err(|e| CallError::Setup(e.to_string()))?;
-        Ok((engine, call_id.clone(), addr))
+        Ok((engine, call_id.clone(), relay_endpoint))
     }
 }
 
@@ -932,7 +932,7 @@ impl<'a> OutgoingGroupCall<'a> {
         .map_err(|error| CallError::Setup(error.to_string()))?;
         config.audio = audio.config();
         config.enable_video = video.is_some();
-        let addr = socket_addr_from_config(&config)?;
+        let relay_endpoint = relay_endpoint_from_config(&config)?;
         let mut engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
             .map_err(|error| CallError::Setup(error.to_string()))?;
@@ -963,7 +963,7 @@ impl<'a> OutgoingGroupCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = self.client.relay_transport_factory(addr).await?;
+        let factory = self.client.relay_transport_factory(&relay_endpoint).await?;
         let handle =
             spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
@@ -1142,7 +1142,7 @@ impl<'a> CallLinkCall<'a> {
         .map_err(|error| CallError::Setup(error.to_string()))?;
         config.audio = audio.config();
         config.enable_video = video.is_some();
-        let addr = socket_addr_from_config(&config)?;
+        let relay_endpoint = relay_endpoint_from_config(&config)?;
         let mut engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
             .map_err(|error| CallError::Setup(error.to_string()))?;
@@ -1158,7 +1158,7 @@ impl<'a> CallLinkCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = self.client.relay_transport_factory(addr).await?;
+        let factory = self.client.relay_transport_factory(&relay_endpoint).await?;
         let handle =
             spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
@@ -2234,6 +2234,28 @@ fn socket_addr_from_config(config: &CallConfig) -> Result<SocketAddr, CallError>
         .map_err(|_| CallError::Media("relay address is not a valid socket addr"))
 }
 
+/// Everything the platform's transport needs to reach this call's relay.
+///
+/// The two ICE fields are read off the config rather than looked up again, because the config is
+/// what the relay walk already resolved: `relay_token` is the token this call allocates with, and
+/// `integrity_key` is the relay `<key>` in the ASCII base64 form it arrived in, which is both the
+/// STUN MESSAGE-INTEGRITY key and the `a=ice-pwd` a synthetic SDP answer carries. A native dialer
+/// ignores both; a browser cannot build an `RTCPeerConnection` without them, and looking them up
+/// from the transport would mean handing every transport the call's whole `RelayData`.
+fn relay_endpoint_from_config(
+    config: &CallConfig,
+) -> Result<wacore::voip::RelayEndpointParams, CallError> {
+    Ok(wacore::voip::RelayEndpointParams {
+        addr: socket_addr_from_config(config)?,
+        ice_ufrag: wacore::voip::relay_parse::token_to_ice_ufrag(&config.relay_token),
+        // Lossy rather than fallible: the relay key is base64 text in every offer that has one, and
+        // a call is not worth failing over a byte that is not. A relay that then refuses the
+        // credential says so in the ICE check, which is a far more legible failure than "the
+        // integrity key was not UTF-8".
+        ice_pwd: String::from_utf8_lossy(&config.integrity_key).into_owned(),
+    })
+}
+
 /// Build the engine from a relay that arrived for a pending OUTGOING call and start the driver,
 /// reusing the dormant handle's shared state. Returns `Ok(false)` when no pending outgoing call
 /// matches `call_id` (so the caller can fall through to normal handling).
@@ -2283,12 +2305,16 @@ pub(crate) async fn attach_outgoing_relay(
         .map_err(|e| CallError::Setup(e.to_string()))?;
         config.audio = pending.audio.config();
         config.enable_video = pending.video.is_some();
-        // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
-        let addr = socket_addr_from_config(&config)?;
+        // Read the dial endpoint off the config before CallEngine::new consumes it (no second relay
+        // walk).
+        let relay_endpoint = relay_endpoint_from_config(&config)?;
         let engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
             .map_err(|e| CallError::Setup(e.to_string()))?;
-        Ok::<_, CallError>((engine, client.relay_transport_factory(addr).await?))
+        Ok::<_, CallError>((
+            engine,
+            client.relay_transport_factory(&relay_endpoint).await?,
+        ))
     }
     .await;
     let (engine, factory) = match build {
@@ -5967,16 +5993,20 @@ mod tests {
 
     /// A provider that hands out a [`MockFactory`] and records the relay it was asked about.
     struct RecordingProvider {
-        asked: Arc<Mutex<Vec<SocketAddr>>>,
+        asked: Arc<Mutex<Vec<(SocketAddr, String, String)>>>,
     }
 
     #[async_trait]
     impl wacore::voip::RelayTransportProvider for RecordingProvider {
         async fn factory(
             &self,
-            relay: SocketAddr,
+            relay: &wacore::voip::RelayEndpointParams,
         ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
-            self.asked.lock().unwrap().push(relay);
+            self.asked.lock().unwrap().push((
+                relay.addr,
+                relay.ice_ufrag.clone(),
+                relay.ice_pwd.clone(),
+            ));
             let (_tx, rx) = async_channel::unbounded();
             Ok(Arc::new(MockFactory {
                 sent: Arc::new(Mutex::new(Vec::new())),
@@ -6001,17 +6031,70 @@ mod tests {
             asked: asked.clone(),
         }));
 
-        let relay: SocketAddr = "203.0.113.7:3478".parse().expect("addr");
+        let addr: SocketAddr = "203.0.113.7:3478".parse().expect("addr");
+        let endpoint = wacore::voip::RelayEndpointParams {
+            addr,
+            ice_ufrag: "UFRAG".to_string(),
+            ice_pwd: "PWD".to_string(),
+        };
         client
-            .relay_transport_factory(relay)
+            .relay_transport_factory(&endpoint)
             .await
             .expect("the installed provider answers");
 
         assert_eq!(
             asked.lock().unwrap().as_slice(),
-            &[relay],
-            "the provider is asked about the relay the call named, not a default"
+            &[(addr, "UFRAG".to_string(), "PWD".to_string())],
+            "the provider is asked about the relay the call named, with the ICE credentials a \
+             synthetic SDP answer needs -- an address alone cannot build an RTCPeerConnection"
         );
+    }
+
+    /// The ICE credentials a browser signs its connectivity checks with are the call's own, read
+    /// off the config the relay walk already resolved. Getting either wrong is a call that dials
+    /// the right host and is refused by it, which looks like a network fault and is not one.
+    #[test]
+    fn a_relay_endpoint_carries_the_call_ice_credentials() {
+        let mut config = CallConfig::for_outgoing(
+            "CID-ICE",
+            "111:0@lid",
+            "222:0@lid",
+            vec![7u8; 32],
+            &sample_relay(),
+        )
+        .expect("config");
+        config.relay_ip = "198.51.100.9".to_string();
+        config.relay_port = 3480;
+        config.relay_token = vec![0xaa, 0xbb, 0xcc];
+        config.integrity_key = b"EBESExQVFhcYGRobHB0eHw==".to_vec();
+
+        let endpoint = relay_endpoint_from_config(&config).expect("endpoint");
+        assert_eq!(endpoint.addr.to_string(), "198.51.100.9:3480");
+        assert_eq!(
+            endpoint.ice_ufrag,
+            wacore::voip::relay_parse::token_to_ice_ufrag(&[0xaa, 0xbb, 0xcc]),
+            "ice-ufrag is the relay token, base64"
+        );
+        assert_eq!(
+            endpoint.ice_pwd, "EBESExQVFhcYGRobHB0eHw==",
+            "ice-pwd is the relay <key> in the ASCII form it arrived in"
+        );
+    }
+
+    /// The redaction is the point of the manual Debug: a transport implementation reaching for a
+    /// `{:?}` must not put the relay key in a log.
+    #[test]
+    fn a_relay_endpoint_does_not_print_its_password() {
+        let printed = format!(
+            "{:?}",
+            wacore::voip::RelayEndpointParams {
+                addr: "203.0.113.7:3480".parse().expect("addr"),
+                ice_ufrag: "UFRAG".to_string(),
+                ice_pwd: "SECRET-RELAY-KEY".to_string(),
+            }
+        );
+        assert!(!printed.contains("SECRET-RELAY-KEY"), "got: {printed}");
+        assert!(printed.contains("UFRAG"), "got: {printed}");
     }
 
     /// A provider that refuses fails the call with its reason, rather than falling back to a dialer
@@ -6024,7 +6107,7 @@ mod tests {
         impl wacore::voip::RelayTransportProvider for Refuses {
             async fn factory(
                 &self,
-                _relay: SocketAddr,
+                _relay: &wacore::voip::RelayEndpointParams,
             ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
                 anyhow::bail!("this browser has no WebRTC")
             }
@@ -6032,11 +6115,13 @@ mod tests {
 
         let client = make_client().await;
         client.set_relay_transport_provider(Arc::new(Refuses));
+        let endpoint = wacore::voip::RelayEndpointParams {
+            addr: "203.0.113.7:3478".parse().expect("addr"),
+            ice_ufrag: String::new(),
+            ice_pwd: String::new(),
+        };
         // `expect_err` wants the Ok side to be Debug, and `dyn RelayTransportFactory` is not.
-        let error = match client
-            .relay_transport_factory("203.0.113.7:3478".parse().expect("addr"))
-            .await
-        {
+        let error = match client.relay_transport_factory(&endpoint).await {
             Ok(_) => panic!("a refusing provider must not fall through to the native dialer"),
             Err(error) => error,
         };

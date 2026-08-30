@@ -173,12 +173,17 @@ So a target without a UDP socket does not lose calls; it supplies the way onto t
 client.set_relay_transport_provider(Arc::new(MyProvider));
 ```
 
-A `RelayTransportProvider` is asked for a `RelayTransportFactory` per relay address, because the
-relay is named by the server per call. A browser's implementation is an `RTCPeerConnection` with a
-synthetic SDP answer naming that address and the same pre-negotiated `id=0` DataChannel
-(`ordered=false`, `maxRetransmits=0`) the native stack assembles by hand -- which is what WhatsApp
-Web itself does, and the reason the native transport's own doc comment describes the stack as "the
-synthetic-SDP / wrtc dance".
+A `RelayTransportProvider` is asked for a `RelayTransportFactory` per relay endpoint, because the
+relay is named by the server per call. What it is handed is a `RelayEndpointParams`: the address,
+plus the `ice-ufrag` (the relay token, base64) and `ice-pwd` (the relay `<key>`, in the ASCII form
+it arrived in) that a synthetic SDP answer has to carry. The address alone is enough for a stack
+that dials UDP itself; it is not enough for a browser, where ICE is not optional and the relay
+validates the credentials.
+
+A browser's implementation is an `RTCPeerConnection` with that synthetic SDP answer and the same
+pre-negotiated `id=0` DataChannel (`ordered=false`, `maxRetransmits=0`) the native stack assembles
+by hand -- which is what WhatsApp Web itself does, and the reason the native transport's own doc
+comment describes the stack as "the synthetic-SDP / wrtc dance".
 
 The codec is not a blocker there either: MLOW is pure Rust (`wacore/voip-mlow`) and builds
 everywhere. libopus is the C one, so `voip-libopus` stays native; a browser that wants Opus supplies

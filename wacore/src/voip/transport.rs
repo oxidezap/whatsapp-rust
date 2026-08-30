@@ -87,6 +87,40 @@ pub trait RelayTransport: crate::sync_marker::MaybeSendSync {
     }
 }
 
+/// Everything a platform needs to reach one relay endpoint.
+///
+/// The address alone is enough for a stack that dials UDP and handshakes DTLS itself, which is what
+/// the native transport does. It is not enough for a browser: there the media channel is an
+/// `RTCPeerConnection`, ICE is not optional, and a synthetic SDP answer describing the relay has to
+/// carry credentials the relay will actually validate -- so the two ICE fields travel with the
+/// address rather than being looked up from a `RelayData` no transport is handed.
+///
+/// Both are derived rather than invented: `ice_ufrag` is
+/// [`token_to_ice_ufrag`](crate::voip::relay_parse::token_to_ice_ufrag) of the relay token, and
+/// `ice_pwd` is the relay `<key>` in the ASCII base64 form it arrived in -- the same bytes the
+/// engine keys STUN MESSAGE-INTEGRITY with.
+#[derive(Clone)]
+pub struct RelayEndpointParams {
+    /// Where the relay is.
+    pub addr: SocketAddr,
+    /// `a=ice-ufrag` for a synthetic SDP answer.
+    pub ice_ufrag: String,
+    /// `a=ice-pwd` for a synthetic SDP answer. Live credential material.
+    pub ice_pwd: String,
+}
+
+// Manual Debug: `ice_pwd` is the relay key, and this struct is the kind of thing a `{:?}` in a
+// transport implementation reaches for. Matches the redaction `RelayData` and `CallConfig` apply.
+impl core::fmt::Debug for RelayEndpointParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RelayEndpointParams")
+            .field("addr", &self.addr)
+            .field("ice_ufrag", &self.ice_ufrag)
+            .field("ice_pwd", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Chooses which [`RelayTransportFactory`] dials a given relay endpoint.
 ///
 /// A factory is bound to one address, and the address is not known until the server names the
@@ -107,7 +141,7 @@ pub trait RelayTransportProvider: crate::sync_marker::MaybeSendSync {
     /// Async because a platform may have to ask for something before it can build one -- a browser
     /// creating an `RTCPeerConnection` is a call into JS. Failing here fails the call with the
     /// reason, which is the honest answer for a page whose browser has no WebRTC at all.
-    async fn factory(&self, relay: SocketAddr) -> Result<Arc<dyn RelayTransportFactory>>;
+    async fn factory(&self, relay: &RelayEndpointParams) -> Result<Arc<dyn RelayTransportFactory>>;
 }
 
 /// Creates a [`RelayTransport`] connected to a relay endpoint, returning it alongside a push stream
