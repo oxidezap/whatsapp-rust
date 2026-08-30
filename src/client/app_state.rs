@@ -1022,7 +1022,7 @@ impl Client {
     /// batched path reserves its collections in
     /// [`sync_collections_batched`](Self::sync_collections_batched).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.fetch", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
-    async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> Result<()> {
+    async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> Result<SyncOutcome> {
         let _t = wacore::telemetry::timer(wacore::telemetry::APPSTATE_SYNC_DURATION);
         let mut attempt = 0u32;
         loop {
@@ -1034,7 +1034,7 @@ impl Client {
             match res {
                 Ok(SyncOutcome::Completed) => {
                     wacore::telemetry::appstate_sync("ok");
-                    return Ok(());
+                    return Ok(SyncOutcome::Completed);
                 }
                 // The send succeeded and the collection is now behind its own
                 // head, which is precisely the state this re-sync exists to
@@ -1046,7 +1046,7 @@ impl Client {
                     if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
                         client.schedule_app_state_task_retry(name, false);
                     }
-                    return Ok(());
+                    return Ok(SyncOutcome::Deferred);
                 }
                 Err(e) => {
                     if e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
@@ -2408,7 +2408,14 @@ impl Client {
         if stored.is_none() {
             full_sync = true;
         }
+        let had_record = stored.is_some();
         let mut state = stored.unwrap_or_default();
+        // Whether this run put anything of the server's into `state`. A bootstrap
+        // that was deferred before applying a single page has nothing to write,
+        // and writing version 0 anyway would hand the next sync a record saying
+        // the collection had synced -- so it would ask for patches, and a
+        // non-genesis first patch over an empty ltHash is refused.
+        let mut applied_anything = false;
 
         let mut has_more = true;
         let mut want_snapshot = full_sync;
@@ -2552,13 +2559,26 @@ impl Client {
             }
 
             state = new_state;
+            applied_anything = true;
             has_more = list.has_more_patches;
             // After the first batch, never request a snapshot again — only incremental patches.
             want_snapshot = false;
             debug!(target: "Client/AppState", "After processing batch name={:?} has_more={has_more} new_version={}", name, state.version);
         }
 
-        backend.set_version(name.as_str(), state.clone()).await?;
+        // A completed run records the collection even when the server had nothing
+        // to send: that is the bootstrap, and the record is what stops the next
+        // sync asking for a snapshot again. A deferred one only writes what it
+        // actually applied.
+        if had_record || applied_anything || outcome == SyncOutcome::Completed {
+            backend.set_version(name.as_str(), state.clone()).await?;
+        } else {
+            debug!(
+                target: "Client/AppState",
+                "{name:?} was deferred before it applied anything; leaving it unsynced \
+                 rather than recording a version it never reached"
+            );
+        }
 
         debug!(target: "Client/AppState", "Finished app state sync for {name:?} as {outcome:?} (final version={})", state.version);
         Ok(outcome)
@@ -3087,16 +3107,32 @@ impl Client {
                     "{collection_name} is not a known collection, so its conflict cannot be resolved"
                 ));
             };
-            if let Err(e) = self.fetch_app_state_with_retry_inner(patch_name).await {
-                warn!(
-                    target: "Client/AppState",
-                    "Failed to re-sync {collection_name} after a patch conflict: {e}"
-                );
+            match self.fetch_app_state_with_retry_inner(patch_name).await {
                 // The base is where it was and the re-sync is the only thing that
                 // could have moved it. A snapshot MAC that will not validate
                 // fails this way every time, so the remaining attempts are the
                 // same request and the same refusal.
-                return Recovery::Failed(e);
+                Err(e) => {
+                    warn!(
+                        target: "Client/AppState",
+                        "Failed to re-sync {collection_name} after a patch conflict: {e}"
+                    );
+                    return Recovery::Failed(e);
+                }
+                // Deferred is not recovered: the sync was scheduled for a later
+                // connection and this one applied nothing, so the base is exactly
+                // where the refused patch was built.
+                Ok(SyncOutcome::Deferred) => {
+                    warn!(
+                        target: "Client/AppState",
+                        "Re-sync of {collection_name} after a patch conflict was deferred; \
+                         the base has not moved"
+                    );
+                    return Recovery::Failed(anyhow::anyhow!(
+                        "re-sync of {collection_name} was deferred to a later connection"
+                    ));
+                }
+                Ok(SyncOutcome::Completed) => {}
             }
         }
         Recovery::Recovered

@@ -301,6 +301,47 @@ mod tests {
     /// `await_connection` is right to keep waiting on. Both stores
     /// `handle_success` makes, in that order: the session, then the generation
     /// it is authenticated under.
+    async fn create_reachable_client() -> (
+        Arc<Client>,
+        Arc<crate::transport::mock::CapturingMockTransport>,
+    ) {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        (client, transport)
+    }
+
+    /// A bootstrap that never reached the server must not leave a record behind.
+    ///
+    /// Review of #1365: the sync writes the version it ends on whatever happened,
+    /// which is right for pages it applied and wrong for a run that applied
+    /// nothing. Writing version 0 for a collection that had no record tells the
+    /// next sync it has already bootstrapped, so it asks for patches -- and a
+    /// non-genesis first patch over an empty ltHash is refused, which is how a
+    /// collection strands itself.
+    #[tokio::test]
+    async fn a_bootstrap_that_never_reached_the_server_leaves_no_record() {
+        // Not reachable: the sync defers before it sends anything.
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+
+        let _ = client
+            .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Incremental)
+            .await;
+
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .expect("the version should be readable")
+                .is_none(),
+            "a deferred bootstrap applied nothing, so it has no version to record"
+        );
+    }
 
     /// WA Web reads bootstrap as `version == null`, not `version == 0`: a
     /// collection that synced and is legitimately empty has a record, and asks
@@ -313,10 +354,7 @@ mod tests {
         client
             .persistence_manager
             .backend()
-            .set_version(
-                WAPatchName::Regular.as_str(),
-                wacore::appstate::hash::HashState::default(),
-            )
+            .set_version(WAPatchName::Regular.as_str(), HashState::default())
             .await
             .expect("the test backend should accept a version");
 
@@ -358,19 +396,6 @@ mod tests {
         assert_eq!(asked.len(), 1);
         assert_eq!(attr(&asked[0], "return_snapshot").as_deref(), Some("true"));
         assert_eq!(attr(&asked[0], "version").as_deref(), Some("0"));
-    }
-
-    async fn create_reachable_client() -> (
-        Arc<Client>,
-        Arc<crate::transport::mock::CapturingMockTransport>,
-    ) {
-        let (client, transport) = crate::test_utils::create_iq_test_client().await;
-        client.is_logged_in.store(true, Ordering::Relaxed);
-        client.authenticated_generation.store(
-            client.connection_generation.load(Ordering::SeqCst),
-            Ordering::SeqCst,
-        );
-        (client, transport)
     }
 
     /// Answer every IQ the resync sends, with `collections` describing the

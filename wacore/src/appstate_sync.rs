@@ -285,11 +285,9 @@ impl AppStateProcessor {
         // Pre-fetch all keys we'll need
         self.prefetch_keys(&pl).await?;
 
-        let mut state = self
-            .backend
-            .get_version(pl.name.as_str())
-            .await?
-            .unwrap_or_default();
+        let stored = self.backend.get_version(pl.name.as_str()).await?;
+        let had_record = stored.is_some();
+        let mut state = stored.unwrap_or_default();
         let mut new_mutations: Vec<Mutation> = Vec::new();
         let collection_name = pl.name.as_str();
 
@@ -478,6 +476,16 @@ impl AppStateProcessor {
 
         // Handle case where we only have a snapshot and no patches
         if pl.patches.is_empty() && pl.snapshot.is_some() {
+            self.backend
+                .set_version(collection_name, state.clone())
+                .await?;
+        } else if pl.patches.is_empty() && !had_record && pl.error.is_none() {
+            // A bootstrap the server answered with nothing to apply. WA Web
+            // records it -- `if (isBootstrap(v)) updateCollectionVersionAndLtHash(0,
+            // EMPTY_LT_HASH)` on its "sync X but there are no updates" branch --
+            // and the record is what stops the next sync asking for the snapshot
+            // again. Without it an account whose collection is legitimately empty
+            // re-requests one forever.
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
