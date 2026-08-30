@@ -1987,10 +1987,14 @@ impl Client {
                     continue;
                 }
                 let stored = backend.get_version(name.as_str()).await?;
-                // WA Web: `isBootstrap = version == null`. A collection with a
-                // record sitting at 0 has synced and is simply empty, and asks
-                // for patches like any other.
-                let want_snapshot = stored.is_none();
+                // WA Web reads `isBootstrap = version == null`. Presence alone
+                // cannot answer it here: version 0 with an empty ltHash is
+                // byte-identical between a collection that never synced and one
+                // that synced and is empty, and a row written by an older build
+                // could be either. The flag is what separates them, and it is
+                // false on every row that predates it -- so those bootstrap once
+                // more, which is the safe direction.
+                let want_snapshot = !stored.as_ref().is_some_and(|s| s.bootstrapped);
                 let state = stored.unwrap_or_default();
                 if want_snapshot {
                     replaying_snapshot.insert(name);
@@ -2256,7 +2260,11 @@ impl Client {
                                 // ConflictHasMore: server has more patches, must refetch.
                                 warn!(target: "Client/AppState", "Collection {:?} conflict (has_more=true), will refetch", name);
                                 needs_refetch.push(name);
-                            } else if backend.get_version(name.as_str()).await?.is_some() {
+                            } else if backend
+                                .get_version(name.as_str())
+                                .await?
+                                .is_some_and(|s| s.bootstrapped)
+                            {
                                 // Conflict without has_more: WA Web reads this as
                                 // success once it has nothing left to push.
                                 debug!(target: "Client/AppState", "Collection {:?} conflict (has_more=false), treating as success", name);
@@ -2414,10 +2422,10 @@ impl Client {
         let backend = self.persistence_manager.backend();
         let mut full_sync = full_sync;
 
-        // Bootstrap is the absence of a record, not a version that happens to be
-        // zero: WA Web reads `isBootstrap = version == null`.
+        // See the batched builder: a completed bootstrap is a fact the record
+        // carries, not one its presence implies.
         let stored = backend.get_version(name.as_str()).await?;
-        if stored.is_none() {
+        if !stored.as_ref().is_some_and(|s| s.bootstrapped) {
             full_sync = true;
         }
         let mut state = stored.unwrap_or_default();
@@ -2942,16 +2950,29 @@ impl Client {
         // full sync is incomplete". Sync first, then build.
         if let Some(name) = patch_name {
             let backend = self.persistence_manager.backend();
-            if backend.get_version(collection_name).await?.is_none() {
+            if !backend
+                .get_version(collection_name)
+                .await?
+                .is_some_and(|s| s.bootstrapped)
+            {
                 debug!(
                     target: "Client/AppState",
                     "{collection_name} has never synced; syncing before building a patch on it"
                 );
-                self.fetch_app_state_with_retry_inner(name).await?;
-                if backend.get_version(collection_name).await?.is_none() {
+                // A record is not enough: a bootstrap that persisted some pages
+                // and then deferred leaves one behind while the collection is
+                // still short of the head, and a patch built on that base is the
+                // 409 this guard exists to avoid.
+                let synced = self.fetch_app_state_with_retry_inner(name).await?;
+                if synced != SyncOutcome::Completed
+                    || !backend
+                        .get_version(collection_name)
+                        .await?
+                        .is_some_and(|s| s.bootstrapped)
+                {
                     return Err(anyhow::anyhow!(
                         "app-state patch for {collection_name} not attempted: \
-                         the collection has never synced"
+                         its bootstrap has not completed"
                     ));
                 }
             }
@@ -3087,6 +3108,19 @@ impl Client {
         mut list: wacore::appstate::patch_decode::PatchList,
         has_more: bool,
     ) -> Recovery {
+        // What the recovery has to move, read before anything can move it.
+        // `process_parsed_patch_list` persists each patch as it applies it, so
+        // reading after it would compare the advanced version against itself and
+        // call a successful absorb a failure -- dropping the user's mutation on
+        // the one path where rebuilding would have worked.
+        let backend = self.persistence_manager.backend();
+        let base_before = backend
+            .get_version(collection_name)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.version);
+
         // The error tag described the send; the patches under it are ordinary
         // inbound data, so clear it before handing the list to the processor.
         list.error = None;
@@ -3138,20 +3172,6 @@ impl Client {
                 }
             }
         };
-
-        // What the recovery has to move. Read before it runs, compared after:
-        // "the sync completed" is not "the collection advanced", and only the
-        // second one makes another send worth its round trip. A conflict the
-        // server answers with `has_more: false`, a re-sync that returns nothing
-        // new, and a patch list the processor refuses all end the same way --
-        // the base exactly where the refused patch was built.
-        let backend = self.persistence_manager.backend();
-        let base_before = backend
-            .get_version(collection_name)
-            .await
-            .ok()
-            .flatten()
-            .map(|s| s.version);
 
         // `has_more` means the server held patches back, so even a clean apply
         // leaves the base short of the head.

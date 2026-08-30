@@ -367,14 +367,20 @@ mod tests {
         );
     }
 
-    /// WA Web reads bootstrap as `version == null`, not `version == 0`: a
-    /// collection that synced and is legitimately empty has a record, and asks
-    /// for patches like any other. Collapsing the two made every empty
-    /// collection re-request a snapshot on every sync, forever.
+    /// A collection that synced and is legitimately empty asks for patches like
+    /// any other; collapsing it with "never synced" made every empty collection
+    /// re-request a snapshot forever.
+    ///
+    /// Presence cannot carry that on its own: version 0 with an empty ltHash is
+    /// byte-identical between the two, and a row written by an older build --
+    /// which persisted version 0 for an interrupted bootstrap too -- could be
+    /// either. `bootstrapped` is what separates them, and it decodes false on
+    /// every such row, so those bootstrap once more instead of asking for
+    /// patches their empty ltHash can never accept.
     #[tokio::test]
     async fn a_synced_but_empty_collection_asks_for_patches_not_a_snapshot() {
         let (client, transport) = create_reachable_client().await;
-        // A record at version 0: synced, and empty.
+        // A record at version 0 that completed a bootstrap: synced, and empty.
         client
             .persistence_manager
             .backend()
@@ -401,6 +407,39 @@ mod tests {
         assert_eq!(attr(&asked[0], "version").as_deref(), Some("0"));
     }
 
+    /// The upgrade hazard: a row written before `bootstrapped` existed decodes
+    /// with it false, and an interrupted bootstrap under the old code left
+    /// exactly such a row at version 0. Reading presence alone would call it
+    /// synced, ask for patches, and have every non-genesis one refused against
+    /// the empty ltHash -- with the row still there, forever.
+    #[tokio::test]
+    async fn a_legacy_zero_row_bootstraps_once_more_instead_of_asking_for_patches() {
+        let (client, transport) = create_reachable_client().await;
+        // What an older build persisted: version 0, empty ltHash, no flag.
+        client
+            .persistence_manager
+            .backend()
+            .set_version(WAPatchName::Regular.as_str(), HashState::default())
+            .await
+            .expect("the test backend should accept a version");
+
+        let (result, asked) = resync_against(
+            &client,
+            &transport,
+            vec![WAPatchName::Regular],
+            AppStateResyncMode::Incremental,
+            |_, id| batch_result(id, &[("regular", None)]),
+        )
+        .await;
+
+        result.expect("the server answered");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            attr(&asked[0], "return_snapshot").as_deref(),
+            Some("true"),
+            "a row that never recorded a completed bootstrap has to ask for one"
+        );
+    }
     /// The other half: no record at all is bootstrap, and bootstrap asks for a
     /// snapshot.
     #[tokio::test]

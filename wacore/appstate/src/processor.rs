@@ -120,10 +120,6 @@ where
         let keys = get_keys(key_id)?;
         let computed = initial_state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
         if computed != *mac_expected {
-            // At warn, with both sides and the inputs that produced them: this is
-            // the failure that strands a collection, and the ltHash plus the
-            // record count are what tell a stale snapshot from a fold that went
-            // wrong. Mirrors WA Web's own snapshot-mac diagnostic line.
             // The identifying line stays at warn, because a collection that
             // strands itself has to be visible without turning logging up. The
             // MACs and the ltHash do not: a snapshot MAC is HMAC output under
@@ -157,11 +153,18 @@ where
         );
     }
 
-    // Decode all records and collect MACs in a single pass
-    let mut mutations = Vec::with_capacity(snapshot.records.len());
-    let mut mutation_macs = Vec::with_capacity(snapshot.records.len());
+    // Decode the records and collect MACs in a single pass, over the same keyed
+    // set the ltHash folded. A snapshot that repeats an index has one winner --
+    // the last record for it -- and decoding the losers too would dispatch a
+    // stale mutation beside the winning one. Event delivery is concurrent by
+    // default, so the consumer can apply them in either order and end up with a
+    // contact, mute or label that the snapshot we just authenticated does not
+    // describe.
+    let winners = last_record_per_index(&snapshot.records);
+    let mut mutations = Vec::with_capacity(winners.len());
+    let mut mutation_macs = Vec::with_capacity(winners.len());
 
-    for rec in &snapshot.records {
+    for rec in winners {
         let key_id = rec.key_id.id.as_ref().ok_or(AppStateError::MissingKeyId)?;
         let keys = get_keys(key_id)?;
 
@@ -515,6 +518,32 @@ pub fn validate_patch_macs(
     }
 
     Ok(PatchMacVerdict::default())
+}
+
+/// The records a keyed snapshot actually describes: one per index, the last of
+/// any run, plus every record that carries no index and so cannot collide.
+///
+/// Mirrors the `Map` WA Web builds in `WAWebSyncdAntiTampering`, and must stay in
+/// step with [`HashState::update_hash_from_records`] -- the ltHash is folded over
+/// this same set, and a snapshot whose MAC we accepted has to be the snapshot we
+/// then decode.
+fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
+    let mut winners: Vec<&wa::SyncdRecord> = Vec::with_capacity(records.len());
+    let mut seen: Vec<&[u8]> = Vec::new();
+    // Backwards, so the first hit for an index is its last record.
+    for rec in records.iter().rev() {
+        match rec.index.as_option().and_then(|idx| idx.blob.as_deref()) {
+            Some(index_mac) => {
+                if !seen.contains(&index_mac) {
+                    seen.push(index_mac);
+                    winners.push(rec);
+                }
+            }
+            None => winners.push(rec),
+        }
+    }
+    winners.reverse();
+    winners
 }
 
 /// Validate a snapshot MAC.
@@ -895,6 +924,7 @@ mod tests {
             hash: [hash; 128],
             index_value_map: HashMap::new(),
             mac_mismatch_fatal: false,
+            bootstrapped: false,
         }
     }
 

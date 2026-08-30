@@ -1,5 +1,5 @@
 
-Ô
+ø
 
 wire.protowire"Y
 	NoiseCert
@@ -13,12 +13,13 @@ not_before (R	notBefore
 AppStateSyncKeyWire
 key_data (RkeyData 
 fingerprint (Rfingerprint
-	timestamp (R	timestamp"ý
+	timestamp (R	timestamp"¡
 HashStateWire
 version (Rversion
 hash (RhashN
 index_value_map (2&.wire.HashStateWire.IndexValueMapEntryRindexValueMap,
-mac_mismatch_fatal (RmacMismatchFatal@
+mac_mismatch_fatal (RmacMismatchFatal"
+bootstrapped (Rbootstrapped@
 IndexValueMapEntry
 key (	Rkey
 value (Rvalue:8bproto3

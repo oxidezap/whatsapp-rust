@@ -286,7 +286,7 @@ impl AppStateProcessor {
         self.prefetch_keys(&pl).await?;
 
         let stored = self.backend.get_version(pl.name.as_str()).await?;
-        let had_record = stored.is_some();
+        let had_bootstrap = stored.as_ref().is_some_and(|s| s.bootstrapped);
         let mut state = stored.unwrap_or_default();
         let mut new_mutations: Vec<Mutation> = Vec::new();
         let collection_name = pl.name.as_str();
@@ -361,6 +361,7 @@ impl AppStateProcessor {
                     )
                     .await?;
             }
+            state.bootstrapped = true;
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
@@ -458,6 +459,7 @@ impl AppStateProcessor {
             new_mutations.extend(result.mutations);
 
             // Persist state and MACs
+            state.bootstrapped = true;
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
@@ -476,13 +478,14 @@ impl AppStateProcessor {
 
         // Handle case where we only have a snapshot and no patches
         if pl.patches.is_empty() && pl.snapshot.is_some() {
+            state.bootstrapped = true;
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
         } else if pl.patches.is_empty()
             && !pl.has_more_patches
             && pl.snapshot_ref.is_none()
-            && !had_record
+            && !had_bootstrap
             && pl.error.is_none()
         {
             // A bootstrap the server answered with nothing to apply, and nothing
@@ -497,6 +500,7 @@ impl AppStateProcessor {
             // would end the bootstrap early: the collection would never ask for a
             // snapshot again, and a non-genesis patch over its empty ltHash is
             // refused for good.
+            state.bootstrapped = true;
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;

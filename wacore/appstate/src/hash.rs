@@ -28,6 +28,18 @@ pub struct HashState {
     /// to be trusted again.
     #[serde(default)]
     pub mac_mismatch_fatal: bool,
+    /// Whether this collection has completed a bootstrap.
+    ///
+    /// Presence of a record cannot answer that on its own: a collection that has
+    /// never synced and one that synced and is legitimately empty are both
+    /// version 0 with an all-zero ltHash, byte for byte. WA Web distinguishes
+    /// them by whether a record exists at all, because it writes one on the
+    /// "no updates" branch; we carry the fact explicitly so a row written by an
+    /// older build -- which wrote version 0 for an interrupted bootstrap too --
+    /// decodes to false and bootstraps once more rather than asking for patches
+    /// its empty ltHash can never accept.
+    #[serde(default)]
+    pub bootstrapped: bool,
 }
 
 impl Default for HashState {
@@ -37,6 +49,7 @@ impl Default for HashState {
             hash: [0; 128],
             index_value_map: HashMap::new(),
             mac_mismatch_fatal: false,
+            bootstrapped: false,
         }
     }
 }

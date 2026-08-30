@@ -34,4 +34,10 @@ message HashStateWire {
   // rows written before this field existed, which decode to false — the same
   // state a healthy collection is in.
   bool mac_mismatch_fatal = 4;
+  // Set once the collection has completed a bootstrap. Absent in rows written
+  // before this field existed, which decode to false and so re-bootstrap once --
+  // the safe direction, because version 0 with an empty ltHash is byte-identical
+  // between "never synced" and "synced and empty", and only this flag tells them
+  // apart.
+  bool bootstrapped = 5;
 }

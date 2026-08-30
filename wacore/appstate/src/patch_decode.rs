@@ -175,11 +175,22 @@ fn parse_single_collection(collection: &Node) -> Result<PatchList> {
 
     // snapshot (optional)
     let mut snapshot_ref = None;
-    if let Some(snapshot_node) = collection.get_optional_child("snapshot")
-        && let Some(wacore_binary::node::NodeContent::Bytes(raw)) = &snapshot_node.content
-        && let Ok(ext_ref) = waproto::codec::external_blob_reference_decode(raw.as_slice())
-    {
-        snapshot_ref = Some(ext_ref);
+    // A `<snapshot>` we cannot read is not the same as no snapshot. Dropping it
+    // silently made the collection look like a bootstrap the server answered with
+    // nothing, which is recorded as a synced empty collection -- after which it
+    // never asks for the snapshot again and a non-genesis patch over its empty
+    // ltHash is refused for good.
+    let mut unreadable_snapshot = false;
+    if let Some(snapshot_node) = collection.get_optional_child("snapshot") {
+        match &snapshot_node.content {
+            Some(wacore_binary::node::NodeContent::Bytes(raw)) => {
+                match waproto::codec::external_blob_reference_decode(raw.as_slice()) {
+                    Ok(ext_ref) => snapshot_ref = Some(ext_ref),
+                    Err(_) => unreadable_snapshot = true,
+                }
+            }
+            _ => unreadable_snapshot = true,
+        }
     }
     let snapshot = None; // external only currently
 
@@ -208,7 +219,12 @@ fn parse_single_collection(collection: &Node) -> Result<PatchList> {
         patches,
         snapshot,
         snapshot_ref,
-        error,
+        error: error.or_else(|| {
+            unreadable_snapshot.then(|| CollectionSyncError::Retry {
+                code: 0,
+                text: "unreadable snapshot reference".to_string(),
+            })
+        }),
     })
 }
 
@@ -266,11 +282,16 @@ fn parse_single_collection_ref(collection: &NodeRef<'_>) -> Result<PatchList> {
 
     // snapshot (optional)
     let mut snapshot_ref = None;
-    if let Some(snapshot_node) = collection.get_optional_child("snapshot")
-        && let Some(raw) = snapshot_node.content_bytes()
-        && let Ok(ext_ref) = waproto::codec::external_blob_reference_decode(raw)
-    {
-        snapshot_ref = Some(ext_ref);
+    // See the sibling parser: an unreadable `<snapshot>` must not read as none.
+    let mut unreadable_snapshot = false;
+    if let Some(snapshot_node) = collection.get_optional_child("snapshot") {
+        match snapshot_node
+            .content_bytes()
+            .map(waproto::codec::external_blob_reference_decode)
+        {
+            Some(Ok(ext_ref)) => snapshot_ref = Some(ext_ref),
+            _ => unreadable_snapshot = true,
+        }
     }
     let snapshot = None; // external only currently
 
@@ -298,7 +319,12 @@ fn parse_single_collection_ref(collection: &NodeRef<'_>) -> Result<PatchList> {
         patches,
         snapshot,
         snapshot_ref,
-        error,
+        error: error.or_else(|| {
+            unreadable_snapshot.then(|| CollectionSyncError::Retry {
+                code: 0,
+                text: "unreadable snapshot reference".to_string(),
+            })
+        }),
     })
 }
 

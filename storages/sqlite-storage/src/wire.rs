@@ -137,6 +137,7 @@ pub(crate) fn encode_hash_state(s: &HashState) -> Vec<u8> {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         mac_mismatch_fatal: s.mac_mismatch_fatal,
+        bootstrapped: s.bootstrapped,
     }
     .encode_to_vec()
 }
@@ -153,6 +154,7 @@ pub(crate) fn decode_hash_state(bytes: &[u8]) -> Result<HashState, StoreError> {
         hash,
         index_value_map: w.index_value_map.into_iter().collect(),
         mac_mismatch_fatal: w.mac_mismatch_fatal,
+        bootstrapped: w.bootstrapped,
     })
 }
 
@@ -238,6 +240,7 @@ mod tests {
             hash,
             index_value_map: index_value_map.clone(),
             mac_mismatch_fatal: true,
+            bootstrapped: true,
         };
         let decoded = decode_hash_state(&encode_hash_state(&state)).unwrap();
         assert_eq!(decoded.version, 42);
@@ -268,12 +271,17 @@ mod tests {
             version: 9,
             hash: vec![0u8; 128],
             index_value_map: Default::default(),
-            mac_mismatch_fatal: false,
+            ..Default::default()
         }
         .encode_to_vec();
         let decoded = decode_hash_state(&bytes).expect("an old row must still decode");
         assert_eq!(decoded.version, 9);
         assert!(!decoded.mac_mismatch_fatal);
+        assert!(
+            !decoded.bootstrapped,
+            "a row written before the flag existed has not recorded a completed \
+             bootstrap, so it must read as one that has not"
+        );
     }
 
     #[test]
@@ -283,7 +291,7 @@ mod tests {
             version: 1,
             hash: vec![0u8; 64],
             index_value_map: Default::default(),
-            mac_mismatch_fatal: false,
+            ..Default::default()
         }
         .encode_to_vec();
         assert!(decode_hash_state(&bytes).is_err());
