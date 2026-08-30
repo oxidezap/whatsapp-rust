@@ -286,7 +286,7 @@ impl AppStateProcessor {
         self.prefetch_keys(&pl).await?;
 
         let stored = self.backend.get_version(pl.name.as_str()).await?;
-        let had_bootstrap = stored.as_ref().is_some_and(|s| s.bootstrapped);
+        let had_bootstrap = stored.as_ref().is_some_and(|s| s.has_bootstrapped());
         let mut state = stored.unwrap_or_default();
         let mut new_mutations: Vec<Mutation> = Vec::new();
         let collection_name = pl.name.as_str();

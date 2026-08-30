@@ -54,6 +54,20 @@ impl Default for HashState {
     }
 }
 
+impl HashState {
+    /// Whether this collection has completed a bootstrap.
+    ///
+    /// A version past zero proves it: patches only apply on top of a baseline,
+    /// so reaching v7 means one was established. Only version zero is ambiguous
+    /// -- never synced and synced-but-empty are byte-identical there -- and that
+    /// is the case [`HashState::bootstrapped`] exists to decide. Reading the flag
+    /// alone would make every account re-download a snapshot per collection on
+    /// upgrade, for a question the version already answers.
+    pub fn has_bootstrapped(&self) -> bool {
+        self.bootstrapped || self.version > 0
+    }
+}
+
 /// Result of updating the hash state with mutations.
 #[derive(Debug, Clone, Default)]
 pub struct HashUpdateResult {
