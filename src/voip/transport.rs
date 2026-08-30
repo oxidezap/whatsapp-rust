@@ -38,7 +38,6 @@ use rtc_sctp::{
 };
 
 use wacore::runtime::{AbortHandle, Runtime};
-use wacore::voip::engine::TxIdSource;
 use wacore::voip::relay_parse::WEB_CLIENT_RELAY_PORT;
 use wacore::voip::transport::{
     RelayDisconnectReason, RelayTransport, RelayTransportEvent, RelayTransportFactory,
@@ -580,16 +579,10 @@ pub async fn connect_relay_media(
     }
 }
 
-/// OS-RNG-backed STUN transaction ids for production calls. The core's `SequentialTxIds` is
-/// deterministic (test-only); real calls need unpredictable ids for consent freshness.
-#[derive(Default)]
-pub struct RandTxIds;
-
-impl TxIdSource for RandTxIds {
-    fn next_tx_id(&mut self) -> [u8; 12] {
-        rand::random()
-    }
-}
+// `RandTxIds` used to live here, and had no business doing so: an OS-RNG transaction id needs no
+// socket. It moved to the portable driver when the native relay became its own feature, and is
+// re-exported so `whatsapp_rust::voip::transport::RandTxIds` keeps naming it.
+pub use crate::voip::driver::RandTxIds;
 
 #[async_trait]
 impl RelayTransport for RelayMediaChannel {

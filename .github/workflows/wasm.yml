@@ -87,8 +87,7 @@ jobs:
           fi
       # The sans-IO VoIP core (wacore::voip: the CallEngine, the portable run_call driver,
       # the RelayTransport seam, the MLow codec, SRTP/SFrame crypto) must stay wasm-buildable
-      # so the WASM bridge can drive 1:1 calls. whatsapp-rust's `voip` feature compile-errors on
-      # wasm (it pulls webrtc-rs + libopus FFI), so the guard is on the pure core here.
+      # so a browser front end can drive 1:1 calls.
       - name: Build wacore VoIP core for wasm32 (release)
         env:
           RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
@@ -96,3 +95,16 @@ jobs:
           cargo build -p wacore --lib --release
           --target wasm32-unknown-unknown
           --no-default-features --features "voip,js"
+      # And the half above it: signaling, the facade, `CallHandle` -- everything a consumer
+      # actually places a call through. It builds here because `voip-runtime` no longer carries the
+      # native relay dialer (that is `voip-relay-native`, and it is the one thing that still
+      # compile_error!s on this target), so what a page supplies is a `RelayTransportProvider` and
+      # not a reimplementation of the call flow. Without this step that split silently regresses the
+      # first time something in the facade reaches for a socket or a clock.
+      - name: Build whatsapp-rust VoIP runtime for wasm32 (release)
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: >
+          cargo build -p whatsapp-rust --lib --release
+          --target wasm32-unknown-unknown
+          --no-default-features --features voip-mlow

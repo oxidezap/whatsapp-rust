@@ -1,20 +1,34 @@
-//! VoIP calls media plane (Tokio runtime side): the DTLS/SCTP DataChannel transport
-//! over the WhatsApp relay, encoded audio, the call state machine, and the media pipeline.
-//! Pure protocol/crypto lives in `wacore::voip`.
+//! VoIP calls media plane: the call state machine, the media pipeline, encoded audio, and the
+//! relay transport that carries them. Pure protocol/crypto lives in `wacore::voip`.
 //!
-//! This module drives the media stack over a Tokio UDP socket, which does not exist on wasm32 or
-//! espidf. The wasm/esp32-safe subset is `wacore`'s `voip` feature (pure-Rust crypto and encoded
-//! transport); add `wacore/voip-mlow` for its pure-Rust MLOW codec.
+//! # Two halves, and only one of them owns a socket
+//!
+//! Everything here except [`transport`] is portable: it drives `wacore`'s sans-IO engine over an
+//! injected [`Runtime`](wacore::runtime::Runtime) and an injected
+//! [`RelayTransportFactory`](wacore::voip::transport::RelayTransportFactory), so it names no clock
+//! and opens no descriptor. That half is `voip-runtime`, and it builds wherever `wacore` does.
+//!
+//! [`transport`] is the other half -- a UDP socket per call with DTLS, SCTP and the pre-negotiated
+//! DataChannel over it -- and it is `voip-relay-native`, because a UDP socket is exactly what
+//! wasm32 and espidf do not have. A page reaches the same relay through an `RTCPeerConnection`,
+//! which is a factory it supplies with [`Client::set_relay_transport_factory`]; it needs no part of
+//! this module's native half, and asking for one used to be a `compile_error!` across the whole
+//! feature rather than across the socket.
+//!
+//! [`Client::set_relay_transport_factory`]: crate::client::Client::set_relay_transport_factory
 
-// Fail fast with an actionable message instead of a confusing link error further down.
+// Fail fast with an actionable message instead of a confusing link error further down. Narrowed to
+// the transport: `voip-runtime` alone is portable, and the message now names the way forward
+// rather than only the wall.
 #[cfg(all(
-    feature = "voip-runtime",
+    feature = "voip-relay-native",
     any(target_arch = "wasm32", target_os = "espidf")
 ))]
 compile_error!(
-    "the native VoIP features of `whatsapp-rust` drive the relay media stack over a Tokio UDP \
-     socket and do not build on wasm32/espidf. For those targets use `wacore/voip` for \
-     crypto/encoded transport and optionally `wacore/voip-mlow` for the pure-Rust MLOW codec."
+    "`voip-relay-native` drives the relay media stack over a Tokio UDP socket and does not build \
+     on wasm32/espidf. Enable `voip-mlow` (or `voip-encoded`) without it and supply your own \
+     `RelayTransportFactory` through `Client::set_relay_transport_factory` -- in a browser an \
+     `RTCPeerConnection` with a pre-negotiated DataChannel reaches the same relay."
 );
 
 pub mod audio;
@@ -23,6 +37,7 @@ pub mod facade;
 pub mod registry;
 pub mod session;
 mod state;
+#[cfg(feature = "voip-relay-native")]
 pub mod transport;
 pub mod video;
 

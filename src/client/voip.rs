@@ -403,6 +403,69 @@ impl Client {
         self.voip_state().call_registry.clone()
     }
 
+    /// Install the platform's way onto the media wire.
+    ///
+    /// A relay endpoint is a `SocketAddr` the server names per call, and what dials it is the
+    /// platform's business: on a `voip-relay-native` build the default is this crate's own
+    /// UDP/DTLS/SCTP/DataChannel dialer, and nothing else needs to say so. Everywhere else -- a
+    /// browser above all, where there is no UDP socket to open and an `RTCPeerConnection` reaches
+    /// the same relay over the same pre-negotiated DataChannel -- this is how the transport gets
+    /// in.
+    ///
+    /// Call it before placing or answering a call; a call already running keeps the transport it
+    /// dialled with. Installing one on a native build replaces the default rather than racing it,
+    /// which is also how a packet tap or an in-memory transport gets used against a real client.
+    #[cfg(feature = "voip-runtime")]
+    pub fn set_relay_transport_provider(
+        &self,
+        provider: Arc<dyn wacore::voip::RelayTransportProvider>,
+    ) {
+        *self
+            .voip_state()
+            .relay_transport_provider
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(provider);
+    }
+
+    /// The factory that dials `relay`, from the installed provider or this build's default.
+    ///
+    /// The error is `CallError::Setup` rather than a panic or a `compile_error!`, because "this
+    /// build has no way onto the media wire" is a fact about a deployment: a page that has not
+    /// installed a provider yet is in exactly the state a page with no `RTCPeerConnection` is in
+    /// permanently, and both deserve a sentence rather than a crash.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn relay_transport_factory(
+        &self,
+        relay: std::net::SocketAddr,
+    ) -> Result<Arc<dyn wacore::voip::RelayTransportFactory>, CallError> {
+        let installed = self
+            .voip_state()
+            .relay_transport_provider
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(provider) = installed {
+            return provider
+                .factory(relay)
+                .await
+                .map_err(|e| CallError::Setup(format!("relay transport for {relay}: {e}")));
+        }
+        #[cfg(feature = "voip-relay-native")]
+        {
+            Ok(Arc::new(
+                crate::voip::transport::RelayMediaChannelFactory::new(relay, self.runtime.clone()),
+            ))
+        }
+        #[cfg(not(feature = "voip-relay-native"))]
+        {
+            Err(CallError::Setup(format!(
+                "no relay media transport for {relay}: this build has no native relay dialler \
+                 (`voip-relay-native`), so it needs one installed with \
+                 `Client::set_relay_transport_provider`"
+            )))
+        }
+    }
+
     #[cfg(feature = "voip-runtime")]
     fn begin_call_link_join(&self) -> PendingCallLinkJoinGuard {
         let mut state = self

@@ -74,11 +74,14 @@ fn default_http_client() -> Option<Arc<dyn crate::http::HttpClient>> {
     None
 }
 
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 fn default_runtime() -> Option<Arc<dyn Runtime>> {
     Some(Arc::new(crate::runtime_impl::TokioRuntime))
 }
-#[cfg(not(feature = "tokio-runtime"))]
+/// No default anywhere `TokioRuntime` is absent -- which on wasm32 is the whole point: the page
+/// supplies its own single-threaded runtime, and a default that panicked on first spawn would be
+/// found out one call into a session rather than at assembly.
+#[cfg(not(all(feature = "tokio-runtime", not(target_arch = "wasm32"))))]
 fn default_runtime() -> Option<Arc<dyn Runtime>> {
     None
 }

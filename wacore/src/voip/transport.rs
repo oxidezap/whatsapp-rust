@@ -87,6 +87,29 @@ pub trait RelayTransport: crate::sync_marker::MaybeSendSync {
     }
 }
 
+/// Chooses which [`RelayTransportFactory`] dials a given relay endpoint.
+///
+/// A factory is bound to one address, and the address is not known until the server names the
+/// relay for a call -- so what a platform actually supplies is this: a way to make a factory once
+/// the address arrives. Native builds default to the UDP/DTLS/SCTP dialer behind
+/// `voip-relay-native`; a browser has no UDP socket and hands in an `RTCPeerConnection` instead,
+/// which reaches the same relay over the same pre-negotiated DataChannel the native stack builds
+/// by hand.
+///
+/// It is a trait rather than a boxed closure because an implementation carries state -- a page's
+/// carries the JS handles its peer connections are built from -- and a closure returning an `Arc`
+/// would have to own that anyway.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait RelayTransportProvider: crate::sync_marker::MaybeSendSync {
+    /// The factory that dials `relay`.
+    ///
+    /// Async because a platform may have to ask for something before it can build one -- a browser
+    /// creating an `RTCPeerConnection` is a call into JS. Failing here fails the call with the
+    /// reason, which is the honest answer for a page whose browser has no WebRTC at all.
+    async fn factory(&self, relay: SocketAddr) -> Result<Arc<dyn RelayTransportFactory>>;
+}
+
 /// Creates a [`RelayTransport`] connected to a relay endpoint, returning it alongside a push stream
 /// of inbound packets. Mirrors `wacore::net::TransportFactory`.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]

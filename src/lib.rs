@@ -183,7 +183,10 @@ pub(crate) mod signal_flush;
 pub use request::{IqError, RejectionStanza};
 #[cfg(feature = "tokio-runtime")]
 pub mod runtime_impl;
-#[cfg(feature = "tokio-runtime")]
+// The module is the feature's; the type inside it is the target's (`tokio::spawn` needs threads).
+// Re-exporting on the feature alone made `--features tokio-runtime` on wasm32 an unresolved import
+// rather than a runtime the target simply does not have.
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 pub use runtime_impl::TokioRuntime;
 pub use wacore::runtime::Runtime;
 pub mod send;
@@ -278,7 +281,7 @@ pub mod prelude {
         UntypedClientPlugin,
     };
     pub use crate::request::{IqError, RejectionStanza};
-    #[cfg(feature = "tokio-runtime")]
+    #[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
     pub use crate::runtime_impl::TokioRuntime;
     pub use crate::send::{EditOptions, SendError, SendOptions, SendResult};
     #[cfg(feature = "signal")]

@@ -37,7 +37,7 @@ use wacore::voip::{
     AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection,
     CallEngine, CallEvent, CallPhase, CodecDecisionSource, EncodedAudioFrame, GroupEngineConfig,
     VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame, VideoUpgradeToken,
-    video_control_channel,
+    run_call, video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -47,8 +47,7 @@ use crate::client::{CallError, Client, ResponseWaiter};
 use crate::voip::audio::{
     AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource, WA_FRAME_SAMPLES,
 };
-use crate::voip::driver::{RandTxIds, run_call_tokio};
-use crate::voip::transport::RelayMediaChannelFactory;
+use crate::voip::driver::RandTxIds;
 use crate::voip::video::{VideoSink, VideoSource};
 
 enum AudioEndpoints {
@@ -384,7 +383,7 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         registration.ensure_current()?;
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
+        let factory = self.client.relay_transport_factory(addr).await?;
         // Final acceptance waits until media setup succeeded and the registered generation is still
         // current; only then may the caller apply the participant keys and enter the call.
         send_answer_node(self.client, &registration, &mut teardown, accept).await?;
@@ -393,7 +392,7 @@ impl<'a> AcceptCall<'a> {
             &mut registration,
             teardown,
             engine,
-            &factory,
+            &*factory,
             audio,
             video,
         )
@@ -964,9 +963,9 @@ impl<'a> OutgoingGroupCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
+        let factory = self.client.relay_transport_factory(addr).await?;
         let handle =
-            spawn_registered_call(self.client, &registration, engine, &factory, audio, video)
+            spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
         registration.disarm();
         teardown.disarm();
@@ -1159,9 +1158,9 @@ impl<'a> CallLinkCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
+        let factory = self.client.relay_transport_factory(addr).await?;
         let handle =
-            spawn_registered_call(self.client, &registration, engine, &factory, audio, video)
+            spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
         registration.disarm();
         teardown.disarm();
@@ -2273,7 +2272,7 @@ pub(crate) async fn attach_outgoing_relay(
     // call would otherwise leak its registry generation and a parked wait_ended() would hang forever
     // (no pending entry left for a later hangup to drain). Build everything in a fallible block and, on
     // any early-return error in this window, reap the generation and notify `ended` before propagating.
-    let build = (|| {
+    let build = async {
         let mut config = CallConfig::for_outgoing(
             call_id,
             &pending.self_lid,
@@ -2289,11 +2288,9 @@ pub(crate) async fn attach_outgoing_relay(
         let engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
             .map_err(|e| CallError::Setup(e.to_string()))?;
-        Ok::<_, CallError>((
-            engine,
-            RelayMediaChannelFactory::new(addr, client.runtime.clone()),
-        ))
-    })();
+        Ok::<_, CallError>((engine, client.relay_transport_factory(addr).await?))
+    }
+    .await;
     let (engine, factory) = match build {
         Ok(pair) => pair,
         Err(e) => {
@@ -2311,7 +2308,7 @@ pub(crate) async fn attach_outgoing_relay(
         pending.generation,
         FailureCleanup::Here,
         engine,
-        &factory,
+        &*factory,
         pending.audio,
         pending.video,
         pending.video_shared,
@@ -2976,13 +2973,18 @@ async fn attach_engine(
     let ended_guard = scopeguard::guard(ended, |e| {
         e.notify();
     });
+    // The driver's runtime is the client's own, not a hardcoded Tokio one. `run_call` has always
+    // been portable and taken the runtime as an argument; naming Tokio here was what put the one
+    // remaining executor assumption in the call path, and it is exactly the assumption a page
+    // cannot satisfy.
+    let driver_runtime = client.runtime.clone();
     let task = client.runtime.spawn(Box::pin(async move {
         // All are captured (moved in), so any teardown -- even an abort before the first poll --
         // drops them: the feeds are aborted and `ended` is notified.
         let _ended_guard = ended_guard;
         let _audio_feed = audio_feed;
         let _video_out_feed = video_out_feed;
-        run_call_tokio(transport, relay_events, channels, engine).await;
+        run_call(driver_runtime, transport, relay_events, channels, engine).await;
         // A locally-ended call gets no <terminate>; drop our own entry so the registry doesn't grow.
         // The call's `ring_devices` live on the session, so this also drops the sibling-dismiss
         // tracking -- no separate map to clean up.
@@ -5961,6 +5963,87 @@ mod tests {
                 rx,
             ))
         }
+    }
+
+    /// A provider that hands out a [`MockFactory`] and records the relay it was asked about.
+    struct RecordingProvider {
+        asked: Arc<Mutex<Vec<SocketAddr>>>,
+    }
+
+    #[async_trait]
+    impl wacore::voip::RelayTransportProvider for RecordingProvider {
+        async fn factory(
+            &self,
+            relay: SocketAddr,
+        ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+            self.asked.lock().unwrap().push(relay);
+            let (_tx, rx) = async_channel::unbounded();
+            Ok(Arc::new(MockFactory {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                relay_rx: Mutex::new(Some(rx)),
+                connects: Arc::new(AtomicUsize::new(0)),
+            }))
+        }
+    }
+
+    /// An installed provider is what dials, and it is told which relay to dial.
+    ///
+    /// This is the seam a page reaches a call through: with no provider a native build falls back
+    /// to its own UDP dialer, and a build without one -- wasm32, where there is no UDP socket to
+    /// open -- has nothing to fall back to. Guarding it here rather than only in the wasm CI build
+    /// is what makes "the browser transport is used" a fact this test suite can hold, since the
+    /// browser half itself cannot run in this test suite at all.
+    #[tokio::test]
+    async fn an_installed_relay_transport_provider_is_what_dials() {
+        let client = make_client().await;
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        client.set_relay_transport_provider(Arc::new(RecordingProvider {
+            asked: asked.clone(),
+        }));
+
+        let relay: SocketAddr = "203.0.113.7:3478".parse().expect("addr");
+        client
+            .relay_transport_factory(relay)
+            .await
+            .expect("the installed provider answers");
+
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            &[relay],
+            "the provider is asked about the relay the call named, not a default"
+        );
+    }
+
+    /// A provider that refuses fails the call with its reason, rather than falling back to a dialer
+    /// the platform may not have. A browser with no `RTCPeerConnection` is exactly this case, and
+    /// the reason is the only thing a person ever sees of it.
+    #[tokio::test]
+    async fn a_refusing_provider_fails_the_call_with_its_reason() {
+        struct Refuses;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for Refuses {
+            async fn factory(
+                &self,
+                _relay: SocketAddr,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                anyhow::bail!("this browser has no WebRTC")
+            }
+        }
+
+        let client = make_client().await;
+        client.set_relay_transport_provider(Arc::new(Refuses));
+        // `expect_err` wants the Ok side to be Debug, and `dyn RelayTransportFactory` is not.
+        let error = match client
+            .relay_transport_factory("203.0.113.7:3478".parse().expect("addr"))
+            .await
+        {
+            Ok(_) => panic!("a refusing provider must not fall through to the native dialer"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("this browser has no WebRTC"),
+            "the provider's own reason has to survive to the caller, got: {error}"
+        );
     }
 
     // spawn_call: connects via the injected factory, registers the call, emits the STUN allocate,

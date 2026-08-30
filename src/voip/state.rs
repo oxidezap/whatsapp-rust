@@ -113,6 +113,17 @@ pub(crate) struct VoipState {
     /// engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id arrives.
     pub(crate) pending_outgoing_calls:
         Arc<std::sync::Mutex<HashMap<String, super::facade::PendingOutgoing>>>,
+    /// How a relay endpoint becomes a media transport, when the platform supplies its own.
+    ///
+    /// `None` means "use whatever this build has": the UDP/DTLS/SCTP dialer on a `voip-relay-native`
+    /// build, and nothing at all anywhere else -- a page that has not installed one gets a call
+    /// that fails at setup with a reason, rather than a crate that would not compile.
+    ///
+    /// A `std` lock over one `Option`, taken for the length of a clone. It is written once during
+    /// assembly in every use anyone has, but making it a constructor argument would put a VoIP type
+    /// in `ClientBuilder` for every consumer that never places a call.
+    pub(crate) relay_transport_provider:
+        std::sync::Mutex<Option<Arc<dyn wacore::voip::RelayTransportProvider>>>,
 }
 
 impl Default for VoipState {
@@ -123,6 +134,7 @@ impl Default for VoipState {
             pending_call_link_join_lane: Mutex::new(()),
             answer_transition_locks: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
             pending_outgoing_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            relay_transport_provider: std::sync::Mutex::new(None),
         }
     }
 }
