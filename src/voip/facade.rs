@@ -2097,23 +2097,33 @@ fn spawn_outgoing_relay_waiter(
     runtime
         .clone()
         .spawn(Box::pin(async move {
+            // Three outcomes and not two. They used to collapse into one `None`, which was fine
+            // while the only consumer was a log line saying "(timeout or absent)" -- and is not,
+            // now that the reason reaches the caller: an ack that arrived carrying no relay and an
+            // ack that never arrived are different faults, and telling somebody the server's reply
+            // lacked something when there was no reply sends them looking in the wrong place.
             let relay =
                 match wacore::runtime::timeout(&*runtime, OFFER_ACK_RELAY_TIMEOUT, ack_rx).await {
                     // The ack node re-encoded as OwnedNodeRef; find its <relay> child and parse it (same
                     // path the incoming offer uses). handle_ack_response already removed our waiter entry.
                     Ok(Ok(ack)) => wacore::stanza::call::find_relay(ack.get())
-                        .and_then(wacore::voip::relay_parse::parse_relay_data),
+                        .and_then(wacore::voip::relay_parse::parse_relay_data)
+                        .ok_or("the server acked the offer but carried no relay"),
                     // Sender dropped (disconnect cleared the waiter map) or the timeout elapsed:
                     // handle_ack_response never ran, so our still-registered waiter entry must be dropped
                     // here or send_keepalive suppresses pings for the life of the connection.
-                    Ok(Err(_)) | Err(_) => {
+                    Ok(Err(_)) => {
                         client.response_waiters_guard().remove(&offer_stanza_id);
-                        None
+                        Err("the connection dropped before the server acked the offer")
+                    }
+                    Err(_) => {
+                        client.response_waiters_guard().remove(&offer_stanza_id);
+                        Err("the server did not ack the offer in time")
                     }
                 };
 
             match relay {
-                Some(relay) => {
+                Ok(relay) => {
                     if let Err(e) = attach_outgoing_relay(&client, &call_id, &relay).await {
                         warn!("voip: failed to attach outgoing relay for {call_id}: {e}");
                         fail_pending_outgoing_with(
@@ -2124,15 +2134,13 @@ fn spawn_outgoing_relay_waiter(
                         );
                     }
                 }
-                None => {
-                    warn!(
-                        "voip: no relay in offer ack for {call_id} (timeout or absent); call failed"
-                    );
+                Err(reason) => {
+                    warn!("voip: {reason} for {call_id}; call failed");
                     fail_pending_outgoing_with(
                         &client,
                         &call_id,
                         generation,
-                        Some("the server's offer ack carried no relay".to_string()),
+                        Some(reason.to_string()),
                     );
                 }
             }
@@ -2178,6 +2186,20 @@ fn take_pending_if_current(
     }
 }
 
+/// Put the reason a call never started onto its handle's stream.
+///
+/// `force_send` rather than `try_send`, which is what every other publish onto this queue uses and
+/// is wrong for this one: a full queue would drop the one event that explains the teardown, and it
+/// is the *last* event either way -- so if something has to go, the oldest diagnostic is a better
+/// loss than the reason the call failed. Never blocks; a teardown cannot wait on a consumer.
+///
+/// The queue is empty in every case reachable today, since a dormant outgoing call has no driver
+/// publishing to it -- which is exactly why this is `force_send` rather than that assumption
+/// written down as a comment.
+fn publish_setup_failure(events: &async_channel::Sender<CallEvent>, reason: String) {
+    let _ = events.force_send(CallEvent::MediaSetupFailed(reason));
+}
+
 fn fail_pending_outgoing(client: &Client, call_id: &str, generation: u64) {
     fail_pending_outgoing_with(client, call_id, generation, None);
 }
@@ -2215,9 +2237,7 @@ fn fail_pending_outgoing_with(
         .remove_if_current(call_id, generation);
     if let Some(pending) = pending {
         if let Some(reason) = reason {
-            // `try_send`, like every other publish onto this queue: the channel is bounded and a
-            // consumer that is not reading must not hold a teardown open.
-            let _ = pending.ev_tx.try_send(CallEvent::MediaSetupFailed(reason));
+            publish_setup_failure(&pending.ev_tx, reason);
         }
         pending.ended.notify();
     }
@@ -2381,9 +2401,7 @@ pub(crate) async fn attach_outgoing_relay(
             // Before `ended`, for the reason it is ordered that way there: a caller racing
             // `wait_ended()` against the stream would otherwise see the call end and then the
             // explanation.
-            let _ = pending
-                .ev_tx
-                .try_send(CallEvent::MediaSetupFailed(e.to_string()));
+            publish_setup_failure(&pending.ev_tx, e.to_string());
             pending.ended.notify();
             return Err(e);
         }

@@ -1,14 +1,13 @@
 //! The relay media transport, and the paths that name it.
 //!
-//! Two things live here and only one of them owns a socket. The native relay stack -- a UDP
-//! endpoint per call with DTLS, SCTP and the pre-negotiated DataChannel over it -- is the
-//! `native` submodule, gated on `voip-relay-native`, because a UDP socket is exactly what wasm32
-//! and espidf do not have.
+//! The native relay stack -- a UDP endpoint per call with DTLS, SCTP and the pre-negotiated
+//! DataChannel over it -- is the `native` submodule, gated on `voip-relay-native`. Why that half
+//! is a feature of its own is in [`crate::voip`], and stays there.
 //!
-//! The module itself is not gated, and that is deliberate rather than tidy: `RandTxIds` and the
-//! packet demux have always been reachable at `whatsapp_rust::voip::transport::*`, neither one
-//! needs a socket, and gating the module around them would break every codec-only consumer that
-//! imports one -- a build with `voip-mlow` and no relay is exactly the build a browser makes.
+//! What is decided *here* is that the module around it is not gated: `RandTxIds` and the packet
+//! demux have always been reachable at `whatsapp_rust::voip::transport::*`, neither needs a
+//! socket, and gating the module for their sake would break every codec-only consumer that imports
+//! one -- a build with `voip-mlow` and no relay is exactly the build a browser makes.
 
 #[cfg(feature = "voip-relay-native")]
 mod native;
