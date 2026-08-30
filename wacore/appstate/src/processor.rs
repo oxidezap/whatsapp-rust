@@ -8,7 +8,7 @@ use crate::AppStateError;
 use crate::decode::{Mutation, decode_record};
 use crate::hash::{HashState, generate_patch_mac};
 use crate::keys::ExpandedAppStateKeys;
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -100,27 +100,48 @@ where
     // Validate snapshot MAC if requested. A snapshot that omits `mac`/`key_id` is
     // treated as a validation FAILURE, not skipped: WA Web's anti-tampering
     // compares against the (possibly undefined) mac and fires the recovery path on
-    // mismatch, so a missing mac must not silently accept unverified records.
+    // mismatch, so a missing mac must not silently accept unverified records. It
+    // answers its own variant, though: the two failures need different fixes and
+    // reaching the log as one string cost a production investigation.
     if validate_macs {
         let (Some(mac_expected), Some(key_id)) = (
             snapshot.mac.as_ref(),
             snapshot.key_id.as_option().and_then(|k| k.id.as_deref()),
         ) else {
-            return Err(AppStateError::SnapshotMACMismatch);
+            warn!(
+                target: "AppState",
+                "Snapshot {} v{} carries no {}; refusing it rather than accepting unverified records",
+                collection_name,
+                version,
+                if snapshot.mac.is_none() { "MAC" } else { "key id" }
+            );
+            return Err(AppStateError::SnapshotMACMissing);
         };
         let keys = get_keys(key_id)?;
         let computed = initial_state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
-        trace!(
-            target: "AppState",
-            "Snapshot {} v{} MAC validation: computed={}, expected={}",
-            collection_name,
-            version,
-            hex::encode(&computed),
-            hex::encode(mac_expected)
-        );
         if computed != *mac_expected {
+            // At warn, with both sides and the inputs that produced them: this is
+            // the failure that strands a collection, and the ltHash plus the
+            // record count are what tell a stale snapshot from a fold that went
+            // wrong. Mirrors WA Web's own snapshot-mac diagnostic line.
+            warn!(
+                target: "AppState",
+                "Snapshot {} v{} MAC mismatch: computed={}, expected={}, records={}, ltHash={}",
+                collection_name,
+                version,
+                hex::encode(&computed),
+                hex::encode(mac_expected),
+                snapshot.records.len(),
+                hex::encode(&initial_state.hash[120..])
+            );
             return Err(AppStateError::SnapshotMACMismatch);
         }
+        trace!(
+            target: "AppState",
+            "Snapshot {} v{} MAC validated",
+            collection_name,
+            version
+        );
     }
 
     // Decode all records and collect MACs in a single pass
@@ -495,7 +516,7 @@ pub fn validate_snapshot_mac(
     // A missing snapshot mac is a validation failure, not a skip (matches WA Web
     // and process_snapshot's enforced gate).
     let Some(mac_expected) = snapshot.mac.as_ref() else {
-        return Err(AppStateError::SnapshotMACMismatch);
+        return Err(AppStateError::SnapshotMACMissing);
     };
     let computed = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
     if computed != *mac_expected {
@@ -656,7 +677,10 @@ mod tests {
         let mut state = HashState::default();
         let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
             .expect_err("missing snapshot mac must fail when validating");
-        assert!(matches!(err, AppStateError::SnapshotMACMismatch));
+        assert!(
+            matches!(err, AppStateError::SnapshotMACMissing),
+            "a snapshot with no MAC must be distinguishable from one whose MAC differs, got {err:?}"
+        );
     }
 
     #[test]
@@ -682,7 +706,10 @@ mod tests {
         let mut state = HashState::default();
         let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
             .expect_err("missing snapshot key_id must fail when validating");
-        assert!(matches!(err, AppStateError::SnapshotMACMismatch));
+        assert!(
+            matches!(err, AppStateError::SnapshotMACMissing),
+            "no key id means nothing to compare against, not a differing MAC, got {err:?}"
+        );
     }
 
     /// Deterministic reproduction of the fresh-pairing race that PR #972 works

@@ -26,6 +26,14 @@ pub enum AppStateError {
     MissingKeyId,
     #[error("snapshot MAC mismatch")]
     SnapshotMACMismatch,
+    /// The snapshot carried no `mac`, or no `key_id` to derive the key from, so
+    /// there was nothing to compare against. Still a validation failure -- WA
+    /// Web compares against the possibly-undefined mac and fires recovery on
+    /// mismatch, so unverified records must never be accepted -- but a distinct
+    /// one, because "the server sent no MAC" and "the MAC we computed differs"
+    /// call for different investigations and used to reach the log identically.
+    #[error("snapshot MAC missing")]
+    SnapshotMACMissing,
     #[error("patch snapshot MAC mismatch")]
     PatchSnapshotMACMismatch,
     #[error("patch MAC mismatch")]
