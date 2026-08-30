@@ -383,7 +383,7 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         registration.ensure_current()?;
-        let factory = self.client.relay_transport_factory(&relay_endpoint).await?;
+        let factory = relay_factory_or_ended(self.client, &registration, &relay_endpoint).await?;
         // Final acceptance waits until media setup succeeded and the registered generation is still
         // current; only then may the caller apply the participant keys and enter the call.
         send_answer_node(self.client, &registration, &mut teardown, accept).await?;
@@ -963,7 +963,7 @@ impl<'a> OutgoingGroupCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = self.client.relay_transport_factory(&relay_endpoint).await?;
+        let factory = relay_factory_or_ended(self.client, &registration, &relay_endpoint).await?;
         let handle =
             spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
@@ -1158,7 +1158,7 @@ impl<'a> CallLinkCall<'a> {
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = self.client.relay_transport_factory(&relay_endpoint).await?;
+        let factory = relay_factory_or_ended(self.client, &registration, &relay_endpoint).await?;
         let handle =
             spawn_registered_call(self.client, &registration, engine, &*factory, audio, video)
                 .await?;
@@ -2238,6 +2238,40 @@ impl SetupStop {
             }
             Self::Cancelled(e) => e,
         }
+    }
+}
+
+/// The provider await, *cancelled* by the call ending rather than merely bounded by
+/// `RELAY_PROVIDER_TIMEOUT`.
+///
+/// The timeout is the floor and not the answer. A peer `<terminate>`, a decline from another
+/// device, or a connection cleanup removes the registration and fires `ended` while an installed
+/// provider is still building its factory — and these three callers are *awaited* by whoever
+/// called `accept()` or `start()`, so a wait that watched only the timeout would be their wait
+/// too: up to `RELAY_PROVIDER_TIMEOUT` holding the engine, the audio endpoints and the call key
+/// for a call that is already over.
+///
+/// `attach_outgoing_relay` already races this same flag on the dormant 1:1 path, and
+/// `attach_engine` races it around the dial. This is that rule for the paths a `RegisteredCall`
+/// owns, which were the three that still only had the ceiling.
+///
+/// Cancellation, not failure: the error says the call ended, and the caller drops its endpoints
+/// on the way out rather than publishing a media setup failure for an ordinary ending.
+async fn relay_factory_or_ended(
+    client: &Client,
+    registration: &RegisteredCall,
+    endpoint: &wacore::voip::RelayEndpointParams,
+) -> Result<Arc<dyn RelayTransportFactory>, CallError> {
+    match futures::future::select(
+        std::pin::pin!(client.relay_transport_factory(endpoint)),
+        std::pin::pin!(registration.ended.wait()),
+    )
+    .await
+    {
+        futures::future::Either::Left((built, _)) => built,
+        futures::future::Either::Right(((), _)) => Err(CallError::Connect(
+            "the call ended while the relay transport was being built".into(),
+        )),
     }
 }
 
@@ -6528,6 +6562,64 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("and the call must still end rather than hang");
+    }
+
+    /// A peer `<terminate>` cancels the provider await on a call that is already registered.
+    ///
+    /// `RELAY_PROVIDER_TIMEOUT` is the floor and not the answer here. `accept()` and the group
+    /// starts are *awaited* by their callers, so a wait that watched only the ceiling would be
+    /// the caller's wait too — up to fifteen seconds holding the engine, the audio endpoints and
+    /// the call key for a call the peer has already hung up. The dormant 1:1 path got this race
+    /// when the provider seam landed; the three paths a `RegisteredCall` owns did not, which is
+    /// the hole this closes.
+    ///
+    /// On a real clock deliberately: under `start_paused` the fifteen-second ceiling
+    /// auto-advances and fires, so the test would pass without the race and prove nothing. Two
+    /// seconds is far inside it, so only the cancellation can satisfy this.
+    #[tokio::test]
+    async fn a_peer_terminate_cancels_a_registered_call_s_provider_await() {
+        struct NeverAnswers;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for NeverAnswers {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                std::future::pending().await
+            }
+        }
+
+        let (client, _sent) = make_sending_client().await;
+        let incoming = incoming_offer(false);
+        let registration = register_answer(&client, &incoming).await;
+        client.set_relay_transport_provider(Arc::new(NeverAnswers));
+        let endpoint = wacore::voip::RelayEndpointParams {
+            addr: "203.0.113.9:3478".parse().expect("addr"),
+            ice_ufrag: String::new(),
+            ice_pwd: String::new(),
+        };
+
+        let awaiting = relay_factory_or_ended(&client, &registration, &endpoint);
+        let end_peer = async {
+            tokio::task::yield_now().await;
+            terminate_call(&client, incoming.action.call_id());
+        };
+
+        let (result, ()) = tokio::time::timeout(
+            Duration::from_secs(2),
+            futures::future::join(awaiting, end_peer),
+        )
+        .await
+        .expect("the peer's terminate must end the await, not leave it on the provider");
+
+        let error = match result {
+            Ok(_) => panic!("a provider that never answers must not resolve"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("the call ended"),
+            "the reason has to name the ending rather than the ceiling, got: {error}"
+        );
     }
 
     /// A provider that never answers fails the call rather than parking its setup forever.
