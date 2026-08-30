@@ -195,10 +195,15 @@ pub struct CallConfig {
     /// ([`relay_parse::token_to_ice_ufrag`](crate::voip::relay_parse::token_to_ice_ufrag)), which a
     /// platform whose transport is an `RTCPeerConnection` needs and the native dialer does not.
     ///
-    /// Empty when the offer carries none: every endpoint arriving with `auth_token_id = 0` is a
-    /// real shape (see `is_outbound_relay_candidate`, where that marks an endpoint as
-    /// relaylatency-ineligible rather than unusable) and such a call must still connect for media.
-    /// So this is best-effort, and a transport that cannot do without it is the one that says so.
+    /// `auth_token_id` is an ordinary index, exactly as `token_id` is: both default to 0 when the
+    /// attribute is absent, and slot 0 is a real slot. It is *not* a sentinel -- treating it as one
+    /// would blank the ufrag for every offer that omits the attribute, which is the common shape.
+    /// What `is_outbound_relay_candidate` does with `auth_token_id != 0` is pick relaylatency
+    /// probes, and that is a different question from which credential signs an ICE check.
+    ///
+    /// Empty when the offer genuinely carries no matching token, because such a call must still
+    /// connect for media (`get_media_relay_endpoint` says so). Best-effort, therefore, and the
+    /// transport that cannot do without it is the one that says so.
     pub auth_token: Vec<u8>,
     pub relay_ip: String,
     pub relay_port: u16,
@@ -218,7 +223,24 @@ pub struct CallConfig {
     pub enable_sframe: bool,
 }
 
-/// Group-media inputs layered onto a regular engine before it starts.
+/// The endpoint's `<auth_token>`, or empty when the relay carries no matching one.
+///
+/// Shared by the 1:1 and group paths, which index two different token sets the same way and used
+/// to disagree about whether the group one existed at all.
+///
+/// No special case for id 0: it is an ordinary index that both `token_id` and `auth_token_id`
+/// default to when the attribute is absent, so skipping it would blank the credential for the most
+/// common shape of offer. An empty or absent slot answers empty, which is the honest "there is no
+/// token here" and is what a transport needing one checks.
+fn select_auth_token(auth_tokens: &[Vec<u8>], auth_token_id: u32) -> Vec<u8> {
+    auth_tokens
+        .get(auth_token_id as usize)
+        .filter(|token| !token.is_empty())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Group-media inputs layered onto a regular engine before it starts./// Group-media inputs layered onto a regular engine before it starts.
 pub struct GroupEngineConfig {
     pub call_creator: Jid,
     pub self_jid: Jid,
@@ -325,16 +347,11 @@ impl CallConfig {
             .filter(|t| !t.is_empty())
             .cloned()
             .ok_or(SetupError::NoRelayToken(ep.token_id))?;
-        // Best-effort, unlike the token above: an offer whose endpoints all carry
-        // `auth_token_id = 0` has no auth token to select and must still connect for media, so a
-        // missing one is empty here rather than an error. Only a transport that builds a synthetic
-        // SDP reads it, and that is the layer with something to say about an empty one.
-        let auth_token = relay
-            .auth_tokens
-            .get(ep.auth_token_id as usize)
-            .filter(|t| !t.is_empty())
-            .cloned()
-            .unwrap_or_default();
+        // Best-effort, unlike the token above: an offer that carries no matching auth token must
+        // still connect for media, so a missing one is empty here rather than an error. Only a
+        // transport that builds a synthetic SDP reads it, and that is the layer with something to
+        // say about an empty one. Slot 0 is indexed like any other -- see the field's own note.
+        let auth_token = select_auth_token(&relay.auth_tokens, ep.auth_token_id);
         // The relay <key> is the STUN MESSAGE-INTEGRITY key; without it the allocate/binding-success
         // we sign can't authenticate, so fail here rather than dial with an empty key. Sign with the
         // base64 TEXT of <key> (relay_key_ascii), NOT its decoded bytes (relay.relay_key): the relay
@@ -460,9 +477,11 @@ impl CallConfig {
             ),
             audio: AudioConfig::MLOW_PCM,
             relay_token,
-            // A `GroupCallRelay` carries one indexed token set and no `<auth_token>`, so there is
-            // nothing to select here.
-            auth_token: Vec::new(),
+            // A `GroupCallRelay` carries its own `<auth_token>` set, indexed by the selected
+            // endpoint's `auth_token_id` exactly as the 1:1 offer's is. This said the opposite and
+            // was wrong: a browser joining a group call would have built its synthetic SDP with an
+            // empty `ice-ufrag`, which the relay refuses.
+            auth_token: select_auth_token(&relay.auth_tokens, endpoint.auth_token_id),
             relay_ip,
             relay_port,
             integrity_key: relay.key.clone(),

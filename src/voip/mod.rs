@@ -37,9 +37,7 @@ pub mod facade;
 pub mod registry;
 pub mod session;
 mod state;
-// Not gated, though nearly all of it is: `RandTxIds` and the packet demux are reachable here and
-// need no socket, so the module stays and its native stack is what carries the feature. See its
-// own docs.
+// Not gated, and its own docs say why.
 pub mod transport;
 pub mod video;
 

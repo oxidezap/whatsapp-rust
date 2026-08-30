@@ -2378,10 +2378,29 @@ pub(crate) async fn attach_outgoing_relay(
         let engine = CallEngine::new(config, Box::new(RandTxIds))
             .map(with_platform_audio_codec)
             .map_err(|e| CallError::Setup(e.to_string()))?;
-        Ok::<_, CallError>((
-            engine,
-            client.relay_transport_factory(&relay_endpoint).await?,
-        ))
+        // Raced against the call's own ending, not merely bounded by
+        // `RELAY_PROVIDER_TIMEOUT`. The timeout is the floor -- it stops a provider that never
+        // answers from parking any setup path -- but this one path can be *cancelled* rather than
+        // waited out, and it is the path that most needs to be: this function took the pending
+        // entry out of the map on its way in, so a hangup arriving now finds no call to end and
+        // the task would sit on the provider for the rest of the timeout holding the audio, the
+        // video and the call key. `attach_engine` already races its own dial against this same
+        // flag, three functions along; the provider await was the one step in front of it that
+        // did not.
+        let factory = match futures::future::select(
+            std::pin::pin!(client.relay_transport_factory(&relay_endpoint)),
+            std::pin::pin!(pending.ended.wait()),
+        )
+        .await
+        {
+            futures::future::Either::Left((built, _)) => built?,
+            futures::future::Either::Right(((), _)) => {
+                return Err(CallError::Connect(
+                    "the call ended while the relay transport was being built".into(),
+                ));
+            }
+        };
+        Ok::<_, CallError>((engine, factory))
     }
     .await;
     let (engine, factory) = match build {
@@ -6184,7 +6203,56 @@ mod tests {
         assert!(printed.contains("UFRAG"), "got: {printed}");
     }
 
-    /// A provider that never answers fails the call rather than parking its setup forever.
+    /// A hangup during relay setup cancels the provider rather than waiting it out.
+    ///
+    /// The timeout beside this is the floor and not the answer: `attach_outgoing_relay` takes the
+    /// pending entry out of the map on its way in, so a hangup arriving while the provider is
+    /// still building finds no call to end -- and without the race the task would hold the audio,
+    /// the video and the call key for the rest of `RELAY_PROVIDER_TIMEOUT`.
+    #[tokio::test]
+    async fn a_hangup_during_relay_setup_stops_waiting_for_the_provider() {
+        /// Answers only when told to, so the test owns the ordering.
+        struct Gated {
+            release: async_channel::Receiver<()>,
+        }
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for Gated {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                let _ = self.release.recv().await;
+                anyhow::bail!("released")
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        let (_release_tx, release) = async_channel::bounded::<()>(1);
+        client.set_relay_transport_provider(Arc::new(Gated { release }));
+
+        // The attach parks in the provider; the hangup is what has to end it.
+        let attaching = {
+            let client = client.clone();
+            let call_id = call_id.clone();
+            tokio::spawn(
+                async move { attach_outgoing_relay(&client, &call_id, &sample_relay()).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        handle.hangup_local().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), attaching)
+            .await
+            .expect("the hangup must end the attach, not leave it on the provider")
+            .expect("task");
+        assert!(
+            matches!(result, Err(CallError::Connect(_))),
+            "a call that ended during setup is a Connect error, got {result:?}"
+        );
+    }
+
+    /// A provider that never answers fails the call rather than parking its setup forever.    /// A provider that never answers fails the call rather than parking its setup forever.
     ///
     /// The await this bounds is new: the native dialer it replaced was a synchronous constructor,
     /// so nothing on the setup path could stall here. An installed provider is somebody else's I/O,

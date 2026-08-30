@@ -175,8 +175,14 @@ client.set_relay_transport_provider(Arc::new(MyProvider));
 
 A `RelayTransportProvider` is asked for a `RelayTransportFactory` per relay endpoint, because the
 relay is named by the server per call. What it is handed is a `RelayEndpointParams`: the address,
-plus the `ice-ufrag` (the relay token, base64) and `ice-pwd` (the relay `<key>`, in the ASCII form
-it arrived in) that a synthetic SDP answer has to carry. The address alone is enough for a stack
+plus the `ice-ufrag` and `ice-pwd` that a synthetic SDP answer has to carry.
+
+Which credential is which matters, and the two are easy to swap. `ice-ufrag` is the selected
+endpoint's `<auth_token>`, indexed by its `auth_token_id`; `ice-pwd` is the relay `<key>` in the
+ASCII base64 form it arrived in. The `<token>` beside them -- indexed by `token_id` -- is the STUN
+allocation credential and goes on the wire as `RELAY-TOKEN`, never as a ufrag. A ufrag built from
+the wrong one is refused at the browser's first connectivity check, which surfaces as a call that
+will not connect rather than as a bad credential. The address alone is enough for a stack
 that dials UDP itself; it is not enough for a browser, where ICE is not optional and the relay
 validates the credentials.
 

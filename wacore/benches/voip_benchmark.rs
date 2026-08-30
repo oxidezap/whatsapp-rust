@@ -115,6 +115,7 @@ fn config_for(self_lid: &str, peer_lid: &str, ssrc: u32, direction: CallDirectio
         ssrc,
         audio: wacore::voip::AudioConfig::MLOW_PCM,
         relay_token: vec![0xAB; 16],
+        auth_token: vec![0xCD; 8],
         relay_ip: "203.0.113.7".into(),
         relay_port: 3478,
         integrity_key: b"relay-key".to_vec(),
