@@ -2278,17 +2278,23 @@ fn socket_addr_from_config(config: &CallConfig) -> Result<SocketAddr, CallError>
 /// Everything the platform's transport needs to reach this call's relay.
 ///
 /// The two ICE fields are read off the config rather than looked up again, because the config is
-/// what the relay walk already resolved: `relay_token` is the token this call allocates with, and
-/// `integrity_key` is the relay `<key>` in the ASCII base64 form it arrived in, which is both the
-/// STUN MESSAGE-INTEGRITY key and the `a=ice-pwd` a synthetic SDP answer carries. A native dialer
-/// ignores both; a browser cannot build an `RTCPeerConnection` without them, and looking them up
-/// from the transport would mean handing every transport the call's whole `RelayData`.
+/// what the relay walk already resolved: `auth_token` is the selected endpoint's `<auth_token>`,
+/// and `integrity_key` is the relay `<key>` in the ASCII base64 form it arrived in, which is both
+/// the STUN MESSAGE-INTEGRITY key and the `a=ice-pwd` a synthetic SDP answer carries. A native
+/// dialer ignores both; a browser cannot build an `RTCPeerConnection` without them, and looking
+/// them up from the transport would mean handing every transport the call's whole `RelayData`.
+///
+/// `auth_token` and **not** `relay_token`, which is the neighbouring field and the wrong one: they
+/// are two indexed sets, selected by `auth_token_id` and `token_id` respectively, and where those
+/// differ a ufrag built from the allocate token is one the relay refuses the browser's very first
+/// connectivity check over. `token_to_ice_ufrag`'s own doc has always named its input the auth
+/// token.
 fn relay_endpoint_from_config(
     config: &CallConfig,
 ) -> Result<wacore::voip::RelayEndpointParams, CallError> {
     Ok(wacore::voip::RelayEndpointParams {
         addr: socket_addr_from_config(config)?,
-        ice_ufrag: wacore::voip::relay_parse::token_to_ice_ufrag(&config.relay_token),
+        ice_ufrag: wacore::voip::relay_parse::token_to_ice_ufrag(&config.auth_token),
         // Lossy rather than fallible: the relay key is base64 text in every offer that has one, and
         // a call is not worth failing over a byte that is not. A relay that then refuses the
         // credential says so in the ICE check, which is a far more legible failure than "the
@@ -2364,6 +2370,20 @@ pub(crate) async fn attach_outgoing_relay(
             client
                 .call_registry()
                 .remove_if_current(call_id, pending.generation);
+            // Said here rather than left to the waiter's `fail_pending_outgoing_with`, which is
+            // where it looks like it belongs and is where it cannot happen: this function took the
+            // pending entry out of the map on its way in, so by the time the waiter tries to
+            // publish, `take_pending_if_current` finds nothing and the reason is dropped with the
+            // sender it needed. This is the last place that still holds `ev_tx` -- and it is the
+            // path a browser with no WebRTC takes on every outgoing call, which is precisely the
+            // one the event exists for.
+            //
+            // Before `ended`, for the reason it is ordered that way there: a caller racing
+            // `wait_ended()` against the stream would otherwise see the call end and then the
+            // explanation.
+            let _ = pending
+                .ev_tx
+                .try_send(CallEvent::MediaSetupFailed(e.to_string()));
             pending.ended.notify();
             return Err(e);
         }
@@ -6106,7 +6126,10 @@ mod tests {
         .expect("config");
         config.relay_ip = "198.51.100.9".to_string();
         config.relay_port = 3480;
-        config.relay_token = vec![0xaa, 0xbb, 0xcc];
+        // Deliberately different, because the two are separate indexed sets and building the
+        // ufrag from the allocate token is a call the relay refuses at the first ICE check.
+        config.relay_token = vec![0x11, 0x22, 0x33];
+        config.auth_token = vec![0xaa, 0xbb, 0xcc];
         config.integrity_key = b"EBESExQVFhcYGRobHB0eHw==".to_vec();
 
         let endpoint = relay_endpoint_from_config(&config).expect("endpoint");
@@ -6114,7 +6137,12 @@ mod tests {
         assert_eq!(
             endpoint.ice_ufrag,
             wacore::voip::relay_parse::token_to_ice_ufrag(&[0xaa, 0xbb, 0xcc]),
-            "ice-ufrag is the relay token, base64"
+            "ice-ufrag is the endpoint's auth token, base64 -- not the allocate token beside it"
+        );
+        assert_ne!(
+            endpoint.ice_ufrag,
+            wacore::voip::relay_parse::token_to_ice_ufrag(&[0x11, 0x22, 0x33]),
+            "and never the relay token"
         );
         assert_eq!(
             endpoint.ice_pwd, "EBESExQVFhcYGRobHB0eHw==",
@@ -9646,6 +9674,57 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("a setup error must resolve the handle's wait_ended, not hang it");
+    }
+
+    /// A refusing transport provider reaches the handle, not only the log.
+    ///
+    /// The regression this pins is subtle and was live: publishing the reason from
+    /// `fail_pending_outgoing_with` looks right and cannot work, because `attach_outgoing_relay`
+    /// takes the pending entry out of the map on its way in -- so by the time the relay waiter
+    /// tries, the `ev_tx` it needs has already been dropped with the entry. The event has to be
+    /// sent from inside `attach_outgoing_relay`, which is the last place that still holds it.
+    ///
+    /// It matters most on the path this whole feature exists for: a browser with no
+    /// `RTCPeerConnection` refuses here on *every* outgoing call, and without the event a caller
+    /// cannot tell that from the peer hanging up.
+    #[tokio::test]
+    async fn a_refused_transport_provider_reaches_the_handle() {
+        struct Refuses;
+        #[async_trait]
+        impl wacore::voip::RelayTransportProvider for Refuses {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                anyhow::bail!("this browser has no WebRTC")
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        client.set_relay_transport_provider(Arc::new(Refuses));
+
+        let res = attach_outgoing_relay(&client, &call_id, &sample_relay()).await;
+        assert!(
+            matches!(res, Err(CallError::Setup(_))),
+            "a refusing provider must surface as a Setup error, got {res:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), handle.events().recv())
+            .await
+            .expect("the reason must reach the handle rather than only the log")
+            .expect("the event stream must carry it before it closes");
+        match event {
+            CallEvent::MediaSetupFailed(reason) => assert!(
+                reason.contains("this browser has no WebRTC"),
+                "the provider's own reason has to survive to the caller, got: {reason}"
+            ),
+            other => panic!("expected MediaSetupFailed, got {other:?}"),
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
+            .await
+            .expect("and the call must still end rather than hang");
     }
 
     // Finding M: if hangup() races the relay ack -- removing the registry entry while

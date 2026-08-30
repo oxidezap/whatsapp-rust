@@ -1750,6 +1750,7 @@ mod udp_relay_e2e {
             ssrc: SSRC,
             audio: wacore::voip::AudioConfig::MLOW_PCM,
             relay_token: vec![0xAB; 16],
+            auth_token: vec![0xCD; 8],
             relay_ip: relay_addr.ip().to_string(),
             relay_port: relay_addr.port(),
             integrity_key: b"relay-key".to_vec(),

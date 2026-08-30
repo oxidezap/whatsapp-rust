@@ -187,6 +187,19 @@ pub struct CallConfig {
     pub audio: AudioConfig,
     /// Relay endpoint allocate inputs.
     pub relay_token: Vec<u8>,
+    /// The selected endpoint's `<auth_token>`, which is a different indexed set from
+    /// [`Self::relay_token`] and is indexed by `auth_token_id` rather than `token_id`.
+    ///
+    /// Not used by the allocate -- that is `relay_token`, the STUN `RELAY-TOKEN` attribute. This is
+    /// what a synthetic SDP answer's `a=ice-ufrag` is built from
+    /// ([`relay_parse::token_to_ice_ufrag`](crate::voip::relay_parse::token_to_ice_ufrag)), which a
+    /// platform whose transport is an `RTCPeerConnection` needs and the native dialer does not.
+    ///
+    /// Empty when the offer carries none: every endpoint arriving with `auth_token_id = 0` is a
+    /// real shape (see `is_outbound_relay_candidate`, where that marks an endpoint as
+    /// relaylatency-ineligible rather than unusable) and such a call must still connect for media.
+    /// So this is best-effort, and a transport that cannot do without it is the one that says so.
+    pub auth_token: Vec<u8>,
     pub relay_ip: String,
     pub relay_port: u16,
     /// The relay `<key>` (ASCII) used as the STUN MESSAGE-INTEGRITY key.
@@ -236,6 +249,7 @@ impl core::fmt::Debug for CallConfig {
             .field("ssrc", &self.ssrc)
             .field("audio", &self.audio)
             .field("relay_token", &"[redacted]")
+            .field("auth_token", &"[redacted]")
             .field("relay_ip", &self.relay_ip)
             .field("relay_port", &self.relay_port)
             .field("integrity_key", &"[redacted]")
@@ -311,6 +325,16 @@ impl CallConfig {
             .filter(|t| !t.is_empty())
             .cloned()
             .ok_or(SetupError::NoRelayToken(ep.token_id))?;
+        // Best-effort, unlike the token above: an offer whose endpoints all carry
+        // `auth_token_id = 0` has no auth token to select and must still connect for media, so a
+        // missing one is empty here rather than an error. Only a transport that builds a synthetic
+        // SDP reads it, and that is the layer with something to say about an empty one.
+        let auth_token = relay
+            .auth_tokens
+            .get(ep.auth_token_id as usize)
+            .filter(|t| !t.is_empty())
+            .cloned()
+            .unwrap_or_default();
         // The relay <key> is the STUN MESSAGE-INTEGRITY key; without it the allocate/binding-success
         // we sign can't authenticate, so fail here rather than dial with an empty key. Sign with the
         // base64 TEXT of <key> (relay_key_ascii), NOT its decoded bytes (relay.relay_key): the relay
@@ -346,6 +370,7 @@ impl CallConfig {
             ssrc: our_ssrc,
             audio: AudioConfig::MLOW_PCM,
             relay_token,
+            auth_token,
             relay_ip,
             relay_port,
             integrity_key,
@@ -435,6 +460,9 @@ impl CallConfig {
             ),
             audio: AudioConfig::MLOW_PCM,
             relay_token,
+            // A `GroupCallRelay` carries one indexed token set and no `<auth_token>`, so there is
+            // nothing to select here.
+            auth_token: Vec::new(),
             relay_ip,
             relay_port,
             integrity_key: relay.key.clone(),
@@ -3927,6 +3955,7 @@ mod encoded_tests {
             ssrc: 0x5741_0001,
             audio: AudioConfig::encoded(AudioFormat::OPUS_16KHZ_60MS),
             relay_token: vec![0xAB; 16],
+            auth_token: vec![0xCD; 8],
             relay_ip: "203.0.113.7".into(),
             relay_port: 3478,
             integrity_key: b"relay-key".to_vec(),
@@ -6178,6 +6207,7 @@ mod tests {
             ssrc: SSRC,
             audio: AudioConfig::MLOW_PCM,
             relay_token: vec![0xAB; 16],
+            auth_token: vec![0xCD; 8],
             relay_ip: "203.0.113.7".into(),
             relay_port: 3478,
             integrity_key: b"relay-key".to_vec(),
@@ -6206,11 +6236,16 @@ mod tests {
             dbg.contains("relay_token: \"[redacted]\""),
             "relay_token not redacted"
         );
-        // The 0..32 callKey bytes, the b"relay-key" integrity key, and the 0xAB relay-token bytes
-        // must not appear.
+        assert!(
+            dbg.contains("auth_token: \"[redacted]\""),
+            "auth_token not redacted"
+        );
+        // The 0..32 callKey bytes, the b"relay-key" integrity key, the 0xAB relay-token bytes and
+        // the 0xCD auth-token bytes must not appear.
         assert!(!dbg.contains("[0, 1, 2, 3"), "callKey bytes leaked");
         assert!(!dbg.contains("114, 101, 108"), "integrity_key bytes leaked");
         assert!(!dbg.contains("[171, 171"), "relay_token bytes leaked");
+        assert!(!dbg.contains("[205, 205"), "auth_token bytes leaked");
         // Non-secret fields stay visible for diagnostics.
         assert!(dbg.contains("call_id: \"CID\""));
     }
