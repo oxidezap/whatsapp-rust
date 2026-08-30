@@ -771,6 +771,18 @@ fn finalize_app_state_key_request_peers(
     Ok(peers)
 }
 
+/// Whether a 409's conflicting patches left the collection somewhere new.
+///
+/// A rebuild is only worth re-sending if the base moved. When the recovery
+/// itself failed, the next attempt builds the same patch on the same base and
+/// earns the same refusal -- which in production meant five identical round
+/// trips, holding the collection reservation throughout, before the mutation was
+/// reported lost.
+enum Recovery {
+    Recovered,
+    Failed(anyhow::Error),
+}
+
 /// Why a collection this round asked for is missing from its results.
 ///
 /// A `<sync>` that omits a requested `<collection>` parses fine, so the omission
@@ -2855,6 +2867,32 @@ impl Client {
         };
         let proc = self.get_app_state_processor();
 
+        // A collection that never synced has nothing to build on: its ltHash is
+        // empty and the server is at whatever version the account reached, so the
+        // patch is refused with a 409 by construction rather than by a race, and
+        // the 409 is what drags the send into the rebuild loop. WA Web does not
+        // send one either -- `pendingCollectionsInBootstrap` holds the mutations
+        // back and logs "skipping N collections in sync iq patch because initial
+        // full sync is incomplete". Sync first, then build.
+        if let Some(name) = patch_name {
+            let backend = self.persistence_manager.backend();
+            let state = backend.get_version(collection_name).await?;
+            if state.version == 0 && state.hash == [0u8; 128] {
+                debug!(
+                    target: "Client/AppState",
+                    "{collection_name} has never synced; syncing before building a patch on it"
+                );
+                self.fetch_app_state_with_retry_inner(name).await?;
+                let state = backend.get_version(collection_name).await?;
+                if state.version == 0 && state.hash == [0u8; 128] {
+                    return Err(anyhow::anyhow!(
+                        "app-state patch for {collection_name} not attempted: \
+                         the collection has never synced"
+                    ));
+                }
+            }
+        }
+
         for attempt in 1..=APP_STATE_PATCH_SEND_ATTEMPTS {
             // Cloned per attempt because a conflict rebuilds the patch against
             // the winner's base; verbs carry one or two mutations, and this only
@@ -2939,8 +2977,22 @@ impl Client {
                          (attempt {attempt}/{APP_STATE_PATCH_SEND_ATTEMPTS}, has_more={has_more}); \
                          applying the conflicting patches and rebuilding"
                     );
-                    self.absorb_conflicting_patches(collection_name, patch_name, list, has_more)
-                        .await;
+                    // A rebuild is only worth re-sending if the absorb could move
+                    // the base. When the recovery itself failed -- a snapshot
+                    // whose MAC will not validate is the case production hit --
+                    // the next attempt sends byte-identical bytes and earns the
+                    // byte-identical refusal, so the cap turns one deterministic
+                    // failure into five round trips, with the collection
+                    // reservation held throughout.
+                    if let Recovery::Failed(e) = self
+                        .absorb_conflicting_patches(collection_name, patch_name, list, has_more)
+                        .await
+                    {
+                        return Err(e.context(format!(
+                            "app-state patch for {collection_name} conflicted on \
+                             v{base_version} and the collection could not be recovered"
+                        )));
+                    }
                 }
                 Some(error) => {
                     return Err(anyhow::anyhow!(
@@ -2970,7 +3022,7 @@ impl Client {
         patch_name: Option<WAPatchName>,
         mut list: wacore::appstate::patch_decode::PatchList,
         has_more: bool,
-    ) {
+    ) -> Recovery {
         // The error tag described the send; the patches under it are ordinary
         // inbound data, so clear it before handing the list to the processor.
         list.error = None;
@@ -2992,12 +3044,26 @@ impl Client {
             };
             let proc = self.get_app_state_processor();
             match proc.process_parsed_patch_list(list, &download, true).await {
-                Ok((mutations, _, _)) => {
+                // The third element is the processor's own verdict, and it is
+                // not always agreement: a collection with an empty ltHash and a
+                // non-genesis first patch is refused here, with `Retry` set and
+                // the version untouched. Discarding it read that refusal as a
+                // clean apply.
+                Ok((mutations, _, list)) => {
                     wacore::telemetry::appstate_mutations(mutations.len() as u64);
                     for m in &mutations {
                         self.dispatch_app_state_mutation(m, false).await;
                     }
-                    true
+                    if let Some(refused) = &list.error {
+                        debug!(
+                            target: "Client/AppState",
+                            "{collection_name} refused the conflicting patches ({refused}); \
+                             a re-sync is the only way forward"
+                        );
+                        false
+                    } else {
+                        true
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -3011,15 +3077,27 @@ impl Client {
 
         // `has_more` means the server held patches back, so even a clean apply
         // leaves the base short of the head.
-        if (!applied || has_more)
-            && let Some(patch_name) = patch_name
-            && let Err(e) = self.fetch_app_state_with_retry_inner(patch_name).await
-        {
-            warn!(
-                target: "Client/AppState",
-                "Failed to re-sync {collection_name} after a patch conflict: {e}"
-            );
+        if !applied || has_more {
+            let Some(patch_name) = patch_name else {
+                // Nothing to re-sync against, and the apply did not land: the
+                // retry would rebuild on the same base.
+                return Recovery::Failed(anyhow::anyhow!(
+                    "{collection_name} is not a known collection, so its conflict cannot be resolved"
+                ));
+            };
+            if let Err(e) = self.fetch_app_state_with_retry_inner(patch_name).await {
+                warn!(
+                    target: "Client/AppState",
+                    "Failed to re-sync {collection_name} after a patch conflict: {e}"
+                );
+                // The base is where it was and the re-sync is the only thing that
+                // could have moved it. A snapshot MAC that will not validate
+                // fails this way every time, so the remaining attempts are the
+                // same request and the same refusal.
+                return Recovery::Failed(e);
+            }
         }
+        Recovery::Recovered
     }
 
     async fn dispatch_app_state_mutation(
@@ -3399,6 +3477,21 @@ mod send_patch_response_tests {
             .build()
     }
 
+    /// An IQ-level failure, which `send_iq` raises. A collection-level error is
+    /// bucketed into the sync outcome instead, so it is not the shape that makes
+    /// a re-sync fail from the caller's point of view.
+    fn iq_error_result(request_id: &str) -> Node {
+        NodeBuilder::new("iq")
+            .attr("type", "error")
+            .attr("id", request_id)
+            .attr("from", "s.whatsapp.net")
+            .children([NodeBuilder::new("error")
+                .attr("code", "500")
+                .attr("text", "server-error")
+                .build()])
+            .build()
+    }
+
     const COLLECTION: &str = "regular_low";
 
     /// Answers every IQ the client writes, in order, with whatever `reply`
@@ -3434,6 +3527,7 @@ mod send_patch_response_tests {
                 0
             };
             let response = match reply(attempt) {
+                Some("iq-error") => iq_error_result(&id),
                 Some(code) => collection_error_result(&id, response_collection, code),
                 None => empty_sync_result(&id, response_collection),
             };
@@ -3453,6 +3547,14 @@ mod send_patch_response_tests {
         reply: impl FnMut(usize) -> Option<&'static str>,
     ) -> (Result<()>, usize) {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        // Reachable, so the re-sync between attempts actually runs: an
+        // unreachable client defers it and reports Ok, which hides whether the
+        // collection was recovered at all.
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
         seed_collection(&client, COLLECTION).await;
 
         let mut send = {
@@ -3499,6 +3601,10 @@ mod send_patch_response_tests {
     /// A 409 means the patch was built on a stale base and did NOT land. A
     /// server that keeps rejecting must end as an error, never as success — a
     /// `markChatAsRead` that silently lost must not be reported as done.
+    ///
+    /// The re-sync between attempts succeeds here, so each rebuild starts from a
+    /// base that may have moved and the attempts are worth spending. When it does
+    /// not, see `a_conflict_whose_resync_fails_stops_at_the_first_attempt`.
     #[tokio::test]
     async fn unresolvable_conflict_is_not_reported_as_success() {
         let (result, patches) = send_against(|_| Some("409")).await;
@@ -3512,6 +3618,128 @@ mod send_patch_response_tests {
         );
     }
 
+    /// Production symptom: `regular_low` sat at v0 because its sync never
+    /// landed, and a `markChatAsRead` was still built on it. A patch over an
+    /// empty ltHash against a server at v61 is refused by construction, not by a
+    /// race, and that refusal is what drags the send into the rebuild loop.
+    ///
+    /// WA Web holds those mutations back instead
+    /// (`pendingCollectionsInBootstrap`, "skipping N collections in sync iq
+    /// patch because initial full sync is incomplete").
+    #[tokio::test]
+    async fn a_collection_that_never_synced_is_synced_before_it_is_patched() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        // A sync key, but deliberately no version: the collection has never
+        // synced, which is (0, all-zero ltHash).
+        let backend = client.persistence_manager.backend();
+        backend
+            .set_sync_key(
+                b"send-patch-key",
+                crate::store::traits::AppStateSyncKey {
+                    key_data: vec![5u8; 32],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept a sync key");
+
+        let patch_attempts = Arc::new(AtomicUsize::new(0));
+        let first_iq_carried_a_patch = Arc::new(AtomicUsize::new(0));
+
+        let mut send = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_app_state_patch(COLLECTION, vec![wa::SyncdMutation::default()])
+                    .await
+            })
+        };
+
+        let server = {
+            let client = Arc::clone(&client);
+            let transport = Arc::clone(&transport);
+            let patch_attempts = Arc::clone(&patch_attempts);
+            let first_iq_carried_a_patch = Arc::clone(&first_iq_carried_a_patch);
+            async move {
+                let mut frame = 0usize;
+                loop {
+                    let node = crate::test_utils::decode_sent_iq(&transport, frame).await;
+                    let node = node.get().to_owned();
+                    let id = node
+                        .attrs()
+                        .optional_string("id")
+                        .expect("every IQ carries an id")
+                        .into_owned();
+                    let is_patch = node
+                        .get_optional_child_by_tag(&["sync", "collection", "patch"])
+                        .is_some();
+                    if is_patch {
+                        patch_attempts.fetch_add(1, Ordering::Relaxed);
+                        if frame == 0 {
+                            first_iq_carried_a_patch.store(1, Ordering::Relaxed);
+                        }
+                    }
+                    // Answer every sync with an empty result, so the collection
+                    // never leaves v0.
+                    let response = empty_sync_result(&id, COLLECTION);
+                    crate::test_utils::answer_iq(&client, &id, &response).await;
+                    frame += 1;
+                }
+            }
+        };
+        futures::pin_mut!(server);
+        let result = futures::select! {
+            result = (&mut send).fuse() => result.expect("the send task should not panic"),
+            () = server.fuse() => unreachable!("the server loop never returns"),
+        };
+
+        let err = result.expect_err("a collection that never synced cannot carry a patch");
+        assert!(
+            format!("{err:#}").contains("never synced"),
+            "the error should name the unsynced collection, got: {err:#}"
+        );
+        assert_eq!(
+            first_iq_carried_a_patch.load(Ordering::Relaxed),
+            0,
+            "the first thing on the wire must be the sync, not the patch"
+        );
+        assert_eq!(
+            patch_attempts.load(Ordering::Relaxed),
+            0,
+            "a patch built on an empty ltHash is refused by construction; do not send one"
+        );
+    }
+    /// Production symptom: `regular_low` conflicted on v0, the re-sync that
+    /// would have moved the base answered `snapshot MAC mismatch`, and the send
+    /// spent all five attempts re-asking the same question — holding the
+    /// collection's sync reservation for the whole run — before reporting the
+    /// `markChatAsRead` lost.
+    ///
+    /// A recovery that failed leaves the base exactly where the refused patch
+    /// was built, so the remaining attempts are the same bytes and the same
+    /// refusal.
+    #[tokio::test]
+    async fn a_conflict_whose_resync_fails_stops_at_the_first_attempt() {
+        // Patch IQs (attempt >= 1) conflict; the re-sync in between (attempt 0)
+        // fails outright, so the collection cannot be recovered and the base
+        // cannot move.
+        let (result, patches) =
+            send_against(|attempt| Some(if attempt == 0 { "iq-error" } else { "409" })).await;
+        let err = result.expect_err("an unrecoverable conflict is not a successful send");
+        assert!(
+            format!("{err:#}").contains("could not be recovered"),
+            "the error should say the collection could not be recovered, got: {err:#}"
+        );
+        assert_eq!(
+            patches, 1,
+            "once the re-sync fails the base cannot move, so re-sending is the same request"
+        );
+    }
     /// The resolution path: the first attempt loses the race, the client
     /// rebuilds against the new base, and the second attempt lands. That is WA
     /// Web's conflict loop, and the mutation survives it.
