@@ -221,3 +221,38 @@ fn bench_decode_record(bencher: divan::Bencher, shape: &str) {
             )
         });
 }
+
+/// Folding a snapshot's records into the ltHash: runs once per snapshot, over
+/// every record the account holds in the collection. The `dups` arm is the
+/// shape that made a collection unsyncable (a repeated index must contribute
+/// only its last value MAC); the `unique` arm is what every healthy account
+/// pays and is the one that must not regress.
+#[divan::bench(args = [(10, false), (200, false), (5000, false), (200, true), (5000, true)])]
+fn bench_update_hash_from_records(bencher: divan::Bencher, shape: (usize, bool)) {
+    let (n, with_dups) = shape;
+    bencher
+        .with_inputs(|| {
+            (0..n)
+                .map(|i| {
+                    // With dups, every index is shared by two records.
+                    let idx = if with_dups { i / 2 } else { i } as u32;
+                    let mut index_mac = [0u8; 32];
+                    index_mac[..4].copy_from_slice(&idx.to_le_bytes());
+                    let mut blob = vec![0u8; 16];
+                    blob.extend_from_slice(&[(i % 251) as u8; 32]);
+                    wa::SyncdRecord {
+                        index: buffa::MessageField::some(wa::SyncdIndex {
+                            blob: Some(index_mac.to_vec()),
+                        }),
+                        value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                        ..Default::default()
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .bench_refs(|records| {
+            let mut state = HashState::default();
+            state.update_hash_from_records(black_box(records));
+            black_box(state.hash)
+        });
+}
