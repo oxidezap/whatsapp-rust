@@ -537,6 +537,17 @@ pub enum CallEvent {
     RelayAllocateFailed(u16),
     /// The relay never acked the allocate within the deadline (wedged relay). Terminal.
     RelayAllocateTimedOut,
+    /// The media path was never built, and this is why. Terminal.
+    ///
+    /// Distinct from the two above, which are the relay *answering* badly. This one is everything
+    /// before there is a relay to answer: no `<relay>` in the offer ack, an engine that would not
+    /// build, or a platform whose transport provider refused -- the last of which is a browser
+    /// with no `RTCPeerConnection`, where it is not an edge case but every outgoing call.
+    ///
+    /// It exists because `wait_ended()` resolving says a call is *over*, not that it never
+    /// started, so without this a setup failure was indistinguishable from an ordinary remote
+    /// hangup and its reason lived only in a log line.
+    MediaSetupFailed(String),
     /// Replacing a migrated relay transport did not finish within the reconnect deadline.
     RelayReconnectTimedOut,
     /// The peer's `<video state=N>` signaling arrived (upgrade requested/accepted, stopped, ...).
@@ -716,6 +727,7 @@ impl CallEvent {
                         .map(|item| item.fci.capacity())
                         .sum::<usize>()
             }
+            Self::MediaSetupFailed(reason) => reason.capacity(),
             Self::RelayAllocated
             | Self::RelayAllocateFailed(_)
             | Self::RelayAllocateTimedOut

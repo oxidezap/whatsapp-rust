@@ -2116,14 +2116,24 @@ fn spawn_outgoing_relay_waiter(
                 Some(relay) => {
                     if let Err(e) = attach_outgoing_relay(&client, &call_id, &relay).await {
                         warn!("voip: failed to attach outgoing relay for {call_id}: {e}");
-                        fail_pending_outgoing(&client, &call_id, generation);
+                        fail_pending_outgoing_with(
+                            &client,
+                            &call_id,
+                            generation,
+                            Some(e.to_string()),
+                        );
                     }
                 }
                 None => {
                     warn!(
                         "voip: no relay in offer ack for {call_id} (timeout or absent); call failed"
                     );
-                    fail_pending_outgoing(&client, &call_id, generation);
+                    fail_pending_outgoing_with(
+                        &client,
+                        &call_id,
+                        generation,
+                        Some("the server's offer ack carried no relay".to_string()),
+                    );
                 }
             }
         }))
@@ -2169,6 +2179,32 @@ fn take_pending_if_current(
 }
 
 fn fail_pending_outgoing(client: &Client, call_id: &str, generation: u64) {
+    fail_pending_outgoing_with(client, call_id, generation, None);
+}
+
+/// The same teardown, with the reason the media path never came up.
+///
+/// `wait_ended()` resolving is all a caller used to get from this, which says a call is over and
+/// not that it never started -- so a setup failure was indistinguishable from an ordinary remote
+/// hangup, and the reason lived only in a log line. That was survivable while the failures here
+/// were a missing `<relay>` or an engine that would not build, both rare; it is not once a
+/// platform's transport provider is one of them, because a browser with no WebRTC fails *every*
+/// outgoing call this way and the person placing it deserves to be told which.
+///
+/// [`CallEvent::MediaSetupFailed`] and not `RelayAllocateFailed`, which carries a STUN error code:
+/// there is no relay answering here, and dressing "the browser has no WebRTC" as a STUN class
+/// would be a worse lie than saying nothing. Sent before `ended` is notified, because a caller
+/// racing the two would otherwise see the call end and then the explanation -- the same ordering
+/// rule the terminal events in the drive loop follow.
+///
+/// A terminal stanza (`<reject>`, `<terminate>`) passes `None`: that is a call the peer ended, not
+/// a relay that failed, and dressing it as one would be a worse lie than saying nothing.
+fn fail_pending_outgoing_with(
+    client: &Client,
+    call_id: &str,
+    generation: u64,
+    reason: Option<String>,
+) {
     let pending = take_pending_if_current(
         &client.voip_state().pending_outgoing_calls,
         call_id,
@@ -2178,6 +2214,11 @@ fn fail_pending_outgoing(client: &Client, call_id: &str, generation: u64) {
         .call_registry()
         .remove_if_current(call_id, generation);
     if let Some(pending) = pending {
+        if let Some(reason) = reason {
+            // `try_send`, like every other publish onto this queue: the channel is bounded and a
+            // consumer that is not reading must not hold a teardown open.
+            let _ = pending.ev_tx.try_send(CallEvent::MediaSetupFailed(reason));
+        }
         pending.ended.notify();
     }
 }

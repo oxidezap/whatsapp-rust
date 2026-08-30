@@ -34,6 +34,12 @@ whatsapp-rust = { path = "../..", features = [
     "tokio-transport",
     "ureq-client",
     "tokio-native",
+    # The way onto the media wire. It used to arrive with the codec profiles above, and no longer
+    # does: `voip-runtime` is the portable half and the UDP relay dialler is its own feature, so a
+    # native shell that does not install a provider of its own has to ask for it. Here rather than
+    # in each codec feature, because it is not a property of the codec -- and a CLI that skipped it
+    # would build fine and then fail every call at "no relay media transport".
+    "voip-relay-native",
 ] }
 
 [lints]

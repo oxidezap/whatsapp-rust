@@ -49,9 +49,14 @@ type DefaultHttpState = Provided;
 #[cfg(not(feature = "ureq-client"))]
 type DefaultHttpState = MissingHttpClient;
 
-#[cfg(feature = "tokio-runtime")]
+// The target as well as the feature, because `default_runtime` below answers on both: `TokioRuntime`
+// spawns through `tokio::spawn`, which wasm32 does not have, so a builder that read `Provided` from
+// the feature alone would offer `build()` on a page and then reach `build_graph`'s
+// `unreachable!("typestate guarantees...")` at run time. A page supplies its own runtime, and the
+// type system is where it should be told to.
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 type DefaultRuntimeState = Provided;
-#[cfg(not(feature = "tokio-runtime"))]
+#[cfg(not(all(feature = "tokio-runtime", not(target_arch = "wasm32"))))]
 type DefaultRuntimeState = MissingRuntime;
 
 #[cfg(feature = "tokio-transport")]
@@ -897,8 +902,11 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// Runtime-agnostic: the hook wraps whatever runtime the client uses, so
     /// every task spawned through the `Runtime` trait is covered, and
     /// [`Bot::run`] meters the main run loop itself — the read loop reports
-    /// on either launch path (`voip` media tasks spawn directly on Tokio and
-    /// are not covered). Pass a
+    /// on either launch path. The VoIP **call driver** is covered too: it runs
+    /// on the client's runtime, so do not attribute it separately or its work
+    /// is counted twice. What is not covered is the native relay transport's
+    /// own socket and timer tasks (`voip-relay-native`), which spawn on Tokio
+    /// directly. Pass a
     /// [`CpuMeter`](wacore::stats::CpuMeter) for per-session CPU accounting
     /// (keep a clone to read snapshots), or a custom hook to scope
     /// allocator-attribution or platform samplers to this client's work.

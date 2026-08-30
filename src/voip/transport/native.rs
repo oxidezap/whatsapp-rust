@@ -61,9 +61,7 @@ const MEDIA_CHANNEL_TYPE: ChannelType = ChannelType::PartialReliableRexmitUnorde
 /// The retransmit count [`MEDIA_CHANNEL_TYPE`] carries: never retransmit, abandon instead.
 const MEDIA_MAX_RETRANSMITS: u32 = 0;
 
-// First-byte relay-packet demux moved to the portable core; re-exported so the existing
-// `whatsapp_rust::voip::transport::{classify_relay_packet, RelayPacketKind}` paths stay stable.
-pub use wacore::voip::demux::{RelayPacketKind, classify_relay_packet};
+use wacore::voip::demux::{RelayPacketKind, classify_relay_packet};
 
 /// Why the media stack stopped. The driver branches on the variant: a peer close ends the call the
 /// way hanging up does, anything else is a transport failure the call surfaces as a read error.
@@ -578,11 +576,6 @@ pub async fn connect_relay_media(
         )),
     }
 }
-
-// `RandTxIds` used to live here, and had no business doing so: an OS-RNG transaction id needs no
-// socket. It moved to the portable driver when the native relay became its own feature, and is
-// re-exported so `whatsapp_rust::voip::transport::RandTxIds` keeps naming it.
-pub use crate::voip::driver::RandTxIds;
 
 #[async_trait]
 impl RelayTransport for RelayMediaChannel {

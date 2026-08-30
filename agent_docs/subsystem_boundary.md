@@ -91,21 +91,36 @@ Asked often enough to write down: the runtime-free VoIP core already exists, and
 it is not what `voip-runtime` gates.
 
 `wacore::voip` is sans-IO. Its feature is `["dep:aes-gcm", "dep:zerocopy"]`,
-`tokio` appears only under wacore's `[dev-dependencies]`, and the four mentions
-of tokio or webrtc under `wacore/src/voip/` are doc comments describing what the
-native side injects. The executor is the `wacore::runtime::Runtime` trait, with
-a `Send` native shape and a non-`Send` wasm one; the socket is the
+`tokio` appears only under wacore's `[dev-dependencies]`, and the mentions of
+tokio or webrtc under `wacore/src/voip/` are doc comments describing what a
+platform injects. The executor is the `wacore::runtime::Runtime` trait, with a
+`Send` native shape and a non-`Send` wasm one; the socket is the
 `RelayTransport` seam. CI builds it for `wasm32-unknown-unknown` with
 `--no-default-features --features "voip,js"` on every PR, which is what keeps
 that true.
 
-What `voip-runtime` gates in this crate is the native media plane: the webrtc-rs
-DTLS/SCTP DataChannel, the libopus FFI and the task orchestration around them.
-That is runtime-bound by construction, and `src/voip/mod.rs` has a
-`compile_error!` pointing wasm32 and espidf builds at `wacore/voip` instead.
-Making it runtime-agnostic would not be a refactor of this code, it would be
-replacing webrtc-rs, and there is no consumer waiting for it: the one a split
-was supposed to free is already served by `wacore::voip`.
+What `voip-runtime` gates in this crate is no longer the native media plane. It
+used to, and the split that changed it is worth stating plainly, because this
+section previously said the opposite and a boundary decision made from the old
+text would be made backwards:
+
+- **`voip-runtime`** is the portable half — signaling, the facade, `CallHandle`,
+  and the orchestration around `wacore`'s engine. It owns no socket and reads no
+  clock (every timeout goes through `wacore::runtime`, and the driver runs on the
+  client's own `Arc<dyn Runtime>`), so it builds wherever `wacore` does. CI
+  builds it for `wasm32-unknown-unknown` with `--features voip-mlow`.
+- **`voip-relay-native`** is the half that cannot: one UDP endpoint per call with
+  the webrtc-rs DTLS/SCTP DataChannel over it. It carries the `compile_error!`
+  for wasm32 and espidf, and it is the only VoIP feature that does.
+- **`voip-libopus`** is the other native-only one, and for the other reason: it
+  is C. MLow (`voip-mlow`) is pure Rust and is what a portable build uses.
+
+So "make it runtime-agnostic" is no longer a question about replacing webrtc-rs.
+A target without a UDP socket keeps the whole call flow and supplies its own way
+onto the wire through `Client::set_relay_transport_provider`; in a browser that
+is an `RTCPeerConnection`, which is the same DTLS/SCTP/DataChannel stack with the
+browser assembling it. The consumer that was said not to exist is the web front
+end, and it is the reason the split was made.
 
 `voip-runtime` is one test away from cuttable, and the three sites that keep it
 coupled are all the same shape: a `pub(crate)` helper whose only caller is VoIP.
