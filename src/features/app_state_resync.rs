@@ -314,7 +314,7 @@ mod tests {
         (client, transport)
     }
 
-    /// A bootstrap that never reached the server must not leave a record behind.
+    /// A bootstrap that is deferred mid-run must not leave a record behind.
     ///
     /// Review of #1365: the sync writes the version it ends on whatever happened,
     /// which is right for pages it applied and wrong for a run that applied
@@ -322,14 +322,38 @@ mod tests {
     /// next sync it has already bootstrapped, so it asks for patches -- and a
     /// non-genesis first patch over an empty ltHash is refused, which is how a
     /// collection strands itself.
+    ///
+    /// The connection is retired while the first response is in flight, so the
+    /// loop takes its `Deferred` exit *after* asking. An unreachable client
+    /// would not do: it fails in `await_connection` before any sync code runs,
+    /// and the assertion below would hold for reasons that have nothing to do
+    /// with the fix.
     #[tokio::test]
-    async fn a_bootstrap_that_never_reached_the_server_leaves_no_record() {
-        // Not reachable: the sync defers before it sends anything.
-        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+    async fn a_bootstrap_deferred_mid_run_leaves_no_record() {
+        let (client, transport) = create_reachable_client().await;
 
-        let _ = client
-            .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Incremental)
-            .await;
+        let resync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Incremental)
+                    .await
+            })
+        };
+
+        // Answer the first sync, then retire the socket it was admitted on, so
+        // the next iteration defers instead of applying.
+        let node = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let node = node.get().to_owned();
+        let id = node
+            .attrs()
+            .optional_string("id")
+            .expect("every IQ carries an id")
+            .into_owned();
+        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        crate::test_utils::answer_iq(&client, &id, &batch_result(&id, &[("regular", None)])).await;
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), resync).await;
 
         assert!(
             client
@@ -339,7 +363,7 @@ mod tests {
                 .await
                 .expect("the version should be readable")
                 .is_none(),
-            "a deferred bootstrap applied nothing, so it has no version to record"
+            "a bootstrap that applied nothing has no version to record"
         );
     }
 

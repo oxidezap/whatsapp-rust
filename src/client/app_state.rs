@@ -2256,12 +2256,24 @@ impl Client {
                                 // ConflictHasMore: server has more patches, must refetch.
                                 warn!(target: "Client/AppState", "Collection {:?} conflict (has_more=true), will refetch", name);
                                 needs_refetch.push(name);
-                            } else {
-                                // Conflict without has_more: WA Web treats this as success
-                                // when there are no pending mutations to push (which is
-                                // always the case for us since we don't push app state).
-                                debug!(target: "Client/AppState", "Collection {:?} conflict (has_more=false), treating as success (no pending mutations)", name);
+                            } else if backend.get_version(name.as_str()).await?.is_some() {
+                                // Conflict without has_more: WA Web reads this as
+                                // success once it has nothing left to push.
+                                debug!(target: "Client/AppState", "Collection {:?} conflict (has_more=false), treating as success", name);
                                 outcome.synced.push(name);
+                            } else {
+                                // Except when the collection has no record at all.
+                                // `process_parsed_patch_list` returns early for a list
+                                // carrying an error, so nothing was persisted -- calling
+                                // that synced closes the bootstrap gate over a collection
+                                // that will bootstrap again on the next connection, and
+                                // again after that.
+                                warn!(
+                                    target: "Client/AppState",
+                                    "Collection {name:?} conflict (has_more=false) while it has \
+                                     no version record; nothing was persisted, so it is not synced"
+                                );
+                                outcome.retryable.push(name);
                             }
                             continue;
                         }
@@ -2569,10 +2581,37 @@ impl Client {
             if let Some(refused) = &list.error
                 && new_state.version <= state.version
             {
-                return Err(anyhow::anyhow!(
-                    "app-state sync for {name:?} was refused by the server \
-                     and advanced nothing: {refused}"
-                ));
+                use wacore::appstate::patch_decode::CollectionSyncError;
+                match refused {
+                    // WA Web reads a conflict with nothing left to come as
+                    // success once it has nothing to push. Raising here would
+                    // send the scheduler back to rediscover the same benign
+                    // answer until its retry budget ran out.
+                    CollectionSyncError::Conflict { has_more: false } => {
+                        debug!(
+                            target: "Client/AppState",
+                            "{name:?} conflict with no more patches; nothing left to apply"
+                        );
+                    }
+                    // A collection the server will not serve. Retrying is what
+                    // the batched path already refuses to do with these.
+                    CollectionSyncError::Fatal { code, text } => {
+                        return Err(anyhow::anyhow!(
+                            "app-state sync for {name:?} refused fatally by the server \
+                             ({code}): {text}"
+                        ));
+                    }
+                    // Retryable, or a conflict that says more is coming: the
+                    // collection did not advance, so reporting this run as
+                    // completed would tell the conflict recovery that the base
+                    // moved when it did not.
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "app-state sync for {name:?} was refused by the server \
+                             and advanced nothing: {refused}"
+                        ));
+                    }
+                }
             }
 
             state = new_state;
@@ -3657,12 +3696,15 @@ mod send_patch_response_tests {
     /// server that keeps rejecting must end as an error, never as success — a
     /// `markChatAsRead` that silently lost must not be reported as done.
     ///
-    /// The re-sync between attempts succeeds here, so each rebuild starts from a
-    /// base that may have moved and the attempts are worth spending. When it does
-    /// not, see `a_conflict_whose_resync_fails_stops_at_the_first_attempt`.
+    /// The re-sync between attempts is answered cleanly here, so each rebuild
+    /// starts from a base that may have moved and the attempts are worth
+    /// spending. When the re-sync fails, is deferred, or is refused, see the
+    /// three `a_conflict_whose_resync_*` tests — those stop at the first attempt.
     #[tokio::test]
     async fn unresolvable_conflict_is_not_reported_as_success() {
-        let (result, patches) = send_against(|_| Some("409")).await;
+        // attempt 0 is the re-sync between patches; only the patches conflict.
+        let (result, patches) =
+            send_against(|attempt| if attempt == 0 { None } else { Some("409") }).await;
         assert!(
             result.is_err(),
             "a 409 conflict means the mutation was dropped; reporting Ok hides the loss"

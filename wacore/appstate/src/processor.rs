@@ -124,14 +124,27 @@ where
             // the failure that strands a collection, and the ltHash plus the
             // record count are what tell a stale snapshot from a fold that went
             // wrong. Mirrors WA Web's own snapshot-mac diagnostic line.
+            // The identifying line stays at warn, because a collection that
+            // strands itself has to be visible without turning logging up. The
+            // MACs and the ltHash do not: a snapshot MAC is HMAC output under
+            // the account's app-state key and the ltHash is an aggregate of the
+            // collection's contents, and this failure repeats deterministically
+            // -- at warn it would be a loop pouring key-derived material into a
+            // log people paste into issues.
             warn!(
                 target: "AppState",
-                "Snapshot {} v{} MAC mismatch: computed={}, expected={}, records={}, ltHash={}",
+                "Snapshot {} v{} MAC mismatch over {} records",
+                collection_name,
+                version,
+                snapshot.records.len()
+            );
+            debug!(
+                target: "AppState",
+                "Snapshot {} v{} MAC mismatch: computed={}, expected={}, ltHash={}",
                 collection_name,
                 version,
                 hex::encode(&computed),
                 hex::encode(mac_expected),
-                snapshot.records.len(),
                 hex::encode(&initial_state.hash[120..])
             );
             return Err(AppStateError::SnapshotMACMismatch);

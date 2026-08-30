@@ -51,10 +51,13 @@ pub struct HashUpdateResult {
     pub has_missing_remove: bool,
 }
 
-/// Index count at or below which [`HashState::update_hash_from_records`] dedups
-/// with a linear scan instead of a sort; above it the sort wins despite ordering
-/// every entry. Mirrors `MAC_DEDUP_SCAN_LIMIT` in `wacore`'s appstate sync,
-/// which measured the same trade-off over the same kind of key (#856).
+/// Count of *records carrying an index* at or below which
+/// [`HashState::update_hash_from_records`] dedups with a linear scan instead of
+/// a sort; above it the sort wins despite ordering every entry. Note this counts
+/// records, not distinct indices: a snapshot of 200 records over 100 indices
+/// takes the sorted branch. Mirrors `MAC_DEDUP_SCAN_LIMIT` in `wacore`'s
+/// appstate sync, which measured the same trade-off over the same kind of key
+/// (#856).
 const MAC_DEDUP_SCAN_LIMIT: usize = 64;
 
 impl HashState {
@@ -158,11 +161,10 @@ impl HashState {
         (result, Ok(()))
     }
 
-    /// Update hash state from snapshot records directly (avoids cloning into SyncdMutation).
-    ///
-    /// This is an optimized version for snapshots where all operations are SET
-    /// and there are no previous values to look up.
     /// Fold a snapshot's records into the ltHash.
+    ///
+    /// Takes the records directly rather than cloning into `SyncdMutation`:
+    /// a snapshot is all SETs with no previous values to look up.
     ///
     /// A snapshot is keyed by index, not a list: WA Web builds
     /// `new Map(records.map(r => [hex(r.index.blob), valueMac(r.value.blob)]))`
@@ -174,6 +176,13 @@ impl HashState {
     /// `snapshot MAC mismatch`. The store already keys the same way
     /// (`put_mutation_macs`, `on_conflict((name, index_mac, device_id))`), so
     /// before this the ltHash and the store disagreed about the same snapshot.
+    ///
+    /// One deliberate difference from that Map: a record whose value blob is
+    /// shorter than a MAC is dropped before the dedup, so the winner is the last
+    /// *usable* record for an index rather than the last one. WA Web slices with
+    /// a negative index there and folds the truncated buffer instead. Both are
+    /// answers to a record the server should never send; ours refuses to fold
+    /// something that is not a MAC.
     pub fn update_hash_from_records(&mut self, records: &[wa::SyncdRecord]) {
         // Borrow the MAC tails; no Vec<u8> allocation per MAC.
         let mut added: Vec<&[u8]> = Vec::with_capacity(records.len());
@@ -641,6 +650,76 @@ mod tests {
         assert_eq!(
             state.hash, expected,
             "a repeated index must contribute only its last value MAC, as WA Web's Map does"
+        );
+    }
+
+    /// The branch production actually takes. `MAC_DEDUP_SCAN_LIMIT` counts
+    /// records carrying an index, not distinct indices, so any real snapshot --
+    /// `regular_low` on an active account is hundreds of records -- sorts rather
+    /// than scans. The linear branch the other tests exercise is the one a real
+    /// account almost never reaches.
+    #[test]
+    fn a_repeated_index_is_deduped_above_the_scan_limit_too() {
+        const DUPLICATED: &[u8] = &[0xEEu8; 32];
+        const STALE: &[u8] = &[0x11u8; 32];
+        const WINNER: &[u8] = &[0x22u8; 32];
+
+        // Comfortably past the limit, so this takes the sorted branch.
+        let filler = MAC_DEDUP_SCAN_LIMIT * 2;
+        let mut records = Vec::with_capacity(filler + 2);
+        let mut expected_macs: Vec<[u8; 32]> = Vec::with_capacity(filler + 1);
+
+        // The stale copy first, and the winner last, with the whole filler set
+        // between them: the sort has to keep encounter order within the index.
+        records.push(record_with(DUPLICATED, STALE));
+        for i in 0..filler {
+            let mut index_mac = [0u8; 32];
+            index_mac[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            let mac = [(i % 251) as u8; 32];
+            records.push(record_with(&index_mac, &mac));
+            expected_macs.push(mac);
+        }
+        records.push(record_with(DUPLICATED, WINNER));
+        expected_macs.push(*<&[u8; 32]>::try_from(WINNER).unwrap());
+
+        let mut state = HashState::default();
+        state.update_hash_from_records(&records);
+
+        let added: Vec<&[u8]> = expected_macs.iter().map(|m| m.as_slice()).collect();
+        let mut expected = [0u8; 128];
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut expected, &[] as &[&[u8]], &added);
+
+        assert_eq!(
+            state.hash, expected,
+            "above the scan limit the sort must still keep the last record for a \
+             repeated index, and only that one"
+        );
+    }
+
+    /// Three records under one index, the winner in last place. Guards
+    /// `rest[run - 1]` against picking the middle of a run.
+    #[test]
+    fn the_last_of_a_run_of_three_is_the_one_that_folds() {
+        const INDEX: &[u8] = &[7u8; 32];
+        const FIRST: &[u8] = &[0xA1u8; 32];
+        const MIDDLE: &[u8] = &[0xA2u8; 32];
+        const LAST: &[u8] = &[0xA3u8; 32];
+
+        let records = vec![
+            record_with(INDEX, FIRST),
+            record_with(INDEX, MIDDLE),
+            record_with(INDEX, LAST),
+        ];
+
+        let mut state = HashState::default();
+        state.update_hash_from_records(&records);
+
+        let mut expected = [0u8; 128];
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut expected, &[] as &[&[u8]], &[LAST]);
+
+        assert_eq!(
+            state.hash, expected,
+            "a run of three must fold its last record, not its first or middle"
         );
     }
 

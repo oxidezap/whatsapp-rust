@@ -479,13 +479,24 @@ impl AppStateProcessor {
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;
-        } else if pl.patches.is_empty() && !had_record && pl.error.is_none() {
-            // A bootstrap the server answered with nothing to apply. WA Web
-            // records it -- `if (isBootstrap(v)) updateCollectionVersionAndLtHash(0,
-            // EMPTY_LT_HASH)` on its "sync X but there are no updates" branch --
-            // and the record is what stops the next sync asking for the snapshot
-            // again. Without it an account whose collection is legitimately empty
-            // re-requests one forever.
+        } else if pl.patches.is_empty()
+            && !pl.has_more_patches
+            && pl.snapshot_ref.is_none()
+            && !had_record
+            && pl.error.is_none()
+        {
+            // A bootstrap the server answered with nothing to apply, and nothing
+            // still to come. WA Web records it -- `if (isBootstrap(v))
+            // updateCollectionVersionAndLtHash(0, EMPTY_LT_HASH)` on its "sync X
+            // but there are no updates" branch -- and the record is what stops
+            // the next sync asking for the snapshot again. Without it an account
+            // whose collection is legitimately empty re-requests one forever.
+            //
+            // `has_more_patches` and an undownloaded `snapshot_ref` both mean this
+            // is a page rather than the whole answer. Recording zero for either
+            // would end the bootstrap early: the collection would never ask for a
+            // snapshot again, and a non-genesis patch over its empty ltHash is
+            // refused for good.
             self.backend
                 .set_version(collection_name, state.clone())
                 .await?;

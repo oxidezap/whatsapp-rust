@@ -4094,6 +4094,59 @@ mod tests {
             .expect("Failed to create test store")
     }
 
+    /// `delete_version` is how a rebuild is expressed, so what it does to a row
+    /// that is not there, and to another device's row, is load-bearing.
+    #[tokio::test]
+    async fn delete_version_removes_one_device_and_tolerates_a_missing_row() {
+        let store = create_test_store().await;
+        const NAME: &str = "regular_low";
+
+        // A no-op, not an error: a collection that never synced is already in
+        // the state a rebuild wants it in.
+        store
+            .delete_app_state_version_for_device(NAME, 1)
+            .await
+            .expect("deleting a collection that has no row is a no-op");
+
+        for device_id in [1, 2] {
+            store
+                .set_app_state_version_for_device(
+                    NAME,
+                    HashState {
+                        version: 40 + device_id as u64,
+                        ..Default::default()
+                    },
+                    device_id,
+                )
+                .await
+                .expect("the store should accept a version");
+        }
+
+        store
+            .delete_app_state_version_for_device(NAME, 1)
+            .await
+            .expect("the row should delete");
+
+        assert!(
+            store
+                .get_app_state_version_for_device(NAME, 1)
+                .await
+                .expect("readable")
+                .is_none(),
+            "the deleted device's collection reads back as never synced"
+        );
+        assert_eq!(
+            store
+                .get_app_state_version_for_device(NAME, 2)
+                .await
+                .expect("readable")
+                .expect("the other device still has its record")
+                .version,
+            42,
+            "a delete is scoped to one device, or a rebuild on one wipes them all"
+        );
+    }
+
     #[tokio::test]
     async fn with_config_custom_tuning_builds_and_operates() {
         use portable_atomic::AtomicU64;
