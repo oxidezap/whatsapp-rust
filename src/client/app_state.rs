@@ -2558,6 +2558,23 @@ impl Client {
                 self.dispatch_app_state_mutation(&m, full_sync).await;
             }
 
+            // A collection the server refused advances nothing: the processor
+            // returns the state untouched for a list carrying an error
+            // (`process_parsed_patch_list`, the `pl.error.is_some()` early
+            // return). Reporting `Completed` for it would say the loop ended,
+            // not that the collection synced -- and the conflict recovery reads
+            // that answer as "the base moved", then re-sends the same patch
+            // until the attempt cap. The batched path buckets these as
+            // retryable or fatal; this one has no buckets, so it raises.
+            if let Some(refused) = &list.error
+                && new_state.version <= state.version
+            {
+                return Err(anyhow::anyhow!(
+                    "app-state sync for {name:?} was refused by the server \
+                     and advanced nothing: {refused}"
+                ));
+            }
+
             state = new_state;
             applied_anything = true;
             has_more = list.has_more_patches;
@@ -3747,6 +3764,30 @@ mod send_patch_response_tests {
         assert!(
             patch_attempts.load(Ordering::Relaxed) >= 1,
             "once the collection has a record the patch is legitimate and must be sent"
+        );
+    }
+
+    /// Production shape, and review of #1365: a re-sync whose collection comes
+    /// back with an error advances nothing, but the loop around it still ends,
+    /// so `SyncOutcome::Completed` said "recovered" and the send re-tried the
+    /// same patch against the same base until the cap.
+    ///
+    /// `Completed` has to mean the collection synced, not that the loop stopped.
+    #[tokio::test]
+    async fn a_conflict_whose_resync_is_refused_stops_at_the_first_attempt() {
+        // Patch IQs conflict; the re-sync between them is answered with a
+        // collection-level error, which advances nothing.
+        let (result, patches) =
+            send_against(|attempt| Some(if attempt == 0 { "500" } else { "409" })).await;
+        let err = result.expect_err("a re-sync the server refused is not a recovery");
+        assert!(
+            format!("{err:#}").contains("could not be recovered"),
+            "the error should say the collection could not be recovered, got: {err:#}"
+        );
+        assert_eq!(
+            patches, 1,
+            "a refused re-sync leaves the base where it was, so re-sending is the \
+             same request"
         );
     }
     /// Production symptom: `regular_low` conflicted on v0, the re-sync that
