@@ -673,17 +673,22 @@ mod tests {
         assert_eq!(report.synced, vec![WAPatchName::Regular]);
         assert_eq!(asked.len(), 1, "one collection, one round");
         assert_eq!(attr(&asked[0], "return_snapshot").as_deref(), Some("true"));
+        // WA Web emits `version` on every collection node, falling back to
+        // DEFAULT_COLLECTION_VERSION when it has none
+        // (`_buildCollectionNodes`: `version: INT(v ?? 0)`). A node with no
+        // `version` at all is a shape the official client never sends.
         assert_eq!(
-            attr(&asked[0], "version"),
-            None,
-            "a snapshot request carries no version"
+            attr(&asked[0], "version").as_deref(),
+            Some("0"),
+            "a snapshot request still names the version it is starting from"
         );
     }
 
-    /// A rebuild is expressed by standing the collection down, because a
-    /// snapshot is only ever sent for a request that carries no version. Both
-    /// halves matter: a version left behind stale MACs, or MACs left behind a
-    /// version, is a baseline nothing downstream is looking for.
+    /// A rebuild is expressed by standing the collection down: the request that
+    /// asks for a snapshot names version 0, so the state it is starting from has
+    /// to actually be zero. Both halves matter -- a version left behind stale
+    /// MACs, or MACs left behind a version, is a baseline nothing downstream is
+    /// looking for.
     #[tokio::test]
     async fn snapshot_mode_stands_the_collection_down_before_asking() {
         let (client, transport) = create_reachable_client().await;
@@ -742,9 +747,9 @@ mod tests {
             Some("true")
         );
         assert_eq!(
-            attr(&collection, "version"),
-            None,
-            "a request that carries a version is not answered with a snapshot"
+            attr(&collection, "version").as_deref(),
+            Some("0"),
+            "the collection was stood down first, so the snapshot request names zero"
         );
 
         let id = node

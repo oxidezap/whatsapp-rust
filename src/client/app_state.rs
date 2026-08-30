@@ -1982,15 +1982,17 @@ impl Client {
                 if want_snapshot {
                     replaying_snapshot.insert(name);
                 }
-                let mut builder = NodeBuilder::new("collection")
+                // `version` goes on every node, snapshot request included. WA
+                // Web's `_buildCollectionNodes` emits `version: INT(v ?? 0)`
+                // unconditionally, so a `<collection>` without one is a shape the
+                // official client never sends.
+                let builder = NodeBuilder::new("collection")
                     .attr("name", name.as_str())
                     .attr(
                         "return_snapshot",
                         if want_snapshot { "true" } else { "false" },
-                    );
-                if !want_snapshot {
-                    builder = builder.attr("version", state.version);
-                }
+                    )
+                    .attr("version", state.version);
                 collection_nodes.push(builder.build());
             }
             rebuild = false;
@@ -2427,15 +2429,15 @@ impl Client {
             }
             debug!(target: "Client/AppState", "Fetching app state patch batch: name={:?} want_snapshot={want_snapshot} version={} full_sync={} has_more_previous={}", name, state.version, full_sync, has_more);
 
-            let mut collection_builder = NodeBuilder::new("collection")
+            // See the batched builder: `version` is unconditional, matching
+            // `_buildCollectionNodes`.
+            let collection_builder = NodeBuilder::new("collection")
                 .attr("name", name.as_str())
                 .attr(
                     "return_snapshot",
                     if want_snapshot { "true" } else { "false" },
-                );
-            if !want_snapshot {
-                collection_builder = collection_builder.attr("version", state.version);
-            }
+                )
+                .attr("version", state.version);
             let sync_node = NodeBuilder::new("sync")
                 .children([collection_builder.build()])
                 .build();
