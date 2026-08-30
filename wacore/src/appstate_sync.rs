@@ -248,7 +248,11 @@ impl AppStateProcessor {
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         // Skip collections with errors — caller handles them via pl.error
         if pl.error.is_some() {
-            let state = self.backend.get_version(pl.name.as_str()).await?;
+            let state = self
+                .backend
+                .get_version(pl.name.as_str())
+                .await?
+                .unwrap_or_default();
             return Ok((Vec::new(), state, pl));
         }
 
@@ -261,7 +265,11 @@ impl AppStateProcessor {
                 code: 0,
                 text: e.to_string(),
             });
-            let state = self.backend.get_version(pl.name.as_str()).await?;
+            let state = self
+                .backend
+                .get_version(pl.name.as_str())
+                .await?
+                .unwrap_or_default();
             return Ok((Vec::new(), state, pl));
         }
 
@@ -277,7 +285,11 @@ impl AppStateProcessor {
         // Pre-fetch all keys we'll need
         self.prefetch_keys(&pl).await?;
 
-        let mut state = self.backend.get_version(pl.name.as_str()).await?;
+        let mut state = self
+            .backend
+            .get_version(pl.name.as_str())
+            .await?
+            .unwrap_or_default();
         let mut new_mutations: Vec<Mutation> = Vec::new();
         let collection_name = pl.name.as_str();
 
@@ -503,7 +515,11 @@ impl AppStateProcessor {
         let keys = self.get_app_state_key(&key_id).await?;
 
         // Get current hash state — save base version for the caller
-        let mut state = self.backend.get_version(collection_name).await?;
+        let mut state = self
+            .backend
+            .get_version(collection_name)
+            .await?
+            .unwrap_or_default();
         let base_version = state.version;
 
         // Pre-fetch previous value MACs in one backend round-trip, mirroring

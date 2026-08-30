@@ -571,15 +571,13 @@ impl AppSyncStore for InMemoryBackend {
         Ok(())
     }
 
-    async fn get_version(&self, name: &str) -> Result<HashState> {
-        Ok(self
-            .state
-            .lock()
-            .await
-            .versions
-            .get(name)
-            .cloned()
-            .unwrap_or_default())
+    async fn get_version(&self, name: &str) -> Result<Option<HashState>> {
+        Ok(self.state.lock().await.versions.get(name).cloned())
+    }
+
+    async fn delete_version(&self, name: &str) -> Result<()> {
+        self.state.lock().await.versions.remove(name);
+        Ok(())
     }
 
     async fn set_version(&self, name: &str, state: HashState) -> Result<()> {

@@ -1621,7 +1621,7 @@ impl SqliteStore {
         &self,
         name: &str,
         device_id: i32,
-    ) -> Result<HashState> {
+    ) -> Result<Option<HashState>> {
         let name = name.to_string();
         let res: Option<Vec<u8>> = self
             .read_query(move |conn| {
@@ -1637,22 +1637,45 @@ impl SqliteStore {
             .await?;
 
         if let Some(data) = res {
-            // An undecodable blob (an old bincode row or corruption) resets the
-            // collection to default, which simply re-syncs it from version 0.
+            // An undecodable blob (an old bincode row or corruption) is answered
+            // as never-synced, which rebuilds the collection from a snapshot.
+            // Answering version 0 instead asked the server to resume from a
+            // baseline this side could not actually read.
             match crate::wire::decode_hash_state(&data) {
-                Ok(state) => Ok(state),
+                Ok(state) => Ok(Some(state)),
                 Err(e) => {
                     warn!(
                         "app_state_version blob ({} bytes) failed to decode: {e}; \
-                         resetting to default, collection will re-sync from 0",
+                         treating the collection as never synced so it rebuilds",
                         data.len()
                     );
-                    Ok(HashState::default())
+                    Ok(None)
                 }
             }
         } else {
-            Ok(HashState::default())
+            Ok(None)
         }
+    }
+
+    pub async fn delete_app_state_version_for_device(
+        &self,
+        name: &str,
+        device_id: i32,
+    ) -> Result<()> {
+        let name = name.to_string();
+        self.with_retry("delete_app_state_version", || {
+            let name = name.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                diesel::delete(
+                    app_state_versions::table
+                        .filter(app_state_versions::name.eq(&name))
+                        .filter(app_state_versions::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(())
+            })
+        })
+        .await
     }
 
     pub async fn set_app_state_version_for_device(
@@ -2488,8 +2511,13 @@ impl AppSyncStore for SqliteStore {
             .await
     }
 
-    async fn get_version(&self, name: &str) -> Result<HashState> {
+    async fn get_version(&self, name: &str) -> Result<Option<HashState>> {
         self.get_app_state_version_for_device(name, self.device_id)
+            .await
+    }
+
+    async fn delete_version(&self, name: &str) -> Result<()> {
+        self.delete_app_state_version_for_device(name, self.device_id)
             .await
     }
 
@@ -5234,14 +5262,15 @@ mod tests {
                 .is_none(),
             "a legacy bincode sync-key row must read back as absent"
         );
-        assert_eq!(
+        assert!(
             store
                 .get_app_state_version_for_device(name, device_id)
                 .await
                 .expect("legacy version blob must not surface a decode error")
-                .version,
-            0,
-            "a legacy bincode version row must reset to default (re-sync from 0)"
+                .is_none(),
+            "a legacy bincode version row must read back as never-synced, so the \
+             collection rebuilds from a snapshot rather than resuming from a \
+             baseline nothing here can read"
         );
 
         // And the protobuf setters overwrite the healed rows: a re-shared key and a
@@ -5282,6 +5311,7 @@ mod tests {
                 .get_app_state_version_for_device(name, device_id)
                 .await
                 .expect("get version")
+                .expect("the collection has a version record")
                 .version,
             5,
             "a re-synced version must persist over the legacy row"
@@ -5938,7 +5968,7 @@ mod read_routing_tests {
         );
         assert!(store.get_sync_key(b"k1").await.unwrap().is_none());
         assert_eq!(store.get_latest_sync_key_id().await.unwrap(), None);
-        assert_eq!(store.get_version("critical").await.unwrap().version, 0);
+        assert!(store.get_version("critical").await.unwrap().is_none());
         assert_eq!(
             store
                 .get_mutation_mac("critical", &[1u8; 32])
@@ -6059,7 +6089,15 @@ mod read_routing_tests {
             ..Default::default()
         };
         store.set_version("critical", state).await.unwrap();
-        assert_eq!(store.get_version("critical").await.unwrap().version, 42);
+        assert_eq!(
+            store
+                .get_version("critical")
+                .await
+                .unwrap()
+                .expect("the collection has a version record")
+                .version,
+            42
+        );
 
         let mac = AppStateMutationMAC {
             index_mac: vec![1u8; 32],

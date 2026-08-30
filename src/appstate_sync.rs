@@ -113,14 +113,12 @@ mod tests {
             *self.latest_key_id.lock().await = Some(key_id.to_vec());
             Ok(())
         }
-        async fn get_version(&self, name: &str) -> StoreResult<HashState> {
-            Ok(self
-                .versions
-                .lock()
-                .await
-                .get(name)
-                .cloned()
-                .unwrap_or_default())
+        async fn get_version(&self, name: &str) -> StoreResult<Option<HashState>> {
+            Ok(self.versions.lock().await.get(name).cloned())
+        }
+        async fn delete_version(&self, name: &str) -> StoreResult<()> {
+            self.versions.lock().await.remove(name);
+            Ok(())
         }
         async fn set_version(&self, name: &str, state: HashState) -> StoreResult<()> {
             self.versions.lock().await.insert(name.to_string(), state);
@@ -624,6 +622,7 @@ mod tests {
                 .get_version(WAPatchName::Regular.as_str())
                 .await
                 .unwrap()
+                .expect("the collection has a version record")
                 .version,
             state.version,
             "the state handed back must be the state already persisted"
@@ -859,6 +858,7 @@ mod tests {
                 .get_version(WAPatchName::Regular.as_str())
                 .await
                 .unwrap()
+                .expect("the collection has a version record")
                 .version,
             2
         );
@@ -880,6 +880,7 @@ mod tests {
                 .get_version(WAPatchName::Regular.as_str())
                 .await
                 .unwrap()
+                .expect("the collection has a version record")
                 .version,
             1,
             "version must not advance when the MAC reset fails"
@@ -1194,7 +1195,8 @@ mod tests {
             let persisted = backend
                 .get_version(name.as_str())
                 .await
-                .expect("version readable");
+                .expect("version readable")
+                .expect("the collection has a version record");
             assert_eq!(
                 persisted.version, version,
                 "the collection must advance, or the next sync re-requests the same patch"
@@ -1292,6 +1294,7 @@ mod tests {
                 .get_version(name.as_str())
                 .await
                 .expect("version readable")
+                .expect("the collection has a version record")
                 .version,
             11,
             "the collection must pass the cut, or every later sync repeats the snapshot"

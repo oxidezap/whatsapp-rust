@@ -59,7 +59,7 @@ pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef
                 for (name, server_version) in collections {
                     if server_version > 0 {
                         match backend.get_version(name.as_str()).await {
-                            Ok(state) if state.version >= server_version => {
+                            Ok(Some(state)) if state.version >= server_version => {
                                 debug!(
                                     target: "Client/AppState",
                                     "Skipping server_sync for {:?}: local version {} >= server version {}",

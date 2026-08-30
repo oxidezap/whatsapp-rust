@@ -301,6 +301,65 @@ mod tests {
     /// `await_connection` is right to keep waiting on. Both stores
     /// `handle_success` makes, in that order: the session, then the generation
     /// it is authenticated under.
+
+    /// WA Web reads bootstrap as `version == null`, not `version == 0`: a
+    /// collection that synced and is legitimately empty has a record, and asks
+    /// for patches like any other. Collapsing the two made every empty
+    /// collection re-request a snapshot on every sync, forever.
+    #[tokio::test]
+    async fn a_synced_but_empty_collection_asks_for_patches_not_a_snapshot() {
+        let (client, transport) = create_reachable_client().await;
+        // A record at version 0: synced, and empty.
+        client
+            .persistence_manager
+            .backend()
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                wacore::appstate::hash::HashState::default(),
+            )
+            .await
+            .expect("the test backend should accept a version");
+
+        let (result, asked) = resync_against(
+            &client,
+            &transport,
+            vec![WAPatchName::Regular],
+            AppStateResyncMode::Incremental,
+            |_, id| batch_result(id, &[("regular", None)]),
+        )
+        .await;
+
+        result.expect("the server answered");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            attr(&asked[0], "return_snapshot").as_deref(),
+            Some("false"),
+            "a collection with a record has synced, however empty it is"
+        );
+        assert_eq!(attr(&asked[0], "version").as_deref(), Some("0"));
+    }
+
+    /// The other half: no record at all is bootstrap, and bootstrap asks for a
+    /// snapshot.
+    #[tokio::test]
+    async fn a_collection_with_no_record_asks_for_a_snapshot() {
+        let (client, transport) = create_reachable_client().await;
+
+        let (result, asked) = resync_against(
+            &client,
+            &transport,
+            vec![WAPatchName::Regular],
+            AppStateResyncMode::Incremental,
+            |_, id| batch_result(id, &[("regular", None)]),
+        )
+        .await;
+
+        result.expect("the server answered");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(attr(&asked[0], "return_snapshot").as_deref(), Some("true"));
+        assert_eq!(attr(&asked[0], "version").as_deref(), Some("0"));
+    }
+
     async fn create_reachable_client() -> (
         Arc<Client>,
         Arc<crate::transport::mock::CapturingMockTransport>,
@@ -555,6 +614,7 @@ mod tests {
                 .get_version(WAPatchName::Regular.as_str())
                 .await
                 .expect("the version should be readable")
+                .expect("the collection has a version record")
                 .version,
             42,
             "a rebuild that could not run must leave the collection alone"
@@ -719,14 +779,14 @@ mod tests {
         // The IQ is on the wire: whatever the rebuild stood down, it stood down
         // before asking, and it did so holding the collection's reservation.
         let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
-        assert_eq!(
+        assert!(
             backend
                 .get_version(WAPatchName::Regular.as_str())
                 .await
                 .expect("the version should be readable")
-                .version,
-            0,
-            "the collection must be asking as one that never synced"
+                .is_none(),
+            "a rebuild is expressed by having nothing: the record is gone, which is \
+             what makes the next sync bootstrap the collection"
         );
         assert_eq!(
             backend
@@ -790,7 +850,8 @@ mod tests {
             .backend()
             .get_version(WAPatchName::Regular.as_str())
             .await
-            .expect("the version should be readable");
+            .expect("the version should be readable")
+            .expect("the collection has a version record");
         assert_eq!(
             persisted.version, 42,
             "an incremental resync must leave the persisted version alone"

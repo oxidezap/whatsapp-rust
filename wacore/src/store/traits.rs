@@ -687,8 +687,21 @@ pub trait AppSyncStore: Send + Sync {
     /// Set an app state sync key.
     async fn set_sync_key(&self, key_id: &[u8], key: AppStateSyncKey) -> Result<()>;
 
-    /// Get the app state version for a collection.
-    async fn get_version(&self, name: &str) -> Result<HashState>;
+    /// Get the app state version for a collection, or `None` if it has never
+    /// synced.
+    ///
+    /// The absence is the point. WA Web treats "no record" as bootstrap
+    /// (`isBootstrap = version == null`) and asks for a snapshot; a collection
+    /// that synced and is legitimately empty sits at version 0 with a record and
+    /// asks for patches. Collapsing the two into `HashState::default()` made
+    /// every empty collection re-request a snapshot forever.
+    async fn get_version(&self, name: &str) -> Result<Option<HashState>>;
+
+    /// Forget a collection's version, returning it to the never-synced state.
+    ///
+    /// This is how a rebuild is expressed: the collection has nothing, so the
+    /// next sync bootstraps it from a snapshot.
+    async fn delete_version(&self, name: &str) -> Result<()>;
 
     /// Set the app state version for a collection.
     async fn set_version(&self, name: &str, state: HashState) -> Result<()>;

@@ -1702,10 +1702,9 @@ impl Client {
         name: WAPatchName,
         scope: SyncScope,
     ) -> Result<StandDown> {
-        let state = backend.get_version(name.as_str()).await?;
-        if state.version == 0 {
+        let Some(state) = backend.get_version(name.as_str()).await? else {
             return Ok(StandDown::Done);
-        }
+        };
         if let Err(lost) = self.admits(scope) {
             return Ok(StandDown::Declined(lost));
         }
@@ -1714,9 +1713,7 @@ impl Client {
             "Batched sync: standing {name:?} down from v{} to rebuild it",
             state.version
         );
-        backend
-            .set_version(name.as_str(), wacore::appstate::hash::HashState::default())
-            .await?;
+        backend.delete_version(name.as_str()).await?;
         if let Err(lost) = self.admits(scope) {
             // The version is already down, and that half is the recoverable one:
             // the next sync sees an unsynced collection and rebuilds it, clearing
@@ -1989,8 +1986,12 @@ impl Client {
                     );
                     continue;
                 }
-                let state = backend.get_version(name.as_str()).await?;
-                let want_snapshot = state.version == 0;
+                let stored = backend.get_version(name.as_str()).await?;
+                // WA Web: `isBootstrap = version == null`. A collection with a
+                // record sitting at 0 has synced and is simply empty, and asks
+                // for patches like any other.
+                let want_snapshot = stored.is_none();
+                let state = stored.unwrap_or_default();
                 if want_snapshot {
                     replaying_snapshot.insert(name);
                 }
@@ -2401,10 +2402,13 @@ impl Client {
         let backend = self.persistence_manager.backend();
         let mut full_sync = full_sync;
 
-        let mut state = backend.get_version(name.as_str()).await?;
-        if state.version == 0 {
+        // Bootstrap is the absence of a record, not a version that happens to be
+        // zero: WA Web reads `isBootstrap = version == null`.
+        let stored = backend.get_version(name.as_str()).await?;
+        if stored.is_none() {
             full_sync = true;
         }
+        let mut state = stored.unwrap_or_default();
 
         let mut has_more = true;
         let mut want_snapshot = full_sync;
@@ -2876,15 +2880,13 @@ impl Client {
         // full sync is incomplete". Sync first, then build.
         if let Some(name) = patch_name {
             let backend = self.persistence_manager.backend();
-            let state = backend.get_version(collection_name).await?;
-            if state.version == 0 && state.hash == [0u8; 128] {
+            if backend.get_version(collection_name).await?.is_none() {
                 debug!(
                     target: "Client/AppState",
                     "{collection_name} has never synced; syncing before building a patch on it"
                 );
                 self.fetch_app_state_with_retry_inner(name).await?;
-                let state = backend.get_version(collection_name).await?;
-                if state.version == 0 && state.hash == [0u8; 128] {
+                if backend.get_version(collection_name).await?.is_none() {
                     return Err(anyhow::anyhow!(
                         "app-state patch for {collection_name} not attempted: \
                          the collection has never synced"
@@ -3684,8 +3686,9 @@ mod send_patch_response_tests {
                             first_iq_carried_a_patch.store(1, Ordering::Relaxed);
                         }
                     }
-                    // Answer every sync with an empty result, so the collection
-                    // never leaves v0.
+                    // An empty result is what the server sends a bootstrap with
+                    // nothing in it: WA Web writes version 0 with an empty
+                    // ltHash and the collection is synced from then on.
                     let response = empty_sync_result(&id, COLLECTION);
                     crate::test_utils::answer_iq(&client, &id, &response).await;
                     frame += 1;
@@ -3698,20 +3701,16 @@ mod send_patch_response_tests {
             () = server.fuse() => unreachable!("the server loop never returns"),
         };
 
-        let err = result.expect_err("a collection that never synced cannot carry a patch");
-        assert!(
-            format!("{err:#}").contains("never synced"),
-            "the error should name the unsynced collection, got: {err:#}"
-        );
+        result.expect("the bootstrap sync lifts the collection out of never-synced");
         assert_eq!(
             first_iq_carried_a_patch.load(Ordering::Relaxed),
             0,
-            "the first thing on the wire must be the sync, not the patch"
+            "the first thing on the wire must be the bootstrap sync, not a patch built \
+             on an empty ltHash"
         );
-        assert_eq!(
-            patch_attempts.load(Ordering::Relaxed),
-            0,
-            "a patch built on an empty ltHash is refused by construction; do not send one"
+        assert!(
+            patch_attempts.load(Ordering::Relaxed) >= 1,
+            "once the collection has a record the patch is legitimate and must be sent"
         );
     }
     /// Production symptom: `regular_low` conflicted on v0, the re-sync that
