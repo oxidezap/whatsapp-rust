@@ -771,6 +771,35 @@ fn finalize_app_state_key_request_peers(
     Ok(peers)
 }
 
+/// Why a collection this round asked for is missing from its results.
+///
+/// A `<sync>` that omits a requested `<collection>` parses fine, so the omission
+/// has to be reconciled rather than detected. But an apply that failed leaves the
+/// collection unaccounted for too, and calling that "the response omitted it"
+/// blames the server for our own error -- which is exactly what a production
+/// investigation into a permanently unsyncable `regular_low` had to unpick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unaccounted {
+    /// The response never mentioned it.
+    Omitted,
+    /// It came back, and the apply stopped before finishing it.
+    NotApplied,
+}
+
+fn unaccounted_for(
+    name: WAPatchName,
+    responded: &HashSet<WAPatchName>,
+    answered: &HashSet<WAPatchName>,
+) -> Option<Unaccounted> {
+    if answered.contains(&name) {
+        None
+    } else if responded.contains(&name) {
+        Some(Unaccounted::NotApplied)
+    } else {
+        Some(Unaccounted::Omitted)
+    }
+}
+
 impl Client {
     pub(crate) fn get_app_state_processor(&self) -> &Arc<AppStateProcessor> {
         self.app_state_processor.get_or_init(|| {
@@ -2149,6 +2178,11 @@ impl Client {
             // The error still ends the run — after what was applied has been
             // dispatched.
             let mut apply_error = None;
+            // What the response actually carried, captured before the apply
+            // consumes it: a collection that came back and failed to apply is a
+            // different fact from one the server never mentioned, and the two
+            // used to reach the log as the same sentence.
+            let responded: HashSet<WAPatchName> = patch_lists.iter().map(|pl| pl.name).collect();
             for pl in patch_lists {
                 if let Err(lost) = self.admits(scope) {
                     warn!(
@@ -2157,9 +2191,19 @@ impl Client {
                     );
                     break;
                 }
+                let name = pl.name;
                 match proc.process_one_patch_list(pl, &download, true).await {
                     Ok(applied) => results.push(applied),
                     Err(e) => {
+                        // Named here or nowhere: the loop stops on the first
+                        // failure, and the collections behind it are reported as
+                        // unaccounted for without anything saying which one
+                        // actually broke. Ordering makes this concrete --
+                        // `regular_low` sorts last, so it is the usual casualty.
+                        warn!(
+                            target: "Client/AppState",
+                            "Batched sync: apply failed for {name:?}: {e}"
+                        );
                         apply_error = Some(e);
                         break;
                     }
@@ -2274,12 +2318,22 @@ impl Client {
             // and did not fail either; treat it as retryable so it is neither
             // reported as done nor re-asked immediately in this loop.
             for name in pending {
-                if !answered.contains(&name) {
-                    warn!(
-                        target: "Client/AppState",
-                        "Batched sync: response omitted collection {name:?}"
-                    );
-                    outcome.retryable.push(name);
+                match unaccounted_for(name, &responded, &answered) {
+                    None => {}
+                    Some(Unaccounted::Omitted) => {
+                        warn!(
+                            target: "Client/AppState",
+                            "Batched sync: response omitted collection {name:?}"
+                        );
+                        outcome.retryable.push(name);
+                    }
+                    Some(Unaccounted::NotApplied) => {
+                        warn!(
+                            target: "Client/AppState",
+                            "Batched sync: {name:?} came back but was not applied"
+                        );
+                        outcome.retryable.push(name);
+                    }
                 }
             }
 
@@ -4001,6 +4055,43 @@ pub(crate) mod batched_sync_outcome_tests {
 
 #[cfg(test)]
 mod batched_sync_reconciliation_tests {
+    use super::{Unaccounted, unaccounted_for};
+    use std::collections::HashSet;
+
+    /// Production symptom: a snapshot whose MAC would not validate stopped the
+    /// apply loop, and every collection left over -- `regular_low` first, since
+    /// it sorts last -- was logged as omitted by the server. The server had sent
+    /// it.
+    #[test]
+    fn a_collection_that_came_back_and_failed_is_not_blamed_on_the_server() {
+        let responded = HashSet::from([WAPatchName::RegularLow]);
+        let answered = HashSet::new();
+        assert_eq!(
+            unaccounted_for(WAPatchName::RegularLow, &responded, &answered),
+            Some(Unaccounted::NotApplied)
+        );
+    }
+
+    #[test]
+    fn a_collection_the_response_never_mentioned_is_an_omission() {
+        let responded = HashSet::from([WAPatchName::Regular]);
+        let answered = HashSet::from([WAPatchName::Regular]);
+        assert_eq!(
+            unaccounted_for(WAPatchName::RegularLow, &responded, &answered),
+            Some(Unaccounted::Omitted)
+        );
+    }
+
+    #[test]
+    fn a_collection_that_applied_is_accounted_for() {
+        let responded = HashSet::from([WAPatchName::RegularLow]);
+        let answered = HashSet::from([WAPatchName::RegularLow]);
+        assert_eq!(
+            unaccounted_for(WAPatchName::RegularLow, &responded, &answered),
+            None
+        );
+    }
+
     use super::*;
     use crate::client::app_state::batched_sync_outcome_tests::{batch_result, sync_against};
 
