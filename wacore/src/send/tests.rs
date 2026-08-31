@@ -2653,23 +2653,46 @@ mod stanza_type {
     }
 
     #[test]
-    fn ai_rich_response_family_is_text() {
-        // Empty inner on purpose: the wrapper is matched at the top level, so it
-        // classifies as text without anything to unwrap.
-        let cases = [
-            wa::Message {
-                bot_forwarded_message: buffa::MessageField::some(Default::default()),
-                ..Default::default()
-            },
-            wa::Message {
+    fn rich_response_is_text() {
+        let m = wa::Message {
+            rich_response_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(media_type_from_message(&m), None);
+        assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_TEXT);
+    }
+
+    #[test]
+    fn bot_forwarded_classifies_by_inner() {
+        // The wrapper is unwrapped, not classified: a rich response inside is
+        // text, an image inside is media *with* a mediatype. Sending the image
+        // case as text is what the guard in #692 exists to prevent.
+        let rich = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
                 rich_response_message: buffa::MessageField::some(Default::default()),
                 ..Default::default()
-            },
-        ];
-        for m in cases {
-            assert_eq!(media_type_from_message(&m), None);
-            assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_TEXT);
-        }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&rich), stanza::MSG_TYPE_TEXT);
+        assert_eq!(media_type_from_message(&rich), None);
+
+        let img = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                image_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&img), stanza::MSG_TYPE_MEDIA);
+        assert_eq!(media_type_from_message(&img), Some("image"));
+
+        // Empty inner is the one case WA Web answers with text.
+        let vazio = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&vazio), stanza::MSG_TYPE_TEXT);
     }
 
     #[test]
