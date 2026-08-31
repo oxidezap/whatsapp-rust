@@ -284,7 +284,7 @@ impl HashState {
     /// it, and the server signed a snapshot that includes it. Dropping it here
     /// is the ltHash disagreeing with the MAC it will be checked against, which
     /// is a judgement about what a MAC ought to look like paid for with the
-    /// whole collection. [`value_mac_start`] is that slice; an empty blob folds
+    /// whole collection. `value_mac_start` is that slice; an empty blob folds
     /// an empty operand, which the ltHash's HKDF derives from perfectly well.
     ///
     /// Answers what it folded rather than how many records it was given: a
