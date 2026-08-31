@@ -577,25 +577,34 @@ pub fn validate_patch_macs(
 }
 
 /// The records a keyed snapshot actually describes: one per index, the last of
-/// any run, plus every record that carries no index and so cannot collide.
+/// any run.
 ///
 /// Mirrors the `Map` WA Web builds in `WAWebSyncdAntiTampering`, and must stay in
 /// step with [`HashState::update_hash_from_records`] -- the ltHash is folded over
 /// this same set, and a snapshot whose MAC we accepted has to be the snapshot we
 /// then decode.
+///
+/// Which is why a record carrying no index is keyed here too, on the empty
+/// slice, exactly as the fold keys it. Letting every such record through as its
+/// own winner read as "they cannot collide" and was the same mistake the fold
+/// made: WA Web keys on `hex(index.blob)`, `hex` of an absent buffer is the
+/// empty string, and they all collide there. Keeping the two in step matters
+/// more than either answer on its own -- the fold decides which MAC we accept
+/// and this decides what we then decrypt, so a disagreement means accepting a
+/// snapshot on one set of records and storing another.
 fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
     let mut winners: Vec<&wa::SyncdRecord> = Vec::with_capacity(records.len());
     let mut seen: Vec<&[u8]> = Vec::new();
     // Backwards, so the first hit for an index is its last record.
     for rec in records.iter().rev() {
-        match rec.index.as_option().and_then(|idx| idx.blob.as_deref()) {
-            Some(index_mac) => {
-                if !seen.contains(&index_mac) {
-                    seen.push(index_mac);
-                    winners.push(rec);
-                }
-            }
-            None => winners.push(rec),
+        let index_mac = rec
+            .index
+            .as_option()
+            .and_then(|idx| idx.blob.as_deref())
+            .unwrap_or_default();
+        if !seen.contains(&index_mac) {
+            seen.push(index_mac);
+            winners.push(rec);
         }
     }
     winners.reverse();
@@ -696,6 +705,65 @@ mod tests {
                 id: Some(key_id.to_vec()),
             }),
         }
+    }
+
+    /// The two passes over a snapshot must describe the same set of records.
+    ///
+    /// `update_hash_from_records` decides which MAC we accept and
+    /// `last_record_per_index` decides what we then decrypt and store, so a
+    /// disagreement means accepting a snapshot on one set of records and
+    /// persisting another. Records carrying no index are where the two came
+    /// apart: each pass independently read "no index" as "cannot collide" and
+    /// let every one of them through, where WA Web keys on `hex(index.blob)`
+    /// and collides them all on the empty string.
+    #[test]
+    fn the_decode_set_is_the_set_the_fold_folded() {
+        fn record(index: Option<&[u8]>, value_mac: u8) -> wa::SyncdRecord {
+            let mut blob = vec![0u8; 16];
+            blob.extend_from_slice(&[value_mac; 32]);
+            wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: index.map(<[u8]>::to_vec),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                ..Default::default()
+            }
+        }
+
+        // One ordinary index carrying a run of two, and three records with no
+        // index at all: five records describing two things.
+        let records = vec![
+            record(Some(&[0x01; 32]), 0x11),
+            record(None, 0x22),
+            record(Some(&[0x01; 32]), 0x33),
+            record(None, 0x44),
+            record(None, 0x55),
+        ];
+
+        let mut state = HashState::default();
+        let fold = state.update_hash_from_records(&records);
+        let winners = last_record_per_index(&records);
+
+        assert_eq!(fold.folded, 2, "one index and one empty key");
+        assert_eq!(
+            winners.len(),
+            fold.folded,
+            "the decode walks the records the fold folded, or the MAC we accepted \
+             was computed over a different snapshot than the one we store"
+        );
+        assert_eq!(
+            fold.unkeyed, 3,
+            "and it still says how many arrived unkeyed"
+        );
+
+        // Last wins in both, and on the same records.
+        let last_of = |mac: u8| {
+            winners
+                .iter()
+                .any(|rec| rec.value.blob.as_ref().is_some_and(|b| b[16] == mac))
+        };
+        assert!(last_of(0x33), "the run's last record, not its first");
+        assert!(last_of(0x55), "the last unkeyed record, not the first");
     }
 
     #[test]
