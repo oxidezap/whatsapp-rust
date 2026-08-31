@@ -121,20 +121,27 @@ fn parse_jid_scan(s: &str) -> Option<(ParsedJidParts<'_>, Option<Server>)> {
                 Some(pos) => (&s[..pos], parse_u16_decimal(&s[pos + 1..at]).unwrap_or(0)),
                 None => (user_part, 0),
             };
-            // The scan already found the last dot, so no second pass is
-            // needed -- but only one before the device separator is the agent,
-            // which is what the bound enforces. The two readings differ for a
-            // user holding a second colon (`a:1.5:2`).
-            let (final_user, agent) =
-                match last_dot_pos.filter(|&dot_pos| dot_pos < user_before_colon.len()) {
-                    Some(dot_pos) => match parse_u16_decimal(&user_before_colon[dot_pos + 1..]) {
-                        Some(agent_val) if agent_val <= u8::MAX as u16 => {
-                            (&user_before_colon[..dot_pos], agent_val as u8)
-                        }
-                        _ => (user_before_colon, 0),
-                    },
-                    None => (user_before_colon, 0),
-                };
+            // The scan already found the last dot, so the common case needs no
+            // second pass. Only a dot before the device separator is the agent,
+            // though, and a malformed device can hold one of its own
+            // (`123.4:x.y`) -- there the scanned dot is not the agent and the
+            // earlier one still is, so that case falls back to a reverse scan
+            // of the user. Getting this wrong is not cosmetic: it would parse
+            // to a different identity than the rendered form reparses to.
+            let agent_dot = match last_dot_pos {
+                Some(pos) if pos < user_before_colon.len() => Some(pos),
+                Some(_) => user_before_colon.rfind('.'),
+                None => None,
+            };
+            let (final_user, agent) = match agent_dot {
+                Some(dot_pos) => match parse_u16_decimal(&user_before_colon[dot_pos + 1..]) {
+                    Some(agent_val) if agent_val <= u8::MAX as u16 => {
+                        (&user_before_colon[..dot_pos], agent_val as u8)
+                    }
+                    _ => (user_before_colon, 0),
+                },
+                None => (user_before_colon, 0),
+            };
             Some((
                 ParsedJidParts {
                     user: final_user,
@@ -2006,6 +2013,11 @@ mod tests {
             // A second colon puts the last dot after the first one, which is
             // where reusing the scanned dot position would silently diverge.
             ("a:1.5:2@bot", "a:1", 5, 2),
+            // A valid agent followed by a malformed device: the scan's last dot
+            // is the one inside `x.y`, which is not the agent. Recovering the
+            // earlier one matters because the device degrades to 0 rather than
+            // rejecting the JID, so this must render and reparse to itself.
+            ("123.4:x.y@interop", "123", 4, 0),
             // Unparsable device degrades to 0 rather than rejecting the JID.
             ("5511999998888:x@s.whatsapp.net", "5511999998888", 0, 0),
         ];
