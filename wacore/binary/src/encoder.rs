@@ -194,12 +194,13 @@ impl EncodeNode for NodeRef<'_> {
 
 // u8 offsets keep StringHint small — the hint tape stores one per string —
 // and always fit: classify_string_hint only treats strings <= 48 bytes as
-// JID candidates.
+// JID candidates. The tape is one hint per string of the whole node, so a
+// byte added here is a byte times every string in the payload: keep the
+// resolved server and derive everything derivable from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedJidMeta {
     user_end: u8,
     server_start: u8,
-    domain_type: u8,
     device: Option<u8>,
     /// The resolved server, when the suffix is one we know. `JID_PAIR` writes
     /// this rather than the caller's substring, so a string-valued attribute
@@ -207,6 +208,17 @@ struct ParsedJidMeta {
     /// equivalent `Jid` would be. `None` keeps an unknown suffix verbatim,
     /// which is the only way it can survive the round trip.
     server: Option<jid::Server>,
+}
+
+impl ParsedJidMeta {
+    /// The AD_JID domain byte, from the resolved server rather than a second
+    /// stored copy of the same fact — `device` is `Some` only for the servers
+    /// [`server_supports_ad_jid`] accepts, which are exactly the ones
+    /// [`server_to_domain_type`] maps.
+    #[inline]
+    fn domain_type(self) -> u8 {
+        self.server.map_or(0, server_to_domain_type)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,15 +306,8 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
     };
 
     let server_kind = jid::Server::parse_known(server);
-    let domain_type = match server_kind {
-        Some(jid::Server::Pn) => 0,
-        Some(jid::Server::Lid) => 1,
-        Some(jid::Server::Hosted) => 128,
-        Some(jid::Server::HostedLid) => 129,
-        _ => 0,
-    };
 
-    // Single source of truth: only servers whose `domain_type` the decoder
+    // Single source of truth: only servers whose domain byte the decoder
     // round-trips back can use AD_JID. For everyone else drop the device
     // and fall through to JID_PAIR (which preserves the server name).
     let device = server_kind
@@ -313,7 +318,6 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         server: server_kind,
         user_end: u8::try_from(user_end).ok()?,
         server_start: u8::try_from(server_start).ok()?,
-        domain_type,
         device,
     })
 }
@@ -334,11 +338,12 @@ fn split_jid_from_meta(input: &str, meta: ParsedJidMeta) -> (&str, &str) {
 ///   128 = hosted
 ///   129 = hosted.lid
 ///
-/// WARNING: This must stay in sync with the string-path mapping in
-/// `classify_string_hint` / `parse_jid_meta` and the inverse mapping in
-/// `decoder.rs read_ad_jid`. Writing `jid.agent` unconditionally here
-/// (instead of only as a fallback) was the root cause of a regression
-/// where LID group messages were silently rejected by the server (error 421).
+/// WARNING: This must stay in sync with the inverse mapping in
+/// `decoder.rs read_ad_jid`. The string path no longer keeps its own copy of
+/// this mapping — `ParsedJidMeta::domain_type` calls this. Writing `jid.agent`
+/// unconditionally here (instead of only as a fallback) was the root cause of a
+/// regression where LID group messages were silently rejected by the server
+/// (error 421).
 #[inline]
 fn server_to_domain_type(server: jid::Server) -> u8 {
     match server {
@@ -772,7 +777,7 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
         let server = meta.server.map_or(raw_server, |s| s.as_str());
         if let Some(device) = meta.device {
             self.write_u8(token::AD_JID)?;
-            self.write_u8(meta.domain_type)?;
+            self.write_u8(meta.domain_type())?;
             self.write_u8(device)?;
             self.write_string(user)?;
         } else {
@@ -1003,6 +1008,25 @@ mod tests {
                 "nibble table disagrees at {byte:#04x}"
             );
         }
+    }
+
+    /// The hint tape holds one `StringHint` per string in the payload, so its
+    /// width is multiplied by every tag, attribute key, attribute value and
+    /// string content of the node: a 2048-child stanza records ~12k hints, and
+    /// one byte added here is 16 KiB of peak allocation once the `SmallVec`
+    /// rounds up. Adding a field that duplicates something already derivable
+    /// (the AD_JID domain byte, from the resolved server) cost exactly that
+    /// before it was derived instead. Pinned so the next field has to justify
+    /// itself.
+    #[test]
+    fn the_hint_tape_stays_five_bytes_wide() {
+        assert_eq!(
+            size_of::<StringHint>(),
+            5,
+            "StringHint got wider; the tape is one per string, so this is \
+             peak memory times every string in the payload"
+        );
+        assert_eq!(size_of::<ParsedJidMeta>(), 5, "ParsedJidMeta got wider");
     }
 
     /// The legacy spelling must not reach the wire by any encoding path, not
