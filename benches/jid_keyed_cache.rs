@@ -64,6 +64,11 @@ fn chat_jid(i: usize) -> Jid {
     Jid::pn(format!("5511999{i:06}"))
 }
 
+/// A key of the same width that no fixture ever inserts, for the miss probes.
+fn absent_jid(i: usize) -> Jid {
+    Jid::pn(format!("5511000{i:06}"))
+}
+
 /// `count + 1` keys per chat count, built once. One more than the cache holds,
 /// so a rotation through them always lands on the key that is currently absent
 /// -- which is what lets the creation bench stay on the miss path without
@@ -86,14 +91,21 @@ fn index_of(count: usize) -> usize {
         .expect("known chat count")
 }
 
-/// A warm cache plus the two probes into it, one of each outcome.
+/// A warm cache plus a set of probes into it for each outcome.
+///
+/// Both sets are cycled rather than repeated, for the reason
+/// `bench_jid_hashmap_get` cycles its own: the cache hashes with a per-process
+/// `RandomState`, so one fixed probe measures whichever bucket and collision
+/// chain that process happened to draw. Repeating it a thousand times only
+/// amplifies the draw, and CodSpeed compares two separate processes -- the
+/// baseline could differ from the branch with no code change at all.
 struct Probed {
     cache: Cache<Jid, Arc<()>>,
-    hit: Jid,
-    miss: Jid,
+    hits: Vec<Jid>,
+    misses: Vec<Jid>,
 }
 
-/// One warm cache per chat count, plus a key that hits and one that misses.
+/// One warm cache per chat count, plus the probe sets that hit and miss it.
 fn fixture(count: usize) -> &'static Probed {
     static BUILT: OnceLock<Vec<Probed>> = OnceLock::new();
     let built = BUILT.get_or_init(|| {
@@ -111,8 +123,8 @@ fn fixture(count: usize) -> &'static Probed {
                 });
                 Probed {
                     cache,
-                    hit: chat_jid(n / 2),
-                    miss: Jid::pn("5511000000000"),
+                    hits: (0..n).map(chat_jid).collect(),
+                    misses: (0..n).map(absent_jid).collect(),
                 }
             })
             .collect()
@@ -123,11 +135,12 @@ fn fixture(count: usize) -> &'static Probed {
 /// The per-message path: an existing chat resolves its lane.
 #[divan::bench(args = CHAT_COUNTS)]
 fn bench_chat_lane_get_hit(bencher: divan::Bencher, count: usize) {
-    let Probed { cache, hit, .. } = fixture(count);
+    let Probed { cache, hits, .. } = fixture(count);
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
         let mut found = 0usize;
-        for _ in 0..BATCH {
-            found += block_on(cache.get(black_box(hit))).is_some() as usize;
+        for i in 0..BATCH {
+            let key = &hits[i % hits.len()];
+            found += block_on(cache.get(black_box(key))).is_some() as usize;
         }
         black_box(found)
     });
@@ -136,11 +149,12 @@ fn bench_chat_lane_get_hit(bencher: divan::Bencher, count: usize) {
 /// First message from a chat: the lookup misses and a lane has to be created.
 #[divan::bench(args = CHAT_COUNTS)]
 fn bench_chat_lane_get_miss(bencher: divan::Bencher, count: usize) {
-    let Probed { cache, miss, .. } = fixture(count);
+    let Probed { cache, misses, .. } = fixture(count);
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
         let mut absent = 0usize;
-        for _ in 0..BATCH {
-            absent += block_on(cache.get(black_box(miss))).is_none() as usize;
+        for i in 0..BATCH {
+            let key = &misses[i % misses.len()];
+            absent += block_on(cache.get(black_box(key))).is_none() as usize;
         }
         black_box(absent)
     });
