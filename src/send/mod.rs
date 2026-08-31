@@ -1077,7 +1077,6 @@ impl Client {
         #[cfg(feature = "tracing")]
         self.record_identity_on_span(&tracing::Span::current());
 
-        let to = canonical_user_server(to);
         validate_extra_stanza_nodes(&options.extra_stanza_nodes)?;
         if options.message_id.as_ref().is_some_and(String::is_empty) {
             return Err(SendError::InvalidRequest(
@@ -2025,7 +2024,6 @@ impl Client {
             device_freshness,
             borrowed_message_id,
         } = options;
-        let to = canonical_user_server(to);
         // Callers that already stamped their message hand the instant down; the
         // rest sample here so the pipeline below still has exactly one.
         let sent_at = sent_at.unwrap_or_else(SendInstant::now);
@@ -2959,28 +2957,9 @@ pub(crate) fn is_self_dm_recipient(
 ) -> bool {
     match recipient_bare.server {
         Server::Lid => own_lid.is_some_and(|lid| recipient_bare.user == lid.user),
-        // `Legacy` alongside `Pn` for the same reason `canonical_user_server`
-        // exists: both name a phone user, and reading one as "not me" sends a
-        // note to self down the third-party path.
-        Server::Pn | Server::Legacy => recipient_bare.user == own_pn.user,
+        Server::Pn => recipient_bare.user == own_pn.user,
         _ => false,
     }
-}
-
-/// `@c.us` is not a namespace of its own: it is what WA Web calls a phone user
-/// in memory, mapped to `s.whatsapp.net` only when a wid is serialized
-/// (`WAWebWid`: `this.server==="c.us"?"s.whatsapp.net":this.server`). We take
-/// `Server::Pn` as the canonical spelling instead, so a `to` that arrives the
-/// other way is rewritten here rather than travelling the send path as a
-/// namespace nothing recognises: `is_pn()` is false for it, so it misses the
-/// self-chat check, the PN-to-LID usync, the LID resolution and, worst, the
-/// pre-key fetch, whose response is matched back by whole-`Jid` equality and
-/// so reports every bundle the server did return as absent.
-pub(crate) fn canonical_user_server(mut jid: Jid) -> Jid {
-    if jid.server == Server::Legacy {
-        jid.server = Server::Pn;
-    }
-    jid
 }
 
 /// The outer `<message to>`, the DeviceSentMessage destinationJid, and the
@@ -4617,45 +4596,28 @@ mod tests {
         assert!(is_self_dm_recipient(&recipient, &own_pn, None));
     }
 
-    /// A note to self addressed in the legacy namespace is still a note to
-    /// self. Read as a third party it takes the recipient path and asks the
-    /// server for our own pre-key bundles, which is the shape the reporter of
-    /// #1361 saw on every failing send.
+    /// A note to self addressed in the legacy spelling is still a note to self.
+    /// Read as a third party it takes the recipient path and asks the server
+    /// for our own pre-key bundles, which is the shape the reporter of #1361
+    /// saw on every failing send. Nothing here special-cases the spelling any
+    /// more: parsing resolves it to the phone namespace, and this asserts the
+    /// resolution actually reaches the check.
     #[test]
     fn self_dm_legacy_recipient_matches_own_pn() {
         let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
         let own_lid = Jid::lid_device(SELF_LID, SELF_DEVICE);
-        let recipient = Jid::new(SELF_PN, Server::Legacy);
+        let recipient: Jid = format!("{SELF_PN}@c.us").parse().unwrap();
 
+        assert_eq!(recipient.server, Server::Pn);
         assert!(is_self_dm_recipient(&recipient, &own_pn, Some(&own_lid)));
     }
 
     #[test]
     fn non_self_legacy_recipient_is_not_self_dm() {
         let own_pn = Jid::pn_device(SELF_PN, SELF_DEVICE);
-        let recipient = Jid::new(OTHER_PN, Server::Legacy);
+        let recipient: Jid = format!("{OTHER_PN}@c.us").parse().unwrap();
 
         assert!(!is_self_dm_recipient(&recipient, &own_pn, None));
-    }
-
-    /// `Legacy` is a spelling of the phone-user namespace, not a namespace of
-    /// its own, and only that one is rewritten: nothing else may be quietly
-    /// re-pointed at a different server.
-    #[test]
-    fn canonical_user_server_rewrites_only_legacy() {
-        assert_eq!(
-            canonical_user_server(Jid::new(OTHER_PN, Server::Legacy).with_device(3)),
-            Jid::pn_device(OTHER_PN, 3),
-            "the device survives the rewrite"
-        );
-        for untouched in [
-            Jid::pn(OTHER_PN),
-            Jid::lid(OTHER_LID),
-            Jid::group("120363000000000000"),
-            Jid::status_broadcast(),
-        ] {
-            assert_eq!(canonical_user_server(untouched.clone()), untouched);
-        }
     }
 
     #[test]
@@ -7548,16 +7510,16 @@ mod tests {
         );
     }
 
-    /// `@c.us` is the namespace WA Web keeps a phone user in; a caller that
-    /// spells a recipient that way is naming a PN user, and the send must treat
-    /// it as one. Left alone it misses `is_pn()` everywhere that matters, most
-    /// damagingly in the pre-key fetch, whose response is matched back by whole
-    /// jid and so reports every bundle as absent.
+    /// `@c.us` is a spelling of the phone namespace; a caller that names a
+    /// recipient that way is naming a PN user, and the send must treat it as
+    /// one end to end. Left alone it misses `is_pn()` everywhere that matters,
+    /// most damagingly in the pre-key fetch, whose response is matched back by
+    /// whole jid and so reports every bundle as absent.
     #[tokio::test]
     async fn a_legacy_namespace_recipient_is_sent_as_a_phone_user() {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
         let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
-        let legacy = Jid::new(peer_pn.user.as_str(), Server::Legacy);
+        let legacy: Jid = format!("{}@c.us", peer_pn.user).parse().unwrap();
 
         let message_id = "LEGACYNSDM1";
         client
@@ -7579,9 +7541,9 @@ mod tests {
             .attrs()
             .optional_jid("to")
             .expect("the stanza names its chat");
-        assert_ne!(
+        assert_eq!(
             to.server,
-            Server::Legacy,
+            Server::Pn,
             "the legacy spelling must not reach the wire: {to}"
         );
         assert_eq!(to.user, peer_pn.user, "and it must still be the same user");

@@ -993,6 +993,52 @@ mod tests {
         }
     }
 
+    /// The legacy spelling must not reach the wire by any encoding path, not
+    /// just the message send. `write_jid_owned`/`write_jid_ref` write
+    /// `server.as_str()` for a JID_PAIR with no guard, and `c.us` is not in the
+    /// token dictionary (`s.whatsapp.net` is), so emitting it would put a raw
+    /// string on the wire where WA Web sends a token -- and a server spelling
+    /// WA Web never sends at all, since its whole JID layer (`WAJids`) knows
+    /// only `s.whatsapp.net`. There is no guard because there is nothing left
+    /// to guard against: no `Server` renders it. This holds the bytes to that.
+    #[test]
+    fn the_legacy_spelling_never_reaches_the_wire() -> TestResult {
+        use crate::jid::{Jid, parse_jid_ref};
+
+        fn encode(jid: &Jid) -> Result<Vec<u8>> {
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_jid_owned(jid)?;
+            Ok(buffer)
+        }
+
+        for (legacy, modern) in [
+            ("5511999998888@c.us", "5511999998888@s.whatsapp.net"),
+            // AD_JID form: same domain byte, so the bytes match there too.
+            ("5511999998888:3@c.us", "5511999998888:3@s.whatsapp.net"),
+            // A dotted agent is inert on a phone user and encodes nothing.
+            ("5511999998888.2@c.us", "5511999998888@s.whatsapp.net"),
+        ] {
+            let legacy: Jid = legacy.parse().unwrap();
+            let modern: Jid = modern.parse().unwrap();
+            let bytes = encode(&legacy)?;
+            assert_eq!(bytes, encode(&modern)?, "{legacy} must encode as {modern}");
+            assert!(
+                !bytes.windows(4).any(|w| w == b"c.us"),
+                "{legacy} put the legacy spelling on the wire: {bytes:?}"
+            );
+
+            // The borrowed writer is a separate copy of the same branch.
+            let rendered = legacy.to_string();
+            let borrowed = parse_jid_ref(&rendered).unwrap();
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_jid_ref(&borrowed)?;
+            assert_eq!(buffer, bytes);
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_encode_node() -> TestResult {
         let node = Node::new(

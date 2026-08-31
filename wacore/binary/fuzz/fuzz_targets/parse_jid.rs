@@ -21,7 +21,7 @@
 use libfuzzer_sys::fuzz_target;
 use wacore_binary::jid::{Jid, Server, parse_jid_fast, parse_jid_ref};
 
-const SERVERS: [Server; 12] = [
+const SERVERS: [Server; 11] = [
     Server::Pn,
     Server::Lid,
     Server::Group,
@@ -32,7 +32,6 @@ const SERVERS: [Server; 12] = [
     Server::Messenger,
     Server::Interop,
     Server::Bot,
-    Server::Legacy,
     Server::Call,
 ];
 

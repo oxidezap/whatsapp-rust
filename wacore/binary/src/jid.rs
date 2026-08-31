@@ -79,8 +79,7 @@ fn parse_jid_scan(s: &str) -> Option<(ParsedJidParts<'_>, Option<Server>)> {
                 break;
             }
             b':' => colon_pos = Some(i),
-            // Dots after the first colon belong to the device, not the agent.
-            b'.' if colon_pos.is_none() => last_dot_pos = Some(i),
+            b'.' => last_dot_pos = Some(i),
             _ => {}
         }
     }
@@ -112,65 +111,36 @@ fn parse_jid_scan(s: &str) -> Option<(ParsedJidParts<'_>, Option<Server>)> {
                 server,
             ))
         }
-        // `s.whatsapp.net` has no agent in the string form; a trailing dotted
-        // number is the legacy device spelling.
-        Some(Server::Pn) => {
-            if let Some(pos) = colon_pos {
-                return Some((
-                    ParsedJidParts {
-                        user: &s[..pos],
-                        server: server_str,
-                        agent: 0,
-                        device: parse_u16_decimal(&s[pos + 1..at]).unwrap_or(0),
-                        integrator: 0,
-                    },
-                    server,
-                ));
-            }
-            if let Some(dot_pos) = last_dot_pos
-                && let Some(device_val) = parse_u16_decimal(&s[dot_pos + 1..at])
-            {
-                return Some((
-                    ParsedJidParts {
-                        user: &s[..dot_pos],
-                        server: server_str,
-                        agent: 0,
-                        device: device_val,
-                        integrator: 0,
-                    },
-                    server,
-                ));
-            }
-            Some((
-                ParsedJidParts {
-                    user: user_part,
-                    server: server_str,
-                    agent: 0,
-                    device: 0,
-                    integrator: 0,
-                },
-                server,
-            ))
-        }
-        // Everything else (including unknown servers): `user.agent:device`.
+        // Everything else, phone users included (and unknown servers):
+        // `user.agent:device`. The dot is the agent position on every server WA
+        // Web parses -- `WAJids.parseJidParts` splits `:` then `.` with no
+        // per-server carve-out, `fullFormDeviceJidString` writes it back as
+        // `user.<agent>:<device>@server`, and `stripAgentIdFromPhoneDeviceJid`
+        // exists precisely to drop it off a phone user. It is never a device
+        // there: the device only ever follows a colon. On the phone namespace
+        // the agent is inert (`renders_agent`), so a JID that carries one is
+        // still the same identity as the bare user, which is what makes reading
+        // it here safe rather than merely faithful.
         _ => {
             let (user_before_colon, device) = match colon_pos {
                 Some(pos) => (&s[..pos], parse_u16_decimal(&s[pos + 1..at]).unwrap_or(0)),
                 None => (user_part, 0),
             };
-            // Deliberately `rfind` on the pre-colon slice rather than reusing
-            // `last_dot_pos`: the two differ for pathological users that hold a
-            // second colon (`a:1.5:2`), and this branch is cold enough that
-            // matching the historical rule is worth the extra scan.
-            let (final_user, agent) = match user_before_colon.rfind('.') {
-                Some(dot_pos) => match parse_u16_decimal(&user_before_colon[dot_pos + 1..]) {
-                    Some(agent_val) if agent_val <= u8::MAX as u16 => {
-                        (&user_before_colon[..dot_pos], agent_val as u8)
-                    }
-                    _ => (user_before_colon, 0),
-                },
-                None => (user_before_colon, 0),
-            };
+            // The scan already found the last dot, so this needs no second
+            // pass -- but only a dot *before* the device separator is the
+            // agent, which is what the bound rules out. The two readings differ
+            // for a pathological user holding a second colon (`a:1.5:2`), and
+            // the pre-colon one is what the agent rule means.
+            let (final_user, agent) =
+                match last_dot_pos.filter(|&dot_pos| dot_pos < user_before_colon.len()) {
+                    Some(dot_pos) => match parse_u16_decimal(&user_before_colon[dot_pos + 1..]) {
+                        Some(agent_val) if agent_val <= u8::MAX as u16 => {
+                            (&user_before_colon[..dot_pos], agent_val as u8)
+                        }
+                        _ => (user_before_colon, 0),
+                    },
+                    None => (user_before_colon, 0),
+                };
             Some((
                 ParsedJidParts {
                     user: final_user,
@@ -221,7 +191,9 @@ pub enum Server {
     Messenger = 7,
     Interop = 8,
     Bot = 9,
-    Legacy = 10,
+    // 10 was the legacy `c.us` spelling of `Pn`, which `parse_known` now
+    // resolves. The gap is left rather than closed so no existing discriminant
+    // changes meaning.
     /// `@call` call-signaling JID; not an AD server, so it round-trips via JID_PAIR.
     Call = 11,
 }
@@ -285,7 +257,6 @@ impl Server {
             Self::Messenger => "msgr",
             Self::Interop => "interop",
             Self::Bot => "bot",
-            Self::Legacy => "c.us",
             Self::Call => "call",
         }
     }
@@ -322,7 +293,7 @@ impl Server {
     pub fn carries_phone_number(self) -> bool {
         matches!(
             self,
-            Self::Pn | Self::Hosted | Self::Legacy | Self::Messenger | Self::Interop
+            Self::Pn | Self::Hosted | Self::Messenger | Self::Interop
         )
     }
 }
@@ -363,7 +334,17 @@ impl Server {
             "msgr" => Self::Messenger,
             "interop" => Self::Interop,
             "bot" => Self::Bot,
-            "c.us" => Self::Legacy,
+            // `c.us` is not a namespace: it is the other spelling of the phone
+            // namespace, collapsed here so it cannot exist past parsing. WA Web
+            // collapses the same way and in the same place -- `createWid` does
+            // `t.replace("@s.whatsapp.net","@c.us")` before the constructor runs
+            // and caches under the collapsed key, so the two spellings can never
+            // reach two objects, two cache entries or two comparisons. This is
+            // the sole converter behind text (`FromStr`), the wire
+            // (`read_jid_pair`) and serde, so collapsing it here covers all
+            // three, and `Server` then has no variant that could render `c.us`
+            // back out.
+            "c.us" => Self::Pn,
             "call" => Self::Call,
             _ => return None,
         })
@@ -463,11 +444,11 @@ pub trait JidExt {
         self.server() == Server::Broadcast && self.user() == STATUS_BROADCAST_USER
     }
 
-    /// The system/announcements account (`0@s.whatsapp.net` / `0@c.us`).
+    /// The system/announcements account (`0@s.whatsapp.net`, however spelled).
     /// It never answers user-directed IQs, so requests must be short-circuited
     /// client-side (WA Web excludes it via `isPSA` before hitting the server).
     fn is_psa(&self) -> bool {
-        matches!(self.server(), Server::Pn | Server::Legacy) && self.user() == PSA_USER
+        self.server() == Server::Pn && self.user() == PSA_USER
     }
 
     fn is_bot(&self) -> bool {
@@ -504,6 +485,9 @@ pub trait JidExt {
 /// encodes an agent set there (`server_to_domain_type`), nothing prints it
 /// (`renders_agent`), and nothing hashes it (`push_phash_form_to` writes a literal `0`,
 /// matching WA Web). Two JIDs differing only there address the same device.
+/// A phone user parsed from `user.<n>@...` lands here: WA Web reads that
+/// position as the agent too and drops it (`stripAgentIdFromPhoneDeviceJid`),
+/// and this is what makes keeping it inert equivalent to dropping it.
 ///
 /// Letting it into equality anyway is what made a JID decoded from the wire
 /// unequal to the same JID read back from the store, which holds JIDs as text
@@ -1033,8 +1017,10 @@ impl FromStr for Jid {
             device = d_str.parse()?;
         }
 
-        if server != DEFAULT_USER_SERVER
-            && server != HIDDEN_USER_SERVER
+        // No phone-namespace carve-out: the dot is the agent position on every
+        // server this reaches, matching `parse_jid_scan` and WA Web. See the
+        // generic arm there.
+        if server != HIDDEN_USER_SERVER
             && let Some((u, last_part)) = user.rsplit_once('.')
             && let Ok(num_val) = last_part.parse::<u16>()
         {
@@ -1372,6 +1358,163 @@ impl TryFrom<String> for Jid {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// The regression the whole change is for, and the one a naive fix does not
+    /// pass. Relaxing `==` alone -- teaching it that the two spellings of the
+    /// phone namespace are one -- still leaves the two sides classified
+    /// differently by `identity_agent`, because the legacy spelling was not in
+    /// the set of servers that suppress the agent. Two JIDs equal in everything
+    /// but the spelling would then compare unequal whenever the agent is
+    /// non-zero, which is rare enough to pass CI and show up only on odd input
+    /// off the wire. Collapsing at the parser instead means there is no second
+    /// classification to get wrong.
+    #[test]
+    fn the_two_spellings_agree_when_the_agent_is_not_zero() {
+        let legacy: Jid = "12345678901.6@c.us".parse().unwrap();
+        let modern: Jid = "12345678901.6@s.whatsapp.net".parse().unwrap();
+
+        assert_eq!(legacy.agent, 6, "the dotted number is read, not discarded");
+        assert_eq!(legacy.device, 0, "and it is not a device");
+        assert_eq!(legacy, modern);
+        assert_eq!(hash_of(&legacy), hash_of(&modern));
+        // ...and both are the same identity as the bare user, since the agent
+        // is inert on the phone namespace.
+        assert_eq!(legacy, "12345678901@s.whatsapp.net".parse::<Jid>().unwrap());
+        assert_eq!(legacy.to_string(), "12345678901@s.whatsapp.net");
+    }
+
+    /// The dotted position on a phone user is the agent, not a device. WA Web's
+    /// `WAJids.parseJidParts` splits `user:device` then `user.agent` with no
+    /// per-server branch, `fullFormDeviceJidString` writes it back as
+    /// `user.<agent>:<device>@server`, and `stripAgentIdFromPhoneDeviceJid`
+    /// drops it; its `Wid` layer has no agent field at all and accepts only a
+    /// literal `.0` there. Reading it as a device -- which this parser did --
+    /// turned a bare user into a request addressed at device N.
+    #[test]
+    fn a_dotted_number_on_a_phone_user_is_the_inert_agent() {
+        let dotted: Jid = "5511999998888.2@s.whatsapp.net".parse().unwrap();
+        assert_eq!(dotted.user, "5511999998888");
+        assert_eq!(dotted.agent, 2);
+        assert_eq!(dotted.device, 0, "a device only ever follows a colon");
+        assert_eq!(dotted, Jid::pn("5511999998888"));
+
+        // The colon still is the device, and the two positions compose.
+        let both: Jid = "5511999998888.2:3@s.whatsapp.net".parse().unwrap();
+        assert_eq!(
+            (both.user.as_str(), both.agent, both.device),
+            ("5511999998888", 2, 3)
+        );
+        assert_eq!(both, Jid::pn_device("5511999998888", 3));
+        assert_ne!(both, dotted);
+
+        // The shape WA Web actually writes, `formatFull`'s `user.0:device`.
+        // The old phone-namespace carve-out returned early on the colon and
+        // never looked at the dot, so the `.0` stayed inside `user` and the
+        // result was not equal to the same device addressed without it.
+        let full: Jid = "5511999998888.0:3@s.whatsapp.net".parse().unwrap();
+        assert_eq!(
+            full.user, "5511999998888",
+            "the agent is not part of the user"
+        );
+        assert_eq!(full, Jid::pn_device("5511999998888", 3));
+        assert_eq!(full.to_string(), "5511999998888:3@s.whatsapp.net");
+    }
+
+    /// Text, wire and serde all resolve the server through `Server::parse_known`,
+    /// so the collapse has to hold for all three -- and none of them may
+    /// materialise the legacy spelling internally, because a `Server` that could
+    /// render it is a `Server` that could reach the wire.
+    #[test]
+    fn every_input_direction_collapses_the_legacy_spelling() {
+        let expected = Jid::pn("5511999998888");
+
+        // Text, both parsers.
+        assert_eq!("5511999998888@c.us".parse::<Jid>().unwrap(), expected);
+        assert_eq!(
+            parse_jid_ref("5511999998888@c.us").unwrap().to_owned(),
+            expected
+        );
+        // The fallback path (an empty user forces it) resolves it too.
+        assert_eq!("@c.us".parse::<Jid>().unwrap().server, Server::Pn);
+
+        // Wire: `read_jid_pair` classifies the server string with the same
+        // converter, so a JID_PAIR naming `c.us` decodes as a phone user.
+        assert_eq!(Server::try_from("c.us").unwrap(), Server::Pn);
+
+        // No spelling of the enum renders it back out.
+        for server in [
+            Server::Pn,
+            Server::Lid,
+            Server::Group,
+            Server::Broadcast,
+            Server::Newsletter,
+            Server::Hosted,
+            Server::HostedLid,
+            Server::Messenger,
+            Server::Interop,
+            Server::Bot,
+            Server::Call,
+        ] {
+            assert_ne!(
+                server.as_str(),
+                LEGACY_USER_SERVER,
+                "{server:?} must not render the legacy spelling"
+            );
+        }
+        assert_eq!(expected.to_string(), "5511999998888@s.whatsapp.net");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_collapses_the_legacy_spelling_too() {
+        let server: Server = serde_json::from_str("\"c.us\"").unwrap();
+        assert_eq!(server, Server::Pn);
+        assert_eq!(
+            serde_json::to_string(&server).unwrap(),
+            "\"s.whatsapp.net\""
+        );
+
+        let jid: Jid = serde_json::from_str(
+            r#"{"user":"5511999998888","server":"c.us","agent":0,"device":0,"integrator":0}"#,
+        )
+        .unwrap();
+        assert_eq!(jid, Jid::pn("5511999998888"));
+
+        // A server that is not a spelling of anything still fails.
+        assert!(serde_json::from_str::<Server>("\"nope\"").is_err());
+    }
+
+    /// A JID's identity must not depend on which spelling it arrived as, in any
+    /// of the derived keys built over it.
+    #[test]
+    fn the_two_spellings_share_every_derived_key() {
+        let legacy: Jid = "5511999998888:3@c.us".parse().unwrap();
+        let modern: Jid = "5511999998888:3@s.whatsapp.net".parse().unwrap();
+
+        assert_eq!(legacy, modern);
+        assert_eq!(hash_of(&legacy), hash_of(&modern));
+        assert_eq!(legacy.device_key(), modern.device_key());
+        assert!(legacy.is_same_chat_as(&modern));
+        assert!(legacy.device_eq(&modern));
+        assert!(legacy.display_eq_jid(&modern));
+        assert_eq!(legacy.to_string(), modern.to_string());
+        assert_eq!(legacy.to_non_ad_string(), modern.to_non_ad_string());
+        assert_eq!(legacy.to_phash_form_string(), modern.to_phash_form_string());
+        assert!(legacy.is_pn(), "a phone user however it is spelled");
+
+        // And a single map entry, which is the failure the batch is named for.
+        let mut map = std::collections::HashMap::new();
+        map.insert(legacy.clone(), ());
+        assert!(map.contains_key(&modern), "one person, one entry");
+    }
+
+    /// One fixed-key hasher, so two calls are comparable at all.
+    fn hash_of(jid: &Jid) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        jid.hash(&mut hasher);
+        hasher.finish()
+    }
 
     #[test]
     fn is_psa_matches_system_jid_in_both_user_namespaces() {
@@ -1858,17 +2001,20 @@ mod tests {
             ("123456789.4@interop", "123456789", 4, 0),
             // ...but an agent past u8 leaves the user whole instead.
             ("123.999@interop", "123.999", 0, 0),
-            // On s.whatsapp.net that same trailing number is the legacy device.
-            ("5511999998888.2@s.whatsapp.net", "5511999998888", 0, 2),
+            // s.whatsapp.net reads it the same way, as the agent. WA Web's
+            // `parseJidParts` splits `.` into `agent` with no per-server
+            // carve-out and the device only ever follows a colon; see
+            // `a_dotted_number_on_a_phone_user_is_the_inert_agent`.
+            ("5511999998888.2@s.whatsapp.net", "5511999998888", 2, 0),
             // Dots in a lid user are part of the user.
             ("12345.678@lid", "12345.678", 0, 0),
             ("12345.678:9@lid", "12345.678", 0, 9),
-            // `hosted.lid` and `c.us` are NOT in the lid family here — they take
-            // the generic rule, so a dotted number that fits in u8 becomes the
-            // agent. Pinned as the pre-existing behaviour, not endorsed as
-            // correct; changing it needs WA Web as ground truth, not this PR.
+            // `hosted.lid` is NOT in the lid family here — it takes the generic
+            // rule, so a dotted number that fits in u8 becomes the agent.
             ("12345.6@hosted.lid", "12345", 6, 0),
             ("12345.678@hosted.lid", "12345.678", 0, 0),
+            // ...and so does the legacy spelling of the phone namespace, which
+            // by then is the phone namespace.
             ("12345.6@c.us", "12345", 6, 0),
             // A second colon puts the last dot after the first one, which is
             // where reusing the scanned dot position would silently diverge.
@@ -2612,7 +2758,7 @@ mod tests {
             // Short user
             Case {
                 user: "1",
-                server: Server::Legacy,
+                server: Server::Call,
                 agent: 0,
                 device: 1,
             },

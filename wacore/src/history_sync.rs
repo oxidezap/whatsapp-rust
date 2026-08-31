@@ -774,8 +774,8 @@ fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySy
 ///
 /// Parsing is left to `parse_jid_ref` rather than split by hand: it borrows
 /// (no allocation for the entries we discard) and it already knows the forms
-/// this field can take — the legacy `@c.us` spelling of the phone namespace,
-/// and both device suffixes, `user:3` and the legacy dotted `user.3`.
+/// this field can take, the legacy `@c.us` spelling included — it resolves that
+/// to the phone namespace, so nothing here has to name it.
 fn pushname_id_is(id: &str, own_user: &str) -> bool {
     if !id.contains('@') {
         // Pre-JID bare form, still accepted.
@@ -784,8 +784,7 @@ fn pushname_id_is(id: &str, own_user: &str) -> bool {
     let Some(jid) = wacore_binary::jid::parse_jid_ref(id) else {
         return false;
     };
-    (jid.server.is_pn_family() || jid.server == wacore_binary::jid::Server::Legacy)
-        && &*jid.user == own_user
+    jid.server.is_pn_family() && &*jid.user == own_user
 }
 
 /// History sync's placeholder for an entry that carries no push name. It is a
@@ -1015,16 +1014,16 @@ fn history_lid_mapping(
     lid_raw: &str,
     source: HistoryLidMappingSource,
 ) -> Option<HistoryLidMapping> {
-    use wacore_binary::{Jid, Server};
+    use wacore_binary::Jid;
 
     let pn: Jid = pn_raw.parse().ok()?;
     let lid: Jid = lid_raw.parse().ok()?;
     // Family predicates, not the exact-server ones: `@hosted` and `@hosted.lid`
     // are the PN and LID namespaces for hosted accounts, and the mapping and
-    // Signal-address code elsewhere already treats them as such. Legacy `@c.us`
-    // is the PN namespace under its old name (whatsmeow maps it to
-    // `@s.whatsapp.net` the same way); the user part is the phone either way.
-    if !(pn.server.is_pn_family() || pn.server == Server::Legacy) || !lid.server.is_lid_family() {
+    // Signal-address code elsewhere already treats them as such. The legacy
+    // `@c.us` spelling needs no arm of its own: it parses as the phone
+    // namespace.
+    if !pn.server.is_pn_family() || !lid.server.is_lid_family() {
         return None;
     }
     if pn.user_base().is_empty() || lid.user_base().is_empty() {
@@ -2079,9 +2078,7 @@ where
     let pn_jid = pn_jid.or_else(|| {
         chat_jid
             .as_ref()
-            .filter(|jid| {
-                jid.server.is_pn_family() || jid.server == wacore_binary::jid::Server::Legacy
-            })
+            .filter(|jid| jid.server.is_pn_family())
             .map(|_| chat_id)
     });
     let lid_jid = lid_jid.or_else(|| {

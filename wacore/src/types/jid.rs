@@ -264,6 +264,56 @@ mod tests {
         assert_eq!(jid.to_signal_address_string(), "15550000001@c.us");
     }
 
+    /// The Signal address is a stored key: every session, identity and sender
+    /// key ever written is filed under it, so a byte that moves here invalidates
+    /// them. It is built from `mapped_server`, not from `Server::as_str`, and
+    /// that is why collapsing the legacy spelling into the phone namespace does
+    /// not touch it -- both spellings produced `@c.us` before and both produce
+    /// `@c.us` now, for the bare user and the device form alike.
+    #[test]
+    fn the_signal_address_is_the_same_for_both_spellings() {
+        for (legacy, modern, expected) in [
+            (
+                "15550000001@c.us",
+                "15550000001@s.whatsapp.net",
+                "15550000001@c.us",
+            ),
+            (
+                "15550000001:33@c.us",
+                "15550000001:33@s.whatsapp.net",
+                "15550000001:33@c.us",
+            ),
+            // A dotted agent is inert on a phone user and stays out of the
+            // address, so a session is not filed twice.
+            (
+                "15550000001.2:33@c.us",
+                "15550000001:33@s.whatsapp.net",
+                "15550000001:33@c.us",
+            ),
+        ] {
+            let legacy = Jid::from_str(legacy).unwrap();
+            let modern = Jid::from_str(modern).unwrap();
+            assert_eq!(legacy.to_signal_address_string(), expected);
+            assert_eq!(modern.to_signal_address_string(), expected);
+            assert_eq!(
+                legacy.to_protocol_address_string(),
+                modern.to_protocol_address_string()
+            );
+            assert_eq!(
+                make_sender_key_name_for_jid(&Jid::group("120363000000000000"), &legacy),
+                make_sender_key_name_for_jid(&Jid::group("120363000000000000"), &modern)
+            );
+        }
+
+        // A LID address is untouched by any of this.
+        assert_eq!(
+            Jid::from_str("123456789@lid")
+                .unwrap()
+                .to_signal_address_string(),
+            "123456789@lid"
+        );
+    }
+
     #[test]
     fn test_protocol_address_format() {
         let jid = Jid::from_str("123456789:33@lid").unwrap();

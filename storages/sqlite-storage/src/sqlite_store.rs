@@ -4094,6 +4094,114 @@ mod tests {
             .expect("Failed to create test store")
     }
 
+    /// The legacy-spelling normalisation, run against the migration file itself
+    /// so the SQL under test cannot drift from the SQL that ships.
+    ///
+    /// Two halves matter equally: the JID-rendered keys move, and the Signal
+    /// address columns do not. `@c.us` is the correct, current spelling of a
+    /// Signal address (it is what WA Web uses, and `mapped_server` still writes
+    /// it), so rewriting one would orphan every established session -- the
+    /// opposite of what this migration is for.
+    #[tokio::test]
+    async fn the_normalisation_migration_moves_jids_and_leaves_signal_addresses() {
+        use diesel::connection::SimpleConnection;
+
+        const NORMALISE: &str =
+            include_str!("../migrations/2026-08-31-000000_normalize_legacy_user_server/up.sql");
+
+        let store = create_test_store().await;
+        let pool = store.pool.clone();
+        let mut conn = pool.get().expect("a connection");
+
+        conn.batch_execute(
+            "INSERT INTO tc_tokens (jid, token, token_timestamp, device_id, updated_at)
+                  VALUES ('15550000001@c.us', x'01', 0, 1, 0),
+                         ('15550000002@s.whatsapp.net', x'02', 0, 1, 0),
+                         ('120363000000000000@g.us', x'03', 0, 1, 0);
+             INSERT INTO sent_messages (chat_jid, message_id, payload, device_id, created_at)
+                  VALUES ('15550000001@c.us', 'M1', x'01', 1, 0);
+             INSERT INTO device_registry (user_id, devices_json, timestamp, device_id, updated_at)
+                  VALUES ('15550000001@c.us', '[]', 0, 1, 0);
+             INSERT INTO sessions (address, record, device_id)
+                  VALUES ('15550000001@c.us.0', x'01', 1);
+             INSERT INTO sender_keys (address, record, device_id)
+                  VALUES ('120363000000000000@g.us:15550000001@c.us.0', x'01', 1);",
+        )
+        .expect("seed rows");
+
+        conn.batch_execute(NORMALISE).expect("the migration runs");
+
+        let scalar = |conn: &mut _, sql: &str| -> String {
+            diesel::dsl::sql::<diesel::sql_types::Text>(sql)
+                .get_result::<String>(conn)
+                .expect("one row")
+        };
+
+        assert_eq!(
+            scalar(&mut *conn, "SELECT jid FROM tc_tokens WHERE token = x'01'"),
+            "15550000001@s.whatsapp.net"
+        );
+        assert_eq!(
+            scalar(&mut *conn, "SELECT chat_jid FROM sent_messages"),
+            "15550000001@s.whatsapp.net"
+        );
+        assert_eq!(
+            scalar(&mut *conn, "SELECT user_id FROM device_registry"),
+            "15550000001@s.whatsapp.net"
+        );
+        // Untouched: a group is not in this namespace, and one already spelled
+        // the modern way must not be double-rewritten.
+        assert_eq!(
+            scalar(&mut *conn, "SELECT jid FROM tc_tokens WHERE token = x'02'"),
+            "15550000002@s.whatsapp.net"
+        );
+        assert_eq!(
+            scalar(&mut *conn, "SELECT jid FROM tc_tokens WHERE token = x'03'"),
+            "120363000000000000@g.us"
+        );
+        // The Signal addresses, both the plain one and the one that carries an
+        // address in the middle of a longer key.
+        assert_eq!(
+            scalar(&mut *conn, "SELECT address FROM sessions"),
+            "15550000001@c.us.0"
+        );
+        assert_eq!(
+            scalar(&mut *conn, "SELECT address FROM sender_keys"),
+            "120363000000000000@g.us:15550000001@c.us.0"
+        );
+    }
+
+    /// Both spellings of one peer collide on the primary key when the legacy one
+    /// is rewritten. `UPDATE OR REPLACE` has to resolve that rather than abort
+    /// the migration, which would leave the database unopenable.
+    #[tokio::test]
+    async fn the_normalisation_migration_survives_a_duplicated_peer() {
+        use diesel::connection::SimpleConnection;
+
+        const NORMALISE: &str =
+            include_str!("../migrations/2026-08-31-000000_normalize_legacy_user_server/up.sql");
+
+        let store = create_test_store().await;
+        let mut conn = store.pool.get().expect("a connection");
+
+        conn.batch_execute(
+            "INSERT INTO tc_tokens (jid, token, token_timestamp, device_id, updated_at)
+                  VALUES ('15550000001@c.us', x'01', 0, 1, 0),
+                         ('15550000001@s.whatsapp.net', x'02', 0, 1, 0);",
+        )
+        .expect("seed both spellings of one peer");
+
+        conn.batch_execute(NORMALISE)
+            .expect("a duplicate must not abort the migration");
+
+        let rows: i64 = diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "SELECT count(*) FROM tc_tokens WHERE jid = '15550000001@s.whatsapp.net'",
+        )
+        .get_result(&mut *conn)
+        .expect("one row");
+        assert_eq!(rows, 1, "one peer, one row");
+    }
+
     /// `delete_version` is how a rebuild is expressed, so what it does to a row
     /// that is not there, and to another device's row, is load-bearing.
     #[tokio::test]
