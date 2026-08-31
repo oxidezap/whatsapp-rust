@@ -60,6 +60,19 @@ impl Default for HashState {
     }
 }
 
+/// What a fold actually did, as opposed to what it was handed.
+///
+/// Returned rather than recomputed by callers: the fold's eligibility rule has
+/// already changed once, and a diagnostic that restates it is one that can
+/// disagree with the hash it is describing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldReport {
+    /// How many value MACs entered the ltHash.
+    pub folded: usize,
+    /// How many of those came from records carrying no index MAC.
+    pub unkeyed: usize,
+}
+
 impl HashState {
     /// Whether there is a real ltHash here to apply patches on top of.
     ///
@@ -222,14 +235,23 @@ impl HashState {
     /// a negative index there and folds the truncated buffer instead. Both are
     /// answers to a record the server should never send; ours refuses to fold
     /// something that is not a MAC.
-    /// Answers how many value MACs it folded, which is not `records.len()`: a
-    /// record whose value blob is too short to hold one is dropped, and a
-    /// repeated index contributes once. Diagnostics read it rather than
+    /// Answers what it folded rather than how many records it was given: a
+    /// record whose value blob is too short to hold a MAC is dropped, and a
+    /// repeated index contributes once. Diagnostics read this rather than
     /// restating the rule, which is how a count and a fold drift apart.
-    pub fn update_hash_from_records(&mut self, records: &[wa::SyncdRecord]) -> usize {
+    pub fn update_hash_from_records(&mut self, records: &[wa::SyncdRecord]) -> FoldReport {
         // Borrow the MAC tails; no Vec<u8> allocation per MAC.
         let mut added: Vec<&[u8]> = Vec::with_capacity(records.len());
         let mut indexed: Vec<(&[u8], &[u8])> = Vec::with_capacity(records.len());
+        // Counted here rather than recomputed by a caller, for the reason the
+        // fold reports its own total: this arm is a known divergence from WA
+        // Web, which keys every record through `hex(index.blob)` and so
+        // collapses records carrying no index into a single entry where this
+        // folds each of them. Harmless while at most one record is unkeyed,
+        // and a silent wrong ltHash the moment two are -- with a folded count
+        // that still equals the record count, which is exactly the shape a
+        // diagnostic has to be able to see.
+        let mut unkeyed = 0usize;
 
         for record in records {
             let Some(value_mac) = record
@@ -245,8 +267,13 @@ impl HashState {
             match record.index.as_option().and_then(|idx| idx.blob.as_deref()) {
                 // Keyed: the last record for this index is the one that counts.
                 Some(index_mac) => indexed.push((index_mac, value_mac)),
-                // Unkeyed records cannot collide, so they always fold.
-                None => added.push(value_mac),
+                // Unkeyed records cannot collide with a keyed one, so they
+                // always fold. Whether they collide with *each other* is the
+                // divergence noted above, and `unkeyed` is what says so.
+                None => {
+                    unkeyed += 1;
+                    added.push(value_mac)
+                }
             }
         }
 
@@ -276,7 +303,10 @@ impl HashState {
         }
 
         WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &[] as &[&[u8]], &added);
-        added.len()
+        FoldReport {
+            folded: added.len(),
+            unkeyed,
+        }
     }
 
     pub fn generate_snapshot_mac(&self, name: &str, key: &[u8]) -> Vec<u8> {
@@ -860,5 +890,48 @@ mod tests {
         WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut expected, &[] as &[&[u8]], &[MAC]);
 
         assert_eq!(state.hash, expected);
+    }
+
+    /// The fold says how many records reached it without an index, because
+    /// that arm is a known divergence from WA Web and the count that would
+    /// otherwise expose it does not: two unkeyed records fold twice here and
+    /// once there -- WA Web keys every record through `hex(index.blob)`, so
+    /// records carrying no index collapse into one entry -- while `folded`
+    /// still equals the number of records, which is what a snapshot MAC
+    /// mismatch looks like when nothing else is wrong.
+    ///
+    /// Pins the reporting rather than the divergence: correcting the fold to
+    /// match WA Web is a change to a live account's ltHash and wants evidence
+    /// that such records exist, which is what this number is for.
+    #[test]
+    fn the_fold_reports_records_that_carried_no_index() {
+        let unkeyed = |mac: u8| {
+            let mut blob = vec![0u8; 16];
+            blob.extend_from_slice(&[mac; 32]);
+            wa::SyncdRecord {
+                value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                ..Default::default()
+            }
+        };
+
+        let mut state = HashState::default();
+        let report = state.update_hash_from_records(&[
+            record_with(&[0x01; 32], &[0x11; 32]),
+            unkeyed(0x22),
+            unkeyed(0x33),
+        ]);
+
+        assert_eq!(
+            report.folded, 3,
+            "every record carried a foldable value MAC"
+        );
+        assert_eq!(report.unkeyed, 2, "two of them carried no index MAC");
+
+        // The number a caller would reach for cannot tell the two apart, which
+        // is the whole reason the fold answers instead.
+        assert_eq!(
+            report.folded, 3,
+            "and the folded count still equals the record count"
+        );
     }
 }

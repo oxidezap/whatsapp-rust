@@ -86,7 +86,7 @@ where
     initial_state.version = version;
 
     // Update hash state directly from records (no cloning needed)
-    let folded = initial_state.update_hash_from_records(&snapshot.records);
+    let fold = initial_state.update_hash_from_records(&snapshot.records);
 
     debug!(
         target: "AppState",
@@ -187,14 +187,16 @@ where
             debug!(
                 target: "AppState",
                 "Snapshot {} v{} MAC mismatch: computed={}, expected={}, ltHash={}, \
-                 the fold folded {} of {} records, key probe says {}",
+                 the fold folded {} of {} records ({} carrying no index), \
+                 key probe says {}",
                 collection_name,
                 version,
                 hex::encode(&computed),
                 hex::encode(mac_expected),
                 hex::encode(&initial_state.hash[120..]),
-                folded,
+                fold.folded,
                 snapshot.records.len(),
+                fold.unkeyed,
                 key_probe
             );
             return Err(AppStateError::SnapshotMACMismatch);
