@@ -222,7 +222,11 @@ impl HashState {
     /// a negative index there and folds the truncated buffer instead. Both are
     /// answers to a record the server should never send; ours refuses to fold
     /// something that is not a MAC.
-    pub fn update_hash_from_records(&mut self, records: &[wa::SyncdRecord]) {
+    /// Answers how many value MACs it folded, which is not `records.len()`: a
+    /// record whose value blob is too short to hold one is dropped, and a
+    /// repeated index contributes once. Diagnostics read it rather than
+    /// restating the rule, which is how a count and a fold drift apart.
+    pub fn update_hash_from_records(&mut self, records: &[wa::SyncdRecord]) -> usize {
         // Borrow the MAC tails; no Vec<u8> allocation per MAC.
         let mut added: Vec<&[u8]> = Vec::with_capacity(records.len());
         let mut indexed: Vec<(&[u8], &[u8])> = Vec::with_capacity(records.len());
@@ -272,6 +276,7 @@ impl HashState {
         }
 
         WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &[] as &[&[u8]], &added);
+        added.len()
     }
 
     pub fn generate_snapshot_mac(&self, name: &str, key: &[u8]) -> Vec<u8> {

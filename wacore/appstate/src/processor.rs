@@ -86,7 +86,7 @@ where
     initial_state.version = version;
 
     // Update hash state directly from records (no cloning needed)
-    initial_state.update_hash_from_records(&snapshot.records);
+    let folded = initial_state.update_hash_from_records(&snapshot.records);
 
     debug!(
         target: "AppState",
@@ -130,21 +130,17 @@ where
             // Only when someone is reading: decoding a record costs an AES pass, a
             // MAC and a protobuf parse, and this arm is reached on every page of
             // a collection that is failing.
-            let (key_probe, folded, total) = if log_enabled!(target: "AppState", Level::Debug) {
-                let total = snapshot.records.len();
-                // What the fold actually kept: one record per index MAC, plus
-                // every record carrying no index blob, since those cannot
-                // collide. Not "distinct indices" -- nothing here has decoded or
-                // validated an index, so this counts blobs, and comparing it
-                // against `total` is what says whether the dedup applied at all.
-                let folded = last_record_per_index(&snapshot.records).len();
+            // Only when someone is reading: decoding a record costs an AES pass, a
+            // MAC and a protobuf parse, and this arm is reached on every page of
+            // a collection that is failing.
+            let key_probe = if log_enabled!(target: "AppState", Level::Debug) {
                 // The question is whether *this* key is right, and `computed` was
                 // made with the snapshot's. A record keyed with some other id
                 // answers about that other key: decoding it proves nothing here,
                 // and failing to decode it accuses a key the snapshot never
                 // claimed. Across an app-state key rotation a snapshot may carry
                 // both, so the record has to be chosen, not taken.
-                let probe = match snapshot
+                match snapshot
                     .records
                     .iter()
                     .find(|rec| rec.key_id.id.as_deref() == Some(key_id))
@@ -158,18 +154,20 @@ where
                         key_id,
                         true,
                     ) {
-                        Ok(_) => "the snapshot's key decodes its own record, so the fold differs"
-                            .to_string(),
+                        // Says what it proved and no more. The key validating one
+                        // record does not make the fold the culprit: a stale or
+                        // truncated expected MAC produces this same mismatch with
+                        // a fold that is perfectly correct.
+                        Ok(_) => "the snapshot's key decodes its own record".to_string(),
                         // The class, not just the fact: `decode_record` refuses
                         // for a bad content MAC, a failed decryption, a malformed
                         // value and a missing index MAC, and only some of those
                         // are about the key.
                         Err(e) => format!("the snapshot's key failed on its own record: {e}"),
                     },
-                };
-                (probe, folded, total)
+                }
             } else {
-                ("not probed".to_string(), 0, 0)
+                "not probed".to_string()
             };
 
             // The identifying line stays at warn, because a collection that
@@ -189,14 +187,14 @@ where
             debug!(
                 target: "AppState",
                 "Snapshot {} v{} MAC mismatch: computed={}, expected={}, ltHash={}, \
-                 the fold kept {} of {} records, key probe says {}",
+                 the fold folded {} of {} records, key probe says {}",
                 collection_name,
                 version,
                 hex::encode(&computed),
                 hex::encode(mac_expected),
                 hex::encode(&initial_state.hash[120..]),
                 folded,
-                total,
+                snapshot.records.len(),
                 key_probe
             );
             return Err(AppStateError::SnapshotMACMismatch);
