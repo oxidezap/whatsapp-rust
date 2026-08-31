@@ -60,19 +60,10 @@ fn test_is_ad_logic() {
 
 #[test]
 fn test_legacy_and_agent_jid_parsing() {
-    // A dotted number on a phone user is the agent, and the agent is inert
-    // there, so the JID still addresses the primary device.
-    //
-    // This block used to assert the opposite -- that `.13` was a companion
-    // device -- on the strength of a comment about "an older WhatsApp Web".
-    // Three things in the current bundle say otherwise, and one of them is
-    // decisive: WA Web's phoneDevice pattern requires the colon group
-    // (`(:[0-9]{1,2})` is not optional), so a dotted-only JID is a phoneUser
-    // and cannot be a device at all. `WAJids.parseJidParts` then splits `:`
-    // into `device` and `.` into `agent`, and `stripAgentIdFromPhoneDeviceJid`
-    // exists to drop exactly that field. This repository already agreed in one
-    // place: `push_phash_form_to` renders `user.0:device@server`, putting the
-    // agent before the colon and the device after it.
+    // A dotted number on a phone user is the agent, not a companion device, so
+    // the JID still addresses the primary one. This block asserted the opposite
+    // until the parser was corrected; the rationale for the rule lives at that
+    // decision point, in `parse_jid_scan`.
     let dotted_jid_str = format!("1234567890.13@{}", SERVER_JID);
     let dotted_jid = Jid::from_str(&dotted_jid_str).expect("test JID should be valid");
     assert_eq!(dotted_jid.user, "1234567890", "the user stops at the dot");

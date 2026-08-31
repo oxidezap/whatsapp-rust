@@ -10,15 +10,28 @@
 -- spelling there, matching WA Web, and rewriting them would invalidate every
 -- established session.
 --
--- Where both spellings of one peer exist the rows collide on the primary key,
--- and which one survives matters. For the three caches below it decides what
--- the client believes about a peer, so the collision is resolved by freshness
--- first: the loser is deleted, then the rewrite cannot collide at all. Letting
--- `UPDATE OR REPLACE` pick would always keep the row being rewritten -- the
--- legacy one, which is by construction the older of the two -- and for
--- `device_registry` that means a stale device list replacing a current one,
--- which `get_devices` would then serve until the next refresh, dropping linked
--- devices from every send in between.
+-- One rule decides every collision: **a legacy row never displaces a canonical
+-- one.** Where both spellings of the same key exist, the legacy row is deleted
+-- and the canonical row is left exactly as it is; only an uncontested legacy
+-- row is rewritten.
+--
+-- That is not a coin toss between two candidates, it is the only choice that
+-- cannot lose information. The canonical row is the one the current client has
+-- been reading and writing all along, and the legacy row is already unreachable
+-- to it -- so deleting the legacy row costs nothing that is live today, while
+-- keeping it can only substitute stale state for current state. It is also why
+-- no per-table merge is attempted: every table below has its own freshness
+-- rule (`put_msg_secrets` keeps the later `expires_at` and a non-zero
+-- `message_ts`; `set_sender_key_status` must not let a stale `has_key = true`
+-- outlive a forget mark; `tc_tokens` advances `token_timestamp` and
+-- `sender_timestamp` independently), and a migration that tried to reproduce
+-- each of them would be a second implementation of every writer, drifting from
+-- the first. Preferring the canonical row defers to whatever those writers
+-- already decided.
+--
+-- Deleting first also means the rewrite cannot collide, so it needs no
+-- `OR REPLACE` and a surprise collision would surface as a failure rather than
+-- silently discarding a row.
 
 -- device_registry: the cached device list per peer.
 DELETE FROM device_registry
@@ -27,16 +40,7 @@ DELETE FROM device_registry
        SELECT 1 FROM device_registry AS canon
         WHERE canon.user_id =
               substr(device_registry.user_id, 1, length(device_registry.user_id) - 5) || '@s.whatsapp.net'
-          AND canon.device_id = device_registry.device_id
-          AND canon.updated_at >= device_registry.updated_at);
-
-DELETE FROM device_registry
- WHERE user_id NOT LIKE '%@c.us'
-   AND EXISTS (
-       SELECT 1 FROM device_registry AS legacy
-        WHERE legacy.user_id LIKE '%@c.us'
-          AND substr(legacy.user_id, 1, length(legacy.user_id) - 5) || '@s.whatsapp.net' = device_registry.user_id
-          AND legacy.device_id = device_registry.device_id);
+          AND canon.device_id = device_registry.device_id);
 
 UPDATE device_registry
    SET user_id = substr(user_id, 1, length(user_id) - 5) || '@s.whatsapp.net'
@@ -48,22 +52,16 @@ DELETE FROM tc_tokens
    AND EXISTS (
        SELECT 1 FROM tc_tokens AS canon
         WHERE canon.jid = substr(tc_tokens.jid, 1, length(tc_tokens.jid) - 5) || '@s.whatsapp.net'
-          AND canon.device_id = tc_tokens.device_id
-          AND canon.updated_at >= tc_tokens.updated_at);
-
-DELETE FROM tc_tokens
- WHERE jid NOT LIKE '%@c.us'
-   AND EXISTS (
-       SELECT 1 FROM tc_tokens AS legacy
-        WHERE legacy.jid LIKE '%@c.us'
-          AND substr(legacy.jid, 1, length(legacy.jid) - 5) || '@s.whatsapp.net' = tc_tokens.jid
-          AND legacy.device_id = tc_tokens.device_id);
+          AND canon.device_id = tc_tokens.device_id);
 
 UPDATE tc_tokens
    SET jid = substr(jid, 1, length(jid) - 5) || '@s.whatsapp.net'
  WHERE jid LIKE '%@c.us';
 
 -- sender_key_devices: which devices hold the current sender key for a group.
+-- `group_jid` is part of the key, so the counterpart must match on it too: a
+-- legacy row for a device in one group must not be deleted because that device
+-- has a canonical row in a different group.
 DELETE FROM sender_key_devices
  WHERE device_jid LIKE '%@c.us'
    AND EXISTS (
@@ -71,44 +69,81 @@ DELETE FROM sender_key_devices
         WHERE canon.device_jid =
               substr(sender_key_devices.device_jid, 1, length(sender_key_devices.device_jid) - 5) || '@s.whatsapp.net'
           AND canon.group_jid = sender_key_devices.group_jid
-          AND canon.device_id = sender_key_devices.device_id
-          AND canon.updated_at >= sender_key_devices.updated_at);
-
-DELETE FROM sender_key_devices
- WHERE device_jid NOT LIKE '%@c.us'
-   AND EXISTS (
-       SELECT 1 FROM sender_key_devices AS legacy
-        WHERE legacy.device_jid LIKE '%@c.us'
-          AND substr(legacy.device_jid, 1, length(legacy.device_jid) - 5) || '@s.whatsapp.net' = sender_key_devices.device_jid
-          AND legacy.group_jid = sender_key_devices.group_jid
-          AND legacy.device_id = sender_key_devices.device_id);
+          AND canon.device_id = sender_key_devices.device_id);
 
 UPDATE sender_key_devices
    SET device_jid = substr(device_jid, 1, length(device_jid) - 5) || '@s.whatsapp.net'
  WHERE device_jid LIKE '%@c.us';
 
--- The rest key on a message id as well as the chat, so a collision means the
--- same message stored under both spellings -- the same bytes either way, with
--- nothing to choose between them. `OR REPLACE` is enough, and is also the
--- backstop that keeps a collision from aborting the migration and leaving the
--- database unopenable.
-UPDATE OR REPLACE sent_messages
+-- sent_messages: the retry payload, keyed by chat and message id.
+DELETE FROM sent_messages
+ WHERE chat_jid LIKE '%@c.us'
+   AND EXISTS (
+       SELECT 1 FROM sent_messages AS canon
+        WHERE canon.chat_jid =
+              substr(sent_messages.chat_jid, 1, length(sent_messages.chat_jid) - 5) || '@s.whatsapp.net'
+          AND canon.message_id = sent_messages.message_id
+          AND canon.device_id = sent_messages.device_id);
+
+UPDATE sent_messages
    SET chat_jid = substr(chat_jid, 1, length(chat_jid) - 5) || '@s.whatsapp.net'
  WHERE chat_jid LIKE '%@c.us';
 
-UPDATE OR REPLACE msg_secrets
+-- msg_secrets: keyed by chat, sender and message id, so both jid columns move
+-- and either can collide. Deleted per column in turn, each against the shape
+-- the row would take after that column is rewritten.
+DELETE FROM msg_secrets
+ WHERE chat LIKE '%@c.us'
+   AND EXISTS (
+       SELECT 1 FROM msg_secrets AS canon
+        WHERE canon.chat = substr(msg_secrets.chat, 1, length(msg_secrets.chat) - 5) || '@s.whatsapp.net'
+          AND canon.sender = msg_secrets.sender
+          AND canon.msg_id = msg_secrets.msg_id
+          AND canon.device_id = msg_secrets.device_id);
+
+UPDATE msg_secrets
    SET chat = substr(chat, 1, length(chat) - 5) || '@s.whatsapp.net'
  WHERE chat LIKE '%@c.us';
 
-UPDATE OR REPLACE msg_secrets
+DELETE FROM msg_secrets
+ WHERE sender LIKE '%@c.us'
+   AND EXISTS (
+       SELECT 1 FROM msg_secrets AS canon
+        WHERE canon.sender = substr(msg_secrets.sender, 1, length(msg_secrets.sender) - 5) || '@s.whatsapp.net'
+          AND canon.chat = msg_secrets.chat
+          AND canon.msg_id = msg_secrets.msg_id
+          AND canon.device_id = msg_secrets.device_id);
+
+UPDATE msg_secrets
    SET sender = substr(sender, 1, length(sender) - 5) || '@s.whatsapp.net'
  WHERE sender LIKE '%@c.us';
 
-UPDATE OR REPLACE pending_inbound_messages
+-- pending_inbound_messages: the durability buffer, same two-column shape.
+DELETE FROM pending_inbound_messages
+ WHERE chat LIKE '%@c.us'
+   AND EXISTS (
+       SELECT 1 FROM pending_inbound_messages AS canon
+        WHERE canon.chat =
+              substr(pending_inbound_messages.chat, 1, length(pending_inbound_messages.chat) - 5) || '@s.whatsapp.net'
+          AND canon.sender = pending_inbound_messages.sender
+          AND canon.id = pending_inbound_messages.id
+          AND canon.device_id = pending_inbound_messages.device_id);
+
+UPDATE pending_inbound_messages
    SET chat = substr(chat, 1, length(chat) - 5) || '@s.whatsapp.net'
  WHERE chat LIKE '%@c.us';
 
-UPDATE OR REPLACE pending_inbound_messages
+DELETE FROM pending_inbound_messages
+ WHERE sender LIKE '%@c.us'
+   AND EXISTS (
+       SELECT 1 FROM pending_inbound_messages AS canon
+        WHERE canon.sender =
+              substr(pending_inbound_messages.sender, 1, length(pending_inbound_messages.sender) - 5) || '@s.whatsapp.net'
+          AND canon.chat = pending_inbound_messages.chat
+          AND canon.id = pending_inbound_messages.id
+          AND canon.device_id = pending_inbound_messages.device_id);
+
+UPDATE pending_inbound_messages
    SET sender = substr(sender, 1, length(sender) - 5) || '@s.whatsapp.net'
  WHERE sender LIKE '%@c.us';
 

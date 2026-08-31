@@ -297,7 +297,7 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         (user_combined, None)
     };
 
-    let user_end = if let Some(underscore_idx) = user_agent.find('_')
+    let mut user_end = if let Some(underscore_idx) = user_agent.find('_')
         && user_agent[underscore_idx + 1..].parse::<u8>().is_ok()
     {
         underscore_idx
@@ -306,6 +306,20 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
     };
 
     let server_kind = jid::Server::parse_known(server);
+    // A dotted agent is inert on the phone and hosted namespaces, so a parsed
+    // `Jid` drops it from the rendered form (`renders_agent`). Drop it here too,
+    // or the two public attribute paths address different users: `read_jid_pair`
+    // takes the user verbatim and never reads a `.2` back as an agent. `@lid`
+    // is excluded because a dot there is part of the user, and the servers that
+    // do render an agent keep it for the same reason -- it is theirs.
+    if matches!(
+        server_kind,
+        Some(jid::Server::Pn | jid::Server::Hosted | jid::Server::HostedLid)
+    ) && let Some(dot_idx) = user_agent[..user_end].rfind('.')
+        && user_agent[dot_idx + 1..user_end].parse::<u8>().is_ok()
+    {
+        user_end = dot_idx;
+    }
 
     // Single source of truth: only servers whose domain byte the decoder
     // round-trips back can use AD_JID. For everyone else drop the device
@@ -1074,6 +1088,20 @@ mod tests {
             assert!(
                 !buffer.windows(4).any(|w| w == b"c.us"),
                 "the string path leaked the legacy spelling of {raw}: {buffer:?}"
+            );
+
+            // A dotted agent in a string attribute must drop out the same way
+            // it does for a parsed `Jid`, or the two public paths address
+            // different users: `read_jid_pair` reads the user verbatim and
+            // never parses a `.2` back into an agent.
+            let dotted = format!("{}.2@c.us", legacy.user);
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_string(&dotted)?;
+            assert_eq!(
+                buffer,
+                encode(&modern.to_non_ad())?,
+                "{dotted} must encode as the bare user, like the parsed Jid does"
             );
 
             // Plan and write must agree on the canonical spelling too: the

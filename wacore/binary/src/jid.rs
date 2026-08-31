@@ -1006,11 +1006,9 @@ impl FromStr for Jid {
             device = d_str.parse()?;
         }
 
-        // No phone-namespace carve-out: the dot is the agent position on every
-        // server this reaches, matching `parse_jid_scan` and WA Web. See the
-        // generic arm there.
-        if server != HIDDEN_USER_SERVER
-            && let Some((u, last_part)) = user.rsplit_once('.')
+        // No carve-out by server: the LID branch has already returned, and the
+        // dot is the agent position on everything else. See `parse_jid_scan`.
+        if let Some((u, last_part)) = user.rsplit_once('.')
             && let Ok(num_val) = last_part.parse::<u16>()
         {
             if num_val > u8::MAX as u16 {

@@ -7537,16 +7537,19 @@ mod tests {
         let stanza = crate::test_utils::decode_sent_iq(&transport, 0).await;
         let stanza = stanza.get();
         assert_eq!(stanza.tag, "message");
-        let to = stanza
+        // The raw attribute, before parsing: `optional_jid` would resolve
+        // `@c.us` back to `Server::Pn` and pass on a stanza that still spelled
+        // it the old way, which is the regression this is here to catch.
+        let to_raw = stanza
             .attrs()
-            .optional_jid("to")
-            .expect("the stanza names its chat");
+            .optional_string("to")
+            .expect("the stanza names its chat")
+            .to_string();
         assert_eq!(
-            to.server,
-            Server::Pn,
-            "the legacy spelling must not reach the wire: {to}"
+            to_raw,
+            format!("{}@s.whatsapp.net", peer_pn.user),
+            "the legacy spelling must not reach the wire"
         );
-        assert_eq!(to.user, peer_pn.user, "and it must still be the same user");
     }
 
     /// The exclude list: only what the refresh added is resent. A device the
