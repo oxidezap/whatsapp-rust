@@ -130,34 +130,46 @@ where
             // Only when someone is reading: decoding a record costs an AES pass, a
             // MAC and a protobuf parse, and this arm is reached on every page of
             // a collection that is failing.
-            let (key_probe, distinct_indices) = if log_enabled!(target: "AppState", Level::Debug) {
-                // The record's own key id, not the snapshot's. The two are
-                // allowed to differ, and the normal decode loop below reads each
-                // record's -- probing with the snapshot's would report a key
-                // failure for a record the key never claimed to cover, sending
-                // the reader after the one answer this line exists to rule out.
-                let probe = match snapshot.records.first() {
-                    None => "the snapshot carries no records to probe",
-                    Some(rec) => match rec.key_id.id.as_deref() {
-                        None => "the first record names no key id",
-                        Some(rec_key_id) => match get_keys(rec_key_id) {
-                            Err(_) => "the first record's key id is not one we hold",
-                            Ok(rec_keys) => match decode_record(
-                                wa::syncd_mutation::SyncdOperation::SET,
-                                rec,
-                                &rec_keys,
-                                rec_key_id,
-                                true,
-                            ) {
-                                Ok(_) => "its records decode, so the fold is what differs",
-                                Err(_) => "its records do not decode either, so look at the key",
-                            },
-                        },
+            let (key_probe, folded, total) = if log_enabled!(target: "AppState", Level::Debug) {
+                let total = snapshot.records.len();
+                // What the fold actually kept: one record per index MAC, plus
+                // every record carrying no index blob, since those cannot
+                // collide. Not "distinct indices" -- nothing here has decoded or
+                // validated an index, so this counts blobs, and comparing it
+                // against `total` is what says whether the dedup applied at all.
+                let folded = last_record_per_index(&snapshot.records).len();
+                // The question is whether *this* key is right, and `computed` was
+                // made with the snapshot's. A record keyed with some other id
+                // answers about that other key: decoding it proves nothing here,
+                // and failing to decode it accuses a key the snapshot never
+                // claimed. Across an app-state key rotation a snapshot may carry
+                // both, so the record has to be chosen, not taken.
+                let probe = match snapshot
+                    .records
+                    .iter()
+                    .find(|rec| rec.key_id.id.as_deref() == Some(key_id))
+                {
+                    None => "inconclusive: no record is keyed with the snapshot's own key id"
+                        .to_string(),
+                    Some(rec) => match decode_record(
+                        wa::syncd_mutation::SyncdOperation::SET,
+                        rec,
+                        &keys,
+                        key_id,
+                        true,
+                    ) {
+                        Ok(_) => "the snapshot's key decodes its own record, so the fold differs"
+                            .to_string(),
+                        // The class, not just the fact: `decode_record` refuses
+                        // for a bad content MAC, a failed decryption, a malformed
+                        // value and a missing index MAC, and only some of those
+                        // are about the key.
+                        Err(e) => format!("the snapshot's key failed on its own record: {e}"),
                     },
                 };
-                (probe, last_record_per_index(&snapshot.records).len())
+                (probe, folded, total)
             } else {
-                ("not probed", 0)
+                ("not probed".to_string(), 0, 0)
             };
 
             // The identifying line stays at warn, because a collection that
@@ -177,14 +189,14 @@ where
             debug!(
                 target: "AppState",
                 "Snapshot {} v{} MAC mismatch: computed={}, expected={}, ltHash={}, \
-                 {} of {} records carry a distinct index, key probe says {}",
+                 the fold kept {} of {} records, key probe says {}",
                 collection_name,
                 version,
                 hex::encode(&computed),
                 hex::encode(mac_expected),
                 hex::encode(&initial_state.hash[120..]),
-                distinct_indices,
-                snapshot.records.len(),
+                folded,
+                total,
                 key_probe
             );
             return Err(AppStateError::SnapshotMACMismatch);
