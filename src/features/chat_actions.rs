@@ -990,6 +990,12 @@ where
             collection,
             wacore::appstate::hash::HashState {
                 version: 7,
+                // `send_app_state_patch` refuses to build on a collection whose
+                // bootstrap never completed and syncs it first, which the mock
+                // transport cannot answer. A verb test is about the mutation the
+                // verb writes, not about reaching that state, so the fixture
+                // starts from a collection that has bootstrapped.
+                bootstrapped: true,
                 ..Default::default()
             },
         )

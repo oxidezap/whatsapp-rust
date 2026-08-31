@@ -3549,7 +3549,11 @@ mod send_patch_response_tests {
     use wacore_binary::node::Node;
 
     /// Seed the client's store with an app-state key so `build_patch` can sign,
-    /// and give the collection a non-zero base so the IQ carries a `version`.
+    /// and give the collection a bootstrapped, non-zero base so the IQ carries a
+    /// `version`. The base has to say it bootstrapped: `send_app_state_patch`
+    /// syncs a collection that never completed one instead of building on it,
+    /// and these tests are about what the send does with the server's answer to
+    /// a patch, not about reaching that state.
     async fn seed_collection(client: &Arc<Client>, collection: &str) -> Vec<u8> {
         let backend = client.persistence_manager.backend();
         let key_id = b"send-patch-key".to_vec();
@@ -3568,6 +3572,7 @@ mod send_patch_response_tests {
                 collection,
                 wacore::appstate::hash::HashState {
                     version: 7,
+                    bootstrapped: true,
                     ..Default::default()
                 },
             )
