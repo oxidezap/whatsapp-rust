@@ -201,6 +201,12 @@ struct ParsedJidMeta {
     server_start: u8,
     domain_type: u8,
     device: Option<u8>,
+    /// The resolved server, when the suffix is one we know. `JID_PAIR` writes
+    /// this rather than the caller's substring, so a string-valued attribute
+    /// (`.attr("to", "…@c.us")`) is spelled on the wire exactly as the
+    /// equivalent `Jid` would be. `None` keeps an unknown suffix verbatim,
+    /// which is the only way it can survive the round trip.
+    server: Option<jid::Server>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +310,7 @@ fn parse_jid_meta(input: &str) -> Option<ParsedJidMeta> {
         .and(device);
 
     Some(ParsedJidMeta {
+        server: server_kind,
         user_end: u8::try_from(user_end).ok()?,
         server_start: u8::try_from(server_start).ok()?,
         domain_type,
@@ -536,7 +543,11 @@ fn parsed_jid_encoded_size_with_cache(
     meta: ParsedJidMeta,
     hints: &mut StringHintCache,
 ) -> usize {
-    let (user, server) = split_jid_from_meta(jid, meta);
+    let (user, raw_server) = split_jid_from_meta(jid, meta);
+    // The same canonicalisation `write_jid_from_meta` applies. Sizing the
+    // caller's substring while the writer emits the resolved spelling is not a
+    // bad estimate, it is an `UnexpectedEof` on the send.
+    let server = meta.server.map_or(raw_server, |s| s.as_str());
     if meta.device.is_some() {
         3 + string_encoded_size_with_cache(user, hints)
     } else {
@@ -757,7 +768,8 @@ impl<'a, W: ByteWriter> Encoder<'a, W> {
 
     #[inline(always)]
     fn write_jid_from_meta(&mut self, jid: &str, meta: ParsedJidMeta) -> Result<()> {
-        let (user, server) = split_jid_from_meta(jid, meta);
+        let (user, raw_server) = split_jid_from_meta(jid, meta);
+        let server = meta.server.map_or(raw_server, |s| s.as_str());
         if let Some(device) = meta.device {
             self.write_u8(token::AD_JID)?;
             self.write_u8(meta.domain_type)?;
@@ -1012,20 +1024,47 @@ mod tests {
             Ok(buffer)
         }
 
-        for (legacy, modern) in [
+        for (raw, modern) in [
             ("5511999998888@c.us", "5511999998888@s.whatsapp.net"),
             // AD_JID form: same domain byte, so the bytes match there too.
             ("5511999998888:3@c.us", "5511999998888:3@s.whatsapp.net"),
             // A dotted agent is inert on a phone user and encodes nothing.
             ("5511999998888.2@c.us", "5511999998888@s.whatsapp.net"),
         ] {
-            let legacy: Jid = legacy.parse().unwrap();
+            let legacy: Jid = raw.parse().unwrap();
             let modern: Jid = modern.parse().unwrap();
             let bytes = encode(&legacy)?;
-            assert_eq!(bytes, encode(&modern)?, "{legacy} must encode as {modern}");
+            assert_eq!(bytes, encode(&modern)?, "{raw} must encode as {modern}");
             assert!(
                 !bytes.windows(4).any(|w| w == b"c.us"),
-                "{legacy} put the legacy spelling on the wire: {bytes:?}"
+                "{raw} put the legacy spelling on the wire: {bytes:?}"
+            );
+
+            // The string path: a caller that hands a JID as a node attribute
+            // (`.attr("to", "…@c.us")`) never builds a `Jid`, and the JID_PAIR
+            // branch there writes the server substring straight out of the
+            // input.
+            let mut buffer = Vec::new();
+            let mut encoder = Encoder::new(Cursor::new(&mut buffer))?;
+            encoder.write_string(raw)?;
+            assert!(
+                !buffer.windows(4).any(|w| w == b"c.us"),
+                "the string path leaked the legacy spelling of {raw}: {buffer:?}"
+            );
+
+            // Plan and write must agree on the canonical spelling too: the
+            // exact marshal sizes its buffer from the estimator and then writes
+            // into it, so a mismatch is an `UnexpectedEof`, not a loose bound.
+            let node = NodeBuilder::new("message").attr("to", raw).build();
+            let exact = crate::marshal::marshal_exact(&node)?;
+            assert_eq!(
+                exact,
+                crate::marshal::marshal(&node)?,
+                "plan and writer disagree for {raw}"
+            );
+            assert!(
+                !exact.windows(4).any(|w| w == b"c.us"),
+                "a string-valued attribute leaked the legacy spelling of {raw}"
             );
 
             // The borrowed writer is a separate copy of the same branch.

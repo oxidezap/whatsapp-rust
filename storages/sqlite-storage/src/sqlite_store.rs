@@ -4172,10 +4172,16 @@ mod tests {
     }
 
     /// Both spellings of one peer collide on the primary key when the legacy one
-    /// is rewritten. `UPDATE OR REPLACE` has to resolve that rather than abort
-    /// the migration, which would leave the database unopenable.
+    /// is rewritten, and which row survives is not a detail: for the caches
+    /// keyed this way it decides what the client believes about a peer. The
+    /// freshest row has to win in *both* directions, and the collision must
+    /// never abort the migration, which would leave the database unopenable.
+    ///
+    /// `UPDATE OR REPLACE` alone gets this wrong: it keeps the row being
+    /// rewritten, which is the legacy one, so a stale device list would replace
+    /// a current one and `get_devices` would serve it until the next refresh.
     #[tokio::test]
-    async fn the_normalisation_migration_survives_a_duplicated_peer() {
+    async fn the_normalisation_migration_keeps_the_fresher_of_two_spellings() {
         use diesel::connection::SimpleConnection;
 
         const NORMALISE: &str =
@@ -4184,22 +4190,85 @@ mod tests {
         let store = create_test_store().await;
         let mut conn = store.pool.get().expect("a connection");
 
+        // Peer 1: the canonical row is newer, so it survives.
+        // Peer 2: the legacy row is newer, so that one does.
+        // Peer 3: only the legacy row exists, so it is simply rewritten.
         conn.batch_execute(
-            "INSERT INTO tc_tokens (jid, token, token_timestamp, device_id, updated_at)
-                  VALUES ('15550000001@c.us', x'01', 0, 1, 0),
-                         ('15550000001@s.whatsapp.net', x'02', 0, 1, 0);",
+            r#"INSERT INTO tc_tokens (jid, token, token_timestamp, device_id, updated_at)
+                    VALUES ('15550000001@c.us',           x'01', 0, 1, 10),
+                           ('15550000001@s.whatsapp.net', x'02', 0, 1, 20),
+                           ('15550000002@c.us',           x'03', 0, 1, 20),
+                           ('15550000002@s.whatsapp.net', x'04', 0, 1, 10),
+                           ('15550000003@c.us',           x'05', 0, 1, 5);
+               INSERT INTO device_registry (user_id, devices_json, timestamp, device_id, updated_at)
+                    VALUES ('15550000001@c.us',           '["stale"]', 0, 1, 10),
+                           ('15550000001@s.whatsapp.net', '["fresh"]', 0, 1, 20);"#,
         )
-        .expect("seed both spellings of one peer");
+        .expect("seed both spellings of the same peers");
 
         conn.batch_execute(NORMALISE)
             .expect("a duplicate must not abort the migration");
 
-        let rows: i64 = diesel::dsl::sql::<diesel::sql_types::BigInt>(
-            "SELECT count(*) FROM tc_tokens WHERE jid = '15550000001@s.whatsapp.net'",
-        )
-        .get_result(&mut *conn)
-        .expect("one row");
-        assert_eq!(rows, 1, "one peer, one row");
+        let scalar = |conn: &mut _, sql: &str| -> String {
+            diesel::dsl::sql::<diesel::sql_types::Text>(sql)
+                .get_result::<String>(conn)
+                .expect("one row")
+        };
+        let count = |conn: &mut _, sql: &str| -> i64 {
+            diesel::dsl::sql::<diesel::sql_types::BigInt>(sql)
+                .get_result::<i64>(conn)
+                .expect("one row")
+        };
+
+        assert_eq!(
+            count(&mut *conn, "SELECT count(*) FROM tc_tokens"),
+            3,
+            "one row per peer"
+        );
+        assert_eq!(
+            count(
+                &mut *conn,
+                "SELECT count(*) FROM tc_tokens WHERE jid LIKE '%@c.us'"
+            ),
+            0,
+            "and none of them spelled the old way"
+        );
+        assert_eq!(
+            scalar(
+                &mut *conn,
+                "SELECT hex(token) FROM tc_tokens WHERE jid = '15550000001@s.whatsapp.net'"
+            ),
+            "02",
+            "the canonical row was newer and must survive"
+        );
+        assert_eq!(
+            scalar(
+                &mut *conn,
+                "SELECT hex(token) FROM tc_tokens WHERE jid = '15550000002@s.whatsapp.net'"
+            ),
+            "03",
+            "the legacy row was newer and must survive the rewrite"
+        );
+        assert_eq!(
+            scalar(
+                &mut *conn,
+                "SELECT hex(token) FROM tc_tokens WHERE jid = '15550000003@s.whatsapp.net'"
+            ),
+            "05",
+            "an uncontested legacy row is just rewritten"
+        );
+
+        // The case with a real consequence: a stale device list must not
+        // displace the current one.
+        assert_eq!(count(&mut *conn, "SELECT count(*) FROM device_registry"), 1);
+        assert_eq!(
+            scalar(
+                &mut *conn,
+                "SELECT devices_json FROM device_registry WHERE user_id = '15550000001@s.whatsapp.net'"
+            ),
+            r#"["fresh"]"#,
+            "the newer device list must win"
+        );
     }
 
     /// `delete_version` is how a rebuild is expressed, so what it does to a row
