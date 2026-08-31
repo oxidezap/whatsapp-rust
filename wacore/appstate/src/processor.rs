@@ -597,6 +597,14 @@ fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
     let mut seen: Vec<&[u8]> = Vec::new();
     // Backwards, so the first hit for an index is its last record.
     for rec in records.iter().rev() {
+        // Skipped for the same reason the fold skips it: a record with no value
+        // blob contributes no value MAC, so it is not part of what the accepted
+        // MAC describes. Letting it win an index anyway is worse than letting it
+        // through -- it displaces the record that *was* folded, so the two
+        // passes disagree about a snapshot that is otherwise perfectly ordinary.
+        if rec.value.blob.is_none() {
+            continue;
+        }
         let index_mac = rec
             .index
             .as_option()
@@ -707,15 +715,9 @@ mod tests {
         }
     }
 
-    /// The two passes over a snapshot must describe the same set of records.
-    ///
-    /// `update_hash_from_records` decides which MAC we accept and
-    /// `last_record_per_index` decides what we then decrypt and store, so a
-    /// disagreement means accepting a snapshot on one set of records and
-    /// persisting another. Records carrying no index are where the two came
-    /// apart: each pass independently read "no index" as "cannot collide" and
-    /// let every one of them through, where WA Web keys on `hex(index.blob)`
-    /// and collides them all on the empty string.
+    /// A run of one index and three records with no index describe two things,
+    /// and both passes have to say two -- the last of the run and the last of
+    /// the unkeyed.
     #[test]
     fn the_decode_set_is_the_set_the_fold_folded() {
         fn record(index: Option<&[u8]>, value_mac: u8) -> wa::SyncdRecord {
@@ -764,6 +766,46 @@ mod tests {
         };
         assert!(last_of(0x33), "the run's last record, not its first");
         assert!(last_of(0x55), "the last unkeyed record, not the first");
+    }
+
+    /// The regression the invariant above did not catch on its own: a record
+    /// with no value blob is skipped by the fold, so it must not be allowed to
+    /// win an index from the record that *was* folded. Every record here is
+    /// perfectly ordinary except the last, and the snapshot is one the server
+    /// could send.
+    #[test]
+    fn a_record_with_no_value_cannot_displace_the_one_that_folded() {
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(&[0x11; 32]);
+        let records = vec![
+            wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: Some(vec![0x01; 32]),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                ..Default::default()
+            },
+            // Same index, no value: later in the run, and so the winner under a
+            // dedup that only looks at indices.
+            wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: Some(vec![0x01; 32]),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue { blob: None }),
+                ..Default::default()
+            },
+        ];
+
+        let mut state = HashState::default();
+        let fold = state.update_hash_from_records(&records);
+        let winners = last_record_per_index(&records);
+
+        assert_eq!(fold.folded, 1, "only the record carrying a value folded");
+        assert_eq!(winners.len(), 1, "and only that record is decoded");
+        assert!(
+            winners[0].value.blob.is_some(),
+            "the winner is the folded record, not the valueless one that followed it"
+        );
     }
 
     #[test]
