@@ -88,6 +88,24 @@ where
     // Update hash state directly from records (no cloning needed)
     let fold = initial_state.update_hash_from_records(&snapshot.records);
 
+    // A record with no value blob is one nobody can agree about: WA Web reads
+    // `.byteLength` off the absent buffer and the whole fold throws. Refused
+    // here rather than folded around, because the fold and the decode both have
+    // to leave it out to stay in step -- and two passes quietly agreeing to
+    // ignore a record is how a malformed snapshot would validate and be stored
+    // as though it were whole. Rejecting keeps the old answer
+    // (`decode_record`'s `MissingValueBlob`) for input that never changed.
+    if fold.valueless > 0 {
+        warn!(
+            target: "AppState",
+            "Snapshot {} v{} carries {} record(s) with no value blob; refusing it",
+            collection_name,
+            version,
+            fold.valueless,
+        );
+        return Err(AppStateError::MissingValueBlob);
+    }
+
     debug!(
         target: "AppState",
         "Snapshot {} v{}: {} records, ltHash ends with ...{}",
@@ -806,6 +824,49 @@ mod tests {
             winners[0].value.blob.is_some(),
             "the winner is the folded record, not the valueless one that followed it"
         );
+    }
+
+    /// A snapshot carrying a record with no value blob is refused, not quietly
+    /// folded around. Both passes leave such a record out to stay in step, so
+    /// without this the two would agree to ignore it and a malformed snapshot
+    /// would validate and be stored as though it were whole -- where before it
+    /// was rejected at the decode.
+    #[test]
+    fn a_snapshot_with_a_valueless_record_is_refused() {
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(&[0x11; 32]);
+        let snapshot = wa::SyncdSnapshot {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(7) }),
+            records: vec![
+                wa::SyncdRecord {
+                    index: buffa::MessageField::some(wa::SyncdIndex {
+                        blob: Some(vec![0x01; 32]),
+                    }),
+                    value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                    ..Default::default()
+                },
+                wa::SyncdRecord {
+                    index: buffa::MessageField::some(wa::SyncdIndex {
+                        blob: Some(vec![0x02; 32]),
+                    }),
+                    value: buffa::MessageField::some(wa::SyncdValue { blob: None }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut state = HashState::default();
+        // Refused before the MAC is even reached, so it needs no key and no mac.
+        let err = process_snapshot(
+            &snapshot,
+            &mut state,
+            |_| panic!("a valueless record is refused before any key is looked up"),
+            true,
+            "regular_low",
+        )
+        .expect_err("a snapshot with a valueless record must be refused");
+        assert!(matches!(err, AppStateError::MissingValueBlob), "{err:?}");
     }
 
     #[test]

@@ -80,6 +80,13 @@ pub struct FoldReport {
     /// only the last of them -- correct, and still worth seeing in a log,
     /// because nothing else in `folded` will ever hint at it.
     pub unkeyed: usize,
+    /// How many records carried no value blob at all and so folded nothing.
+    ///
+    /// Not a curiosity: WA Web reads `.byteLength` off the absent buffer and
+    /// the whole fold throws, so a snapshot holding one is a snapshot nobody
+    /// can agree about. Counted here rather than re-derived by a caller, and
+    /// answered by whoever decides what a malformed snapshot costs.
+    pub valueless: usize,
 }
 
 impl HashState {
@@ -214,12 +221,15 @@ impl HashState {
                 }
             };
             let is_set = op == wa::syncd_mutation::SyncdOperation::SET;
+            // The same slice `generate_patch_mac` feeds the MAC, and it has to
+            // be: the two describe one patch, so a rule applied to only one of
+            // them lets a patch authenticate against its own patchMac and then
+            // carry an ltHash the server's snapshotMac disagrees with.
             if is_set
                 && mutation.record.is_set()
                 && let Some(blob) = &mutation.record.value.blob
-                && blob.len() >= 32
             {
-                added.push(&blob[blob.len() - 32..]);
+                added.push(value_mac_tail(blob));
             }
             if let Some(index_mac) = index_mac_of(mutation) {
                 if is_set && removed_in_patch.contains(&index_mac) {
@@ -301,6 +311,7 @@ impl HashState {
         // fix it is invisible in `folded` — several of them contribute one
         // value MAC between them, exactly as they do at the far end.
         let mut unkeyed = 0usize;
+        let mut valueless = 0usize;
 
         for record in records {
             // A record with no value blob at all is the one place this still
@@ -309,6 +320,7 @@ impl HashState {
             // collection fails either way; skipping is the failure that leaves
             // a diagnosable state behind.
             let Some(blob) = record.value.blob.as_ref() else {
+                valueless += 1;
                 continue;
             };
             let value_mac = &blob[value_mac_start(blob.len())..];
@@ -359,6 +371,7 @@ impl HashState {
         FoldReport {
             folded: added.len(),
             unkeyed,
+            valueless,
         }
     }
 
