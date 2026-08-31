@@ -200,7 +200,7 @@ fn bench_chat_lane_create<const PROTECTED: usize>(bencher: divan::Bencher, count
                         });
                         AtCapacity {
                             cache,
-                            next: AtomicUsize::new(n),
+                            next: AtomicUsize::new(n - protected),
                             _protected: held,
                         }
                     })
@@ -210,12 +210,16 @@ fn bench_chat_lane_create<const PROTECTED: usize>(bencher: divan::Bencher, count
     });
     let slot = if PROTECTED == 0 { 0 } else { 1 };
     let AtCapacity { cache, next, .. } = &built[slot][index_of(count)];
-    let keys = keys(count);
+    // The protected keys are pinned in the cache forever, so probing one is a
+    // hit, not a creation. Rotate only over the evictable tail: the cache holds
+    // `PROTECTED` pinned plus `count - PROTECTED` of these, one short of the
+    // set, so the rotation still lands on the absent key every time.
+    let rotating = &keys(count)[PROTECTED..];
 
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
         for _ in 0..BATCH {
-            let i = next.fetch_add(1, Ordering::Relaxed) % keys.len();
-            block_on(cache.get_with_by_ref(black_box(&keys[i]), async { Arc::new(()) }));
+            let i = next.fetch_add(1, Ordering::Relaxed) % rotating.len();
+            block_on(cache.get_with_by_ref(black_box(&rotating[i]), async { Arc::new(()) }));
         }
         black_box(cache.entry_count())
     });
