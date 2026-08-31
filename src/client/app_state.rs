@@ -3672,8 +3672,6 @@ mod send_patch_response_tests {
                 Some(code) => collection_error_result(&id, response_collection, code),
                 None => empty_sync_result(&id, response_collection),
             };
-            let clean_resync = attempt == 0 && verdict.is_none();
-            crate::test_utils::answer_iq(client, &id, &response).await;
             // A re-sync the server answers cleanly is one that found it ahead of
             // us, so it moves the base -- which is what makes the next patch a
             // different request rather than the same one. The real
@@ -3682,7 +3680,14 @@ mod send_patch_response_tests {
             // this the mock says "your base is stale" and then "nothing new",
             // which no server does, and the retry it provoked was measuring an
             // impossible sequence.
-            if clean_resync {
+            //
+            // Moved before the answer on purpose. `answer_iq` releases the
+            // waiter, so the sender resumes and `absorb_conflicting_patches`
+            // reads the base to decide whether the recovery moved it. Bumping
+            // afterwards races that read: lose it and the absorb sees the base
+            // it started from, calls the recovery failed and breaks the retry
+            // loop early. A real server has already moved before it answers.
+            if attempt == 0 && verdict.is_none() {
                 let backend = client.persistence_manager.backend();
                 let current = backend
                     .get_version(COLLECTION)
@@ -3700,6 +3705,7 @@ mod send_patch_response_tests {
                     .await
                     .expect("the test backend should accept a version");
             }
+            crate::test_utils::answer_iq(client, &id, &response).await;
             frame += 1;
         }
     }
