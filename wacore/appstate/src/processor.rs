@@ -8,7 +8,7 @@ use crate::AppStateError;
 use crate::decode::{Mutation, decode_record};
 use crate::hash::{HashState, generate_patch_mac};
 use crate::keys::ExpandedAppStateKeys;
-use log::{debug, trace, warn};
+use log::{Level, debug, log_enabled, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,24 +127,38 @@ where
             // disagree. Decoding one record answers it: the value MAC inside it
             // is derived from the same expanded key, so a record that decodes
             // proves the key is right and points at the fold.
-            let key_probe = snapshot
-                .records
-                .first()
-                .map(|rec| {
-                    decode_record(
-                        wa::syncd_mutation::SyncdOperation::SET,
-                        rec,
-                        &keys,
-                        key_id,
-                        true,
-                    )
-                })
-                .map(|r| match r {
-                    Ok(_) => "the key is right, so the fold is what differs",
-                    Err(_) => "the key does not decode this snapshot either",
-                })
-                .unwrap_or("the snapshot carries no records to probe");
-            let distinct_indices = last_record_per_index(&snapshot.records).len();
+            // Only when someone is reading: decoding a record costs an AES pass, a
+            // MAC and a protobuf parse, and this arm is reached on every page of
+            // a collection that is failing.
+            let (key_probe, distinct_indices) = if log_enabled!(target: "AppState", Level::Debug) {
+                // The record's own key id, not the snapshot's. The two are
+                // allowed to differ, and the normal decode loop below reads each
+                // record's -- probing with the snapshot's would report a key
+                // failure for a record the key never claimed to cover, sending
+                // the reader after the one answer this line exists to rule out.
+                let probe = match snapshot.records.first() {
+                    None => "the snapshot carries no records to probe",
+                    Some(rec) => match rec.key_id.id.as_deref() {
+                        None => "the first record names no key id",
+                        Some(rec_key_id) => match get_keys(rec_key_id) {
+                            Err(_) => "the first record's key id is not one we hold",
+                            Ok(rec_keys) => match decode_record(
+                                wa::syncd_mutation::SyncdOperation::SET,
+                                rec,
+                                &rec_keys,
+                                rec_key_id,
+                                true,
+                            ) {
+                                Ok(_) => "its records decode, so the fold is what differs",
+                                Err(_) => "its records do not decode either, so look at the key",
+                            },
+                        },
+                    },
+                };
+                (probe, last_record_per_index(&snapshot.records).len())
+            } else {
+                ("not probed", 0)
+            };
 
             // The identifying line stays at warn, because a collection that
             // strands itself has to be visible without turning logging up. The
