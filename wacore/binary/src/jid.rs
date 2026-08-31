@@ -112,25 +112,19 @@ fn parse_jid_scan(s: &str) -> Option<(ParsedJidParts<'_>, Option<Server>)> {
             ))
         }
         // Everything else, phone users included (and unknown servers):
-        // `user.agent:device`. The dot is the agent position on every server WA
-        // Web parses -- `WAJids.parseJidParts` splits `:` then `.` with no
-        // per-server carve-out, `fullFormDeviceJidString` writes it back as
-        // `user.<agent>:<device>@server`, and `stripAgentIdFromPhoneDeviceJid`
-        // exists precisely to drop it off a phone user. It is never a device
-        // there: the device only ever follows a colon. On the phone namespace
-        // the agent is inert (`renders_agent`), so a JID that carries one is
-        // still the same identity as the bare user, which is what makes reading
-        // it here safe rather than merely faithful.
+        // `user.agent:device`, one rule. The dot is the agent on every server WA
+        // Web parses and never a device, which only ever follows a colon; the
+        // phone namespace had a carve-out reading it as one, and that turned a
+        // bare user into a request addressed at a device it never named.
         _ => {
             let (user_before_colon, device) = match colon_pos {
                 Some(pos) => (&s[..pos], parse_u16_decimal(&s[pos + 1..at]).unwrap_or(0)),
                 None => (user_part, 0),
             };
-            // The scan already found the last dot, so this needs no second
-            // pass -- but only a dot *before* the device separator is the
-            // agent, which is what the bound rules out. The two readings differ
-            // for a pathological user holding a second colon (`a:1.5:2`), and
-            // the pre-colon one is what the agent rule means.
+            // The scan already found the last dot, so no second pass is
+            // needed -- but only one before the device separator is the agent,
+            // which is what the bound enforces. The two readings differ for a
+            // user holding a second colon (`a:1.5:2`).
             let (final_user, agent) =
                 match last_dot_pos.filter(|&dot_pos| dot_pos < user_before_colon.len()) {
                     Some(dot_pos) => match parse_u16_decimal(&user_before_colon[dot_pos + 1..]) {
@@ -334,16 +328,11 @@ impl Server {
             "msgr" => Self::Messenger,
             "interop" => Self::Interop,
             "bot" => Self::Bot,
-            // `c.us` is not a namespace: it is the other spelling of the phone
-            // namespace, collapsed here so it cannot exist past parsing. WA Web
-            // collapses the same way and in the same place -- `createWid` does
-            // `t.replace("@s.whatsapp.net","@c.us")` before the constructor runs
-            // and caches under the collapsed key, so the two spellings can never
-            // reach two objects, two cache entries or two comparisons. This is
-            // the sole converter behind text (`FromStr`), the wire
-            // (`read_jid_pair`) and serde, so collapsing it here covers all
-            // three, and `Server` then has no variant that could render `c.us`
-            // back out.
+            // `c.us` is the other spelling of the phone namespace, not a
+            // namespace. Collapsing it in this converter -- the one text, the
+            // wire and serde all resolve through, and the same place WA Web
+            // collapses it -- is what leaves no variant able to render it back
+            // out, so one person cannot become two identities.
             "c.us" => Self::Pn,
             "call" => Self::Call,
             _ => return None,
