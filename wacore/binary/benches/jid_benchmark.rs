@@ -113,12 +113,21 @@ fn interop_agent(agent: u8) -> Jid {
     }
 }
 
-/// The four comparisons `==` resolves differently: an equal pair (the full
-/// field walk), a mismatch caught on the first field, a mismatch caught only on
-/// `server`, and a pair carrying a non-zero `agent`, which is the one case that
-/// reaches the `identity_agent` normalisation instead of the raw equal-agents
-/// shortcut.
-const EQ_CASES: [&str; 4] = ["equal", "user_differs", "server_differs", "agent_nonzero"];
+/// The five comparisons `==` resolves differently: an equal pair (the full field
+/// walk), a mismatch caught on the first field, a mismatch caught only on
+/// `server`, and the two shapes that miss the raw equal-agents shortcut and go
+/// through `identity_agent`. Those two are separate because the normalisation
+/// does different work in each: on `@interop` it renders the agent, so it
+/// confirms a real difference, while on the phone namespace it suppresses it, so
+/// it is what makes two JIDs equal that the raw compare would have split. The
+/// second is the case the function exists for.
+const EQ_CASES: [&str; 5] = [
+    "equal",
+    "user_differs",
+    "server_differs",
+    "agent_nonzero",
+    "agent_normalised",
+];
 
 fn eq_pair(case: &str) -> &'static (Jid, Jid) {
     static PAIRS: OnceLock<HashMap<&'static str, (Jid, Jid)>> = OnceLock::new();
@@ -138,6 +147,19 @@ fn eq_pair(case: &str) -> &'static (Jid, Jid) {
                 (pn_device("5511999990000", 7), right)
             }),
             ("agent_nonzero", (interop_agent(3), interop_agent(4))),
+            // Different raw agents, equal identity: the phone namespace does
+            // not render the agent, so both normalise to 0 and the pair is one
+            // device.
+            (
+                "agent_normalised",
+                (
+                    pn_device("5511999990000", 7),
+                    Jid {
+                        agent: 1,
+                        ..pn_device("5511999990000", 7)
+                    },
+                ),
+            ),
         ])
     })[case]
 }

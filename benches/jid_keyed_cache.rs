@@ -24,6 +24,7 @@ use divan::black_box;
 use divan::counter::ItemsCount;
 use std::future::Future;
 use std::pin::pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use wacore_binary::jid::Jid;
@@ -123,14 +124,46 @@ fn bench_chat_lane_get_miss(bencher: divan::Bencher, count: usize) {
     });
 }
 
-/// Creating the lane, which is what a miss leads to. Overwrites one key rather
-/// than growing the cache, so the arms stay comparable and nothing evicts.
+/// Creating the lane, which is what a miss leads to.
+///
+/// A separate fixture from the lookups above, and built at `max_capacity =
+/// count` on purpose: inserting a key the cache already holds takes an
+/// overwrite branch that returns before `insert_new` and measures none of what
+/// creating a lane costs -- the key clone, the FIFO bookkeeping, the capacity
+/// check, the new map entry. Every key here is new, so every iteration goes
+/// through that path, and the cache sits at capacity so each insert also pays
+/// the eviction it triggers. That is the steady state of a client with more
+/// live chats than `chat_lanes_capacity`, which is the state a long-lived one
+/// is in.
 #[divan::bench(args = CHAT_COUNTS)]
 fn bench_chat_lane_insert(bencher: divan::Bencher, count: usize) {
-    let Probed { cache, hit, .. } = fixture(count);
+    static FULL: OnceLock<Vec<(Cache<Jid, Arc<()>>, AtomicUsize)>> = OnceLock::new();
+    let built = FULL.get_or_init(|| {
+        CHAT_COUNTS
+            .iter()
+            .map(|&n| {
+                let cache: Cache<Jid, Arc<()>> = Cache::builder()
+                    .max_capacity(n as u64)
+                    .evict_guard(|v: &Arc<()>| Arc::strong_count(v) <= 1)
+                    .build();
+                block_on(async {
+                    for i in 0..n {
+                        cache.insert(chat_jid(i), Arc::new(())).await;
+                    }
+                });
+                (cache, AtomicUsize::new(n))
+            })
+            .collect()
+    });
+    let (cache, next) = &built[CHAT_COUNTS
+        .iter()
+        .position(|&n| n == count)
+        .expect("known chat count")];
+
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
         for _ in 0..BATCH {
-            block_on(cache.insert(black_box(hit).clone(), Arc::new(())));
+            let key = chat_jid(next.fetch_add(1, Ordering::Relaxed));
+            block_on(cache.insert(black_box(key), Arc::new(())));
         }
         black_box(cache.entry_count())
     });
