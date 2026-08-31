@@ -178,7 +178,18 @@ pub fn media_type_from_message(msg: &wa::Message) -> Option<&'static str> {
     // WA Web's mediaTypeFromProtobuf treats a top-level lottieStickerMessage as a
     // terminal "sticker" and does NOT recurse into it (unlike typeAttributeFromProtobuf,
     // which unwraps it via getUnwrappedProtobufMessage). Check before the shared unwrap.
-    if msg.lottie_sticker_message.is_set() {
+    // A lottie behind `bot_forwarded_message` counts too: that wrapper is absent
+    // from mediaTypeFromProtobuf's own list but present in the shared unwrap, so
+    // without this the check above misses it, the unwrap descends past it, and
+    // the stanza goes out `media` with no mediatype — the shape the recipient
+    // drops.
+    if msg.lottie_sticker_message.is_set()
+        || msg
+            .bot_forwarded_message
+            .as_option()
+            .and_then(|w| w.message.as_option())
+            .is_some_and(|inner| inner.lottie_sticker_message.is_set())
+    {
         return Some("sticker");
     }
 

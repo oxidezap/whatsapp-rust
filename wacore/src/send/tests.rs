@@ -2664,9 +2664,6 @@ mod stanza_type {
 
     #[test]
     fn bot_forwarded_classifies_by_inner() {
-        // The wrapper is unwrapped, not classified: a rich response inside is
-        // text, an image inside is media *with* a mediatype. Sending the image
-        // case as text is what the guard in #692 exists to prevent.
         let rich = wa::Message {
             bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
                 rich_response_message: buffa::MessageField::some(Default::default()),
@@ -2687,12 +2684,23 @@ mod stanza_type {
         assert_eq!(stanza_type_from_message(&img), stanza::MSG_TYPE_MEDIA);
         assert_eq!(media_type_from_message(&img), Some("image"));
 
-        // Empty inner is the one case WA Web answers with text.
         let vazio = wa::Message {
             bot_forwarded_message: buffa::MessageField::some(Default::default()),
             ..Default::default()
         };
         assert_eq!(stanza_type_from_message(&vazio), stanza::MSG_TYPE_TEXT);
+    }
+
+    #[test]
+    fn lottie_behind_bot_forwarded_stays_sticker() {
+        let m = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                lottie_sticker_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(media_type_from_message(&m), Some("sticker"));
     }
 
     #[test]
