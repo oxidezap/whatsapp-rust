@@ -50,15 +50,40 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 /// Live-chat counts worth distinguishing. The default `chat_lanes_capacity` is
-/// 5000, so none of these evict; what changes across them is how deep the map
-/// is when the lookup lands.
+/// 5000, so none of these evict on the lookup benches; what changes across them
+/// is how deep the map is when the lookup lands.
 const CHAT_COUNTS: [usize; 3] = [16, 256, 4096];
 
 /// Lookups per measured iteration.
 const BATCH: usize = 1024;
 
+/// Fixed-width so every key costs the same to hash and compare, whichever
+/// rotation a bench is on. Six digits covers the largest fixture with room to
+/// spare, and never widens mid-run.
 fn chat_jid(i: usize) -> Jid {
     Jid::pn(format!("5511999{i:06}"))
+}
+
+/// `count + 1` keys per chat count, built once. One more than the cache holds,
+/// so a rotation through them always lands on the key that is currently absent
+/// -- which is what lets the creation bench stay on the miss path without
+/// building a key inside the measured loop.
+fn keys(count: usize) -> &'static [Jid] {
+    static KEYS: OnceLock<Vec<Vec<Jid>>> = OnceLock::new();
+    let built = KEYS.get_or_init(|| {
+        CHAT_COUNTS
+            .iter()
+            .map(|&n| (0..=n).map(chat_jid).collect())
+            .collect()
+    });
+    &built[index_of(count)]
+}
+
+fn index_of(count: usize) -> usize {
+    CHAT_COUNTS
+        .iter()
+        .position(|&n| n == count)
+        .expect("known chat count")
 }
 
 /// A warm cache plus the two probes into it, one of each outcome.
@@ -92,10 +117,7 @@ fn fixture(count: usize) -> &'static Probed {
             })
             .collect()
     });
-    &built[CHAT_COUNTS
-        .iter()
-        .position(|&n| n == count)
-        .expect("known chat count")]
+    &built[index_of(count)]
 }
 
 /// The per-message path: an existing chat resolves its lane.
@@ -124,55 +146,76 @@ fn bench_chat_lane_get_miss(bencher: divan::Bencher, count: usize) {
     });
 }
 
-/// Creating the lane, which is what a miss leads to.
-///
-/// A separate fixture from the lookups above, and built at `max_capacity =
-/// count` on purpose: inserting a key the cache already holds takes an
-/// overwrite branch that returns before `insert_new` and measures none of what
-/// creating a lane costs -- the key clone, the FIFO bookkeeping, the capacity
-/// check, the new map entry. Every key here is new, so every iteration goes
-/// through that path, and the cache sits at capacity so each insert also pays
-/// the eviction it triggers. That is the steady state of a client with more
-/// live chats than `chat_lanes_capacity`, which is the state a long-lived one
-/// is in.
-#[divan::bench(args = CHAT_COUNTS)]
-fn bench_chat_lane_insert(bencher: divan::Bencher, count: usize) {
-    /// A cache held at capacity, plus the next unused chat index.
-    struct AtCapacity {
-        cache: Cache<Jid, Arc<()>>,
-        next: AtomicUsize,
-    }
+/// A cache held at capacity, and the rotation position that is absent from it.
+struct AtCapacity {
+    cache: Cache<Jid, Arc<()>>,
+    next: AtomicUsize,
+    /// Values kept alive so `evict_guard` refuses them, standing in for lanes
+    /// whose `enqueue_lock` is still held by message processing. Never read;
+    /// holding the `Arc` is the whole point.
+    _protected: Vec<Arc<()>>,
+}
 
-    static FULL: OnceLock<Vec<AtCapacity>> = OnceLock::new();
+/// Creating a lane, which is what a first message from a chat actually does.
+///
+/// Driven through `get_with_by_ref`, not `insert`, because that is what
+/// `handlers::message` calls: the miss path behind it hashes and acquires a
+/// per-key init lock, re-checks under it, converts the borrowed key to an owned
+/// one, inserts, clones the value out and reclaims the lock. A bare `insert`
+/// measures none of that, and an `insert` of a key already present measures
+/// less still -- it returns from the overwrite branch before `insert_new`.
+///
+/// The cache is built at `max_capacity = count` and the keys rotate through
+/// `count + 1` prebuilt values, so every iteration lands on the one key FIFO
+/// eviction has just removed: always a miss, always the same key width, and no
+/// allocation inside the measured loop.
+///
+/// `PROTECTED` picks whether some entries are ineligible for eviction. That is
+/// the guard `chat_lanes` actually runs -- a lane whose lock is held must be
+/// skipped -- and it makes the eviction scan walk past entries instead of
+/// taking the first FIFO candidate, which is the depth-dependent part.
+#[divan::bench(args = CHAT_COUNTS, consts = [0usize, 8usize])]
+fn bench_chat_lane_create<const PROTECTED: usize>(bencher: divan::Bencher, count: usize) {
+    static FULL: OnceLock<Vec<Vec<AtCapacity>>> = OnceLock::new();
     let built = FULL.get_or_init(|| {
-        CHAT_COUNTS
+        [0usize, 8usize]
             .iter()
-            .map(|&n| {
-                let cache: Cache<Jid, Arc<()>> = Cache::builder()
-                    .max_capacity(n as u64)
-                    .evict_guard(|v: &Arc<()>| Arc::strong_count(v) <= 1)
-                    .build();
-                block_on(async {
-                    for i in 0..n {
-                        cache.insert(chat_jid(i), Arc::new(())).await;
-                    }
-                });
-                AtCapacity {
-                    cache,
-                    next: AtomicUsize::new(n),
-                }
+            .map(|&protected| {
+                CHAT_COUNTS
+                    .iter()
+                    .map(|&n| {
+                        let cache: Cache<Jid, Arc<()>> = Cache::builder()
+                            .max_capacity(n as u64)
+                            .evict_guard(|v: &Arc<()>| Arc::strong_count(v) <= 1)
+                            .build();
+                        let mut held = Vec::new();
+                        block_on(async {
+                            for (i, key) in keys(n).iter().take(n).enumerate() {
+                                let value = Arc::new(());
+                                if i < protected {
+                                    held.push(Arc::clone(&value));
+                                }
+                                cache.insert(key.clone(), value).await;
+                            }
+                        });
+                        AtCapacity {
+                            cache,
+                            next: AtomicUsize::new(n),
+                            _protected: held,
+                        }
+                    })
+                    .collect()
             })
             .collect()
     });
-    let AtCapacity { cache, next } = &built[CHAT_COUNTS
-        .iter()
-        .position(|&n| n == count)
-        .expect("known chat count")];
+    let slot = if PROTECTED == 0 { 0 } else { 1 };
+    let AtCapacity { cache, next, .. } = &built[slot][index_of(count)];
+    let keys = keys(count);
 
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
         for _ in 0..BATCH {
-            let key = chat_jid(next.fetch_add(1, Ordering::Relaxed));
-            block_on(cache.insert(black_box(key), Arc::new(())));
+            let i = next.fetch_add(1, Ordering::Relaxed) % keys.len();
+            block_on(cache.get_with_by_ref(black_box(&keys[i]), async { Arc::new(()) }));
         }
         black_box(cache.entry_count())
     });

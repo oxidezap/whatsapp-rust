@@ -221,15 +221,22 @@ fn bench_jid_hashmap_insert(bencher: divan::Bencher, size: usize) {
     });
 }
 
-/// A warm map plus the two probes into it, one of each outcome.
+/// A warm map plus a full set of probes for each outcome.
 struct Probed {
     map: HashMap<Jid, ()>,
-    hit: Jid,
-    miss: Jid,
+    hits: Vec<Jid>,
+    misses: Vec<Jid>,
 }
 
 /// The per-message shape: one lookup into a warm map. Hit and miss are separate
 /// because a miss stops at the hash and a hit pays the `==` on top of it.
+///
+/// Each batch cycles through every key rather than repeating one. `HashMap`'s
+/// default hasher is seeded per process, so a single probe's bucket and
+/// collision chain are drawn fresh on every run: repeating it would let the
+/// same code measure differently between a baseline and a PR, and batching
+/// would only amplify whichever path that one draw happened to pick. Averaging
+/// over the whole key set makes the layout wash out instead.
 #[divan::bench(args = FANOUT_SIZES, consts = [true, false])]
 fn bench_jid_hashmap_get<const HIT: bool>(bencher: divan::Bencher, size: usize) {
     static MAPS: OnceLock<Vec<Probed>> = OnceLock::new();
@@ -238,8 +245,12 @@ fn bench_jid_hashmap_get<const HIT: bool>(bencher: divan::Bencher, size: usize) 
             .iter()
             .map(|&n| Probed {
                 map: fanout(n).iter().map(|j| (j.clone(), ())).collect(),
-                hit: fanout(n)[n / 2].clone(),
-                miss: pn_device("5511000000000", 1),
+                hits: fanout(n).to_vec(),
+                // Same shape and width as the hits, so a miss differs only in
+                // being absent.
+                misses: (0..n)
+                    .map(|i| pn_device(&format!("5511000{i:06}"), (i % 8) as u16))
+                    .collect(),
             })
             .collect()
     });
@@ -247,11 +258,12 @@ fn bench_jid_hashmap_get<const HIT: bool>(bencher: divan::Bencher, size: usize) 
         .iter()
         .position(|&n| n == size)
         .expect("known fan-out size")];
-    let (map, probe) = (&probed.map, if HIT { &probed.hit } else { &probed.miss });
+    let map = &probed.map;
+    let probes: &[Jid] = if HIT { &probed.hits } else { &probed.misses };
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
         let mut found = 0usize;
-        for _ in 0..BATCH {
-            found += map.get(black_box(probe)).is_some() as usize;
+        for i in 0..BATCH {
+            found += map.get(black_box(&probes[i % probes.len()])).is_some() as usize;
         }
         black_box(found)
     });
