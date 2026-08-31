@@ -137,7 +137,13 @@ fn bench_chat_lane_get_miss(bencher: divan::Bencher, count: usize) {
 /// is in.
 #[divan::bench(args = CHAT_COUNTS)]
 fn bench_chat_lane_insert(bencher: divan::Bencher, count: usize) {
-    static FULL: OnceLock<Vec<(Cache<Jid, Arc<()>>, AtomicUsize)>> = OnceLock::new();
+    /// A cache held at capacity, plus the next unused chat index.
+    struct AtCapacity {
+        cache: Cache<Jid, Arc<()>>,
+        next: AtomicUsize,
+    }
+
+    static FULL: OnceLock<Vec<AtCapacity>> = OnceLock::new();
     let built = FULL.get_or_init(|| {
         CHAT_COUNTS
             .iter()
@@ -151,11 +157,14 @@ fn bench_chat_lane_insert(bencher: divan::Bencher, count: usize) {
                         cache.insert(chat_jid(i), Arc::new(())).await;
                     }
                 });
-                (cache, AtomicUsize::new(n))
+                AtCapacity {
+                    cache,
+                    next: AtomicUsize::new(n),
+                }
             })
             .collect()
     });
-    let (cache, next) = &built[CHAT_COUNTS
+    let AtCapacity { cache, next } = &built[CHAT_COUNTS
         .iter()
         .position(|&n| n == count)
         .expect("known chat count")];
