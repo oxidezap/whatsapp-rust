@@ -120,6 +120,32 @@ where
         let keys = get_keys(key_id)?;
         let computed = initial_state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
         if computed != *mac_expected {
+            // Two things can produce this, and they need opposite fixes: the key
+            // we derived is wrong, or the ltHash we folded is. They are
+            // indistinguishable from the MACs alone, and the MAC is checked
+            // before any record is decoded -- so nothing downstream ever gets to
+            // disagree. Decoding one record answers it: the value MAC inside it
+            // is derived from the same expanded key, so a record that decodes
+            // proves the key is right and points at the fold.
+            let key_probe = snapshot
+                .records
+                .first()
+                .map(|rec| {
+                    decode_record(
+                        wa::syncd_mutation::SyncdOperation::SET,
+                        rec,
+                        &keys,
+                        key_id,
+                        true,
+                    )
+                })
+                .map(|r| match r {
+                    Ok(_) => "the key is right, so the fold is what differs",
+                    Err(_) => "the key does not decode this snapshot either",
+                })
+                .unwrap_or("the snapshot carries no records to probe");
+            let distinct_indices = last_record_per_index(&snapshot.records).len();
+
             // The identifying line stays at warn, because a collection that
             // strands itself has to be visible without turning logging up. The
             // MACs and the ltHash do not: a snapshot MAC is HMAC output under
@@ -136,12 +162,16 @@ where
             );
             debug!(
                 target: "AppState",
-                "Snapshot {} v{} MAC mismatch: computed={}, expected={}, ltHash={}",
+                "Snapshot {} v{} MAC mismatch: computed={}, expected={}, ltHash={}, \
+                 {} of {} records carry a distinct index, key probe says {}",
                 collection_name,
                 version,
                 hex::encode(&computed),
                 hex::encode(mac_expected),
-                hex::encode(&initial_state.hash[120..])
+                hex::encode(&initial_state.hash[120..]),
+                distinct_indices,
+                snapshot.records.len(),
+                key_probe
             );
             return Err(AppStateError::SnapshotMACMismatch);
         }
