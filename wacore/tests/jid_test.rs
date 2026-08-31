@@ -60,19 +60,34 @@ fn test_is_ad_logic() {
 
 #[test]
 fn test_legacy_and_agent_jid_parsing() {
-    // Test case 1: Legacy companion device JID (e.g., from an older WhatsApp Web)
-    // This is the primary failing case. The parser incorrectly identifies '.13' as an agent.
-    let legacy_jid_str = format!("1234567890.13@{}", SERVER_JID);
-    let legacy_jid = Jid::from_str(&legacy_jid_str).expect("test JID should be valid");
+    // A dotted number on a phone user is the agent, and the agent is inert
+    // there, so the JID still addresses the primary device.
+    //
+    // This block used to assert the opposite -- that `.13` was a companion
+    // device -- on the strength of a comment about "an older WhatsApp Web".
+    // Three things in the current bundle say otherwise, and one of them is
+    // decisive: WA Web's phoneDevice pattern requires the colon group
+    // (`(:[0-9]{1,2})` is not optional), so a dotted-only JID is a phoneUser
+    // and cannot be a device at all. `WAJids.parseJidParts` then splits `:`
+    // into `device` and `.` into `agent`, and `stripAgentIdFromPhoneDeviceJid`
+    // exists to drop exactly that field. This repository already agreed in one
+    // place: `push_phash_form_to` renders `user.0:device@server`, putting the
+    // agent before the colon and the device after it.
+    let dotted_jid_str = format!("1234567890.13@{}", SERVER_JID);
+    let dotted_jid = Jid::from_str(&dotted_jid_str).expect("test JID should be valid");
+    assert_eq!(dotted_jid.user, "1234567890", "the user stops at the dot");
+    assert_eq!(dotted_jid.agent, 13, "the dotted number is the agent");
+    assert_eq!(dotted_jid.device, 0, "a device only ever follows a colon");
     assert_eq!(
-        legacy_jid.user, "1234567890",
-        "Legacy JID user part is incorrect"
-    );
-    assert_eq!(legacy_jid.device, 13, "Legacy JID device part should be 13");
-    assert_eq!(legacy_jid.agent, 0, "Legacy JID agent part should be 0");
-    assert_eq!(
-        legacy_jid.server, SERVER_JID,
+        dotted_jid.server, SERVER_JID,
         "Legacy JID server part is incorrect"
+    );
+    // The agent is not rendered on the phone namespace, so this is the same
+    // identity as the bare user and addresses the same device.
+    assert!(!dotted_jid.is_ad(), "no device means not an AD jid");
+    assert_eq!(
+        dotted_jid,
+        Jid::from_str(&format!("1234567890@{SERVER_JID}")).expect("bare user parses")
     );
 
     // Test case 2: Modern companion device JID (for comparison)
