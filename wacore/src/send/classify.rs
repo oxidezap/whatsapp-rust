@@ -107,6 +107,15 @@ pub fn stanza_type_from_message(msg: &wa::Message) -> &'static str {
         || msg.newsletter_follower_invite_message_v2.is_set()
         || msg.message_history_notice.is_set()
         || msg.album_message.is_set()
+        // AI rich-response family (bot-forwarded games/cards, rich responses).
+        // WA Web's typeAttributeFromProtobuf leaves these at the media default,
+        // but a media stanza carrying no concrete mediatype does not render on
+        // the recipient — the same failure the payment family below documents.
+        // Text delivers and renders. `bot_forwarded_message` is a
+        // FutureProofMessage wrapper that classify does not unwrap, so it is
+        // matched here at the top level rather than via the inner message.
+        || msg.bot_forwarded_message.is_set()
+        || msg.rich_response_message.is_set()
         // Payment family. WA Web's typeAttributeFromProtobuf leaves these at the media
         // default, but media-without-mediatype is dropped by the server (so is a bare
         // "pay" stanza); text is what delivers and renders on Android.

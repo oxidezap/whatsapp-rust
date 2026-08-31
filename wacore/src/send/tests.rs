@@ -2653,6 +2653,29 @@ mod stanza_type {
     }
 
     #[test]
+    fn ai_rich_response_family_is_text() {
+        // A bot-forwarded rich response (the HTML-card / game payload) carries no
+        // concrete mediatype, so the media default would be dropped by the
+        // recipient and render nothing. Same remedy as the payment family: text.
+        // `bot_forwarded_message` is a FutureProofMessage wrapper classify does
+        // not unwrap, so an empty inner still classifies as text at top level.
+        let cases = [
+            wa::Message {
+                bot_forwarded_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            },
+            wa::Message {
+                rich_response_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            },
+        ];
+        for m in cases {
+            assert_eq!(media_type_from_message(&m), None);
+            assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_TEXT);
+        }
+    }
+
+    #[test]
     fn backfilled_wrappers_classify_by_inner() {
         let spoiler = wa::Message {
             spoiler_message: buffa::MessageField::some(fpm(text_inner())),
