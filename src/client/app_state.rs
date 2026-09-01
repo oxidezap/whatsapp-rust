@@ -3377,7 +3377,11 @@ impl Client {
         // reservation held here stops excluding the new connection's own sync
         // from the very rows about to be written. So the apply asks again, on
         // the far side of that work and in front of the first write.
-        let still_current = || self.connection_generation.load(Ordering::Acquire) == generation;
+        // The counter, not `self`: the predicate is `Send + Sync` so it can be
+        // held across the awaits inside the apply, and `Client` carries trait
+        // objects that are neither on wasm.
+        let live = Arc::clone(&self.connection_generation);
+        let still_current = move || live.load(Ordering::Acquire) == generation;
         match proc
             .apply_snapshot_recovery(recovery, name, &still_current)
             .await
