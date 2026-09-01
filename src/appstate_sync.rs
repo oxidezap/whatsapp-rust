@@ -559,6 +559,74 @@ mod tests {
         );
     }
 
+    /// The MAC store keeps one value per index, so a collection that names an
+    /// index twice persists one of them. Dispatching the loser beside the winner
+    /// would hand a consumer state the persisted collection does not describe --
+    /// and delivery is concurrent, so it could be the one that sticks. The
+    /// snapshot path picks the last record per index; so does this.
+    #[tokio::test]
+    async fn a_repeated_index_in_a_recovery_dispatches_only_its_last_record() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let key_id = b"test_key_id".to_vec();
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let index = r#"["mute","1@s.whatsapp.net"]"#;
+        let recovery = recovery_of(
+            "regular_low",
+            253,
+            [0x5A; 128],
+            &key_id,
+            // The same index twice, then a second index that must survive.
+            &[
+                (index, [0x11; 32]),
+                (index, [0x22; 32]),
+                (r#"["mute","2@s.whatsapp.net"]"#, [0x33; 32]),
+            ],
+        );
+
+        let outcome = processor
+            .apply_snapshot_recovery(recovery, "regular_low", &|| true)
+            .await
+            .expect("a recovery with a repeated index still applies");
+        let RecoveryOutcome::Applied(mutations) = outcome else {
+            panic!("{outcome:?}");
+        };
+
+        assert_eq!(
+            mutations.len(),
+            2,
+            "the losing record is not dispatched: {mutations:?}"
+        );
+        assert_eq!(mutations[0].index, vec!["mute", "1@s.whatsapp.net"]);
+        assert_eq!(mutations[1].index, vec!["mute", "2@s.whatsapp.net"]);
+
+        // And what the store kept is the winner's MAC, which is what the next
+        // patch overwriting this index has to subtract.
+        let index_mac = wacore::appstate::hash::generate_index_mac(index.as_bytes(), &keys.index);
+        let got = backend
+            .get_mutation_mac("regular_low", &index_mac)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0x22u8; 32][..]),
+            "the last record for the index is the one that stands"
+        );
+    }
+
     /// The reservation this write runs under is a connection's, and a disconnect
     /// drops the whole registry -- so a recovery that is still doing its key
     /// lookups and its HMACs when one happens no longer excludes the new

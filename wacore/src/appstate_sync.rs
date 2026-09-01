@@ -414,9 +414,39 @@ impl AppStateProcessor {
         // needs.
         let owned_name = name.to_string();
         let (mutations, macs) = crate::runtime::blocking(&*self.runtime, move || {
+            // One winner per index -- the last record for it -- which is the
+            // rule the snapshot path already applies, for the reason it gives:
+            // the MAC store keeps a single value per index, so a loser that was
+            // dispatched anyway would hand a consumer a mute, a contact or a
+            // label the collection we just persisted does not describe, and
+            // event delivery is concurrent, so it could be the one that sticks.
+            let winners: Vec<bool> = {
+                let mut winners = vec![true; recovery.mutation_records.len()];
+                let mut seen: Vec<&[u8]> = Vec::new();
+                // Backwards, so the first hit for an index is its last record.
+                for (i, record) in recovery.mutation_records.iter().enumerate().rev() {
+                    // A record missing its value or index is not silently
+                    // dropped here: it falls through to the loop below, which
+                    // refuses the whole recovery over it.
+                    let Some(index) = record.value.as_option().and_then(|v| v.index.as_deref())
+                    else {
+                        continue;
+                    };
+                    if seen.contains(&index) {
+                        winners[i] = false;
+                    } else {
+                        seen.push(index);
+                    }
+                }
+                winners
+            };
+
             let mut mutations = Vec::with_capacity(recovery.mutation_records.len());
             let mut macs = Vec::with_capacity(recovery.mutation_records.len());
             for (i, record) in recovery.mutation_records.into_iter().enumerate() {
+                if !winners[i] {
+                    continue;
+                }
                 let action = record.value.into_option().ok_or_else(|| {
                     anyhow!("recovery record {i} of {owned_name} carries no value")
                 })?;

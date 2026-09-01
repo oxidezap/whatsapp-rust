@@ -310,13 +310,28 @@ impl Client {
         self: &Arc<Self>,
         collection: &str,
     ) -> Result<String, anyhow::Error> {
-        // Enforced here as well as at the escalation, because this is public and
-        // takes a name: a caller asking for the block list would otherwise mark
-        // it pending and send, and the reply passes the known-collection check
-        // and applies. Rebuilding a block list from a device that may itself be
-        // behind is the one collection where being wrong means talking to
-        // somebody who was blocked.
-        if collection == wacore::appstate::patch_decode::WAPatchName::CriticalBlock.as_str() {
+        // Both gates are enforced here as well as at the escalation, because this
+        // is public and takes a name.
+        //
+        // A name this client has no rules for is refused outright: the reply
+        // side rejects `Unknown` *before* spending the marker, and an
+        // outstanding request only ever expires when the same name is asked for
+        // again -- so one typo would sit in the map for the life of the process,
+        // having been sent to the phone for nothing.
+        let patch_name = collection
+            .parse::<wacore::appstate::patch_decode::WAPatchName>()
+            .unwrap_or(wacore::appstate::patch_decode::WAPatchName::Unknown);
+        if patch_name == wacore::appstate::patch_decode::WAPatchName::Unknown {
+            return Err(anyhow::anyhow!(
+                "{collection} is not an app-state collection this client knows"
+            ));
+        }
+        // And the block list is refused because a caller asking for it would
+        // otherwise mark it pending and send, and the reply passes the
+        // known-collection check and applies. Rebuilding a block list from a
+        // device that may itself be behind is the one collection where being
+        // wrong means talking to somebody who was blocked.
+        if patch_name == wacore::appstate::patch_decode::WAPatchName::CriticalBlock {
             return Err(anyhow::anyhow!(
                 "the block list is not recovered from the primary"
             ));
@@ -497,6 +512,23 @@ impl Client {
             }
             return;
         };
+
+        // Correlated before a byte is cloned or inflated. A stale, duplicate or
+        // simply unsolicited type-8 reply is refused by the same lookup either
+        // way, and doing it here rather than after the decode is the difference
+        // between a map read and up to 64 MiB of inflate plus a record graph
+        // built for something that was never eligible to apply. The lookup runs
+        // again inside the task, because a request can expire while the decode
+        // is under way; this one only stops the work from starting.
+        if self
+            .get_app_state_processor()
+            .collection_for_request_id(request_id)
+            .await
+            .is_none()
+        {
+            warn!("Ignoring a snapshot recovery nothing here asked for");
+            return;
+        }
 
         // The whole continuation is detached, not just the CPU inside it.
         // `receive.rs` awaits this handler inline and inbound processing is
