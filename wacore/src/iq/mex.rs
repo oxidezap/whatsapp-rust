@@ -378,4 +378,35 @@ mod tests {
             "Group does not exist"
         )));
     }
+
+    /// The whole point of the typed error: a fatal GraphQL code has to survive
+    /// `parse_response`, because the IQ layer erases everything else about it
+    /// and a caller reads a MEX 404 as "nothing here" rather than as a failure.
+    #[test]
+    fn a_fatal_graphql_code_survives_parse_response() {
+        let spec = MexQuerySpec::new(TEST_DOC, &json!({})).expect("serialize test variables");
+        let payload = json!({
+            "data": null,
+            "errors": [{
+                "message": "no username",
+                "extensions": {"error_code": 404, "is_retryable": false, "severity": "CRITICAL"}
+            }]
+        })
+        .to_string();
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("result")
+                .bytes(payload.into_bytes())
+                .build()])
+            .build();
+
+        let error = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("a fatal error must fail the parse");
+        let fatal = error
+            .downcast_ref::<MexFatalError>()
+            .expect("the fatal error keeps its type");
+        assert_eq!(fatal.code, 404);
+        assert_eq!(fatal.query, TEST_DOC.name);
+    }
 }

@@ -803,20 +803,4 @@ mod tests {
             Err(MexError::PayloadParsing(_))
         ));
     }
-
-    /// The server reports "no username on this account" as a fatal GraphQL 404,
-    /// which reaches a caller through `IqError::ParseError`; recovering the code
-    /// from the typed source is what keeps that from reading as a failure.
-    #[test]
-    fn a_fatal_graphql_error_keeps_its_code() {
-        let fatal = MexFatalError {
-            query: "WAWebMexGetUsernameJobQuery",
-            code: 404,
-            message: "not found".to_owned(),
-        };
-        let recovered = anyhow::Error::from(fatal)
-            .downcast_ref::<MexFatalError>()
-            .map(|fatal| fatal.code);
-        assert_eq!(recovered, Some(404));
-    }
 }

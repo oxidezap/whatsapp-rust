@@ -592,24 +592,27 @@ impl IqSpec for UsernameLookupSpec {
         let Some(user) = response.users.into_iter().next() else {
             return Ok(UsernameLookup::NotFound);
         };
-        // A contact subprotocol that failed for this user answers nothing about
-        // the handle, so it must not read as a resolved or key-gated account:
-        // `find_by_username` would persist a LID/PN pair off it.
+        // The contact result is the whole answer to a username lookup, so
+        // anything short of a successful one must not read as a resolved or
+        // key-gated account: `find_by_username` would persist a LID/PN pair off
+        // it. WhatsApp Web reads `contact.type` unconditionally here, which says
+        // it never expects the node to be missing either.
         let contact = match user.protocol(UsyncProtocolKind::Contact) {
-            Some(UsyncProtocolResult::Contact(UsyncOutcome::Value(contact))) => Some(contact),
+            Some(UsyncProtocolResult::Contact(UsyncOutcome::Value(contact))) => contact,
             Some(UsyncProtocolResult::Contact(UsyncOutcome::Error(error))) => {
                 return Err(anyhow!(usync_subprotocol_error_message(
                     UsyncProtocolKind::Contact.as_str(),
                     error
                 )));
             }
-            _ => None,
+            _ => return Err(anyhow!("username lookup answered without a contact result")),
         };
-        if contact.is_some_and(|contact| contact.contact_type == CONTACT_TYPE_OUT) {
+        if contact.contact_type == CONTACT_TYPE_OUT {
             return Ok(UsernameLookup::NotFound);
         }
         let username = contact
-            .and_then(|contact| contact.username.clone())
+            .username
+            .clone()
             .filter(|username| !username.is_empty());
         let (is_business, verified_name, _) = project_business(&user);
         let pn_jid = match user.protocol(UsyncProtocolKind::Business) {
@@ -2513,6 +2516,25 @@ mod tests {
             spec.parse_response(&empty.as_node_ref()).unwrap(),
             UsernameLookup::NotFound
         );
+    }
+
+    /// A `<user>` the contact subprotocol never spoke for is not a resolution,
+    /// however much of it the server filled in.
+    #[test]
+    fn username_lookup_refuses_to_resolve_without_a_contact_result() {
+        let spec = UsernameLookupSpec::new("example.handle", None, "sid-1").unwrap();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "100000001@lid")
+                .children([NodeBuilder::new("business").build()])
+                .build(),
+        ]);
+
+        let error = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("a user with no contact result cannot resolve a handle")
+            .to_string();
+        assert!(error.contains("contact result"), "{error}");
     }
 
     /// A deletion the server reports through the subprotocol must not be undone
