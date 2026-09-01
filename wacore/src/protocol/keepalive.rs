@@ -165,14 +165,16 @@ mod tests {
         assert!(is_dead_socket_at(armed, None, now));
     }
 
-    /// Regression for the wake-from-suspend false positive (issue #1376).
+    /// A socket idle for a moment is not a dead socket: a receive, then the send
+    /// that arms the anchor, then one second of elapsed time.
     ///
-    /// A receive, then a send that arms the anchor, then one second of real
-    /// time. A wall clock that leapt twelve hours inside that second (a resumed
-    /// laptop re-syncing NTP) has no way to reach this decision any more,
-    /// because none of these three values is a wall-clock timestamp.
+    /// The wake-from-suspend false positive (issue #1376) is ruled out a level
+    /// up rather than here: these arguments are monotonic `Instant`s, so a
+    /// wall-clock timestamp no longer type-checks into this predicate, and the
+    /// anchors that feed it are pinned to the monotonic clock by
+    /// `wire_bookkeeping_reads_the_clock_only_where_a_value_is_used`.
     #[test]
-    fn a_wall_clock_jump_does_not_declare_a_live_socket_dead() {
+    fn a_briefly_idle_socket_is_not_dead() {
         let received = at(1_000);
         let armed = received + Duration::from_millis(1);
         assert!(!is_dead_socket_at(

@@ -293,6 +293,21 @@ impl WallDerivedMonotonicProvider {
 impl MonotonicProvider for WallDerivedMonotonicProvider {
     fn now_nanos(&self) -> u64 {
         use std::sync::atomic::Ordering;
+        // Warn once: a caller on this fallback is measuring timeouts against a
+        // clock that still follows the wall clock forward, so a system-clock
+        // correction can fire the dead-socket watchdog on a healthy socket.
+        // The clamp below only rules out the backwards half of that.
+        {
+            use std::sync::atomic::AtomicBool;
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "wacore::time: no monotonic provider set on wasm32; deriving from the \
+                     wall clock, so a forward clock adjustment reads as elapsed time. \
+                     Call set_monotonic_provider() with performance.now() before the first timeout."
+                );
+            }
+        }
         let raw = (now_millis().max(0) as u64).saturating_mul(1_000_000);
         let mut last = self.last.load(Ordering::Relaxed);
         loop {
@@ -415,7 +430,10 @@ impl std::ops::Sub<Instant> for Instant {
 pub struct AtomicInstant(portable_atomic::AtomicU64);
 
 impl AtomicInstant {
-    /// Encoded as nanos + 1 so that 0 means unset.
+    /// Encoded as nanos + 1 so that 0 means unset, which reserves the top
+    /// nanosecond: `u64::MAX` and `u64::MAX - 1` both encode to `u64::MAX`.
+    /// That ceiling is inherited, not introduced -- [`StdMonotonicProvider`]
+    /// already saturates there, 584 years past any process start.
     fn encode(instant: Instant) -> u64 {
         instant.0.saturating_add(1)
     }

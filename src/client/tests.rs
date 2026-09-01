@@ -3237,12 +3237,16 @@ fn should_reset_backoff_requires_uptime_window_and_no_penalty() {
     ));
 }
 
-/// The stability window is real elapsed time, not a difference of wall-clock
-/// readings: a system clock that leaps forward (a laptop resuming and
-/// re-syncing NTP) must not sell a connection seconds old as thirty seconds
-/// stable and drop the guard against a flapping server.
+/// The stability window is real elapsed time: a connection one second old is
+/// not thirty seconds stable, so the guard against a flapping server holds.
+///
+/// This is the window's arithmetic, not the clock-jump regression. A wall-clock
+/// reading can no longer reach this predicate at all, because `connected_at` is
+/// an `Instant` and the compiler rejects a millisecond timestamp in its place;
+/// what pins the anchor itself to the monotonic clock is
+/// `wire_bookkeeping_reads_the_clock_only_where_a_value_is_used`.
 #[test]
-fn a_wall_clock_jump_does_not_make_a_young_connection_look_stable() {
+fn only_elapsed_time_opens_the_stability_window() {
     let connected_at = wacore::time::Instant::now();
     let a_moment_later = connected_at + Duration::from_secs(1);
     assert!(!should_reset_backoff(

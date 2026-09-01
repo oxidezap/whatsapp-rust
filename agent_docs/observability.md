@@ -51,8 +51,9 @@ It also owns the activity timestamps the keepalive dead-socket watchdog reads:
 `last_data_received` (one clock read per received transport event, plus one
 more when that event carries several frames, so a slow drain is not read as
 silence) and `first_send_since_recv`, which every frame loads but only the
-send that arms or re-arms the anchor spends a clock read on. Both are
-`wacore::time::Instant`, never wall-clock stamps: the watchdog asks how much
+send that arms or re-arms the anchor spends a clock read on. Both are held as
+`wacore::time::AtomicInstant` (an atomic slot carrying a `wacore::time::Instant`
+or nothing), never wall-clock stamps: the watchdog asks how much
 time passed, and a wall clock answers that with whatever the system clock was
 last set to, so a laptop resuming from suspend used to kill a socket it had
 authenticated seconds earlier. `StatsSnapshot::last_data_received_ms` still
