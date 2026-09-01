@@ -1532,10 +1532,17 @@ pub struct Client {
     /// Flips only AFTER the drain-tail commit, so the tail's acks still join
     /// the aggregate offline-receipt drain.
     pub(crate) offline_sync_completed: Arc<AtomicBool>,
-    /// Once-guard for the drain finisher (the semaphore swap is not
-    /// idempotent). Separate from `offline_sync_completed` because the finish
-    /// runs off the read loop and the flag must flip only after its commit.
-    pub(crate) offline_sync_finish_started: Arc<AtomicBool>,
+    /// Highest connection generation whose drain finisher has started, held as
+    /// `generation + 1` so zero reads as "none yet". Separate from
+    /// `offline_sync_completed` because the finish runs off the read loop and
+    /// that flag must flip only after its commit.
+    ///
+    /// A once-guard because the semaphore swap is not idempotent, and stamped
+    /// with the generation for the same reason the terminal report is: a
+    /// completion descheduled past its own connection would otherwise claim
+    /// the boolean after a teardown cleared it, and the next connection's
+    /// completion would find the guard taken and never start a finisher.
+    pub(crate) offline_sync_finish_started: Arc<AtomicU64>,
     /// Highest connection generation whose resume already published a terminal
     /// event, either `OfflineSyncCompleted` or `OfflineSyncInterrupted`, held
     /// as `generation + 1` so zero reads as "none yet".

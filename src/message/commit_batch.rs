@@ -230,8 +230,13 @@ impl Client {
     /// test does — a send measured in drain mode is not the steady state.
     pub(crate) fn enter_live_mode_for_tests(&self) {
         self.offline_sync_completed.store(true, Ordering::Release);
-        self.offline_sync_finish_started
-            .store(true, Ordering::Release);
+        // The guard is a generation stamp now; mark the current one finished.
+        self.offline_sync_finish_started.store(
+            self.connection_generation
+                .load(Ordering::Acquire)
+                .saturating_add(1),
+            Ordering::Release,
+        );
         self.swap_message_semaphore(64);
         self.inbound_commit_batch.deactivate();
     }

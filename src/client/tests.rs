@@ -7331,7 +7331,6 @@ async fn one_resume_never_reports_both_terminal_events() {
     client
         .abandon_offline_sync_if_interrupted(client.connection_generation.load(Ordering::Acquire));
     client.complete_offline_sync(711).await;
-    client.wait_for_offline_delivery_end().await;
 
     let (interrupted, completed) = drain_offline_sync_events(&rx);
     assert_eq!(
@@ -7340,8 +7339,8 @@ async fn one_resume_never_reports_both_terminal_events() {
         "exactly one terminal event per resume, got interrupted={interrupted:?} completed={completed:?}"
     );
     assert!(
-        client.offline_sync_completed.load(Ordering::Acquire),
-        "suppressing the duplicate event must not suppress the live-state publication"
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "the loser publishes nothing at all: the winner's teardown owns this state"
     );
 }
 
@@ -7442,6 +7441,72 @@ async fn a_finisher_left_behind_by_two_connections_reports_nothing() {
     let (interrupted, completed) = drain_offline_sync_events(&rx);
     assert_eq!(interrupted.len(), 1, "the first drain's interruption");
     assert_eq!(completed, vec![25], "the second drain's own completion");
+}
+
+/// A completion descheduled past its own connection must not consume the
+/// finisher guard the next connection needs.
+///
+/// With a plain boolean the stale call claimed it after the teardown cleared
+/// it, and the next drain's completion then found the guard taken and never
+/// started a finisher, so that drain reported nothing at all.
+#[tokio::test]
+async fn a_stale_completion_does_not_consume_the_next_connection_finisher() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.cleanup_connection_state().await;
+
+    // The stale completion runs late, against a connection that is gone.
+    client
+        .complete_offline_sync_for_generation(711, stale_generation)
+        .await;
+
+    // The next connection's drain still gets its own finisher and its own event.
+    let live_generation = client.connection_generation.load(Ordering::Acquire);
+    arm_offline_drain(&client, 25, 25).await;
+    client
+        .complete_offline_sync_for_generation(25, live_generation)
+        .await;
+    client.wait_for_offline_delivery_end().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(interrupted.len(), 1, "the first drain's interruption");
+    assert_eq!(completed, vec![25], "the second drain still completes");
+}
+
+/// The startup waiter reports a teardown as soon as it happens.
+///
+/// A teardown ends this wait's answer but never notifies
+/// `offline_sync_notifier`, so a single await on that notifier sat out the
+/// caller's whole timeout before reporting a connection that had been gone the
+/// entire time.
+#[tokio::test]
+async fn wait_for_startup_sync_reports_a_teardown_without_waiting_out_its_timeout() {
+    let client = offline_resume_test_client().await;
+
+    let started = wacore::time::Instant::now();
+    let waiter = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.wait_for_startup_sync(Duration::from_secs(30)).await }
+    });
+    crate::test_utils::wait_for_notifier_listeners(&client.offline_sync_notifier, 1).await;
+
+    // The teardown lands under the parked waiter, and never notifies it.
+    client.connection_generation.fetch_add(1, Ordering::SeqCst);
+
+    let result = waiter.await.expect("waiter task must not panic");
+    let waited = started.elapsed();
+
+    assert!(result.is_err(), "a dead connection cannot have synced");
+    assert!(
+        waited < Duration::from_secs(5),
+        "reported after {waited:?}, which means it sat out the timeout"
+    );
 }
 
 /// A completion belongs to the connection whose drain it is.

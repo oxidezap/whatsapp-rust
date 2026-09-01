@@ -327,11 +327,7 @@ impl Client {
         // flips after the tail commit so the tail's acks still observe it as
         // false and join the aggregate offline-receipt drain (WA Web
         // `sendAggregateOfflineReceipts`) instead of going out 1:1.
-        if self
-            .offline_sync_finish_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if !Self::claim_generation_stamp(&self.offline_sync_finish_started, generation) {
             return;
         }
 
@@ -417,6 +413,20 @@ impl Client {
     /// widens the semaphore then. `None` (upgrade-failure fallback) leaves
     /// the buffer alone for the connection-state reset to clear.
     fn publish_offline_sync_live_state(&self, count: i32, durable: Option<bool>, generation: u64) {
+        // The claim is the serialization point for the whole transition, not
+        // just its event. Losing it means a teardown already reported this
+        // drain's end, or a newer drain overtook it: either way that teardown
+        // has reset the flag, the semaphore and the receipt buffer this would
+        // publish, and applying them now would be publishing one connection's
+        // drain onto another's state.
+        if !self.claim_offline_terminal_report(generation) {
+            log::debug!(
+                target: "Client/OfflineSync",
+                "Drain of generation {} was already ended by its teardown; leaving live state alone",
+                generation,
+            );
+            return;
+        }
         self.offline_sync_completed.store(true, Ordering::Release);
         if durable != Some(false) {
             self.swap_message_semaphore(64);
@@ -431,19 +441,36 @@ impl Client {
             }
             None => {}
         }
-        // Only the event is claimed, never the live-state publication above:
-        // the semaphore, the flag and the receipt flush must land whether or
-        // not a concurrent teardown already spoke for this drain.
-        if self.claim_offline_terminal_report(generation) {
-            self.core.event_bus.dispatch(Event::OfflineSyncCompleted(
-                OfflineSyncCompleted::builder().count(count).build(),
-            ));
-        }
+        self.core.event_bus.dispatch(Event::OfflineSyncCompleted(
+            OfflineSyncCompleted::builder().count(count).build(),
+        ));
         // Notified last, so a waiter that wakes on it can already see the
         // event: the notifier is the coarser signal and firing it first left a
         // window where the drain looked finished and its event had not been
         // dispatched yet.
         self.offline_sync_notifier.notify(usize::MAX);
+    }
+
+    /// Claim `stamp_cell` for `generation`, once, and never for a drain a
+    /// newer one has already overtaken.
+    ///
+    /// Generations only count up, so "a stamp at or above mine is already
+    /// there" decides both cases at once: my drain has been reported (or
+    /// finished) already, or I am a task descheduled past my own connection
+    /// and the answer is no longer mine to give. Cells hold `generation + 1`
+    /// so the initial zero reads as "none yet".
+    fn claim_generation_stamp(cell: &portable_atomic::AtomicU64, generation: u64) -> bool {
+        let stamp = generation.saturating_add(1);
+        let mut seen = cell.load(Ordering::Acquire);
+        loop {
+            if seen >= stamp {
+                return false;
+            }
+            match cell.compare_exchange_weak(seen, stamp, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(actual) => seen = actual,
+            }
+        }
     }
 
     /// Claim the right to publish the event that ends the resume of
@@ -456,22 +483,7 @@ impl Client {
     /// own teardown reported. Generations only count up, which is what makes
     /// the comparison a decision rather than a guess.
     pub(crate) fn claim_offline_terminal_report(&self, generation: u64) -> bool {
-        let stamp = generation.saturating_add(1);
-        let mut reported = self.offline_terminal_reported.load(Ordering::Acquire);
-        loop {
-            if reported >= stamp {
-                return false;
-            }
-            match self.offline_terminal_reported.compare_exchange_weak(
-                reported,
-                stamp,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => reported = actual,
-            }
-        }
+        Self::claim_generation_stamp(&self.offline_terminal_reported, generation)
     }
 
     /// Report a drain that ended before its `<ib><offline>` end marker.
@@ -631,17 +643,30 @@ impl Client {
                 || self.expected_disconnect.load(Ordering::Relaxed)
         };
 
-        // Register the notified future *before* checking state to avoid missing
-        // a notify_waiters() that fires between the check and the await.
-        let offline_fut = self.offline_sync_notifier.listen();
-        if !self.offline_sync_completed.load(Ordering::Relaxed) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            wacore::runtime::timeout(&*self.runtime, remaining, offline_fut)
-                .await
-                .map_err(|_| anyhow!("Timeout waiting for offline sync completion"))?;
+        // Ticked rather than one long wait: a teardown ends this wait's answer
+        // but does not notify `offline_sync_notifier`, so a single await on it
+        // would sit out the caller's whole timeout before reporting a
+        // connection that has been gone the entire time.
+        loop {
+            // Register the listener *before* checking state to avoid missing a
+            // notify that fires between the check and the await.
+            let offline_fut = self.offline_sync_notifier.listen();
+            if self.offline_sync_completed.load(Ordering::Relaxed) {
+                break;
+            }
             if connection_ended() {
                 return Err(anyhow!("Connection ended before offline sync completed"));
             }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("Timeout waiting for offline sync completion"));
+            }
+            let _ = wacore::runtime::timeout(
+                &*self.runtime,
+                remaining.min(Duration::from_millis(250)),
+                offline_fut,
+            )
+            .await;
         }
 
         loop {

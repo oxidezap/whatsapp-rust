@@ -516,7 +516,7 @@ impl Client {
             signed_pre_key_rotation_lock: Arc::new(Mutex::new(())),
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
-            offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
+            offline_sync_finish_started: Arc::new(AtomicU64::new(0)),
             offline_terminal_reported: Arc::new(AtomicU64::new(0)),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             inbound_commit_batch: Default::default(),
@@ -1061,8 +1061,6 @@ impl Client {
             self.connection_generation.load(Ordering::Acquire),
         );
         self.offline_sync_completed.store(false, Ordering::Relaxed);
-        self.offline_sync_finish_started
-            .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Uncommitted batch entries were never acked; the server redelivers
         // them on this fresh connection. The cache decision is coupled to the
@@ -1855,8 +1853,6 @@ impl Client {
         // the next drain will need.
         self.abandon_offline_sync_if_interrupted(closed_generation);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
-        self.offline_sync_finish_started
-            .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Same rule as receipts: uncommitted entries drop here and the server
         // redelivers them on the next connect. The cache falls with dropped
