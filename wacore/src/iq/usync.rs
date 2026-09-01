@@ -607,8 +607,18 @@ impl IqSpec for UsernameLookupSpec {
             }
             _ => return Err(anyhow!("username lookup answered without a contact result")),
         };
+        // WA Web only rejects "out" here, while the PN path of the same job
+        // requires "in". Take the stricter reading: a type this parser cannot
+        // name is not a confirmation, and a false `Found` writes an identity
+        // mapping to the LID/PN cache.
         if contact.contact_type == CONTACT_TYPE_OUT {
             return Ok(UsernameLookup::NotFound);
+        }
+        if contact.contact_type != CONTACT_TYPE_IN {
+            return Err(anyhow!(
+                "username lookup answered with an unknown contact type: {}",
+                contact.contact_type
+            ));
         }
         let username = contact
             .username
@@ -2643,5 +2653,25 @@ mod tests {
             .expect("the response still parses");
         assert!(results[0].is_registered);
         assert!(results[0].is_business);
+    }
+
+    /// Only "in" is a confirmation. A type this parser cannot name must not
+    /// resolve a handle, because `find_by_username` caches what it resolves.
+    #[test]
+    fn username_lookup_refuses_an_unknown_contact_type() {
+        let spec = UsernameLookupSpec::new("example.handle", None, "sid-1").unwrap();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "100000001@lid")
+                .children([NodeBuilder::new("contact").attr("type", "sideways").build()])
+                .build(),
+        ]);
+
+        let error = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("an unnameable contact type cannot resolve a handle")
+            .to_string();
+        assert!(error.contains("unknown contact type"), "{error}");
+        assert!(error.contains("sideways"), "{error}");
     }
 }
