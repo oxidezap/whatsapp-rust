@@ -3259,6 +3259,8 @@ impl Client {
     pub(crate) async fn apply_recovered_collection(
         &self,
         name: &str,
+        request_id: &str,
+        generation: u64,
         recovery: waproto::whatsapp::SyncdSnapshotRecovery,
     ) {
         // `WAPatchName::from_str` is infallible: every unrecognised name maps to
@@ -3301,7 +3303,16 @@ impl Client {
             let Some(key_id) = record.key_id.as_deref() else {
                 continue;
             };
-            if seen.insert(key_id.to_vec()) && proc.get_app_state_key(key_id).await.is_err() {
+            if !seen.insert(key_id.to_vec()) {
+                continue;
+            }
+            // Only a key that is genuinely absent. Any other store error means
+            // the key may well be there, and asking peers for it buys a ten
+            // second wait and a message nobody needed -- the apply below reports
+            // the real failure.
+            if let Err(wacore::appstate_sync::AppStateSyncError::KeyNotFound(_)) =
+                proc.get_app_state_key(key_id).await
+            {
                 missing_keys.push(key_id.to_vec());
             }
         }
@@ -3335,10 +3346,32 @@ impl Client {
             return;
         };
 
-        if !proc.take_recovery_request(name).await {
+        // Taken by the id, never by the name. The reservation above may wait
+        // longer than a request lives -- 450 seconds against a 300-second TTL --
+        // so by the time this runs the ask that produced this reply can have
+        // expired and been replaced. Taking by name would consume the
+        // replacement's marker, apply the older reply, and have the newer one
+        // refused as unsolicited.
+        if proc.take_recovery_request_by_id(request_id).await.is_none() {
             debug!(
                 target: "Client/AppState",
-                "Another reply already answered the recovery request for {name}"
+                "The recovery request for {name} is no longer outstanding; dropping this reply"
+            );
+            return;
+        }
+
+        // Rechecked after the waits above, not only before them. A disconnect
+        // during the key share or the reservation clears the registry, so the
+        // guard this holds would no longer exclude the new connection's own
+        // sync from the rows about to be written.
+        if self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            != generation
+        {
+            debug!(
+                target: "Client/AppState",
+                "Dropping the {name} recovery: the connection it belongs to went while it waited"
             );
             return;
         }

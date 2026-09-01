@@ -628,7 +628,9 @@ impl Client {
                 return;
             }
 
-            client.apply_recovered_collection(&asked, recovery).await;
+            client
+                .apply_recovered_collection(&asked, &request_id, generation, recovery)
+                .await;
         }));
     }
 
