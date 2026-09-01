@@ -2033,16 +2033,10 @@ impl CallEngine {
     /// waits for a keyframe the peer only emits when asked, which nobody was
     /// asking for.
     ///
-    /// Throttled, and not as a courtesy: a gap is *caused* by congestion, so the
-    /// requests arrive in bursts describing one loss, and each answer is the
-    /// largest frame the peer's encoder can make. One per
-    /// [`MIN_PEER_KEYFRAME_INTERVAL_MS`] is longer than any relayed round trip,
-    /// so a burst coalesces into the one request that can still be answered
-    /// before the next is allowed.
-    ///
     /// Returns whether a request reached the outbox: `false` for a call with no
     /// video plane, a plane that has authenticated no inbound stream yet -- there
-    /// is no picture to have lost -- and a request made too soon after the last.
+    /// is no picture to have lost -- and a request made too soon after the last
+    /// (the throttle, whose reasoning is with the interval it is measured in).
     pub fn request_peer_keyframe(&mut self, now: Millis) -> bool {
         let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) else {
             return false;
@@ -9578,13 +9572,17 @@ mod tests {
 
         let transport = derive_srtcp_keys(&call_key, SELF_LID).unwrap();
         let (plain, _) = unprotect_srtcp(&transport, local_video_ssrc, protected).unwrap();
-        assert_eq!(&plain[..4], &[0x81, RTCP_PT_PSFB, 0, 2]);
+        // 0x91, not 0x81: the native video profile sets bit 4 beside the FMT,
+        // which is the shape `whatsapp_feedback_profile_bit_is_not_part_of_fmt`
+        // already documents from the receive side.
+        assert_eq!(&plain[..4], &[0x91, RTCP_PT_PSFB, 0, 2]);
         assert_eq!(&plain[4..8], &local_video_ssrc.to_be_bytes());
         assert_eq!(&plain[8..12], &peer_video_ssrc.to_be_bytes());
 
         // The peer's own parser is the one that has to accept it: what we send
         // has to be what `requests_keyframe` reads.
         let summary = summarize_rtcp(&plain).unwrap();
+        assert!(summary.uses_whatsapp_profile_extension);
         assert!(requests_keyframe(&summary.feedback, peer_video_ssrc));
     }
 

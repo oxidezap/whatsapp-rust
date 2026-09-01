@@ -515,6 +515,20 @@ pub fn build_picture_loss_indication(sender_ssrc: u32, media_ssrc: u32) -> [u8; 
     buf
 }
 
+/// A PLI on the native video profile, which sets bit 4 beside the FMT.
+///
+/// The same bit `build_whatsapp_source_description` sets, and for the same
+/// reason: this is what a WhatsApp peer sends and therefore what one expects
+/// to receive. `summarize_rtcp` strips it back out of the FMT rather than
+/// reading 17 where the RFC says 1, and the parser's own test calls a `0x91`
+/// packet a WhatsApp-profile PLI -- so the shape was already described here
+/// from captures, on the receive side, before anything could send one.
+pub fn build_whatsapp_picture_loss_indication(sender_ssrc: u32, media_ssrc: u32) -> [u8; 12] {
+    let mut packet = build_picture_loss_indication(sender_ssrc, media_ssrc);
+    packet[0] |= 0x10;
+    packet
+}
+
 /// 28-byte Sender Report (PT 200, RC=0). `now_ms` is the wall clock in milliseconds.
 pub fn build_sender_report(local_ssrc: u32, stats: &RtcpSenderStats, now_ms: u64) -> [u8; 28] {
     let mut buf = [0u8; 28];

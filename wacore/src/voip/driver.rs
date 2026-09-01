@@ -151,9 +151,8 @@ pub enum VideoControl {
     Disable,
     /// Require the next outbound access unit to be an IDR frame after changing its source role.
     RequireKeyframe,
-    /// Ask the PEER for a keyframe, by RTCP PLI. The mirror of `RequireKeyframe`, and the one
-    /// direction the shell could not previously ask in: sent when the consumer of inbound video
-    /// loses an access unit and its decoder can no longer draw. Throttled in the engine.
+    /// Ask the PEER for a keyframe, by RTCP PLI: the mirror of `RequireKeyframe`. See
+    /// `CallEngine::request_peer_keyframe`, which decides what becomes of one.
     RequestPeerKeyframe,
     /// The peer's device orientation (0..3, ×90°) from a `<video>` stanza.
     SetOrientation(u8),

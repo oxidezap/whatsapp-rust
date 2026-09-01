@@ -10,9 +10,10 @@ use super::e2e_srtp::{
 };
 use super::h264::{H264_MAX_AU_BYTES, H264Depacketizer, PacketizedAu, au_has_idr, packetize_au};
 use super::rtcp::{
-    RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN, build_picture_loss_indication,
-    build_whatsapp_rtcp_cname, build_whatsapp_sender_report_with_sdes,
-    build_whatsapp_source_description, parse_rtcp_sender_ssrc,
+    RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN,
+    build_whatsapp_picture_loss_indication, build_whatsapp_rtcp_cname,
+    build_whatsapp_sender_report_with_sdes, build_whatsapp_source_description,
+    parse_rtcp_sender_ssrc,
 };
 use super::rtp::{
     RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, VIDEO_MEDIA_FRAME_INFO_DELTA,
@@ -890,14 +891,13 @@ impl VideoPipeline {
     /// first packet authenticates, which is the honest answer -- before that
     /// there is no inbound stream to have lost.
     ///
-    /// Protected under our own SSRC, like every other report this sender
-    /// emits: SRTCP authenticates the sender, and the stream being complained
-    /// about is in the payload.
+    /// On the native video profile, and protected under our own SSRC, like
+    /// every other report this sender emits.
     pub fn picture_loss_indication(&mut self) -> Option<Vec<u8>> {
         let media_ssrc = self.depacketizer_ssrc?;
         Some(self.srtcp.protect(
             self.rtp.ssrc,
-            &build_picture_loss_indication(self.rtp.ssrc, media_ssrc),
+            &build_whatsapp_picture_loss_indication(self.rtp.ssrc, media_ssrc),
         ))
     }
 
