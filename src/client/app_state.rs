@@ -3254,7 +3254,7 @@ impl Client {
     pub(crate) async fn apply_recovered_collection(
         &self,
         name: &str,
-        recovery: &waproto::whatsapp::SyncdSnapshotRecovery,
+        recovery: waproto::whatsapp::SyncdSnapshotRecovery,
     ) {
         // `WAPatchName::from_str` is infallible: every unrecognised name maps to
         // `Unknown`, which is one shared reservation slot and one collection
@@ -3304,6 +3304,7 @@ impl Client {
                     "Recovered the {name} collection from the primary device: {} record(s)",
                     mutations.len()
                 );
+                wacore::telemetry::appstate_mutations(mutations.len() as u64);
                 for m in &mutations {
                     self.dispatch_app_state_mutation(m, true).await;
                 }

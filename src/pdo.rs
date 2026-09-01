@@ -513,7 +513,7 @@ impl Client {
             return;
         };
 
-        self.apply_recovered_collection(&name, &recovery).await;
+        self.apply_recovered_collection(&name, recovery).await;
     }
 
     async fn handle_placeholder_resend_response(

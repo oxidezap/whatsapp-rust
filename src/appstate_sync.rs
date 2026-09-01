@@ -434,7 +434,7 @@ mod tests {
         );
 
         let outcome = processor
-            .apply_snapshot_recovery(&recovery, "regular_low")
+            .apply_snapshot_recovery(recovery, "regular_low")
             .await
             .expect("a recovery for the collection that was asked for applies");
         let RecoveryOutcome::Applied(mutations) = outcome else {
@@ -515,7 +515,7 @@ mod tests {
 
         let recovery = recovery_of("regular_low", 253, [0x5A; 128], b"k", &[]);
         let outcome = processor
-            .apply_snapshot_recovery(&recovery, "regular_low")
+            .apply_snapshot_recovery(recovery, "regular_low")
             .await
             .expect("a stale recovery is discarded, not an error");
 
@@ -546,7 +546,7 @@ mod tests {
 
         let recovery = recovery_of("regular", 5, [0u8; 128], b"k", &[]);
         let err = processor
-            .apply_snapshot_recovery(&recovery, "regular_low")
+            .apply_snapshot_recovery(recovery, "regular_low")
             .await
             .expect_err("a recovery naming another collection must be refused");
         assert!(err.to_string().contains("regular_low"), "{err}");

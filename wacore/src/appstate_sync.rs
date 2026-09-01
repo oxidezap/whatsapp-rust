@@ -251,7 +251,7 @@ impl AppStateProcessor {
     /// already made by every key in the store.
     pub async fn apply_snapshot_recovery(
         &self,
-        recovery: &wa::SyncdSnapshotRecovery,
+        recovery: wa::SyncdSnapshotRecovery,
         expected_collection: &str,
     ) -> Result<RecoveryOutcome> {
         // The response says which collection it is, and the request said which
@@ -273,62 +273,14 @@ impl AppStateProcessor {
             .and_then(|v| v.version)
             .ok_or_else(|| anyhow!("snapshot recovery for {name} carries no version"))?;
 
-        let lthash = recovery
-            .collection_lthash
-            .as_deref()
-            .ok_or_else(|| anyhow!("snapshot recovery for {name} carries no ltHash"))?;
-        let hash: [u8; 128] = lthash.try_into().map_err(|_| {
-            anyhow!(
-                "snapshot recovery for {name} carries a {}-byte ltHash, not 128",
-                lthash.len()
-            )
-        })?;
-
-        let mut mutations = Vec::with_capacity(recovery.mutation_records.len());
-        let mut macs = Vec::with_capacity(recovery.mutation_records.len());
-
-        for (i, record) in recovery.mutation_records.iter().enumerate() {
-            let action = record
-                .value
-                .as_option()
-                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no value"))?;
-            let key_id = record
-                .key_id
-                .as_deref()
-                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no key id"))?;
-            // The record's own MAC is the value MAC the store keeps: the
-            // primary sends what it computed over the encrypted form, so
-            // nothing here has to re-encrypt a record to arrive at it.
-            let value_mac = record
-                .mac
-                .as_deref()
-                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no MAC"))?;
-            let index = action
-                .index
-                .as_deref()
-                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no index"))?;
-
-            let keys = self.get_app_state_key(key_id).await?;
-
-            mutations.push(Mutation {
-                action_value: action.value.clone().into_option(),
-                index: serde_json::from_slice::<Vec<String>>(index).unwrap_or_default(),
-                // A recovered collection is what exists, so every record is a
-                // SET -- there is nothing left to remove. WA Web forces the same.
-                operation: wa::syncd_mutation::SyncdOperation::SET,
-            });
-            macs.push(AppStateMutationMAC {
-                index_mac: generate_index_mac(index, &keys.index),
-                value_mac: value_mac.to_vec(),
-            });
-        }
-
-        // Nothing waits for this reply, so the collection can have moved on
-        // while the phone was answering -- a later server sync that did
-        // validate, or a recovery that already landed. Rolling it back would
-        // undo real state and leave the next patch conflicting with a baseline
-        // nobody is at. Same rule the snapshot path applies to a stale snapshot,
-        // because this is one.
+        // Asked here, before the ltHash is read and before a single record is
+        // looked at. Nothing waits for this reply, so the collection can have
+        // moved on while the phone was answering -- a later server sync that did
+        // validate, or a recovery that already landed -- and rolling it back
+        // would undo real state and leave the next patch conflicting with a
+        // baseline nobody is at. Checking first also means a stale reply costs
+        // one read rather than a key lookup and an HMAC per record, and cannot
+        // be turned into an error by a payload nobody is going to apply.
         let held = self
             .backend
             .get_version(name)
@@ -341,6 +293,79 @@ impl AppStateProcessor {
                 offered: version,
             });
         }
+
+        let lthash = recovery
+            .collection_lthash
+            .as_deref()
+            .ok_or_else(|| anyhow!("snapshot recovery for {name} carries no ltHash"))?;
+        let hash: [u8; 128] = lthash.try_into().map_err(|_| {
+            anyhow!(
+                "snapshot recovery for {name} carries a {}-byte ltHash, not 128",
+                lthash.len()
+            )
+        })?;
+
+        // The keys first, because looking one up may reach the store and the
+        // work below may not. Distinct ids only: a collection is usually keyed
+        // by one or two, and the cache behind this makes a repeat cheap anyway.
+        let mut keys_by_id: HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>> = HashMap::new();
+        for (i, record) in recovery.mutation_records.iter().enumerate() {
+            let key_id = record
+                .key_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no key id"))?;
+            if !keys_by_id.contains_key(key_id) {
+                let keys = self.get_app_state_key(key_id).await?;
+                keys_by_id.insert(key_id.to_vec(), keys);
+            }
+        }
+
+        // And the rest off the caller's thread. A primary may send a whole
+        // collection, and this is a JSON parse, an action clone and an HMAC per
+        // record -- reached from the inbound message path, where holding a
+        // worker stalls every message queued behind it. The recovery is taken by
+        // value so the closure can consume it rather than deep-clone what it
+        // needs.
+        let owned_name = name.to_string();
+        let (mutations, macs) = crate::runtime::blocking(&*self.runtime, move || {
+            let mut mutations = Vec::with_capacity(recovery.mutation_records.len());
+            let mut macs = Vec::with_capacity(recovery.mutation_records.len());
+            for (i, record) in recovery.mutation_records.into_iter().enumerate() {
+                let action = record.value.into_option().ok_or_else(|| {
+                    anyhow!("recovery record {i} of {owned_name} carries no value")
+                })?;
+                let key_id = record.key_id.ok_or_else(|| {
+                    anyhow!("recovery record {i} of {owned_name} carries no key id")
+                })?;
+                // The record's own MAC is the value MAC the store keeps: the
+                // primary sends what it computed over the encrypted form, so
+                // nothing here has to re-encrypt a record to arrive at it.
+                let value_mac = record
+                    .mac
+                    .ok_or_else(|| anyhow!("recovery record {i} of {owned_name} carries no MAC"))?;
+                let index = action.index.ok_or_else(|| {
+                    anyhow!("recovery record {i} of {owned_name} carries no index")
+                })?;
+                let keys = keys_by_id
+                    .get(&key_id)
+                    .expect("every key id was fetched above");
+
+                macs.push(AppStateMutationMAC {
+                    index_mac: generate_index_mac(&index, &keys.index),
+                    value_mac,
+                });
+                mutations.push(Mutation {
+                    action_value: action.value.into_option(),
+                    index: serde_json::from_slice::<Vec<String>>(&index).unwrap_or_default(),
+                    // A recovered collection is what exists, so every record is
+                    // a SET -- there is nothing left to remove. WA Web forces
+                    // the same.
+                    operation: wa::syncd_mutation::SyncdOperation::SET,
+                });
+            }
+            Ok::<_, anyhow::Error>((mutations, macs))
+        })
+        .await?;
 
         // Same order the snapshot path commits in, and for the same reason: the
         // version goes last, so a store error part-way leaves a collection that
