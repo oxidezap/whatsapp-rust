@@ -204,6 +204,11 @@ impl AppStateProcessor {
         true
     }
 
+    /// How many recovery requests are outstanding, for the memory report.
+    pub async fn outstanding_recovery_requests(&self) -> usize {
+        self.recovery_requested.lock().await.len()
+    }
+
     /// Whether a recovery for this collection is outstanding, without taking it.
     ///
     /// The cheap check a reply is refused by before anything is reserved or
@@ -354,6 +359,18 @@ impl AppStateProcessor {
                 let value_mac = record
                     .mac
                     .ok_or_else(|| anyhow!("recovery record {i} of {owned_name} carries no MAC"))?;
+                // The store keeps this as a value MAC and a later patch
+                // subtracts it from the ltHash to overwrite or remove the index.
+                // A MAC of the wrong length would be subtracted just the same,
+                // producing a state the server disagrees with and stranding the
+                // collection behind another MAC failure -- the very thing this
+                // recovery exists to end.
+                if value_mac.len() != 32 {
+                    return Err(anyhow!(
+                        "recovery record {i} of {owned_name} carries a {}-byte MAC, not 32",
+                        value_mac.len()
+                    ));
+                }
                 let index = action.index.ok_or_else(|| {
                     anyhow!("recovery record {i} of {owned_name} carries no index")
                 })?;
@@ -365,9 +382,20 @@ impl AppStateProcessor {
                     index_mac: generate_index_mac(&index, &keys.index),
                     value_mac,
                 });
+                // Not `unwrap_or_default()`. An index that does not parse would
+                // become an empty vec, `dispatch_app_state_mutation` returns
+                // early on one, and the record would reach no consumer -- while
+                // its MAC was committed and the version written with a baseline,
+                // so nothing would ever ask for the collection again. Silently
+                // losing a record is exactly the failure this recovery exists to
+                // end, and every other field here is already required.
+                let parsed_index: Vec<String> = serde_json::from_slice(&index).map_err(|e| {
+                    anyhow!("recovery record {i} of {owned_name} has an unreadable index: {e}")
+                })?;
+
                 mutations.push(Mutation {
                     action_value: action.value.into_option(),
-                    index: serde_json::from_slice::<Vec<String>>(&index).unwrap_or_default(),
+                    index: parsed_index,
                     // A recovered collection is what exists, so every record is
                     // a SET -- there is nothing left to remove. WA Web forces
                     // the same.

@@ -519,6 +519,11 @@ pub struct MemoryReport {
     /// reference, emptied only on reconnect. Zero until the first app-state
     /// sync builds the processor.
     pub app_state_key_cache: usize,
+    /// Collections with an outstanding snapshot-recovery request.
+    ///
+    /// Bounded by the number of collections in practice, but retained until a
+    /// reply consumes the entry, so it is reported rather than assumed small.
+    pub app_state_recovery_requests: usize,
     pub app_state_syncing: usize,
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
@@ -725,6 +730,11 @@ impl std::fmt::Display for MemoryReport {
             self.app_state_key_requests
         )?;
         writeln!(f, "  app_state_key_cache:    {}", self.app_state_key_cache)?;
+        writeln!(
+            f,
+            "  app_state_recovery:     {}",
+            self.app_state_recovery_requests
+        )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
         writeln!(f, "--- Signal store caches ---")?;
         for (name, c) in &collections[TTL_BOUNDED..TTL_BOUNDED + SIGNAL_CACHES] {
