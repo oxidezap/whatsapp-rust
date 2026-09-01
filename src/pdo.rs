@@ -337,6 +337,24 @@ impl Client {
             ));
         }
 
+        // And the rollout gate, for the same reason the two above are here: an
+        // explicit `0` is the account being told its primary cannot do this, and
+        // a caller reaching past the escalation would spend a whole-collection
+        // request on a device that will ignore it. Silence still proceeds --
+        // this client is not on WhatsApp's rollout and may simply never be sent
+        // the prop, and reading that as a refusal would disable the escalation
+        // for everyone it exists to help.
+        if self
+            .ab_props()
+            .get(wacore::iq::abprops::web::ENABLE_PEER_SNAPSHOT_RECOVERY)
+            .await
+            .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+        {
+            return Err(anyhow::anyhow!(
+                "the account has peer snapshot recovery turned off"
+            ));
+        }
+
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
@@ -485,10 +503,26 @@ impl Client {
                 self.handle_placeholder_resend_response(placeholder_response, request_id)
                     .await;
             }
-            if let Some(recovery) = result.syncd_snapshot_fatal_recovery_response.as_option() {
-                self.handle_syncd_snapshot_recovery_response(recovery, request_id)
-                    .await;
-            }
+        }
+
+        // One response can carry several recovery results, and they all answer
+        // the one ask this stanza id was made about -- so exactly one of them is
+        // handled, and a populated one wins. Taking them in order would let an
+        // empty result arriving first spend the request the good one still
+        // needs; an empty one is answered only when nothing here carries a
+        // collection at all.
+        let recoveries: Vec<_> = response
+            .peer_data_operation_result
+            .iter()
+            .filter_map(|result| result.syncd_snapshot_fatal_recovery_response.as_option())
+            .collect();
+        if let Some(recovery) = recoveries
+            .iter()
+            .find(|recovery| recovery.collection_snapshot.is_some())
+            .or(recoveries.first())
+        {
+            self.handle_syncd_snapshot_recovery_response(recovery, request_id)
+                .await;
         }
     }
 
