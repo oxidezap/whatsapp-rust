@@ -3281,6 +3281,28 @@ impl Client {
             return;
         }
 
+        // The record count WA Web allows a recovery to carry. The byte ceiling
+        // bounds the payload, but small records encode in a few bytes each, so
+        // 64 MiB is room for orders of magnitude more than a collection has --
+        // and every one of them is an HMAC, a store row and a dispatched event.
+        // The prop's registry default is 2000, which is what an account that is
+        // never sent it reads.
+        let allowed = self
+            .ab_props()
+            .get_int(wacore::iq::abprops::web::SNAPSHOT_RECOVERY_MAX_MUTATIONS_COUNT_ALLOWED)
+            .await;
+        if allowed > 0 && recovery.mutation_records.len() as i64 > allowed {
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            warn!(
+                target: "Client/AppState",
+                "Snapshot recovery for {name} carries {} records, over the {allowed} allowed; refusing it",
+                recovery.mutation_records.len()
+            );
+            return;
+        }
+
         // Refused before anything is reserved on its behalf: an unsolicited
         // reply should cost a map lookup, not a wait. The marker is only *taken*
         // once the reservation is held, so a wait that times out does not
@@ -3430,9 +3452,15 @@ impl Client {
             Err(e) => {
                 // The marker stays taken. One request was answered, and this was
                 // the answer -- no second reply is coming, so putting it back
-                // would only suppress a real retry for the rest of the window
-                // while the collection stayed stuck. The next failed apply asks
-                // again.
+                // would only suppress the next ask for the rest of the window
+                // while the collection stayed stuck.
+                //
+                // What happens instead is the next sync of this collection: the
+                // snapshot fails to validate exactly as before and escalates
+                // again. That is not necessarily soon -- the retry rounds that
+                // produced this ask may already be spent -- so the honest
+                // statement is that the collection stays where it was until the
+                // next connection syncs it, which is where it was anyway.
                 warn!(
                     target: "Client/AppState",
                     "Failed to apply the snapshot recovery for {name}: {e}"
