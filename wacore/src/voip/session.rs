@@ -10,9 +10,9 @@ use super::e2e_srtp::{
 };
 use super::h264::{H264_MAX_AU_BYTES, H264Depacketizer, PacketizedAu, au_has_idr, packetize_au};
 use super::rtcp::{
-    RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN, build_whatsapp_rtcp_cname,
-    build_whatsapp_sender_report_with_sdes, build_whatsapp_source_description,
-    parse_rtcp_sender_ssrc,
+    RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN, build_picture_loss_indication,
+    build_whatsapp_rtcp_cname, build_whatsapp_sender_report_with_sdes,
+    build_whatsapp_source_description, parse_rtcp_sender_ssrc,
 };
 use super::rtp::{
     RTP_FIXED_HEADER_LEN, RtpHeader, RtpStream, VIDEO_MEDIA_FRAME_INFO_DELTA,
@@ -879,6 +879,26 @@ impl VideoPipeline {
 
     pub fn send_ssrc(&self) -> u32 {
         self.rtp.ssrc
+    }
+
+    /// Ask the peer for a keyframe, or `None` when there is nobody to ask.
+    ///
+    /// Addressed to `depacketizer_ssrc`, the peer stream this pipeline is
+    /// actually reassembling, rather than to any SSRC that has ever
+    /// authenticated: a PLI naming a stream the peer has renumbered away from
+    /// asks for a reset of something it no longer sends. Absent until the
+    /// first packet authenticates, which is the honest answer -- before that
+    /// there is no inbound stream to have lost.
+    ///
+    /// Protected under our own SSRC, like every other report this sender
+    /// emits: SRTCP authenticates the sender, and the stream being complained
+    /// about is in the payload.
+    pub fn picture_loss_indication(&mut self) -> Option<Vec<u8>> {
+        let media_ssrc = self.depacketizer_ssrc?;
+        Some(self.srtcp.protect(
+            self.rtp.ssrc,
+            &build_picture_loss_indication(self.rtp.ssrc, media_ssrc),
+        ))
     }
 
     pub(crate) fn set_send_ssrc(&mut self, ssrc: u32) {

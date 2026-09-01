@@ -497,6 +497,24 @@ pub fn build_compact_rtcp_209(local_ssrc: u32) -> [u8; 8] {
     buf
 }
 
+/// 12-byte Picture Loss Indication (PT 206, FMT=1), RFC 4585 s6.3.1.
+///
+/// The receiver's half of the keyframe contract: `requests_keyframe` reads
+/// exactly this shape from the peer to drive our own encoder, and until this
+/// existed there was no way to send one. A PLI carries no FCI -- the two SSRCs
+/// are the whole message -- so a peer that has lost its reference chain gets
+/// told which stream to reset and nothing else.
+pub fn build_picture_loss_indication(sender_ssrc: u32, media_ssrc: u32) -> [u8; 12] {
+    let mut buf = [0u8; 12];
+    buf[0] = 0x81; // V=2, P=0, FMT=1 (PLI)
+    buf[1] = RTCP_PT_PSFB;
+    buf[2] = 0;
+    buf[3] = 2; // (2+1)*4 = 12 bytes
+    buf[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
+    buf[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
+    buf
+}
+
 /// 28-byte Sender Report (PT 200, RC=0). `now_ms` is the wall clock in milliseconds.
 pub fn build_sender_report(local_ssrc: u32, stats: &RtcpSenderStats, now_ms: u64) -> [u8; 28] {
     let mut buf = [0u8; 28];

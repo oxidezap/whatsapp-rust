@@ -65,6 +65,16 @@ pub const NEVER: Millis = u64::MAX;
 const KEEPALIVE_MS: Millis = 1000;
 /// RTCP Sender-Report cadence. WhatsApp's `voip_settings` advertises `rtcp_interval_ms=1500`.
 const RTCP_MS: Millis = 1500;
+/// Shortest gap between two PLIs asking the peer for a keyframe.
+///
+/// WhatsApp's own receive path throttles the same request the same way
+/// (`pli_throttle_time_ms` in its VoIP settings), for the reason
+/// [`CallEngine::request_peer_keyframe`] gives: the gaps that prompt a request
+/// arrive in bursts describing one loss, and each answer costs the peer its
+/// largest frame at the moment the path has least room for one. A second is
+/// past any relayed round trip, so a burst coalesces into one request rather
+/// than into one request per lost unit.
+const MIN_PEER_KEYFRAME_INTERVAL_MS: Millis = 1000;
 /// Deadline for the relay to ack the allocate. Past this with no success the relay is wedged
 /// (silently dropping the allocate), so surface a terminal timeout instead of keepaliving forever.
 const ALLOCATE_TIMEOUT_MS: Millis = 10_000;
@@ -979,6 +989,9 @@ struct VideoPlaneState {
     send_gated: bool,
     /// PLI/FIR means dependent frames only prolong the peer's undecodable jitter-buffer state.
     keyframe_required: bool,
+    /// When the last PLI was sent to the peer, so a burst of gaps describing one
+    /// loss costs one request. See [`CallEngine::request_peer_keyframe`].
+    peer_keyframe_asked_at: Option<Millis>,
     /// Whether the application has been told about the current requirement.
     ///
     /// Separate from the requirement itself because the two end at different
@@ -1042,6 +1055,7 @@ fn make_video_plane(
         active: true,
         send_gated: false,
         keyframe_required: true,
+        peer_keyframe_asked_at: None,
         keyframe_announced: false,
     })
 }
@@ -2007,6 +2021,46 @@ impl CallEngine {
             video.keyframe_announced = false;
         }
         self.announce_video_keyframe();
+    }
+
+    /// Ask the peer to send a keyframe, by RTCP PLI.
+    ///
+    /// The receive half of the same contract [`Self::require_video_keyframe`]
+    /// serves for the send half, and the half this engine could not hold up: it
+    /// has always read the peer's PLI and FIR to drive our own encoder, and had
+    /// no way to send one. That asymmetry makes a single lost inbound access
+    /// unit permanent -- a decoder abandons its reference chain at the gap and
+    /// waits for a keyframe the peer only emits when asked, which nobody was
+    /// asking for.
+    ///
+    /// Throttled, and not as a courtesy: a gap is *caused* by congestion, so the
+    /// requests arrive in bursts describing one loss, and each answer is the
+    /// largest frame the peer's encoder can make. One per
+    /// [`MIN_PEER_KEYFRAME_INTERVAL_MS`] is longer than any relayed round trip,
+    /// so a burst coalesces into the one request that can still be answered
+    /// before the next is allowed.
+    ///
+    /// Returns whether a request reached the outbox: `false` for a call with no
+    /// video plane, a plane that has authenticated no inbound stream yet -- there
+    /// is no picture to have lost -- and a request made too soon after the last.
+    pub fn request_peer_keyframe(&mut self, now: Millis) -> bool {
+        let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) else {
+            return false;
+        };
+        if !video.active {
+            return false;
+        }
+        if let Some(asked) = video.peer_keyframe_asked_at
+            && now.saturating_sub(asked) < MIN_PEER_KEYFRAME_INTERVAL_MS
+        {
+            return false;
+        }
+        let Some(pli) = video.pipe.picture_loss_indication() else {
+            return false;
+        };
+        video.peer_keyframe_asked_at = Some(now);
+        self.outbox.push_back(Output::Transmit(Bytes::from(pli)));
+        true
     }
 
     /// Set the nominal RTP cadence for subsequent video access units. The source must pace access
@@ -9470,6 +9524,94 @@ mod tests {
         assert_eq!(summary.report_blocks.len(), 1);
         assert_eq!(summary.report_blocks[0].profile_extension, [0; 24]);
         assert!(summary.uses_whatsapp_profile_extension);
+    }
+
+    /// The receive half of the keyframe contract: a PLI naming the peer's
+    /// video stream, protected under our own SSRC.
+    #[test]
+    fn request_peer_keyframe_sends_a_pli_for_the_stream_being_reassembled() {
+        use crate::voip::e2e_srtp::{derive_srtcp_keys, unprotect_srtcp};
+
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let call_key = cfg.call_key.clone();
+        let local_video_ssrc = ssrc::derive_video_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.self_lid),
+        );
+        let peer_video_ssrc = ssrc::derive_video_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.peer_lid),
+        );
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+
+        // Nothing has authenticated yet, so there is no stream to have lost.
+        assert!(!eng.request_peer_keyframe(100));
+
+        let mut peer_video = peer_video_pipe();
+        let video = peer_video
+            .protect_video(&video_au(100))
+            .pop()
+            .expect("one-packet video AU");
+        eng.handle_input(101, Input::RelayPacket(&video));
+        let _ = drain(&mut eng);
+
+        assert!(eng.request_peer_keyframe(200));
+        let (outs, _) = drain(&mut eng);
+        let protected = outs
+            .iter()
+            .find_map(|output| match output {
+                Output::Transmit(packet)
+                    if parse_rtcp_sender_ssrc(packet) == Some(local_video_ssrc)
+                        && classify_relay_packet(packet) == RelayPacketKind::Rtcp =>
+                {
+                    Some(packet)
+                }
+                _ => None,
+            })
+            .expect("a PLI on the video stream");
+
+        let transport = derive_srtcp_keys(&call_key, SELF_LID).unwrap();
+        let (plain, _) = unprotect_srtcp(&transport, local_video_ssrc, protected).unwrap();
+        assert_eq!(&plain[..4], &[0x81, RTCP_PT_PSFB, 0, 2]);
+        assert_eq!(&plain[4..8], &local_video_ssrc.to_be_bytes());
+        assert_eq!(&plain[8..12], &peer_video_ssrc.to_be_bytes());
+
+        // The peer's own parser is the one that has to accept it: what we send
+        // has to be what `requests_keyframe` reads.
+        let summary = summarize_rtcp(&plain).unwrap();
+        assert!(requests_keyframe(&summary.feedback, peer_video_ssrc));
+    }
+
+    /// A burst of gaps describing one loss costs one request, and the next is
+    /// allowed once the interval has passed.
+    #[test]
+    fn peer_keyframe_requests_are_throttled() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+        let mut peer_video = peer_video_pipe();
+        let video = peer_video
+            .protect_video(&video_au(100))
+            .pop()
+            .expect("one-packet video AU");
+        eng.handle_input(101, Input::RelayPacket(&video));
+        let _ = drain(&mut eng);
+
+        assert!(eng.request_peer_keyframe(1_000));
+        assert!(!eng.request_peer_keyframe(1_000));
+        assert!(!eng.request_peer_keyframe(1_000 + MIN_PEER_KEYFRAME_INTERVAL_MS - 1));
+        assert!(eng.request_peer_keyframe(1_000 + MIN_PEER_KEYFRAME_INTERVAL_MS));
     }
 
     #[test]

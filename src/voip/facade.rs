@@ -4123,6 +4123,23 @@ impl CallHandle {
         .await
     }
 
+    /// Ask the peer to send a video keyframe, by RTCP PLI.
+    ///
+    /// For the consumer of [`VideoSink`], which is the only side that knows its
+    /// decoder can no longer draw: an access unit lost anywhere past this
+    /// library -- a queue that refused it, a decoder that failed and reset --
+    /// leaves every later unit referencing one the decoder does not have, and
+    /// nothing in the stream itself will say so.
+    ///
+    /// Best-effort and fire-and-forget, like the media it is about. The engine
+    /// throttles these, so calling on every dropped unit is the intended usage
+    /// rather than an abuse: what reaches the wire is one request per burst.
+    /// A call with no video plane, or one whose peer has not yet sent an
+    /// authenticated packet, simply has nothing to ask.
+    pub fn request_peer_keyframe(&self) {
+        self.video.send_control(VideoControl::RequestPeerKeyframe);
+    }
+
     /// Send the standalone `<video state=1 dec="H264" device_orientation="0">` used after a
     /// mid-call video upgrade. Captured video-from-start callees do not need this extra stanza.
     pub async fn announce_video_enabled(&self) -> Result<(), CallError> {
