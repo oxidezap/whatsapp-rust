@@ -52,7 +52,7 @@ jobs:
           --log-opt max-file=1
           --log-opt compress=false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@master
@@ -63,7 +63,7 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
       # Swatinem restores them; sccache still fills in after a Cargo.lock change.
@@ -94,7 +94,7 @@ jobs:
         run: scripts/ci/nextest_timed.sh e2e -p e2e-tests
       - name: Publish test timings
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-timings-e2e
           path: ${{ runner.temp }}/test-timings

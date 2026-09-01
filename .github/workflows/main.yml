@@ -42,7 +42,7 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Check Bartender image pins
         run: scripts/ci/sync-bartender-image.sh --check
       - uses: dtolnay/rust-toolchain@master
@@ -66,7 +66,7 @@ jobs:
       # This job never pushes, and the codegen shells out to `git fetch` against
       # a different repository; the checkout token has no business being left in
       # .git/config for that.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
@@ -76,14 +76,14 @@ jobs:
       # RUSTC_WRAPPER is set workspace-wide, so cargo needs sccache on PATH even
       # in a job this small.
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       - run: cargo run -p whatspec-codegen -- --check
 
   clippy:
     name: Clippy Linter
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -96,7 +96,7 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
       # Swatinem restores them; sccache still fills in after a Cargo.lock change.
@@ -111,7 +111,7 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Reclaim unused Android SDK space
         run: |
           df -h /
@@ -130,7 +130,7 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
       # Swatinem restores them; sccache still fills in after a Cargo.lock change.
@@ -159,7 +159,7 @@ jobs:
         run: scripts/ci/nextest_timed.sh workspace --workspace --exclude e2e-tests
       - name: Publish test timings
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-timings-build-and-test
           path: ${{ runner.temp }}/test-timings
@@ -187,7 +187,7 @@ jobs:
     # set, and paying that on the workflow's most-read job put it on the
     # critical path for nothing. Here it runs beside everything else.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -196,7 +196,7 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       - name: Cache Rust build (registry + target)
         uses: Swatinem/rust-cache@v2
         with:
@@ -221,7 +221,7 @@ jobs:
           exit "$status"
       - name: Publish test timings
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-timings-waproto-serde
           path: ${{ runner.temp }}/test-timings
@@ -237,7 +237,7 @@ jobs:
     # webrtc/opus tree compiles once and is cached (sccache), so the steady-state cost is the
     # workspace recompile with voip on, not the deps. The heavy relay e2e tests stay out of `--lib`.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Reclaim unused Android SDK space
         run: |
           df -h /
@@ -255,7 +255,7 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
       # Swatinem restores them; sccache still fills in after a Cargo.lock change.
@@ -295,7 +295,7 @@ jobs:
           exit "$status"
       - name: Publish test timings
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-timings-all-features
           path: ${{ runner.temp }}/test-timings
@@ -311,7 +311,7 @@ jobs:
       # rustdoc, never by clippy or rustc, so they need their own gate.
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Reclaim unused Android SDK space
         run: |
           df -h /
@@ -328,7 +328,7 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }}
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
       # Swatinem restores them; sccache still fills in after a Cargo.lock change.
@@ -351,7 +351,7 @@ jobs:
     outputs:
       crates: ${{ steps.crates.outputs.crates }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - id: crates
         run: echo "crates=$(scripts/ci/feature_matrix_crates.sh)" >> "$GITHUB_OUTPUT"
 
@@ -373,7 +373,7 @@ jobs:
       matrix:
         crate: ${{ fromJSON(needs.feature-matrix-crates.outputs.crates) }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # No Android SDK reclaim here, unlike the three jobs that build the whole
       # workspace. A runner starts this leg with 87G free and one crate's
       # `check` comes nowhere near it, so the `rm -rf` bought 10G nothing asked
@@ -396,7 +396,7 @@ jobs:
         with:
           tool: cargo-hack
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
       # Swatinem restores them; sccache still fills in after a Cargo.lock change.
@@ -425,11 +425,11 @@ jobs:
       RUSTFLAGS: ""
       NEXTEST_PROFILE: ci
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Pinned rather than `@stable`: this version is the workspace MSRV
       # (`rust-version` in the root Cargo.toml). To raise the floor, bump both
       # together — a floating `stable` would silently let the declared MSRV rot.
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.100.0
       # The pre-built nextest binary is toolchain-independent — it drives this
       # MSRV cargo the same way it drives the nightly one.
       - name: Install protoc and cargo-nextest
@@ -437,7 +437,7 @@ jobs:
         with:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-nextest
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
       # Swatinem restores them; sccache still fills in after a Cargo.lock change.
@@ -478,7 +478,7 @@ jobs:
           -p whatsapp-rust-sqlite-storage -p whatsapp-rust-tokio-transport
       - name: Publish test timings
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-timings-msrv
           path: ${{ runner.temp }}/test-timings

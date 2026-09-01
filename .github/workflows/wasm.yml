@@ -30,13 +30,13 @@ jobs:
     name: Build whatsapp-rust (wasm32, release)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
           targets: wasm32-unknown-unknown
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
       # Swatinem restores them; sccache still fills in after a Cargo.lock change.

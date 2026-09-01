@@ -37,7 +37,7 @@ jobs:
       actions: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -55,7 +55,7 @@ jobs:
           cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
@@ -73,7 +73,7 @@ jobs:
         run: python3 scripts/ci/measure_binary_size.py --out-dir size-out
 
       - name: Upload size artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: size-metrics
           path: size-out/
@@ -175,7 +175,7 @@ jobs:
       # github-action-benchmark deploys the gh-pages site after auto-push.
       deployments: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -193,7 +193,7 @@ jobs:
           cargo-llvm-lines@${{ env.CARGO_LLVM_LINES_VERSION }}
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Cache the target dir too: sccache can't cache proc-macros, build scripts
       # or bins (linker-output crate types), and those recompile every run.
@@ -212,7 +212,7 @@ jobs:
 
       # This artifact is the comparison baseline for PR runs.
       - name: Upload size artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: size-metrics
           path: size-out/

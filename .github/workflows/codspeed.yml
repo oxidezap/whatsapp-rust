@@ -76,7 +76,7 @@ jobs:
             packages: -p whatsapp-rust
             features: --features bench-harness
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -118,7 +118,7 @@ jobs:
       # the cache key: it hits while the package is valid and misses the moment
       # the runner image bumps glibc.
       - name: Cache the libc6-dbg package
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/libc6-dbg
           key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
@@ -249,7 +249,7 @@ jobs:
           CHATSTATE_TTL_SECS: "3"
         options: --log-driver none
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -291,7 +291,7 @@ jobs:
       # the cache key: it hits while the package is valid and misses the moment
       # the runner image bumps glibc.
       - name: Cache the libc6-dbg package
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/libc6-dbg
           key: libc6-dbg-${{ runner.arch }}-${{ steps.libc6.outputs.version }}
