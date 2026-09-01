@@ -349,7 +349,15 @@ where
         // contributed rather than the store's pre-patch value. A short blob is
         // folded there, so recording it only when it is 32 bytes long leaves the
         // first SET's operand added and never cancelled.
-        if let Some(rec) = patch.mutations[idx].record.as_option()
+        //
+        // Only a SET, because only a SET adds one. A REMOVE subtracts, and after
+        // it the index holds nothing -- so recording its tail here would have a
+        // later SET on that index subtract a value the patch had already taken
+        // out. `update_hash` suppresses that lookup entirely, but only when
+        // every mutation carries an index; one that does not drops the whole
+        // patch to the legacy path, where this map is what answers.
+        if !is_remove
+            && let Some(rec) = patch.mutations[idx].record.as_option()
             && let Some(index) = rec.index.as_option().and_then(|i| i.blob.as_deref())
             && let Some(value) = rec.value.as_option().and_then(|v| v.blob.as_deref())
         {
@@ -1645,17 +1653,96 @@ mod tests {
         );
     }
 
-    /// The overwrite map has to record the operand the fold actually added, not
-    /// the one a 32-byte rule would have. A first SET whose value blob is short
-    /// still contributes -- `slice(len - 32)` counts from the end -- so a map
-    /// that only remembers full-length values leaves that operand added and
-    /// uncancelled, and the second SET subtracts the store's pre-patch value
-    /// instead.
+    /// A REMOVE leaves nothing behind for a later SET to subtract.
     ///
-    /// Observed on the state rather than the return value on purpose: the hash
-    /// is updated before any record is decoded, and a 16-byte blob is not
-    /// decryptable, so this patch fails afterwards. The ltHash it left behind is
-    /// still the thing under test.
+    /// `update_hash` suppresses that subtraction outright, but only when every
+    /// mutation carries an index MAC; the unindexed third mutation here is what
+    /// drops the patch to the legacy path, where the overwrite map is the only
+    /// thing answering. A REMOVE recorded there would have the SET subtract a
+    /// value the REMOVE had already taken out.
+    #[test]
+    fn a_remove_leaves_nothing_for_a_later_set_to_subtract() {
+        let index_mac = vec![9u8; 32];
+        let removed: Vec<u8> = (0..48u8).collect();
+        let set: Vec<u8> = (100..148u8).collect();
+        let unindexed: Vec<u8> = (200..248u8).collect();
+        let tail = |b: &[u8]| b[b.len() - 32..].to_vec();
+
+        let mutation = |op: wa::syncd_mutation::SyncdOperation,
+                        index: Option<&[u8]>,
+                        blob: &[u8]| wa::SyncdMutation {
+            operation: Some(op.into()),
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: index.map(<[u8]>::to_vec),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue {
+                    blob: Some(blob.to_vec()),
+                }),
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(b"test_key_id".to_vec()),
+                }),
+            }),
+        };
+
+        use wa::syncd_mutation::SyncdOperation::{REMOVE, SET};
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![
+                mutation(REMOVE, Some(&index_mac), &removed),
+                mutation(SET, Some(&index_mac), &set),
+                // No index: this is what makes it the legacy path.
+                mutation(SET, None, &unindexed),
+            ],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(b"test_key_id".to_vec()),
+            }),
+            ..Default::default()
+        };
+
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let mut state = HashState::default();
+        let _ = process_patch(
+            &patch,
+            &mut state,
+            |_: &[u8]| Ok(Arc::new(keys.clone())),
+            |_: &[u8]| Ok(None),
+            false,
+            "regular",
+        );
+
+        const EMPTY: &[Vec<u8>] = &[];
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            &[tail(&set), tail(&unindexed)],
+        );
+        assert_eq!(
+            state.hash.as_slice(),
+            expected.as_slice(),
+            "the store held nothing, so the two SETs are all there is to fold"
+        );
+
+        // The exact regression: the SET subtracting the REMOVE's own tail.
+        let subtracted_the_remove = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            &[tail(&removed)],
+            &[tail(&set), tail(&unindexed)],
+        );
+        assert_ne!(
+            state.hash.as_slice(),
+            subtracted_the_remove.as_slice(),
+            "a REMOVE must not leave an operand for the SET after it to cancel"
+        );
+    }
+
+    /// A first SET whose value blob is short must still be cancelled by the
+    /// second SET on the same index.
+    ///
+    /// Read off the state rather than the return value: a 16-byte blob is not
+    /// decryptable, so this patch fails after the hash has already been updated,
+    /// and the ltHash it left behind is the thing under test.
     #[test]
     fn a_short_first_set_is_cancelled_by_the_second() {
         let index_mac = vec![9u8; 32];
