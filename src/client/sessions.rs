@@ -358,6 +358,10 @@ impl Client {
             log::debug!(
                 "finish_offline_sync: connection generation changed during the tail commit; leaving the new connection's state alone"
             );
+            // The teardown that bumped the generation normally reported the
+            // interruption already; this covers losing the race to it, and the
+            // claim keeps it from being a second terminal event.
+            self.abandon_offline_sync_if_interrupted();
             return;
         }
 
@@ -405,9 +409,23 @@ impl Client {
             None => {}
         }
         self.offline_sync_notifier.notify(usize::MAX);
-        self.core.event_bus.dispatch(Event::OfflineSyncCompleted(
-            OfflineSyncCompleted::builder().count(count).build(),
-        ));
+        // Only the event is claimed, never the live-state publication above:
+        // the semaphore, the flag and the receipt flush must land whether or
+        // not a concurrent teardown already spoke for this drain.
+        if self.claim_offline_terminal_report() {
+            self.core.event_bus.dispatch(Event::OfflineSyncCompleted(
+                OfflineSyncCompleted::builder().count(count).build(),
+            ));
+        }
+    }
+
+    /// Claim the right to publish the event that ends this resume. Exactly
+    /// one of `OfflineSyncCompleted` / `OfflineSyncInterrupted` reaches the
+    /// consumer per drain, whichever publication gets here first.
+    fn claim_offline_terminal_report(&self) -> bool {
+        self.offline_terminal_reported
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Report a drain that ended before its `<ib><offline>` end marker.
@@ -430,6 +448,9 @@ impl Client {
             .swap(false, Ordering::AcqRel);
         let was_armed = self.offline_batch.take_armed();
         if (!was_active && !was_armed) || self.offline_sync_completed.load(Ordering::Acquire) {
+            return;
+        }
+        if !self.claim_offline_terminal_report() {
             return;
         }
 

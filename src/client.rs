@@ -1536,6 +1536,13 @@ pub struct Client {
     /// idempotent). Separate from `offline_sync_completed` because the finish
     /// runs off the read loop and the flag must flip only after its commit.
     pub(crate) offline_sync_finish_started: Arc<AtomicBool>,
+    /// Once-guard for the *event* that ends one resume, either
+    /// `OfflineSyncCompleted` or `OfflineSyncInterrupted`. The finisher runs
+    /// detached and can pass its generation check just before a teardown bumps
+    /// it, so both terminal publications can be in flight for the same drain;
+    /// this makes them mutually exclusive, and the loser stays silent rather
+    /// than telling the consumer the opposite of what it was just told.
+    pub(crate) offline_terminal_reported: Arc<AtomicBool>,
     /// Delivery receipts buffered during offline sync, flushed as aggregate
     /// `<receipt>` stanzas at completion (WA Web `sendAggregateOfflineReceipts`).
     /// Empty (zero capacity) outside the offline window.

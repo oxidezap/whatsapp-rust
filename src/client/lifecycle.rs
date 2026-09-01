@@ -517,6 +517,7 @@ impl Client {
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
             offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
+            offline_terminal_reported: Arc::new(AtomicBool::new(false)),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             inbound_commit_batch: Default::default(),
             history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
@@ -1057,6 +1058,8 @@ impl Client {
         self.abandon_offline_sync_if_interrupted();
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
+            .store(false, Ordering::Relaxed);
+        self.offline_terminal_reported
             .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Uncommitted batch entries were never acked; the server redelivers
@@ -1851,6 +1854,8 @@ impl Client {
         self.abandon_offline_sync_if_interrupted();
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
+            .store(false, Ordering::Relaxed);
+        self.offline_terminal_reported
             .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Same rule as receipts: uncommitted entries drop here and the server

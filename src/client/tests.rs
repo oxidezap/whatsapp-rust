@@ -7310,6 +7310,38 @@ async fn completed_offline_resume_is_not_reported_as_interrupted() {
     );
 }
 
+/// One resume produces one terminal event, never both.
+///
+/// The finisher runs detached and can pass its generation check just before a
+/// teardown bumps it, so the two publications can be in flight for the same
+/// drain. This drives that interleaving directly: the teardown reports the
+/// interruption while `offline_sync_completed` is still false, and the
+/// finisher then arrives with its completion.
+#[tokio::test]
+async fn one_resume_never_reports_both_terminal_events() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 700).await;
+    client.abandon_offline_sync_if_interrupted();
+    client.complete_offline_sync(711).await;
+    client.wait_for_offline_delivery_end().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(
+        interrupted.len() + completed.len(),
+        1,
+        "exactly one terminal event per resume, got interrupted={interrupted:?} completed={completed:?}"
+    );
+    assert!(
+        client.offline_sync_completed.load(Ordering::Acquire),
+        "suppressing the duplicate event must not suppress the live-state publication"
+    );
+}
+
 /// WA Web's `ShiftTimer`: a drain the server stops feeding on a live
 /// connection is completed by the client rather than left open.
 #[tokio::test]
