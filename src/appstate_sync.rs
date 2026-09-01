@@ -588,19 +588,50 @@ mod tests {
             .await
             .unwrap();
 
+        // A second key, so the test can also pin what "the same index" means.
+        let other_key_id = b"another_key_id".to_vec();
+        let other_master_key = [9u8; 32];
+        let other_keys = expand_app_state_keys(&other_master_key);
+        backend
+            .set_sync_key(
+                &other_key_id,
+                AppStateSyncKey {
+                    key_data: other_master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
         let index = r#"["mute","1@s.whatsapp.net"]"#;
-        let recovery = recovery_of(
+        let mut recovery = recovery_of(
             "regular_low",
             253,
             [0x5A; 128],
             &key_id,
-            // The same index twice, then a second index that must survive.
+            // The same index twice, a second index that must survive, and the
+            // first index again under another key.
             &[
                 (index, [0x11; 32]),
                 (index, [0x22; 32]),
                 (r#"["mute","2@s.whatsapp.net"]"#, [0x33; 32]),
+                (index, [0x44; 32]),
             ],
         );
+        // The loser carries a payload the winner does not, so a regression that
+        // dispatched the wrong one of the pair is visible rather than merely
+        // mis-ordered: without this the two differ only in a MAC the mutation
+        // does not carry.
+        recovery.mutation_records[0]
+            .value
+            .as_option_mut()
+            .and_then(|data| data.value.as_option_mut())
+            .and_then(|value| value.mute_action.as_option_mut())
+            .expect("the helper builds a mute action")
+            .muted = Some(false);
+        // Same index, different key -- so a different index MAC and a different
+        // row in the store. It is not the pair's duplicate and must survive.
+        recovery.mutation_records[3].key_id = Some(other_key_id.clone());
 
         let outcome = processor
             .apply_snapshot_recovery(recovery, "regular_low", &|| true)
@@ -612,11 +643,21 @@ mod tests {
 
         assert_eq!(
             mutations.len(),
-            2,
-            "the losing record is not dispatched: {mutations:?}"
+            3,
+            "the losing record is dropped and the other-key record is kept: {mutations:?}"
         );
         assert_eq!(mutations[0].index, vec!["mute", "1@s.whatsapp.net"]);
         assert_eq!(mutations[1].index, vec!["mute", "2@s.whatsapp.net"]);
+        assert_eq!(mutations[2].index, vec!["mute", "1@s.whatsapp.net"]);
+        assert_eq!(
+            mutations[0]
+                .action_value
+                .as_ref()
+                .and_then(|v| v.mute_action.as_option())
+                .and_then(|m| m.muted),
+            Some(true),
+            "the winner's payload is what reaches the consumer, not the loser's"
+        );
 
         // And what the store kept is the winner's MAC, which is what the next
         // patch overwriting this index has to subtract.
@@ -629,6 +670,25 @@ mod tests {
             got.as_deref(),
             Some(&[0x22u8; 32][..]),
             "the last record for the index is the one that stands"
+        );
+
+        // And the other key's record has its own row, which is why it is not a
+        // duplicate: collapsing the two would leave this one out of the ltHash
+        // the primary just handed over.
+        let other_index_mac =
+            wacore::appstate::hash::generate_index_mac(index.as_bytes(), &other_keys.index);
+        assert_ne!(
+            other_index_mac, index_mac,
+            "a different key, a different MAC"
+        );
+        assert_eq!(
+            backend
+                .get_mutation_mac("regular_low", &other_index_mac)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&[0x44u8; 32][..]),
+            "the same index under another key keeps its own row"
         );
     }
 

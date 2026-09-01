@@ -420,22 +420,35 @@ impl AppStateProcessor {
             // dispatched anyway would hand a consumer a mute, a contact or a
             // label the collection we just persisted does not describe, and
             // event delivery is concurrent, so it could be the one that sticks.
+            //
+            // Keyed by the index *and the key id*, because that pair is what the
+            // stored index MAC is derived from: two records naming the same
+            // index under different app-state keys hash to different MACs and so
+            // occupy different rows, and collapsing them would leave part of the
+            // primary's ltHash with nothing standing for it -- the next patch
+            // then fails on the collection this recovery just repaired. The
+            // snapshot path deduplicates on the index MAC itself for the same
+            // reason; here the MAC has not been derived yet, and the pair it
+            // comes from decides the same thing for two HMACs less.
             let winners: Vec<bool> = {
                 let mut winners = vec![true; recovery.mutation_records.len()];
-                let mut seen: Vec<&[u8]> = Vec::new();
+                let mut seen: Vec<(&[u8], &[u8])> = Vec::new();
                 // Backwards, so the first hit for an index is its last record.
                 for (i, record) in recovery.mutation_records.iter().enumerate().rev() {
-                    // A record missing its value or index is not silently
-                    // dropped here: it falls through to the loop below, which
-                    // refuses the whole recovery over it.
+                    // A record missing its value, index or key id is not
+                    // silently dropped here: it falls through to the loop below,
+                    // which refuses the whole recovery over it.
                     let Some(index) = record.value.as_option().and_then(|v| v.index.as_deref())
                     else {
                         continue;
                     };
-                    if seen.contains(&index) {
+                    let Some(key_id) = record.key_id.as_deref() else {
+                        continue;
+                    };
+                    if seen.contains(&(index, key_id)) {
                         winners[i] = false;
                     } else {
-                        seen.push(index);
+                        seen.push((index, key_id));
                     }
                 }
                 winners
