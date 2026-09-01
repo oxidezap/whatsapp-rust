@@ -295,31 +295,33 @@ fn project_business(
 
 /// The server publishes a username on two independent channels: the `username`
 /// attribute of the `<contact>` result, and the `<username>` subprotocol result.
-/// The subprotocol wins because it is the one WhatsApp Web feeds to its contact
-/// store, and an empty value on either is the wire's way of saying "no username".
+/// A `<username>` result answers in every form it takes, an empty one included:
+/// WhatsApp Web reads a present-but-empty node as a deletion
+/// (`WAWebHandleUsernameSync`), so letting the contact attribute fill that in
+/// would republish a username the server just retracted. The attribute answers
+/// only when the subprotocol did not, which is what a server that ignores it
+/// returns.
 fn project_username(
     user: &UsyncUserResult,
 ) -> (Option<CompactString>, Option<UsyncSubprotocolError>) {
     let present = |value: &CompactString| !value.is_empty();
-    let (subprotocol, error) = match user.protocol(UsyncProtocolKind::Username) {
+    match user.protocol(UsyncProtocolKind::Username) {
         Some(UsyncProtocolResult::Username(UsyncOutcome::Value(username))) => {
             (username.clone().filter(present), None)
         }
         Some(UsyncProtocolResult::Username(UsyncOutcome::Error(error))) => {
             (None, Some((**error).clone()))
         }
-        _ => (None, None),
-    };
-    if subprotocol.is_some() {
-        return (subprotocol, error);
-    }
-    let from_contact = match user.protocol(UsyncProtocolKind::Contact) {
-        Some(UsyncProtocolResult::Contact(UsyncOutcome::Value(contact))) => {
-            contact.username.clone().filter(present)
+        _ => {
+            let from_contact = match user.protocol(UsyncProtocolKind::Contact) {
+                Some(UsyncProtocolResult::Contact(UsyncOutcome::Value(contact))) => {
+                    contact.username.clone().filter(present)
+                }
+                _ => None,
+            };
+            (from_contact, None)
         }
-        _ => None,
-    };
-    (from_contact, error)
+    }
 }
 
 pub(crate) fn project_lid_mapping(user: &UsyncUserResult) -> Option<UsyncLidMapping> {
@@ -585,8 +587,17 @@ impl IqSpec for UsernameLookupSpec {
         let Some(user) = response.users.into_iter().next() else {
             return Ok(UsernameLookup::NotFound);
         };
+        // A contact subprotocol that failed for this user answers nothing about
+        // the handle, so it must not read as a resolved or key-gated account:
+        // `find_by_username` would persist a LID/PN pair off it.
         let contact = match user.protocol(UsyncProtocolKind::Contact) {
             Some(UsyncProtocolResult::Contact(UsyncOutcome::Value(contact))) => Some(contact),
+            Some(UsyncProtocolResult::Contact(UsyncOutcome::Error(error))) => {
+                return Err(anyhow!(usync_subprotocol_error_message(
+                    UsyncProtocolKind::Contact.as_str(),
+                    error
+                )));
+            }
             _ => None,
         };
         if contact.is_some_and(|contact| contact.contact_type == CONTACT_TYPE_OUT) {
@@ -2497,5 +2508,76 @@ mod tests {
             spec.parse_response(&empty.as_node_ref()).unwrap(),
             UsernameLookup::NotFound
         );
+    }
+
+    /// A deletion the server reports through the subprotocol must not be undone
+    /// by the `<contact>` attribute the same response happens to carry.
+    #[test]
+    fn is_on_whatsapp_empty_username_result_outranks_the_contact_attribute() {
+        let spec = pn_spec();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "1234567890@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("contact")
+                        .attr("type", "in")
+                        .attr("username", "stale.handle")
+                        .build(),
+                    NodeBuilder::new("username").build(),
+                ])
+                .build(),
+        ]);
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results[0].username, None);
+    }
+
+    #[test]
+    fn is_on_whatsapp_username_error_reports_no_username_at_all() {
+        let spec = pn_spec();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "1234567890@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("contact")
+                        .attr("type", "in")
+                        .attr("username", "stale.handle")
+                        .build(),
+                    NodeBuilder::new("username")
+                        .children([NodeBuilder::new("error").attr("code", "429").build()])
+                        .build(),
+                ])
+                .build(),
+        ]);
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results[0].username, None);
+        assert_eq!(
+            results[0].username_error.as_ref().and_then(|e| e.code),
+            Some(429)
+        );
+    }
+
+    #[test]
+    fn username_lookup_refuses_to_resolve_a_failed_contact() {
+        let spec = UsernameLookupSpec::new("example.handle", None, "sid-1").unwrap();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "100000001@lid")
+                .children([NodeBuilder::new("contact")
+                    .children([NodeBuilder::new("error")
+                        .attr("code", "403")
+                        .attr("text", "forbidden")
+                        .build()])
+                    .build()])
+                .build(),
+        ]);
+
+        let error = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("a failed contact subprotocol cannot resolve a handle")
+            .to_string();
+        assert!(error.contains("contact"), "{error}");
+        assert!(error.contains("403"), "{error}");
     }
 }
