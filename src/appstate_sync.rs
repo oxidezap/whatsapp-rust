@@ -17,6 +17,7 @@ mod tests {
     use wacore::appstate::keys::{ExpandedAppStateKeys, expand_app_state_keys};
     use wacore::appstate::patch_decode::{CollectionSyncError, PatchList, WAPatchName};
     use wacore::appstate::processor::AppStateMutationMAC;
+    use wacore::appstate_sync::RecoveryOutcome;
     use wacore::libsignal::crypto::aes_256_cbc_encrypt_into;
     use wacore::store::error::Result as StoreResult;
     use wacore::store::traits::{
@@ -419,10 +420,13 @@ mod tests {
             &[(r#"["mute","1@s.whatsapp.net"]"#, [0x11; 32])],
         );
 
-        let mutations = processor
+        let outcome = processor
             .apply_snapshot_recovery(&recovery, "regular_low")
             .await
             .expect("a recovery for the collection that was asked for applies");
+        let RecoveryOutcome::Applied(mutations) = outcome else {
+            panic!("a collection stuck at v0 is not ahead of anything: {outcome:?}");
+        };
 
         assert_eq!(mutations.len(), 1);
         assert_eq!(mutations[0].index, vec!["mute", "1@s.whatsapp.net"]);
@@ -463,6 +467,50 @@ mod tests {
             Some(&[0x11u8; 32][..]),
             "the record's own MAC is the value MAC; nothing is re-encrypted to get one"
         );
+    }
+
+    /// Nothing waits for the reply, so the collection can move on while the
+    /// phone is answering. A recovery that lands behind where this side already
+    /// is must be discarded, not applied: rolling the version back would undo
+    /// real state and leave the next patch conflicting with a baseline nobody
+    /// is at.
+    #[tokio::test]
+    async fn a_recovery_that_arrives_behind_the_collection_is_discarded() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        // A later sync got through while the phone was answering.
+        let current = HashState {
+            version: 260,
+            hash: [0x77; 128],
+            ..Default::default()
+        };
+        backend
+            .set_version("regular_low", current.clone())
+            .await
+            .unwrap();
+
+        let recovery = recovery_of("regular_low", 253, [0x5A; 128], b"k", &[]);
+        let outcome = processor
+            .apply_snapshot_recovery(&recovery, "regular_low")
+            .await
+            .expect("a stale recovery is discarded, not an error");
+
+        assert!(
+            matches!(
+                outcome,
+                RecoveryOutcome::Stale {
+                    held: 260,
+                    offered: 253
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let stored = backend.get_version("regular_low").await.unwrap().unwrap();
+        assert_eq!(stored.version, 260, "the newer version stands");
+        assert_eq!(stored.hash, current.hash, "and so does its ltHash");
     }
 
     /// The reply carries no request id, so the collection name is the only thing

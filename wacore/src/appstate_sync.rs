@@ -139,6 +139,19 @@ pub enum AppStateSyncError {
     Other(#[from] anyhow::Error),
 }
 
+/// What became of a collection the primary sent back.
+///
+/// Discarding is neither a failure nor a success, and a caller that could not
+/// tell the two apart would log a recovery that did not happen.
+#[derive(Debug)]
+pub enum RecoveryOutcome {
+    /// The collection was replaced; these are its records.
+    Applied(Vec<Mutation>),
+    /// The collection had already moved past what the primary offered, so it was
+    /// left alone.
+    Stale { held: u64, offered: u64 },
+}
+
 #[derive(Clone)]
 pub struct AppStateProcessor {
     pub backend: Arc<dyn Backend>,
@@ -227,7 +240,7 @@ impl AppStateProcessor {
         &self,
         recovery: &wa::SyncdSnapshotRecovery,
         expected_collection: &str,
-    ) -> Result<Vec<Mutation>> {
+    ) -> Result<RecoveryOutcome> {
         // The response says which collection it is, and the request said which
         // one was asked for. WA Web compares the two and refuses on mismatch;
         // so does this, because the reply is not correlated by anything else.
@@ -297,6 +310,25 @@ impl AppStateProcessor {
             });
         }
 
+        // Nothing waits for this reply, so the collection can have moved on
+        // while the phone was answering -- a later server sync that did
+        // validate, or a recovery that already landed. Rolling it back would
+        // undo real state and leave the next patch conflicting with a baseline
+        // nobody is at. Same rule the snapshot path applies to a stale snapshot,
+        // because this is one.
+        let held = self
+            .backend
+            .get_version(name)
+            .await?
+            .map(|state| state.version)
+            .unwrap_or(0);
+        if snapshot_is_stale(held, version) {
+            return Ok(RecoveryOutcome::Stale {
+                held,
+                offered: version,
+            });
+        }
+
         // Same order the snapshot path commits in, and for the same reason: the
         // version goes last, so a store error part-way leaves a collection that
         // will be recovered again rather than one whose version says it is
@@ -321,7 +353,7 @@ impl AppStateProcessor {
             )
             .await?;
 
-        Ok(mutations)
+        Ok(RecoveryOutcome::Applied(mutations))
     }
 
     /// Clear the in-memory key cache (e.g. on reconnect).

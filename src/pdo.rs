@@ -345,13 +345,22 @@ impl Client {
 
         self.ensure_e2e_sessions(std::slice::from_ref(&peer_target))
             .await?;
-        let request_id = self.send_peer_message(peer_target, &msg).await?;
-        // Only once it is actually on the wire: a send that failed is not a
-        // recovery anybody is waiting for.
-        self.get_app_state_processor()
-            .mark_recovery_requested(collection)
-            .await;
-        Ok(request_id)
+
+        // Marked before the send, not after. The reply is handled on the inbound
+        // path by a different task, and a primary that answers quickly can be
+        // read before a mark placed afterwards is visible -- which would drop a
+        // perfectly good recovery for a request that really was made. Marking
+        // first cannot lose one; the only cost is a marker to take back if the
+        // send never happened, which is what the failure arm does.
+        let proc = self.get_app_state_processor();
+        proc.mark_recovery_requested(collection).await;
+        match self.send_peer_message(peer_target, &msg).await {
+            Ok(request_id) => Ok(request_id),
+            Err(e) => {
+                proc.take_recovery_request(collection).await;
+                Err(e)
+            }
+        }
     }
 
     /// Sends a peer message (message to our own devices).
@@ -466,6 +475,15 @@ impl Client {
                 }
                 reader.consume(taken);
             }
+            // A zlib stream that simply runs out is not one that ended. Without
+            // this a truncated payload whose prefix happens to parse is applied
+            // as though it were the whole collection -- and a short collection
+            // is indistinguishable from a real one, since nothing here knows how
+            // many records to expect.
+            if !reader.stream_ended() {
+                warn!("Snapshot recovery response is a truncated compressed stream; ignoring");
+                return;
+            }
             owned = plain;
             owned.as_slice()
         } else {
@@ -494,7 +512,7 @@ impl Client {
         }
 
         match proc.apply_snapshot_recovery(&recovery, &name).await {
-            Ok(mutations) => {
+            Ok(wacore::appstate_sync::RecoveryOutcome::Applied(mutations)) => {
                 info!(
                     "Recovered the {name} collection from the primary device: {} record(s)",
                     mutations.len()
@@ -503,7 +521,19 @@ impl Client {
                     self.dispatch_app_state_mutation(m, true).await;
                 }
             }
-            Err(e) => warn!("Failed to apply the snapshot recovery for {name}: {e}"),
+            Ok(wacore::appstate_sync::RecoveryOutcome::Stale { held, offered }) => {
+                info!(
+                    "Discarding the primary's {name} at v{offered}: this side already holds v{held}"
+                );
+            }
+            Err(e) => {
+                // Put it back: the request was made and this reply did not
+                // answer it, so a later one still may. Not restored for a stale
+                // reply above -- there the collection has moved past what was
+                // asked for, and the request is moot rather than unanswered.
+                proc.mark_recovery_requested(&name).await;
+                warn!("Failed to apply the snapshot recovery for {name}: {e}");
+            }
         }
     }
 
