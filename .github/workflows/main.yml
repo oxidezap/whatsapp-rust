@@ -429,7 +429,15 @@ jobs:
       # Pinned rather than `@stable`: this version is the workspace MSRV
       # (`rust-version` in the root Cargo.toml). To raise the floor, bump both
       # together — a floating `stable` would silently let the declared MSRV rot.
-      - uses: dtolnay/rust-toolchain@1.100.0
+      #
+      # And it is not Dependabot's to raise. This ref is a Rust version, not a
+      # release of the action, so the updater bumps it by comparing numbers and
+      # has no way to know the toolchain has to exist and has to match the
+      # declared floor. It once moved this to 1.100.0 — numerically the largest
+      # ref, a Rust release that does not exist — and every pull request in the
+      # repository failed at `rustup`, before a line was compiled. The
+      # `dependabot.yml` entry beside this one is what keeps the pin ours.
+      - uses: dtolnay/rust-toolchain@1.94.1
       # The pre-built nextest binary is toolchain-independent — it drives this
       # MSRV cargo the same way it drives the nightly one.
       - name: Install protoc and cargo-nextest

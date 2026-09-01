@@ -59,6 +59,15 @@ updates:
       actions:
         patterns:
           - "*"
+    # The MSRV job pins `dtolnay/rust-toolchain` by a ref that names a *Rust
+    # version*, not a release of the action. The updater cannot see that: it
+    # compares the numbers, finds 1.100.0 larger than 1.94.1, and pins a
+    # toolchain `rustup` then 404s on — which is what happened, and it failed
+    # every pull request in the repository at toolchain install. The floor is
+    # raised by hand, next to `rust-version` in the root Cargo.toml, which is
+    # the pairing the job's own comment asks for.
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
 
   # No docker entry: the Dockerfile builds `FROM rust:alpine` and `FROM
   # scratch`, neither of which carries a version for the updater to bump. Add
