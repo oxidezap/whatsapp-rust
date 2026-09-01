@@ -537,6 +537,7 @@ impl Client {
             subsystems: subsystem::Subsystems::default(),
             signal_flush_state: AtomicU64::new(0),
             signal_flush_lifecycle: Mutex::new(()),
+            offline_terminal_lock: Mutex::new(()),
             #[cfg(test)]
             signal_flush_test_failures: AtomicU32::new(0),
             #[cfg(test)]
@@ -1847,10 +1848,14 @@ impl Client {
         // connection don't trigger an immediate reconnect on the next one.
         self.stats.reset_connection_activity();
         self.pending_device_sync.clear();
-        // Reset offline sync state for next connection. The report is stamped
-        // with the generation being retired, not the one just installed, so it
-        // silences that drain's own stale finisher without claiming the slot
-        // the next drain will need.
+        // Reset offline sync state for next connection, under the lock the
+        // finisher publishes beneath: whichever of the two wins the stamp, its
+        // writes land wholly before or wholly after the other's, so a widened
+        // semaphore can never survive into the next connection's drain.
+        // The report is stamped with the generation being retired, not the one
+        // just installed, so it silences that drain's own stale finisher
+        // without claiming the slot the next drain will need.
+        let terminal_gate = self.offline_terminal_lock.lock().await;
         self.abandon_offline_sync_if_interrupted(closed_generation);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
@@ -1880,6 +1885,7 @@ impl Client {
             Ok(mut guard) => *guard = None,
             Err(poison) => *poison.into_inner() = None,
         }
+        drop(terminal_gate);
         self.history_sync_activity.reset();
         // Drain all pending IQ waiters so they fail fast with InternalChannelClosed
         // instead of hanging until the 75s timeout.

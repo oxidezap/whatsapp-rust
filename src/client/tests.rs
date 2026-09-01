@@ -7398,6 +7398,12 @@ async fn a_later_drain_still_reports_its_own_outcome() {
     client
         .process_node(crate::test_utils::node_to_owned_ref(&preview))
         .await;
+    // The preview handler arms the coordinator from a spawned task; wait for
+    // that rather than racing it, so this really does cover the preview path.
+    crate::test_utils::poll_until("the new preview arms a drain", || {
+        client.offline_batch.is_armed()
+    })
+    .await;
     client.complete_offline_sync(25).await;
     client.wait_for_offline_delivery_end().await;
 

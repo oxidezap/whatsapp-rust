@@ -339,6 +339,7 @@ impl Client {
                 "complete_offline_sync: self_weak upgrade failed; dropping the drain tail and switching to live mode"
             );
             self.inbound_commit_batch.force_live_dropping_entries();
+            let _terminal_gate = self.offline_terminal_lock.lock().await;
             self.publish_offline_sync_live_state(count, None, generation);
             return;
         };
@@ -371,6 +372,9 @@ impl Client {
         // first (WA Web's createSnapshot ordering).
         let durable = self.finish_inbound_commit_drain(generation).await;
 
+        // Taken before the check so the check and everything it publishes are
+        // one section against the teardown that would retire this generation.
+        let _terminal_gate = self.offline_terminal_lock.lock().await;
         if self.connection_generation.load(Ordering::Acquire) != generation {
             log::debug!(
                 "finish_offline_sync: connection generation changed during the tail commit; leaving the new connection's state alone"

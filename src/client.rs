@@ -1791,6 +1791,16 @@ pub struct Client {
     /// holds it around the settle. Lock order is always this-gate → processing
     /// permit / sessions lock, so no inversion.
     pub(crate) signal_flush_lifecycle: Mutex<()>,
+    /// Serializes a drain's end against the teardown that retires it.
+    ///
+    /// The generation stamp decides *who* reports, but the finisher runs
+    /// detached, so without this its check and its publication interleave with
+    /// the teardown's own resets: the winner's writes could land on either
+    /// side of them, and a semaphore widened after the reset would follow the
+    /// next connection into its drain. Held across the claim and everything it
+    /// publishes on one side, and across the teardown's offline resets on the
+    /// other.
+    pub(crate) offline_terminal_lock: Mutex<()>,
     /// Injected failures for the coalesced flush (consumed one per attempt),
     /// so tests can exercise the retry/backoff path deterministically.
     #[cfg(test)]

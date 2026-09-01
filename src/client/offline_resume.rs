@@ -36,6 +36,10 @@ const REQUEST_DEBOUNCE: Duration = Duration::from_millis(100);
 /// on every offline stanza, and on expiry completes the session itself.
 const STANZA_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Parked in `stanza_activity` by the watchdog that completes a stalled drain,
+/// so a stanza racing that decision loses the CAS instead of being ignored.
+const INACTIVE_CLAIMED: u64 = u64::MAX;
+
 #[derive(Default)]
 pub(crate) struct OfflineBatchCoordinator {
     armed: AtomicBool,
@@ -71,12 +75,28 @@ impl OfflineBatchCoordinator {
         self.armed.swap(false, Ordering::AcqRel)
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+
     pub(crate) fn stanza_activity(&self) -> u64 {
         self.stanza_activity.load(Ordering::Acquire)
     }
 
     pub(crate) fn note_stanza_activity(&self) {
         self.stanza_activity.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Claim a drain as inactive, but only if no stanza has arrived since
+    /// `seen`. A bump landing between the watchdog's read and its decision
+    /// fails the CAS, so a drain that is still being fed is never completed
+    /// behind the server's back. The sentinel it parks on is never a value
+    /// `note_stanza_activity` can reach from a fresh `arm()`.
+    fn try_claim_inactive(&self, seen: u64) -> bool {
+        self.stanza_activity
+            .compare_exchange(seen, INACTIVE_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     fn arm(&self, generation: u64) {
@@ -157,6 +177,12 @@ pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, ti
                 let current = client.offline_batch.stanza_activity();
                 if current != seen {
                     seen = current;
+                    continue;
+                }
+                if !client.offline_batch.try_claim_inactive(seen) {
+                    // A stanza arrived while this was deciding; the drain is
+                    // alive after all, so give it another window.
+                    seen = client.offline_batch.stanza_activity();
                     continue;
                 }
                 let processed = client
