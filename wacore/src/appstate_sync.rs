@@ -404,53 +404,7 @@ impl AppStateProcessor {
             )
         })?;
 
-        // One winner per index -- the last record for it -- which is the rule the
-        // snapshot path already applies, for the reason it gives: the MAC store
-        // keeps a single value per index, so a loser that was dispatched anyway
-        // would hand a consumer a mute, a contact or a label the collection we
-        // just persisted does not describe, and event delivery is concurrent, so
-        // it could be the one that sticks.
-        //
-        // Keyed by the index *and the key id*, because that pair is what the
-        // stored index MAC is derived from: two records naming the same index
-        // under different app-state keys hash to different MACs and so occupy
-        // different rows, and collapsing them would leave part of the primary's
-        // ltHash with nothing standing for it -- the next patch then fails on
-        // the collection this recovery just repaired. The snapshot path
-        // deduplicates on the index MAC itself for the same reason; here the MAC
-        // has not been derived yet, and the pair it comes from decides the same
-        // thing for two HMACs less.
-        //
-        // Note what keying on the pair settles: a loser shares its winner's key
-        // id by construction, so there is no such thing as a superseded record
-        // whose key nobody else needs. Skipping losers below would save no
-        // lookup, and a record referencing a key this side never received fails
-        // the recovery whether or not it goes on to win.
-        let winners: Vec<bool> = {
-            let mut winners = vec![true; recovery.mutation_records.len()];
-            // Hashed, not scanned: a whole collection is thousands of records
-            // and every one of them is a membership test, so a linear `seen`
-            // makes this quadratic in a payload whose size the primary chose.
-            let mut seen: HashSet<(&[u8], &[u8])> = HashSet::new();
-            // Backwards, so the first hit for an index is its last record.
-            for (i, record) in recovery.mutation_records.iter().enumerate().rev() {
-                // A record missing its value, index or key id is not silently
-                // dropped here: it falls through to the loop below, which
-                // refuses the whole recovery over it.
-                let Some(index) = record.value.as_option().and_then(|v| v.index.as_deref()) else {
-                    continue;
-                };
-                let Some(key_id) = record.key_id.as_deref() else {
-                    continue;
-                };
-                if !seen.insert((index, key_id)) {
-                    winners[i] = false;
-                }
-            }
-            winners
-        };
-
-        // The keys next, because looking one up may reach the store and the
+        // The keys first, because looking one up may reach the store and the
         // work below may not. Distinct ids only: a collection is usually keyed
         // by one or two, and the cache behind this makes a repeat cheap anyway.
         let mut keys_by_id: HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>> = HashMap::new();
@@ -473,6 +427,53 @@ impl AppStateProcessor {
         // needs.
         let owned_name = name.to_string();
         let (mutations, macs) = crate::runtime::blocking(&*self.runtime, move || {
+            // One winner per index -- the last record for it -- which is the rule the
+            // snapshot path already applies, for the reason it gives: the MAC store
+            // keeps a single value per index, so a loser that was dispatched anyway
+            // would hand a consumer a mute, a contact or a label the collection we
+            // just persisted does not describe, and event delivery is concurrent, so
+            // it could be the one that sticks.
+            //
+            // Keyed by the index *and the key id*, because that pair is what the
+            // stored index MAC is derived from: two records naming the same index
+            // under different app-state keys hash to different MACs and so occupy
+            // different rows, and collapsing them would leave part of the primary's
+            // ltHash with nothing standing for it -- the next patch then fails on
+            // the collection this recovery just repaired. The snapshot path
+            // deduplicates on the index MAC itself for the same reason; here the MAC
+            // has not been derived yet, and the pair it comes from decides the same
+            // thing for two HMACs less.
+            //
+            // Note what keying on the pair settles: a loser shares its winner's key
+            // id by construction, so there is no such thing as a superseded record
+            // whose key nobody else needs. Skipping losers below would save no
+            // lookup, and a record referencing a key this side never received fails
+            // the recovery whether or not it goes on to win.
+            let winners: Vec<bool> = {
+                let mut winners = vec![true; recovery.mutation_records.len()];
+                // Hashed, not scanned: a whole collection is thousands of records
+                // and every one of them is a membership test, so a linear `seen`
+                // makes this quadratic in a payload whose size the primary chose.
+                let mut seen: HashSet<(&[u8], &[u8])> = HashSet::new();
+                // Backwards, so the first hit for an index is its last record.
+                for (i, record) in recovery.mutation_records.iter().enumerate().rev() {
+                    // A record missing its value, index or key id is not silently
+                    // dropped here: it falls through to the loop below, which
+                    // refuses the whole recovery over it.
+                    let Some(index) = record.value.as_option().and_then(|v| v.index.as_deref())
+                    else {
+                        continue;
+                    };
+                    let Some(key_id) = record.key_id.as_deref() else {
+                        continue;
+                    };
+                    if !seen.insert((index, key_id)) {
+                        winners[i] = false;
+                    }
+                }
+                winners
+            };
+
             let mut mutations = Vec::with_capacity(recovery.mutation_records.len());
             let mut macs = Vec::with_capacity(recovery.mutation_records.len());
             for (i, record) in recovery.mutation_records.into_iter().enumerate() {

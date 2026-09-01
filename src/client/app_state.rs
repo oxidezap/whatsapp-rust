@@ -3268,6 +3268,12 @@ impl Client {
         // reservation that means nothing.
         let patch_name = name.parse::<WAPatchName>().unwrap_or(WAPatchName::Unknown);
         if patch_name == WAPatchName::Unknown {
+            // Released for the same reason as every other ending that is not an
+            // apply: the ask has been answered, badly, and keeping it would
+            // refuse the next one for nothing.
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
             warn!(
                 target: "Client/AppState",
                 "Snapshot recovery names an unknown collection {name}; ignoring"
@@ -3337,6 +3343,11 @@ impl Client {
         )
         .await
         else {
+            // Released, not left claimed. The reply is being dropped, and one
+            // ask has one reply -- so holding the request would refuse a repeat
+            // of this one and suppress the next escalation for the rest of the
+            // window, over a collection still exactly as stuck as it was.
+            proc.take_recovery_request_by_id(request_id).await;
             warn!(
                 target: "Client/AppState",
                 "Gave up waiting to reserve {name} for a snapshot recovery"
