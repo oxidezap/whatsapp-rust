@@ -364,6 +364,12 @@ impl Client {
         // perfectly good recovery for a request that really was made. Marking
         // first cannot lose one; the only cost is a marker to take back if the
         // send never happened, which is what the failure arm does.
+        // Generated here, not inside the send: the answer is identified by this
+        // id, and a reply that beats the send's return would otherwise find the
+        // request recorded with no id at all -- unrecognisable, and so unable to
+        // free the ask it answers.
+        let request_id = self.generate_message_id();
+
         let proc = self.get_app_state_processor();
         if !proc.mark_recovery_requested(collection).await {
             // One is already outstanding, and the reply that is coming answers
@@ -373,13 +379,12 @@ impl Client {
             debug!("A recovery for {collection} is already outstanding; not asking again");
             return Ok(String::new());
         }
-        match self.send_peer_message(peer_target, &msg).await {
-            Ok(request_id) => {
-                // The answer carries this back, and it is the only thing that
-                // identifies the request when the payload cannot be read.
-                proc.note_recovery_request_id(collection, &request_id).await;
-                Ok(request_id)
-            }
+        proc.note_recovery_request_id(collection, &request_id).await;
+        match self
+            .send_peer_message_with_id(peer_target, &msg, &request_id)
+            .await
+        {
+            Ok(()) => Ok(request_id),
             Err(e) => {
                 proc.take_recovery_request(collection).await;
                 Err(e)
@@ -396,20 +401,32 @@ impl Client {
         msg: &wa::Message,
     ) -> Result<String, anyhow::Error> {
         let msg_id = self.generate_message_id();
+        self.send_peer_message_with_id(to, msg, &msg_id).await?;
+        Ok(msg_id)
+    }
 
+    /// [`Self::send_peer_message`] for a caller that has to know the id before
+    /// the send, because it records something against it that an answer can
+    /// arrive and look up before this returns.
+    async fn send_peer_message_with_id(
+        self: &Arc<Self>,
+        to: Jid,
+        msg: &wa::Message,
+        msg_id: &str,
+    ) -> Result<(), anyhow::Error> {
         // Send with peer category and high priority
         self.send_message_impl(
             to,
             msg,
             crate::send::SendPipelineOptions {
-                request_id: Some(&msg_id),
+                request_id: Some(msg_id),
                 peer: true,
                 ..Default::default()
             },
         )
         .await?;
 
-        Ok(msg_id)
+        Ok(())
     }
 
     /// Handles a PDO response message from our primary phone.

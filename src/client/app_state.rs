@@ -3288,6 +3288,39 @@ impl Client {
             return;
         }
 
+        // The keys the primary signed these records with, asked for before the
+        // reservation rather than during it. A recovery is reached because the
+        // collection is already stuck, and a historical key this side never
+        // received would fail every attempt at it identically -- the normal
+        // snapshot path repairs exactly this with a key share, and skipping it
+        // here would leave the one escalation that exists to unstick a
+        // collection stuck on a key nobody ever asked for.
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut missing_keys = Vec::new();
+        for record in &recovery.mutation_records {
+            let Some(key_id) = record.key_id.as_deref() else {
+                continue;
+            };
+            if seen.insert(key_id.to_vec()) && proc.get_app_state_key(key_id).await.is_err() {
+                missing_keys.push(key_id.to_vec());
+            }
+        }
+        if !missing_keys.is_empty() {
+            let asked = missing_keys.len();
+            if !self
+                .request_keys_and_wait(missing_keys, APP_STATE_KEY_REQUEST_TIMEOUT)
+                .await
+            {
+                // Not a refusal: the apply below reports which record it could
+                // not read, and the ask is spent either way rather than left to
+                // suppress the next one.
+                warn!(
+                    target: "Client/AppState",
+                    "{asked} app-state key(s) the {name} recovery needs are still missing"
+                );
+            }
+        }
+
         let Ok(_reservation) = rt_timeout(
             &*self.runtime,
             APP_STATE_RESERVATION_WAIT,
