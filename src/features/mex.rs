@@ -14,7 +14,9 @@ use wacore::iq::mex_operations::{
 use wacore_binary::jid::JidError;
 
 // Re-export types from wacore
-pub use wacore::iq::mex::{MexDoc, MexErrorExtensions, MexGraphQLError, MexResponse};
+pub use wacore::iq::mex::{
+    MexDoc, MexErrorExtensions, MexFatalError, MexGraphQLError, MexResponse,
+};
 pub use wacore::iq::mex_operations::fetch_reachout_timelock::Xwa2FetchAccountReachoutTimelock as ReachoutTimelock;
 
 /// Error types for MEX operations.
@@ -289,7 +291,11 @@ impl<'a> Mex<'a> {
     pub async fn get_username(&self) -> Result<Option<OwnUsername>, MexError> {
         let response = match self.query(mex_request!(get_username {})).await {
             Ok(response) => response,
-            Err(MexError::Request(IqError::ServerError { code: 404, .. })) => return Ok(None),
+            // The official job reads a 404 as "this account has no username",
+            // and reaches it from both shapes: WAWebMexNativeClient raises the
+            // same error for a fatal GraphQL extension code and for an IQ one.
+            Err(MexError::ExtensionError { code: 404, .. })
+            | Err(MexError::Request(IqError::ServerError { code: 404, .. })) => return Ok(None),
             Err(err) => return Err(err),
         };
         decode_own_username(response.data)
@@ -309,18 +315,20 @@ impl<'a> Mex<'a> {
     // Non-generic so the execute/error-handling body instantiates once, not
     // per variables type.
     async fn execute_spec(&self, spec: MexQuerySpec) -> Result<MexResponse, MexError> {
-        let response = self.client.execute(spec).await?;
-
-        // Check for fatal errors (the IqSpec already checks, but we want to return our error type)
-        if let Some(fatal) = response.fatal_error() {
-            let code = fatal.error_code().unwrap_or(500);
-            return Err(MexError::ExtensionError {
-                code,
-                message: fatal.message.clone(),
-            });
+        // A fatal GraphQL error fails the spec's own parse, so it arrives as an
+        // `IqError::ParseError` carrying the typed source. Recovering the code
+        // here is what lets a caller act on one, rather than on a message.
+        match self.client.execute(spec).await {
+            Ok(response) => Ok(response),
+            Err(IqError::ParseError(err)) => Err(match err.downcast_ref::<MexFatalError>() {
+                Some(fatal) => MexError::ExtensionError {
+                    code: fatal.code,
+                    message: fatal.message.clone(),
+                },
+                None => MexError::Request(IqError::ParseError(err)),
+            }),
+            Err(err) => Err(err.into()),
         }
-
-        Ok(response)
     }
 }
 
@@ -794,5 +802,21 @@ mod tests {
             decode_own_username(None),
             Err(MexError::PayloadParsing(_))
         ));
+    }
+
+    /// The server reports "no username on this account" as a fatal GraphQL 404,
+    /// which reaches a caller through `IqError::ParseError`; recovering the code
+    /// from the typed source is what keeps that from reading as a failure.
+    #[test]
+    fn a_fatal_graphql_error_keeps_its_code() {
+        let fatal = MexFatalError {
+            query: "WAWebMexGetUsernameJobQuery",
+            code: 404,
+            message: "not found".to_owned(),
+        };
+        let recovered = anyhow::Error::from(fatal)
+            .downcast_ref::<MexFatalError>()
+            .map(|fatal| fatal.code);
+        assert_eq!(recovered, Some(404));
     }
 }

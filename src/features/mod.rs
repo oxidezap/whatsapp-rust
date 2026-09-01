@@ -63,8 +63,8 @@ pub use comments::Comments;
 
 pub use contacts::{
     ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, USERNAME_MAX_LENGTH,
-    USERNAME_MIN_LENGTH, UserInfo, UsernameLookup, UsernameLookupUser, UsyncSubprotocolError,
-    VerifiedName,
+    USERNAME_MIN_LENGTH, UserInfo, UsernameLookup, UsernameLookupError, UsernameLookupUser,
+    UsyncSubprotocolError, VerifiedName,
 };
 
 pub use events::{EventCreationParams, EventResponseType, Events};
@@ -89,7 +89,8 @@ pub use message_edit::{EncryptedEdit, MessageEditError, SecretEncKind, SecretEnc
 
 pub use mex::{
     CappingMvStatus, CappingOteStatus, CappingStatus, Mex, MexError, MexErrorExtensions,
-    MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, OwnUsername, ReachoutTimelock,
+    MexFatalError, MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, OwnUsername,
+    ReachoutTimelock,
 };
 
 pub use newsletter::{

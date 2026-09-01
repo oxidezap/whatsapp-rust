@@ -105,6 +105,21 @@ impl MexGraphQLError {
     }
 }
 
+/// Code reported for a fatal MEX error whose payload carried none.
+const DEFAULT_MEX_ERROR_CODE: i32 = 500;
+
+/// A GraphQL error the server marked fatal, raised as a typed error so the
+/// code survives the trip: the IQ layer wraps this in `IqError::ParseError`,
+/// which keeps the source, and a caller that cares about a particular code
+/// (a MEX 404 is how the server says "nothing here") downcasts to it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("MEX fatal error (query={query}, code={code}): {message}")]
+pub struct MexFatalError {
+    pub query: &'static str,
+    pub code: i32,
+    pub message: String,
+}
+
 /// MEX GraphQL response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MexResponse {
@@ -225,13 +240,12 @@ impl IqSpec for MexQuerySpec {
                     self.doc.name, self.doc.id, fatal.message
                 );
             }
-            let code = fatal.error_code().unwrap_or(500);
-            return Err(anyhow!(
-                "MEX fatal error (query={}, code={}): {}",
-                self.doc.name,
-                code,
-                fatal.message
-            ));
+            return Err(MexFatalError {
+                query: self.doc.name,
+                code: fatal.error_code().unwrap_or(DEFAULT_MEX_ERROR_CODE),
+                message: fatal.message.clone(),
+            }
+            .into());
         }
 
         Ok(mex_response)

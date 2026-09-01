@@ -11,8 +11,7 @@ use std::time::Duration;
 use thiserror::Error;
 use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType};
 use wacore::iq::usync::{
-    IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec, UsernameLookupError,
-    UsernameLookupSpec,
+    IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec, UsernameLookupSpec,
 };
 use wacore_binary::{Jid, JidExt};
 
@@ -20,7 +19,7 @@ use wacore_binary::{Jid, JidExt};
 pub use wacore::iq::contacts::ProfilePicture;
 pub use wacore::iq::usync::{
     IsOnWhatsAppResult, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo, UsernameLookup,
-    UsernameLookupUser, UsyncSubprotocolError,
+    UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError,
 };
 pub use wacore::stanza::business::VerifiedName;
 
