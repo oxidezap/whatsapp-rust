@@ -139,6 +139,16 @@ pub enum AppStateSyncError {
     Other(#[from] anyhow::Error),
 }
 
+/// One outstanding ask, and the id the answer will carry back.
+///
+/// The id is what lets a reply that cannot be decoded still be recognised as
+/// the answer to a request: the collection name is inside the payload, so a
+/// truncated or corrupt one names nothing.
+struct RecoveryRequest {
+    asked_at: crate::time::Instant,
+    request_id: Option<String>,
+}
+
 /// What became of a collection the primary sent back.
 ///
 /// Discarding is neither a failure nor a success, and a caller that could not
@@ -163,7 +173,7 @@ pub struct AppStateProcessor {
     /// is what says a recovery was wanted. It lives here rather than beside the
     /// connection because it has to outlive the sync that raised it: the phone
     /// answers whenever it answers, and by then the run that asked is long over.
-    recovery_requested: Arc<Mutex<HashMap<String, crate::time::Instant>>>,
+    recovery_requested: Arc<Mutex<HashMap<String, RecoveryRequest>>>,
 }
 
 impl AppStateProcessor {
@@ -195,18 +205,50 @@ impl AppStateProcessor {
     /// the reply that is already coming answers this ask too.
     pub async fn mark_recovery_requested(&self, collection: &str) -> bool {
         let mut outstanding = self.recovery_requested.lock().await;
-        if let Some(asked_at) = outstanding.get(collection)
-            && asked_at.elapsed() < Self::RECOVERY_REQUEST_TTL
+        if let Some(request) = outstanding.get(collection)
+            && request.asked_at.elapsed() < Self::RECOVERY_REQUEST_TTL
         {
             return false;
         }
-        outstanding.insert(collection.to_string(), crate::time::Instant::now());
+        outstanding.insert(
+            collection.to_string(),
+            RecoveryRequest {
+                asked_at: crate::time::Instant::now(),
+                request_id: None,
+            },
+        );
         true
     }
 
     /// How many recovery requests are outstanding, for the memory report.
     pub async fn outstanding_recovery_requests(&self) -> usize {
         self.recovery_requested.lock().await.len()
+    }
+
+    /// Records the id the primary's answer will carry, once the ask is sent.
+    ///
+    /// Set after the send because that is when the id exists; the marker itself
+    /// goes in before, so a fast reply cannot be read as unsolicited.
+    pub async fn note_recovery_request_id(&self, collection: &str, request_id: &str) {
+        if let Some(request) = self.recovery_requested.lock().await.get_mut(collection) {
+            request.request_id = Some(request_id.to_string());
+        }
+    }
+
+    /// Takes the request an id answers, whatever its payload turned out to be.
+    ///
+    /// For a reply that cannot be decoded: the collection name lives inside the
+    /// payload, so a truncated or corrupt one names nothing, and leaving the
+    /// marker would suppress every retry for the rest of the window over an ask
+    /// that has already been answered -- badly, but answered.
+    pub async fn take_recovery_request_by_id(&self, request_id: &str) -> Option<String> {
+        let mut outstanding = self.recovery_requested.lock().await;
+        let collection = outstanding
+            .iter()
+            .find(|(_, request)| request.request_id.as_deref() == Some(request_id))
+            .map(|(name, _)| name.clone())?;
+        outstanding.remove(&collection);
+        Some(collection)
     }
 
     /// Whether a recovery for this collection is outstanding, without taking it.

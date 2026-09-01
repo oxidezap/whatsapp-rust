@@ -374,7 +374,12 @@ impl Client {
             return Ok(String::new());
         }
         match self.send_peer_message(peer_target, &msg).await {
-            Ok(request_id) => Ok(request_id),
+            Ok(request_id) => {
+                // The answer carries this back, and it is the only thing that
+                // identifies the request when the payload cannot be read.
+                proc.note_recovery_request_id(collection, &request_id).await;
+                Ok(request_id)
+            }
             Err(e) => {
                 proc.take_recovery_request(collection).await;
                 Err(e)
@@ -443,7 +448,8 @@ impl Client {
                     .await;
             }
             if let Some(recovery) = result.syncd_snapshot_fatal_recovery_response.as_option() {
-                self.handle_syncd_snapshot_recovery_response(recovery).await;
+                self.handle_syncd_snapshot_recovery_response(recovery, request_id)
+                    .await;
             }
         }
     }
@@ -457,75 +463,96 @@ impl Client {
     async fn handle_syncd_snapshot_recovery_response(
         &self,
         response: &wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse,
+        request_id: &str,
     ) {
         let Some(blob) = response.collection_snapshot.as_deref() else {
             warn!("Snapshot recovery response carries no collection; ignoring");
             return;
         };
 
-        // Off the inbound path. A primary may send a whole collection, so this
-        // is up to 64 MiB of inflate plus a protobuf decode wide enough that
-        // `waproto` pins its instantiation -- work that would otherwise hold a
-        // runtime worker and stall the read loop and every other message behind
-        // it. The copy the closure takes is the price of moving it, and is
-        // bounded by the same ceiling.
-        let compressed = response.is_compressed.unwrap_or(false);
-        let payload = blob.to_vec();
-        let decoded = wacore::runtime::blocking(&*self.runtime, move || {
-            let bytes = if compressed {
-                let mut reader = wacore_binary::zlib_pool::InflateReader::new(
-                    &payload,
-                    wacore::history_sync::MAX_DECOMPRESSED,
-                );
-                let mut plain = Vec::new();
-                loop {
-                    match reader.ensure(1) {
-                        Ok(true) => {}
-                        // The stream ran out; `ensure(1)` answers false only
-                        // with nothing left to take.
-                        Ok(false) => break,
-                        Err(e) => return Err(format!("failed to decompress: {e}")),
-                    }
-                    let taken = {
-                        let chunk = reader.available();
-                        plain.extend_from_slice(chunk);
-                        chunk.len()
-                    };
-                    if taken == 0 {
-                        break;
-                    }
-                    reader.consume(taken);
-                }
-                // Running out is not ending. A payload cut short after a
-                // parseable prefix would otherwise be applied as the whole
-                // collection, and a short collection cannot be told from a real
-                // one -- nothing here knows how many records to expect.
-                if !reader.stream_ended() {
-                    return Err("truncated compressed stream".to_string());
-                }
-                std::borrow::Cow::Owned(plain)
-            } else {
-                std::borrow::Cow::Borrowed(&payload[..])
-            };
-            waproto::codec::syncd_snapshot_recovery_decode(&bytes)
-                .map_err(|e| format!("failed to decode: {e}"))
-        })
-        .await;
-
-        let recovery = match decoded {
-            Ok(recovery) => recovery,
-            Err(e) => {
-                warn!("Snapshot recovery response {e}");
-                return;
-            }
-        };
-
-        let Some(name) = recovery.collection_name.clone() else {
-            warn!("Snapshot recovery response names no collection; ignoring");
+        // The whole continuation is detached, not just the CPU inside it.
+        // `receive.rs` awaits this handler inline and inbound processing is
+        // serialized per chat, so awaiting the decode -- even one that runs on
+        // the blocking pool -- keeps the self-chat lane closed behind it, and
+        // the primary's key shares queue behind a payload of the primary's own
+        // choosing. Nothing here has an answer to give back.
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
             return;
         };
+        let compressed = response.is_compressed.unwrap_or(false);
+        let payload = blob.to_vec();
+        let request_id = request_id.to_string();
 
-        self.apply_recovered_collection(&name, recovery).await;
+        self.runtime.spawn_detached(Box::pin(async move {
+            // Up to 64 MiB of inflate plus a decode wide enough that `waproto`
+            // pins its instantiation: off the runtime's async workers either
+            // way.
+            let decoded = wacore::runtime::blocking(&*client.runtime, move || {
+                let bytes = if compressed {
+                    let mut reader = wacore_binary::zlib_pool::InflateReader::new(
+                        &payload,
+                        wacore::history_sync::MAX_DECOMPRESSED,
+                    );
+                    let mut plain = Vec::new();
+                    loop {
+                        match reader.ensure(1) {
+                            Ok(true) => {}
+                            // `ensure(1)` answers false only with nothing left.
+                            Ok(false) => break,
+                            Err(e) => return Err(format!("failed to decompress: {e}")),
+                        }
+                        let taken = {
+                            let chunk = reader.available();
+                            plain.extend_from_slice(chunk);
+                            chunk.len()
+                        };
+                        if taken == 0 {
+                            break;
+                        }
+                        reader.consume(taken);
+                    }
+                    // Running out is not ending. A payload cut short after a
+                    // parseable prefix would otherwise be applied as the whole
+                    // collection, and a short collection cannot be told from a
+                    // real one -- nothing here knows how many records to expect.
+                    if !reader.stream_ended() {
+                        return Err("is a truncated compressed stream".to_string());
+                    }
+                    std::borrow::Cow::Owned(plain)
+                } else {
+                    std::borrow::Cow::Borrowed(&payload[..])
+                };
+                waproto::codec::syncd_snapshot_recovery_decode(&bytes)
+                    .map_err(|e| format!("failed to decode: {e}"))
+            })
+            .await;
+
+            let recovery = match decoded {
+                Ok(recovery) => recovery,
+                Err(e) => {
+                    // The request was answered, badly. Its collection name is
+                    // inside the payload that would not read, so the id the
+                    // answer carried is the only way to say which ask this was
+                    // -- and leaving the marker would suppress every retry for
+                    // the rest of the window over a question already answered.
+                    let proc = client.get_app_state_processor();
+                    match proc.take_recovery_request_by_id(&request_id).await {
+                        Some(name) => warn!(
+                            "Snapshot recovery response for {name} {e}; the collection may be asked for again"
+                        ),
+                        None => warn!("Snapshot recovery response {e}"),
+                    }
+                    return;
+                }
+            };
+
+            let Some(name) = recovery.collection_name.clone() else {
+                warn!("Snapshot recovery response names no collection; ignoring");
+                return;
+            };
+
+            client.apply_recovered_collection(&name, recovery).await;
+        }));
     }
 
     async fn handle_placeholder_resend_response(
