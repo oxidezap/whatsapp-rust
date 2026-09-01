@@ -35,7 +35,7 @@ pub enum ContactError {
     #[error("unsupported contact JID: {0}")]
     InvalidJid(String),
     /// The username lookup could not be built from the given handle.
-    #[error(transparent)]
+    #[error("{0}")]
     Username(#[from] UsernameLookupError),
 }
 
