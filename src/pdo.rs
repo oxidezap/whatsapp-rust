@@ -546,25 +546,39 @@ impl Client {
         let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
             return;
         };
+        let compressed = response.is_compressed.unwrap_or(false);
+
         // Bounded before it is copied, not after. The ceiling was enforced
         // inside the task, so a malformed gigabyte reply was still allocated and
         // memcpy'd in full on the inbound lane before anything looked at its
         // size -- on the self-chat lane, where the primary's key shares queue
-        // behind it. The raw blob is checked here for both branches: a
-        // compressed one over the ceiling cannot inflate to anything this path
-        // would accept either.
-        if blob.len() as u64 > wacore::history_sync::MAX_DECOMPRESSED {
+        // behind it.
+        //
+        // Both branches are bounded, by what each can legitimately be. An
+        // uncompressed reply is its own output, so the ceiling is the ceiling. A
+        // compressed one is measured against the largest a stream whose *output*
+        // fits can be on the wire: deflate stores what it cannot compress, at a
+        // cost of about a thousandth plus a small header, so anything past that
+        // could not have inflated to something this path would accept. The
+        // inflate still enforces the real ceiling on the way out; this only
+        // decides whether the bytes are worth copying.
+        let max_wire = if compressed {
+            wacore::history_sync::MAX_DECOMPRESSED
+                + wacore::history_sync::MAX_DECOMPRESSED / 1000
+                + 64
+        } else {
+            wacore::history_sync::MAX_DECOMPRESSED
+        };
+        if blob.len() as u64 > max_wire {
             self.get_app_state_processor()
                 .take_recovery_request_by_id(request_id)
                 .await;
             warn!(
-                "Snapshot recovery for {asked} is {} bytes, over the {} this path allows; refusing it",
-                blob.len(),
-                wacore::history_sync::MAX_DECOMPRESSED
+                "Snapshot recovery for {asked} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
+                blob.len()
             );
             return;
         }
-        let compressed = response.is_compressed.unwrap_or(false);
         let payload = blob.to_vec();
         let request_id = request_id.to_string();
         let generation = self
