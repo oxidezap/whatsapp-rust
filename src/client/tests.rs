@@ -7402,6 +7402,43 @@ async fn a_new_preview_re_arms_the_terminal_report_slot() {
     assert_eq!(completed, vec![25], "the second drain's own completion");
 }
 
+/// A completion belongs to the connection whose drain it is.
+///
+/// The inactivity watchdog and the offline-delivery waiter both check the
+/// generation and then call into completion, so a reconnect landing in between
+/// would otherwise mark the replacement connection's backlog finished and
+/// widen its semaphore mid-drain.
+#[tokio::test]
+async fn a_completion_for_a_retired_generation_is_ignored() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.connection_generation.fetch_add(1, Ordering::SeqCst);
+
+    client
+        .complete_offline_sync_for_generation(711, stale_generation)
+        .await;
+
+    let (_, completed) = drain_offline_sync_events(&rx);
+    assert!(
+        completed.is_empty(),
+        "a retired generation's completion must not be published, got {completed:?}"
+    );
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "nor may it flip the live-state flag for the connection that replaced it"
+    );
+    assert!(
+        client.offline_sync_metrics.active.load(Ordering::Acquire),
+        "nor touch the drain state it no longer owns"
+    );
+}
+
 /// WA Web's `ShiftTimer`: a drain the server stops feeding on a live
 /// connection is completed by the client rather than left open.
 #[tokio::test]

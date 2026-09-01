@@ -292,6 +292,28 @@ impl Client {
     pub(crate) const DEFAULT_OFFLINE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub(crate) async fn complete_offline_sync(&self, count: i32) {
+        let generation = self.connection_generation.load(Ordering::Acquire);
+        self.complete_offline_sync_for_generation(count, generation)
+            .await
+    }
+
+    /// [`complete_offline_sync`](Self::complete_offline_sync) for a caller that
+    /// checked the generation earlier and may have been descheduled since.
+    ///
+    /// The check is the first thing done, before any drain state is touched,
+    /// and the same `generation` is handed to the finisher instead of being
+    /// re-read: a completion belongs to the connection whose drain it is, and
+    /// applying it to the replacement would mark that connection's backlog
+    /// finished and widen its semaphore mid-drain.
+    pub(crate) async fn complete_offline_sync_for_generation(&self, count: i32, generation: u64) {
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            log::debug!(
+                target: "Client/OfflineSync",
+                "Ignoring a completion for generation {} on a newer connection",
+                generation,
+            );
+            return;
+        }
         self.offline_sync_metrics
             .active
             .store(false, Ordering::Release);
@@ -333,7 +355,6 @@ impl Client {
         // trip the keepalive at the end of every drain. Ordering does not need
         // the inline await: the single permit already serializes the finisher
         // against stanza processing, so run it off-loop.
-        let generation = self.connection_generation.load(Ordering::Acquire);
         self.runtime
             .spawn(Box::pin(async move {
                 client.finish_offline_sync(count, generation).await;
@@ -358,10 +379,12 @@ impl Client {
             log::debug!(
                 "finish_offline_sync: connection generation changed during the tail commit; leaving the new connection's state alone"
             );
-            // The teardown that bumped the generation normally reported the
-            // interruption already; this covers losing the race to it, and the
-            // claim keeps it from being a second terminal event.
-            self.abandon_offline_sync_if_interrupted();
+            // No report from here: the only production bump of the generation
+            // with a drain in flight is `cleanup_connection_state`, which
+            // reports the interruption itself a few lines later. Reporting
+            // here as well would read (and disarm) whatever drain is current
+            // by the time this stale task runs, which may already be the next
+            // connection's.
             return;
         }
 
@@ -521,8 +544,11 @@ impl Client {
                 processed,
                 expected,
             );
-            self.complete_offline_sync(i32::try_from(processed).unwrap_or(i32::MAX))
-                .await;
+            self.complete_offline_sync_for_generation(
+                i32::try_from(processed).unwrap_or(i32::MAX),
+                wait_generation,
+            )
+            .await;
             // The finisher runs as a spawned task; keep this helper's contract
             // that live state is in place when it returns (callers start
             // session/send work right after). Ticked so a reconnect or

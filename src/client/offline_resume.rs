@@ -170,7 +170,10 @@ pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, ti
                     processed,
                 );
                 client
-                    .complete_offline_sync(i32::try_from(processed).unwrap_or(i32::MAX))
+                    .complete_offline_sync_for_generation(
+                        i32::try_from(processed).unwrap_or(i32::MAX),
+                        generation,
+                    )
                     .await;
                 return;
             }

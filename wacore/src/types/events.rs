@@ -974,7 +974,6 @@ pub enum Event {
     HistorySync(Box<LazyHistorySync>),
     OfflineSyncPreview(OfflineSyncPreview),
     OfflineSyncCompleted(OfflineSyncCompleted),
-    OfflineSyncInterrupted(OfflineSyncInterrupted),
     /// The server marked one of its cached protocol domains dirty.
     DirtyState(DirtyState),
 
@@ -1085,6 +1084,12 @@ pub enum Event {
 
     /// The server pushed (or withdrew) a retirement deadline for this build.
     ClientExpirationChanged(ClientExpirationChanged),
+
+    /// An offline backlog drain ended without its `<ib><offline>` end marker.
+    ///
+    /// Last, next to its sibling rather than next to
+    /// [`Event::OfflineSyncCompleted`], for the index reason above.
+    OfflineSyncInterrupted(OfflineSyncInterrupted),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1180,10 +1185,10 @@ impl Event {
             Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
             Event::CallLogSync(_) => EventKind::CallLogSync,
             Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
+            Event::OfflineSyncInterrupted(_) => EventKind::OfflineSyncInterrupted,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
-            Event::OfflineSyncInterrupted(_) => EventKind::OfflineSyncInterrupted,
             Event::DirtyState(_) => EventKind::DirtyState,
             Event::DeviceListUpdate(_) => EventKind::DeviceListUpdate,
             Event::IdentityChange(_) => EventKind::IdentityChange,
