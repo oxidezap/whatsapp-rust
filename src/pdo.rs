@@ -401,7 +401,13 @@ impl Client {
         {
             Ok(()) => Ok(request_id),
             Err(e) => {
-                proc.take_recovery_request(collection).await;
+                // By id, not by name. The window this marker holds is shorter
+                // than a send can take, so by now another ask for the same
+                // collection may have replaced this entry -- and withdrawing by
+                // name would take *its* marker, leaving a request that really is
+                // on the wire with nothing to recognise its answer. Taking by id
+                // withdraws this ask or nothing.
+                proc.take_recovery_request_by_id(&request_id).await;
                 Err(e)
             }
         }
