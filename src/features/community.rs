@@ -21,6 +21,10 @@ use wacore::iq::groups::{
 use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
 use wacore_binary::Jid;
 
+/// How the subgroup queries say the request came from a user acting now, which
+/// is the only context WA Web sends from the web client.
+const SUBGROUP_QUERY_CONTEXT: &str = "INTERACTIVE";
+
 /// Error returned by community operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -303,7 +307,11 @@ impl<'a> Community<'a> {
             .mex()
             .query(mex_request!(fetch_all_subgroups {
                 group_id: Some(community_jid.to_string()),
-                ..Default::default()
+                query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+                // WA Web names a subgroup the user has already joined here, to
+                // steer which subgroups come back first. There is no such hint
+                // to give from this API, and WA Web omits it in that case too.
+                sub_group_hint_id: None,
             }))
             .await?;
 
@@ -370,7 +378,8 @@ impl<'a> Community<'a> {
             .query(mex_request!(query_subgroup_participant_count {
                 input: Some(query_subgroup_participant_count::Input {
                     group_jid: Some(community_jid.to_string()),
-                    ..Default::default()
+                    query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+                    sub_group_jid_hint: None,
                 }),
             }))
             .await?;
@@ -539,6 +548,63 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn community_jid() -> Jid {
+        "120363000000000001@g.us"
+            .parse()
+            .expect("fictitious community")
+    }
+
+    /// Regression for the same 400 as the newsletter queries: WhatsApp Web
+    /// always sends `query_context`, and only leaves `sub_group_hint_id` out
+    /// when it has no joined subgroup to name, which is this client's case.
+    #[test]
+    fn subgroup_listing_sends_the_query_context_and_omits_only_the_hint() {
+        let request = mex_request!(fetch_all_subgroups {
+            group_id: Some(community_jid().to_string()),
+            query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+            sub_group_hint_id: None,
+        });
+
+        assert_eq!(
+            request.missing_variables().expect("serialize"),
+            vec!["sub_group_hint_id"]
+        );
+        assert_eq!(
+            serde_json::to_value(&request.variables).expect("serialize"),
+            serde_json::json!({
+                "group_id": "120363000000000001@g.us",
+                "query_context": "INTERACTIVE",
+            })
+        );
+    }
+
+    /// The participant count carries the same context, one level down inside
+    /// `input`, where the compiler cannot force the decision.
+    #[test]
+    fn participant_count_input_carries_the_query_context() {
+        let request = mex_request!(query_subgroup_participant_count {
+            input: Some(query_subgroup_participant_count::Input {
+                group_jid: Some(community_jid().to_string()),
+                query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+                sub_group_jid_hint: None,
+            }),
+        });
+
+        assert_eq!(
+            request.missing_variables().expect("serialize"),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            serde_json::to_value(&request.variables).expect("serialize"),
+            serde_json::json!({
+                "input": {
+                    "group_jid": "120363000000000001@g.us",
+                    "query_context": "INTERACTIVE",
+                }
+            })
+        );
+    }
 
     #[test]
     fn subgroup_parser_preserves_typed_metadata() {

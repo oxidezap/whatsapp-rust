@@ -980,6 +980,9 @@ mod tests {
         assert_eq!(request["collection_limit"], json!("51"));
         assert_eq!(request["item_limit"], json!("51"));
         assert_eq!(request["width"], json!("100"));
+        // Same rule as the catalog: no cursor on the first page, because an
+        // explicit null is a cursor value.
+        assert!(request.get("after").is_none());
     }
 
     /// The order query is the one that sends real JSON numbers, and it wraps

@@ -214,7 +214,11 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .query(mex_request!(fetch_all_newsletters_metadata {
-                ..Default::default()
+                // Both gate response blocks this client does not parse. WA Web
+                // reads the same two feature flags and sends whatever they say,
+                // so `false` is a value the server sees from it every day.
+                fetch_status_metadata: Some(false),
+                fetch_wamo_sub: Some(false),
             }))
             .await?;
 
@@ -235,17 +239,10 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(fetch_newsletter {
-                input: Some(fetch_newsletter::Input {
-                    key: Some(jid.to_string()),
-                    r#type: Some("JID".into()),
-                    view_role: Some("GUEST".into()),
-                }),
-                fetch_viewer_metadata: Some(true),
-                fetch_full_image: Some(true),
-                fetch_creation_time: Some(true),
-                ..Default::default()
-            }))
+            .query(mex_request!(
+                fetch_newsletter,
+                newsletter_variables(&jid.to_string(), "JID")
+            ))
             .await?;
 
         let data = response
@@ -549,17 +546,10 @@ impl<'a> Newsletter<'a> {
         let response = self
             .client
             .mex()
-            .query(mex_request!(fetch_newsletter {
-                input: Some(fetch_newsletter::Input {
-                    key: Some(invite_code.to_string()),
-                    r#type: Some("INVITE".into()),
-                    view_role: Some("GUEST".into()),
-                }),
-                fetch_viewer_metadata: Some(true),
-                fetch_full_image: Some(true),
-                fetch_creation_time: Some(true),
-                ..Default::default()
-            }))
+            .query(mex_request!(
+                fetch_newsletter,
+                newsletter_variables(invite_code, "INVITE")
+            ))
             .await?;
 
         let data = response
@@ -1026,6 +1016,28 @@ fn picture_update_variables(jid: &Jid, jpeg: Option<&[u8]>) -> update_newsletter
     }
 }
 
+/// Variables for `WAWebMexFetchNewsletterJobQuery`, addressing a channel by
+/// `key`/`key_type` (`"JID"` or `"INVITE"`).
+///
+/// The three `false` flags ask for response blocks this client does not parse;
+/// WA Web puts each behind a feature flag and sends the flag's value either
+/// way. `view_role` is `GUEST` because WA Web maps an absent role to it.
+fn newsletter_variables(key: &str, key_type: &str) -> fetch_newsletter::Variables {
+    fetch_newsletter::Variables {
+        input: Some(fetch_newsletter::Input {
+            key: Some(key.to_string()),
+            r#type: Some(key_type.to_string()),
+            view_role: Some("GUEST".into()),
+        }),
+        fetch_viewer_metadata: Some(true),
+        fetch_full_image: Some(true),
+        fetch_creation_time: Some(true),
+        fetch_pinned_messages: Some(false),
+        fetch_status_metadata: Some(false),
+        fetch_wamo_sub: Some(false),
+    }
+}
+
 fn delete_variables(jid: &Jid) -> delete_newsletter::Variables {
     delete_newsletter::Variables {
         newsletter_id: Some(jid.to_string()),
@@ -1076,6 +1088,79 @@ mod tests {
     use super::*;
     use serde_json::json;
     use wacore_binary::builder::NodeBuilder;
+
+    /// Regression for the 400 the server answers a persisted query that omits a
+    /// declared variable with. WhatsApp Web sends both flags unconditionally,
+    /// as whatever their feature gates say.
+    #[test]
+    fn subscribed_list_request_declares_every_variable() {
+        let request = mex_request!(fetch_all_newsletters_metadata {
+            fetch_status_metadata: Some(false),
+            fetch_wamo_sub: Some(false),
+        });
+
+        assert_eq!(
+            request.missing_variables().expect("serialize"),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            serde_json::to_value(&request.variables).expect("serialize"),
+            json!({ "fetch_status_metadata": false, "fetch_wamo_sub": false })
+        );
+    }
+
+    /// Same regression for the newsletter fetch, whose seven variables WA Web
+    /// also writes out in full at every call site.
+    #[test]
+    fn newsletter_fetch_request_declares_every_variable() {
+        for (key, key_type) in [
+            ("120363000000000001@newsletter", "JID"),
+            ("0029Vabcdefghij0123456789", "INVITE"),
+        ] {
+            let request = mex_request!(fetch_newsletter, newsletter_variables(key, key_type));
+
+            assert_eq!(
+                request.missing_variables().expect("serialize"),
+                Vec::<&str>::new(),
+                "{key_type}"
+            );
+            assert_eq!(
+                serde_json::to_value(&request.variables).expect("serialize"),
+                json!({
+                    "input": { "key": key, "type": key_type, "view_role": "GUEST" },
+                    "fetch_viewer_metadata": true,
+                    "fetch_full_image": true,
+                    "fetch_creation_time": true,
+                    "fetch_pinned_messages": false,
+                    "fetch_status_metadata": false,
+                    "fetch_wamo_sub": false,
+                })
+            );
+        }
+    }
+
+    /// `updates` is a tri-state: an absent key means "leave alone" and a null
+    /// would clear the field. Serializing `None` as null here would wipe a
+    /// channel's name and description on every picture change, so this pins the
+    /// omission that the `skip_serializing_if` on the nested types provides.
+    #[test]
+    fn a_picture_update_does_not_touch_the_name_or_description() {
+        for jpeg in [Some(&b"\xff\xd8\xff"[..]), None] {
+            let updates = serde_json::to_value(picture_update_variables(&newsletter_jid(), jpeg))
+                .expect("serialize");
+            let updates = &updates["updates"];
+
+            assert!(updates.get("name").is_none(), "{updates}");
+            assert!(updates.get("description").is_none(), "{updates}");
+            assert!(updates.get("settings").is_none(), "{updates}");
+            assert!(updates["picture"].is_string(), "{updates}");
+        }
+        // Clearing is an empty string, not a null: the server collapses null to
+        // "no change" and the picture would survive.
+        let cleared = serde_json::to_value(picture_update_variables(&newsletter_jid(), None))
+            .expect("serialize");
+        assert_eq!(cleared["updates"]["picture"], json!(""));
+    }
 
     #[test]
     fn mute_variables_match_wa_web_shape() {

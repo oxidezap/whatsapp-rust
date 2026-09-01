@@ -47,19 +47,51 @@ pub enum MexError {
 pub struct MexRequest<V> {
     /// GraphQL persisted-query descriptor (name + id).
     pub doc: MexDoc,
+    /// The variable names the persisted document declares, from the op module's
+    /// `VARIABLE_KEYS`. Carried so a payload can be checked against them even
+    /// when the variables are a loosely-typed `json!`.
+    pub declared_variables: &'static [&'static str],
     /// Typed query variables: a generated `Variables`, or any `Serialize` value
     /// (e.g. a `json!` object) for inputs the generated mirror types too loosely.
     pub variables: V,
 }
 
 impl<V> MexRequest<V> {
-    /// Pair a `(name, id)` from a generated op module with its variables.
-    /// Prefer the `mex_request!` macro, which names the op once.
-    pub fn new(name: &'static str, id: &'static str, variables: V) -> Self {
+    /// Pair a `(name, id, declared variables)` from a generated op module with
+    /// its variables. Prefer the `mex_request!` macro, which names the op once.
+    pub fn new(
+        name: &'static str,
+        id: &'static str,
+        declared_variables: &'static [&'static str],
+        variables: V,
+    ) -> Self {
         Self {
             doc: MexDoc { name, id },
+            declared_variables,
             variables,
         }
+    }
+}
+
+impl<V: Serialize> MexRequest<V> {
+    /// Declared variables this request's payload does not carry.
+    ///
+    /// A persisted query the server cannot bind every variable of comes back as
+    /// a bare `400 Bad Request`, so serializing and looking is the only way to
+    /// see the omission before it reaches the wire. A non-empty result is not
+    /// automatically wrong: WhatsApp Web omits an optional variable it has no
+    /// value for, and this reports that the same way.
+    pub fn missing_variables(&self) -> Result<Vec<&'static str>, serde_json::Error> {
+        let value = serde_json::to_value(&self.variables)?;
+        let Some(object) = value.as_object() else {
+            return Ok(self.declared_variables.to_vec());
+        };
+        Ok(self
+            .declared_variables
+            .iter()
+            .copied()
+            .filter(|key| !object.contains_key(*key))
+            .collect())
     }
 }
 
@@ -78,12 +110,18 @@ macro_rules! mex_request {
         $crate::features::mex::MexRequest::new(
             __mex_op::NAME,
             __mex_op::DOC_ID,
+            __mex_op::VARIABLE_KEYS,
             __mex_op::Variables { $($body)* },
         )
     }};
     ($op:path, $vars:expr $(,)?) => {{
         use $op as __mex_op;
-        $crate::features::mex::MexRequest::new(__mex_op::NAME, __mex_op::DOC_ID, $vars)
+        $crate::features::mex::MexRequest::new(
+            __mex_op::NAME,
+            __mex_op::DOC_ID,
+            __mex_op::VARIABLE_KEYS,
+            $vars,
+        )
     }};
 }
 pub(crate) use mex_request;
@@ -331,11 +369,49 @@ mod tests {
         };
         let request = MexRequest {
             doc: DOC,
+            declared_variables: &[],
             variables: json!({}),
         };
 
         assert_eq!(request.doc.id, "29829202653362039");
         assert_eq!(request.doc.name, "WAWebMexTestQuery");
+    }
+
+    /// The guard for the loosely-typed form of `mex_request!`, where the
+    /// compiler cannot see the variables at all: a `json!` payload is still
+    /// checked against the op's own `VARIABLE_KEYS`.
+    #[test]
+    fn missing_variables_names_what_a_payload_leaves_out() {
+        use wacore::iq::mex_operations::fetch_all_newsletters_metadata as op;
+
+        let complete = MexRequest::new(
+            op::NAME,
+            op::DOC_ID,
+            op::VARIABLE_KEYS,
+            json!({ "fetch_status_metadata": false, "fetch_wamo_sub": false }),
+        );
+        assert_eq!(
+            complete.missing_variables().expect("serialize"),
+            Vec::<&str>::new()
+        );
+
+        let partial = MexRequest::new(
+            op::NAME,
+            op::DOC_ID,
+            op::VARIABLE_KEYS,
+            json!({ "fetch_wamo_sub": true }),
+        );
+        assert_eq!(
+            partial.missing_variables().expect("serialize"),
+            vec!["fetch_status_metadata"]
+        );
+
+        // A payload that is not an object binds nothing at all.
+        let bogus = MexRequest::new(op::NAME, op::DOC_ID, op::VARIABLE_KEYS, json!("nope"));
+        assert_eq!(
+            bogus.missing_variables().expect("serialize"),
+            vec!["fetch_status_metadata", "fetch_wamo_sub"]
+        );
     }
 
     #[test]

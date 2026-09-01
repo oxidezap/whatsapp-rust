@@ -15,6 +15,40 @@
 //!   <result>{"data":{...},"errors":[...]}</result>
 //! </iq>
 //! ```
+//!
+//! # Variables are all-or-nothing
+//!
+//! The server binds a persisted query's variables by name and answers a bare
+//! `400 Bad Request` when it cannot bind one, so a call site has to decide every
+//! variable the document declares. That is why a generated `Variables` is not
+//! `Default`, and it is the compiler that enforces it:
+//!
+//! ```compile_fail
+//! use wacore::iq::mex_operations::fetch_newsletter;
+//!
+//! // Names one variable and inherits six. `Variables` has no `Default`, so
+//! // this does not compile.
+//! let _ = fetch_newsletter::Variables {
+//!     fetch_full_image: Some(true),
+//!     ..Default::default()
+//! };
+//! ```
+//!
+//! Writing every field out compiles, and `VARIABLE_KEYS` is the same list for
+//! anything that has to check a payload it did not build from the type:
+//!
+//! ```
+//! use wacore::iq::mex_operations::fetch_all_newsletters_metadata as op;
+//!
+//! let variables = op::Variables {
+//!     fetch_status_metadata: Some(false),
+//!     fetch_wamo_sub: Some(false),
+//! };
+//! let payload = serde_json::to_value(&variables).expect("variables serialize");
+//! for key in op::VARIABLE_KEYS {
+//!     assert!(payload.get(key).is_some(), "{key} is missing");
+//! }
+//! ```
 
 use crate::iq::spec::IqSpec;
 use crate::request::InfoQuery;
