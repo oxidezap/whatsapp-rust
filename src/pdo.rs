@@ -513,22 +513,29 @@ impl Client {
             return;
         };
 
-        // Correlated before a byte is cloned or inflated. A stale, duplicate or
-        // simply unsolicited type-8 reply is refused by the same lookup either
-        // way, and doing it here rather than after the decode is the difference
+        // Which collection this id was asked about -- claimed, before a byte is
+        // cloned or inflated.
+        //
+        // Correlating here rather than after the decode is the difference
         // between a map read and up to 64 MiB of inflate plus a record graph
-        // built for something that was never eligible to apply. The lookup runs
-        // again inside the task, because a request can expire while the decode
-        // is under way; this one only stops the work from starting.
-        if self
+        // built for a reply that was never eligible to apply. Claiming rather
+        // than reading is what makes one ask cost one decode: a response that
+        // repeats the result, or a second copy arriving before the first is
+        // consumed, would otherwise each spawn a collection-sized job against
+        // the same request.
+        //
+        // The payload names a collection too, but that is the reply's claim
+        // about itself -- and with two recoveries outstanding, a reply carrying
+        // A's id and B's name would select B's marker and be checked against its
+        // own name, which always agrees. So the ask decides.
+        let Some(asked) = self
             .get_app_state_processor()
-            .collection_for_request_id(request_id)
+            .claim_recovery_request_by_id(request_id)
             .await
-            .is_none()
-        {
+        else {
             warn!("Ignoring a snapshot recovery nothing here asked for");
             return;
-        }
+        };
 
         // The whole continuation is detached, not just the CPU inside it.
         // `receive.rs` awaits this handler inline and inbound processing is
@@ -623,16 +630,6 @@ impl Client {
 
             let proc = client.get_app_state_processor();
 
-            // Which collection this id was asked about. The payload names one
-            // too, but that is the reply's claim about itself -- and with two
-            // recoveries outstanding, a reply carrying A's id and B's name would
-            // otherwise select B's marker and be checked against its own name,
-            // which always agrees. So the ask decides, and a payload that
-            // disagrees with it is refused.
-            let Some(asked) = proc.collection_for_request_id(&request_id).await else {
-                warn!("Ignoring a snapshot recovery nothing here asked for");
-                return;
-            };
             match recovery.collection_name.as_deref() {
                 Some(named) if named == asked => {}
                 other => {

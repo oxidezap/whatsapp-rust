@@ -147,6 +147,9 @@ pub enum AppStateSyncError {
 struct RecoveryRequest {
     asked_at: crate::time::Instant,
     request_id: Option<String>,
+    /// Set once an answer carrying this id has been taken up, so a repeat of
+    /// that answer is refused before it costs a decode.
+    answering: bool,
 }
 
 /// What became of a collection the primary sent back.
@@ -218,6 +221,7 @@ impl AppStateProcessor {
             RecoveryRequest {
                 asked_at: crate::time::Instant::now(),
                 request_id: None,
+                answering: false,
             },
         );
         true
@@ -240,19 +244,28 @@ impl AppStateProcessor {
         }
     }
 
-    /// The collection an answer's id was asked about, without taking it.
+    /// The collection an answer's id was asked about, claimed for this answer.
     ///
     /// The payload names a collection too, and that name is the reply's own
     /// claim about itself; this is what the ask actually was. Comparing the two
     /// is what stops a reply carrying one collection's id and another's name
     /// from overwriting a collection nobody asked about.
-    pub async fn collection_for_request_id(&self, request_id: &str) -> Option<String> {
-        self.recovery_requested
-            .lock()
-            .await
-            .iter()
-            .find(|(_, request)| request.request_id.as_deref() == Some(request_id))
-            .map(|(name, _)| name.clone())
+    ///
+    /// Claiming rather than reading, because one ask has one answer: a response
+    /// repeating the result, or a second copy arriving before the first is
+    /// consumed, would otherwise each inflate and decode a whole collection
+    /// against the same request. `None` once it is claimed, and every path that
+    /// ends an answer removes the request outright.
+    pub async fn claim_recovery_request_by_id(&self, request_id: &str) -> Option<String> {
+        let mut outstanding = self.recovery_requested.lock().await;
+        let (name, request) = outstanding
+            .iter_mut()
+            .find(|(_, request)| request.request_id.as_deref() == Some(request_id))?;
+        if request.answering {
+            return None;
+        }
+        request.answering = true;
+        Some(name.clone())
     }
 
     /// Takes the request an id answers, whatever its payload turned out to be.
@@ -391,7 +404,52 @@ impl AppStateProcessor {
             )
         })?;
 
-        // The keys first, because looking one up may reach the store and the
+        // One winner per index -- the last record for it -- which is the rule the
+        // snapshot path already applies, for the reason it gives: the MAC store
+        // keeps a single value per index, so a loser that was dispatched anyway
+        // would hand a consumer a mute, a contact or a label the collection we
+        // just persisted does not describe, and event delivery is concurrent, so
+        // it could be the one that sticks.
+        //
+        // Keyed by the index *and the key id*, because that pair is what the
+        // stored index MAC is derived from: two records naming the same index
+        // under different app-state keys hash to different MACs and so occupy
+        // different rows, and collapsing them would leave part of the primary's
+        // ltHash with nothing standing for it -- the next patch then fails on
+        // the collection this recovery just repaired. The snapshot path
+        // deduplicates on the index MAC itself for the same reason; here the MAC
+        // has not been derived yet, and the pair it comes from decides the same
+        // thing for two HMACs less.
+        //
+        // Note what keying on the pair settles: a loser shares its winner's key
+        // id by construction, so there is no such thing as a superseded record
+        // whose key nobody else needs. Skipping losers below would save no
+        // lookup, and a record referencing a key this side never received fails
+        // the recovery whether or not it goes on to win.
+        let winners: Vec<bool> = {
+            let mut winners = vec![true; recovery.mutation_records.len()];
+            let mut seen: Vec<(&[u8], &[u8])> = Vec::new();
+            // Backwards, so the first hit for an index is its last record.
+            for (i, record) in recovery.mutation_records.iter().enumerate().rev() {
+                // A record missing its value, index or key id is not silently
+                // dropped here: it falls through to the loop below, which
+                // refuses the whole recovery over it.
+                let Some(index) = record.value.as_option().and_then(|v| v.index.as_deref()) else {
+                    continue;
+                };
+                let Some(key_id) = record.key_id.as_deref() else {
+                    continue;
+                };
+                if seen.contains(&(index, key_id)) {
+                    winners[i] = false;
+                } else {
+                    seen.push((index, key_id));
+                }
+            }
+            winners
+        };
+
+        // The keys next, because looking one up may reach the store and the
         // work below may not. Distinct ids only: a collection is usually keyed
         // by one or two, and the cache behind this makes a repeat cheap anyway.
         let mut keys_by_id: HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>> = HashMap::new();
@@ -414,46 +472,6 @@ impl AppStateProcessor {
         // needs.
         let owned_name = name.to_string();
         let (mutations, macs) = crate::runtime::blocking(&*self.runtime, move || {
-            // One winner per index -- the last record for it -- which is the
-            // rule the snapshot path already applies, for the reason it gives:
-            // the MAC store keeps a single value per index, so a loser that was
-            // dispatched anyway would hand a consumer a mute, a contact or a
-            // label the collection we just persisted does not describe, and
-            // event delivery is concurrent, so it could be the one that sticks.
-            //
-            // Keyed by the index *and the key id*, because that pair is what the
-            // stored index MAC is derived from: two records naming the same
-            // index under different app-state keys hash to different MACs and so
-            // occupy different rows, and collapsing them would leave part of the
-            // primary's ltHash with nothing standing for it -- the next patch
-            // then fails on the collection this recovery just repaired. The
-            // snapshot path deduplicates on the index MAC itself for the same
-            // reason; here the MAC has not been derived yet, and the pair it
-            // comes from decides the same thing for two HMACs less.
-            let winners: Vec<bool> = {
-                let mut winners = vec![true; recovery.mutation_records.len()];
-                let mut seen: Vec<(&[u8], &[u8])> = Vec::new();
-                // Backwards, so the first hit for an index is its last record.
-                for (i, record) in recovery.mutation_records.iter().enumerate().rev() {
-                    // A record missing its value, index or key id is not
-                    // silently dropped here: it falls through to the loop below,
-                    // which refuses the whole recovery over it.
-                    let Some(index) = record.value.as_option().and_then(|v| v.index.as_deref())
-                    else {
-                        continue;
-                    };
-                    let Some(key_id) = record.key_id.as_deref() else {
-                        continue;
-                    };
-                    if seen.contains(&(index, key_id)) {
-                        winners[i] = false;
-                    } else {
-                        seen.push((index, key_id));
-                    }
-                }
-                winners
-            };
-
             let mut mutations = Vec::with_capacity(recovery.mutation_records.len());
             let mut macs = Vec::with_capacity(recovery.mutation_records.len());
             for (i, record) in recovery.mutation_records.into_iter().enumerate() {
@@ -505,6 +523,16 @@ impl AppStateProcessor {
                 let parsed_index: Vec<String> = serde_json::from_slice(&index).map_err(|e| {
                     anyhow!("recovery record {i} of {owned_name} has an unreadable index: {e}")
                 })?;
+                // `[]` parses, and then names nothing:
+                // `dispatch_app_state_mutation` returns early on an empty index,
+                // so the record would reach no consumer while its MAC was
+                // committed and the version written -- the same silent loss the
+                // unreadable index above is refused for, one step further along.
+                if parsed_index.is_empty() {
+                    return Err(anyhow!(
+                        "recovery record {i} of {owned_name} carries an empty index"
+                    ));
+                }
 
                 mutations.push(Mutation {
                     action_value: action.value.into_option(),

@@ -797,6 +797,29 @@ mod tests {
             !processor.take_recovery_request("regular_low").await,
             "a second reply to one request would apply a collection twice"
         );
+
+        // And an answer is claimed, not merely recognised: a response repeating
+        // its result, or a second copy of it, would otherwise each inflate and
+        // decode a whole collection against the one ask.
+        assert!(processor.mark_recovery_requested("regular_low").await);
+        processor
+            .note_recovery_request_id("regular_low", "req-1")
+            .await;
+        assert_eq!(
+            processor.claim_recovery_request_by_id("req-1").await,
+            Some("regular_low".to_string()),
+            "the first copy of the answer takes the ask up"
+        );
+        assert_eq!(
+            processor.claim_recovery_request_by_id("req-1").await,
+            None,
+            "a repeat of it does not get a second decode"
+        );
+        assert_eq!(
+            processor.take_recovery_request_by_id("req-1").await,
+            Some("regular_low".to_string()),
+            "and the claim does not stop the answer from spending its request"
+        );
     }
 
     #[tokio::test]
