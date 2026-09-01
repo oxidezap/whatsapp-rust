@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -428,7 +428,10 @@ impl AppStateProcessor {
         // the recovery whether or not it goes on to win.
         let winners: Vec<bool> = {
             let mut winners = vec![true; recovery.mutation_records.len()];
-            let mut seen: Vec<(&[u8], &[u8])> = Vec::new();
+            // Hashed, not scanned: a whole collection is thousands of records
+            // and every one of them is a membership test, so a linear `seen`
+            // makes this quadratic in a payload whose size the primary chose.
+            let mut seen: HashSet<(&[u8], &[u8])> = HashSet::new();
             // Backwards, so the first hit for an index is its last record.
             for (i, record) in recovery.mutation_records.iter().enumerate().rev() {
                 // A record missing its value, index or key id is not silently
@@ -440,10 +443,8 @@ impl AppStateProcessor {
                 let Some(key_id) = record.key_id.as_deref() else {
                     continue;
                 };
-                if seen.contains(&(index, key_id)) {
+                if !seen.insert((index, key_id)) {
                     winners[i] = false;
-                } else {
-                    seen.push((index, key_id));
                 }
             }
             winners
