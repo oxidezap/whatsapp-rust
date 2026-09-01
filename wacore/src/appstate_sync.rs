@@ -160,6 +160,9 @@ pub enum RecoveryOutcome {
     /// The collection had already moved past what the primary offered, so it was
     /// left alone.
     Stale { held: u64, offered: u64 },
+    /// The caller stopped standing behind the write before it began, so nothing
+    /// was touched.
+    Retired,
 }
 
 #[derive(Clone)]
@@ -324,10 +327,18 @@ impl AppStateProcessor {
     /// Trusting them is trusting the paired phone, over an end-to-end encrypted
     /// message, about an account it owns -- which is a weaker claim than the one
     /// already made by every key in the store.
+    /// `still_current` is asked once more, immediately before the first write.
+    /// Everything above it is reads and CPU and can be abandoned freely, but the
+    /// three writes below replace a collection, and what makes that safe is the
+    /// caller's exclusion of the other writers -- a reservation that a
+    /// disconnect drops wholesale. The checks the caller made before calling are
+    /// therefore stale by exactly the store lookups and the record work in
+    /// between, which is the part of this that can take real time.
     pub async fn apply_snapshot_recovery(
         &self,
         recovery: wa::SyncdSnapshotRecovery,
         expected_collection: &str,
+        still_current: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<RecoveryOutcome> {
         // The response says which collection it is, and the request said which
         // one was asked for. WA Web compares the two and refuses on mismatch;
@@ -464,6 +475,13 @@ impl AppStateProcessor {
             Ok::<_, anyhow::Error>((mutations, macs))
         })
         .await?;
+
+        // Asked again here, with the reads and the record work behind us and the
+        // first write in front. Whatever the caller checked before calling was
+        // true a key lookup and a whole collection's worth of HMACs ago.
+        if !still_current() {
+            return Ok(RecoveryOutcome::Retired);
+        }
 
         // Same order the snapshot path commits in, and for the same reason: the
         // version goes last, so a store error part-way leaves a collection that

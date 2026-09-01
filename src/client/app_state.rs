@@ -3370,7 +3370,18 @@ impl Client {
             return;
         }
 
-        match proc.apply_snapshot_recovery(recovery, name).await {
+        // The generation check above is true only until the next await. Beneath
+        // this call are a store lookup per key, a whole collection's worth of
+        // HMACs, and then the three writes that replace the collection -- and a
+        // disconnect anywhere in there drops the registry wholesale, so the
+        // reservation held here stops excluding the new connection's own sync
+        // from the very rows about to be written. So the apply asks again, on
+        // the far side of that work and in front of the first write.
+        let still_current = || self.connection_generation.load(Ordering::Acquire) == generation;
+        match proc
+            .apply_snapshot_recovery(recovery, name, &still_current)
+            .await
+        {
             Ok(wacore::appstate_sync::RecoveryOutcome::Applied(mutations)) => {
                 info!(
                     target: "Client/AppState",
@@ -3378,9 +3389,26 @@ impl Client {
                     mutations.len()
                 );
                 wacore::telemetry::appstate_mutations(mutations.len() as u64);
+                // Written under this connection, so announced under it too. A
+                // disconnect during the writes leaves the rows where they are --
+                // the next sync reads them -- but an event dispatched now would
+                // describe the replaced session to consumers of the new one.
+                if !still_current() {
+                    debug!(
+                        target: "Client/AppState",
+                        "Not announcing the {name} recovery: the connection it belongs to went while it was written"
+                    );
+                    return;
+                }
                 for m in &mutations {
                     self.dispatch_app_state_mutation(m, true).await;
                 }
+            }
+            Ok(wacore::appstate_sync::RecoveryOutcome::Retired) => {
+                debug!(
+                    target: "Client/AppState",
+                    "Dropping the {name} recovery: the connection it belongs to went before it was written"
+                );
             }
             Ok(wacore::appstate_sync::RecoveryOutcome::Stale { held, offered }) => {
                 info!(

@@ -434,7 +434,7 @@ mod tests {
         );
 
         let outcome = processor
-            .apply_snapshot_recovery(recovery, "regular_low")
+            .apply_snapshot_recovery(recovery, "regular_low", &|| true)
             .await
             .expect("a recovery for the collection that was asked for applies");
         let RecoveryOutcome::Applied(mutations) = outcome else {
@@ -515,7 +515,7 @@ mod tests {
 
         let recovery = recovery_of("regular_low", 253, [0x5A; 128], b"k", &[]);
         let outcome = processor
-            .apply_snapshot_recovery(recovery, "regular_low")
+            .apply_snapshot_recovery(recovery, "regular_low", &|| true)
             .await
             .expect("a stale recovery is discarded, not an error");
 
@@ -535,9 +535,11 @@ mod tests {
         assert_eq!(stored.hash, current.hash, "and so does its ltHash");
     }
 
-    /// The reply carries no request id, so the collection name is the only thing
-    /// tying it to what was asked. WA Web compares the two and refuses; so does
-    /// this, or a reply for one collection could overwrite another.
+    /// The name the payload claims, against the name the ask was made about.
+    /// The caller resolves the latter from the request id, so this comparison is
+    /// what stops a reply carrying one collection's id and another's name from
+    /// overwriting a collection nobody asked about. WA Web compares the two the
+    /// same way.
     #[tokio::test]
     async fn snapshot_recovery_for_another_collection_is_refused() {
         let backend = Arc::new(MockBackend::default());
@@ -546,7 +548,7 @@ mod tests {
 
         let recovery = recovery_of("regular", 5, [0u8; 128], b"k", &[]);
         let err = processor
-            .apply_snapshot_recovery(recovery, "regular_low")
+            .apply_snapshot_recovery(recovery, "regular_low", &|| true)
             .await
             .expect_err("a recovery naming another collection must be refused");
         assert!(err.to_string().contains("regular_low"), "{err}");
@@ -554,6 +556,74 @@ mod tests {
         assert!(
             backend.get_version("regular").await.unwrap().is_none(),
             "and nothing is written for the collection it did name"
+        );
+    }
+
+    /// The reservation this write runs under is a connection's, and a disconnect
+    /// drops the whole registry -- so a recovery that is still doing its key
+    /// lookups and its HMACs when one happens no longer excludes the new
+    /// connection's sync from the rows it is about to clear and rewrite.
+    #[tokio::test]
+    async fn a_recovery_whose_connection_goes_writes_nothing() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let key_id = b"test_key_id".to_vec();
+        let master_key = [7u8; 32];
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Where the collection stood when the recovery started: stuck, and the
+        // state the new connection's sync would be reading and moving.
+        let held = HashState {
+            version: 0,
+            mac_mismatch_fatal: true,
+            ..Default::default()
+        };
+        backend.set_version("regular_low", held).await.unwrap();
+
+        let recovery = recovery_of(
+            "regular_low",
+            253,
+            [0x5A; 128],
+            &key_id,
+            &[(r#"["mute","1@s.whatsapp.net"]"#, [0x11; 32])],
+        );
+
+        // Retired between the caller's check and the first write, which is the
+        // whole window this guard exists for.
+        let outcome = processor
+            .apply_snapshot_recovery(recovery, "regular_low", &|| false)
+            .await
+            .expect("a retired recovery is dropped, not an error");
+        assert!(matches!(outcome, RecoveryOutcome::Retired), "{outcome:?}");
+
+        let stored = backend.get_version("regular_low").await.unwrap().unwrap();
+        assert_eq!(stored.version, 0, "the version is left where it was");
+        assert!(
+            stored.mac_mismatch_fatal,
+            "and so is the flag that will have it asked for again"
+        );
+        let keys = expand_app_state_keys(&master_key);
+        let index_mac = wacore::appstate::hash::generate_index_mac(
+            br#"["mute","1@s.whatsapp.net"]"#,
+            &keys.index,
+        );
+        assert!(
+            backend
+                .get_mutation_mac("regular_low", &index_mac)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing reached the MAC store either"
         );
     }
 
