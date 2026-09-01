@@ -169,10 +169,10 @@ pub struct AppStateProcessor {
     key_cache: Arc<Mutex<HashMap<String, Arc<ExpandedAppStateKeys>>>>,
     /// Collections a recovery has been asked of the primary for.
     ///
-    /// The reply carries no request id and nothing else correlates it, so this
-    /// is what says a recovery was wanted. It lives here rather than beside the
-    /// connection because it has to outlive the sync that raised it: the phone
-    /// answers whenever it answers, and by then the run that asked is long over.
+    /// Held here rather than beside the connection because it has to outlive the
+    /// sync that raised it: the phone answers whenever it answers, and by then
+    /// the run that asked is long over. What each entry carries, and why, is on
+    /// [`RecoveryRequest`].
     recovery_requested: Arc<Mutex<HashMap<String, RecoveryRequest>>>,
 }
 
@@ -233,6 +233,21 @@ impl AppStateProcessor {
         if let Some(request) = self.recovery_requested.lock().await.get_mut(collection) {
             request.request_id = Some(request_id.to_string());
         }
+    }
+
+    /// The collection an answer's id was asked about, without taking it.
+    ///
+    /// The payload names a collection too, and that name is the reply's own
+    /// claim about itself; this is what the ask actually was. Comparing the two
+    /// is what stops a reply carrying one collection's id and another's name
+    /// from overwriting a collection nobody asked about.
+    pub async fn collection_for_request_id(&self, request_id: &str) -> Option<String> {
+        self.recovery_requested
+            .lock()
+            .await
+            .iter()
+            .find(|(_, request)| request.request_id.as_deref() == Some(request_id))
+            .map(|(name, _)| name.clone())
     }
 
     /// Takes the request an id answers, whatever its payload turned out to be.

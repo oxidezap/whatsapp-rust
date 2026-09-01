@@ -3253,11 +3253,6 @@ impl Client {
     /// store describing different states.
     /// Write a collection the primary sent back, and announce what changed.
     ///
-    /// Lives here rather than beside the peer-message plumbing because the write
-    /// is app-state's: it takes the same reservation a sync and a patch send
-    /// take, since it is a clear, a put and a set over the very rows they write,
-    /// and interleaving with either can leave the persisted ltHash and the MAC
-    /// store describing different states.
     ///
     /// The caller is already detached from the inbound path, so this waits for
     /// the reservation on its own time.
@@ -3381,6 +3376,26 @@ impl Client {
             warn!(
                 target: "Client/AppState",
                 "Not asking the primary to rebuild {name:?}: the block list is not recovered this way"
+            );
+            return;
+        }
+
+        // The rollout gate WA Web reads. Honoured when the server has actually
+        // spoken: a `0` is the account being told the primary cannot do this,
+        // and asking anyway spends a whole-collection request every window on a
+        // device that will ignore it. Absence is not a refusal, though -- this
+        // client is not on WhatsApp's rollout and may simply never be sent the
+        // prop, and treating silence as "no" would turn the escalation off for
+        // everyone it exists to help.
+        if self
+            .ab_props()
+            .get(wacore::iq::abprops::web::ENABLE_PEER_SNAPSHOT_RECOVERY)
+            .await
+            .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+        {
+            warn!(
+                target: "Client/AppState",
+                "Not asking the primary to rebuild {name:?}: the account has peer snapshot recovery turned off"
             );
             return;
         }

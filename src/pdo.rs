@@ -466,7 +466,18 @@ impl Client {
         request_id: &str,
     ) {
         let Some(blob) = response.collection_snapshot.as_deref() else {
-            warn!("Snapshot recovery response carries no collection; ignoring");
+            // Answered, with nothing. Leaving the marker would suppress every
+            // retry for the rest of the window over an ask already spent.
+            match self
+                .get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await
+            {
+                Some(name) => warn!(
+                    "Snapshot recovery response for {name} carries no collection; it may be asked for again"
+                ),
+                None => warn!("Snapshot recovery response carries no collection; ignoring"),
+            }
             return;
         };
 
@@ -482,6 +493,9 @@ impl Client {
         let compressed = response.is_compressed.unwrap_or(false);
         let payload = blob.to_vec();
         let request_id = request_id.to_string();
+        let generation = self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
 
         self.runtime.spawn_detached(Box::pin(async move {
             // Up to 64 MiB of inflate plus a decode wide enough that `waproto`
@@ -520,6 +534,18 @@ impl Client {
                     }
                     std::borrow::Cow::Owned(plain)
                 } else {
+                    // The same ceiling the compressed branch enforces. Without
+                    // it an uncompressed reply is bounded by nothing, and the
+                    // decode allocates a record graph from whatever arrives --
+                    // so the shape that is refused when zipped was accepted when
+                    // it was not.
+                    if payload.len() as u64 > wacore::history_sync::MAX_DECOMPRESSED {
+                        return Err(format!(
+                            "is {} bytes, over the {} the recovery path allows",
+                            payload.len(),
+                            wacore::history_sync::MAX_DECOMPRESSED
+                        ));
+                    }
                     std::borrow::Cow::Borrowed(&payload[..])
                 };
                 waproto::codec::syncd_snapshot_recovery_decode(&bytes)
@@ -546,12 +572,40 @@ impl Client {
                 }
             };
 
-            let Some(name) = recovery.collection_name.clone() else {
-                warn!("Snapshot recovery response names no collection; ignoring");
+            let proc = client.get_app_state_processor();
+
+            // Which collection this id was asked about. The payload names one
+            // too, but that is the reply's claim about itself -- and with two
+            // recoveries outstanding, a reply carrying A's id and B's name would
+            // otherwise select B's marker and be checked against its own name,
+            // which always agrees. So the ask decides, and a payload that
+            // disagrees with it is refused.
+            let Some(asked) = proc.collection_for_request_id(&request_id).await else {
+                warn!("Ignoring a snapshot recovery nothing here asked for");
                 return;
             };
+            match recovery.collection_name.as_deref() {
+                Some(named) if named == asked => {}
+                other => {
+                    proc.take_recovery_request_by_id(&request_id).await;
+                    warn!(
+                        "Snapshot recovery answering the ask for {asked} names {}; refusing it",
+                        other.unwrap_or("nothing")
+                    );
+                    return;
+                }
+            }
 
-            client.apply_recovered_collection(&name, recovery).await;
+            // The reservation is a connection's, and a disconnect clears the
+            // registry wholesale -- so a task that started before one and
+            // applied after it would write beside the new connection's own sync
+            // and dispatch events for a session that has since been replaced.
+            if client.connection_generation.load(std::sync::atomic::Ordering::Acquire) != generation {
+                debug!("Dropping the {asked} recovery: the connection it belongs to is gone");
+                return;
+            }
+
+            client.apply_recovered_collection(&asked, recovery).await;
         }));
     }
 
