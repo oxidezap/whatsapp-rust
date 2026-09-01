@@ -3393,17 +3393,13 @@ impl Client {
                     mutations.len()
                 );
                 wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                // Written under this connection, so announced under it too. A
-                // disconnect during the writes leaves the rows where they are --
-                // the next sync reads them -- but an event dispatched now would
-                // describe the replaced session to consumers of the new one.
-                if !still_current() {
-                    debug!(
-                        target: "Client/AppState",
-                        "Not announcing the {name} recovery: the connection it belongs to went while it was written"
-                    );
-                    return;
-                }
+                // Announced unconditionally, even if the connection has gone in
+                // the meantime. The rows are committed and the collection now
+                // reads as current, so the next sync starts past these records
+                // and they are never offered again -- withholding them here
+                // would lose a mute or an archive for good. And what they
+                // describe is the account, not the session that learned it,
+                // which is why the ordinary sync path dispatches the same way.
                 for m in &mutations {
                     self.dispatch_app_state_mutation(m, true).await;
                 }

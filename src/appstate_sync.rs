@@ -40,6 +40,9 @@ mod tests {
         // lookups, so tests can pin which path the processor takes.
         singular_mac_calls: Arc<portable_atomic::AtomicU64>,
         batch_mac_calls: Arc<portable_atomic::AtomicU64>,
+        // Counts key reads, so a test can tell "before the recovery started"
+        // from "part-way through it".
+        sync_key_calls: Arc<portable_atomic::AtomicU64>,
     }
 
     // Implement SignalStore - Signal protocol cryptographic operations
@@ -107,6 +110,8 @@ mod tests {
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl AppSyncStore for MockBackend {
         async fn get_sync_key(&self, key_id: &[u8]) -> StoreResult<Option<AppStateSyncKey>> {
+            self.sync_key_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.keys.lock().await.get(key_id).cloned())
         }
         async fn set_sync_key(&self, key_id: &[u8], key: AppStateSyncKey) -> StoreResult<()> {
@@ -666,10 +671,22 @@ mod tests {
             &[(r#"["mute","1@s.whatsapp.net"]"#, [0x11; 32])],
         );
 
-        // Retired between the caller's check and the first write, which is the
-        // whole window this guard exists for.
+        // True when the recovery starts and false by the time it is asked, which
+        // is the window this guard exists for -- a predicate that was already
+        // false would have been caught by the caller's own check and would say
+        // nothing about where inside the apply the second one happens. The key
+        // read is the first thing the apply does that reaches the store, so
+        // "a key has been fetched" is "we are past the reads and the record
+        // work".
+        let reads = Arc::clone(&backend.sync_key_calls);
+        let still_current = move || reads.load(std::sync::atomic::Ordering::Relaxed) == 0;
+        assert!(
+            still_current(),
+            "the connection is live when the recovery begins"
+        );
+
         let outcome = processor
-            .apply_snapshot_recovery(recovery, "regular_low", &|| false)
+            .apply_snapshot_recovery(recovery, "regular_low", &still_current)
             .await
             .expect("a retired recovery is dropped, not an error");
         assert!(matches!(outcome, RecoveryOutcome::Retired), "{outcome:?}");
