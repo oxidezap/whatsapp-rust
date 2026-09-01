@@ -6,7 +6,7 @@
 
 use crate::AppStateError;
 use crate::decode::{Mutation, decode_record};
-use crate::hash::{HashState, generate_patch_mac};
+use crate::hash::{HashState, generate_patch_mac, value_mac_tail};
 use crate::keys::ExpandedAppStateKeys;
 use log::{Level, debug, log_enabled, trace, warn};
 use serde::{Deserialize, Serialize};
@@ -344,12 +344,16 @@ where
         } else {
             get_prev_value_mac(index_mac).map_err(|e| anyhow::anyhow!(e))?
         };
+        // The operand `update_hash` just added for this SET, by the same rule it
+        // used -- so the next SET on this index subtracts what the first one
+        // contributed rather than the store's pre-patch value. A short blob is
+        // folded there, so recording it only when it is 32 bytes long leaves the
+        // first SET's operand added and never cancelled.
         if let Some(rec) = patch.mutations[idx].record.as_option()
             && let Some(index) = rec.index.as_option().and_then(|i| i.blob.as_deref())
             && let Some(value) = rec.value.as_option().and_then(|v| v.blob.as_deref())
-            && value.len() >= 32
         {
-            in_patch.insert(index, &value[value.len() - 32..]);
+            in_patch.insert(index, value_mac_tail(value));
         }
         Ok(prev)
     });
@@ -1638,6 +1642,84 @@ mod tests {
             result.state.hash.as_slice(),
             both_kept.as_slice(),
             "both SET values must not remain: in-patch overwrite regressed"
+        );
+    }
+
+    /// The overwrite map has to record the operand the fold actually added, not
+    /// the one a 32-byte rule would have. A first SET whose value blob is short
+    /// still contributes -- `slice(len - 32)` counts from the end -- so a map
+    /// that only remembers full-length values leaves that operand added and
+    /// uncancelled, and the second SET subtracts the store's pre-patch value
+    /// instead.
+    ///
+    /// Observed on the state rather than the return value on purpose: the hash
+    /// is updated before any record is decoded, and a 16-byte blob is not
+    /// decryptable, so this patch fails afterwards. The ltHash it left behind is
+    /// still the thing under test.
+    #[test]
+    fn a_short_first_set_is_cancelled_by_the_second() {
+        let index_mac = vec![9u8; 32];
+        let short = vec![0xABu8; 16];
+        let second: Vec<u8> = (0..48u8).collect();
+
+        let mutation = |blob: &[u8]| wa::SyncdMutation {
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: Some(index_mac.clone()),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue {
+                    blob: Some(blob.to_vec()),
+                }),
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(b"test_key_id".to_vec()),
+                }),
+            }),
+        };
+
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![mutation(&short), mutation(&second)],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(b"test_key_id".to_vec()),
+            }),
+            ..Default::default()
+        };
+
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let mut state = HashState::default();
+        let _ = process_patch(
+            &patch,
+            &mut state,
+            |_: &[u8]| Ok(Arc::new(keys.clone())),
+            |_: &[u8]| Ok(None),
+            false,
+            "regular",
+        );
+
+        const EMPTY: &[Vec<u8>] = &[];
+        let only_second = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            &[second[second.len() - 32..].to_vec()],
+        );
+        assert_eq!(
+            state.hash.as_slice(),
+            only_second.as_slice(),
+            "the short first SET must be cancelled by the second, not left in the ltHash"
+        );
+
+        // The exact regression: the short operand added and never subtracted.
+        let both_kept = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            &[short.clone(), second[second.len() - 32..].to_vec()],
+        );
+        assert_ne!(
+            state.hash.as_slice(),
+            both_kept.as_slice(),
+            "the overwrite map forgot the short operand the fold added"
         );
     }
 

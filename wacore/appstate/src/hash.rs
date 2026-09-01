@@ -419,7 +419,7 @@ pub fn generate_patch_mac(patch: &wa::SyncdPatch, name: &str, key: &[u8], versio
 /// patch path used to require `blob.len() >= 32` and drop the mutation when it
 /// was not met, which made a patch carrying a short blob MAC as though that
 /// mutation were absent — for a single-mutation patch, the empty patch's MAC.
-fn value_mac_tail(blob: &[u8]) -> &[u8] {
+pub(crate) fn value_mac_tail(blob: &[u8]) -> &[u8] {
     &blob[value_mac_start(blob.len())..]
 }
 
