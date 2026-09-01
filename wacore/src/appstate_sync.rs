@@ -199,10 +199,18 @@ impl AppStateProcessor {
     /// on every failed apply, and the retry machinery re-runs those applies
     /// across rounds and again after a reconnect. Each request asks the primary
     /// to serialize and send a whole collection, so a stuck collection would
-    /// have the phone rebuilding it in a loop. Long enough to cover the reply --
-    /// WA Web waits 60s for one -- and short enough that a request the phone
-    /// never answered is eventually made again.
-    const RECOVERY_REQUEST_TTL: core::time::Duration = core::time::Duration::from_secs(300);
+    /// have the phone rebuilding it in a loop.
+    ///
+    /// Bounded on both sides by what has to happen inside it. Longer than the
+    /// reply takes -- WA Web waits 60s for one -- and shorter than the retry
+    /// budget that produces the asks, or the escalation would fire once and
+    /// never again: the sync retries at 1, 2, 4, 8, 16, 32, 64 and 128 seconds,
+    /// so a window of 300s covers every one of them and the loop exits at 255s
+    /// with the first request still unanswered and nothing left to re-ask.
+    /// At 120s the rounds at 127s and 255s cross it, so a phone that stays
+    /// silent is asked again within the same stuck sync rather than after some
+    /// unrelated trigger.
+    const RECOVERY_REQUEST_TTL: core::time::Duration = core::time::Duration::from_secs(120);
 
     /// Records that the primary is being asked for this collection, answering
     /// whether the request is a new one.

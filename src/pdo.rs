@@ -546,6 +546,24 @@ impl Client {
         let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
             return;
         };
+        // Bounded before it is copied, not after. The ceiling was enforced
+        // inside the task, so a malformed gigabyte reply was still allocated and
+        // memcpy'd in full on the inbound lane before anything looked at its
+        // size -- on the self-chat lane, where the primary's key shares queue
+        // behind it. The raw blob is checked here for both branches: a
+        // compressed one over the ceiling cannot inflate to anything this path
+        // would accept either.
+        if blob.len() as u64 > wacore::history_sync::MAX_DECOMPRESSED {
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            warn!(
+                "Snapshot recovery for {asked} is {} bytes, over the {} this path allows; refusing it",
+                blob.len(),
+                wacore::history_sync::MAX_DECOMPRESSED
+            );
+            return;
+        }
         let compressed = response.is_compressed.unwrap_or(false);
         let payload = blob.to_vec();
         let request_id = request_id.to_string();
@@ -590,18 +608,10 @@ impl Client {
                     }
                     std::borrow::Cow::Owned(plain)
                 } else {
-                    // The same ceiling the compressed branch enforces. Without
-                    // it an uncompressed reply is bounded by nothing, and the
-                    // decode allocates a record graph from whatever arrives --
-                    // so the shape that is refused when zipped was accepted when
-                    // it was not.
-                    if payload.len() as u64 > wacore::history_sync::MAX_DECOMPRESSED {
-                        return Err(format!(
-                            "is {} bytes, over the {} the recovery path allows",
-                            payload.len(),
-                            wacore::history_sync::MAX_DECOMPRESSED
-                        ));
-                    }
+                    // Already bounded: the raw blob was measured against the
+                    // same ceiling before it was copied, which is what an
+                    // uncompressed reply needs -- the decode allocates a record
+                    // graph from whatever arrives.
                     std::borrow::Cow::Borrowed(&payload[..])
                 };
                 waproto::codec::syncd_snapshot_recovery_decode(&bytes)
