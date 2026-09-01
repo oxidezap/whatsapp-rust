@@ -3270,26 +3270,12 @@ impl Client {
             return;
         }
 
-        // Bounded, unlike the reservation a sync takes with a deadline of its
-        // own: this runs on the inbound message path, and a holder that wedges
-        // would stall every message queued behind it. Giving up costs the
-        // recovery, which the next failed apply asks for again.
-        let Ok(_reservation) = rt_timeout(
-            &*self.runtime,
-            APP_STATE_RESERVATION_WAIT,
-            self.app_state_syncing.begin(patch_name, SyncHolder::Sync),
-        )
-        .await
-        else {
-            warn!(
-                target: "Client/AppState",
-                "Gave up waiting to reserve {name} for a snapshot recovery"
-            );
-            return;
-        };
-
+        // Refused here, before anything is reserved or spawned on its behalf:
+        // an unsolicited reply should cost a map lookup, not a task and a wait.
+        // The marker is only *taken* once the reservation is held, so a wait
+        // that times out does not consume a request that was really made.
         let proc = self.get_app_state_processor();
-        if !proc.take_recovery_request(name).await {
+        if !proc.has_recovery_request(name).await {
             warn!(
                 target: "Client/AppState",
                 "Ignoring an unsolicited snapshot recovery for {name}: nothing here asked for one"
@@ -3297,36 +3283,74 @@ impl Client {
             return;
         }
 
-        match proc.apply_snapshot_recovery(recovery, name).await {
-            Ok(wacore::appstate_sync::RecoveryOutcome::Applied(mutations)) => {
-                info!(
-                    target: "Client/AppState",
-                    "Recovered the {name} collection from the primary device: {} record(s)",
-                    mutations.len()
-                );
-                wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                for m in &mutations {
-                    self.dispatch_app_state_mutation(m, true).await;
-                }
-            }
-            Ok(wacore::appstate_sync::RecoveryOutcome::Stale { held, offered }) => {
-                info!(
-                    target: "Client/AppState",
-                    "Discarding the primary's {name} at v{offered}: this side already holds v{held}"
-                );
-            }
-            Err(e) => {
-                // Put it back: the request was made and this reply did not
-                // answer it, so a later one still may. Not restored for a stale
-                // reply, where the collection has moved past what was asked for
-                // and the request is moot rather than unanswered.
-                proc.mark_recovery_requested(name).await;
+        // And off the inbound path entirely. This runs from the peer-message
+        // handler, where processing is serialized per chat -- so waiting here
+        // for a sync or a patch send to release the collection would hold the
+        // self-chat lane, and with it the key shares and everything else the
+        // primary sends, for as long as the holder takes. Nothing downstream
+        // needs an answer: the reply has already arrived, and applying it is
+        // this side's own business.
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let name = name.to_string();
+        self.runtime.spawn_detached(Box::pin(async move {
+            let Ok(_reservation) = rt_timeout(
+                &*client.runtime,
+                APP_STATE_RESERVATION_WAIT,
+                client
+                    .app_state_syncing
+                    .begin(patch_name, SyncHolder::Sync),
+            )
+            .await
+            else {
                 warn!(
                     target: "Client/AppState",
-                    "Failed to apply the snapshot recovery for {name}: {e}"
+                    "Gave up waiting to reserve {name} for a snapshot recovery"
                 );
+                return;
+            };
+
+            let proc = client.get_app_state_processor();
+            if !proc.take_recovery_request(&name).await {
+                debug!(
+                    target: "Client/AppState",
+                    "Another reply already answered the recovery request for {name}"
+                );
+                return;
             }
-        }
+
+            match proc.apply_snapshot_recovery(recovery, &name).await {
+                Ok(wacore::appstate_sync::RecoveryOutcome::Applied(mutations)) => {
+                    info!(
+                        target: "Client/AppState",
+                        "Recovered the {name} collection from the primary device: {} record(s)",
+                        mutations.len()
+                    );
+                    wacore::telemetry::appstate_mutations(mutations.len() as u64);
+                    for m in &mutations {
+                        client.dispatch_app_state_mutation(m, true).await;
+                    }
+                }
+                Ok(wacore::appstate_sync::RecoveryOutcome::Stale { held, offered }) => {
+                    info!(
+                        target: "Client/AppState",
+                        "Discarding the primary's {name} at v{offered}: this side already holds v{held}"
+                    );
+                }
+                Err(e) => {
+                    // The marker stays taken. One request was answered, and this
+                    // was the answer -- no second reply is coming, so putting it
+                    // back would only suppress a real retry for the rest of the
+                    // window while the collection stayed stuck. The next failed
+                    // apply asks again.
+                    warn!(
+                        target: "Client/AppState",
+                        "Failed to apply the snapshot recovery for {name}: {e}"
+                    );
+                }
+            }
+        }));
     }
 
     /// Ask the primary for a collection whose snapshot this side cannot validate.

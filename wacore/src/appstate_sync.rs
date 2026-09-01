@@ -204,6 +204,17 @@ impl AppStateProcessor {
         true
     }
 
+    /// Whether a recovery for this collection is outstanding, without taking it.
+    ///
+    /// The cheap check a reply is refused by before anything is reserved or
+    /// spawned on its behalf.
+    pub async fn has_recovery_request(&self, collection: &str) -> bool {
+        self.recovery_requested
+            .lock()
+            .await
+            .contains_key(collection)
+    }
+
     pub async fn take_recovery_request(&self, collection: &str) -> bool {
         self.recovery_requested
             .lock()

@@ -310,6 +310,18 @@ impl Client {
         self: &Arc<Self>,
         collection: &str,
     ) -> Result<String, anyhow::Error> {
+        // Enforced here as well as at the escalation, because this is public and
+        // takes a name: a caller asking for the block list would otherwise mark
+        // it pending and send, and the reply passes the known-collection check
+        // and applies. Rebuilding a block list from a device that may itself be
+        // behind is the one collection where being wrong means talking to
+        // somebody who was blocked.
+        if collection == wacore::appstate::patch_decode::WAPatchName::CriticalBlock.as_str() {
+            return Err(anyhow::anyhow!(
+                "the block list is not recovered from the primary"
+            ));
+        }
+
         let device_snapshot = self.persistence_manager.get_device_snapshot();
         let peer_target = self_peer_target(&device_snapshot)?;
 
