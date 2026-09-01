@@ -294,6 +294,66 @@ impl Client {
         self.send_peer_message(peer_target, &msg).await
     }
 
+    /// Ask the primary device for a collection this side could not validate.
+    ///
+    /// Sent when a snapshot's MAC does not match the one we compute over it.
+    /// There is no way forward through the server after that -- the same bytes
+    /// arrive on every retry and fail the same way -- so the collection would
+    /// otherwise stay at version 0 for ever, and every mutation this client
+    /// tries to write to it (a chat marked read, a mute, an archive) is refused
+    /// with a conflict it can never resolve.
+    ///
+    /// Fire-and-forget, like every other PDO here: the answer arrives later as
+    /// an ordinary peer message and is applied then. Nothing waits, so a phone
+    /// that is off simply means the collection stays as it was.
+    pub async fn request_syncd_snapshot_recovery(
+        self: &Arc<Self>,
+        collection: &str,
+    ) -> Result<String, anyhow::Error> {
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let peer_target = self_peer_target(&device_snapshot)?;
+
+        let pdo_request = wa::message::PeerDataOperationRequestMessage {
+            peer_data_operation_request_type: Some(
+                wa::message::PeerDataOperationRequestType::COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY,
+            ),
+            syncd_collection_fatal_recovery_request: buffa::MessageField::some(
+                wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest {
+                    collection_name: Some(collection.to_string()),
+                    timestamp: Some(wacore::time::now_secs() as i64),
+                },
+            ),
+            ..Default::default()
+        };
+
+        let protocol_message = wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE),
+            peer_data_operation_request_message: buffa::MessageField::some(pdo_request),
+            ..Default::default()
+        };
+
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(protocol_message),
+            ..Default::default()
+        };
+
+        info!(
+            "Asking {} to send back the {} collection after a snapshot we could not validate",
+            peer_target.observe(),
+            collection
+        );
+
+        self.ensure_e2e_sessions(std::slice::from_ref(&peer_target))
+            .await?;
+        let request_id = self.send_peer_message(peer_target, &msg).await?;
+        // Only once it is actually on the wire: a send that failed is not a
+        // recovery anybody is waiting for.
+        self.get_app_state_processor()
+            .mark_recovery_requested(collection)
+            .await;
+        Ok(request_id)
+    }
+
     /// Sends a peer message (message to our own devices).
     /// This is used for PDO requests and similar device-to-device communication.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.send_peer_message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
@@ -354,6 +414,96 @@ impl Client {
                 self.handle_placeholder_resend_response(placeholder_response, request_id)
                     .await;
             }
+            if let Some(recovery) = result.syncd_snapshot_fatal_recovery_response.as_option() {
+                self.handle_syncd_snapshot_recovery_response(recovery).await;
+            }
+        }
+    }
+
+    /// Apply a collection the primary sent back after a snapshot we refused.
+    ///
+    /// Logged rather than returned: this arrives on the inbound message path,
+    /// long after the sync that asked, and there is nobody left to hand an error
+    /// to. What a failure costs is the collection staying where it was, which is
+    /// where it already was.
+    async fn handle_syncd_snapshot_recovery_response(
+        &self,
+        response: &wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse,
+    ) {
+        let Some(blob) = response.collection_snapshot.as_deref() else {
+            warn!("Snapshot recovery response carries no collection; ignoring");
+            return;
+        };
+
+        // The primary may compress what it sends, unlike the server's snapshot
+        // blob, which never is. Bounded like every other inflate here: the size
+        // is the sender's to choose and this one arrives before anything about
+        // it has been checked.
+        let owned;
+        let bytes = if response.is_compressed.unwrap_or(false) {
+            let mut reader = wacore_binary::zlib_pool::InflateReader::new(
+                blob,
+                wacore::history_sync::MAX_DECOMPRESSED,
+            );
+            let mut plain = Vec::new();
+            loop {
+                match reader.ensure(1) {
+                    Ok(true) => {}
+                    // The stream ended; anything still buffered has been taken.
+                    Ok(false) => break,
+                    Err(e) => {
+                        warn!("Snapshot recovery response failed to decompress: {e}");
+                        return;
+                    }
+                }
+                let taken = {
+                    let chunk = reader.available();
+                    plain.extend_from_slice(chunk);
+                    chunk.len()
+                };
+                if taken == 0 {
+                    break;
+                }
+                reader.consume(taken);
+            }
+            owned = plain;
+            owned.as_slice()
+        } else {
+            blob
+        };
+
+        let recovery = match waproto::codec::syncd_snapshot_recovery_decode(bytes) {
+            Ok(recovery) => recovery,
+            Err(e) => {
+                warn!("Snapshot recovery response failed to decode: {e}");
+                return;
+            }
+        };
+
+        let Some(name) = recovery.collection_name.clone() else {
+            warn!("Snapshot recovery response names no collection; ignoring");
+            return;
+        };
+
+        let proc = self.get_app_state_processor();
+        if !proc.take_recovery_request(&name).await {
+            warn!(
+                "Ignoring an unsolicited snapshot recovery for {name}: nothing here asked for one"
+            );
+            return;
+        }
+
+        match proc.apply_snapshot_recovery(&recovery, &name).await {
+            Ok(mutations) => {
+                info!(
+                    "Recovered the {name} collection from the primary device: {} record(s)",
+                    mutations.len()
+                );
+                for m in &mutations {
+                    self.dispatch_app_state_mutation(m, true).await;
+                }
+            }
+            Err(e) => warn!("Failed to apply the snapshot recovery for {name}: {e}"),
         }
     }
 

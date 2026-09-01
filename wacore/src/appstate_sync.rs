@@ -6,8 +6,10 @@ use async_lock::Mutex;
 use thiserror::Error;
 
 use crate::appstate::hash::HashState;
+use crate::appstate::hash::generate_index_mac;
 use crate::appstate::keys::ExpandedAppStateKeys;
 use crate::appstate::patch_decode::{CollectionSyncError, PatchList};
+use crate::appstate::processor::AppStateMutationMAC;
 use crate::appstate::{
     collect_key_id_refs_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
 };
@@ -142,6 +144,13 @@ pub struct AppStateProcessor {
     pub backend: Arc<dyn Backend>,
     pub runtime: Arc<dyn crate::runtime::Runtime>,
     key_cache: Arc<Mutex<HashMap<String, Arc<ExpandedAppStateKeys>>>>,
+    /// Collections a recovery has been asked of the primary for.
+    ///
+    /// The reply carries no request id and nothing else correlates it, so this
+    /// is what says a recovery was wanted. It lives here rather than beside the
+    /// connection because it has to outlive the sync that raised it: the phone
+    /// answers whenever it answers, and by then the run that asked is long over.
+    recovery_requested: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl AppStateProcessor {
@@ -150,7 +159,31 @@ impl AppStateProcessor {
             runtime,
             backend,
             key_cache: Arc::new(Mutex::new(HashMap::new())),
+            recovery_requested: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Records that the primary has been asked for this collection.
+    ///
+    /// Called after the request is on the wire, not before: a send that failed
+    /// is not a recovery anybody is waiting for, and leaving the name here would
+    /// have an unrelated reply accepted later.
+    pub async fn mark_recovery_requested(&self, collection: &str) {
+        self.recovery_requested
+            .lock()
+            .await
+            .insert(collection.to_string());
+    }
+
+    /// Whether a recovery for this collection was asked for, consuming the
+    /// record of it.
+    ///
+    /// One reply per request. An unsolicited collection is refused rather than
+    /// applied: it would overwrite what this side holds with a version nobody
+    /// here asked to be at, and a reply that arrives after the collection has
+    /// recovered on its own would undo that.
+    pub async fn take_recovery_request(&self, collection: &str) -> bool {
+        self.recovery_requested.lock().await.remove(collection)
     }
 
     pub async fn get_app_state_key(
@@ -168,6 +201,127 @@ impl AppStateProcessor {
         let expanded = Arc::new(expand_app_state_keys(&key.key_data));
         self.key_cache.lock().await.insert(id_b64, expanded.clone());
         Ok(expanded)
+    }
+
+    /// Rebuild a collection from what the primary device sent back.
+    ///
+    /// The escalation for a snapshot this side cannot validate. The server's
+    /// snapshot is signed with a MAC we recompute, and when the two disagree
+    /// there is no way forward through the server: the same bytes arrive on
+    /// every retry and fail the same way, so the collection stays at version 0
+    /// for ever. WA Web answers that by asking the phone, and this is the
+    /// second half of that exchange.
+    ///
+    /// What arrives is not another snapshot. The records carry their
+    /// `SyncActionData` **in the clear**, so nothing here decrypts and the
+    /// app-state key is needed only to re-derive each index MAC -- which is why
+    /// a collection whose value encryption we could not follow is still
+    /// recoverable. The version and the ltHash are the primary's own, written
+    /// as given rather than folded from the records: reproducing them would be
+    /// this side recomputing the very thing it just failed to agree about.
+    ///
+    /// Trusting them is trusting the paired phone, over an end-to-end encrypted
+    /// message, about an account it owns -- which is a weaker claim than the one
+    /// already made by every key in the store.
+    pub async fn apply_snapshot_recovery(
+        &self,
+        recovery: &wa::SyncdSnapshotRecovery,
+        expected_collection: &str,
+    ) -> Result<Vec<Mutation>> {
+        // The response says which collection it is, and the request said which
+        // one was asked for. WA Web compares the two and refuses on mismatch;
+        // so does this, because the reply is not correlated by anything else.
+        let name = recovery
+            .collection_name
+            .as_deref()
+            .ok_or_else(|| anyhow!("snapshot recovery names no collection"))?;
+        if name != expected_collection {
+            return Err(anyhow!(
+                "snapshot recovery is for {name}, not the {expected_collection} that was asked for"
+            ));
+        }
+
+        let version = recovery
+            .version
+            .as_option()
+            .and_then(|v| v.version)
+            .ok_or_else(|| anyhow!("snapshot recovery for {name} carries no version"))?;
+
+        let lthash = recovery
+            .collection_lthash
+            .as_deref()
+            .ok_or_else(|| anyhow!("snapshot recovery for {name} carries no ltHash"))?;
+        let hash: [u8; 128] = lthash.try_into().map_err(|_| {
+            anyhow!(
+                "snapshot recovery for {name} carries a {}-byte ltHash, not 128",
+                lthash.len()
+            )
+        })?;
+
+        let mut mutations = Vec::with_capacity(recovery.mutation_records.len());
+        let mut macs = Vec::with_capacity(recovery.mutation_records.len());
+
+        for (i, record) in recovery.mutation_records.iter().enumerate() {
+            let action = record
+                .value
+                .as_option()
+                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no value"))?;
+            let key_id = record
+                .key_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no key id"))?;
+            // The record's own MAC is the value MAC the store keeps: the
+            // primary sends what it computed over the encrypted form, so
+            // nothing here has to re-encrypt a record to arrive at it.
+            let value_mac = record
+                .mac
+                .as_deref()
+                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no MAC"))?;
+            let index = action
+                .index
+                .as_deref()
+                .ok_or_else(|| anyhow!("recovery record {i} of {name} carries no index"))?;
+
+            let keys = self.get_app_state_key(key_id).await?;
+
+            mutations.push(Mutation {
+                action_value: action.value.clone().into_option(),
+                index: serde_json::from_slice::<Vec<String>>(index).unwrap_or_default(),
+                // A recovered collection is what exists, so every record is a
+                // SET -- there is nothing left to remove. WA Web forces the same.
+                operation: wa::syncd_mutation::SyncdOperation::SET,
+            });
+            macs.push(AppStateMutationMAC {
+                index_mac: generate_index_mac(index, &keys.index),
+                value_mac: value_mac.to_vec(),
+            });
+        }
+
+        // Same order the snapshot path commits in, and for the same reason: the
+        // version goes last, so a store error part-way leaves a collection that
+        // will be recovered again rather than one whose version says it is
+        // current over MACs that are gone.
+        self.backend.clear_mutation_macs(name).await?;
+        if !macs.is_empty() {
+            self.backend.put_mutation_macs(name, version, &macs).await?;
+        }
+        self.backend
+            .set_version(
+                name,
+                HashState {
+                    version,
+                    hash,
+                    bootstrapped: true,
+                    // The snapshot that could not be validated is the reason we
+                    // are here; the collection the primary just handed over is
+                    // not in that state.
+                    mac_mismatch_fatal: false,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        Ok(mutations)
     }
 
     /// Clear the in-memory key cache (e.g. on reconnect).
@@ -329,7 +483,11 @@ impl AppStateProcessor {
                 Ok::<_, crate::appstate::AppStateError>((result, snapshot_state, snapshot))
             })
             .await
-            .map_err(|e| anyhow!("{}", e))?;
+            // Carried as itself rather than flattened to a string: a snapshot MAC
+            // that does not match is the one error with an answer -- asking the
+            // primary for the collection -- and a caller can only tell it apart
+            // from a missing key or a bad decode by downcasting to it.
+            .map_err(anyhow::Error::new)?;
 
             let (snapshot_result, snapshot_state, snapshot) = result;
             pl.snapshot = Some(snapshot);

@@ -323,6 +323,17 @@ pub mod codec {
         whatsapp::SyncdPatch::decode_from_slice(bytes)
     }
 
+    /// The collection a primary device sends back when a companion cannot
+    /// validate a snapshot it was served. Pinned here with its siblings for the
+    /// same reason: it carries `SyncActionData` in the clear, so decoding it
+    /// instantiates the same wide `SyncActionValue` subtree.
+    #[inline(never)]
+    pub fn syncd_snapshot_recovery_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::SyncdSnapshotRecovery, buffa::DecodeError> {
+        whatsapp::SyncdSnapshotRecovery::decode_from_slice(bytes)
+    }
+
     #[inline(never)]
     pub fn syncd_patch_to_vec(patch: &whatsapp::SyncdPatch) -> Vec<u8> {
         patch.encode_to_vec()

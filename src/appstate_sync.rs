@@ -343,6 +343,170 @@ mod tests {
         }
     }
 
+    /// Builds the reply a primary device sends back, with one record per index.
+    fn recovery_of(
+        collection: &str,
+        version: u64,
+        lthash: [u8; 128],
+        key_id: &[u8],
+        records: &[(&str, [u8; 32])],
+    ) -> wa::SyncdSnapshotRecovery {
+        wa::SyncdSnapshotRecovery {
+            version: buffa::MessageField::some(wa::SyncdVersion {
+                version: Some(version),
+            }),
+            collection_name: Some(collection.to_string()),
+            collection_lthash: Some(lthash.to_vec()),
+            mutation_records: records
+                .iter()
+                .map(|(index_json, value_mac)| wa::SyncdPlainTextRecord {
+                    value: buffa::MessageField::some(wa::SyncActionData {
+                        index: Some(index_json.as_bytes().to_vec()),
+                        version: Some(version as i32),
+                        ..Default::default()
+                    }),
+                    key_id: Some(key_id.to_vec()),
+                    mac: Some(value_mac.to_vec()),
+                })
+                .collect(),
+        }
+    }
+
+    /// The version and the ltHash are the primary's, written as given.
+    ///
+    /// Folding the records to check them would be this side recomputing the very
+    /// thing it just failed to agree about, which is the whole reason the phone
+    /// was asked. What is derived locally is only each index MAC, from the index
+    /// the record carries in the clear -- the same split WA Web makes.
+    #[tokio::test]
+    async fn snapshot_recovery_writes_what_the_primary_sent() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let key_id = b"test_key_id".to_vec();
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // A collection this side had already given up on: stuck, and marked so.
+        backend
+            .set_version(
+                "regular_low",
+                HashState {
+                    version: 0,
+                    mac_mismatch_fatal: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let lthash = [0x5Au8; 128];
+        let recovery = recovery_of(
+            "regular_low",
+            253,
+            lthash,
+            &key_id,
+            &[(r#"["mute","1@s.whatsapp.net"]"#, [0x11; 32])],
+        );
+
+        let mutations = processor
+            .apply_snapshot_recovery(&recovery, "regular_low")
+            .await
+            .expect("a recovery for the collection that was asked for applies");
+
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].index, vec!["mute", "1@s.whatsapp.net"]);
+        assert_eq!(
+            mutations[0].operation,
+            wa::syncd_mutation::SyncdOperation::SET,
+            "a recovered collection is what exists; there is nothing left to remove"
+        );
+
+        let stored = backend
+            .get_version("regular_low")
+            .await
+            .unwrap()
+            .expect("the collection is written");
+        assert_eq!(
+            stored.version, 253,
+            "the primary's version, not a computed one"
+        );
+        assert_eq!(stored.hash, lthash, "and the primary's ltHash, verbatim");
+        assert!(stored.bootstrapped, "a recovered collection has a baseline");
+        assert!(
+            !stored.mac_mismatch_fatal,
+            "the snapshot that could not be validated is not the collection we now hold"
+        );
+
+        // The MAC store has to be repopulated, or the next patch that overwrites
+        // an index has nothing to subtract.
+        let expected_index_mac = wacore::appstate::hash::generate_index_mac(
+            br#"["mute","1@s.whatsapp.net"]"#,
+            &keys.index,
+        );
+        let got = backend
+            .get_mutation_mac("regular_low", &expected_index_mac)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0x11u8; 32][..]),
+            "the record's own MAC is the value MAC; nothing is re-encrypted to get one"
+        );
+    }
+
+    /// The reply carries no request id, so the collection name is the only thing
+    /// tying it to what was asked. WA Web compares the two and refuses; so does
+    /// this, or a reply for one collection could overwrite another.
+    #[tokio::test]
+    async fn snapshot_recovery_for_another_collection_is_refused() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        let recovery = recovery_of("regular", 5, [0u8; 128], b"k", &[]);
+        let err = processor
+            .apply_snapshot_recovery(&recovery, "regular_low")
+            .await
+            .expect_err("a recovery naming another collection must be refused");
+        assert!(err.to_string().contains("regular_low"), "{err}");
+
+        assert!(
+            backend.get_version("regular").await.unwrap().is_none(),
+            "and nothing is written for the collection it did name"
+        );
+    }
+
+    /// One reply per request, and none at all for a request nobody made.
+    #[tokio::test]
+    async fn a_recovery_request_is_taken_once() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        assert!(
+            !processor.take_recovery_request("regular_low").await,
+            "an unsolicited reply is not one this side is waiting for"
+        );
+
+        processor.mark_recovery_requested("regular_low").await;
+        assert!(processor.take_recovery_request("regular_low").await);
+        assert!(
+            !processor.take_recovery_request("regular_low").await,
+            "a second reply to one request would apply a collection twice"
+        );
+    }
+
     #[tokio::test]
     async fn test_process_patch_list_handles_set_overwrite_correctly() {
         let backend = Arc::new(MockBackend::default());

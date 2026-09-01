@@ -2223,6 +2223,7 @@ impl Client {
                             target: "Client/AppState",
                             "Batched sync: apply failed for {name:?}: {e}"
                         );
+                        self.escalate_to_snapshot_recovery(name, &e).await;
                         apply_error = Some(e);
                         break;
                     }
@@ -2549,7 +2550,17 @@ impl Client {
             }
 
             let (mutations, new_state, list) =
-                proc.process_parsed_patch_list(pl, &download, true).await?;
+                match proc.process_parsed_patch_list(pl, &download, true).await {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        // The single-collection path fails the same way the batched
+                        // one does and deserves the same escalation; without it, a
+                        // collection would recover only when its failure happened to
+                        // arrive in a batch.
+                        self.escalate_to_snapshot_recovery(name, &e).await;
+                        return Err(e);
+                    }
+                };
             let decode_elapsed = _decode_start.elapsed();
             if decode_elapsed.as_millis() > 500 {
                 debug!(target: "Client/AppState", "Patch decode for {:?} took {:?}", name, decode_elapsed);
@@ -3233,7 +3244,62 @@ impl Client {
         Recovery::Recovered
     }
 
-    async fn dispatch_app_state_mutation(
+    /// Ask the primary for a collection whose snapshot this side cannot validate.
+    ///
+    /// A snapshot MAC that does not match is the one app-state failure with
+    /// nothing behind it: the server serves the same bytes on every retry, they
+    /// fail the same way, and the collection stays at version 0 for ever --
+    /// which means every mutation written to it (a chat marked read, a mute, an
+    /// archive) is refused with a conflict that can never resolve. WA Web treats
+    /// it as an expected condition and asks the phone; so does this.
+    ///
+    /// Narrow on purpose. A missing key is answered by a key share and a bad
+    /// decode is answered by nothing, so only the mismatch escalates, and only
+    /// after the error has been carried here as itself rather than as a string.
+    ///
+    /// `critical_block` is excluded for the reason WA Web excludes it: it is the
+    /// block list, and rebuilding it from a device that may itself be behind is
+    /// the one collection where being wrong means talking to somebody who was
+    /// blocked.
+    async fn escalate_to_snapshot_recovery(&self, name: WAPatchName, err: &anyhow::Error) {
+        use wacore::appstate::AppStateError;
+
+        if !matches!(
+            err.downcast_ref::<AppStateError>(),
+            Some(AppStateError::SnapshotMACMismatch)
+        ) {
+            return;
+        }
+        if name == WAPatchName::CriticalBlock {
+            warn!(
+                target: "Client/AppState",
+                "Not asking the primary to rebuild {name:?}: the block list is not recovered this way"
+            );
+            return;
+        }
+
+        info!(
+            target: "Client/AppState",
+            "Asking the primary device to send back {name:?}: its snapshot did not validate here"
+        );
+        // The send needs an owned handle and the sync path holds `&self`; this
+        // is the same weak-self route the other `&self` callers here take.
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            warn!(
+                target: "Client/AppState",
+                "Could not ask the primary to rebuild {name:?}: the client is going away"
+            );
+            return;
+        };
+        if let Err(e) = client.request_syncd_snapshot_recovery(name.as_str()).await {
+            warn!(
+                target: "Client/AppState",
+                "Could not ask the primary to rebuild {name:?}: {e}"
+            );
+        }
+    }
+
+    pub(crate) async fn dispatch_app_state_mutation(
         &self,
         m: &crate::appstate_sync::Mutation,
         full_sync: bool,
