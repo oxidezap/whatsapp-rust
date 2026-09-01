@@ -523,19 +523,25 @@ impl Client {
         {
             self.handle_syncd_snapshot_recovery_response(recovery, request_id)
                 .await;
-        } else if let Some(name) = self
-            .get_app_state_processor()
-            .take_recovery_request_by_id(request_id)
-            .await
-        {
+        } else {
             // A response under this id carrying no recovery result at all --
             // an empty list, or only somebody else's result. It is still the
             // answer to the ask that id was made about, so it spends it:
             // leaving the request would suppress every retry for the rest of
             // the window over a question already answered, badly.
-            warn!(
-                "Snapshot recovery response for {name} carries no result; it may be asked for again"
-            );
+            //
+            // Claimed before it is spent, for the reason the absent-blob path
+            // is: a resultless response arriving beside one already being
+            // decoded must not delete the request that decoder will take at the
+            // end, or a usable recovery is dropped and the collection stays
+            // behind the MAC failure it started at.
+            let proc = self.get_app_state_processor();
+            if let Some(name) = proc.claim_recovery_request_by_id(request_id).await {
+                proc.take_recovery_request_by_id(request_id).await;
+                warn!(
+                    "Snapshot recovery response for {name} carries no result; it may be asked for again"
+                );
+            }
         }
     }
 
