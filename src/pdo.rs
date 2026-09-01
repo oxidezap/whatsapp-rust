@@ -444,56 +444,59 @@ impl Client {
             return;
         };
 
-        // The primary may compress what it sends, unlike the server's snapshot
-        // blob, which never is. Bounded like every other inflate here: the size
-        // is the sender's to choose and this one arrives before anything about
-        // it has been checked.
-        let owned;
-        let bytes = if response.is_compressed.unwrap_or(false) {
-            let mut reader = wacore_binary::zlib_pool::InflateReader::new(
-                blob,
-                wacore::history_sync::MAX_DECOMPRESSED,
-            );
-            let mut plain = Vec::new();
-            loop {
-                match reader.ensure(1) {
-                    Ok(true) => {}
-                    // The stream ended; anything still buffered has been taken.
-                    Ok(false) => break,
-                    Err(e) => {
-                        warn!("Snapshot recovery response failed to decompress: {e}");
-                        return;
+        // Off the inbound path. A primary may send a whole collection, so this
+        // is up to 64 MiB of inflate plus a protobuf decode wide enough that
+        // `waproto` pins its instantiation -- work that would otherwise hold a
+        // runtime worker and stall the read loop and every other message behind
+        // it. The copy the closure takes is the price of moving it, and is
+        // bounded by the same ceiling.
+        let compressed = response.is_compressed.unwrap_or(false);
+        let payload = blob.to_vec();
+        let decoded = wacore::runtime::blocking(&*self.runtime, move || {
+            let bytes = if compressed {
+                let mut reader = wacore_binary::zlib_pool::InflateReader::new(
+                    &payload,
+                    wacore::history_sync::MAX_DECOMPRESSED,
+                );
+                let mut plain = Vec::new();
+                loop {
+                    match reader.ensure(1) {
+                        Ok(true) => {}
+                        // The stream ran out; `ensure(1)` answers false only
+                        // with nothing left to take.
+                        Ok(false) => break,
+                        Err(e) => return Err(format!("failed to decompress: {e}")),
                     }
+                    let taken = {
+                        let chunk = reader.available();
+                        plain.extend_from_slice(chunk);
+                        chunk.len()
+                    };
+                    if taken == 0 {
+                        break;
+                    }
+                    reader.consume(taken);
                 }
-                let taken = {
-                    let chunk = reader.available();
-                    plain.extend_from_slice(chunk);
-                    chunk.len()
-                };
-                if taken == 0 {
-                    break;
+                // Running out is not ending. A payload cut short after a
+                // parseable prefix would otherwise be applied as the whole
+                // collection, and a short collection cannot be told from a real
+                // one -- nothing here knows how many records to expect.
+                if !reader.stream_ended() {
+                    return Err("truncated compressed stream".to_string());
                 }
-                reader.consume(taken);
-            }
-            // A zlib stream that simply runs out is not one that ended. Without
-            // this a truncated payload whose prefix happens to parse is applied
-            // as though it were the whole collection -- and a short collection
-            // is indistinguishable from a real one, since nothing here knows how
-            // many records to expect.
-            if !reader.stream_ended() {
-                warn!("Snapshot recovery response is a truncated compressed stream; ignoring");
-                return;
-            }
-            owned = plain;
-            owned.as_slice()
-        } else {
-            blob
-        };
+                std::borrow::Cow::Owned(plain)
+            } else {
+                std::borrow::Cow::Borrowed(&payload[..])
+            };
+            waproto::codec::syncd_snapshot_recovery_decode(&bytes)
+                .map_err(|e| format!("failed to decode: {e}"))
+        })
+        .await;
 
-        let recovery = match waproto::codec::syncd_snapshot_recovery_decode(bytes) {
+        let recovery = match decoded {
             Ok(recovery) => recovery,
             Err(e) => {
-                warn!("Snapshot recovery response failed to decode: {e}");
+                warn!("Snapshot recovery response {e}");
                 return;
             }
         };
@@ -503,38 +506,7 @@ impl Client {
             return;
         };
 
-        let proc = self.get_app_state_processor();
-        if !proc.take_recovery_request(&name).await {
-            warn!(
-                "Ignoring an unsolicited snapshot recovery for {name}: nothing here asked for one"
-            );
-            return;
-        }
-
-        match proc.apply_snapshot_recovery(&recovery, &name).await {
-            Ok(wacore::appstate_sync::RecoveryOutcome::Applied(mutations)) => {
-                info!(
-                    "Recovered the {name} collection from the primary device: {} record(s)",
-                    mutations.len()
-                );
-                for m in &mutations {
-                    self.dispatch_app_state_mutation(m, true).await;
-                }
-            }
-            Ok(wacore::appstate_sync::RecoveryOutcome::Stale { held, offered }) => {
-                info!(
-                    "Discarding the primary's {name} at v{offered}: this side already holds v{held}"
-                );
-            }
-            Err(e) => {
-                // Put it back: the request was made and this reply did not
-                // answer it, so a later one still may. Not restored for a stale
-                // reply above -- there the collection has moved past what was
-                // asked for, and the request is moot rather than unanswered.
-                proc.mark_recovery_requested(&name).await;
-                warn!("Failed to apply the snapshot recovery for {name}: {e}");
-            }
-        }
+        self.apply_recovered_collection(&name, &recovery).await;
     }
 
     async fn handle_placeholder_resend_response(

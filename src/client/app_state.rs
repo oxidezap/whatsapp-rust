@@ -3244,6 +3244,71 @@ impl Client {
         Recovery::Recovered
     }
 
+    /// Write a collection the primary sent back, and announce what changed.
+    ///
+    /// Lives here rather than beside the peer-message plumbing because the write
+    /// is app-state's: it takes the same reservation a sync and a patch send
+    /// take, since it is a clear, a put and a set over the very rows they write,
+    /// and interleaving with either can leave the persisted ltHash and the MAC
+    /// store describing different states.
+    pub(crate) async fn apply_recovered_collection(
+        &self,
+        name: &str,
+        recovery: &waproto::whatsapp::SyncdSnapshotRecovery,
+    ) {
+        let Ok(patch_name) = name.parse::<WAPatchName>() else {
+            warn!(
+                target: "Client/AppState",
+                "Snapshot recovery names an unknown collection {name}; ignoring"
+            );
+            return;
+        };
+
+        let _reservation = self
+            .app_state_syncing
+            .begin(patch_name, SyncHolder::Sync)
+            .await;
+
+        let proc = self.get_app_state_processor();
+        if !proc.take_recovery_request(name).await {
+            warn!(
+                target: "Client/AppState",
+                "Ignoring an unsolicited snapshot recovery for {name}: nothing here asked for one"
+            );
+            return;
+        }
+
+        match proc.apply_snapshot_recovery(recovery, name).await {
+            Ok(wacore::appstate_sync::RecoveryOutcome::Applied(mutations)) => {
+                info!(
+                    target: "Client/AppState",
+                    "Recovered the {name} collection from the primary device: {} record(s)",
+                    mutations.len()
+                );
+                for m in &mutations {
+                    self.dispatch_app_state_mutation(m, true).await;
+                }
+            }
+            Ok(wacore::appstate_sync::RecoveryOutcome::Stale { held, offered }) => {
+                info!(
+                    target: "Client/AppState",
+                    "Discarding the primary's {name} at v{offered}: this side already holds v{held}"
+                );
+            }
+            Err(e) => {
+                // Put it back: the request was made and this reply did not
+                // answer it, so a later one still may. Not restored for a stale
+                // reply, where the collection has moved past what was asked for
+                // and the request is moot rather than unanswered.
+                proc.mark_recovery_requested(name).await;
+                warn!(
+                    target: "Client/AppState",
+                    "Failed to apply the snapshot recovery for {name}: {e}"
+                );
+            }
+        }
+    }
+
     /// Ask the primary for a collection whose snapshot this side cannot validate.
     ///
     /// A snapshot MAC that does not match is the one app-state failure with
@@ -3264,9 +3329,13 @@ impl Client {
     async fn escalate_to_snapshot_recovery(&self, name: WAPatchName, err: &anyhow::Error) {
         use wacore::appstate::AppStateError;
 
+        // A snapshot that omits its MAC or key id is refused by the same gate
+        // for the same reason -- unverified records are not applied -- and
+        // leaves the collection just as stuck. WA Web's anti-tampering compares
+        // against a possibly-undefined mac and reaches recovery either way.
         if !matches!(
             err.downcast_ref::<AppStateError>(),
-            Some(AppStateError::SnapshotMACMismatch)
+            Some(AppStateError::SnapshotMACMismatch | AppStateError::SnapshotMACMissing)
         ) {
             return;
         }
