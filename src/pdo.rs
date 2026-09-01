@@ -506,16 +506,23 @@ impl Client {
         let Some(blob) = response.collection_snapshot.as_deref() else {
             // Answered, with nothing. Leaving the marker would suppress every
             // retry for the rest of the window over an ask already spent.
-            match self
-                .get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
-                .await
-            {
-                Some(name) => warn!(
-                    "Snapshot recovery response for {name} carries no collection; it may be asked for again"
-                ),
-                None => warn!("Snapshot recovery response carries no collection; ignoring"),
-            }
+            //
+            // Claimed first, though, rather than removed outright: one response
+            // can carry several results under one id, so an empty one arriving
+            // beside a good one would otherwise delete the request the good
+            // one's decoder is still working against -- and that task, finding
+            // no marker at the end, would drop a usable recovery.
+            let proc = self.get_app_state_processor();
+            let Some(name) = proc.claim_recovery_request_by_id(request_id).await else {
+                warn!(
+                    "Ignoring a snapshot recovery with no collection: nothing here is waiting on that ask"
+                );
+                return;
+            };
+            proc.take_recovery_request_by_id(request_id).await;
+            warn!(
+                "Snapshot recovery response for {name} carries no collection; it may be asked for again"
+            );
             return;
         };
 
@@ -625,6 +632,18 @@ impl Client {
                     // real one -- nothing here knows how many records to expect.
                     if !reader.stream_ended() {
                         return Err("is a truncated compressed stream".to_string());
+                    }
+                    // And ending is not all of it. A complete stream followed by
+                    // a second member or by trailing bytes leaves the reader
+                    // done with input to spare, and taking the first member for
+                    // the collection is the same silent short read the check
+                    // above refuses -- reached from the other direction.
+                    let (read, whole) = reader.compressed_progress();
+                    if read != whole {
+                        return Err(format!(
+                            "carries {} byte(s) after its compressed stream",
+                            whole - read
+                        ));
                     }
                     std::borrow::Cow::Owned(plain)
                 } else {
