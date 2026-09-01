@@ -518,7 +518,16 @@ impl Client {
             .collect();
         if let Some(recovery) = recoveries
             .iter()
-            .find(|recovery| recovery.collection_snapshot.is_some())
+            // Present and non-empty. A zero-length field is a result that
+            // carries nothing -- an empty payload decodes to a default recovery
+            // naming no collection, which would then spend the request in the
+            // mismatch path and leave a usable sibling unconsidered.
+            .find(|recovery| {
+                recovery
+                    .collection_snapshot
+                    .as_deref()
+                    .is_some_and(|blob| !blob.is_empty())
+            })
             .or(recoveries.first())
         {
             self.handle_syncd_snapshot_recovery_response(recovery, request_id)
@@ -556,7 +565,15 @@ impl Client {
         response: &wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse,
         request_id: &str,
     ) {
-        let Some(blob) = response.collection_snapshot.as_deref() else {
+        // An empty byte field is a result carrying nothing, handled as the
+        // absent one: decoding it would produce a default recovery naming no
+        // collection, which is a mismatch against the ask and reads in the log
+        // as the primary having answered about something else.
+        let Some(blob) = response
+            .collection_snapshot
+            .as_deref()
+            .filter(|blob| !blob.is_empty())
+        else {
             // Answered, with nothing. Leaving the marker would suppress every
             // retry for the rest of the window over an ask already spent.
             //
