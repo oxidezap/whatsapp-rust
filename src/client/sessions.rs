@@ -343,7 +343,7 @@ impl Client {
                 "complete_offline_sync: self_weak upgrade failed; dropping the drain tail and switching to live mode"
             );
             self.inbound_commit_batch.force_live_dropping_entries();
-            self.publish_offline_sync_live_state(count, None);
+            self.publish_offline_sync_live_state(count, None, generation);
             return;
         };
 
@@ -388,7 +388,7 @@ impl Client {
             return;
         }
 
-        self.publish_offline_sync_live_state(count, Some(durable));
+        self.publish_offline_sync_live_state(count, Some(durable), generation);
     }
 
     /// The drain→live state publication, shared by the finisher and its
@@ -416,7 +416,7 @@ impl Client {
     /// the deferred transition (see `complete_deferred_live_transition`) and
     /// widens the semaphore then. `None` (upgrade-failure fallback) leaves
     /// the buffer alone for the connection-state reset to clear.
-    fn publish_offline_sync_live_state(&self, count: i32, durable: Option<bool>) {
+    fn publish_offline_sync_live_state(&self, count: i32, durable: Option<bool>, generation: u64) {
         self.offline_sync_completed.store(true, Ordering::Release);
         if durable != Some(false) {
             self.swap_message_semaphore(64);
@@ -431,24 +431,47 @@ impl Client {
             }
             None => {}
         }
-        self.offline_sync_notifier.notify(usize::MAX);
         // Only the event is claimed, never the live-state publication above:
         // the semaphore, the flag and the receipt flush must land whether or
         // not a concurrent teardown already spoke for this drain.
-        if self.claim_offline_terminal_report() {
+        if self.claim_offline_terminal_report(generation) {
             self.core.event_bus.dispatch(Event::OfflineSyncCompleted(
                 OfflineSyncCompleted::builder().count(count).build(),
             ));
         }
+        // Notified last, so a waiter that wakes on it can already see the
+        // event: the notifier is the coarser signal and firing it first left a
+        // window where the drain looked finished and its event had not been
+        // dispatched yet.
+        self.offline_sync_notifier.notify(usize::MAX);
     }
 
-    /// Claim the right to publish the event that ends this resume. Exactly
-    /// one of `OfflineSyncCompleted` / `OfflineSyncInterrupted` reaches the
-    /// consumer per drain, whichever publication gets here first.
-    fn claim_offline_terminal_report(&self) -> bool {
-        self.offline_terminal_reported
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    /// Claim the right to publish the event that ends the resume of
+    /// `generation`. Exactly one of `OfflineSyncCompleted` /
+    /// `OfflineSyncInterrupted` reaches the consumer per drain.
+    ///
+    /// Fails for a drain already reported and for one a newer drain has
+    /// overtaken, so a finisher descheduled past its own connection cannot
+    /// take the slot a later drain needs, nor contradict the interruption its
+    /// own teardown reported. Generations only count up, which is what makes
+    /// the comparison a decision rather than a guess.
+    pub(crate) fn claim_offline_terminal_report(&self, generation: u64) -> bool {
+        let stamp = generation.saturating_add(1);
+        let mut reported = self.offline_terminal_reported.load(Ordering::Acquire);
+        loop {
+            if reported >= stamp {
+                return false;
+            }
+            match self.offline_terminal_reported.compare_exchange_weak(
+                reported,
+                stamp,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => reported = actual,
+            }
+        }
     }
 
     /// Report a drain that ended before its `<ib><offline>` end marker.
@@ -460,7 +483,7 @@ impl Client {
     /// this point: the numbers are read out of the same per-connection state
     /// the reset is about to clear, which is what keeps this from becoming
     /// another flag that outlives its connection.
-    pub(crate) fn abandon_offline_sync_if_interrupted(&self) {
+    pub(crate) fn abandon_offline_sync_if_interrupted(&self, generation: u64) {
         // `active` covers the window before the first batch request is armed;
         // `armed` covers the one after the last stanza cleared `active` but
         // before the end marker arrived. Neither is set once the finisher has
@@ -473,7 +496,7 @@ impl Client {
         if (!was_active && !was_armed) || self.offline_sync_completed.load(Ordering::Acquire) {
             return;
         }
-        if !self.claim_offline_terminal_report() {
+        if !self.claim_offline_terminal_report(generation) {
             return;
         }
 

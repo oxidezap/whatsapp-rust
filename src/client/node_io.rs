@@ -404,13 +404,6 @@ impl Client {
                     self.offline_sync_metrics
                         .active
                         .store(true, Ordering::Release);
-                    // The terminal-event guard belongs to the drain, not the
-                    // connection: reopening it in a teardown reset would let a
-                    // finisher still between its generation check and its
-                    // publish claim it again, right after that same teardown
-                    // reported the interruption.
-                    self.offline_terminal_reported
-                        .store(false, Ordering::Release);
                     match self.offline_sync_metrics.start_time.lock() {
                         Ok(mut guard) => *guard = Some(wacore::time::Instant::now()),
                         Err(poison) => *poison.into_inner() = Some(wacore::time::Instant::now()),

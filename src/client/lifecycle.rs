@@ -517,7 +517,7 @@ impl Client {
             offline_sync_notifier: Arc::new(event_listener::Event::new()),
             offline_sync_completed: Arc::new(AtomicBool::new(false)),
             offline_sync_finish_started: Arc::new(AtomicBool::new(false)),
-            offline_terminal_reported: Arc::new(AtomicBool::new(false)),
+            offline_terminal_reported: Arc::new(AtomicU64::new(0)),
             offline_receipt_buffer: std::sync::Mutex::new(Vec::new()),
             inbound_commit_batch: Default::default(),
             history_sync_activity: Arc::new(crate::sync_task::HistorySyncActivity::new()),
@@ -1054,8 +1054,12 @@ impl Client {
         self.expected_disconnect.store(false, Ordering::Relaxed);
         // Runs before the flags it reads are cleared below. Teardown normally
         // reported the interruption already and this is a no-op; it covers the
-        // paths that reach a new attempt without one.
-        self.abandon_offline_sync_if_interrupted();
+        // paths that reach a new attempt without one. The current generation
+        // is the right stamp here: this connection has not logged in yet, so
+        // its own drain arms at a higher one.
+        self.abandon_offline_sync_if_interrupted(
+            self.connection_generation.load(Ordering::Acquire),
+        );
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
             .store(false, Ordering::Relaxed);
@@ -1729,10 +1733,7 @@ impl Client {
         // process_classified_message — no decrypt can START after the
         // permit-held cache settle below, so no rowless ratchet advances can
         // dirty the cache behind teardown's back.
-        #[cfg(feature = "client-lifecycle")]
         let closed_generation = self.connection_generation.fetch_add(1, Ordering::SeqCst);
-        #[cfg(not(feature = "client-lifecycle"))]
-        self.connection_generation.fetch_add(1, Ordering::SeqCst);
         #[cfg(feature = "client-lifecycle")]
         let scope_close = self.lifecycle.as_ref().map(|lifecycle| {
             let lifecycle = Arc::clone(lifecycle);
@@ -1848,8 +1849,11 @@ impl Client {
         // connection don't trigger an immediate reconnect on the next one.
         self.stats.reset_connection_activity();
         self.pending_device_sync.clear();
-        // Reset offline sync state for next connection
-        self.abandon_offline_sync_if_interrupted();
+        // Reset offline sync state for next connection. The report is stamped
+        // with the generation being retired, not the one just installed, so it
+        // silences that drain's own stale finisher without claiming the slot
+        // the next drain will need.
+        self.abandon_offline_sync_if_interrupted(closed_generation);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
             .store(false, Ordering::Relaxed);

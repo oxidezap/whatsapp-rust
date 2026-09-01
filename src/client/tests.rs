@@ -7274,8 +7274,10 @@ async fn interrupted_offline_resume_reports_once() {
 
     arm_offline_drain(&client, 711, 5).await;
     client.cleanup_connection_state().await;
-    client.abandon_offline_sync_if_interrupted();
-    client.abandon_offline_sync_if_interrupted();
+    client
+        .abandon_offline_sync_if_interrupted(client.connection_generation.load(Ordering::Acquire));
+    client
+        .abandon_offline_sync_if_interrupted(client.connection_generation.load(Ordering::Acquire));
 
     let (interrupted, _) = drain_offline_sync_events(&rx);
     assert_eq!(interrupted.len(), 1, "got {interrupted:?}");
@@ -7326,7 +7328,8 @@ async fn one_resume_never_reports_both_terminal_events() {
     client.core.event_bus.subscribe_handler(handler).detach();
 
     arm_offline_drain(&client, 711, 700).await;
-    client.abandon_offline_sync_if_interrupted();
+    client
+        .abandon_offline_sync_if_interrupted(client.connection_generation.load(Ordering::Acquire));
     client.complete_offline_sync(711).await;
     client.wait_for_offline_delivery_end().await;
 
@@ -7342,14 +7345,14 @@ async fn one_resume_never_reports_both_terminal_events() {
     );
 }
 
-/// The teardown that reports the interruption must not hand the slot back.
+/// The teardown reports the interruption under the generation it is retiring,
+/// which is what silences that drain's own finisher afterwards.
 ///
-/// Reopening the guard inside the connection-state reset would do exactly
-/// that: the reset runs alongside the finisher it is racing, so a finisher
-/// still between its generation check and its publish would find the guard
-/// free again and contradict the interruption the same teardown just reported.
+/// Stamping the generation it just installed instead would leave the stale
+/// finisher free to contradict the interruption, and would claim the slot the
+/// next drain needs.
 #[tokio::test]
-async fn a_teardown_reset_does_not_reopen_the_terminal_report_slot() {
+async fn a_teardown_reports_under_the_generation_it_retires() {
     use wacore::types::events::ChannelEventHandler;
 
     let client = offline_resume_test_client().await;
@@ -7357,10 +7360,13 @@ async fn a_teardown_reset_does_not_reopen_the_terminal_report_slot() {
     client.core.event_bus.subscribe_handler(handler).detach();
 
     arm_offline_drain(&client, 711, 700).await;
-    client.abandon_offline_sync_if_interrupted();
+    let retired = client.connection_generation.load(Ordering::Acquire);
     client.cleanup_connection_state().await;
-    client.complete_offline_sync(711).await;
-    client.wait_for_offline_delivery_end().await;
+
+    assert!(
+        !client.claim_offline_terminal_report(retired),
+        "the retired drain's finisher finds its slot taken by its own teardown"
+    );
 
     let (interrupted, completed) = drain_offline_sync_events(&rx);
     assert_eq!(
@@ -7370,10 +7376,10 @@ async fn a_teardown_reset_does_not_reopen_the_terminal_report_slot() {
     );
 }
 
-/// And the next drain gets a fresh slot: the guard is cleared where a resume
-/// begins, so a second connection still reports its own outcome.
+/// And the next drain still reports its own outcome: nothing has to reopen the
+/// guard, the newer generation's higher stamp does it.
 #[tokio::test]
-async fn a_new_preview_re_arms_the_terminal_report_slot() {
+async fn a_later_drain_still_reports_its_own_outcome() {
     use wacore::types::events::ChannelEventHandler;
 
     let client = offline_resume_test_client().await;
@@ -7381,11 +7387,10 @@ async fn a_new_preview_re_arms_the_terminal_report_slot() {
     client.core.event_bus.subscribe_handler(handler).detach();
 
     arm_offline_drain(&client, 711, 700).await;
-    client.abandon_offline_sync_if_interrupted();
     client.cleanup_connection_state().await;
 
-    // The real re-arm path: an `<ib><offline_preview count>` on the next
-    // connection, processed inline like any other stanza.
+    // The real path: an `<ib><offline_preview count>` on the next connection,
+    // processed inline like any other stanza.
     let preview = NodeBuilder::new("ib")
         .children([NodeBuilder::new("offline_preview")
             .attr("count", "25")
@@ -7396,6 +7401,43 @@ async fn a_new_preview_re_arms_the_terminal_report_slot() {
         .await;
     client.complete_offline_sync(25).await;
     client.wait_for_offline_delivery_end().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(interrupted.len(), 1, "the first drain's interruption");
+    assert_eq!(completed, vec![25], "the second drain's own completion");
+}
+
+/// A finisher descheduled past its own connection can neither contradict the
+/// interruption its teardown reported nor steal the slot a later drain needs.
+///
+/// This is the interleaving that ruled out a boolean guard something has to
+/// clear: whoever cleared it handed the stale finisher its slot back.
+#[tokio::test]
+async fn a_finisher_left_behind_by_two_connections_reports_nothing() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    // The drain that will be interrupted, and the teardown that reports it.
+    arm_offline_drain(&client, 711, 5).await;
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.cleanup_connection_state().await;
+
+    // A whole new connection and a new drain, which reports its own outcome.
+    let live_generation = client.connection_generation.load(Ordering::Acquire);
+    arm_offline_drain(&client, 25, 25).await;
+    client
+        .complete_offline_sync_for_generation(25, live_generation)
+        .await;
+    client.wait_for_offline_delivery_end().await;
+
+    // Only now does the finisher from the first drain get to run.
+    assert!(
+        !client.claim_offline_terminal_report(stale_generation),
+        "a finisher two connections behind must not publish"
+    );
 
     let (interrupted, completed) = drain_offline_sync_events(&rx);
     assert_eq!(interrupted.len(), 1, "the first drain's interruption");

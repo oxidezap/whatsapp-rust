@@ -1536,18 +1536,18 @@ pub struct Client {
     /// idempotent). Separate from `offline_sync_completed` because the finish
     /// runs off the read loop and the flag must flip only after its commit.
     pub(crate) offline_sync_finish_started: Arc<AtomicBool>,
-    /// Once-guard for the *event* that ends one resume, either
-    /// `OfflineSyncCompleted` or `OfflineSyncInterrupted`. The finisher runs
-    /// detached and can pass its generation check just before a teardown bumps
-    /// it, so both terminal publications can be in flight for the same drain;
-    /// this makes them mutually exclusive, and the loser stays silent rather
-    /// than telling the consumer the opposite of what it was just told.
+    /// Highest connection generation whose resume already published a terminal
+    /// event, either `OfflineSyncCompleted` or `OfflineSyncInterrupted`, held
+    /// as `generation + 1` so zero reads as "none yet".
     ///
-    /// Cleared where a drain begins (the `<ib><offline_preview>` branch in
-    /// `process_node`), never in the connection-state resets: a reset runs
-    /// alongside the finisher it is racing, so reopening the guard there would
-    /// hand the loser its slot back.
-    pub(crate) offline_terminal_reported: Arc<AtomicBool>,
+    /// Monotonic rather than a boolean that something clears, because the
+    /// publications race in two directions. The finisher runs detached and
+    /// checks the generation before publishing, so it can pass that check and
+    /// then be descheduled past a teardown, past a reconnect, and past the
+    /// next drain's preview. A claim therefore fails both for a drain already
+    /// reported and for one a *newer* drain has overtaken, and nothing has to
+    /// reopen the guard for the next drain: its own higher stamp does that.
+    pub(crate) offline_terminal_reported: Arc<AtomicU64>,
     /// Delivery receipts buffered during offline sync, flushed as aggregate
     /// `<receipt>` stanzas at completion (WA Web `sendAggregateOfflineReceipts`).
     /// Empty (zero capacity) outside the offline window.
