@@ -2620,4 +2620,28 @@ mod tests {
         assert!(error.contains("contact"), "{error}");
         assert!(error.contains("403"), "{error}");
     }
+
+    /// A `pn_jid` the server spelled wrong is one user's bonus field, not a
+    /// reason to reject the batch it rode in on.
+    #[test]
+    fn a_malformed_business_pn_jid_does_not_reject_the_response() {
+        let spec = pn_spec();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "1234567890@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("contact").attr("type", "in").build(),
+                    NodeBuilder::new("business")
+                        .attr("pn_jid", "not a jid")
+                        .build(),
+                ])
+                .build(),
+        ]);
+
+        let results = spec
+            .parse_response(&response.as_node_ref())
+            .expect("the response still parses");
+        assert!(results[0].is_registered);
+        assert!(results[0].is_business);
+    }
 }

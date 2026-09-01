@@ -1490,9 +1490,13 @@ fn parse_business(node: &NodeRef<'_>) -> Result<UsyncBusinessResult, anyhow::Err
         }
         _ => None,
     };
-    let mut attrs = node.attrs();
-    let pn_jid = attrs.optional_jid(ATTR_PN_JID).map(|jid| jid.to_non_ad());
-    attrs.finish()?;
+    // Deliberately not `finish()`ed: `optional_jid` records a malformed value as
+    // an error, and this parser's failure rejects the whole usync response. A
+    // bonus disclosure on one user must not cost the answer for every other.
+    let pn_jid = node
+        .attrs()
+        .optional_jid(ATTR_PN_JID)
+        .map(|jid| jid.to_non_ad());
     Ok(UsyncBusinessResult {
         verified_name,
         pn_jid,
