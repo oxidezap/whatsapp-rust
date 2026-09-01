@@ -7342,6 +7342,66 @@ async fn one_resume_never_reports_both_terminal_events() {
     );
 }
 
+/// The teardown that reports the interruption must not hand the slot back.
+///
+/// Reopening the guard inside the connection-state reset would do exactly
+/// that: the reset runs alongside the finisher it is racing, so a finisher
+/// still between its generation check and its publish would find the guard
+/// free again and contradict the interruption the same teardown just reported.
+#[tokio::test]
+async fn a_teardown_reset_does_not_reopen_the_terminal_report_slot() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 700).await;
+    client.abandon_offline_sync_if_interrupted();
+    client.cleanup_connection_state().await;
+    client.complete_offline_sync(711).await;
+    client.wait_for_offline_delivery_end().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(
+        (interrupted.len(), completed.len()),
+        (1, 0),
+        "the interruption stands; got interrupted={interrupted:?} completed={completed:?}"
+    );
+}
+
+/// And the next drain gets a fresh slot: the guard is cleared where a resume
+/// begins, so a second connection still reports its own outcome.
+#[tokio::test]
+async fn a_new_preview_re_arms_the_terminal_report_slot() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 700).await;
+    client.abandon_offline_sync_if_interrupted();
+    client.cleanup_connection_state().await;
+
+    // The real re-arm path: an `<ib><offline_preview count>` on the next
+    // connection, processed inline like any other stanza.
+    let preview = NodeBuilder::new("ib")
+        .children([NodeBuilder::new("offline_preview")
+            .attr("count", "25")
+            .build()])
+        .build();
+    client
+        .process_node(crate::test_utils::node_to_owned_ref(&preview))
+        .await;
+    client.complete_offline_sync(25).await;
+    client.wait_for_offline_delivery_end().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(interrupted.len(), 1, "the first drain's interruption");
+    assert_eq!(completed, vec![25], "the second drain's own completion");
+}
+
 /// WA Web's `ShiftTimer`: a drain the server stops feeding on a live
 /// connection is completed by the client rather than left open.
 #[tokio::test]

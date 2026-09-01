@@ -1059,8 +1059,6 @@ impl Client {
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
             .store(false, Ordering::Relaxed);
-        self.offline_terminal_reported
-            .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Uncommitted batch entries were never acked; the server redelivers
         // them on this fresh connection. The cache decision is coupled to the
@@ -1854,8 +1852,6 @@ impl Client {
         self.abandon_offline_sync_if_interrupted();
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
-            .store(false, Ordering::Relaxed);
-        self.offline_terminal_reported
             .store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();
         // Same rule as receipts: uncommitted entries drop here and the server

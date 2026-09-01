@@ -1542,6 +1542,11 @@ pub struct Client {
     /// it, so both terminal publications can be in flight for the same drain;
     /// this makes them mutually exclusive, and the loser stays silent rather
     /// than telling the consumer the opposite of what it was just told.
+    ///
+    /// Cleared where a drain begins (the `<ib><offline_preview>` branch in
+    /// `process_node`), never in the connection-state resets: a reset runs
+    /// alongside the finisher it is racing, so reopening the guard there would
+    /// hand the loser its slot back.
     pub(crate) offline_terminal_reported: Arc<AtomicBool>,
     /// Delivery receipts buffered during offline sync, flushed as aggregate
     /// `<receipt>` stanzas at completion (WA Web `sendAggregateOfflineReceipts`).
