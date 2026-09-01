@@ -3364,11 +3364,7 @@ impl Client {
         // during the key share or the reservation clears the registry, so the
         // guard this holds would no longer exclude the new connection's own
         // sync from the rows about to be written.
-        if self
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-            != generation
-        {
+        if self.connection_generation.load(Ordering::Acquire) != generation {
             debug!(
                 target: "Client/AppState",
                 "Dropping the {name} recovery: the connection it belongs to went while it waited"
