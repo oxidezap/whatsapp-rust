@@ -617,7 +617,13 @@ impl Client {
             // registry wholesale -- so a task that started before one and
             // applied after it would write beside the new connection's own sync
             // and dispatch events for a session that has since been replaced.
-            if client.connection_generation.load(std::sync::atomic::Ordering::Acquire) != generation {
+            if client.connection_generation.load(std::sync::atomic::Ordering::Acquire) != generation
+            {
+                // Spent, like every other ending that is not an apply. The ask
+                // was answered; dropping the answer because the connection went
+                // is this side's decision, and leaving the marker would have the
+                // next connection unable to ask again until the window ran out.
+                proc.take_recovery_request_by_id(&request_id).await;
                 debug!("Dropping the {asked} recovery: the connection it belongs to is gone");
                 return;
             }
