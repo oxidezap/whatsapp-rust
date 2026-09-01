@@ -364,6 +364,19 @@ mod tests {
                     value: buffa::MessageField::some(wa::SyncActionData {
                         index: Some(index_json.as_bytes().to_vec()),
                         version: Some(version as i32),
+                        // Carried, because it is the whole point: every consumer
+                        // event is built from `action_value`, so a regression
+                        // that dropped it would pass a suite asserting only the
+                        // index and the operation.
+                        value: buffa::MessageField::some(wa::SyncActionValue {
+                            mute_action: buffa::MessageField::some(
+                                wa::sync_action_value::MuteAction {
+                                    muted: Some(true),
+                                    ..Default::default()
+                                },
+                            ),
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     }),
                     key_id: Some(key_id.to_vec()),
@@ -430,6 +443,15 @@ mod tests {
 
         assert_eq!(mutations.len(), 1);
         assert_eq!(mutations[0].index, vec!["mute", "1@s.whatsapp.net"]);
+        let action = mutations[0]
+            .action_value
+            .as_ref()
+            .expect("the record's payload survives into the mutation");
+        assert_eq!(
+            action.mute_action.as_option().and_then(|m| m.muted),
+            Some(true),
+            "every consumer event is built from this; losing it would ship silently"
+        );
         assert_eq!(
             mutations[0].operation,
             wa::syncd_mutation::SyncdOperation::SET,
@@ -547,7 +569,14 @@ mod tests {
             "an unsolicited reply is not one this side is waiting for"
         );
 
-        processor.mark_recovery_requested("regular_low").await;
+        assert!(
+            processor.mark_recovery_requested("regular_low").await,
+            "the first ask is a new one"
+        );
+        assert!(
+            !processor.mark_recovery_requested("regular_low").await,
+            "a second ask while one is outstanding is suppressed: the reply already coming answers it"
+        );
         assert!(processor.take_recovery_request("regular_low").await);
         assert!(
             !processor.take_recovery_request("regular_low").await,

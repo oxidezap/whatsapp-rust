@@ -353,7 +353,14 @@ impl Client {
         // first cannot lose one; the only cost is a marker to take back if the
         // send never happened, which is what the failure arm does.
         let proc = self.get_app_state_processor();
-        proc.mark_recovery_requested(collection).await;
+        if !proc.mark_recovery_requested(collection).await {
+            // One is already outstanding, and the reply that is coming answers
+            // this ask too. Suppressing the duplicate is also what keeps the
+            // marker honest: a second send that failed would otherwise withdraw
+            // the first request's only record of itself.
+            debug!("A recovery for {collection} is already outstanding; not asking again");
+            return Ok(String::new());
+        }
         match self.send_peer_message(peer_target, &msg).await {
             Ok(request_id) => Ok(request_id),
             Err(e) => {

@@ -3256,18 +3256,37 @@ impl Client {
         name: &str,
         recovery: &waproto::whatsapp::SyncdSnapshotRecovery,
     ) {
-        let Ok(patch_name) = name.parse::<WAPatchName>() else {
+        // `WAPatchName::from_str` is infallible: every unrecognised name maps to
+        // `Unknown`, which is one shared reservation slot and one collection
+        // this side has no rules for. Rejecting it explicitly is the difference
+        // between ignoring a name we do not know and applying it under a
+        // reservation that means nothing.
+        let patch_name = name.parse::<WAPatchName>().unwrap_or(WAPatchName::Unknown);
+        if patch_name == WAPatchName::Unknown {
             warn!(
                 target: "Client/AppState",
                 "Snapshot recovery names an unknown collection {name}; ignoring"
             );
             return;
-        };
+        }
 
-        let _reservation = self
-            .app_state_syncing
-            .begin(patch_name, SyncHolder::Sync)
-            .await;
+        // Bounded, unlike the reservation a sync takes with a deadline of its
+        // own: this runs on the inbound message path, and a holder that wedges
+        // would stall every message queued behind it. Giving up costs the
+        // recovery, which the next failed apply asks for again.
+        let Ok(_reservation) = rt_timeout(
+            &*self.runtime,
+            APP_STATE_RESERVATION_WAIT,
+            self.app_state_syncing.begin(patch_name, SyncHolder::Sync),
+        )
+        .await
+        else {
+            warn!(
+                target: "Client/AppState",
+                "Gave up waiting to reserve {name} for a snapshot recovery"
+            );
+            return;
+        };
 
         let proc = self.get_app_state_processor();
         if !proc.take_recovery_request(name).await {

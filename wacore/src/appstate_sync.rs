@@ -163,7 +163,7 @@ pub struct AppStateProcessor {
     /// is what says a recovery was wanted. It lives here rather than beside the
     /// connection because it has to outlive the sync that raised it: the phone
     /// answers whenever it answers, and by then the run that asked is long over.
-    recovery_requested: Arc<Mutex<std::collections::HashSet<String>>>,
+    recovery_requested: Arc<Mutex<HashMap<String, crate::time::Instant>>>,
 }
 
 impl AppStateProcessor {
@@ -172,31 +172,44 @@ impl AppStateProcessor {
             runtime,
             backend,
             key_cache: Arc::new(Mutex::new(HashMap::new())),
-            recovery_requested: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            recovery_requested: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Records that the primary has been asked for this collection.
+    /// How long one outstanding request suppresses another for the same
+    /// collection.
     ///
-    /// Called after the request is on the wire, not before: a send that failed
-    /// is not a recovery anybody is waiting for, and leaving the name here would
-    /// have an unrelated reply accepted later.
-    pub async fn mark_recovery_requested(&self, collection: &str) {
+    /// Nothing rate-limits the escalation on its own: both call sites reach it
+    /// on every failed apply, and the retry machinery re-runs those applies
+    /// across rounds and again after a reconnect. Each request asks the primary
+    /// to serialize and send a whole collection, so a stuck collection would
+    /// have the phone rebuilding it in a loop. Long enough to cover the reply --
+    /// WA Web waits 60s for one -- and short enough that a request the phone
+    /// never answered is eventually made again.
+    const RECOVERY_REQUEST_TTL: core::time::Duration = core::time::Duration::from_secs(300);
+
+    /// Records that the primary is being asked for this collection, answering
+    /// whether the request is a new one.
+    ///
+    /// `false` means one is already outstanding and the caller should not send:
+    /// the reply that is already coming answers this ask too.
+    pub async fn mark_recovery_requested(&self, collection: &str) -> bool {
+        let mut outstanding = self.recovery_requested.lock().await;
+        if let Some(asked_at) = outstanding.get(collection)
+            && asked_at.elapsed() < Self::RECOVERY_REQUEST_TTL
+        {
+            return false;
+        }
+        outstanding.insert(collection.to_string(), crate::time::Instant::now());
+        true
+    }
+
+    pub async fn take_recovery_request(&self, collection: &str) -> bool {
         self.recovery_requested
             .lock()
             .await
-            .insert(collection.to_string());
-    }
-
-    /// Whether a recovery for this collection was asked for, consuming the
-    /// record of it.
-    ///
-    /// One reply per request. An unsolicited collection is refused rather than
-    /// applied: it would overwrite what this side holds with a version nobody
-    /// here asked to be at, and a reply that arrives after the collection has
-    /// recovered on its own would undo that.
-    pub async fn take_recovery_request(&self, collection: &str) -> bool {
-        self.recovery_requested.lock().await.remove(collection)
+            .remove(collection)
+            .is_some()
     }
 
     pub async fn get_app_state_key(
