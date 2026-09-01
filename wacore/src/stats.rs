@@ -11,7 +11,10 @@
 //!   on a path that already does AEAD crypto plus a transport write.
 //! - Clock reads: zero per frame sent while the dead-socket anchor is armed,
 //!   one on the send that arms it, one per received transport event, plus one
-//!   more when that event carries several frames. A new timestamp field here
+//!   more when that event carries several frames. All of them monotonic: every
+//!   stamp on this path anchors an elapsed-time deadline, and a wall clock
+//!   answers that question with whatever the system clock was last set to. A
+//!   new timestamp field here
 //!   buys a read on the client's hottest path and needs a reader to justify it:
 //!   one direct message arrives as roughly four transport events (the message,
 //!   its ack, the receipt, the receipt's ack), so per-event is per-message x4.
@@ -29,6 +32,7 @@ use std::time::Duration;
 use portable_atomic::{AtomicU64, Ordering};
 
 use crate::sync_marker::MaybeSendSync;
+use crate::time::{AtomicInstant, Instant};
 
 // ── Wire/session counters ────────────────────────────────────────────────────
 
@@ -135,23 +139,28 @@ pub struct SessionStats {
     devices_unkeyed_fetch_failed: AtomicU64,
     devices_unkeyed_encrypt: AtomicU64,
     reconnects: AtomicU64,
-    /// Timestamp (ms since UNIX epoch) of the last received WebSocket data.
+    /// When the last WebSocket data arrived.
     /// WA Web: `parseAndHandleStanza` → `deadSocketTimer.cancel()`.
     ///
-    /// Kept exact: two decisions measure elapsed time from it, the idle-ping
-    /// gate (15 s) and the dead-socket check (20 s). Sampling it would need a
-    /// refresh trigger, and the only one the core has is the keepalive tick,
-    /// which is coarser (15-30 s) than the gate it feeds.
-    last_data_received_ms: AtomicU64,
+    /// Monotonic, because both readers measure elapsed time from it: the
+    /// idle-ping gate (15 s) and the dead-socket check (20 s). A wall clock
+    /// answers "how long since" with whatever the system clock was last set to,
+    /// which is how twelve hours of suspend read as a dead socket (issue #1376).
+    /// [`StatsSnapshot::last_data_received_ms`] still reports a wall-clock
+    /// instant, derived from this one at snapshot time.
+    ///
+    /// Kept exact rather than sampled: a refresh trigger would have to be the
+    /// keepalive tick, which is coarser (15-30 s) than the gate it feeds.
+    last_data_received: AtomicInstant,
     /// Dead-socket watchdog anchor (WA Web `deadSocketTimer.onOrBefore`): the first
     /// send since the last receive, so continued traffic can't push the deadline out.
-    /// Treated as stale (and re-armed) once `<= last_data_received_ms`, so a send that
+    /// Treated as stale (and re-armed) once `<= last_data_received`, so a send that
     /// raced past a receive-reset can't leave a pre-receive value stuck here.
     ///
-    /// The only send-side timestamp: a `last_data_sent_ms` companion cost a
+    /// The only send-side timestamp: a `last_data_sent` companion cost a
     /// clock read per frame written and had no reader, since the watchdog
     /// anchors on the first unanswered send and never on the most recent one.
-    first_send_since_recv_ms: AtomicU64,
+    first_send_since_recv: AtomicInstant,
 }
 
 /// Point-in-time copy of [`SessionStats`], plus client-level counters the
@@ -206,6 +215,10 @@ pub struct StatsSnapshot {
     /// reached consumers: a sender resending one id as fresh ciphertext. This
     /// is the number to check first when a consumer reports a missing message.
     pub messages_suppressed_duplicate: u64,
+    /// Wall-clock milliseconds since the Unix epoch when data last arrived on
+    /// the current connection, or 0 before the first receive. Derived at
+    /// snapshot time from a monotonic anchor, so it reads in the frame the
+    /// caller's own clock is in even after the system clock has been adjusted.
     pub last_data_received_ms: u64,
 }
 
@@ -227,8 +240,8 @@ impl SessionStats {
         Self::default()
     }
 
-    fn now_ms() -> u64 {
-        crate::time::now_millis().max(0) as u64
+    fn now() -> Instant {
+        Instant::now()
     }
 
     /// One encrypted frame written to the transport.
@@ -243,19 +256,18 @@ impl SessionStats {
         // armed: guarding only on `== 0` would let a send whose arm raced past a
         // receive-reset leave a pre-receive timestamp stuck there forever, silently
         // disabling detection.
-        let last_recv = self.last_data_received_ms.load(Ordering::Relaxed);
-        let anchor = self.first_send_since_recv_ms.load(Ordering::Relaxed);
-        if anchor == 0 || anchor <= last_recv {
+        let last_recv = self.last_data_received.load();
+        let is_stale = |anchor: Option<Instant>| match (anchor, last_recv) {
+            (None, _) => true,
+            (Some(anchor), Some(last_recv)) => anchor <= last_recv,
+            (Some(_), None) => false,
+        };
+        if is_stale(self.first_send_since_recv.load()) {
             // The plain load above gates the clock read; the arm itself re-checks
             // under a CAS, so once an anchor is set a later send cannot overwrite
             // it. Two senders that both see it unarmed still resolve by whichever
             // CAS lands first, which the serial sender task makes unreachable.
-            let now = Self::now_ms();
-            let _ = self.first_send_since_recv_ms.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| (current == 0 || current <= last_recv).then_some(now),
-            );
+            self.first_send_since_recv.store_if(Self::now(), is_stale);
         }
     }
 
@@ -273,10 +285,9 @@ impl SessionStats {
         self.frames_received
             .fetch_add(frames as u64, Ordering::Relaxed);
         if frames > 1 {
-            self.last_data_received_ms
-                .store(Self::now_ms(), Ordering::Relaxed);
+            self.last_data_received.store(Self::now());
             // A receive cancels the dead-socket deadline; the next send re-arms it.
-            self.first_send_since_recv_ms.store(0, Ordering::Relaxed);
+            self.first_send_since_recv.clear();
         }
     }
 
@@ -285,10 +296,9 @@ impl SessionStats {
     /// [`Self::record_recv_batch`].
     #[inline]
     pub fn mark_recv_activity(&self) {
-        self.last_data_received_ms
-            .store(Self::now_ms(), Ordering::Relaxed);
+        self.last_data_received.store(Self::now());
         // A receive cancels the dead-socket deadline; the next send re-arms it.
-        self.first_send_since_recv_ms.store(0, Ordering::Relaxed);
+        self.first_send_since_recv.clear();
     }
 
     #[inline]
@@ -356,22 +366,24 @@ impl SessionStats {
     /// watchdog never reads a previous connection's values. Traffic counters
     /// are cumulative and survive.
     pub fn reset_connection_activity(&self) {
-        self.last_data_received_ms.store(0, Ordering::Relaxed);
-        self.first_send_since_recv_ms.store(0, Ordering::Relaxed);
+        self.last_data_received.clear();
+        self.first_send_since_recv.clear();
     }
 
     /// The dead-socket watchdog anchor: the first send since the last receive
-    /// (0 when unarmed). Evaluate
+    /// (`None` when unarmed). Evaluate
     /// [`is_dead_socket`](crate::protocol::keepalive::is_dead_socket) against this, not the last
     /// send, so continued outgoing traffic can't hide a half-open socket.
     #[inline]
-    pub fn first_send_since_recv_ms(&self) -> u64 {
-        self.first_send_since_recv_ms.load(Ordering::Relaxed)
+    pub fn first_send_since_recv(&self) -> Option<Instant> {
+        self.first_send_since_recv.load()
     }
 
+    /// When data last arrived, on the monotonic clock. `None` before the first
+    /// receive of the current connection.
     #[inline]
-    pub fn last_data_received_ms(&self) -> u64 {
-        self.last_data_received_ms.load(Ordering::Relaxed)
+    pub fn last_data_received(&self) -> Option<Instant> {
+        self.last_data_received.load()
     }
 
     /// Copy the session-level counters. Client-level fields
@@ -397,7 +409,18 @@ impl SessionStats {
             reconnect_errors: 0,
             resends_throttled: 0,
             messages_suppressed_duplicate: 0,
-            last_data_received_ms: self.last_data_received_ms.load(Ordering::Relaxed),
+            // Derived, not stamped: the field is kept monotonically so a clock
+            // adjustment cannot move the watchdog's deadline, and reporting it
+            // in the wall-clock frame the caller reads it in costs nothing on
+            // the wire path, only here.
+            last_data_received_ms: self
+                .last_data_received
+                .load()
+                .map(|at| {
+                    let now = crate::time::now_millis().max(0) as u64;
+                    now.saturating_sub(at.elapsed().as_millis() as u64)
+                })
+                .unwrap_or(0),
         }
     }
 }
@@ -986,7 +1009,7 @@ mod tests {
         let stats = SessionStats::new();
         stats.record_frame_sent(100);
         stats.record_frame_sent(50);
-        assert!(stats.first_send_since_recv_ms() > 0);
+        assert!(stats.first_send_since_recv().is_some());
         stats.record_recv_batch(300, 2);
         stats.record_message_sent();
         stats.record_message_received();
@@ -1068,14 +1091,17 @@ mod tests {
 
     #[test]
     fn dead_socket_anchor_holds_across_continued_sends() {
-        use crate::protocol::keepalive::is_dead_socket;
+        use crate::protocol::keepalive::is_dead_socket_at;
 
         let stats = SessionStats::new();
-        assert_eq!(stats.first_send_since_recv_ms(), 0, "unarmed initially");
+        assert_eq!(stats.first_send_since_recv(), None, "unarmed initially");
 
         stats.record_frame_sent(10);
-        let armed = stats.first_send_since_recv_ms();
-        assert!(armed > 0, "the first send arms the dead-socket anchor");
+        let armed = stats.first_send_since_recv();
+        assert!(
+            armed.is_some(),
+            "the first send arms the dead-socket anchor"
+        );
 
         // Continued outgoing traffic must NOT push the anchor out (WA Web onOrBefore
         // keeps the earliest deadline) — this is what let a half-open socket hide.
@@ -1086,30 +1112,35 @@ mod tests {
         stats.record_frame_sent(10);
         stats.record_frame_sent(10);
         assert_eq!(
-            stats.first_send_since_recv_ms(),
+            stats.first_send_since_recv(),
             armed,
             "later sends keep the earliest anchor"
         );
 
         // A dead socket is detected once DEAD_SOCKET_TIME passes the anchor, even
         // though sends kept happening (anchor far in the past, no receive since).
-        let now = crate::time::now_millis().max(0) as u64;
-        let stale = now.saturating_sub(21_000);
+        // Built from the clock's origin rather than `now`, because a process
+        // that has just started has no 21 seconds behind it to subtract.
+        let anchor = Instant::ZERO + Duration::from_secs(1_000);
         assert!(
-            is_dead_socket(stale, stale.saturating_sub(5_000)),
+            is_dead_socket_at(
+                Some(anchor),
+                Some(anchor - Duration::from_secs(5)),
+                anchor + Duration::from_secs(21)
+            ),
             "20s past the anchor with no receive => dead"
         );
 
-        // A receive cancels the anchor; the next send re-arms it (non-zero again).
+        // A receive cancels the anchor; the next send re-arms it.
         stats.mark_recv_activity();
         assert_eq!(
-            stats.first_send_since_recv_ms(),
-            0,
+            stats.first_send_since_recv(),
+            None,
             "a receive cancels the anchor"
         );
         stats.record_frame_sent(10);
         assert!(
-            stats.first_send_since_recv_ms() > 0,
+            stats.first_send_since_recv().is_some(),
             "the next send after a receive re-arms the anchor"
         );
     }
@@ -1122,23 +1153,25 @@ mod tests {
     fn stale_pre_receive_anchor_self_heals_on_next_send() {
         use crate::protocol::keepalive::is_dead_socket;
         let stats = SessionStats::new();
-        let base = SessionStats::now_ms();
+        let base = SessionStats::now();
         // Reconstruct the race outcome directly: a receive at `base`, and an anchor
         // left behind at a pre-receive instant (the lost-reset send's stale `now`).
-        stats.last_data_received_ms.store(base, Ordering::Relaxed);
+        stats.last_data_received.store(base);
         stats
-            .first_send_since_recv_ms
-            .store(base.saturating_sub(1_000), Ordering::Relaxed);
+            .first_send_since_recv
+            .store(base - Duration::from_secs(1));
 
         stats.record_frame_sent(10);
 
-        let rearmed = stats.first_send_since_recv_ms();
+        let rearmed = stats
+            .first_send_since_recv()
+            .expect("a send always leaves an anchor");
         assert!(
             rearmed >= base,
-            "a stale pre-receive anchor must re-arm to a post-receive send, got {rearmed} < {base}"
+            "a stale pre-receive anchor must re-arm to a post-receive send"
         );
         assert!(
-            !is_dead_socket(rearmed, base),
+            !is_dead_socket(Some(rearmed), Some(base)),
             "the re-armed anchor is after the receive, so the socket is not dead"
         );
     }
@@ -1151,7 +1184,7 @@ mod tests {
         stats.reset_connection_activity();
 
         let snap = stats.snapshot();
-        assert_eq!(stats.first_send_since_recv_ms(), 0);
+        assert_eq!(stats.first_send_since_recv(), None);
         assert_eq!(snap.last_data_received_ms, 0);
         assert_eq!(snap.bytes_sent, 10);
         assert_eq!(snap.bytes_received, 20);

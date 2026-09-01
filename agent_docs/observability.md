@@ -48,10 +48,16 @@ travel to the socket as `SendObservers`, so the next observer plugs in there
 instead of widening `do_handshake` again.
 
 It also owns the activity timestamps the keepalive dead-socket watchdog reads:
-`last_data_received_ms` (one clock read per received transport event, plus one
+`last_data_received` (one clock read per received transport event, plus one
 more when that event carries several frames, so a slow drain is not read as
-silence) and `first_send_since_recv_ms`, which every frame loads but only the
-send that arms or re-arms the anchor spends a clock read on. There
+silence) and `first_send_since_recv`, which every frame loads but only the
+send that arms or re-arms the anchor spends a clock read on. Both are
+`wacore::time::Instant`, never wall-clock stamps: the watchdog asks how much
+time passed, and a wall clock answers that with whatever the system clock was
+last set to, so a laptop resuming from suspend used to kill a socket it had
+authenticated seconds earlier. `StatsSnapshot::last_data_received_ms` still
+reports a wall-clock instant, derived from the monotonic anchor when the
+snapshot is taken rather than stamped on the wire path. There
 is deliberately no "last send" timestamp: nothing in the core reads one, and it
 cost a clock read on every frame written, which is the client's hottest path
 and a call out of the module on wasm32/embedded. `frames_sent` answers "is it

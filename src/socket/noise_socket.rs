@@ -1967,7 +1967,7 @@ mod tests {
         let snap = stats.snapshot();
         assert_eq!(snap.frames_sent, sent.len() as u64);
         assert_eq!(snap.bytes_sent, wire_total as u64);
-        assert!(stats.first_send_since_recv_ms() > 0);
+        assert!(stats.first_send_since_recv().is_some());
     }
 
     /// Tests edge cases for buffer sizing

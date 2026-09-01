@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use wacore::iq::spec::IqSpec;
 use wacore::protocol::keepalive::{
-    KEEP_ALIVE_INTERVAL_MAX, KEEP_ALIVE_INTERVAL_MIN, KEEP_ALIVE_RESPONSE_DEADLINE,
-    is_dead_socket_at, ms_since, ms_since_at,
+    KEEP_ALIVE_INTERVAL_MAX, KEEP_ALIVE_INTERVAL_MIN, KEEP_ALIVE_RESPONSE_DEADLINE, elapsed_since,
+    elapsed_since_at, is_dead_socket_at,
 };
 
 #[derive(Debug, PartialEq)]
@@ -170,14 +170,14 @@ impl Client {
                     // outstanding IQ.
                     self.response_waiters_guard().drop_expired_phash();
 
-                    let last_recv = self.stats.last_data_received_ms();
+                    let last_recv = self.stats.last_data_received();
 
                     // WA Web: maybeScheduleHealthCheck — only send ping when idle.
                     // If we recently received data, the connection is proven alive;
                     // skip the ping and reschedule (same as WA Web rescheduling the
                     // healthCheckTimer after activity).
-                    if let Some(since_recv) = ms_since(last_recv)
-                        && since_recv < KEEP_ALIVE_INTERVAL_MIN.as_millis() as u64
+                    if let Some(since_recv) = elapsed_since(last_recv)
+                        && since_recv < KEEP_ALIVE_INTERVAL_MIN
                     {
                         // Connection alive — reset error state, skip ping.
                         if error_count > 0 {
@@ -217,15 +217,15 @@ impl Client {
                     // a failed ping. This catches scenarios where pending IQs caused
                     // the ping to be skipped, or where the ping "succeeded" but the
                     // connection died immediately after.
-                    let first_send = self.stats.first_send_since_recv_ms();
-                    let last_recv = self.stats.last_data_received_ms();
-                    let now = wacore::protocol::keepalive::now_ms();
+                    let first_send = self.stats.first_send_since_recv();
+                    let last_recv = self.stats.last_data_received();
+                    let now = wacore::time::Instant::now();
                     if is_dead_socket_at(first_send, last_recv, now) {
-                        let elapsed = ms_since_at(first_send, now).unwrap_or(0);
+                        let elapsed = elapsed_since_at(first_send, now).unwrap_or_default();
                         warn!(
                             target: "Client/Keepalive",
                             "No data received for {:.1}s after send (dead socket), forcing reconnect.",
-                            elapsed as f64 / 1000.0
+                            elapsed.as_secs_f64()
                         );
                         self.reconnect_immediately().await;
                         return;
@@ -424,5 +424,5 @@ mod tests {
         }));
     }
 
-    // ms_since, is_dead_socket, and constants tests live in wacore::protocol::keepalive
+    // elapsed_since, is_dead_socket, and constants tests live in wacore::protocol::keepalive
 }

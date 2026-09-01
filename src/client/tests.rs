@@ -3209,25 +3209,53 @@ fn test_fibonacci_backoff_first_attempt_is_1s() {
 
 #[test]
 fn should_reset_backoff_requires_uptime_window_and_no_penalty() {
-    let start = 1_000_000i64;
-    let stable = start + Client::STABLE_CONNECTION_RESET_MS;
+    let start = wacore::time::Instant::ZERO + Duration::from_secs(1_000);
+    let window = Client::STABLE_CONNECTION_RESET;
+    let stable = start + window;
     // Never authenticated this cycle → not stable, whatever the clock says.
-    assert!(!should_reset_backoff(0, 1_000_000, false));
+    assert!(!should_reset_backoff(None, stable, false));
     // Authenticated but dropped inside the 30s window → keep escalating.
     assert!(!should_reset_backoff(
-        start,
-        start + Client::STABLE_CONNECTION_RESET_MS - 1,
+        Some(start),
+        start + window - Duration::from_millis(1),
         false
     ));
     // Survived the full window with no penalty → reset the backoff.
-    assert!(should_reset_backoff(start, stable, false));
-    assert!(should_reset_backoff(start, start + 60_000, false));
+    assert!(should_reset_backoff(Some(start), stable, false));
+    assert!(should_reset_backoff(
+        Some(start),
+        start + Duration::from_secs(60),
+        false
+    ));
     // An explicit penalty (429 / manual reconnect) survives even a stable
     // connection (WA Web cancelReset).
-    assert!(!should_reset_backoff(start, stable, true));
-    assert!(!should_reset_backoff(start, start + 60_000, true));
-    // A backwards clock jump must not underflow into a spurious reset.
-    assert!(!should_reset_backoff(start, start - 5_000, false));
+    assert!(!should_reset_backoff(Some(start), stable, true));
+    assert!(!should_reset_backoff(
+        Some(start),
+        start + Duration::from_secs(60),
+        true
+    ));
+}
+
+/// The stability window is real elapsed time, not a difference of wall-clock
+/// readings: a system clock that leaps forward (a laptop resuming and
+/// re-syncing NTP) must not sell a connection seconds old as thirty seconds
+/// stable and drop the guard against a flapping server.
+#[test]
+fn a_wall_clock_jump_does_not_make_a_young_connection_look_stable() {
+    let connected_at = wacore::time::Instant::now();
+    let a_moment_later = connected_at + Duration::from_secs(1);
+    assert!(!should_reset_backoff(
+        Some(connected_at),
+        a_moment_later,
+        false
+    ));
+    // Real elapsed time still resets it.
+    assert!(should_reset_backoff(
+        Some(connected_at),
+        connected_at + Client::STABLE_CONNECTION_RESET,
+        false
+    ));
 }
 
 // ── stream error tests ─────────────────────────────────────────────
@@ -4744,6 +4772,11 @@ async fn stats_snapshot_reflects_counters() {
 /// A clock read leaves the module on wasm32/embedded, so the wire path owes a
 /// budget: only the send that arms the dead-socket anchor may date itself, and
 /// only one stamp may be spent per received transport event.
+///
+/// It also owes a *clock*. Every stamp here anchors a deadline the keepalive
+/// measures elapsed time against, so all of them are monotonic: a wall-clock
+/// read on this path is a timeout a system-clock adjustment can fire, which is
+/// what killed a healthy socket in issue #1376.
 #[test]
 fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
     use wacore::time::clock_reads;
@@ -4753,7 +4786,7 @@ fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
     let arming = clock_reads::snapshot();
     stats.record_frame_sent(10);
     assert_eq!(
-        clock_reads::since(arming).wall,
+        clock_reads::since(arming).monotonic,
         1,
         "the send that arms the anchor dates it"
     );
@@ -4763,7 +4796,7 @@ fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
         stats.record_frame_sent(10);
     }
     assert_eq!(
-        clock_reads::since(armed).wall,
+        clock_reads::since(armed).monotonic,
         0,
         "sends under an already-armed anchor have nothing to date"
     );
@@ -4772,7 +4805,7 @@ fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
     stats.mark_recv_activity();
     stats.record_recv_batch(100, 1);
     assert_eq!(
-        clock_reads::since(recv).wall,
+        clock_reads::since(recv).monotonic,
         1,
         "a single-frame batch is stamped once, at arrival"
     );
@@ -4781,7 +4814,7 @@ fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
     stats.mark_recv_activity();
     stats.record_recv_batch(100, 4);
     assert_eq!(
-        clock_reads::since(long_batch).wall,
+        clock_reads::since(long_batch).monotonic,
         2,
         "a long batch re-stamps on completion so a slow drain is not read as silence"
     );
@@ -4789,9 +4822,42 @@ fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
     let rearm = clock_reads::snapshot();
     stats.record_frame_sent(10);
     assert_eq!(
-        clock_reads::since(rearm).wall,
+        clock_reads::since(rearm).monotonic,
         1,
         "the receive cancelled the anchor, so this send arms it again"
+    );
+
+    let whole_path = clock_reads::snapshot();
+    stats.record_frame_sent(10);
+    stats.mark_recv_activity();
+    stats.record_recv_batch(100, 4);
+    stats.record_frame_sent(10);
+    assert_eq!(
+        clock_reads::since(whole_path).wall,
+        0,
+        "a wall-clock stamp here is a watchdog deadline a clock adjustment can move"
+    );
+}
+
+/// The public snapshot still answers "last seen at T" in the wall-clock frame a
+/// consumer reads it in, even though the field behind it is monotonic.
+#[test]
+fn the_snapshot_still_reports_last_receive_as_a_wall_clock_instant() {
+    let stats = wacore::stats::SessionStats::new();
+    assert_eq!(
+        stats.snapshot().last_data_received_ms,
+        0,
+        "nothing received yet"
+    );
+
+    let before = wacore::time::now_millis().max(0) as u64;
+    stats.mark_recv_activity();
+    let reported = stats.snapshot().last_data_received_ms;
+    let after = wacore::time::now_millis().max(0) as u64;
+
+    assert!(
+        (before..=after).contains(&reported),
+        "expected a wall-clock instant inside [{before}, {after}], got {reported}"
     );
 }
 

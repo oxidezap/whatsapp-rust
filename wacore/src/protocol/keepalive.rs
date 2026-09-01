@@ -5,6 +5,7 @@
 //! and IQ error classification remain in `whatsapp-rust/src/keepalive.rs`
 //! because `IqError` depends on `SocketError` which lives in whatsapp-rust.
 
+use crate::time::Instant;
 use std::time::Duration;
 
 /// WA Web: `healthCheckInterval = 15` -> `15 * (1 + random())` = 15-30 s.
@@ -17,123 +18,118 @@ pub const KEEP_ALIVE_RESPONSE_DEADLINE: Duration = Duration::from_secs(20);
 /// after a send, the socket is considered dead and forcibly closed.
 pub const DEAD_SOCKET_TIME: Duration = Duration::from_secs(20);
 
-/// Returns the number of milliseconds elapsed since a stored timestamp.
-/// Returns `None` if the timestamp was never set (value 0).
-pub fn ms_since(timestamp_ms: u64) -> Option<u64> {
-    ms_since_at(timestamp_ms, now_ms())
+/// Time elapsed since `anchor`, or `None` when nothing is anchored.
+pub fn elapsed_since(anchor: Option<Instant>) -> Option<Duration> {
+    elapsed_since_at(anchor, Instant::now())
 }
 
-/// Same as [`ms_since`], but against a caller-supplied `now`.
+/// Same as [`elapsed_since`], but against a caller-supplied `now`.
 ///
 /// The dead-socket branch of the keepalive tick evaluates this and
 /// [`is_dead_socket_at`] against one instant instead of reading the clock per
 /// predicate, and a test can supply the instant outright.
-pub fn ms_since_at(timestamp_ms: u64, now_ms: u64) -> Option<u64> {
-    if timestamp_ms == 0 {
-        return None;
-    }
-    Some(now_ms.saturating_sub(timestamp_ms))
-}
-
-/// The wall clock in the units these predicates compare.
-pub fn now_ms() -> u64 {
-    crate::time::now_millis().max(0) as u64
+pub fn elapsed_since_at(anchor: Option<Instant>, now: Instant) -> Option<Duration> {
+    anchor.map(|anchor| now.saturating_duration_since(anchor))
 }
 
 /// Checks the dead-socket condition: [`DEAD_SOCKET_TIME`] elapsed since the timer
 /// was armed without a receive cancelling it.
 ///
-/// `armed_ms` is the anchor WA Web's `deadSocketTimer.onOrBefore` keeps: the FIRST
-/// send after the last receive (0 when unarmed / cancelled). It must NOT be the
-/// most-recent send — anchoring there lets continued outgoing traffic keep pushing
-/// the deadline out and hide a half-open socket forever. The caller feeds
-/// `SessionStats::first_send_since_recv_ms`, reset to 0 on every receive
-/// (`parseAndHandleStanza` → `cancel()`).
-pub fn is_dead_socket(armed_ms: u64, last_received_ms: u64) -> bool {
-    is_dead_socket_at(armed_ms, last_received_ms, now_ms())
+/// Every argument is a monotonic [`Instant`], never a wall-clock timestamp: this
+/// asks how much time passed, and a wall clock answers that wrongly whenever the
+/// system clock is adjusted -- a laptop resuming from suspend re-syncs NTP, and
+/// the jump alone used to read as twenty silent seconds and kill a healthy
+/// socket seconds after it authenticated.
+///
+/// `armed` is the anchor WA Web's `deadSocketTimer.onOrBefore` keeps: the FIRST
+/// send after the last receive (`None` when unarmed / cancelled). It must NOT be
+/// the most-recent send -- anchoring there lets continued outgoing traffic keep
+/// pushing the deadline out and hide a half-open socket forever. The caller feeds
+/// `SessionStats::first_send_since_recv`, cleared on every receive
+/// (`parseAndHandleStanza` -> `cancel()`).
+pub fn is_dead_socket(armed: Option<Instant>, last_received: Option<Instant>) -> bool {
+    is_dead_socket_at(armed, last_received, Instant::now())
 }
 
 /// Same as [`is_dead_socket`], but against a caller-supplied `now`, so the
 /// decision is testable without depending on the platform clock.
-pub fn is_dead_socket_at(armed_ms: u64, last_received_ms: u64, now_ms: u64) -> bool {
+pub fn is_dead_socket_at(
+    armed: Option<Instant>,
+    last_received: Option<Instant>,
+    now: Instant,
+) -> bool {
     // Timer not armed (never sent since the last receive).
-    if armed_ms == 0 {
+    let Some(armed) = armed else {
         return false;
-    }
+    };
     // Received data after (or at) the armed instant -- timer cancelled.
-    if last_received_ms >= armed_ms {
+    if last_received.is_some_and(|received| received >= armed) {
         return false;
     }
-    ms_since_at(armed_ms, now_ms)
-        .map(|elapsed| elapsed > DEAD_SOCKET_TIME.as_millis() as u64)
-        .unwrap_or(false)
+    now.saturating_duration_since(armed) > DEAD_SOCKET_TIME
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // -- ms_since tests --
+    fn at(secs: u64) -> Instant {
+        Instant::ZERO + Duration::from_secs(secs)
+    }
+
+    // -- elapsed_since tests --
 
     #[test]
-    fn ms_since_never_set() {
-        assert_eq!(ms_since(0), None);
+    fn elapsed_since_never_set() {
+        assert_eq!(elapsed_since(None), None);
     }
 
     #[test]
-    fn ms_since_recent() {
-        let now_ms = crate::time::now_millis().max(0) as u64;
-        let elapsed = ms_since(now_ms).unwrap();
-        assert!(elapsed < 100, "should be near-zero, got {elapsed}ms");
-    }
-
-    #[test]
-    fn ms_since_stale() {
-        let thirty_sec_ago = (crate::time::now_millis().max(0) as u64).saturating_sub(30_000);
-        let elapsed = ms_since(thirty_sec_ago).unwrap();
+    fn elapsed_since_recent() {
+        let elapsed = elapsed_since(Some(Instant::now())).unwrap();
         assert!(
-            (29_000..=31_000).contains(&elapsed),
-            "should be ~30s, got {elapsed}ms"
+            elapsed < Duration::from_millis(100),
+            "should be near-zero, got {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn elapsed_since_stale() {
+        let elapsed = elapsed_since_at(Some(at(100)), at(130)).unwrap();
+        assert_eq!(elapsed, Duration::from_secs(30));
     }
 
     // -- is_dead_socket tests --
 
     #[test]
     fn dead_socket_never_sent() {
-        assert!(!is_dead_socket(0, 0));
+        assert!(!is_dead_socket(None, None));
     }
 
     #[test]
     fn dead_socket_received_after_send() {
-        let t = crate::time::now_millis().max(0) as u64;
-        assert!(!is_dead_socket(t, t + 1));
+        let t = Instant::now();
+        assert!(!is_dead_socket(Some(t), Some(t + Duration::from_millis(1))));
     }
 
     #[test]
     fn dead_socket_sent_recently() {
-        let now = crate::time::now_millis().max(0) as u64;
-        assert!(!is_dead_socket(now, 0));
+        assert!(!is_dead_socket(Some(Instant::now()), None));
     }
 
     #[test]
     fn dead_socket_sent_long_ago_no_reply() {
-        let thirty_ago = (crate::time::now_millis().max(0) as u64).saturating_sub(30_000);
-        assert!(is_dead_socket(thirty_ago, 0));
+        assert!(is_dead_socket_at(Some(at(100)), None, at(130)));
     }
 
     #[test]
     fn dead_socket_sent_long_ago_old_reply() {
-        let thirty_ago = (crate::time::now_millis().max(0) as u64).saturating_sub(30_000);
-        let thirty_one_ago = thirty_ago.saturating_sub(1_000);
-        assert!(is_dead_socket(thirty_ago, thirty_one_ago));
+        assert!(is_dead_socket_at(Some(at(100)), Some(at(99)), at(130)));
     }
 
     #[test]
     fn dead_socket_sent_long_ago_recent_reply() {
-        let thirty_ago = (crate::time::now_millis().max(0) as u64).saturating_sub(30_000);
-        let one_ago = (crate::time::now_millis().max(0) as u64).saturating_sub(1_000);
-        assert!(!is_dead_socket(thirty_ago, one_ago));
+        assert!(!is_dead_socket_at(Some(at(100)), Some(at(129)), at(130)));
     }
 
     // -- controlled-clock boundary --
@@ -143,10 +139,14 @@ mod tests {
     /// test took to run.
     #[test]
     fn dead_socket_boundary_is_exact() {
-        let armed = 1_000_000u64;
-        let dead_at = armed + DEAD_SOCKET_TIME.as_millis() as u64;
-        assert!(!is_dead_socket_at(armed, 0, dead_at));
-        assert!(is_dead_socket_at(armed, 0, dead_at + 1));
+        let armed = at(1_000);
+        let dead_at = armed + DEAD_SOCKET_TIME;
+        assert!(!is_dead_socket_at(Some(armed), None, dead_at));
+        assert!(is_dead_socket_at(
+            Some(armed),
+            None,
+            dead_at + Duration::from_millis(1)
+        ));
     }
 
     /// A silent socket is still detected while sends keep flowing: the anchor
@@ -155,14 +155,44 @@ mod tests {
     fn continued_sends_do_not_hide_a_silent_socket() {
         let stats = crate::stats::SessionStats::new();
         stats.record_frame_sent(10);
-        let armed = stats.first_send_since_recv_ms();
+        let armed = stats.first_send_since_recv();
         for _ in 0..100 {
             stats.record_frame_sent(10);
         }
-        assert_eq!(stats.first_send_since_recv_ms(), armed);
+        assert_eq!(stats.first_send_since_recv(), armed);
 
-        let now = armed + DEAD_SOCKET_TIME.as_millis() as u64 + 1;
-        assert!(is_dead_socket_at(armed, 0, now));
+        let now = armed.unwrap() + DEAD_SOCKET_TIME + Duration::from_millis(1);
+        assert!(is_dead_socket_at(armed, None, now));
+    }
+
+    /// Regression for the wake-from-suspend false positive (issue #1376).
+    ///
+    /// A receive, then a send that arms the anchor, then one second of real
+    /// time. A wall clock that leapt twelve hours inside that second (a resumed
+    /// laptop re-syncing NTP) has no way to reach this decision any more,
+    /// because none of these three values is a wall-clock timestamp.
+    #[test]
+    fn a_wall_clock_jump_does_not_declare_a_live_socket_dead() {
+        let received = at(1_000);
+        let armed = received + Duration::from_millis(1);
+        assert!(!is_dead_socket_at(
+            Some(armed),
+            Some(received),
+            armed + Duration::from_secs(1)
+        ));
+    }
+
+    /// The other half of the regression: real silence past the deadline still
+    /// forces a reconnect, so the fix is not "disable the watchdog".
+    #[test]
+    fn real_silence_past_the_deadline_is_still_a_dead_socket() {
+        let received = at(1_000);
+        let armed = received + Duration::from_millis(1);
+        assert!(is_dead_socket_at(
+            Some(armed),
+            Some(received),
+            armed + DEAD_SOCKET_TIME + Duration::from_secs(1)
+        ));
     }
 
     // -- constant sanity --

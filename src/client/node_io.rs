@@ -1064,8 +1064,7 @@ impl Client {
         // (`resetDelay`). Resetting on <success> alone lets a server that
         // authenticates then immediately drops keep us in a 1s reconnect storm.
         // The run loop does the stability-gated reset on the next disconnect.
-        self.connected_at_ms
-            .store(wacore::time::now_millis(), Ordering::Relaxed);
+        self.connected_at.store(wacore::time::Instant::now());
         // Fresh connection starts un-penalized (see backoff_reset_suppressed).
         self.backoff_reset_suppressed
             .store(false, Ordering::Relaxed);

@@ -25,6 +25,7 @@ use crate::companion_reg::{
 };
 use crate::libsignal::crypto::{CryptoProviderError, aes_256_gcm_encrypt};
 use crate::libsignal::protocol::{CurveError, KeyPair, PublicKey};
+use crate::time::Instant;
 use aes::cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
 use hmac::{Hmac, Mac};
@@ -207,7 +208,7 @@ pub enum PairCodeState {
     RequestingCode {
         /// Stamped before `companion_hello`, and carried into
         /// [`Self::WaitingForPhoneConfirmation`] unchanged.
-        code_generation_ts: i64,
+        code_generation: Instant,
         /// Identifies *this* request. The stamp cannot: cancel a request and
         /// start its replacement inside the same second and both carry the same
         /// number, so the first one's late response would install its code over
@@ -224,9 +225,12 @@ pub enum PairCodeState {
         pair_code: String,
         /// Ephemeral keypair generated for this session.
         ephemeral_keypair: Box<KeyPair>,
-        /// Unix seconds when the code was generated. Enforces the ~180s validity
-        /// window: a `primary_hello` arriving later is rejected (WA Web `OldCodeError`).
-        code_generation_ts: i64,
+        /// When the code was generated. Enforces the ~180s validity window: a
+        /// `primary_hello` arriving later is rejected (WA Web `OldCodeError`).
+        /// Monotonic: the window is elapsed time, never persisted and never
+        /// compared against a server timestamp, so a system-clock adjustment
+        /// has no business expiring a code someone is still reading.
+        code_generation: Instant,
         /// Count of `primary_hello` notifications processed for this code. WA Web
         /// (`DeviceLinkingApi`) caps this at 3 per code (`MaxPrimaryHelloError`);
         /// the primary may retry, re-deriving fresh key material each time.
@@ -274,25 +278,23 @@ impl PairCodeState {
     ///
     /// The union of the two clocks: the code's own validity window, and the
     /// link that outlives it once the phone has answered.
-    pub fn is_outstanding(&self, now: i64) -> bool {
+    pub fn is_outstanding(&self, now: Instant) -> bool {
         self.live_flow_remaining(now).is_some() || self.awaiting_pair_success()
     }
 
-    pub fn live_flow_remaining(&self, now: i64) -> Option<std::time::Duration> {
+    pub fn live_flow_remaining(&self, now: Instant) -> Option<std::time::Duration> {
         let (Self::RequestingCode {
-            code_generation_ts, ..
+            code_generation, ..
         }
         | Self::WaitingForPhoneConfirmation {
-            code_generation_ts, ..
+            code_generation, ..
         }) = self
         else {
             return None;
         };
         let validity = PairCodeUtils::code_validity();
-        // A backwards clock jump reads as "no time has passed", never as an
-        // expiry that would let the overlap through unreported.
-        let age = now.saturating_sub(*code_generation_ts).max(0) as u64;
-        (age <= validity.as_secs()).then(|| validity - std::time::Duration::from_secs(age))
+        let age = now.saturating_duration_since(*code_generation);
+        (age <= validity).then(|| validity - age)
     }
 }
 
@@ -1202,7 +1204,11 @@ mod tests {
     // `forceManualRefresh`, or the screen's own timers. This predicate is what
     // lets the overwrite be reported instead of silent.
 
-    fn waiting_at(ts: i64) -> PairCodeState {
+    fn at(secs: u64) -> Instant {
+        Instant::ZERO + std::time::Duration::from_secs(secs)
+    }
+
+    fn waiting_at(at_secs: u64) -> PairCodeState {
         PairCodeState::WaitingForPhoneConfirmation {
             pairing_ref: b"3@2:ref".to_vec(),
             phone_jid: "15551234567".to_string(),
@@ -1210,27 +1216,30 @@ mod tests {
             ephemeral_keypair: Box::new(KeyPair::generate(
                 &mut rand::make_rng::<rand::rngs::StdRng>(),
             )),
-            code_generation_ts: ts,
+            code_generation: at(at_secs),
             primary_hello_attempt_count: 0,
         }
     }
 
     #[test]
     fn live_flow_remaining_is_none_when_no_code_is_outstanding() {
-        assert_eq!(PairCodeState::Idle.live_flow_remaining(1_000), None);
-        assert_eq!(PairCodeState::Completed.live_flow_remaining(1_000), None);
+        assert_eq!(PairCodeState::Idle.live_flow_remaining(at(1_000)), None);
+        assert_eq!(
+            PairCodeState::Completed.live_flow_remaining(at(1_000)),
+            None
+        );
     }
 
     #[test]
     fn live_flow_remaining_counts_down_the_validity_window() {
-        let validity = PairCodeUtils::code_validity().as_secs() as i64;
+        let validity = PairCodeUtils::code_validity();
         assert_eq!(
-            waiting_at(1_000).live_flow_remaining(1_000),
-            Some(PairCodeUtils::code_validity())
+            waiting_at(1_000).live_flow_remaining(at(1_000)),
+            Some(validity)
         );
         assert_eq!(
-            waiting_at(1_000).live_flow_remaining(1_000 + 30),
-            Some(std::time::Duration::from_secs(validity as u64 - 30))
+            waiting_at(1_000).live_flow_remaining(at(1_030)),
+            Some(validity - std::time::Duration::from_secs(30))
         );
     }
 
@@ -1239,23 +1248,47 @@ mod tests {
     /// is still usable, so it is still worth reporting as lost.
     #[test]
     fn live_flow_remaining_treats_the_exact_window_as_still_live() {
-        let validity = PairCodeUtils::code_validity().as_secs() as i64;
+        let validity = PairCodeUtils::code_validity();
         assert_eq!(
-            waiting_at(1_000).live_flow_remaining(1_000 + validity),
+            waiting_at(1_000).live_flow_remaining(at(1_000) + validity),
             Some(std::time::Duration::ZERO)
         );
         assert_eq!(
-            waiting_at(1_000).live_flow_remaining(1_000 + validity + 1),
+            waiting_at(1_000)
+                .live_flow_remaining(at(1_000) + validity + std::time::Duration::from_secs(1)),
             None,
             "an expired code is not a flow anyone can still complete"
         );
     }
 
-    /// A clock that jumped backwards must not underflow into a bogus window.
+    /// The window is elapsed time, so a system clock jumping forward past the
+    /// validity must not retire a code the user is still reading off the screen.
+    #[test]
+    fn live_flow_remaining_ignores_a_wall_clock_jump() {
+        let generated = Instant::now();
+        let state = PairCodeState::RequestingCode {
+            code_generation: generated,
+            claim: PairCodeClaim::next(),
+        };
+        assert_eq!(
+            state.live_flow_remaining(generated + std::time::Duration::from_secs(1)),
+            Some(PairCodeUtils::code_validity() - std::time::Duration::from_secs(1)),
+        );
+        // Real elapsed time past the window still expires it.
+        assert_eq!(
+            state.live_flow_remaining(
+                generated + PairCodeUtils::code_validity() + std::time::Duration::from_secs(1)
+            ),
+            None
+        );
+    }
+
+    /// A monotonic clock never moves backwards, but the arithmetic still
+    /// saturates rather than underflowing if a provider misbehaves.
     #[test]
     fn live_flow_remaining_survives_a_backwards_clock() {
         assert_eq!(
-            waiting_at(1_000).live_flow_remaining(900),
+            waiting_at(1_000).live_flow_remaining(at(900)),
             Some(PairCodeUtils::code_validity())
         );
     }

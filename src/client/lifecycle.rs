@@ -28,7 +28,8 @@ impl Drop for Client {
 impl Client {
     /// WA Web `resetDelay: 30000` — only after a connection has stayed up this
     /// long is the reconnect backoff counter reset to its base.
-    pub(crate) const STABLE_CONNECTION_RESET_MS: i64 = 30_000;
+    pub(crate) const STABLE_CONNECTION_RESET: std::time::Duration =
+        std::time::Duration::from_secs(30);
 
     /// Create a runtime-validated low-level client builder.
     pub fn builder() -> ClientBuilder {
@@ -85,7 +86,7 @@ impl Client {
     /// and resets the backoff on the strength of it.
     fn clear_connection_backoff_state(&self) {
         self.auto_reconnect_errors.store(0, Ordering::Relaxed);
-        self.connected_at_ms.store(0, Ordering::Relaxed);
+        self.connected_at.clear();
     }
 
     pub(crate) fn connection_shutdown_signal(&self) -> wacore::runtime::ShutdownSignal {
@@ -501,7 +502,7 @@ impl Client {
             pause_generation: AtomicU64::new(0),
             connection_publish: Mutex::new(()),
             auto_reconnect_errors: Arc::new(AtomicU32::new(0)),
-            connected_at_ms: Arc::new(AtomicI64::new(0)),
+            connected_at: Arc::new(wacore::time::AtomicInstant::unset()),
             backoff_reset_suppressed: Arc::new(AtomicBool::new(false)),
 
             needs_initial_full_sync: Arc::new(app_state::BootstrapGate::new(false)),
@@ -791,9 +792,9 @@ impl Client {
             // Reset the backoff only after a stable connection, unless an
             // explicit penalty (429 / manual reconnect) must survive — WA Web
             // `resetDelay` + `cancelReset`.
-            let connected_at = self.connected_at_ms.swap(0, Ordering::Relaxed);
+            let connected_at = self.connected_at.take();
             let penalty = self.backoff_reset_suppressed.load(Ordering::Relaxed);
-            if should_reset_backoff(connected_at, wacore::time::now_millis(), penalty) {
+            if should_reset_backoff(connected_at, wacore::time::Instant::now(), penalty) {
                 self.auto_reconnect_errors.store(0, Ordering::Relaxed);
             }
 
@@ -2804,7 +2805,7 @@ mod tests {
         let (client, entered, release) = client_parked_in_connect().await;
         // What a session that struggled and then settled leaves behind.
         client.auto_reconnect_errors.store(7, Ordering::Relaxed);
-        client.connected_at_ms.store(1, Ordering::Relaxed);
+        client.connected_at.store(wacore::time::Instant::now());
 
         let runner = Arc::clone(&client);
         let run = tokio::spawn(async move { runner.run().await });
@@ -2822,9 +2823,8 @@ mod tests {
             0,
             "a planned end owes no backoff, so its counter is cleared on both exits"
         );
-        assert_eq!(
-            client.connected_at_ms.load(Ordering::Relaxed),
-            0,
+        assert!(
+            client.connected_at.load().is_none(),
             "and the auth timestamp is consumed, so no later connect reads it as stable"
         );
     }
