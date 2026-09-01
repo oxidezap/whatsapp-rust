@@ -206,13 +206,14 @@ pub enum PairCodeState {
     /// window as a distinct stage (`AfterSendCompanionHello` follows
     /// `Initialized` before the request resolves).
     RequestingCode {
-        /// Stamped before `companion_hello`, and carried into
+        /// The generation instant plus [`PairCodeUtils::code_validity`], stamped
+        /// before `companion_hello` and carried into
         /// [`Self::WaitingForPhoneConfirmation`] unchanged.
-        code_generation: Instant,
-        /// Identifies *this* request. The stamp cannot: cancel a request and
-        /// start its replacement inside the same second and both carry the same
-        /// number, so the first one's late response would install its code over
-        /// the replacement's claim, and its failure path would release it.
+        code_expires_at: Instant,
+        /// Identifies *this* request. The deadline cannot: a replacement started
+        /// right after a cancellation carries an indistinguishable one, so the
+        /// first request's late response would install its code over the
+        /// replacement's claim, and its failure path would release it.
         claim: PairCodeClaim,
     },
     /// Stage 1 complete - waiting for phone to confirm code entry.
@@ -225,12 +226,16 @@ pub enum PairCodeState {
         pair_code: String,
         /// Ephemeral keypair generated for this session.
         ephemeral_keypair: Box<KeyPair>,
-        /// When the code was generated. Enforces the ~180s validity window: a
-        /// `primary_hello` arriving later is rejected (WA Web `OldCodeError`).
-        /// Monotonic: the window is elapsed time, never persisted and never
+        /// When the ~180s validity window closes: a `primary_hello` arriving
+        /// after it is rejected (WA Web `OldCodeError`).
+        ///
+        /// Monotonic, and a deadline rather than the generation instant it is
+        /// derived from. The window is elapsed time, never persisted and never
         /// compared against a server timestamp, so a system-clock adjustment
-        /// has no business expiring a code someone is still reading.
-        code_generation: Instant,
+        /// has no business expiring a code someone is still reading. Holding
+        /// the deadline also means an already-closed window is representable
+        /// without dating something before the process began.
+        code_expires_at: Instant,
         /// Count of `primary_hello` notifications processed for this code. WA Web
         /// (`DeviceLinkingApi`) caps this at 3 per code (`MaxPrimaryHelloError`);
         /// the primary may retry, re-deriving fresh key material each time.
@@ -284,17 +289,15 @@ impl PairCodeState {
 
     pub fn live_flow_remaining(&self, now: Instant) -> Option<std::time::Duration> {
         let (Self::RequestingCode {
-            code_generation, ..
+            code_expires_at, ..
         }
         | Self::WaitingForPhoneConfirmation {
-            code_generation, ..
+            code_expires_at, ..
         }) = self
         else {
             return None;
         };
-        let validity = PairCodeUtils::code_validity();
-        let age = now.saturating_duration_since(*code_generation);
-        (age <= validity).then(|| validity - age)
+        (now <= *code_expires_at).then(|| code_expires_at.saturating_duration_since(now))
     }
 }
 
@@ -1216,7 +1219,7 @@ mod tests {
             ephemeral_keypair: Box::new(KeyPair::generate(
                 &mut rand::make_rng::<rand::rngs::StdRng>(),
             )),
-            code_generation: at(at_secs),
+            code_expires_at: at(at_secs) + PairCodeUtils::code_validity(),
             primary_hello_attempt_count: 0,
         }
     }
@@ -1267,7 +1270,7 @@ mod tests {
     fn live_flow_remaining_ignores_a_wall_clock_jump() {
         let generated = Instant::now();
         let state = PairCodeState::RequestingCode {
-            code_generation: generated,
+            code_expires_at: generated + PairCodeUtils::code_validity(),
             claim: PairCodeClaim::next(),
         };
         assert_eq!(
@@ -1283,13 +1286,22 @@ mod tests {
         );
     }
 
-    /// A monotonic clock never moves backwards, but the arithmetic still
-    /// saturates rather than underflowing if a provider misbehaves.
+    /// A monotonic clock never moves backwards, but if a provider misbehaved
+    /// the countdown must saturate rather than wrap: past the deadline there is
+    /// no window left, however far past it the reading is.
     #[test]
-    fn live_flow_remaining_survives_a_backwards_clock() {
+    fn live_flow_remaining_saturates_instead_of_wrapping() {
+        let state = waiting_at(1_000);
+        let deadline = at(1_000) + PairCodeUtils::code_validity();
         assert_eq!(
-            waiting_at(1_000).live_flow_remaining(at(900)),
-            Some(PairCodeUtils::code_validity())
+            state.live_flow_remaining(deadline),
+            Some(std::time::Duration::ZERO),
+            "the deadline itself is the last live instant"
+        );
+        assert_eq!(
+            state.live_flow_remaining(deadline + std::time::Duration::from_secs(10_000)),
+            None,
+            "long past the deadline is still just expired, never a fresh window"
         );
     }
 

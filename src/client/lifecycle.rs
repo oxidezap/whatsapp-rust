@@ -28,8 +28,7 @@ impl Drop for Client {
 impl Client {
     /// WA Web `resetDelay: 30000` — only after a connection has stayed up this
     /// long is the reconnect backoff counter reset to its base.
-    pub(crate) const STABLE_CONNECTION_RESET: std::time::Duration =
-        std::time::Duration::from_secs(30);
+    pub(crate) const STABLE_CONNECTION_RESET: Duration = Duration::from_secs(30);
 
     /// Create a runtime-validated low-level client builder.
     pub fn builder() -> ClientBuilder {

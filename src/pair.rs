@@ -210,7 +210,7 @@ pub async fn handle_iq(client: &Arc<Client>, node: &NodeRef<'_>) -> bool {
                                 .pair_code_state
                                 .lock()
                                 .await
-                                .is_outstanding(wacore::time::now_secs());
+                                .is_outstanding(wacore::time::Instant::now());
 
                             info!(
                                 "All QR codes for this session have expired\
@@ -623,7 +623,8 @@ mod tests {
             ephemeral_keypair: Box::new(KeyPair::generate(
                 &mut rand::make_rng::<rand::rngs::StdRng>(),
             )),
-            code_generation_ts: wacore::time::now_secs(),
+            code_expires_at: wacore::time::Instant::now()
+                + wacore::pair_code::PairCodeUtils::code_validity(),
             primary_hello_attempt_count: 0,
         };
     }
@@ -735,8 +736,7 @@ mod tests {
         let collector = Arc::new(TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
 
-        let expired = wacore::time::now_secs()
-            - (wacore::pair_code::PairCodeUtils::code_validity().as_secs() as i64 + 1);
+        let expired = wacore::time::Instant::ZERO;
         *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
             pairing_ref: b"3@2:ref".to_vec(),
             phone_jid: "15551234567".to_string(),
@@ -744,7 +744,7 @@ mod tests {
             ephemeral_keypair: Box::new(KeyPair::generate(
                 &mut rand::make_rng::<rand::rngs::StdRng>(),
             )),
-            code_generation_ts: expired,
+            code_expires_at: expired,
             // Stage 2 ran: pair-success is still due.
             primary_hello_attempt_count: 1,
         };

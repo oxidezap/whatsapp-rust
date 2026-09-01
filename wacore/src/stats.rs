@@ -719,13 +719,13 @@ std::thread_local! {
     /// poll, and several meters can share one thread), and each scope must
     /// keep its own start. Poll scopes strictly nest, so LIFO holds; a nested
     /// scope's time is also part of its enclosing scope's elapsed.
-    static POLL_START: core::cell::RefCell<Vec<crate::time::Instant>> =
+    static POLL_START: core::cell::RefCell<Vec<Instant>> =
         const { core::cell::RefCell::new(Vec::new()) };
 }
 
 impl TaskInstrument for CpuMeter {
     fn on_poll_start(&self) {
-        POLL_START.with(|s| s.borrow_mut().push(crate::time::Instant::now()));
+        POLL_START.with(|s| s.borrow_mut().push(Instant::now()));
     }
 
     fn on_poll_end(&self) {
