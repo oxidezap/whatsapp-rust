@@ -3251,8 +3251,6 @@ impl Client {
     /// take, since it is a clear, a put and a set over the very rows they write,
     /// and interleaving with either can leave the persisted ltHash and the MAC
     /// store describing different states.
-    /// Write a collection the primary sent back, and announce what changed.
-    ///
     ///
     /// The caller is already detached from the inbound path, so this waits for
     /// the reservation on its own time.

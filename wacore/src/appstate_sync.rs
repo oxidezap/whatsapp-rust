@@ -225,10 +225,12 @@ impl AppStateProcessor {
         self.recovery_requested.lock().await.len()
     }
 
-    /// Records the id the primary's answer will carry, once the ask is sent.
+    /// Records the id the primary's answer will carry.
     ///
-    /// Set after the send because that is when the id exists; the marker itself
-    /// goes in before, so a fast reply cannot be read as unsolicited.
+    /// Set before the send, like the marker itself: the id is minted by the
+    /// caller rather than by the send, and a reply that beats the send's return
+    /// would otherwise find the request recorded with no id at all -- which is
+    /// unrecognisable, and so unable to free the ask it answers.
     pub async fn note_recovery_request_id(&self, collection: &str, request_id: &str) {
         if let Some(request) = self.recovery_requested.lock().await.get_mut(collection) {
             request.request_id = Some(request_id.to_string());
