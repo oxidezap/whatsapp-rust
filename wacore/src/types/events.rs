@@ -289,6 +289,7 @@ pub enum EventKind {
     EncDecryptFailed,
     CallLogSync,
     ClientExpirationChanged,
+    OfflineSyncInterrupted,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -302,7 +303,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::ClientExpirationChanged as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::OfflineSyncInterrupted as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -973,6 +974,7 @@ pub enum Event {
     HistorySync(Box<LazyHistorySync>),
     OfflineSyncPreview(OfflineSyncPreview),
     OfflineSyncCompleted(OfflineSyncCompleted),
+    OfflineSyncInterrupted(OfflineSyncInterrupted),
     /// The server marked one of its cached protocol domains dirty.
     DirtyState(DirtyState),
 
@@ -1181,6 +1183,7 @@ impl Event {
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
+            Event::OfflineSyncInterrupted(_) => EventKind::OfflineSyncInterrupted,
             Event::DirtyState(_) => EventKind::DirtyState,
             Event::DeviceListUpdate(_) => EventKind::DeviceListUpdate,
             Event::IdentityChange(_) => EventKind::IdentityChange,
@@ -1732,6 +1735,31 @@ pub struct OfflineSyncPreview {
 #[non_exhaustive]
 pub struct OfflineSyncCompleted {
     pub count: i32,
+}
+
+/// An offline backlog drain ended without its `<ib><offline>` end marker,
+/// because the connection went away first.
+///
+/// This is the counterpart of [`OfflineSyncCompleted`], not a variant of it:
+/// the drain did not finish, the client is not caught up, and the remainder of
+/// the backlog is still queued server-side. Nothing was lost — an offline
+/// message is only acked through the aggregate receipt flush that a *completed*
+/// drain performs, so everything undelivered (and the last open batch) is
+/// redelivered on the next connection, where a fresh
+/// [`OfflineSyncPreview`] announces it.
+///
+/// A consumer that gates "caught up" UI or startup work on
+/// [`OfflineSyncCompleted`] should treat this as "not caught up, wait for the
+/// next preview" rather than as completion.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct OfflineSyncInterrupted {
+    /// What the preview announced for this drain.
+    pub total: i32,
+    /// Offline stanzas processed before the connection ended. Never larger
+    /// than `total` in practice, but the server owns both numbers, so treat
+    /// the pair as a progress report rather than an invariant.
+    pub delivered: i32,
 }
 
 /// A valid `<ib><dirty>` marker received from the server.

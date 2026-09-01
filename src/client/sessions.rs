@@ -14,7 +14,7 @@ use wacore::types::jid::JidExt;
 use wacore_binary::Jid;
 
 use super::Client;
-use crate::types::events::{Event, OfflineSyncCompleted};
+use crate::types::events::{Event, OfflineSyncCompleted, OfflineSyncInterrupted};
 use wacore::send::PrimaryDeviceRejected;
 
 /// Waiter side of an in-flight ensure: it never receives a value, only the
@@ -410,6 +410,51 @@ impl Client {
         ));
     }
 
+    /// Report a drain that ended before its `<ib><offline>` end marker.
+    ///
+    /// Called from the connection-state resets, which are the only places a
+    /// resume can end without the finisher running. Both flags are consumed,
+    /// so the pair of resets around one teardown emits at most one event, and
+    /// a drain that already completed emits none. Nothing is retained past
+    /// this point: the numbers are read out of the same per-connection state
+    /// the reset is about to clear, which is what keeps this from becoming
+    /// another flag that outlives its connection.
+    pub(crate) fn abandon_offline_sync_if_interrupted(&self) {
+        // `active` covers the window before the first batch request is armed;
+        // `armed` covers the one after the last stanza cleared `active` but
+        // before the end marker arrived. Neither is set once the finisher has
+        // published completion.
+        let was_active = self
+            .offline_sync_metrics
+            .active
+            .swap(false, Ordering::AcqRel);
+        let was_armed = self.offline_batch.take_armed();
+        if (!was_active && !was_armed) || self.offline_sync_completed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let total = self
+            .offline_sync_metrics
+            .total_messages
+            .load(Ordering::Acquire);
+        let delivered = self
+            .offline_sync_metrics
+            .processed_messages
+            .load(Ordering::Acquire);
+        log::warn!(
+            target: "Client/OfflineSync",
+            "Offline resume interrupted at {} of {} item(s); the undelivered backlog was never acked and the server redelivers it",
+            delivered,
+            total,
+        );
+        self.core.event_bus.dispatch(Event::OfflineSyncInterrupted(
+            OfflineSyncInterrupted::builder()
+                .total(i32::try_from(total).unwrap_or(i32::MAX))
+                .delivered(i32::try_from(delivered).unwrap_or(i32::MAX))
+                .build(),
+        ));
+    }
+
     /// Wait for offline message delivery to complete (with timeout).
     pub(crate) async fn wait_for_offline_delivery_end(&self) {
         self.wait_for_offline_delivery_end_with_timeout(Self::DEFAULT_OFFLINE_SYNC_TIMEOUT)
@@ -496,11 +541,25 @@ impl Client {
         self.history_sync_activity.begin(payload_bytes)
     }
 
+    /// Wait until this connection's offline drain and its history-sync work
+    /// have both settled.
+    ///
+    /// Scoped to the connection it is called on: if that connection ends first
+    /// this returns an error, because neither half of the wait can be answered
+    /// truthfully afterwards. `HistorySyncActivity::reset()` runs on every
+    /// teardown and zeroes the task count while notifying every listener, so a
+    /// waiter that only looked at the count would read the teardown's zero as
+    /// "all tasks finished" and report a sync that never happened.
     pub async fn wait_for_startup_sync(&self, timeout: Duration) -> Result<()> {
         use anyhow::anyhow;
         use wacore::time::Instant;
 
         let deadline = Instant::now() + timeout;
+        let wait_generation = self.connection_generation.load(Ordering::Acquire);
+        let connection_ended = || {
+            self.connection_generation.load(Ordering::Acquire) != wait_generation
+                || self.expected_disconnect.load(Ordering::Relaxed)
+        };
 
         // Register the notified future *before* checking state to avoid missing
         // a notify_waiters() that fires between the check and the await.
@@ -510,11 +569,23 @@ impl Client {
             wacore::runtime::timeout(&*self.runtime, remaining, offline_fut)
                 .await
                 .map_err(|_| anyhow!("Timeout waiting for offline sync completion"))?;
+            if connection_ended() {
+                return Err(anyhow!("Connection ended before offline sync completed"));
+            }
         }
 
         loop {
             let history_fut = self.history_sync_activity.listen();
-            if self.history_sync_activity.tasks() == 0 {
+            let idle = self.history_sync_activity.tasks() == 0;
+            // Read the generation *after* the count: teardown bumps it before
+            // `reset()` zeroes the count, so this ordering is what tells a
+            // genuine idle from the one teardown manufactures.
+            if connection_ended() {
+                return Err(anyhow!(
+                    "Connection ended before history sync tasks became idle"
+                ));
+            }
+            if idle {
                 return Ok(());
             }
 

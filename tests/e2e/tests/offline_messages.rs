@@ -139,3 +139,53 @@ async fn test_server_accepts_messages_for_offline_recipient() -> anyhow::Result<
 
     Ok(())
 }
+
+/// An offline drain always ends with a terminal event, even when the
+/// connection goes away in the middle of it (issue #1377).
+///
+/// The first e2e test to drop a connection with an operation still in flight.
+/// It does not try to win the race — a drain this small often finishes first,
+/// and then the terminal event is the completion. What it locks is that the
+/// resume never ends in silence, which is exactly what it used to do whenever
+/// the reconnect landed first.
+#[tokio::test]
+async fn test_offline_drain_interrupted_by_reconnect_still_signals() -> anyhow::Result<()> {
+    use wacore::types::events::Event;
+
+    let client_a = TestClient::connect("e2e_offline_interrupt_a").await?;
+    let mut client_b = TestClient::connect("e2e_offline_interrupt_b").await?;
+
+    let jid_b = client_b.jid().await;
+    client_b.go_offline().await?;
+
+    for i in 1..=5 {
+        client_a
+            .client
+            .send_message(jid_b.clone(), text_msg(&format!("backlog {i}")))
+            .await?;
+    }
+
+    client_b.come_back_online();
+    client_b
+        .wait_for_event(30, |e| matches!(e, Event::OfflineSyncPreview(_)))
+        .await?;
+    info!("Resume armed; tearing the connection down under it");
+
+    client_b.client.reconnect().await;
+    client_b.wait_for_disconnected(5).await?;
+
+    let terminal = client_b
+        .wait_for_event(30, |e| {
+            matches!(
+                e,
+                Event::OfflineSyncCompleted(_) | Event::OfflineSyncInterrupted(_)
+            )
+        })
+        .await?;
+    info!("Resume ended with {terminal:?}");
+
+    client_a.disconnect().await;
+    client_b.disconnect().await;
+
+    Ok(())
+}

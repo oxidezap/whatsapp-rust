@@ -7178,3 +7178,245 @@ async fn reading_reachability_costs_nothing_on_the_reachable_path() {
     });
     assert_eq!(allocations, 0);
 }
+
+// ── Interrupted offline resume (issue #1377) ────────────────────────────────
+
+async fn offline_resume_test_client() -> Arc<Client> {
+    let backend = crate::test_utils::create_test_backend().await;
+    let pm = Arc::new(
+        PersistenceManager::new(backend)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let (client, _rx) = Client::new(
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        pm,
+        Arc::new(crate::transport::mock::MockTransportFactory::new()),
+        Arc::new(MockHttpClient),
+        None,
+    )
+    .await;
+    client
+}
+
+/// Put the client in the state the log in issue #1377 shows: a preview
+/// announced `total`, the resume armed, and `delivered` stanzas arrived.
+async fn arm_offline_drain(client: &Arc<Client>, total: usize, delivered: usize) {
+    client
+        .offline_sync_metrics
+        .total_messages
+        .store(total, Ordering::Release);
+    client
+        .offline_sync_metrics
+        .processed_messages
+        .store(delivered, Ordering::Release);
+    client
+        .offline_sync_metrics
+        .active
+        .store(true, Ordering::Release);
+    // The send fails (no socket) and is logged; the arming that precedes it is
+    // what this helper is after.
+    offline_resume::send_first_batch(Arc::clone(client), total).await;
+}
+
+fn drain_offline_sync_events(
+    rx: &async_channel::Receiver<Arc<Event>>,
+) -> (Vec<(i32, i32)>, Vec<i32>) {
+    let mut interrupted = Vec::new();
+    let mut completed = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match &*event {
+            Event::OfflineSyncInterrupted(e) => {
+                interrupted.push((e.total, e.delivered));
+            }
+            Event::OfflineSyncCompleted(e) => completed.push(e.count),
+            _ => {}
+        }
+    }
+    (interrupted, completed)
+}
+
+/// Regression for issue #1377: a connection that dies mid-drain used to end the
+/// resume in total silence — no completion, no anything — and the consumer had
+/// only the absence of an event to go on.
+#[tokio::test]
+async fn interrupted_offline_resume_reports_a_terminal_event() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    client.cleanup_connection_state().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(
+        interrupted,
+        vec![(711, 5)],
+        "a teardown mid-drain must report exactly one OfflineSyncInterrupted carrying both counts"
+    );
+    assert!(
+        completed.is_empty(),
+        "an interrupted drain must not claim completion, got {completed:?}"
+    );
+}
+
+/// The event is the *end* of one resume, not a per-teardown tick: the reset in
+/// `connect()` runs over the same state and must stay silent.
+#[tokio::test]
+async fn interrupted_offline_resume_reports_once() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    client.cleanup_connection_state().await;
+    client.abandon_offline_sync_if_interrupted();
+    client.abandon_offline_sync_if_interrupted();
+
+    let (interrupted, _) = drain_offline_sync_events(&rx);
+    assert_eq!(interrupted.len(), 1, "got {interrupted:?}");
+}
+
+/// The happy path is untouched: a drain that reaches its end marker completes
+/// once with its count, and the teardown that follows adds nothing.
+#[tokio::test]
+async fn completed_offline_resume_is_not_reported_as_interrupted() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 711).await;
+    client.complete_offline_sync(711).await;
+    client.wait_for_offline_delivery_end().await;
+    assert!(client.offline_sync_completed.load(Ordering::Acquire));
+
+    client.cleanup_connection_state().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(
+        completed,
+        vec![711],
+        "completion fires once, with its count"
+    );
+    assert!(
+        interrupted.is_empty(),
+        "a completed drain is never interrupted, got {interrupted:?}"
+    );
+}
+
+/// WA Web's `ShiftTimer`: a drain the server stops feeding on a live
+/// connection is completed by the client rather than left open.
+#[tokio::test]
+async fn offline_resume_inactivity_timeout_completes_the_drain() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    let generation = client.connection_generation.load(Ordering::Acquire);
+    offline_resume::spawn_inactivity_watchdog(
+        Arc::clone(&client),
+        generation,
+        Duration::from_millis(30),
+    );
+
+    let event = wait_for_offline_completion(&rx).await;
+    assert_eq!(
+        event, 5,
+        "the timeout completes at the count actually processed"
+    );
+}
+
+/// The other direction: progress shifts the deadline, so a drain that keeps
+/// arriving is never completed behind the server's back.
+#[tokio::test]
+async fn offline_resume_inactivity_timer_is_rearmed_by_progress() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    let generation = client.connection_generation.load(Ordering::Acquire);
+    let timeout = Duration::from_millis(30);
+    offline_resume::spawn_inactivity_watchdog(Arc::clone(&client), generation, timeout);
+
+    // Ten ticks of traffic spanning several timeout windows. The watchdog may
+    // observe up to two windows of silence before firing, so this covers it.
+    for _ in 0..10 {
+        client.offline_batch.note_stanza_activity();
+        tokio::time::sleep(timeout / 2).await;
+        assert!(
+            !client.offline_sync_completed.load(Ordering::Acquire),
+            "a drain that keeps making progress must not be completed by the timer"
+        );
+    }
+
+    // Traffic stops: the same timer that stayed quiet now ends the drain.
+    let count = wait_for_offline_completion(&rx).await;
+    assert_eq!(count, 5);
+}
+
+/// Poll the event stream for the completion event. Bounded by the test
+/// harness's own timeout rather than a sleep long enough to "probably" cover it.
+async fn wait_for_offline_completion(rx: &async_channel::Receiver<Arc<Event>>) -> i32 {
+    loop {
+        let event = rx.recv().await.expect("event bus stays open");
+        if let Event::OfflineSyncCompleted(e) = &*event {
+            return e.count;
+        }
+    }
+}
+
+/// Regression sibling of #1377: `HistorySyncActivity::reset()` runs on every
+/// teardown, zeroing the task count and notifying every listener, so a waiter
+/// that only read the count reported a history sync that never finished.
+#[tokio::test]
+async fn wait_for_startup_sync_fails_when_the_connection_ends_mid_history_sync() {
+    let client = offline_resume_test_client().await;
+
+    client.offline_sync_completed.store(true, Ordering::Release);
+    let _tracker = client.begin_history_sync_task(4096);
+    assert_eq!(client.history_sync_activity.tasks(), 1);
+
+    let waiter = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.wait_for_startup_sync(Duration::from_secs(5)).await }
+    });
+    crate::test_utils::wait_for_notifier_listeners(client.history_sync_activity.idle_notifier(), 1)
+        .await;
+
+    // Exactly what `cleanup_connection_state` does, in that order.
+    client.connection_generation.fetch_add(1, Ordering::SeqCst);
+    client.history_sync_activity.reset();
+
+    let result = waiter.await.expect("waiter task must not panic");
+    assert!(
+        result.is_err(),
+        "a teardown's zeroed task count is not a finished history sync"
+    );
+}
+
+/// The same waiter still succeeds when the tasks genuinely drain.
+#[tokio::test]
+async fn wait_for_startup_sync_succeeds_when_history_tasks_finish() {
+    let client = offline_resume_test_client().await;
+
+    client.offline_sync_completed.store(true, Ordering::Release);
+    let tracker = client.begin_history_sync_task(4096);
+    drop(tracker);
+
+    client
+        .wait_for_startup_sync(Duration::from_secs(5))
+        .await
+        .expect("an idle activity tracker is a completed startup sync");
+}

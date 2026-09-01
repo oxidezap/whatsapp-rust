@@ -67,6 +67,11 @@ impl HistorySyncActivity {
         self.idle_notifier.listen()
     }
 
+    #[cfg(test)]
+    pub(crate) fn idle_notifier(&self) -> &event_listener::Event {
+        &self.idle_notifier
+    }
+
     pub(crate) fn tasks(&self) -> usize {
         self.state_guard().tasks
     }

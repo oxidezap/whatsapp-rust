@@ -1051,6 +1051,10 @@ impl Client {
         // refuse the login. `run` already clears it before each attempt; a
         // caller driving connections itself has nowhere else to learn of it.
         self.expected_disconnect.store(false, Ordering::Relaxed);
+        // Runs before the flags it reads are cleared below. Teardown normally
+        // reported the interruption already and this is a no-op; it covers the
+        // paths that reach a new attempt without one.
+        self.abandon_offline_sync_if_interrupted();
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
             .store(false, Ordering::Relaxed);
@@ -1844,6 +1848,7 @@ impl Client {
         self.stats.reset_connection_activity();
         self.pending_device_sync.clear();
         // Reset offline sync state for next connection
+        self.abandon_offline_sync_if_interrupted();
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.offline_sync_finish_started
             .store(false, Ordering::Relaxed);
