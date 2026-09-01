@@ -1,11 +1,65 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
+# Dependency updates arrive as a few batched pull requests, not one per crate.
+# Configuration reference:
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
 
 version: 2
 updates:
-  - package-ecosystem: "cargo" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  # One directory covers the whole workspace: the cargo updater reads the root
+  # Cargo.toml's `members` and resolves against the single shared Cargo.lock, so
+  # every crate under wacore/, storages/, transports/, plugins/, http_clients/,
+  # examples/ and tools/ is already in scope from here.
+  - package-ecosystem: cargo
+    directory: /
     schedule:
-      interval: "weekly"
+      interval: weekly
+      day: monday
+    # Group PRs, not individual bumps — 5 is headroom for the two groups below
+    # plus anything Dependabot has to split out (a security advisory opens its
+    # own PR regardless of grouping).
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      prefix-development: chore
+      include: scope
+    groups:
+      # The routine weekly batch: one PR, one CI matrix run, one merge.
+      cargo:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      # Majors ride in their own PR so a breaking bump that needs code changes
+      # never holds the routine batch hostage. They stay grouped rather than
+      # one-per-crate because most of this tree is 0.x, where Dependabot counts
+      # 0.24 -> 0.25 as a *minor* update even though Cargo treats it as
+      # breaking; splitting on the semver position alone would not buy the
+      # isolation it looks like it buys, so the split is only about keeping the
+      # rare loud PR separate from the quiet one.
+      cargo-major:
+        patterns:
+          - "*"
+        update-types:
+          - major
+
+  # Not previously configured, and the workflows show it: actions/cache is
+  # pinned at both v4 and v5, upload-artifact at v4, v7 and a bare SHA. One
+  # weekly PR keeps the matrix consistent. SHA pins are updated in place, with
+  # the version carried in a trailing comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # No docker entry: the Dockerfile builds `FROM rust:alpine` and `FROM
+  # scratch`, neither of which carries a version for the updater to bump. Add
+  # one here the day a base image gets pinned to a digest or a tagged release.
