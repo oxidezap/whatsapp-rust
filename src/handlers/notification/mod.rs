@@ -511,7 +511,7 @@ mod tests {
     #[tokio::test]
     async fn companion_reg_refresh_waits_for_a_pending_pair_success() {
         use wacore::libsignal::protocol::KeyPair;
-        use wacore::pair_code::{PairCodeState, PairCodeUtils};
+        use wacore::pair_code::PairCodeState;
 
         let client = create_test_client().await;
         let expired = wacore::time::Instant::ZERO;
