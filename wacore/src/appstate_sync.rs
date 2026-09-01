@@ -212,6 +212,20 @@ impl AppStateProcessor {
     /// unrelated trigger.
     const RECOVERY_REQUEST_TTL: core::time::Duration = core::time::Duration::from_secs(120);
 
+    /// How long a request that is *being answered* survives instead.
+    ///
+    /// The window above is sized for a phone that never replied. Once a reply
+    /// has been taken up, replacing the request would strand the handler holding
+    /// it: it takes by id at the end and would find nothing, dropping a decoded
+    /// recovery for a collection that is stuck. An answer can legitimately take
+    /// far longer than the ask's own window -- the key repair and then the
+    /// collection reservation, which waits up to 450 seconds on its own.
+    ///
+    /// Still an upper bound rather than none: a task that dies without ending
+    /// its claim would otherwise keep the collection from ever being asked
+    /// about again.
+    const RECOVERY_ANSWER_TTL: core::time::Duration = core::time::Duration::from_secs(900);
+
     /// Records that the primary is being asked for this collection, answering
     /// whether the request is a new one.
     ///
@@ -220,7 +234,12 @@ impl AppStateProcessor {
     pub async fn mark_recovery_requested(&self, collection: &str) -> bool {
         let mut outstanding = self.recovery_requested.lock().await;
         if let Some(request) = outstanding.get(collection)
-            && request.asked_at.elapsed() < Self::RECOVERY_REQUEST_TTL
+            && request.asked_at.elapsed()
+                < if request.answering {
+                    Self::RECOVERY_ANSWER_TTL
+                } else {
+                    Self::RECOVERY_REQUEST_TTL
+                }
         {
             return false;
         }
@@ -491,6 +510,18 @@ impl AppStateProcessor {
                 let action = record.value.into_option().ok_or_else(|| {
                     anyhow!("recovery record {i} of {owned_name} carries no value")
                 })?;
+                // The payload itself, not just the envelope around it. A record
+                // whose `SyncActionData` omits its value produces a mutation
+                // with nothing in it, and an index-specific dispatcher then
+                // claims the index and emits no event -- while the MAC and the
+                // version are committed, so the next sync starts past it and the
+                // update is gone. The snapshot path does not count a value-less
+                // record as part of the collection either.
+                if action.value.is_unset() {
+                    return Err(anyhow!(
+                        "recovery record {i} of {owned_name} carries no action value"
+                    ));
+                }
                 let key_id = record.key_id.ok_or_else(|| {
                     anyhow!("recovery record {i} of {owned_name} carries no key id")
                 })?;
