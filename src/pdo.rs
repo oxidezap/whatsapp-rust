@@ -523,6 +523,19 @@ impl Client {
         {
             self.handle_syncd_snapshot_recovery_response(recovery, request_id)
                 .await;
+        } else if let Some(name) = self
+            .get_app_state_processor()
+            .take_recovery_request_by_id(request_id)
+            .await
+        {
+            // A response under this id carrying no recovery result at all --
+            // an empty list, or only somebody else's result. It is still the
+            // answer to the ask that id was made about, so it spends it:
+            // leaving the request would suppress every retry for the rest of
+            // the window over a question already answered, badly.
+            warn!(
+                "Snapshot recovery response for {name} carries no result; it may be asked for again"
+            );
         }
     }
 

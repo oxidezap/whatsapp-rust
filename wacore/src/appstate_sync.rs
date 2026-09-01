@@ -221,6 +221,11 @@ impl AppStateProcessor {
     /// far longer than the ask's own window -- the key repair and then the
     /// collection reservation, which waits up to 450 seconds on its own.
     ///
+    /// Measured from the claim, not from the ask: expiry is lazy, so a phone
+    /// that answers long after the window closed still claims successfully, and
+    /// a ceiling counted from `asked_at` would already be spent the moment the
+    /// handler took the reply up.
+    ///
     /// Still an upper bound rather than none: a task that dies without ending
     /// its claim would otherwise keep the collection from ever being asked
     /// about again.
@@ -292,6 +297,10 @@ impl AppStateProcessor {
             return None;
         }
         request.answering = true;
+        // The clock restarts here, because from here the entry is protecting a
+        // handler rather than recording an unanswered ask -- and a reply can
+        // arrive long after the ask's own window closed.
+        request.asked_at = crate::time::Instant::now();
         Some(name.clone())
     }
 
