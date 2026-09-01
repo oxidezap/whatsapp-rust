@@ -62,7 +62,8 @@ pub use chatstate::{ChatStateError, ChatStateType, Chatstate};
 pub use comments::Comments;
 
 pub use contacts::{
-    ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo, UsyncSubprotocolError,
+    ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, USERNAME_MAX_LENGTH,
+    USERNAME_MIN_LENGTH, UserInfo, UsernameLookup, UsernameLookupUser, UsyncSubprotocolError,
     VerifiedName,
 };
 
@@ -88,7 +89,7 @@ pub use message_edit::{EncryptedEdit, MessageEditError, SecretEncKind, SecretEnc
 
 pub use mex::{
     CappingMvStatus, CappingOteStatus, CappingStatus, Mex, MexError, MexErrorExtensions,
-    MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, ReachoutTimelock,
+    MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, OwnUsername, ReachoutTimelock,
 };
 
 pub use newsletter::{

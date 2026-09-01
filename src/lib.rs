@@ -235,7 +235,7 @@ pub use features::{
     MexRequest, MexResponse, NackReason, NewChatMessageCapping, Newsletter, NewsletterAdminInfo,
     NewsletterAdminProfile, NewsletterError, NewsletterFollower, NewsletterMessage,
     NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
-    NewsletterState, NewsletterVerification, Order, OrderPriceDetails, OrderProduct,
+    NewsletterState, NewsletterVerification, Order, OrderPriceDetails, OrderProduct, OwnUsername,
     ParticipantChangeResponse, ParticipantType, PictureType, PollError, PollOptionResult,
     PollVoteCiphertext, Polls, Presence, PresenceError, PresenceStatus, PreviousDescription, Price,
     Product, ProductAvailability, ProductImage, ProductVideo, Profile, ProfileError,
@@ -244,8 +244,9 @@ pub use features::{
     SecretEncKind, SecretEncrypted, SetProfilePictureResponse, Signal, SignalError,
     SignalSessionInfo, SignalSessionMigration, StanzaRejection, StanzaResponseError, Status,
     StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken, TcTokenError,
-    UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError, VariantProperty, VerifiedName,
-    group_type, message_key, message_range,
+    USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UnlinkSubgroupsResult, UserInfo, UsernameLookup,
+    UsernameLookupUser, UsyncSubprotocolError, VariantProperty, VerifiedName, group_type,
+    message_key, message_range,
 };
 
 pub mod bot;

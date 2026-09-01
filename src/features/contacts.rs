@@ -10,12 +10,18 @@ use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType};
-use wacore::iq::usync::{IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec};
+use wacore::iq::usync::{
+    IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec, UsernameLookupError,
+    UsernameLookupSpec,
+};
 use wacore_binary::{Jid, JidExt};
 
 // Re-export types from wacore
 pub use wacore::iq::contacts::ProfilePicture;
-pub use wacore::iq::usync::{IsOnWhatsAppResult, UserInfo, UsyncSubprotocolError};
+pub use wacore::iq::usync::{
+    IsOnWhatsAppResult, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo, UsernameLookup,
+    UsernameLookupUser, UsyncSubprotocolError,
+};
 pub use wacore::stanza::business::VerifiedName;
 
 /// Error returned by contact-information operations (existence checks,
@@ -29,6 +35,9 @@ pub enum ContactError {
     /// An input JID is not supported for this query (only PN and LID are).
     #[error("unsupported contact JID: {0}")]
     InvalidJid(String),
+    /// The username lookup could not be built from the given handle.
+    #[error(transparent)]
+    Username(#[from] UsernameLookupError),
 }
 
 fn ensure_is_on_whatsapp_jids_supported(jids: &[Jid]) -> Result<(), ContactError> {
@@ -58,6 +67,13 @@ fn reverse_lid_pair(r: &IsOnWhatsAppResult) -> Option<(&Jid, Option<&Jid>)> {
     } else {
         None
     }
+}
+
+/// WhatsApp Web renders a username as `@handle` but never sends the `@`
+/// (`WAWebUsernameTypes.asUsername` strips one and logs it), so accept the
+/// display form callers will have copied out of a chat.
+fn display_to_bare_username(username: &str) -> &str {
+    username.strip_prefix('@').unwrap_or(username)
 }
 
 /// UserInfo entry -> (queried JID, LID mapping).
@@ -303,6 +319,34 @@ impl<'a> Contacts<'a> {
             .await;
         Ok(info)
     }
+
+    /// Resolve a Meta username to the account behind it.
+    ///
+    /// **Experimental.** The request matches WhatsApp Web's
+    /// `WAWebQueryExistsJob.queryUsernameExists` byte for byte, but no capture
+    /// of a server answering it backs this implementation, so a server that
+    /// rejects the query is not necessarily a bug here.
+    ///
+    /// `username` is the bare handle; a leading `@` is display-only and is
+    /// stripped. `username_key` is the account's numeric username key, which
+    /// some accounts require before the server discloses an identity at all
+    /// ([`UsernameLookup::KeyRequired`]).
+    pub async fn find_by_username(
+        &self,
+        username: &str,
+        username_key: Option<&str>,
+    ) -> Result<UsernameLookup, ContactError> {
+        let sid = self.client.generate_request_id();
+        let spec = UsernameLookupSpec::new(display_to_bare_username(username), username_key, sid)?;
+        let lookup = self.client.execute(spec).await?;
+
+        if let UsernameLookup::Found(user) = &lookup
+            && let Some(pn_jid) = &user.pn_jid
+        {
+            self.persist_lid_mappings([(pn_jid, Some(&user.jid))]).await;
+        }
+        Ok(lookup)
+    }
 }
 
 impl Client {
@@ -394,5 +438,25 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ContactError::Iq(IqError::NotConnected)));
+    }
+
+    #[test]
+    fn username_lookup_accepts_the_display_form() {
+        assert_eq!(
+            display_to_bare_username("@example.handle"),
+            "example.handle"
+        );
+        assert_eq!(display_to_bare_username("example.handle"), "example.handle");
+    }
+
+    #[test]
+    fn username_lookup_rejects_a_handle_the_server_would_not_take() {
+        let error = UsernameLookupSpec::new(display_to_bare_username("@ab"), None, "sid-1")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(
+            ContactError::from(error),
+            ContactError::Username(_)
+        ));
     }
 }

@@ -8,7 +8,9 @@ use serde::Serialize;
 use thiserror::Error;
 use wacore::WireEnum;
 use wacore::iq::mex::MexQuerySpec;
-use wacore::iq::mex_operations::{fetch_new_chat_message_capping_info, fetch_reachout_timelock};
+use wacore::iq::mex_operations::{
+    fetch_new_chat_message_capping_info, fetch_reachout_timelock, get_username,
+};
 use wacore_binary::jid::JidError;
 
 // Re-export types from wacore
@@ -208,6 +210,22 @@ impl NewChatMessageCapping {
     }
 }
 
+/// This account's own Meta username, as MEX reports it.
+///
+/// Every field is optional because the server omits the ones that do not apply;
+/// an account that never set a username answers 404, which surfaces as `None`
+/// from [`Mex::get_username`] rather than as an error.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct OwnUsername {
+    /// The handle, without the display-only `@` prefix.
+    pub username: Option<String>,
+    /// `ACTIVE` or `RESERVED`.
+    pub state: Option<String>,
+    /// The numeric username key that guards lookups of this account by handle.
+    pub key: Option<String>,
+}
+
 /// Feature handle for MEX GraphQL operations.
 pub struct Mex<'a> {
     client: &'a Client,
@@ -262,6 +280,21 @@ impl<'a> Mex<'a> {
         decode_new_chat_message_capping(response.data)
     }
 
+    /// Read this account's own username, its state, and its username key.
+    ///
+    /// `None` means no username is set: WhatsApp Web reads the same 404 that
+    /// way. Only reads are exposed; setting a username or its key changes the
+    /// account's identity in a way the server does not undo, so those two
+    /// persisted operations stay unwrapped.
+    pub async fn get_username(&self) -> Result<Option<OwnUsername>, MexError> {
+        let response = match self.query(mex_request!(get_username {})).await {
+            Ok(response) => response,
+            Err(MexError::Request(IqError::ServerError { code: 404, .. })) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        decode_own_username(response.data)
+    }
+
     #[inline]
     async fn execute_request<V: Serialize>(
         &self,
@@ -301,6 +334,23 @@ fn decode_reachout_timelock(data: Option<serde_json::Value>) -> Result<ReachoutT
         .ok_or_else(|| {
             MexError::PayloadParsing("reachout timelock response missing account state".into())
         })
+}
+
+fn decode_own_username(data: Option<serde_json::Value>) -> Result<Option<OwnUsername>, MexError> {
+    let data =
+        data.ok_or_else(|| MexError::PayloadParsing("username response missing data".into()))?;
+    let response: get_username::Response = serde_json::from_value(data)?;
+    let Some(info) = response
+        .xwa2_username_get
+        .and_then(|username_get| username_get.username_info)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(OwnUsername {
+        username: info.username,
+        state: info.state,
+        key: info.pin,
+    }))
 }
 
 /// Read a GraphQL scalar that the schema types as a string but the server has
@@ -713,5 +763,36 @@ mod tests {
         let src = std::error::Error::source(&me).expect("source preserved");
         let inner = src.downcast_ref::<IqError>().expect("downcasts to IqError");
         assert!(matches!(inner, IqError::ServerError { code: 404, .. }));
+    }
+
+    #[test]
+    fn own_username_decodes_the_username_state_and_key() {
+        let decoded = decode_own_username(Some(json!({
+            "xwa2_username_get": {
+                "username_info": {
+                    "username": "example.handle",
+                    "state": "ACTIVE",
+                    "pin": "1234"
+                }
+            }
+        })))
+        .expect("decode")
+        .expect("username info");
+
+        assert_eq!(decoded.username.as_deref(), Some("example.handle"));
+        assert_eq!(decoded.state.as_deref(), Some("ACTIVE"));
+        assert_eq!(decoded.key.as_deref(), Some("1234"));
+    }
+
+    #[test]
+    fn own_username_reads_an_account_without_one_as_absent() {
+        assert_eq!(
+            decode_own_username(Some(json!({ "xwa2_username_get": {} }))).expect("decode"),
+            None
+        );
+        assert!(matches!(
+            decode_own_username(None),
+            Err(MexError::PayloadParsing(_))
+        ));
     }
 }
