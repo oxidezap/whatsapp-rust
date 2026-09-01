@@ -1139,10 +1139,9 @@ mod tests {
         }
     }
 
-    /// `updates` is a tri-state: an absent key means "leave alone" and a null
-    /// would clear the field. Serializing `None` as null here would wipe a
-    /// channel's name and description on every picture change, so this pins the
-    /// omission that the `skip_serializing_if` on the nested types provides.
+    /// Pins the omission that makes `updates` a tri-state. Dropping
+    /// `skip_serializing_if` from the nested types would send `name` and
+    /// `description` as nulls, which clear them: see `picture_update_variables`.
     #[test]
     fn a_picture_update_does_not_touch_the_name_or_description() {
         for jpeg in [Some(&b"\xff\xd8\xff"[..]), None] {
@@ -1155,8 +1154,8 @@ mod tests {
             assert!(updates.get("settings").is_none(), "{updates}");
             assert!(updates["picture"].is_string(), "{updates}");
         }
-        // Clearing is an empty string, not a null: the server collapses null to
-        // "no change" and the picture would survive.
+        // Clearing needs an explicit empty string, because an omitted key means
+        // "leave alone" and the old picture would survive.
         let cleared = serde_json::to_value(picture_update_variables(&newsletter_jid(), None))
             .expect("serialize");
         assert_eq!(cleared["updates"]["picture"], json!(""));

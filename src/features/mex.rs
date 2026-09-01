@@ -80,7 +80,9 @@ impl<V: Serialize> MexRequest<V> {
     /// a bare `400 Bad Request`, so serializing and looking is the only way to
     /// see the omission before it reaches the wire. A non-empty result is not
     /// automatically wrong: WhatsApp Web omits an optional variable it has no
-    /// value for, and this reports that the same way.
+    /// value for, and this reports that the same way. That is also why the send
+    /// path does not check it: an assert here would fire on `fetch_all_subgroups`,
+    /// which is correct precisely because it omits one. Tests know the wanted set.
     pub fn missing_variables(&self) -> Result<Vec<&'static str>, serde_json::Error> {
         let value = serde_json::to_value(&self.variables)?;
         let Some(object) = value.as_object() else {
