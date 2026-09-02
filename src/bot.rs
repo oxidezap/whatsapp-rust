@@ -2331,8 +2331,8 @@ mod tests {
         let ephemeral = wacore::types::events::InboundMessage::builder()
             .message(Arc::new(wa::Message::default()))
             .info(Arc::new(react_info(
-                "15551230000@s.whatsapp.net",
-                "15551230000@s.whatsapp.net",
+                "12025550100@s.whatsapp.net",
+                "12025550100@s.whatsapp.net",
                 "MSGID01",
                 false,
             )))

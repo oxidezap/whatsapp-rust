@@ -627,8 +627,9 @@ impl Client {
             let (agg_msg_id, agg_key, users) =
                 wacore::stanza::receipt::parse_participants(part_node);
             // The event's `message_ids` are owned `MessageId`s, so the borrowed
-            // id is copied into one (inline, for an ordinary 22-character id)
-            // once here instead of cloning both candidates first.
+            // id is copied into one (inline on 64-bit targets for an ordinary
+            // 22-character id) once here instead of cloning both candidates
+            // first.
             let fan_out_id: wacore_binary::MessageId = agg_msg_id
                 .as_deref()
                 .or(agg_key.as_deref())
