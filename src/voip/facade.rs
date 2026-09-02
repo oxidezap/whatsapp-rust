@@ -4134,6 +4134,10 @@ impl CallHandle {
     /// Best-effort and fire-and-forget, like the media it is about, and
     /// throttled downstream -- so calling on every dropped unit is the intended
     /// usage rather than an abuse.
+    ///
+    /// **Does nothing in a group call**, where inbound video does not come
+    /// through the plane this reaches; see `CallEngine::request_peer_keyframe`
+    /// for why, and for what routing one would take.
     pub fn request_peer_keyframe(&self) {
         self.video.send_control(VideoControl::RequestPeerKeyframe);
     }

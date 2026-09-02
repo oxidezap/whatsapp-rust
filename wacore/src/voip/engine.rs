@@ -2037,6 +2037,14 @@ impl CallEngine {
     /// video plane, a plane that has authenticated no inbound stream yet -- there
     /// is no picture to have lost -- and a request made too soon after the last
     /// (the throttle, whose reasoning is with the interval it is measured in).
+    ///
+    /// **A group call is always `false`.** Group video is reassembled through
+    /// the participant registry rather than this plane, so the pipeline asked
+    /// here never learns an inbound SSRC and there is nothing to address. That
+    /// is a gap, not a decision that group video needs no recovery: a group PLI
+    /// has to name *which* participant's stream was lost, and routing one is
+    /// its own change. Stated rather than left silent, because the caller
+    /// cannot tell this apart from a throttled request.
     pub fn request_peer_keyframe(&mut self, now: Millis) -> bool {
         let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) else {
             return false;
@@ -2097,9 +2105,23 @@ impl CallEngine {
         if let Some(v) = m.video.as_mut() {
             // Resuming a plane is a fresh requirement: the peer's decoder lost
             // whatever it had while this one was off or gated.
-            let needs_recovery = !v.active || (v.send_gated && !send_gated);
+            let was_off = !v.active;
+            let needs_recovery = was_off || (v.send_gated && !send_gated);
             v.active = true;
             v.send_gated = send_gated;
+            if was_off {
+                // Inbound decoded nothing while the plane was off, so what the
+                // depacketizer holds belongs to a stream this one cannot
+                // continue -- and its SSRC is what a PLI would name. Sending a
+                // recovery request for a stream the peer has moved on from asks
+                // it to reset something it no longer sends, so the plane comes
+                // back with nothing to address until a packet authenticates.
+                // Only from OFF: a send-gated plane was decoding all along, and
+                // resetting there would discard a stream still in progress. The
+                // send state is untouched either way -- this is reassembly only,
+                // and dropping the SRTP sequence would repeat a keystream.
+                v.pipe.reset_depacketizer();
+            }
             if needs_recovery {
                 v.keyframe_required = true;
                 v.keyframe_announced = false;
@@ -9584,6 +9606,47 @@ mod tests {
         let summary = summarize_rtcp(&plain).unwrap();
         assert!(summary.uses_whatsapp_profile_extension);
         assert!(requests_keyframe(&summary.feedback, peer_video_ssrc));
+    }
+
+    /// A plane coming back on has no inbound stream to complain about: the
+    /// SSRC it held belongs to the session that ended.
+    #[test]
+    fn a_replaced_video_plane_does_not_ask_about_the_previous_stream() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+        let mut peer_video = peer_video_pipe();
+        let video = peer_video
+            .protect_video(&video_au(100))
+            .pop()
+            .expect("one-packet video AU");
+        eng.handle_input(101, Input::RelayPacket(&video));
+        let _ = drain(&mut eng);
+        assert!(eng.request_peer_keyframe(200));
+
+        // Downgrade to audio, then back. The pipeline is deliberately kept --
+        // rebuilding it would repeat an SRTP keystream -- so without the reset
+        // it would still name the stream that just ended.
+        eng.disable_video();
+        assert!(eng.enable_video());
+        assert!(
+            !eng.request_peer_keyframe(10_000),
+            "a plane with no authenticated inbound stream has nothing to ask about"
+        );
+
+        // A packet on the new session restores it.
+        let video = peer_video
+            .protect_video(&video_au(200))
+            .pop()
+            .expect("one-packet video AU");
+        eng.handle_input(10_001, Input::RelayPacket(&video));
+        let _ = drain(&mut eng);
+        assert!(eng.request_peer_keyframe(20_000));
     }
 
     /// A burst of gaps describing one loss costs one request, and the next is
