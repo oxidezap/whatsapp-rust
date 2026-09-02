@@ -497,34 +497,75 @@ pub fn build_compact_rtcp_209(local_ssrc: u32) -> [u8; 8] {
     buf
 }
 
-/// 12-byte Picture Loss Indication (PT 206, FMT=1), RFC 4585 s6.3.1.
+/// The first PLI sequence number a stream sends, and the step between two.
 ///
-/// The receiver's half of the keyframe contract: `requests_keyframe` reads
-/// exactly this shape from the peer to drive our own encoder, and until this
-/// existed there was no way to send one. A PLI carries no FCI -- the two SSRCs
-/// are the whole message -- so a peer that has lost its reference chain gets
-/// told which stream to reset and nothing else.
-pub fn build_picture_loss_indication(sender_ssrc: u32, media_ssrc: u32) -> [u8; 12] {
-    let mut buf = [0u8; 12];
+/// The peer reserves the top two values: `0xFFFF_FFFE` is what its parser
+/// substitutes when a PLI carries no sequence number at all, and it treats that
+/// as "absent" rather than as a number. Stepping over both keeps a real
+/// sequence from ever colliding with the sentinel, which is why the step is
+/// three rather than one where it wraps.
+pub(crate) const PLI_SEQUENCE_FIRST: u32 = 1;
+const PLI_SEQUENCE_RESERVED_FLOOR: u32 = 0xFFFF_FFFE;
+
+/// The number that follows `sequence`, skipping the peer's two reserved values.
+///
+/// WhatsApp's own counter: `n + 1`, or `n + 3` where `n + 1` would land on the
+/// "absent" sentinel or the value above it.
+pub fn next_pli_sequence(sequence: u32) -> u32 {
+    if sequence.wrapping_add(1) < PLI_SEQUENCE_RESERVED_FLOOR {
+        sequence.wrapping_add(1)
+    } else {
+        sequence.wrapping_add(3)
+    }
+}
+
+/// 16-byte Picture Loss Indication (PT 206, FMT=1), carrying a sequence number.
+///
+/// RFC 4585 s6.3.1.2 says a PLI has no FCI and a length field of 2. WhatsApp
+/// ships both shapes and picks between them on a per-stream feature bit: the
+/// 12-byte RFC one, and this one, which appends a monotonic sequence number so
+/// the receiver can tell a retransmitted complaint from a new one. A PLI with
+/// no sequence still sets the peer's keyframe-requested flag, so the short form
+/// is honoured -- but the peer then logs a sender/receiver mismatch and cannot
+/// coalesce, which is the whole point of the field.
+///
+/// `sequence` must never repeat and never decrease for the life of a stream;
+/// advance it with [`next_pli_sequence`]. A counter that resets can be read as
+/// a duplicate and dropped.
+pub fn build_picture_loss_indication(sender_ssrc: u32, media_ssrc: u32, sequence: u32) -> [u8; 16] {
+    let mut buf = [0u8; 16];
     buf[0] = 0x81; // V=2, P=0, FMT=1 (PLI)
     buf[1] = RTCP_PT_PSFB;
     buf[2] = 0;
-    buf[3] = 2; // (2+1)*4 = 12 bytes
+    buf[3] = 3; // (3+1)*4 = 16 bytes
     buf[4..8].copy_from_slice(&sender_ssrc.to_be_bytes());
     buf[8..12].copy_from_slice(&media_ssrc.to_be_bytes());
+    buf[12..16].copy_from_slice(&sequence.to_be_bytes());
     buf
 }
 
 /// A PLI on the native video profile, which sets bit 4 beside the FMT.
 ///
-/// The same bit `build_whatsapp_source_description` sets, and for the same
-/// reason: this is what a WhatsApp peer sends and therefore what one expects
-/// to receive. `summarize_rtcp` strips it back out of the FMT rather than
-/// reading 17 where the RFC says 1, and the parser's own test calls a `0x91`
-/// packet a WhatsApp-profile PLI -- so the shape was already described here
-/// from captures, on the receive side, before anything could send one.
-pub fn build_whatsapp_picture_loss_indication(sender_ssrc: u32, media_ssrc: u32) -> [u8; 12] {
-    let mut packet = build_picture_loss_indication(sender_ssrc, media_ssrc);
+/// Not an extension this code invented to match a capture: the video stream's
+/// RTCP session is configured with a profile byte of 1, and the one header
+/// builder every RTCP packet goes through folds it into the high nibble of
+/// byte 0. That is why the same bit is already on this pipeline's SDES and
+/// sender report -- `build_whatsapp_source_description` and
+/// `build_whatsapp_sender_report_with_sdes` set it, and calls carry -- and it
+/// is why a PLI without it would be the odd one out rather than the safe
+/// choice.
+///
+/// It costs nothing to read: the peer masks the FMT with `& 0x0F`, so bit 4 is
+/// never part of the value it compares. `summarize_rtcp` strips it the same
+/// way. A receiver that follows RFC 4585 to the letter reads FMT 17 and must
+/// discard the packet -- which is the correct trade here, because this
+/// transport carries WhatsApp peers and nothing else.
+pub fn build_whatsapp_picture_loss_indication(
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    sequence: u32,
+) -> [u8; 16] {
+    let mut packet = build_picture_loss_indication(sender_ssrc, media_ssrc, sequence);
     packet[0] |= 0x10;
     packet
 }
@@ -1105,6 +1146,56 @@ mod tests {
         assert!(summary.uses_whatsapp_profile_extension);
         assert_eq!(summary.feedback[0].fmt, 1);
         assert_eq!(summary.referenced_ssrcs, [video]);
+    }
+
+    /// The two builders, byte for byte, and through the parser that reads a
+    /// peer's. The plain one is what a receiver following RFC 4585 to the letter
+    /// accepts; the profile one is what this transport sends, and the two differ
+    /// in one bit.
+    #[test]
+    fn picture_loss_indications_match_the_wire_layout() {
+        let sender = 0x1111_2222u32;
+        let video = 0x5555_6666u32;
+        let sequence = 0x0000_002Au32;
+
+        let plain = build_picture_loss_indication(sender, video, sequence);
+        assert_eq!(&plain[..4], &[0x81, RTCP_PT_PSFB, 0, 3]);
+        assert_eq!(&plain[4..8], &sender.to_be_bytes());
+        assert_eq!(&plain[8..12], &video.to_be_bytes());
+        assert_eq!(&plain[12..16], &sequence.to_be_bytes());
+
+        let profile = build_whatsapp_picture_loss_indication(sender, video, sequence);
+        assert_eq!(profile[0], 0x91);
+        assert_eq!(&profile[1..], &plain[1..]);
+
+        for packet in [plain, profile] {
+            let summary = summarize_rtcp(&packet).expect("a PLI parses as one");
+            assert_eq!(summary.feedback[0].fmt, 1);
+            assert_eq!(summary.feedback[0].media_ssrc, video);
+            assert_eq!(summary.referenced_ssrcs, [video]);
+        }
+        assert!(
+            summarize_rtcp(&build_whatsapp_picture_loss_indication(
+                sender, video, sequence
+            ))
+            .expect("a PLI parses as one")
+            .uses_whatsapp_profile_extension
+        );
+    }
+
+    /// The peer substitutes `0xFFFF_FFFE` for a PLI that carries no sequence and
+    /// treats it as "absent", so a real one must never land on it or on the
+    /// value above it.
+    #[test]
+    fn pli_sequence_numbers_step_over_the_reserved_pair() {
+        assert_eq!(next_pli_sequence(PLI_SEQUENCE_FIRST), 2);
+        assert_eq!(next_pli_sequence(0xFFFF_FFFC), 0xFFFF_FFFD);
+        assert_eq!(next_pli_sequence(0xFFFF_FFFD), 0);
+        let mut sequence = PLI_SEQUENCE_FIRST;
+        for _ in 0..1_000 {
+            sequence = next_pli_sequence(sequence);
+            assert!(sequence < PLI_SEQUENCE_RESERVED_FLOOR);
+        }
     }
 
     #[test]

@@ -36,8 +36,8 @@ use wacore::voip::transport::RelayTransportFactory;
 use wacore::voip::{
     AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection,
     CallEngine, CallEvent, CallPhase, CodecDecisionSource, EncodedAudioFrame, GroupEngineConfig,
-    VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame, VideoUpgradeToken,
-    run_call, video_control_channel,
+    KeyframeUrgency, VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame,
+    VideoUpgradeToken, run_call, video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -4125,21 +4125,31 @@ impl CallHandle {
 
     /// Ask the peer to send a video keyframe, by RTCP PLI.
     ///
-    /// For the consumer of [`VideoSink`], which is the only side that knows its
-    /// decoder can no longer draw: an access unit lost anywhere past this
-    /// library -- a queue that refused it, a decoder that failed and reset --
-    /// leaves every later unit referencing one the decoder does not have, and
-    /// nothing in the stream itself will say so.
-    ///
-    /// Best-effort and fire-and-forget, like the media it is about, and
-    /// throttled downstream -- so calling on every dropped unit is the intended
+    /// For the consumer of [`VideoSink`]: call it whenever your decoder loses or
+    /// discards an access unit, which is a loss nothing else here can see.
+    /// Throttled downstream, so calling on every dropped unit is the intended
     /// usage rather than an abuse.
     ///
-    /// **Does nothing in a group call.** See
-    /// `CallEngine::request_peer_keyframe` for why, and for what routing one
-    /// would take.
+    /// Fire-and-forget: the engine decides whether a request goes out, and the
+    /// outcome is not reported back. **Does nothing in a group call** -- see
+    /// [`wacore::voip::CallEngine::request_peer_keyframe`] for why.
     pub fn request_peer_keyframe(&self) {
-        self.video.send_control(VideoControl::RequestPeerKeyframe);
+        self.video.send_control(VideoControl::RequestPeerKeyframe(
+            KeyframeUrgency::Coalesced,
+        ));
+    }
+
+    /// Ask the peer for a video keyframe now, bypassing the throttle.
+    ///
+    /// For a decoder that has failed and reset rather than one that noticed a
+    /// gap: its reference chain is gone at this instant, so an interval sized
+    /// for coalescing a burst is the wrong thing to wait out. Use
+    /// [`Self::request_peer_keyframe`] for the routine case; a request per lost
+    /// unit on this path would be the flood the throttle exists to prevent.
+    pub fn request_peer_keyframe_now(&self) {
+        self.video.send_control(VideoControl::RequestPeerKeyframe(
+            KeyframeUrgency::Immediate,
+        ));
     }
 
     /// Send the standalone `<video state=1 dec="H264" device_orientation="0">` used after a

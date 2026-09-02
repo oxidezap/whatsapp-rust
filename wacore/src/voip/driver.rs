@@ -24,7 +24,7 @@ use crate::time::Instant;
 use crate::types::group_call::{GROUP_CALL_MAX_PARTICIPANTS, GroupCallUpdate};
 use crate::voip::audio::EncodedAudioFrame;
 use crate::voip::demux::{RelayPacketKind, classify_relay_packet};
-use crate::voip::engine::{self, CallEngine, CallEvent, Input, Output};
+use crate::voip::engine::{self, CallEngine, CallEvent, Input, KeyframeUrgency, Output};
 use crate::voip::group_media::GroupMediaError;
 use crate::voip::h264::VideoFrame;
 use crate::voip::registry::force_send_call_event;
@@ -152,8 +152,8 @@ pub enum VideoControl {
     /// Require the next outbound access unit to be an IDR frame after changing its source role.
     RequireKeyframe,
     /// Ask the PEER for a keyframe, by RTCP PLI: the mirror of `RequireKeyframe`. See
-    /// `CallEngine::request_peer_keyframe`, which decides what becomes of one.
-    RequestPeerKeyframe,
+    /// [`CallEngine::request_peer_keyframe`], which decides what becomes of one.
+    RequestPeerKeyframe(KeyframeUrgency),
     /// The peer's device orientation (0..3, ×90°) from a `<video>` stanza.
     SetOrientation(u8),
     /// One routed group participant's device orientation.
@@ -1125,6 +1125,7 @@ async fn run_call_with_clock_and_wallclock(
         let mut pending_video = Vec::new();
         let mut reconnect_to = None;
         let mut sink_dropped = 0u32;
+        let mut video_sink_dropped = false;
         loop {
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
@@ -1156,8 +1157,14 @@ async fn run_call_with_clock_and_wallclock(
                     }
                 }
                 // Same policy for video: a stalled sink sheds frames, never the drive loop.
+                // Unlike a shed audio frame, a shed access unit leaves every later
+                // one referencing a picture the consumer never got -- and this is
+                // the one such loss the consumer cannot see, so it is asked about
+                // here rather than left to an application that has no way to know.
                 Output::VideoPlayout(frame) => {
-                    let _ = channels.video_out.try_send(frame);
+                    if channels.video_out.try_send(frame).is_err() {
+                        video_sink_dropped = true;
+                    }
                 }
                 Output::Event(ev) => {
                     let keyframe_request = matches!(ev, CallEvent::VideoKeyframeNeeded);
@@ -1203,6 +1210,12 @@ async fn run_call_with_clock_and_wallclock(
         // that is already behind anything per packet.
         if sink_dropped != 0 {
             eng.note_audio_sink_dropped(sink_dropped);
+        }
+        // After the drain, so the request joins an outbox this loop is no longer
+        // walking. Coalesced: a stalled sink sheds a run of units describing one
+        // stall, and the engine's throttle turns that run into one request.
+        if video_sink_dropped {
+            eng.request_peer_keyframe(now_ms(), KeyframeUrgency::Coalesced);
         }
 
         // Only where there is a picture to unblock: a relay reconnect raises the
@@ -1565,8 +1578,8 @@ async fn run_call_with_clock_and_wallclock(
                         drain_video_in = true;
                     }
                     Ok(VideoControl::RequireKeyframe) => eng.require_video_keyframe(),
-                    Ok(VideoControl::RequestPeerKeyframe) => {
-                        eng.request_peer_keyframe(now_ms());
+                    Ok(VideoControl::RequestPeerKeyframe(urgency)) => {
+                        eng.request_peer_keyframe(now_ms(), urgency);
                     }
                     Ok(VideoControl::SetOrientation(o)) => eng.set_peer_video_orientation(o),
                     Ok(VideoControl::SetParticipantOrientation {

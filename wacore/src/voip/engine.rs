@@ -67,13 +67,18 @@ const KEEPALIVE_MS: Millis = 1000;
 const RTCP_MS: Millis = 1500;
 /// Shortest gap between two PLIs asking the peer for a keyframe.
 ///
-/// WhatsApp's own receive path throttles the same request the same way
-/// (`pli_throttle_time_ms` in its VoIP settings), for the reason
-/// [`CallEngine::request_peer_keyframe`] gives: the gaps that prompt a request
-/// arrive in bursts describing one loss, and each answer costs the peer its
-/// largest frame at the moment the path has least room for one. A second is
-/// past any relayed round trip, so a burst coalesces into one request rather
-/// than into one request per lost unit.
+/// WhatsApp throttles the same request, but computes its threshold rather than
+/// fixing it: it derives one from measured RTT and a multiplier, capped by a
+/// server-supplied `pli_throttle_time_ms`, and falls back to a hardcoded second
+/// only where that path is off or there is no RTCP session. This is that
+/// fallback, not the derived value -- we measure no RTT and parse no such
+/// setting -- and a second is the slow end of the range WhatsApp picks from.
+///
+/// Slow is the right direction to err. The gaps that prompt a request arrive in
+/// bursts describing one loss, and each answer costs the peer its largest frame
+/// at the moment the path has least room for one, so a burst has to coalesce
+/// into one request rather than into one per lost unit. A decoder that has
+/// actually failed does not wait it out; see [`KeyframeUrgency::Immediate`].
 const MIN_PEER_KEYFRAME_INTERVAL_MS: Millis = 1000;
 /// Deadline for the relay to ack the allocate. Past this with no success the relay is wedged
 /// (silently dropping the allocate), so surface a terminal timeout instead of keepaliving forever.
@@ -989,14 +994,16 @@ struct VideoPlaneState {
     send_gated: bool,
     /// PLI/FIR means dependent frames only prolong the peer's undecodable jitter-buffer state.
     keyframe_required: bool,
-    /// When the last PLI was sent to the peer, so a burst of gaps describing one
-    /// loss costs one request. See [`CallEngine::request_peer_keyframe`].
+    /// The inbound stream the last PLI named, and when it was sent.
     ///
-    /// Cleared with the stream it describes, by [`Self::forget_inbound_stream`]:
-    /// a throttle is an interval between two complaints about the *same*
-    /// picture, and carrying it across a stream change would spend a new
-    /// stream's first recovery on the previous one's quota.
-    peer_keyframe_asked_at: Option<Millis>,
+    /// Keyed by SSRC rather than kept as a bare timestamp because a throttle is
+    /// an interval between two complaints about the *same* picture, and the
+    /// peer renumbering ends that interval as surely as a rekey does. The plane
+    /// is told about a rekey and about a downgrade, so those could be handled
+    /// by clearing the field -- but a peer changing SSRC mid-call happens inside
+    /// the pipeline, with no call into this state at all, and that is the one
+    /// stream change recovery matters most across.
+    peer_keyframe_asked_at: Option<(u32, Millis)>,
     /// Whether the application has been told about the current requirement.
     ///
     /// Separate from the requirement itself because the two end at different
@@ -1006,6 +1013,23 @@ struct VideoPlaneState {
     /// leave a plane that was born requiring an IDR -- every plane is --
     /// waiting for a request nobody ever made.
     keyframe_announced: bool,
+}
+
+/// Whether a peer-keyframe request may be coalesced with a recent one.
+///
+/// The distinction WhatsApp's own engine draws: its decode-error handler passes
+/// a force flag that skips the throttle outright, because the interval is
+/// measured for bursts of gaps and a decoder that has already failed is not one
+/// of those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeUrgency {
+    /// A gap noticed in the stream. Subject to the throttle, so calling on
+    /// every lost unit costs one request per interval.
+    Coalesced,
+    /// A decoder that has failed and reset. Its reference chain is gone *now*,
+    /// and waiting out an interval sized for coalescing costs the whole gap, so
+    /// this bypasses the throttle.
+    Immediate,
 }
 
 fn requests_keyframe(feedback: &[RtcpFeedback], video_ssrc: u32) -> bool {
@@ -1030,13 +1054,6 @@ fn requests_keyframe(feedback: &[RtcpFeedback], video_ssrc: u32) -> bool {
 
 impl VideoPlaneState {
     /// Forget which inbound stream this plane was reassembling.
-    ///
-    /// Both halves of that go together and neither is useful alone: the
-    /// depacketizer's SSRC is what a PLI names, and the throttle is an
-    /// interval between two complaints about one picture. Kept apart, a plane
-    /// either asks the peer to reset a stream it has moved on from, or spends
-    /// a new stream's first recovery on the previous one's quota -- and
-    /// recovery matters most exactly when a stream has just changed.
     ///
     /// Reassembly and rate state only. The pipeline deliberately outlives a
     /// downgrade so its SRTP send sequence is not reused, and none of that is
@@ -1949,9 +1966,10 @@ impl CallEngine {
         m.recv_peer_lid = answering_peer_lid.to_string();
         if let Some(v) = m.video.as_mut() {
             let rekeyed = v.pipe.rekey_recv(&m.call_key, answering_peer_lid);
-            // `rekey_recv` drops the reassembly; the rate state describes the
-            // same departed stream and goes with it.
-            v.peer_keyframe_asked_at = None;
+            // The inbound stream moves to the answering device, so the plane has
+            // nothing left to complain about; `rekey_recv` has already dropped
+            // the reassembly, and this is idempotent over it.
+            v.forget_inbound_stream();
             return rekeyed;
         }
         true
@@ -2063,25 +2081,21 @@ impl CallEngine {
     ///
     /// Returns whether a request reached the outbox: `false` for a call with no
     /// video plane, a plane that has authenticated no inbound stream yet -- there
-    /// is no picture to have lost -- and a request made too soon after the last
-    /// (the throttle, whose reasoning is with the interval it is measured in).
+    /// is no picture to have lost -- and, for [`KeyframeUrgency::Coalesced`], a
+    /// request made too soon after the last about the same stream.
     ///
-    /// **A group call is always `false`.** Group video is reassembled through
-    /// the participant registry rather than this plane, so the pipeline asked
-    /// here never learns an inbound SSRC and there is nothing to address. That
-    /// is a gap, not a decision that group video needs no recovery: a group PLI
-    /// has to name *which* participant's stream was lost, and routing one is
-    /// its own change. Stated rather than left silent, because the caller
-    /// cannot tell this apart from a throttled request.
-    pub fn request_peer_keyframe(&mut self, now: Millis) -> bool {
-        if self.group.is_some() {
-            // Refused here rather than left to fall out of an unset SSRC below.
-            // A call that authenticated video and *then* promoted to a group
-            // keeps this plane -- `configure_group_at` reads it and does not
-            // clear it -- so its depacketizer still names the direct stream
-            // while `on_rtp` has moved to the registry. Without this, that one
-            // transition would send a PLI for a stream nobody is sending any
-            // more and report success for it.
+    /// **A group call is always `false`.** Group video is routed through the
+    /// participant registry, and a group PLI has to name *which* participant's
+    /// stream was lost -- so it is a different request, not this one aimed
+    /// elsewhere. The per-participant SSRC is on hand; what is not settled is
+    /// whether an SFU-bound PLI travels hop-by-hop rather than end-to-end, which
+    /// this engine has no send path for. Refused explicitly rather than left to
+    /// fall out of an unset SSRC, because promotion breaks that accident: a call
+    /// that authenticated video and *then* received a group update keeps this
+    /// plane, so its depacketizer still names the direct stream while `on_rtp`
+    /// has moved to the registry.
+    pub fn request_peer_keyframe(&mut self, now: Millis, urgency: KeyframeUrgency) -> bool {
+        if self.terminated || self.group.is_some() {
             return false;
         }
         let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) else {
@@ -2090,7 +2104,14 @@ impl CallEngine {
         if !video.active {
             return false;
         }
-        if let Some(asked) = video.peer_keyframe_asked_at
+        // Deliberately not gated on `send_gated`: a plane that is not sending is
+        // still decoding, so it is the one most likely to need this.
+        let Some(inbound) = video.pipe.inbound_ssrc() else {
+            return false;
+        };
+        if urgency == KeyframeUrgency::Coalesced
+            && let Some((stream, asked)) = video.peer_keyframe_asked_at
+            && stream == inbound
             && now.saturating_sub(asked) < MIN_PEER_KEYFRAME_INTERVAL_MS
         {
             return false;
@@ -2098,7 +2119,9 @@ impl CallEngine {
         let Some(pli) = video.pipe.picture_loss_indication() else {
             return false;
         };
-        video.peer_keyframe_asked_at = Some(now);
+        // Stamped on the immediate path too: it starts a fresh interval, so a
+        // burst that follows a decoder reset still coalesces.
+        video.peer_keyframe_asked_at = Some((inbound, now));
         self.outbox.push_back(Output::Transmit(Bytes::from(pli)));
         true
     }
@@ -6310,7 +6333,7 @@ mod tests {
     use crate::types::group_call::{GroupCallDevice, GroupCallParticipant};
     use crate::voip::e2e_srtp::SRTCP_AUTH_TAG_LEN;
     use crate::voip::mlow::MlowEncoder;
-    use crate::voip::rtcp::parse_rtcp_sender_ssrc;
+    use crate::voip::rtcp::{PLI_SEQUENCE_FIRST, next_pli_sequence, parse_rtcp_sender_ssrc};
     use crate::voip::warp::WARP_MI_TAG_LEN;
     use wacore_binary::Server;
 
@@ -9575,12 +9598,64 @@ mod tests {
         assert!(summary.uses_whatsapp_profile_extension);
     }
 
+    /// Bring a 1:1 engine up to the point where the peer's video stream has
+    /// authenticated, so the direct plane has something a PLI can name.
+    fn video_engine_with_inbound_stream() -> (CallEngine, VideoPipeline) {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        // The sender identity a group promotion would derive, so a call built
+        // here can also be promoted without `configure_group_at` refusing to
+        // rotate an allocated sender out from under in-flight media.
+        cfg.ssrc = ssrc::derive_wasm_relay_stream_ssrcs(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.self_lid),
+        )[0];
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+        let allocate = allocate_success(&eng);
+        eng.handle_input(1, Input::RelayPacket(&allocate));
+        let _ = drain(&mut eng);
+        let mut peer_video = peer_video_pipe();
+        let video = peer_video
+            .protect_video(&video_au(100))
+            .pop()
+            .expect("one-packet video AU");
+        eng.handle_input(101, Input::RelayPacket(&video));
+        let _ = drain(&mut eng);
+        (eng, peer_video)
+    }
+
+    /// The one PLI the engine has just queued, decrypted.
+    fn last_peer_keyframe_request(
+        eng: &mut CallEngine,
+        call_key: &[u8],
+        local_ssrc: u32,
+    ) -> Vec<u8> {
+        use crate::voip::e2e_srtp::{derive_srtcp_keys, unprotect_srtcp};
+
+        let (outs, _) = drain(eng);
+        let protected = outs
+            .iter()
+            .find_map(|output| match output {
+                Output::Transmit(packet)
+                    if parse_rtcp_sender_ssrc(packet) == Some(local_ssrc)
+                        && classify_relay_packet(packet) == RelayPacketKind::Rtcp =>
+                {
+                    Some(packet)
+                }
+                _ => None,
+            })
+            .expect("a PLI on the video stream");
+        let transport = derive_srtcp_keys(call_key, SELF_LID).unwrap();
+        let (plain, _) = unprotect_srtcp(&transport, local_ssrc, protected).unwrap();
+        plain
+    }
+
     /// The receive half of the keyframe contract: a PLI naming the peer's
     /// video stream, protected under our own SSRC.
     #[test]
     fn request_peer_keyframe_sends_a_pli_for_the_stream_being_reassembled() {
-        use crate::voip::e2e_srtp::{derive_srtcp_keys, unprotect_srtcp};
-
         let mut cfg = config(true);
         cfg.enable_video = true;
         let call_key = cfg.call_key.clone();
@@ -9599,8 +9674,10 @@ mod tests {
         eng.handle_input(1, Input::RelayPacket(&allocate));
         let _ = drain(&mut eng);
 
-        // Nothing has authenticated yet, so there is no stream to have lost.
-        assert!(!eng.request_peer_keyframe(100));
+        // Nothing has authenticated yet, so there is no stream to have lost --
+        // and a refusal must not spend the quota, which the request at 200
+        // inside the interval then proves.
+        assert!(!eng.request_peer_keyframe(100, KeyframeUrgency::Coalesced));
 
         let mut peer_video = peer_video_pipe();
         let video = peer_video
@@ -9610,27 +9687,15 @@ mod tests {
         eng.handle_input(101, Input::RelayPacket(&video));
         let _ = drain(&mut eng);
 
-        assert!(eng.request_peer_keyframe(200));
-        let (outs, _) = drain(&mut eng);
-        let protected = outs
-            .iter()
-            .find_map(|output| match output {
-                Output::Transmit(packet)
-                    if parse_rtcp_sender_ssrc(packet) == Some(local_video_ssrc)
-                        && classify_relay_packet(packet) == RelayPacketKind::Rtcp =>
-                {
-                    Some(packet)
-                }
-                _ => None,
-            })
-            .expect("a PLI on the video stream");
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+        let plain = last_peer_keyframe_request(&mut eng, &call_key, local_video_ssrc);
 
-        let transport = derive_srtcp_keys(&call_key, SELF_LID).unwrap();
-        let (plain, _) = unprotect_srtcp(&transport, local_video_ssrc, protected).unwrap();
-        // The builder emits the WhatsApp-profile header; see it for why.
-        assert_eq!(&plain[..4], &[0x91, RTCP_PT_PSFB, 0, 2]);
+        // The WhatsApp-profile header and the sequence-carrying length; see the
+        // builders for why each is what it is.
+        assert_eq!(&plain[..4], &[0x91, RTCP_PT_PSFB, 0, 3]);
         assert_eq!(&plain[4..8], &local_video_ssrc.to_be_bytes());
         assert_eq!(&plain[8..12], &peer_video_ssrc.to_be_bytes());
+        assert_eq!(&plain[12..16], &PLI_SEQUENCE_FIRST.to_be_bytes());
 
         // The peer's own parser is the one that has to accept it: what we send
         // has to be what `requests_keyframe` reads.
@@ -9639,11 +9704,35 @@ mod tests {
         assert!(requests_keyframe(&summary.feedback, peer_video_ssrc));
     }
 
+    /// The peer dedupes on the sequence number, so a repeat must never carry one
+    /// it has already answered.
+    #[test]
+    fn consecutive_peer_keyframe_requests_carry_increasing_sequence_numbers() {
+        let cfg = config(true);
+        let call_key = cfg.call_key.clone();
+        let local_video_ssrc = ssrc::derive_video_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.self_lid),
+        );
+        let (mut eng, _peer) = video_engine_with_inbound_stream();
+
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+        let first = last_peer_keyframe_request(&mut eng, &call_key, local_video_ssrc);
+        assert!(eng.request_peer_keyframe(
+            200 + MIN_PEER_KEYFRAME_INTERVAL_MS,
+            KeyframeUrgency::Coalesced
+        ));
+        let second = last_peer_keyframe_request(&mut eng, &call_key, local_video_ssrc);
+
+        let seq_of = |p: &[u8]| u32::from_be_bytes(p[12..16].try_into().unwrap());
+        assert_eq!(seq_of(&first), PLI_SEQUENCE_FIRST);
+        assert_eq!(seq_of(&second), next_pli_sequence(PLI_SEQUENCE_FIRST));
+    }
+
     /// The documented group-call contract, pinned: whatever the plane holds,
-    /// a group call answers `false`. This does not exercise the promotion the
-    /// guard exists for -- inbound here never reached the direct plane, so the
-    /// SSRC is unset and the old code would also have refused. It fixes the
-    /// public behaviour so a later change cannot quietly start answering.
+    /// a group call answers `false`. This one does not exercise the promotion --
+    /// inbound never reached the direct plane here -- which
+    /// `a_call_promoted_to_a_group_stops_asking_about_its_direct_stream` does.
     #[test]
     fn a_group_call_never_asks_the_peer_for_a_keyframe() {
         let mut cfg = config(true);
@@ -9660,81 +9749,149 @@ mod tests {
         eng.start(0, 1_700_000_000_000);
         let _ = drain(&mut eng);
 
-        assert!(!eng.request_peer_keyframe(1_000));
+        assert!(!eng.request_peer_keyframe(1_000, KeyframeUrgency::Coalesced));
         // And not merely once, so a throttle cannot be mistaken for the refusal.
-        assert!(!eng.request_peer_keyframe(1_000_000));
+        assert!(!eng.request_peer_keyframe(1_000_000, KeyframeUrgency::Coalesced));
+        // Nor is it the throttle that the immediate path would bypass.
+        assert!(!eng.request_peer_keyframe(1_000_000, KeyframeUrgency::Immediate));
+    }
+
+    /// The transition the group guard exists for. A direct call that
+    /// authenticated video keeps its plane through promotion -- `configure_group_at`
+    /// rewrites the send SSRC and leaves the depacketizer alone -- while `on_rtp`
+    /// has already moved to the registry. Without the guard this one path sends a
+    /// PLI naming a stream nobody is sending, and reports success for it.
+    #[test]
+    fn a_call_promoted_to_a_group_stops_asking_about_its_direct_stream() {
+        let (mut eng, _peer) = video_engine_with_inbound_stream();
+        assert!(
+            eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced),
+            "the direct plane has a stream to ask about"
+        );
+
+        eng.apply_group_update(2_000, &group_update("video"))
+            .expect("a started direct engine promotes");
+        let _ = drain(&mut eng);
+        assert!(eng.is_group());
+
+        // Far past the interval, so only the group guard can explain the refusal.
+        const _: () = assert!(1_000_000 - 200 > MIN_PEER_KEYFRAME_INTERVAL_MS);
+        assert!(!eng.request_peer_keyframe(1_000_000, KeyframeUrgency::Coalesced));
     }
 
     /// A plane coming back on has no inbound stream to complain about: the
     /// SSRC it held belongs to the session that ended.
     #[test]
-    fn a_replaced_video_plane_does_not_ask_about_the_previous_stream() {
-        let mut cfg = config(true);
-        cfg.enable_video = true;
-        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
-        eng.start(0, 1_700_000_000_000);
-        let _ = drain(&mut eng);
-        let allocate = allocate_success(&eng);
-        eng.handle_input(1, Input::RelayPacket(&allocate));
-        let _ = drain(&mut eng);
-        let mut peer_video = peer_video_pipe();
-        let video = peer_video
-            .protect_video(&video_au(100))
-            .pop()
-            .expect("one-packet video AU");
-        eng.handle_input(101, Input::RelayPacket(&video));
-        let _ = drain(&mut eng);
-        assert!(eng.request_peer_keyframe(200));
+    fn a_resumed_video_plane_has_no_stream_to_ask_about() {
+        let (mut eng, _peer) = video_engine_with_inbound_stream();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
 
         // Downgrade to audio, then back.
         eng.disable_video();
         assert!(eng.enable_video());
+        // Past the interval, so the throttle cannot be what refuses: only the
+        // dropped reassembly can.
+        const _: () = assert!(1_500 - 200 > MIN_PEER_KEYFRAME_INTERVAL_MS);
         assert!(
-            !eng.request_peer_keyframe(300),
+            !eng.request_peer_keyframe(1_500, KeyframeUrgency::Coalesced),
             "a plane with no authenticated inbound stream has nothing to ask about"
         );
+    }
 
-        // A packet on the new session restores it -- and the new stream's first
-        // request is not spent on the previous one's throttle, which is why the
-        // time here is still inside `MIN_PEER_KEYFRAME_INTERVAL_MS` of the
-        // request at 200. Recovery matters most exactly when a stream changed.
+    /// Recovery matters most exactly when a stream has just changed, which is
+    /// when a throttle carried across the change would deny it.
+    #[test]
+    fn a_new_inbound_stream_does_not_inherit_the_previous_throttle() {
+        let (mut eng, mut peer_video) = video_engine_with_inbound_stream();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+
+        eng.disable_video();
+        assert!(eng.enable_video());
         let video = peer_video
             .protect_video(&video_au(200))
             .pop()
             .expect("one-packet video AU");
         eng.handle_input(400, Input::RelayPacket(&video));
         let _ = drain(&mut eng);
-        // At compile time, so shortening the interval below the 200ms these
-        // two requests are apart turns the test into a tautology loudly
-        // rather than quietly.
+        // At compile time, so shortening the interval below the 200ms these two
+        // requests are apart turns the test into a tautology loudly rather than
+        // quietly.
         const _: () = assert!(400 - 200 < MIN_PEER_KEYFRAME_INTERVAL_MS);
-        assert!(eng.request_peer_keyframe(400));
+        assert!(eng.request_peer_keyframe(400, KeyframeUrgency::Coalesced));
+    }
+
+    /// The stream change that happens with no call into the engine at all: the
+    /// peer renumbers mid-call and the pipeline follows it on the first packet,
+    /// because an SSRC it has never retired takes possession immediately. A
+    /// throttle kept as a bare timestamp would spend the new stream's first
+    /// recovery on the departed one's quota.
+    #[test]
+    fn a_peer_that_renumbers_mid_call_is_not_throttled_by_the_departed_stream() {
+        let (mut eng, peer_video) = video_engine_with_inbound_stream();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+
+        let mut renumbered = peer_video_pipe_with_ssrc(peer_video.send_ssrc() ^ 0x5A5A_5A5A);
+        let video = renumbered
+            .protect_video(&video_au(200))
+            .pop()
+            .expect("one-packet video AU");
+        eng.handle_input(300, Input::RelayPacket(&video));
+        let _ = drain(&mut eng);
+
+        const _: () = assert!(400 - 200 < MIN_PEER_KEYFRAME_INTERVAL_MS);
+        assert!(
+            eng.request_peer_keyframe(400, KeyframeUrgency::Coalesced),
+            "the throttle belongs to the stream that ended, not to this one"
+        );
     }
 
     /// A burst of gaps describing one loss costs one request, and the next is
     /// allowed once the interval has passed.
     #[test]
     fn peer_keyframe_requests_are_throttled() {
-        let mut cfg = config(true);
-        cfg.enable_video = true;
-        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
-        eng.start(0, 1_700_000_000_000);
-        let _ = drain(&mut eng);
-        let allocate = allocate_success(&eng);
-        eng.handle_input(1, Input::RelayPacket(&allocate));
-        let _ = drain(&mut eng);
-        let mut peer_video = peer_video_pipe();
-        let video = peer_video
-            .protect_video(&video_au(100))
-            .pop()
-            .expect("one-packet video AU");
-        eng.handle_input(101, Input::RelayPacket(&video));
-        let _ = drain(&mut eng);
+        let (mut eng, _peer) = video_engine_with_inbound_stream();
 
-        assert!(eng.request_peer_keyframe(1_000));
-        assert!(!eng.request_peer_keyframe(1_000));
-        assert!(!eng.request_peer_keyframe(1_000 + MIN_PEER_KEYFRAME_INTERVAL_MS - 1));
-        assert!(eng.request_peer_keyframe(1_000 + MIN_PEER_KEYFRAME_INTERVAL_MS));
+        assert!(eng.request_peer_keyframe(1_000, KeyframeUrgency::Coalesced));
+        assert!(!eng.request_peer_keyframe(1_000, KeyframeUrgency::Coalesced));
+        assert!(!eng.request_peer_keyframe(
+            1_000 + MIN_PEER_KEYFRAME_INTERVAL_MS - 1,
+            KeyframeUrgency::Coalesced
+        ));
+        assert!(eng.request_peer_keyframe(
+            1_000 + MIN_PEER_KEYFRAME_INTERVAL_MS,
+            KeyframeUrgency::Coalesced
+        ));
+    }
+
+    /// A decoder that has already failed does not wait out an interval measured
+    /// for coalescing a burst.
+    #[test]
+    fn an_immediate_peer_keyframe_request_bypasses_the_throttle() {
+        let (mut eng, _peer) = video_engine_with_inbound_stream();
+
+        assert!(eng.request_peer_keyframe(1_000, KeyframeUrgency::Coalesced));
+        assert!(!eng.request_peer_keyframe(1_001, KeyframeUrgency::Coalesced));
+        assert!(eng.request_peer_keyframe(1_001, KeyframeUrgency::Immediate));
+        // It starts a fresh interval rather than turning the throttle off, so a
+        // burst following a decoder reset still coalesces.
+        assert!(!eng.request_peer_keyframe(1_002, KeyframeUrgency::Coalesced));
+    }
+
+    /// The guards that refuse for a reason other than the throttle, each with
+    /// a timestamp far past the interval so the throttle cannot explain it.
+    #[test]
+    fn a_disabled_video_plane_never_asks_the_peer_for_a_keyframe() {
+        let (mut eng, _peer) = video_engine_with_inbound_stream();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+
+        eng.disable_video();
+        assert!(!eng.request_peer_keyframe(1_000_000, KeyframeUrgency::Immediate));
+
+        // And an audio-only call has no plane at all.
+        let mut audio_only = engine(true);
+        audio_only.start(0, 1_700_000_000_000);
+        let _ = drain(&mut audio_only);
+        assert!(!audio_only.request_peer_keyframe(1_000_000, KeyframeUrgency::Immediate));
     }
 
     #[test]
@@ -10187,16 +10344,22 @@ mod tests {
     /// A mirrored peer engine's video plane (its self LID = our peer LID), used to craft real
     /// inbound video packets for demux tests.
     fn peer_video_pipe() -> VideoPipeline {
+        peer_video_pipe_with_ssrc(ssrc::derive_video_participant_ssrc(
+            "CID",
+            &ssrc::format_e2e_srtp_participant_id(PEER_LID),
+        ))
+    }
+
+    /// The same mirrored peer plane under a chosen SSRC, so a test can play the
+    /// peer renumbering mid-call.
+    fn peer_video_pipe_with_ssrc(ssrc: u32) -> VideoPipeline {
         use crate::voip::session::{VideoPipeline, VideoPipelineParams};
         let call_key: Vec<u8> = (0u8..32).collect();
         VideoPipeline::new(&VideoPipelineParams {
             call_key: &call_key,
             self_lid: PEER_LID,
             peer_lid: SELF_LID,
-            ssrc: ssrc::derive_video_participant_ssrc(
-                "CID",
-                &ssrc::format_e2e_srtp_participant_id(PEER_LID),
-            ),
+            ssrc,
             ts_stride: VIDEO_TS_STRIDE_15FPS,
             warp_mi_tag_len: WARP_MI_TAG_LEN,
         })

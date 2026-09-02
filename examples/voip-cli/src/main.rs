@@ -1128,7 +1128,7 @@ async fn start_media(
             let cid = call.action.call_id();
             Some((
                 video::spawn_video_source(&opts).await?,
-                video::spawn_video_sink(&opts, cid).await?,
+                video::spawn_video_sink(&opts, cid, None).await?,
             ))
         } else {
             None
@@ -1203,7 +1203,7 @@ async fn place_outgoing_call(
         let opts = VideoOpts::from_env().await?;
         builder = builder.video(
             video::spawn_video_source(&opts).await?,
-            video::spawn_video_sink(&opts, "outgoing").await?,
+            video::spawn_video_sink(&opts, "outgoing", None).await?,
         );
     }
     let handle = builder
@@ -1452,7 +1452,14 @@ fn spawn_call_event_listener(
 async fn accept_peer_video(handle: &CallHandle, request: VideoUpgradeToken) -> Result<()> {
     let opts = VideoOpts::from_env().await?;
     let src = video::spawn_video_source(&opts).await?;
-    let sink = video::spawn_video_sink(&opts, handle.call_id()).await?;
+    // The one flow with a handle already in hand, so the sink can ask the peer
+    // for the keyframe that ends a shed: an access unit ffplay refused is a loss
+    // nothing inside the library can see.
+    let recover = {
+        let handle = handle.clone();
+        Arc::new(move || handle.request_peer_keyframe()) as video::OnVideoLoss
+    };
+    let sink = video::spawn_video_sink(&opts, handle.call_id(), Some(recover)).await?;
     handle
         .accept_video(request, src, sink)
         .await
@@ -1566,7 +1573,7 @@ fn spawn_stdin_ui(state: Arc<Mutex<CallState>>) {
                         let started = async {
                             let opts = VideoOpts::from_env().await?;
                             let src = video::spawn_video_source(&opts).await?;
-                            let sink = video::spawn_video_sink(&opts, &cid).await?;
+                            let sink = video::spawn_video_sink(&opts, &cid, None).await?;
                             handle
                                 .start_video(src, sink)
                                 .await

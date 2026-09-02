@@ -62,8 +62,8 @@ pub use driver::{
 };
 pub use engine::{
     CallConfig, CallEngine, CallEvent, CodecDecisionSource, CodecSwitchError, DirectPeer,
-    EngineError, GroupControlKind, GroupEngineConfig, Input, Millis, NEVER, Output, SetupError,
-    TxIdSource,
+    EngineError, GroupControlKind, GroupEngineConfig, Input, KeyframeUrgency, Millis, NEVER,
+    Output, SetupError, TxIdSource,
 };
 pub use group::{GroupCallState, GroupStateApply};
 pub use group_audio::{
