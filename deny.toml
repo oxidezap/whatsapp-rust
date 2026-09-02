@@ -12,12 +12,16 @@ exclude-dev = true
 
 [advisories]
 version = 2
-# Only `unmaintained` notices are listed below, and only where no upgrade
-# exists. A real vulnerability advisory must be resolved by a version bump,
-# never by an entry here.
-ignore = [
-    { id = "RUSTSEC-2026-0150", reason = "audiopus_sys, reached through the optional `voip-libopus` feature via opus 0.3. Upstream is dormant with no fork on crates.io; the crate is a thin libopus FFI shim that we build but do not drive directly." },
-]
+# Only `unmaintained` notices belong here, and only where no upgrade exists. A
+# real vulnerability advisory must be resolved by a version bump, never by an
+# entry here.
+#
+# Empty on purpose. RUSTSEC-2026-0150 (audiopus_sys) was listed until the crate
+# left the graph entirely -- `audiopus` appears nowhere in Cargo.lock now, even
+# under `--all-features` -- and cargo-deny reports a stale ignore as
+# `advisory-not-detected`. An ignore outliving the crate it excuses is how a
+# real advisory gets waved through later under a name nobody rechecked.
+ignore = []
 
 [licenses]
 version = 2
@@ -74,6 +78,26 @@ skip = [
     # is on rand 0.10 / getrandom 0.4.
     { name = "getrandom", version = "=0.2.17" },
     { name = "rand_core", version = "=0.6.4" },
+
+    # Build-script-side duplicates, all reached only through `buffa-build`,
+    # which every crate that uses it declares under `[build-dependencies]`.
+    # Like the proc-macro entries below, they cost build time only: a build
+    # script runs at compile time and links into no shipped binary. And none of
+    # them can be collapsed from here, because each pair is two incompatible
+    # majors pulled by different parents -- the workspace is on `getrandom` 0.4
+    # via rand 0.10, while `tempfile` inside the codegen is on 0.3, and `r-efi`
+    # is simply whichever one each `getrandom` chose. Collapses when buffa
+    # upgrades, not on anything we can do to our own manifests.
+    #
+    # `Cargo.lock` invites a misreading here: it carries a `rand_core` 0.9.5
+    # entry that lists `getrandom 0.3.4` as a dependency, which reads like a
+    # second, runtime path into the shipped graph. Nothing reaches that
+    # rand_core -- `cargo tree -i rand_core@0.9.5 --target all` prints nothing
+    # at all -- so the lock entry is stale and the build-dependency route below
+    # is the only one. Check with `cargo tree -i`, not by grepping the lock.
+    { name = "getrandom", version = "=0.3.4" },
+    { name = "prettyplease", version = "=0.2.37" },
+    { name = "r-efi", version = "=5.3.0" },
 
     # Proc-macro-side duplicates. They cost build time only — proc macros run
     # at compile time and never link into the produced binary.
