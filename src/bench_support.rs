@@ -597,7 +597,7 @@ impl wacore::types::events::EventHandler for MessageCounter {
 /// classification, the session or sender-key decrypt through the signal
 /// cache, plaintext handling, dispatch, and the delivery receipt written to
 /// the sink socket. The chat lane is not on the bill: a stanza enters at
-/// [`Client::handle_incoming_message`], which is what the lane worker awaits
+/// `Client::handle_incoming_message`, which is what the lane worker awaits
 /// per message, so the queue hop is excluded by construction and the
 /// per-message work is not.
 pub struct ReceiveHarness {
