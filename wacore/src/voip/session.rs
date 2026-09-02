@@ -2091,6 +2091,72 @@ mod tests {
         );
     }
 
+    // A local downgrade and resume drops possession, which is what the run being built was counted
+    // against. Carried across the pause, two stragglers from a stream the peer had already
+    // renumbered away from -- one either side of the reset -- completed a single reclaim between
+    // them, and the resumed plane went to the stream nobody is sending.
+    //
+    // The live stream takes it back on its next packet, because the wrongly seated straggler
+    // retired nothing on the way in, so this is one discarded access unit rather than a freeze.
+    // The window matters anyway: a keyframe request made inside it names the wrong stream, which
+    // is the one thing this feature exists to get right.
+    #[test]
+    fn a_resumed_plane_does_not_complete_a_reclaim_begun_before_it() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let a = "111111111111111:0@lid";
+        let b = "222222222222222:0@lid";
+        let mut original = VideoPipeline::new(&video_params(&call_key, a, b)).unwrap();
+        let mut replacement = {
+            let mut params = video_params(&call_key, a, b);
+            params.ssrc ^= 0x0F0F_0F0F;
+            VideoPipeline::new(&params).unwrap()
+        };
+        let mut rx = VideoPipeline::new(&video_params(&call_key, b, a)).unwrap();
+
+        let au = video_au(60);
+        let packet = original.protect_video(&au).pop().expect("one packet");
+        assert_eq!(rx.unprotect_video(&packet), Some(vec![au]));
+
+        // The peer renumbers and stays there, well past the grace.
+        for _ in 0..(RETIRED_SSRC_GRACE_PACKETS + 4) {
+            let au = video_au(60);
+            let packet = replacement.protect_video(&au).pop().expect("one packet");
+            let _ = rx.unprotect_video(&packet);
+        }
+
+        // Part of a run from the retired stream, one short of reclaiming.
+        for _ in 0..(RETIRED_SSRC_RESUME_PACKETS - 1) {
+            let au = video_au(60);
+            let straggler = original.protect_video(&au).pop().expect("one packet");
+            let _ = rx.unprotect_video(&straggler);
+        }
+
+        rx.reset_reassembly();
+
+        // One more straggler must not finish what the pause interrupted: seating it would deliver
+        // its access unit, which is what taking the plane looks like from here.
+        let au = video_au(60);
+        let straggler = original.protect_video(&au).pop().expect("one packet");
+        assert_eq!(
+            rx.unprotect_video(&straggler),
+            None,
+            "a straggler must not take the resumed plane on a run built before the reset"
+        );
+
+        let mut delivered = 0;
+        for _ in 0..8 {
+            let au = video_au(60);
+            let packet = replacement.protect_video(&au).pop().expect("one packet");
+            if rx.unprotect_video(&packet) == Some(vec![au]) {
+                delivered += 1;
+            }
+        }
+        assert_eq!(
+            delivered, 8,
+            "the stream the peer is actually sending must take the resumed plane"
+        );
+    }
+
     // The guard asked only about the MOST RECENTLY retired SSRC, so a peer that renumbered twice had
     // an older stream that met neither the grace nor the run: one straggler from it took reassembly
     // outright, and the live stream then froze for a whole fresh grace window.
