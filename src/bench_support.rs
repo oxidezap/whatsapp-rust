@@ -723,6 +723,7 @@ impl ReceiveHarness {
         self.counter.delivered.load(Ordering::Relaxed)
     }
 
+    /// A fresh stanza id per built message, so dedup never sees a repeat.
     fn next_message_id(&self) -> String {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
         format!("3EB0BENCH{n:011}")
@@ -745,6 +746,8 @@ fn decoded(node: &wacore_binary::node::Node) -> Arc<wacore_binary::OwnedNodeRef>
     Arc::new(wacore_binary::OwnedNodeRef::new(bytes).expect("decode"))
 }
 
+/// What [`build_receive_fixture`] hands back for [`ReceiveHarness::new`] to
+/// pair with the runtime it was built on.
 struct ReceiveFixture {
     client: Arc<Client>,
     peer: Arc<Client>,
@@ -756,6 +759,9 @@ struct ReceiveFixture {
     subscription: wacore::types::events::Subscription,
 }
 
+/// The receive fixture's setup, on the harness's own runtime: both clients,
+/// the acknowledged pairwise session, the installed sender key and the
+/// subscribed counter, none of which a benchmark measures.
 async fn build_receive_fixture() -> ReceiveFixture {
     use wacore::libsignal::protocol::create_sender_key_distribution_message;
     use wacore::types::jid::{JidExt, make_sender_key_name};
