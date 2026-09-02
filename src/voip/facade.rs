@@ -3195,7 +3195,11 @@ async fn attach_engine(
             let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(tx) = tx {
                 // Loss tolerant, like the speaker: a stalled sink sheds frames.
-                if tx.try_send(frame).is_err() {
+                // Only `Full` is a shed worth recovering from -- a closed sink is
+                // a consumer that has gone away, and asking it for a keyframe an
+                // interval until the call ends buys the peer nothing but its
+                // largest frame.
+                if let Err(async_channel::TrySendError::Full(_)) = tx.try_send(frame) {
                     keyframe_recovery.send(VideoControl::RequestPeerKeyframe(
                         KeyframeUrgency::Coalesced,
                     ));

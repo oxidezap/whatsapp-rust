@@ -987,9 +987,16 @@ impl VideoPipeline {
     /// from would then take possession of a plane that has just come back, so
     /// anything addressed to the stream being reassembled would name a stream
     /// nobody is sending.
+    /// The retired list is the only thing kept: it is a fact about the peer,
+    /// which did not change. The run and grace counters are evidence about
+    /// packets that arrived before the pause, and a reclaim part-way through one
+    /// would otherwise be completed by fewer stragglers than it takes to earn.
     pub(crate) fn reset_reassembly(&mut self) {
         self.depacketizer.reset();
         self.depacketizer_ssrc = None;
+        self.contender_ssrc = None;
+        self.packets_since_stream_change = 0;
+        self.retired_ssrc_run = 0;
     }
 
     pub(crate) fn reset_depacketizer(&mut self) {

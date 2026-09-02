@@ -37,7 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, anyhow, bail};
 #[cfg(feature = "voip-opus")]
@@ -1119,20 +1119,24 @@ async fn start_media(
     state: &Arc<Mutex<CallState>>,
 ) -> std::result::Result<Arc<CallHandle>, (InboundMediaFailureStage, anyhow::Error)> {
     let voip = client.voip();
-    let (builder, event_speaker) = async {
+    let (builder, event_speaker, video_recovery) = async {
         let mic = spawn_mic()?;
         let speaker = spawn_speaker()?;
         let event_speaker = speaker.clone();
         info!("🔌 connecting media via client.voip().accept(..)…");
-        let video_endpoints = if initial_video {
+        let (video_endpoints, video_recovery) = if initial_video {
             let opts = VideoOpts::from_env().await?;
             let cid = call.action.call_id();
-            Some((
-                video::spawn_video_source(&opts).await?,
-                video::spawn_video_sink(&opts, cid, None).await?,
-            ))
+            let (on_loss, slot) = deferred_keyframe_recovery();
+            (
+                Some((
+                    video::spawn_video_source(&opts).await?,
+                    video::spawn_video_sink(&opts, cid, Some(on_loss)).await?,
+                )),
+                Some(slot),
+            )
         } else {
-            None
+            (None, None)
         };
         if peer_terminated_during_startup(state, call.action.call_id()) {
             bail!("peer ended the call during media preparation");
@@ -1150,7 +1154,7 @@ async fn start_media(
         if let Some((source, sink)) = video_endpoints {
             builder = builder.video(source, sink);
         }
-        Ok::<_, anyhow::Error>((builder, event_speaker))
+        Ok::<_, anyhow::Error>((builder, event_speaker, video_recovery))
     }
     .await
     .map_err(|error| (InboundMediaFailureStage::LocalPreparation, error))?;
@@ -1161,6 +1165,9 @@ async fn start_media(
             anyhow!("accept media: {error}"),
         )
     })?;
+    if let Some(slot) = video_recovery {
+        let _ = slot.set(handle.clone());
+    }
     info!(
         "🎙  {} media flow live for call {} — speak into the mic.{}",
         audio.name(),
@@ -1200,17 +1207,23 @@ async fn place_outgoing_call(
             voip.call(peer).encoded_audio(audio.format(), source, sink)
         }
     };
+    let mut video_recovery = None;
     if video {
         let opts = VideoOpts::from_env().await?;
+        let (on_loss, slot) = deferred_keyframe_recovery();
+        video_recovery = Some(slot);
         builder = builder.video(
             video::spawn_video_source(&opts).await?,
-            video::spawn_video_sink(&opts, "outgoing", None).await?,
+            video::spawn_video_sink(&opts, "outgoing", Some(on_loss)).await?,
         );
     }
     let handle = builder
         .start()
         .await
         .map_err(|e| anyhow!("place call: {e}"))?;
+    if let Some(slot) = video_recovery {
+        let _ = slot.set(handle.clone());
+    }
     info!(
         "☎  {} offer sent for call {} — waiting for the peer's relay to connect media.{}",
         audio.name(),
@@ -1456,6 +1469,27 @@ fn spawn_call_event_listener(
 fn keyframe_recovery(handle: &CallHandle) -> video::OnVideoLoss {
     let handle = handle.clone();
     Arc::new(move || handle.request_peer_keyframe(KeyframeUrgency::Coalesced))
+}
+
+/// The same recovery for a flow that builds its sink *before* the handle exists.
+///
+/// A video-from-start call hands its endpoints to the builder that produces the
+/// handle, so there is nothing to close over yet -- but the sink outlives that,
+/// and a shed frame after the call is up deserves the same request an upgrade
+/// gets. Returns the hook and the slot to fill once the handle is in hand; until
+/// it is filled the hook is a no-op, which is the honest answer for a loss that
+/// happened before there was a call to ask on.
+fn deferred_keyframe_recovery() -> (video::OnVideoLoss, Arc<OnceLock<CallHandle>>) {
+    let slot: Arc<OnceLock<CallHandle>> = Arc::new(OnceLock::new());
+    let hook = {
+        let slot = slot.clone();
+        Arc::new(move || {
+            if let Some(handle) = slot.get() {
+                handle.request_peer_keyframe(KeyframeUrgency::Coalesced);
+            }
+        }) as video::OnVideoLoss
+    };
+    (hook, slot)
 }
 
 /// Fresh ffmpeg/ffplay endpoints for a mid-call upgrade/accept on `handle`.
