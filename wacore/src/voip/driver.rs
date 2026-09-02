@@ -304,7 +304,11 @@ impl VideoControlSender {
                 let previous = self
                     .peer_keyframe
                     .fetch_max(peer_keyframe_slot(urgency), Ordering::Relaxed);
-                if previous != PEER_KEYFRAME_NONE {
+                // Not once the receiver is gone: the marker that would carry this
+                // raise can no longer be consumed, so the slot would stay set and
+                // every later send would report a queued request that does not
+                // exist. Falling through clears it on the failed send instead.
+                if previous != PEER_KEYFRAME_NONE && !self.state.is_closed() {
                     return true;
                 }
                 if self

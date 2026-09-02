@@ -3185,12 +3185,21 @@ async fn attach_engine(
     // Forwarder from the drive loop to whatever sink is CURRENTLY attached (swappable mid-call).
     // Ends when the drive loop drops its video_out sender; moved into the media task like mic_feed.
     let sink_slot = video_shared.sink_slot.clone();
+    // The drive loop watches its own `video_out` for the same purpose, but that queue is drained by
+    // THIS task and so is rarely the one that fills. A sink the consumer attached is where a frame
+    // actually goes missing, and it is the last boundary that still knows a picture was lost -- past
+    // here the consumer's channel is opaque to us.
+    let keyframe_recovery = video_shared.ctl_tx.clone();
     let video_out_feed = client.runtime.spawn(Box::pin(async move {
         while let Ok(frame) = video_out_rx.recv().await {
             let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(tx) = tx {
                 // Loss tolerant, like the speaker: a stalled sink sheds frames.
-                let _ = tx.try_send(frame);
+                if tx.try_send(frame).is_err() {
+                    keyframe_recovery.send(VideoControl::RequestPeerKeyframe(
+                        KeyframeUrgency::Coalesced,
+                    ));
+                }
             }
         }
     }));
