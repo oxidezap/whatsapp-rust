@@ -2181,5 +2181,19 @@ fn fibonacci_backoff(attempt: u32) -> Duration {
     Duration::from_millis(ms)
 }
 
+/// Release the table a reservation set grew during a burst.
+///
+/// `pending_retries` and `pending_lid_refreshes` hold one entry per in-flight
+/// operation and are empty almost all the time, but a reconnect can push
+/// hundreds of retries through at once and a `HashSet` never gives that table
+/// back on its own. The `len * 4` threshold keeps a set that is still draining
+/// from oscillating between shrink and regrow; `shrink_to` rather than
+/// `shrink_to_fit` leaves room for the tail of the burst.
+pub(crate) fn release_after_burst<T: Eq + std::hash::Hash>(set: &mut HashSet<T>) {
+    if set.capacity() > 32 && set.len() * 4 < set.capacity() {
+        set.shrink_to(set.len() * 2);
+    }
+}
+
 #[cfg(test)]
 mod tests;

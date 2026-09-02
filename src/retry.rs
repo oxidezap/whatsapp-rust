@@ -512,10 +512,9 @@ impl Client {
         // the scopeguard instead of cloning again.
         let pending = Arc::clone(&self.pending_retries);
         let _guard = scopeguard::guard((), move |()| {
-            pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&processing_key);
+            let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+            pending.remove(&processing_key);
+            crate::client::release_after_burst(&mut pending);
         });
 
         // A retry from a device missing from our registry signals a stale device

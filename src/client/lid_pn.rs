@@ -1335,10 +1335,9 @@ impl Client {
         }
         let pending = Arc::clone(&self.pending_lid_refreshes);
         let _guard = scopeguard::guard((), move |()| {
-            pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&key);
+            let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+            pending.remove(&key);
+            super::release_after_burst(&mut pending);
         });
 
         // Persists through `add_lid_pn_mapping`, so a corrected pair is durable

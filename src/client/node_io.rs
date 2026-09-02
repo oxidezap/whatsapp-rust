@@ -377,9 +377,12 @@ impl Client {
     pub(crate) async fn process_node(self: &Arc<Self>, node: Arc<wacore_binary::OwnedNodeRef>) {
         use wacore::xml::DisplayableNodeRef;
         let nr = node.get();
+        // Classified once; every gate below dispatches on the enum instead of
+        // re-comparing the tag string.
+        let tag = StanzaTag::try_from(nr.tag.as_ref()).ok();
 
         // --- Offline Sync Tracking ---
-        if nr.tag.as_ref() == StanzaTag::InfoBanner.as_str() {
+        if tag == Some(StanzaTag::InfoBanner) {
             // Check for offline_preview child to get expected count
             if let Some(preview) = nr.get_optional_child("offline_preview") {
                 let count: usize = preview
@@ -469,7 +472,7 @@ impl Client {
         }
         // --- End Tracking ---
 
-        if nr.tag.as_ref() == StanzaTag::Iq.as_str()
+        if tag == Some(StanzaTag::Iq)
             && let Some(sync_node) = nr.get_optional_child("sync")
             && let Some(collection_node) = sync_node.get_optional_child("collection")
         {
@@ -491,7 +494,7 @@ impl Client {
                 .dispatch(Event::RawNode(Arc::clone(&node)));
         }
 
-        if nr.tag.as_ref() == StanzaTag::XmlStreamEnd.as_str() {
+        if tag == Some(StanzaTag::XmlStreamEnd) {
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 debug!("Received <xmlstreamend/>, expected disconnect.");
             } else {
@@ -508,7 +511,7 @@ impl Client {
             self.resolve_node_waiters(&node);
         }
 
-        if nr.tag.as_ref() == StanzaTag::Iq.as_str()
+        if tag == Some(StanzaTag::Iq)
             && let Some(id) = nr.get_attr("id").map(|v| v.as_str())
             && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
         {
@@ -574,14 +577,14 @@ impl Client {
 
         // Bypass async_trait's boxed future for the hot built-in handlers while
         // retaining router registration for direct router callers.
-        match nr.tag.as_ref() {
-            t if t == StanzaTag::Ack.as_str() => {
+        match tag {
+            Some(StanzaTag::Ack) => {
                 self.handle_ack_response_arc(&node);
             }
-            t if t == StanzaTag::Receipt.as_str() => {
+            Some(StanzaTag::Receipt) => {
                 self.handle_receipt_inline(node);
             }
-            t if t == StanzaTag::Message.as_str() => {
+            Some(StanzaTag::Message) => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
                     node,
@@ -591,7 +594,7 @@ impl Client {
             }
             // Differs from a `<message>` only in tag, so WA Web retags it and
             // runs the same pipeline.
-            t if t == StanzaTag::Status.as_str() && is_status_broadcast_stanza(nr) => {
+            Some(StanzaTag::Status) if is_status_broadcast_stanza(nr) => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
                     node,
@@ -702,14 +705,10 @@ impl Client {
     /// would redeliver indefinitely. WA Web emits `<receipt class="status">`
     /// in the success path on top of this; the duplicate is tolerated.
     pub(crate) fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        let tag = StanzaTag::try_from(node.tag.as_ref());
-        if node.get_attr("id").is_none() {
+        if node.get_attr("id").is_none() || node.get_attr("from").is_none() {
             return false;
         }
-        if node.get_attr("from").is_none() {
-            return false;
-        }
-        match tag {
+        match StanzaTag::try_from(node.tag.as_ref()) {
             Ok(StanzaTag::Receipt | StanzaTag::Notification | StanzaTag::Call) => true,
             Ok(StanzaTag::Message) => {
                 from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast())
