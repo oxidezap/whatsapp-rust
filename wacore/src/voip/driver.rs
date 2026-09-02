@@ -1203,7 +1203,7 @@ async fn run_call_with_clock_and_wallclock(
         let mut pending_video = Vec::new();
         let mut reconnect_to = None;
         let mut sink_dropped = 0u32;
-        let mut video_sink_dropped = false;
+        let mut video_sink_dropped = 0u32;
         loop {
             match eng.poll_output() {
                 // Queue for the in-flight send arm; never await the write in this loop.
@@ -1235,13 +1235,16 @@ async fn run_call_with_clock_and_wallclock(
                     }
                 }
                 // Same policy for video: a stalled sink sheds frames, never the drive loop.
-                // Unlike a shed audio frame, a shed access unit leaves every later
-                // one referencing a picture the consumer never got -- and this is
-                // the one such loss the consumer cannot see, so it is asked about
-                // here rather than left to an application that has no way to know.
+                // A shed access unit leaves every later one referencing a picture
+                // the consumer never got, so it is worth a request -- but only
+                // `Full` is a shed. `Closed` means nobody is decoding at all, and
+                // asking once an interval for the rest of the call would buy the
+                // peer nothing but its largest frame.
                 Output::VideoPlayout(frame) => {
-                    if channels.video_out.try_send(frame).is_err() {
-                        video_sink_dropped = true;
+                    if let Err(async_channel::TrySendError::Full(_)) =
+                        channels.video_out.try_send(frame)
+                    {
+                        video_sink_dropped = video_sink_dropped.saturating_add(1);
                     }
                 }
                 Output::Event(ev) => {
@@ -1292,7 +1295,8 @@ async fn run_call_with_clock_and_wallclock(
         // After the drain, so the request joins an outbox this loop is no longer
         // walking. Coalesced: a stalled sink sheds a run of units describing one
         // stall, and the engine's throttle turns that run into one request.
-        if video_sink_dropped {
+        if video_sink_dropped != 0 {
+            eng.note_video_sink_dropped(video_sink_dropped);
             eng.request_peer_keyframe(now_ms(), KeyframeUrgency::Coalesced);
         }
 

@@ -784,14 +784,14 @@ enum SinkTarget {
     None,
 }
 
+/// Called when this sink discards an access unit, so the peer can be asked for
+/// the keyframe that ends the discard. `None` where the sink is built before the
+/// call handle exists, which is every flow that attaches video from the start.
+pub type OnVideoLoss = Arc<dyn Fn() + Send + Sync>;
+
 /// Spawn the display/record sink and return the channel the library pushes received frames into
 /// (`VideoSink` blanket impl on `Sender<VideoFrame>`). Lazy: the window/file only appears when the
 /// first frame arrives, so a call that never activates video opens nothing.
-/// Called when this sink has to discard an access unit, so the peer can be
-/// asked for the keyframe that ends the discard. `None` where the caller has no
-/// call handle yet, which is every flow that builds the sink before starting.
-pub type OnVideoLoss = Arc<dyn Fn() + Send + Sync>;
-
 pub async fn spawn_video_sink(
     opts: &VideoOpts,
     tag: &str,

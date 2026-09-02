@@ -72,6 +72,16 @@ pub struct CallMediaStats {
     /// is healthy -- and it IS healthy: this is the one loss on the receive path that belongs to
     /// the consumer rather than to the call, which is why it does not feed the silence alarm.
     pub audio_sink_dropped: u32,
+    /// Reassembled access units the consumer's video sink refused, for the same
+    /// reason `audio_sink_dropped` exists: the engine produced them and the
+    /// application did not take them, which is a loss no other counter shows.
+    pub video_sink_dropped: u32,
+    /// Peer-keyframe requests that reached the outbox, after the throttle.
+    ///
+    /// The engine sends these on its own initiative as well as on the
+    /// application's, and each one costs the peer its largest frame. Without a
+    /// count there is no way to tell a recovering call from one asking in a loop.
+    pub peer_keyframe_requests: u32,
     /// Relay datagrams the media plane could not read: neither STUN, RTP nor RTCP, or RTP-shaped
     /// but too short or malformed to parse a header from.
     ///
@@ -392,6 +402,12 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
         audio_sink_dropped: now
             .audio_sink_dropped
             .saturating_sub(then.audio_sink_dropped),
+        video_sink_dropped: now
+            .video_sink_dropped
+            .saturating_sub(then.video_sink_dropped),
+        peer_keyframe_requests: now
+            .peer_keyframe_requests
+            .saturating_sub(then.peer_keyframe_requests),
         relay_packet_unclassified: now
             .relay_packet_unclassified
             .saturating_sub(then.relay_packet_unclassified),

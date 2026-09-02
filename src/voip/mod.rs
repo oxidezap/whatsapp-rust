@@ -56,7 +56,11 @@ pub use wacore::voip::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,
     OpusMlowPacketError, depacketize_opus_from_mlow, packetize_opus_for_mlow,
 };
-pub use wacore::voip::{CallEvent, GroupCallState, GroupStateApply, VideoUpgradeToken};
+// `KeyframeUrgency` is a parameter of `CallHandle::request_peer_keyframe`, so a consumer
+// cannot call it without naming the type.
+pub use wacore::voip::{
+    CallEvent, GroupCallState, GroupStateApply, KeyframeUrgency, VideoUpgradeToken,
+};
 // The platform transport seam, beside the facade that consults it: a consumer installing one
 // through `Client::set_relay_transport_provider` reaches for the whole set below, and having to
 // name `wacore` for them while naming `whatsapp_rust` for the call is a paper cut on the one path

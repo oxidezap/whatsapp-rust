@@ -53,6 +53,7 @@ use wacore::voip::MlowDecoder;
 use wacore::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_RED;
 use whatsapp_rust::prelude::*;
 #[cfg(feature = "voip-opus")]
+use whatsapp_rust::voip::KeyframeUrgency;
 use whatsapp_rust::voip::audio::{WaOpusDecoder, WaOpusEncoder};
 #[cfg(feature = "voip-opus")]
 use whatsapp_rust::voip::session::{MediaPipeline, MediaPipelineParams};
@@ -1454,7 +1455,7 @@ fn spawn_call_event_listener(
 /// builder that produces the handle, so there is nothing to close over yet.
 fn keyframe_recovery(handle: &CallHandle) -> video::OnVideoLoss {
     let handle = handle.clone();
-    Arc::new(move || handle.request_peer_keyframe())
+    Arc::new(move || handle.request_peer_keyframe(KeyframeUrgency::Coalesced))
 }
 
 /// Fresh ffmpeg/ffplay endpoints for a mid-call upgrade/accept on `handle`.

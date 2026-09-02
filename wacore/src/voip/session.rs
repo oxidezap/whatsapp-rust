@@ -10,9 +10,9 @@ use super::e2e_srtp::{
 };
 use super::h264::{H264_MAX_AU_BYTES, H264Depacketizer, PacketizedAu, au_has_idr, packetize_au};
 use super::rtcp::{
-    PLI_SEQUENCE_FIRST, RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN,
+    RtcpReceptionReport, RtcpSenderStats, WHATSAPP_RTCP_CNAME_LEN,
     build_whatsapp_picture_loss_indication, build_whatsapp_rtcp_cname,
-    build_whatsapp_sender_report_with_sdes, build_whatsapp_source_description, next_pli_sequence,
+    build_whatsapp_sender_report_with_sdes, build_whatsapp_source_description,
     parse_rtcp_sender_ssrc,
 };
 use super::rtp::{
@@ -457,6 +457,17 @@ impl SrtcpSender {
         out
     }
 
+    /// Build and SRTCP-protect a Picture Loss Indication naming `media_ssrc`.
+    ///
+    /// On this sender's own profile, like every other report it emits: the bit
+    /// is a property of the session, not of the packet kind.
+    fn picture_loss_indication(&mut self, ssrc: u32, media_ssrc: u32) -> Vec<u8> {
+        self.protect(
+            ssrc,
+            &build_whatsapp_picture_loss_indication(ssrc, media_ssrc, self.profile_extension),
+        )
+    }
+
     fn source_description(&mut self, ssrc: u32) -> Vec<u8> {
         self.protect(
             ssrc,
@@ -815,14 +826,6 @@ pub struct VideoPipeline {
     packets_since_stream_change: u32,
     /// Consecutive packets from `contender_ssrc` since the last one from the stream in possession.
     retired_ssrc_run: u32,
-    /// The sequence number the next PLI will carry.
-    ///
-    /// Monotonic for the life of the pipeline, and deliberately not reset by
-    /// [`Self::reset_depacketizer`] the way the reassembly state is: the peer
-    /// dedupes on this number, so one that goes backwards after a stream change
-    /// reads as a complaint it has already answered. The stream a PLI names is
-    /// carried by the media SSRC, not by the counter.
-    pli_sequence: u32,
     pkt_scratch: PacketizedAu,
     srtcp: SrtcpSender,
 }
@@ -871,7 +874,6 @@ impl VideoPipeline {
             contender_ssrc: None,
             packets_since_stream_change: 0,
             retired_ssrc_run: 0,
-            pli_sequence: PLI_SEQUENCE_FIRST,
             pkt_scratch: PacketizedAu::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, true)?,
         })
@@ -911,14 +913,10 @@ impl VideoPipeline {
     ///
     /// On the native video profile, and protected under our own SSRC, like
     /// every other report this sender emits.
-    pub fn picture_loss_indication(&mut self) -> Option<Vec<u8>> {
+    pub(crate) fn picture_loss_indication(&mut self) -> Option<Vec<u8>> {
         let media_ssrc = self.depacketizer_ssrc?;
-        let sequence = self.pli_sequence;
-        self.pli_sequence = next_pli_sequence(sequence);
-        Some(self.srtcp.protect(
-            self.rtp.ssrc,
-            &build_whatsapp_picture_loss_indication(self.rtp.ssrc, media_ssrc, sequence),
-        ))
+        let ours = self.rtp.ssrc;
+        Some(self.srtcp.picture_loss_indication(ours, media_ssrc))
     }
 
     pub(crate) fn set_send_ssrc(&mut self, ssrc: u32) {
@@ -978,6 +976,20 @@ impl VideoPipeline {
         };
         self.recv_keys = recv_keys;
         true
+    }
+
+    /// Drop what the depacketizer holds without forgetting which streams have
+    /// left.
+    ///
+    /// For a change on *our* side -- a local video downgrade and resume -- where
+    /// the peer is still the peer: [`Self::reset_depacketizer`] would also clear
+    /// `retired_ssrcs`, and a straggler from a stream the peer renumbered away
+    /// from would then take possession of a plane that has just come back, so
+    /// anything addressed to the stream being reassembled would name a stream
+    /// nobody is sending.
+    pub(crate) fn reset_reassembly(&mut self) {
+        self.depacketizer.reset();
+        self.depacketizer_ssrc = None;
     }
 
     pub(crate) fn reset_depacketizer(&mut self) {

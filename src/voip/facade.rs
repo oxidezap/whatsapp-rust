@@ -4136,29 +4136,17 @@ impl CallHandle {
     ///
     /// For the consumer of [`VideoSink`]: call it whenever your decoder loses or
     /// discards an access unit, which is a loss nothing else here can see.
-    /// Throttled downstream, so calling on every dropped unit is the intended
-    /// usage rather than an abuse.
+    /// Throttled in the engine, so calling on every dropped unit is the intended
+    /// usage rather than an abuse -- including with
+    /// [`KeyframeUrgency::Immediate`], which shortens the interval rather than
+    /// removing it.
     ///
     /// Fire-and-forget: the engine decides whether a request goes out, and the
     /// outcome is not reported back. **Does nothing in a group call** -- see
     /// [`wacore::voip::CallEngine::request_peer_keyframe`] for why.
-    pub fn request_peer_keyframe(&self) {
-        self.video.send_control(VideoControl::RequestPeerKeyframe(
-            KeyframeUrgency::Coalesced,
-        ));
-    }
-
-    /// Ask the peer for a video keyframe now, bypassing the throttle.
-    ///
-    /// For a decoder that has failed and reset rather than one that noticed a
-    /// gap: its reference chain is gone at this instant, so an interval sized
-    /// for coalescing a burst is the wrong thing to wait out. Use
-    /// [`Self::request_peer_keyframe`] for the routine case; a request per lost
-    /// unit on this path would be the flood the throttle exists to prevent.
-    pub fn request_peer_keyframe_now(&self) {
-        self.video.send_control(VideoControl::RequestPeerKeyframe(
-            KeyframeUrgency::Immediate,
-        ));
+    pub fn request_peer_keyframe(&self, urgency: KeyframeUrgency) {
+        self.video
+            .send_control(VideoControl::RequestPeerKeyframe(urgency));
     }
 
     /// Send the standalone `<video state=1 dec="H264" device_orientation="0">` used after a
