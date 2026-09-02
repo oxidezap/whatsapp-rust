@@ -149,6 +149,20 @@ impl FlushScope {
         self.tracked()
     }
 
+    /// [`Self::flush`] without the deadline: waits until nothing is tracked.
+    /// For a bench that knows the tracked work completes on its own runtime
+    /// and has nothing to gain from a timer registration per call.
+    #[cfg(feature = "bench-harness")]
+    pub async fn wait_idle(&self) {
+        loop {
+            let listener = self.idle.listen();
+            if self.tracked() == 0 {
+                return;
+            }
+            listener.await;
+        }
+    }
+
     /// Number of tasks parked inside [`Self::flush`]. `flush` registers its
     /// listener before checking the counter, so a listener here means a flusher
     /// really is waiting — what tests poll instead of sleeping.

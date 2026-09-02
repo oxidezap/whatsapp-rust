@@ -713,18 +713,17 @@ impl ReceiveHarness {
     ///
     /// The receipt is not sent inline: `ack_received_message` hands it to a
     /// detached worker that marshals and noise-encrypts it, and on this
-    /// current-thread runtime that worker only runs while something else is
-    /// awaiting. Flushing the outbound scope is what pulls that work into
-    /// the measured region instead of letting it leak into the next
-    /// iteration, or past the last one; with nothing tracked it returns at
-    /// once. The timeout only bounds a broken fixture and is never reached.
+    /// current-thread runtime that worker only runs while the measured
+    /// future is pending, which in steady state it never is. Without a wait
+    /// the receipts would pile up in the worker's queue, unmeasured, for the
+    /// whole run. Waiting for the outbound scope to drain is what puts the
+    /// receipt, and the hand-off to its worker, on the bill: about 5 µs on
+    /// top of a DM, the same whether the wait is a listener, a yield loop or
+    /// the timed flush, so the cost is the receipt's and not the wait's.
     pub fn receive(&self, node: Arc<wacore_binary::OwnedNodeRef>) {
         self.runtime.block_on(async {
             Arc::clone(&self.client).handle_incoming_message(node).await;
-            self.client
-                .outbound_flush
-                .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
-                .await;
+            self.client.outbound_flush.wait_idle().await;
         })
     }
 
