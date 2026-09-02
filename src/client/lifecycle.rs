@@ -1053,11 +1053,17 @@ impl Client {
         // refuse the login. `run` already clears it before each attempt; a
         // caller driving connections itself has nowhere else to learn of it.
         self.expected_disconnect.store(false, Ordering::Relaxed);
+        // Under the same lock as the teardown's resets: the previous
+        // connection's finisher is detached and can still be publishing, and
+        // its writes must not interleave with the state this attempt is
+        // establishing.
+        //
         // Runs before the flags it reads are cleared below. Teardown normally
         // reported the interruption already and this is a no-op; it covers the
         // paths that reach a new attempt without one. The current generation
         // is the right stamp here: this connection has not logged in yet, so
         // its own drain arms at a higher one.
+        let terminal_gate = self.offline_terminal_lock.lock().await;
         self.abandon_offline_sync_if_interrupted(
             self.connection_generation.load(Ordering::Acquire),
         );
@@ -1079,6 +1085,7 @@ impl Client {
             self.signal_cache.clear().await;
         }
         self.offline_batch.reset();
+        drop(terminal_gate);
         self.outbound_flush.reopen();
 
         // WA Web: both MQTT and DGW transports use a 20s connect timeout.
@@ -1842,20 +1849,23 @@ impl Client {
             );
             self.signal_cache.clear().await;
         }
+        // Everything the drain-to-live transition also writes goes under the
+        // lock the finisher publishes beneath, starting with the permit count:
+        // whichever of the two wins the stamp, its writes land wholly before
+        // or wholly after the other's. Outside it, a finisher that had already
+        // claimed its stamp could widen the semaphore back to 64 after this
+        // reset, and the next connection would drain its backlog concurrently
+        // with no permit serializing the Signal state.
+        let terminal_gate = self.offline_terminal_lock.lock().await;
         // Reset semaphore to 1 permit for next offline sync.
         self.swap_message_semaphore(1);
         // Reset dead-socket timestamps so stale values from the previous
         // connection don't trigger an immediate reconnect on the next one.
         self.stats.reset_connection_activity();
         self.pending_device_sync.clear();
-        // Reset offline sync state for next connection, under the lock the
-        // finisher publishes beneath: whichever of the two wins the stamp, its
-        // writes land wholly before or wholly after the other's, so a widened
-        // semaphore can never survive into the next connection's drain.
         // The report is stamped with the generation being retired, not the one
         // just installed, so it silences that drain's own stale finisher
         // without claiming the slot the next drain will need.
-        let terminal_gate = self.offline_terminal_lock.lock().await;
         self.abandon_offline_sync_if_interrupted(closed_generation);
         self.offline_sync_completed.store(false, Ordering::Relaxed);
         self.clear_offline_receipt_buffer();

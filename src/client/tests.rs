@@ -7585,6 +7585,47 @@ async fn wait_for_startup_sync_reports_a_teardown_without_waiting_out_its_timeou
     );
 }
 
+/// A drain that ends must not leave the next connection's drain unserialized.
+///
+/// The teardown resets the processing semaphore to one permit so the next
+/// drain commits its Signal state one stanza at a time. A finisher that had
+/// already claimed its stamp would otherwise widen it back to 64 after that
+/// reset, and the backlog would come down concurrently with nothing
+/// serializing the ratchet advances.
+#[tokio::test]
+async fn a_teardown_leaves_the_next_drain_on_one_permit() {
+    let client = offline_resume_test_client().await;
+
+    // `async_lock::Semaphore` does not report its count, so ask it the question
+    // the drain actually asks: can two stanzas be in flight at once?
+    let concurrent_permits = |client: &Arc<Client>| {
+        let semaphore = client.read_message_semaphore().1;
+        let first = semaphore.try_acquire_arc();
+        let second = semaphore.try_acquire_arc();
+        first.is_some() && second.is_some()
+    };
+
+    arm_offline_drain(&client, 711, 700).await;
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.enter_live_mode_for_tests();
+    assert!(
+        concurrent_permits(&client),
+        "live mode is the wide semaphore"
+    );
+
+    client.cleanup_connection_state().await;
+
+    // The finisher of the retired drain runs late and finds its slot taken.
+    client
+        .complete_offline_sync_for_generation(711, stale_generation)
+        .await;
+
+    assert!(
+        !concurrent_permits(&client),
+        "the next drain starts on one permit, whatever the old finisher does"
+    );
+}
+
 /// A completion belongs to the connection whose drain it is.
 ///
 /// The inactivity watchdog and the offline-delivery waiter both check the

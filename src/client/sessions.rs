@@ -417,6 +417,17 @@ impl Client {
     /// widens the semaphore then. `None` (upgrade-failure fallback) leaves
     /// the buffer alone for the connection-state reset to clear.
     fn publish_offline_sync_live_state(&self, count: i32, durable: Option<bool>, generation: u64) {
+        // Re-read under `offline_terminal_lock`, which every caller holds: the
+        // check each of them made before taking it could have been overtaken
+        // by the teardown waiting for that same lock.
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            log::debug!(
+                target: "Client/OfflineSync",
+                "Generation {} was retired before its drain could publish; leaving live state alone",
+                generation,
+            );
+            return;
+        }
         // The claim is the serialization point for the whole transition, not
         // just its event. Losing it means a teardown already reported this
         // drain's end, or a newer drain overtook it: either way that teardown
