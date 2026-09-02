@@ -7594,6 +7594,16 @@ fn concurrent_permits(client: &Arc<Client>) -> bool {
     first.is_some() && second.is_some()
 }
 
+/// Exactly one, not merely "not two": a drain that could acquire nothing at
+/// all would satisfy the negation of [`concurrent_permits`] while being just
+/// as broken.
+fn exactly_one_permit(client: &Arc<Client>) -> bool {
+    let semaphore = client.read_message_semaphore().1;
+    let first = semaphore.try_acquire_arc();
+    let second = semaphore.try_acquire_arc();
+    first.is_some() && second.is_none()
+}
+
 /// A finisher that arrives after its teardown cannot widen the semaphore the
 /// next drain needs narrow.
 ///
@@ -7620,8 +7630,8 @@ async fn a_late_finisher_cannot_widen_the_next_drains_semaphore() {
         .await;
 
     assert!(
-        !concurrent_permits(&client),
-        "the next drain starts on one permit, whatever the old finisher does"
+        exactly_one_permit(&client),
+        "the next drain starts on exactly one permit, whatever the old finisher does"
     );
 }
 
@@ -7668,8 +7678,8 @@ async fn the_permit_reset_is_inside_the_terminal_lock() {
     drop(terminal_gate);
     teardown.await.expect("teardown must not panic");
     assert!(
-        !concurrent_permits(&client),
-        "and once it has the lock, it does narrow it"
+        exactly_one_permit(&client),
+        "and once it has the lock, it does narrow it to exactly one"
     );
 }
 
