@@ -55,11 +55,19 @@ impl MessageHandler {
         let lane = client
             .chat_lanes
             .get_with_by_ref(&chat_jid, async {
-                create_chat_lane(&client, Arc::new(async_lock::Mutex::new(())))
+                create_chat_lane(
+                    &client,
+                    Arc::new(async_lock::Mutex::new(())),
+                    Arc::new(async_lock::Mutex::new(())),
+                )
             })
             .await;
 
-        // Lock serializes enqueue order for this chat
+        // Lock serializes enqueue order for this chat. The lock belongs to
+        // the chat, not the lane: a replacement lane inherits it, so a
+        // handler that reached the cache before or after the swap still
+        // enqueues in one total order, and the replacement below happens
+        // entirely under it.
         let _guard = lane.enqueue_lock.lock().await;
 
         let node = match lane.try_enqueue(node) {
@@ -78,11 +86,8 @@ impl MessageHandler {
 
         // A caller that queued behind this lock on the same stale lane finds
         // the replacement already cached and joins it instead of replacing
-        // it again. Otherwise the fresh lane is published with this message
-        // already queued: an enqueue that finds it in the cache can only land
-        // behind it, so the hand-off keeps the chat's order even for enqueues
-        // that do not share the old lane's lock.
-        let pending = std::sync::Mutex::new(Some(node));
+        // it again. Nothing is enqueued before the lane is in the cache, so a
+        // cancellation here leaves at worst an empty worker that idles out.
         let fresh = match client.chat_lanes.get(&chat_jid).await {
             Some(current) if !current.queue_tx.same_channel(&lane.queue_tx) => current,
             _ => {
@@ -90,35 +95,18 @@ impl MessageHandler {
                 client
                     .chat_lanes
                     .get_with_by_ref(&chat_jid, async {
-                        let fresh = create_chat_lane(&client, Arc::clone(&lane.worker_running));
-                        let queued = pending.lock().unwrap_or_else(|p| p.into_inner()).take();
-                        if let Some(node) = queued
-                            && let Err(e) = fresh.try_enqueue(node)
-                        {
-                            // Unreachable for a channel whose worker was just
-                            // spawned; put the node back so the retry below
-                            // reports it.
-                            let e_node = match e {
-                                async_channel::TrySendError::Full(q)
-                                | async_channel::TrySendError::Closed(q) => q.node,
-                            };
-                            *pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(e_node);
-                        }
-                        fresh
+                        create_chat_lane(
+                            &client,
+                            Arc::clone(&lane.enqueue_lock),
+                            Arc::clone(&lane.worker_running),
+                        )
                     })
                     .await
             }
         };
-        // Still here when a racer published its own lane first, or when the
-        // already-replaced lane was joined above: the message goes in under
-        // that lane's own enqueue lock, like every other enqueue into it.
-        let queued = pending.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(node) = queued {
-            let _fresh_guard = fresh.enqueue_lock.lock().await;
-            if let Err(e) = fresh.try_enqueue(node) {
-                warn!("Failed to enqueue message for processing: {e}");
-                *cancelled = true;
-            }
+        if let Err(e) = fresh.try_enqueue(node) {
+            warn!("Failed to enqueue message for processing: {e}");
+            *cancelled = true;
         }
 
         true
@@ -145,10 +133,14 @@ impl StanzaHandler for MessageHandler {
 /// Construct a ChatLane with a spawned worker task. Extracted to keep the
 /// init closure passed to `get_with_by_ref` small.
 ///
-/// `worker_running` is the lock the worker holds while it runs; a lane that
-/// replaces an idle-exited one passes the predecessor's so the new worker
-/// queues behind it.
-fn create_chat_lane(client: &Arc<Client>, worker_running: Arc<async_lock::Mutex<()>>) -> ChatLane {
+/// Both locks belong to the chat rather than the lane: a lane that replaces
+/// an idle-exited one passes the predecessor's, so enqueues stay in one
+/// order across the swap and the new worker queues behind the old one.
+fn create_chat_lane(
+    client: &Arc<Client>,
+    enqueue_lock: Arc<async_lock::Mutex<()>>,
+    worker_running: Arc<async_lock::Mutex<()>>,
+) -> ChatLane {
     let (tx, rx) = async_channel::unbounded::<QueuedChatMessage>();
 
     let client_for_worker = client.clone();
@@ -206,7 +198,7 @@ fn create_chat_lane(client: &Arc<Client>, worker_running: Arc<async_lock::Mutex<
         .detach();
 
     ChatLane {
-        enqueue_lock: Arc::new(async_lock::Mutex::new(())),
+        enqueue_lock,
         queue_tx: tx,
         worker_running,
     }
@@ -323,6 +315,10 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first.worker_running, &second.worker_running),
             "the successor serializes behind the predecessor's running lock"
+        );
+        assert!(
+            Arc::ptr_eq(&first.enqueue_lock, &second.enqueue_lock),
+            "the chat's enqueue lock survives the swap"
         );
     }
 

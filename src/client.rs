@@ -379,7 +379,8 @@ pub(crate) struct ChatLane {
     /// Held by the lane's worker for as long as it runs. A worker that has
     /// gone idle closes its queue and exits; the replacement worker takes this
     /// lock before its first message, so the two can never process the same
-    /// chat at once, whatever the old one was still draining.
+    /// chat at once, whatever the old one was still draining. Like
+    /// `enqueue_lock`, it is the chat's and is inherited by the replacement.
     pub worker_running: Arc<Mutex<()>>,
 }
 
