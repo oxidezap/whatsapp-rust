@@ -71,9 +71,108 @@ impl UnacknowledgedPreKeyMessageItems {
     }
 }
 
+/// One buffered out-of-order message key of a receiver chain.
+///
+/// A modern record persists a skipped key as its 32-byte seed alone, and the
+/// generated `MessageKey` it decodes into carries that seed as a `Bytes` next
+/// to three empty `Option<Bytes>` slots: 136 bytes inline plus a 32-byte
+/// allocation for 36 bytes of information. This is the in-memory form, and it
+/// is `Copy`-sized: the seed lives inline and there is nothing to allocate or
+/// refcount when the chain is cloned. Only a record written before seeds were
+/// persisted, which carries the derived cipher/MAC/IV triple instead, keeps
+/// its protobuf, boxed so the common arm stays small.
+#[derive(Clone)]
+pub(crate) enum SkippedKey {
+    Seed { index: u32, seed: [u8; 32] },
+    Legacy(Box<session_structure::chain::MessageKey>),
+}
+
+impl std::fmt::Debug for SkippedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkippedKey")
+            .field("index", &self.index())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SkippedKey {
+    /// Adopt a decoded key. A seed-only key becomes the inline arm; anything
+    /// else, the legacy triple included, keeps its protobuf so it round-trips
+    /// and fails (or succeeds) at lookup exactly as it did before.
+    fn from_pb(pb: session_structure::chain::MessageKey) -> Self {
+        if let (Some(index), Some(seed)) = (pb.index, pb.seed.as_deref())
+            && let Ok(seed) = <[u8; 32]>::try_from(seed)
+            && pb.cipher_key.is_none()
+            && pb.mac_key.is_none()
+            && pb.iv.is_none()
+        {
+            return Self::Seed { index, seed };
+        }
+        Self::Legacy(Box::new(pb))
+    }
+
+    fn from_generator(generator: MessageKeyGenerator) -> Self {
+        match generator {
+            MessageKeyGenerator::Seed((seed, index)) => Self::Seed { index, seed },
+            MessageKeyGenerator::Serialized(pb) => Self::Legacy(Box::new(pb)),
+        }
+    }
+
+    fn into_generator(self) -> std::result::Result<MessageKeyGenerator, &'static str> {
+        match self {
+            Self::Seed { index, seed } => Ok(MessageKeyGenerator::new_from_seed(&seed, index)),
+            Self::Legacy(pb) => MessageKeyGenerator::from_pb(*pb),
+        }
+    }
+
+    fn index(&self) -> Option<u32> {
+        match self {
+            Self::Seed { index, .. } => Some(*index),
+            Self::Legacy(pb) => pb.index,
+        }
+    }
+
+    fn to_pb(&self) -> session_structure::chain::MessageKey {
+        match self {
+            Self::Seed { index, seed } => {
+                MessageKeyGenerator::new_from_seed(seed, *index).into_pb()
+            }
+            Self::Legacy(pb) => (**pb).clone(),
+        }
+    }
+
+    /// Heap bytes hanging off this key: only the legacy arm owns any.
+    fn pointed_bytes(&self) -> usize {
+        match self {
+            Self::Seed { .. } => 0,
+            Self::Legacy(pb) => {
+                size_of::<session_structure::chain::MessageKey>()
+                    + bytes_field_retained(&pb.cipher_key)
+                    + bytes_field_retained(&pb.mac_key)
+                    + bytes_field_retained(&pb.iv)
+                    + bytes_field_retained(&pb.seed)
+            }
+        }
+    }
+}
+
+/// The skipped keys of one receiver chain. `None` until the chain first
+/// skips, so the chains of an in-order conversation own nothing; behind an
+/// `Arc` so the decrypt snapshot taken before MAC verification is a refcount
+/// bump per chain rather than a copy of the whole backlog, which is what it
+/// cost while the keys lived inside the cloned protobuf chain. A skip-ahead
+/// during a decrypt pays one copy-on-write against that snapshot, for a
+/// chain that skipped anyway.
+type SkippedKeys = Option<Arc<Vec<SkippedKey>>>;
+
 #[derive(Clone, Debug)]
 pub struct SessionState {
     session: SessionStructure,
+    /// Parallel to `session.receiver_chains`, whose own `message_keys` stay
+    /// empty in memory: this is the source of truth, reassembled into the
+    /// protobuf only when the state is encoded (`to_protobuf`). Same trick
+    /// `SenderKeyState` plays with its backlog.
+    skipped: Vec<SkippedKeys>,
 }
 
 /// Snapshot of the subset of `SessionState` that the decrypt path
@@ -85,6 +184,7 @@ pub struct SessionState {
 /// Held opaque; restore via `SessionState::restore_decrypt_snapshot`.
 pub struct DecryptSnapshot {
     receiver_chains: Vec<session_structure::Chain>,
+    skipped: Vec<SkippedKeys>,
     root_key: Option<Vec<u8>>,
     previous_counter: Option<u32>,
     // Stored as `Option` rather than `MessageField` so the snapshot doesn't
@@ -121,8 +221,81 @@ fn write_chain_key(field: &mut Option<bytes::Bytes>, key: &[u8]) {
 }
 
 impl SessionState {
-    pub fn from_session_structure(session: SessionStructure) -> Self {
-        Self { session }
+    pub fn from_session_structure(mut session: SessionStructure) -> Self {
+        let skipped = session
+            .receiver_chains
+            .iter_mut()
+            .map(|chain| {
+                if chain.message_keys.is_empty() {
+                    return None;
+                }
+                let keys: Vec<SkippedKey> = std::mem::take(&mut chain.message_keys)
+                    .into_iter()
+                    .map(SkippedKey::from_pb)
+                    .collect();
+                Some(Arc::new(keys))
+            })
+            .collect();
+        Self { session, skipped }
+    }
+
+    /// Whether any receiver chain holds a skipped key, i.e. whether encoding
+    /// this state needs the backlog reassembled into the protobuf.
+    fn has_skipped_keys(&self) -> bool {
+        self.skipped
+            .iter()
+            .any(|keys| keys.as_ref().is_some_and(|keys| !keys.is_empty()))
+    }
+
+    /// The protobuf with the skipped keys put back, for encoding. Borrowed
+    /// when there is nothing to put back, which is every chain of an in-order
+    /// conversation; a clone with the backlog reassembled otherwise.
+    fn protobuf(&self) -> std::borrow::Cow<'_, SessionStructure> {
+        if !self.has_skipped_keys() {
+            return std::borrow::Cow::Borrowed(&self.session);
+        }
+        std::borrow::Cow::Owned(self.to_protobuf())
+    }
+
+    /// The protobuf with the skipped keys put back, owned.
+    pub(crate) fn to_protobuf(&self) -> SessionStructure {
+        let mut session = self.session.clone();
+        Self::fill_skipped(&mut session, &self.skipped);
+        session
+    }
+
+    /// [`Self::to_protobuf`] without the clone, for a state being consumed.
+    fn into_protobuf(mut self) -> SessionStructure {
+        Self::fill_skipped(&mut self.session, &self.skipped);
+        self.session
+    }
+
+    fn fill_skipped(session: &mut SessionStructure, skipped: &[SkippedKeys]) {
+        for (chain, keys) in session.receiver_chains.iter_mut().zip(skipped) {
+            if let Some(keys) = keys {
+                chain.message_keys = keys.iter().map(SkippedKey::to_pb).collect();
+            }
+        }
+    }
+
+    /// Heap bytes the skipped-key backlog points at: the per-chain slots,
+    /// then for each chain that skipped, the `Arc` and `Vec` headers, the
+    /// buffer at its capacity, and whatever a legacy key still boxes. The
+    /// `Vec<SkippedKeys>` header itself is inline in the state, charged by
+    /// whoever owns the state.
+    fn skipped_pointed_bytes(&self) -> usize {
+        self.skipped.capacity() * size_of::<SkippedKeys>()
+            + self
+                .skipped
+                .iter()
+                .flatten()
+                .map(|keys| {
+                    2 * size_of::<usize>()
+                        + size_of::<Vec<SkippedKey>>()
+                        + keys.capacity() * size_of::<SkippedKey>()
+                        + keys.iter().map(SkippedKey::pointed_bytes).sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     /// Capture the mutable-during-decrypt fields so MAC failure can
@@ -132,6 +305,7 @@ impl SessionState {
     pub fn decrypt_snapshot(&self) -> DecryptSnapshot {
         DecryptSnapshot {
             receiver_chains: self.session.receiver_chains.clone(),
+            skipped: self.skipped.clone(),
             root_key: self.session.root_key.clone(),
             previous_counter: self.session.previous_counter,
             sender_chain: self.session.sender_chain.as_option().cloned(),
@@ -144,6 +318,7 @@ impl SessionState {
     /// untouched since they were never modified.
     pub fn restore_decrypt_snapshot(&mut self, snap: DecryptSnapshot) {
         self.session.receiver_chains = snap.receiver_chains;
+        self.skipped = snap.skipped;
         self.session.root_key = snap.root_key;
         self.session.previous_counter = snap.previous_counter;
         self.session.sender_chain = snap.sender_chain.into();
@@ -169,6 +344,7 @@ impl SessionState {
                 alice_base_key: Some(alice_base_key.serialize().to_vec()),
                 ..Default::default()
             },
+            skipped: Vec::new(),
         }
     }
 
@@ -393,6 +569,7 @@ impl SessionState {
         };
 
         self.session.receiver_chains.push(chain);
+        self.skipped.push(None);
 
         // Remove oldest chains if we exceed capacity (MAX_RECEIVER_CHAINS = 5).
         // Using drain() for consistency, though with only 5 elements the difference is negligible.
@@ -406,6 +583,7 @@ impl SessionState {
             );
             let excess = len - consts::MAX_RECEIVER_CHAINS;
             self.session.receiver_chains.drain(..excess);
+            self.skipped.drain(..excess);
         }
     }
 
@@ -535,12 +713,15 @@ impl SessionState {
             return Ok(None);
         };
 
+        let Some(keys) = self.skipped.get_mut(chain_idx).and_then(Option::as_mut) else {
+            return Ok(None);
+        };
+
         // Find the message key index without cloning
-        let chain = &self.session.receiver_chains[chain_idx];
         let mut message_key_position = None;
-        for (i, m) in chain.message_keys.iter().enumerate() {
+        for (i, m) in keys.iter().enumerate() {
             let idx = m
-                .index
+                .index()
                 .ok_or(InvalidSessionError("missing message key index"))?;
             if idx == counter {
                 message_key_position = Some(i);
@@ -550,11 +731,10 @@ impl SessionState {
 
         if let Some(position) = message_key_position {
             // swap_remove: lookup is by counter, so slot order is free to
-            // scramble.
-            let message_key = self.session.receiver_chains[chain_idx]
-                .message_keys
-                .swap_remove(position);
-            let keys = MessageKeyGenerator::from_pb(message_key).map_err(InvalidSessionError)?;
+            // scramble. The copy-on-write lands only while a decrypt snapshot
+            // still shares the backlog.
+            let message_key = Arc::make_mut(keys).swap_remove(position);
+            let keys = message_key.into_generator().map_err(InvalidSessionError)?;
             return Ok(Some(keys));
         }
 
@@ -570,38 +750,34 @@ impl SessionState {
             .get_receiver_chain_index(sender)?
             .expect("called set_message_keys for a non-existent chain");
 
-        let chain = &mut self.session.receiver_chains[chain_idx];
+        let keys = Arc::make_mut(self.skipped[chain_idx].get_or_insert_with(Default::default));
 
         // AMORTIZED EVICTION: Only prune when exceeding MAX + threshold.
         // This reduces O(n) prunes from every insert to once every PRUNE_THRESHOLD inserts.
         // The lookup in get_message_keys() does a linear search by counter value, so order
         // doesn't matter for correctness.
-        let len = chain.message_keys.len();
+        let len = keys.len();
         if len > consts::MAX_MESSAGE_KEYS + consts::MESSAGE_KEY_PRUNE_THRESHOLD {
             let excess = len - consts::MAX_MESSAGE_KEYS;
             // Evict the oldest keys by counter value, not slot position:
             // swap_remove (here and in get_message_keys) scrambles slot
             // order, so the front is not the oldest after the first prune.
-            let mut counters: Vec<u32> = chain
-                .message_keys
-                .iter()
-                .map(|m| m.index.unwrap_or(0))
-                .collect();
+            let mut counters: Vec<u32> = keys.iter().map(|m| m.index().unwrap_or(0)).collect();
             let (_, &mut threshold, _) = counters.select_nth_unstable(excess - 1);
             // The removal ceiling keeps duplicate counters at the threshold
             // (impossible in a valid session) from evicting extra keys.
             let mut removed = 0;
             let mut i = 0;
-            while i < chain.message_keys.len() && removed < excess {
-                if chain.message_keys[i].index.unwrap_or(0) <= threshold {
-                    chain.message_keys.swap_remove(i);
+            while i < keys.len() && removed < excess {
+                if keys[i].index().unwrap_or(0) <= threshold {
+                    keys.swap_remove(i);
                     removed += 1;
                 } else {
                     i += 1;
                 }
             }
         }
-        chain.message_keys.push(message_keys.into_pb());
+        keys.push(SkippedKey::from_generator(message_keys));
 
         Ok(())
     }
@@ -721,13 +897,13 @@ impl From<SessionStructure> for SessionState {
 
 impl From<SessionState> for SessionStructure {
     fn from(value: SessionState) -> SessionStructure {
-        value.session
+        value.into_protobuf()
     }
 }
 
 impl From<&SessionState> for SessionStructure {
     fn from(value: &SessionState) -> SessionStructure {
-        value.session.clone()
+        value.to_protobuf()
     }
 }
 
@@ -1007,7 +1183,7 @@ impl SessionRecord {
         }
         let current_session = self
             .current_session
-            .map(|state| session_components_from_structure(state.session))
+            .map(|state| session_components_from_structure(state.into_protobuf()))
             .transpose()?;
         let previous_sessions = self
             .previous_sessions
@@ -1019,7 +1195,7 @@ impl SessionRecord {
                 }
                 let mut state = SessionState::from_session_structure(session);
                 state.fast_forward_sender_chain_or_drop(reserved_sender_chain_index);
-                session_components_from_structure(state.session)
+                session_components_from_structure(state.into_protobuf())
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1076,7 +1252,7 @@ impl SessionRecord {
             };
             let mut state = SessionState::from_session_structure(session);
             state.fast_forward_sender_chain_or_drop(ceiling);
-            *archived = ArchivedSession::encode(&state.session);
+            *archived = ArchivedSession::encode(&state.into_protobuf());
         }
         self.lease.waive();
     }
@@ -1375,7 +1551,7 @@ impl SessionRecord {
                 sessions.pop();
             }
             current_session.clear_unacknowledged_pre_key_message();
-            sessions.insert(0, ArchivedSession::encode(&current_session.session));
+            sessions.insert(0, ArchivedSession::encode(&current_session.into_protobuf()));
             true
         } else {
             false
@@ -1425,10 +1601,12 @@ impl SessionRecord {
         }
 
         let mut cache = buffa::SizeCache::new();
-        let current_msg_len = self
-            .current_session
-            .as_ref()
-            .map(|s| s.session.compute_size(&mut cache) as usize);
+        // Borrowed unless a receiver chain holds skipped keys, in which case
+        // the backlog is reassembled into a clone for the encoder.
+        let current = self.current_session.as_ref().map(|s| s.protobuf());
+        let current_msg_len = current
+            .as_deref()
+            .map(|s| s.compute_size(&mut cache) as usize);
         let current_len = current_msg_len
             .map(|msg_len| 1 + varint_len(msg_len as u64) + msg_len)
             .unwrap_or(0);
@@ -1461,10 +1639,10 @@ impl SessionRecord {
         buf.clear();
         buf.reserve(current_len + previous_len + reserved_len + incarnation_len);
 
-        if let Some(state) = &self.current_session
+        if let Some(session) = current.as_deref()
             && let Some(msg_len) = current_msg_len
         {
-            write_len_delimited(1, &state.session, msg_len, &mut cache, buf);
+            write_len_delimited(1, session, msg_len, &mut cache, buf);
         }
         for archived in self.previous_sessions.iter() {
             let bytes = archived.as_bytes();
@@ -1499,7 +1677,7 @@ impl SessionRecord {
         let current = self
             .current_session
             .as_ref()
-            .map(|s| session_pointed_bytes(&s.session))
+            .map(|s| session_pointed_bytes(&s.session) + s.skipped_pointed_bytes())
             .unwrap_or(0);
         // The `Arc` owns a `Vec` header plus its buffer; each archived state
         // is its own boxed slice of encoded bytes.
@@ -2026,12 +2204,14 @@ mod tests {
         }
     }
 
-    /// What these reports exist to catch is a receiver chain accumulating
-    /// skipped message keys — up to `MAX_MESSAGE_KEYS` of them per chain. That
-    /// only works if the figure is memory, not wire bytes: a modern seed-only
-    /// key is ~36 bytes encoded and 136 bytes of `MessageKey` plus a 32-byte
-    /// `Bytes` allocation in memory, because the three fields it leaves empty
-    /// still occupy their `Option<Bytes>` slots.
+    /// The skipped-key backlog is the one structure in the store that grows
+    /// without bound, up to `MAX_MESSAGE_KEYS` per chain, so the report has
+    /// to charge it at what it costs in memory — and what it costs is now
+    /// the inline `SkippedKey`, not the 136-byte protobuf `MessageKey` plus a
+    /// 32-byte `Bytes` allocation that a seed-only key used to occupy. The
+    /// figure must cover the compact form and must no longer be anywhere
+    /// near the protobuf one, or the report would be describing memory the
+    /// state no longer holds.
     #[test]
     fn skipped_message_keys_are_reported_at_their_in_memory_cost() {
         const KEYS: usize = 500;
@@ -2057,26 +2237,48 @@ mod tests {
         let mut session = make_cache_shape_session(1, 0, 0);
         session.receiver_chains = vec![chain];
 
+        let state = SessionState::from_session_structure(session.clone());
+        assert!(
+            state.session.receiver_chains[0].message_keys.is_empty(),
+            "the protobuf keeps no skipped keys in memory"
+        );
         let record = SessionRecord {
-            current_session: Some(SessionState::from_session_structure(session.clone())),
+            current_session: Some(state),
             previous_sessions: Arc::new(Vec::new()),
             lease: CounterLease::default(),
         };
 
         let reported = record.estimated_size();
-        let backlog = KEYS * size_of::<session_structure::chain::MessageKey>();
+        let compact = KEYS * size_of::<SkippedKey>();
+        let protobuf_shape = KEYS * (size_of::<session_structure::chain::MessageKey>() + 32);
         assert!(
-            reported >= backlog,
-            "a {KEYS}-key backlog occupies at least {backlog} B; reported {reported} B"
+            reported >= compact,
+            "a {KEYS}-key backlog occupies at least {compact} B; reported {reported} B"
+        );
+        assert!(
+            reported < protobuf_shape,
+            "the report ({reported} B) must not still charge the protobuf shape \
+             ({protobuf_shape} B) the backlog no longer takes"
+        );
+        assert!(
+            size_of::<SkippedKey>() <= 40,
+            "a seed-only skipped key is a u32 and 32 bytes of seed"
         );
 
-        // And the figure this replaced: the encoded size, which is what the
-        // report used to hand back for the very same record.
-        let encoded = session.encode_to_vec().len();
-        assert!(
-            reported > encoded * 3,
-            "the in-memory figure ({reported} B) must be far above the encoded \
-             one ({encoded} B) for a seed-only backlog"
+        // And the backlog round-trips: what was moved out comes back on encode.
+        assert_eq!(
+            record.serialize().expect("serialize").len(),
+            SessionRecord {
+                current_session: Some(SessionState {
+                    session: session.clone(),
+                    skipped: Vec::new(),
+                }),
+                previous_sessions: Arc::new(Vec::new()),
+                lease: CounterLease::default(),
+            }
+            .serialize()
+            .expect("serialize")
+            .len()
         );
     }
 
@@ -2580,7 +2782,7 @@ mod tests {
             let key = KeyPair::generate(&mut rng()).public_key;
             let state = create_test_session_state(3, &key);
             Arc::make_mut(&mut record.previous_sessions)
-                .push(ArchivedSession::encode(&state.session));
+                .push(ArchivedSession::encode(&state.to_protobuf()));
         }
 
         // Serialize
