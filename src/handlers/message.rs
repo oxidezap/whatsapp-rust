@@ -63,11 +63,8 @@ impl MessageHandler {
             })
             .await;
 
-        // Lock serializes enqueue order for this chat. The lock belongs to
-        // the chat, not the lane: a replacement lane inherits it, so a
-        // handler that reached the cache before or after the swap still
-        // enqueues in one total order, and the replacement below happens
-        // entirely under it.
+        // Lock serializes enqueue order for this chat, the replacement
+        // below included (see `create_chat_lane` for why it outlives the lane).
         let _guard = lane.enqueue_lock.lock().await;
 
         let node = match lane.try_enqueue(node) {
@@ -133,9 +130,13 @@ impl StanzaHandler for MessageHandler {
 /// Construct a ChatLane with a spawned worker task. Extracted to keep the
 /// init closure passed to `get_with_by_ref` small.
 ///
-/// Both locks belong to the chat rather than the lane: a lane that replaces
-/// an idle-exited one passes the predecessor's, so enqueues stay in one
-/// order across the swap and the new worker queues behind the old one.
+/// Both locks belong to the chat rather than the lane, which is why they are
+/// parameters: a lane that replaces an idle-exited one passes the
+/// predecessor's, and only the chat's first lane mints new ones. Sharing
+/// `enqueue_lock` keeps every enqueue for the chat in one total order
+/// whichever lane generation a handler fetched, and the swap itself runs
+/// under it; sharing `worker_running` makes the new worker wait for the old
+/// one to finish draining, so the two never process the same chat at once.
 fn create_chat_lane(
     client: &Arc<Client>,
     enqueue_lock: Arc<async_lock::Mutex<()>>,
