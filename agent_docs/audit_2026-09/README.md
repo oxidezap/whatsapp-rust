@@ -1,290 +1,250 @@
-# Auditoria de arquitetura — whatsapp-rust, whatsapp-rust-bridge, baileyrs
+# Auditoria de arquitetura — whatsapp-rust, whatsapp-rust-bridge, baileyrs (v2)
 
 Data: 2026-09-02. Commits auditados: `whatsapp-rust@310b969`, `whatsapp-rust-bridge@2332118`, `baileyrs@441c7f4`.
 
-Objetivo: oportunidades de melhorar arquitetura, performance, DRY, reduzir complexidade e reduzir código nas três camadas, respeitando a regra de dependência (`whatsapp-rust` não conhece o bridge; o bridge não conhece o baileyrs).
+**Esta é a segunda versão.** A primeira (seis relatórios de leitura de código, agora em `appendix/`) foi submetida a uma rodada adversarial: dois verificadores tentaram falsificar cada achado, e mais três agentes olharam por ângulos que leitura de código não dá: histórico git (o que é quente e frágil vs. grande e frio), drift real dos contratos e defeitos de correção nas fronteiras, e arquiteturas alternativas com consumidores externos medidos. Somam-se medições de `cargo check`. O resultado muda prioridades e derruba várias recomendações. A seção 1 lista o que estava errado.
 
-Este README é a síntese. Os seis apêndices em `appendix/` trazem cada achado com `arquivo:linha`, delta de linhas estimado, risco e se preserva comportamento:
-
-| Apêndice | Escopo |
+| Apêndice | Conteúdo |
 | --- | --- |
-| `appendix/core-src.md` | `whatsapp-rust/src/` (client, send, retry, receipt, handlers, features, plugins) |
-| `appendix/wacore.md` | `wacore/` (iq, stanza, store, binary, libsignal, noise, derive) e `waproto` |
-| `appendix/core-peripheral.md` | VoIP, plugins/wam-catalog, sqlite-storage, transports, benches, matriz de features, dependências |
-| `appendix/bridge-rust.md` | bridge `src/` (wasm_client, errors, result_types, js_* adapters, wire_batch, camel_serializer) |
-| `appendix/bridge-ts.md` | bridge `ts/`, `codegen/`, `scripts/`, testes, pipeline de build |
-| `appendix/baileyrs.md` | baileyrs `src/` (Bridge, Socket, Utils, Compatibility, WAProto), scripts, testes |
-
-A visão transversal (seção 3) foi consolidada a partir desses seis; o agente dedicado a ela foi interrompido por limite de uso antes de escrever, e o caminho de dados que ele iria traçar já está evidenciado nos apêndices `bridge-ts.md` (achado 10) e `baileyrs.md` (achados 1, 3, 4, 5).
-
----
-
-## 1. Números que enquadram o problema
-
-| Camada | Linhas (`.rs`/`.ts`) | Geradas | Testes | Código "de verdade" |
-| --- | ---: | ---: | ---: | ---: |
-| whatsapp-rust | 589k | 163k | ~206k (inline) + 54k (arquivos) | ~170k |
-| whatsapp-rust-bridge | 144k | 102k | ~13k | ~29k |
-| baileyrs | 78k | 14k (`WAProto/index.d.ts`) | ~38k | ~26k |
-
-Três conclusões saem só desses números:
-
-1. **O volume dominante é gerado e não usado.** No core, `mex_operations.rs` (11k linhas, 947 structs) tem 79% nunca referenciado; `abprops.rs` (18.7k linhas, 2.664 constantes) tem 16 lidas em produção; `wam-catalog` (132k linhas) serve 9 eventos. No bridge, `ts/generated/whatsapp.ts` (81k) carrega `fromPartial`/`create` (~9.6k linhas) que a `.d.ts` publicada nem declara. O padrão `WANTED` que `wire_enums.rs` já usa resolve todos eles.
-2. **Os arquivos "de 8k linhas" são um problema de posicionamento de teste.** Seis dos dez maiores arquivos do core são mais de 55% `mod tests` inline (`send/mod.rs` 63%, `retry.rs` 67%, `receipt.rs` 69%, `device_registry.rs` 65%, `appstate_sync.rs` 99,7%). Mover para `tests.rs` irmão (padrão que `src/client.rs` já usa) é mecânico, risco zero, e torna qualquer outra refatoração revisável.
-3. **Cada camada re-implementa a semântica da camada de baixo em vez de consumi-la.** É a fonte de ~60% do código não gerado do bridge e do baileyrs (seção 3).
+| `appendix/core-src.md`, `wacore.md`, `core-peripheral.md`, `bridge-rust.md`, `bridge-ts.md`, `baileyrs.md` | Primeira rodada: leitura de código por área, com `arquivo:linha`. **Ler junto com a errata correspondente.** |
+| `appendix/verify-core.md` | Verificação adversarial dos três relatórios do core: veredito por achado (CONFIRMED / OVERSTATED / WRONG / UNSAFE) |
+| `appendix/verify-bridge-baileyrs.md` | Idem para bridge e baileyrs |
+| `appendix/history.md` | 12 meses de git: arquivos quentes, co-mudança, cascata entre repos, taxa de re-fix, cadência de release |
+| `appendix/drift-and-defects.md` | Drift medido hoje entre as três camadas + 12 defeitos de correção com repro |
+| `appendix/alternatives.md` | Sete arquiteturas alternativas avaliadas, consumidores externos medidos (crates.io, npm), impacto semver |
+| `appendix/build-timings.txt` | `cargo check --timings` do workspace e tempos incrementais |
 
 ---
 
-## 2. Achados por camada, ordenados por impacto
+## 1. Errata da primeira versão
 
-### 2.1 whatsapp-rust — `src/` (apêndice `core-src.md`)
+O que a rodada adversarial derrubou ou corrigiu. Os números da v1 estavam inflados em 30 a 60% de forma sistemática (contagens à mão), e sete recomendações quebravam invariantes documentados ou consumidores reais.
 
-| # | Achado | Δ linhas | Risco |
-| --- | --- | ---: | --- |
-| 1 | Mover `mod tests` inline dos oito arquivos gigantes para `*/tests.rs` (~23k linhas saem dos arquivos de produção) | 0 | nenhum |
-| 2 | `Client` tem **145 campos**; ~40 `Arc<Atomic*>`/`Arc<Mutex>`/`Arc<Event>` nunca são clonados (o `Client` já vive em `Arc`). Agrupar por domínio (`ConnectionState`, `OfflineSync`, `AppStateSync`, `Pairing`, `RetryState`) | −150 a −250 | baixo |
-| 3 | ~30 campos do `Client` são lidos por um único módulo (`pdo_*`, `pending_lid_refreshes`, `pending_retries`, `app_state_*`, `chatstate_*`), violando `subsystem_boundary.md`. Viram structs de estado por módulo | −50 a −100 | baixo |
-| 4 | `MemoryReport`/`CacheConfig`/`assemble`/`memory_report()` espelham cada cache à mão em seis lugares (57 campos, 57 `writeln!`). Tabela `(&str, u64)` + loop | −180 a −220 | baixo |
-| 5 | Resolução PN⇄LID implementada **oito vezes** com semânticas levemente diferentes (`lid_pn.rs` ×5, `tctoken_lifecycle.rs` ×3, `blocking.rs`, `polls.rs`/`events.rs` idênticos). Um resolvedor com `Keep::{Device,Bare}` explícito | −120 a −160 | médio |
-| 6 | `client/app_state.rs` (3.7k de código) são quatro módulos num arquivo; `sync_collections_batched_inner` tem 484 linhas | ~0 | baixo |
-| 7 | `process_session_enc_batch` 749 linhas / 13 níveis de indentação; `handle_success` 578; `send_group_branch` 388 / 10 níveis. Extrair `classify_decrypt_failure`, `prepare_group_send()` | −100 | médio (hot path) |
-| 8 | 13 enums `features/*Error` com o mesmo shape `{Iq, Mex, InvalidRequest(String), Internal(anyhow)}`; 68 arquivos usam `anyhow`. Um `FeatureError` + variantes de domínio só onde existem | −120 a −180 | médio (API pública) |
-| 9 | `BotBuilder` redeclara 17 setters do `ClientBuilder` em campos `Option` paralelos | −150 a −250 | baixo |
-| 10 | `update_device_list_guarded` duplica `update_device_lists_guarded` | −60 | baixo |
-| 12 | `appstate_sync.rs`: 5 linhas de re-export + 1.777 de teste com um `MockBackend` próprio, quando `create_test_backend()` já existe; `message/tests.rs` tem outro trio `Mem*Store` | −300 a −400 | nenhum |
-| 13 | Fixtures de teste: 240 helpers em `message/tests.rs`, três `MockHttpClient`, cinco `create_transport`, 31 `<iq>` falsos construídos à mão apesar de `test_utils::answer_iq` existir | −800 a −1.500 | nenhum |
+| Afirmação da v1 | Veredito | O que é verdade |
+| --- | --- | --- |
+| 58 `map_err(BridgeError::from)` redundantes, −116 linhas | **Errado** | 56 dos 58 são expressões de cauda; `?` não economiza nada. Ganho: 0. |
+| Eventos do bridge deveriam emitir JID como string `user@server` | **Inseguro** | `Jid::Display` é lossy: `write_jid!` nunca renderiza `integrator`, que o decoder preenche para `@interop` e `is_same_chat_as` compara. JID-string colapsaria chats interop distintos. O baileyrs também lê `.agent`/`.device` do struct. |
+| `js_backend.rs` re-deriva a política de `in_memory.rs` (−2.000 no core) | **Errado / inseguro** | `in_memory.rs` são `HashMap`s tipados com enumeração nativa, sem self-index, sem chave composta, sem expiry scan. Não há −2.000. E o esquema de chaves é **contrato persistido lido diretamente pelo baileyrs** (`use-multi-file-auth-state.ts`, `legacy-store/constants.ts`) e documentado no README para usuários. |
+| `@bufbuild/protobuf` sem uso no baileyrs; remover | **Errado** | É load-bearing: o `.d.ts` publicado do bridge importa dele, e o baileyrs subclassifica `BinaryReader`. Com `skipLibCheck: true` a remoção tornaria a classe base `any` silenciosamente. O problema real é o inverso: **o bridge publica um `.d.ts` que depende de uma devDependency.** |
+| Estreitar `exports["./lib/*"]` do baileyrs | **Inseguro** | O `baileys@7.0.0-rc13` upstream não tem `exports` map: todo deep import em `lib/*` funciona. `./lib/*` é a promessa drop-in. |
+| ~820 linhas de Signal/retry "não usadas pelo socket" (−820) | **Inseguro** | O upstream exporta todas (`extractE2ESessionFromRetryReceipt`, `makeCacheableSignalKeyStore`, `MessageRetryManager`...); o baileyrs re-exporta por compatibilidade; `check-layer-boundaries.ts` **proíbe** o socket de importá-las. É design, não código morto. Ganho real: −100 (consolidar LRU/cache). |
+| Unificar 13 enums `features/*Error` num `FeatureError` | **Superestimado / inseguro** | Só ~5 têm o shape idêntico; `PollError`, `TcTokenError`, `BusinessError`, `MexError` são heterogêneos. O bridge faz `match` em **55** braços desses enums. Ganho: −40 a −60. |
+| `MemoryReport` → tabela `(&str, u64)` (−200) | **Inseguro** | 66 campos `pub` lidos por nome no bridge (22 leituras em `connection.rs`), em `memory_soak.rs` e exemplos; `tests/report_coverage.rs` exige o nome de cada campo em `memory_report()`. Já existe `collections()` de 13 entradas e `Display` já itera. Seguro: só o `Display`, −40 a −60. |
+| Apagar a família do meio de traits de store libsignal (−58 wacore, −900 src) | **Inseguro** | `impl SessionStore for Device` é o **caminho de bypass do cache** documentado em `signal_durability.md`, com `direct_store_incarnation()` próprio; `check_session_exists` passa por ele em produção. É reescrita de caminho de durabilidade, não remoção de cola. E `opencrabs` (crates.io) implementa `wacore::store::traits` e já foi quebrado uma vez por mudança nesse shape. |
+| `SignalStoreCache` com placeholder `Loading` single-flight | **Inseguro** | `signal_cache.rs:86-96` documenta a janela de remoção como "livre de estado por leitor que uma leitura cancelada possa encalhar"; um slot `Loading` é exatamente esse estado. Manter só o `flush_store` genérico, e mesmo esse é −60 a −80, não −190: o bloco de sessões carrega a ordem de deleção de prekey consumida. |
+| `history_sync.rs` sem teste diferencial entre walker e fallback | **Errado** | `differential_fast_path_matches_full_decode_oracle` existe em `history_sync.rs:2772`. |
+| Extrair VoIP em `wacore-voip` é mecânico | **Inseguro como descrito** | `wacore::types::call::MediaOffer.relay: Option<voip::relay_parse::RelayData>` e `stanza/call.rs` chamam `voip::relay_parse`, enquanto `voip` usa `stanza::call`, `types::group_call`, `stats`. `RelayData` + `hbh_srtp` + `rtcp` precisam ficar em `wacore` ou os crates ciclam. E `subsystem_boundary.md` não "adiou" a decisão dos três helpers: registrou explicitamente que ficam. |
+| 284 gates `voip-runtime` em `src/`, +66% vs. a doc | **Errado** | A doc conta só produção; produção hoje é **161** (abaixo dos 171 da doc). `handle` tem 28 braços, não 39. `CallConfig::for_group` tem 53 linhas, não 284. |
+| ~30 campos do `Client` lidos por um único módulo violam `subsystem_boundary.md` | **Errado** | A doc aplica o teste 2 a *subsistemas* e diz que `src/message`/`src/send` "falham por construção". Várias alegações de leitor único são falsas (`pdo_requested` é lido por `message/retry.rs`, `undecryptable_dispatched` por dois módulos...). VoIP já está no seam. ~6 campos são genuinamente de leitor único. |
+| Agrupar `Client` em sub-structs | **Inseguro sem preparo** | `tests/report_coverage.rs` parseia `struct Client` com `syn` e desce **um** nível; `Client -> OfflineSync -> Cache` fica invisível ao guard. Estender o guard primeiro. |
+| `abprops.rs` custa compilação | **Superestimado** | `props.rs:62-66` já documenta que só as constantes lidas materializam no binário. Ganho é ruído de diff, não build. |
+| `run() -> Promise<TerminalReason>` economiza −300 a −400 no baileyrs | **Parcial** | A *conclusão* do loop é exponível hoje no bridge (−150). A *razão* exige um `RunExit` no core, que não existe; `ClientLifecycle` não tem hook de saída. |
+| `uploadEncryptedMediaStream` deveria usar `Client::upload_stream` e parar de bufferizar | **Parcial** | Dedupe vale (−170), mas `UploadSource` exige `Send + Sync` com `reader_from` síncrono; um `ReadableStream` JS não satisfaz. Continuaria bufferizando. Ganho de memória: 0. |
+| Throttle de spawn do bridge compensa thundering herd no core | **Não verificado / obsoleto** | O comentário culpa um semáforo que "acorda todos"; `async-lock 3.4.2` acorda um. Medir antes de mexer no core. |
+| Remover `scopeguard` (2 usos) | **Errado** | 7 usos em produção. Manter. |
+| Aliases de feature economizam legs de `cargo hack` | **Errado** | Mantendo os aliases (como a própria v1 recomenda) economiza zero legs. `tokio-native` está no `default` e é usado por e2e/bench/voip-cli. |
+| 26 de 58 adapters do baileyrs são `noop` | **Superestimado** | 66 entradas, 16 `noop` incondicionais. |
+| 240 helpers em `message/tests.rs`; 145 campos no `Client`; 40 `IqSpec` com `Response = ()` | **Superestimado** | ~95 helpers; 137 campos (145 contando `cfg(test)`); 25 `IqSpec`. |
+| `to_str = to.to_string()` no send é alocação só para log | **Errado** | É a chave `&str` de `SenderKeyName::from_parts` e de quatro tabelas, armazenada em campo de struct. |
 
-Verificado e **não** é problema: locks `std` mantidos através de `await` (zero em produção), alocação em hot path (`receive.rs` tem 2 `to_string()` em 2.2k linhas), gates de feature fora do dono (dentro do teto documentado).
-
-### 2.2 whatsapp-rust — `wacore/` (apêndice `wacore.md`)
-
-| # | Achado | Δ linhas | Risco |
-| --- | --- | ---: | --- |
-| 1 | `mex_operations.rs`: 79% nunca referenciado (747 de 947 structs, cada uma com derive `Serialize`+`Deserialize`+`Debug`+`Clone`+`Default` expandido em toda compilação). Adicionar `WANTED` ao `emit/mex.rs` | −8.500 | baixo |
-| 2 | `abprops.rs`: 2.664 constantes, 16 lidas (`props::WATCHED`). `WANTED` + mover o teste de cobertura para o codegen | −18.500 | baixo |
-| 3 | **Três famílias de traits de store Signal** para os mesmos dados: `wacore::store::SignalStore` (bytes) → `wacore_libsignal::store::*` (glue puro, `get_sub_device_sessions` retorna `Vec::new()`) → `wacore_libsignal::protocol::storage::*` (o que os ciphers usam). Apagar a família do meio; `src/store/signal.rs` + `signal_adapter.rs` têm 1.907 linhas de cola | −600 a −900 | médio (durabilidade Signal) |
-| 4 | O derive `ProtocolNode` só cobre atributos, então os nós mais ricos são escritos à mão: `GroupInfoResponse` = 56 campos, `into_node` 235 linhas + `try_from_node_ref` 290, com 24× `get_optional_child_by_tag(..).is_some()`. Adicionar `#[child(tag, flag)]`, `#[child(tag, text)]`, `#[children(tag)]` ao derive | −500 a −600 | médio |
-| 5 | `wacore-binary`: `Node`/`NodeRef`/`OwnedNodeRef` triplicam a API de leitura; `AttrParser`/`AttrParserRef` duplicam 200 linhas; `marshal.rs` tem cada entry point duas vezes. Trait `AttrSource` + `NodeLike` + macro de forwarders | −470 | baixo (testes de byte-igualdade existem) |
-| 6 | Mocks de store libsignal re-implementados **51 vezes** em testes/benches (`MemSessionStore` definido três vezes em `send/tests.rs`). Upstream tinha `InMemSignalProtocolStore`; o fork removeu. Recolocar sob `test-util` | −1.200 a −1.400 | nenhum |
-| 7 | `SignalStoreCache`: 6 locks, 5 atômicos, protocolo "fui ultrapassado?" (`removal_seq`, `recent_removals`, `UNLOCKED_COLD_READ_ATTEMPTS`) só para soltar o lock durante I/O; `flush` de 190 linhas escrito três vezes. Placeholder `Loading` por chave (single-flight) simplifica; `flush_store<S: DirtyStore>` genérico é independente e seguro | −270 (+ −400 testes) | alto (single-flight) / baixo (flush) |
-| 8 | `events.rs`: `EventKind`, `Event` e `Event::kind()` são três cópias manuais da mesma lista de 78 variantes | −90 | baixo |
-| 9 | Superfície pública morta confirmada (zero uso no workspace e no bridge): `messages.rs` ×7 fns, `reporting_token.rs`, `usync.rs::parse_get_user_devices_response*`, `stanza/call.rs::build_{transport,relay_latency,heartbeat}`, `PlaintextContent`/`DecryptionErrorMessage` no libsignal, `define_simple_node!`/`define_empty_node!` | −1.000 a −1.200 | baixo (semver minor) |
-| 10 | `history_sync.rs` tem duas implementações de extração de message-secret (walker manual de ~700 linhas + fallback de decode completo) sem teste diferencial. Medir; se ganho < 2×, apagar o walker | −80 a −700 | médio |
-| 11 | 40 dos 69 `impl IqSpec` têm `type Response = ()` com `parse_response` idêntico; três toggles de grupo escritos à mão ao lado de uma macro que faz exatamente isso | −250 | baixo |
-| 12 | Helpers de parse existem três vezes com semânticas diferentes (`optional_u64_attr` erra em número inválido; `AttrParserRef::optional_u64` devolve `None` silencioso). `GroupParticipantDetails::from_node` re-escaneia atributos duas vezes após `finish()` — 20k scans extras num grupo de 10k participantes | −110 | baixo |
-| 14 | 99 pares `#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]` idênticos → um attribute macro em `wacore-derive` | −100 | nenhum |
-| 15 | `waproto`: 752 mensagens geradas, ~140 nomeadas em qualquer lugar. Poda por fecho transitivo a partir de raízes `WANTED` no `build.rs` (que já reescreve o descriptor) | a medir | médio |
-
-### 2.3 whatsapp-rust — periféricos (apêndice `core-peripheral.md`)
-
-| # | Achado | Δ | Risco |
-| --- | --- | ---: | --- |
-| 1 | **VoIP é 85,6k linhas** (39,7k código, 45,9k testes) dentro dos dois crates publicados, e compila para nada num build default; o bridge não ativa nenhuma feature voip. O codec MLow (20k linhas, porte símbolo-a-símbolo do `smpl_audio_codec` da Meta) é autocontido, tem `build.rs` próprio que roda em **todo** build de `wacore` (incluindo wasm/ESP32) e embarca **16 MB de vetores de teste no pacote publicado** (`wacore` 0.7.0 = 22,1 MiB; 7,5 MiB comprimido). Extrair `wacore-mlow`, `wacore-voip`, `whatsapp-rust-voip`; sinalização (`reject_call`, `Event::IncomingCall`, `stanza::call`) fica no core | pacote 22 → ~6 MiB; sem build script no default | médio |
-| 2 | `src/client/voip.rs` (156 gates) e `src/handlers/call.rs` (119 gates) somam 275 dos 284 `cfg(feature = "voip-runtime")` de `src/` porque sinalização não-gateada e mídia gateada dividem o arquivo. `CallHandler::handle` é **uma função de 980 linhas** com 39 braços. Dividir no gate | −270 atributos; gates 284 → ~15 | baixo |
-| 3 | `wam-catalog`: 132k linhas geradas para servir 9 eventos; `cargo check` leva 24 s e roda em todo leg `--workspace` do CI. Emitir structs só para `WANTED`, resto como dados `const EVENTS: &[EventDef]` | −110k a −125k | baixo |
-| 4 | `sqlite_store.rs`: o loop de retry está desenrolado à mão **oito vezes** ao lado de `with_retry` (27 usos), e **divergiu** (backoff sem teto e warn a cada tentativa em `put_identity_for_device`) | −350 | baixo |
-| 5 | `sqlite_store.rs`: 20 `pub async fn *_for_device` + 20 forwarders de trait de uma linha; `SharedSqlite::store_for_device(id)` já modela "store ligado a um device" | −300 a −400 | médio (API pública) |
-| 6 | `CallRegistry`: 99 métodos públicos, 26 são gêmeos `_if_current` com um `.filter(generation)` a mais | −300 | baixo |
-| 7 | `voip/facade.rs`: quatro tipos Drop-guard de teardown com os mesmos campos e o mesmo `Drop`; três `start()` de 225–268 linhas com o mesmo pré-voo | −150 a −250 | médio |
-| 10 | Matriz de features: `voip-encoded`, `tokio-native`, `voip`, `metrics` (raiz) **não gateiam nada**; `client-lifecycle` ⇔ `plugins` na prática, mas custa 72 gates; cada alias é um leg a mais de `cargo hack --each-feature` | −2 legs de CI | baixo |
-| 11 | Dependências: `examples/voip-cli` é membro do workspace e linka `cpal`/ALSA em todo `--workspace --all-features`; `base64` duplicado (0.22 vs 0.23); `scopeguard` com 2 usos | −1 crate, CI mais leve | baixo |
-| 12 | `HttpClient` tem seis métodos e dois deles (`execute_streaming`/`execute_upload`) são **síncronos bloqueantes num trait async**; só `ureq-client` implementa; 11 mocks de `HttpClient` e 14 de `Transport` espalhados | −250 | baixo |
-
-### 2.4 whatsapp-rust-bridge — Rust (apêndice `bridge-rust.md`)
-
-O bridge tem 25,3k linhas Rust; ~6.650 (26%) podem sair, a maioria movendo **política** para o core, onde qualquer outro binding (Python, C, uniffi) a reaproveitaria.
-
-| # | Achado | Δ bridge | Δ core | Onde a correção mora |
-| --- | --- | ---: | ---: | --- |
-| 1 | `js_backend.rs` (1.824) implementa os 81 métodos de `SignalStore`+`AppSyncStore`+`ProtocolStore`+`MsgSecretStore`+`DeviceStore` sobre três callbacks `get/set/delete`. Só ~200 linhas são JS; o resto é política de storage (self-index, expiry scan com TOCTOU, JSON do `Device`) que `in_memory.rs` (2.781) re-deriva sobre `HashMap`. → `wacore::store::kv::KvBackend<S: KvStore>` no core; `InMemoryBackend` vira `KvBackend<HashMapKv>` | −1.450 | +1.400 / −2.000 | core |
-| 2 | ~24 `result_types` são cópias campo-a-campo de structs do core que não derivam `Serialize` (`GroupMetadataResult` ~50 campos + conversor de 91 linhas; `MemoryDiagnosticsResult` ~55 campos + 84 linhas de `x: d.x as f64`). → `derive(Serialize)` com `rename_all = "camelCase"` nos tipos de resultado do core | −900 | +60 | core |
-| 3 | `signal_records.rs` + `legacy_session.rs` = 1.000 linhas de DTOs + `From`/`TryFrom` para tipos do core sem serde. → serde nos tipos do core sob o mesmo feature `legacy-session-interop` | −850 | +40 | core |
-| 4 | `errors.rs` classifica erros do core em 11 kinds andando `source()` com downcast de 8 tipos; mapeia `IqError` **duas vezes** porque o core mantém `whatsapp_rust::request::IqError` e `wacore::request::IqError` como gêmeos; 753 das 1.574 linhas são testes de que o bridge re-derivou certo o que o core quis dizer. → `ErrorChainExt::classify() -> ErrorClass` no core (já existe para timeout/transport) | −650 | +400 | core |
-| 5 | Gate de reconexão (`Parked`, `withdraw_parked`, `online_committed`) existe porque o modelo de cancelamento do core é "drope o future", que nenhum host FFI consegue. → `Client::reconnect_gate()` com `wait() -> Result<(), Withdrawn>` e `withdraw_all()` | −180 | +120 | core |
-| 6 | 174 métodos exportados × 6–10 linhas da mesma cadeia (`parse_jid`, `online().await?`, `.await.map_err(BridgeError::from)`); 58 `map_err` redundantes onde `?` já converte; `pin/archive/mute_chat` duplicam a cadeia inteira nos dois braços do `if` | −400 a −600 | — | bridge |
-| 7 | Seis cópias de "pegar função JS, aguardar maybe-promise, mapear erro" entre os adapters `js_*`; um objeto de config malformado chega como `kind: "internal"` (que o AGENTS.md chama de resposta errada) | −150 | — | bridge |
-| 8 | `uploadEncryptedMediaStream` re-implementa o driver de upload do core (failover de host, refresh de auth, `?resume=1`) e ainda **bufferiza o stream inteiro num `Vec`**; o core tem `upload_media_with_retry` e `Client::upload_stream<S: UploadSource>` | −170 | 0 | bridge |
-| 9 | `device_props.rs`/`client_profile.rs`: cópia do enum `PlatformType` (25 variantes) + política de merge que é regra do core | −250 | +80 | core |
-| 11 | `camel_serializer.rs` (813) existe porque prost serializa snake_case e `serde_wasm_bindgen` não renomeia. 60% da razão de existir é uma linha em `waproto/build.rs` (`type_attribute(".", "#[serde(rename_all = \"camelCase\")]")`). Também: três caches de interning de chave JS fazendo um trabalho, e `parse_jid_fast` rodando em **toda string serializada, inclusive corpo de mensagem**, para decidir se interna | −350 | +30 | core |
-| 12 | `audio.rs`, `image_utils.rs`, `sticker_metadata.rs` (923 linhas, 4 deps) nunca foram publicados (fora de `default`) e são conveniências de consumidor | −923 | — | consumidor |
-| 13 | `runtime.rs`: o throttle de spawn (`SPAWN_BATCH_SIZE=16`) existe porque "centenas de workers por chat disputam um semáforo de 1 permit e cada release acorda TODOS" — thundering herd no fan-out de offline-sync do core, corrigido na camada errada | −70 | +20 | core |
-
-Performance no boundary (não é tamanho de código): `js_to_node` e `stream_upload_via_js` usam o padrão `Uint8Array::from(...).to_vec()` / `resize+copy_to` que `js_bytes.rs` existe para evitar; `downloadMediaStream` "stream" é um chunker sobre um buffer inteiro porque o core não expõe `download_to_writer` (que `wacore::download::DownloadWriter` já tem); `enqueue` faz `try_send` num canal de 16.384 e **descarta o evento** com um `warn!` no overflow.
-
-### 2.5 whatsapp-rust-bridge — TS, codegen, build (apêndice `bridge-ts.md`)
-
-| # | Achado | Δ | Risco |
-| --- | --- | ---: | --- |
-| 1 | `codegen/src/proto_gen.rs` (785 linhas) é um segundo gerador de tipos proto **morto**: nenhum script o invoca, só funciona com clone irmão, zero testes, compilado e lintado em todo CI | −785 | nenhum |
-| 2 | Codec gerado ~12% maior do que qualquer consumidor pode usar (`fromPartial` 7,3k + `create` 2,3k linhas, ausentes da `.d.ts` publicada) e `proto-namespace.ts` embrulha os 755 codecs **eagerly no import**. `docs/proto-codec-memory.md` mediu o namespace lazy por tipo em −1,9 MiB por processo e terminou com "não implementado aqui"; `benches/codec-memory/equivalence.mjs` (481 linhas) já prova a equivalência | −9.600 geradas; −110 KB de bundle; −1,9 MiB RSS | baixo / médio |
-| 3 | `codegen/src/main.rs` (2.355) re-implementa o modelo de dados do serde e do `WireEnum` raspando fontes do core com `syn` — e **já divergiu**: `TSIFY_STRUCTS` pula cinco nomes que não existem mais em `result_types.rs`, então cinco tipos do core são silenciosamente omitidos de `generated_types.rs`. → `ts-rs` atrás de feature `ts` no core; o bridge consome o `.ts` exportado | −4.000 | médio-alto |
-| 4 | Quatro parsers textuais independentes de `whatsapp.ts` (`gen-protobufjs-dts.ts` com compiler API, regex em `gen-ts-proto.ts`, `proto-wire-type-guards.ts`, `benches/slice.ts`) quando o `FileDescriptorSet` já está em mãos e é percorrido duas vezes com recursão duplicada | −150 | baixo |
-| 5 | `proto-namespace.encode` ignora os `fns` capturados e re-resolve por string a cada chamada; `REGISTRY` tem 31 entradas, 26 idênticas ao fallback; `decode` faz `Object.defineProperty(toJSON)` por raiz decodificada, e o baileyrs paga um `hydrate` de árvore inteira **por mensagem** justamente para desfazer isso | −35; −1 walk por mensagem | baixo |
-| 6 | Arquivos mortos em `ts/` (`index.d.ts` stale, `macro.ts`/`macro.d.ts`, `proto-types.ts`) com steps de build que só existem para apagar a saída deles | −30 | nenhum |
-| 7 | Pipeline: strings shell de cinco comandos, `tsc` compilando 81k linhas geradas só para `rm -rf` a saída, dois lockfiles (`bun.lock` nomeia o workspace `whatsapp-binary-protocol`), scripts `bench*` apontando para arquivos apagados, `types` depois de `import` em `exports` | +40 / −6 fragmentos | baixo |
-| 8 | Testes: `offlineClient()` copiado em 8 arquivos e `rejection()` em 10 enquanto `tests/helpers.ts` existe; constantes privadas de `wire-info.ts` espelhadas à mão em dois testes; `camel-long.test.ts` testa seu próprio espelho e nunca chama o bridge | −220 | nenhum |
-| 10 | Mensagem inbound é **prost-decodificada no core → re-encodada pelo bridge (`wire_batch.rs:511`) → ts-proto-decodificada no JS**. A re-codificação é custo puro de transporte e perde fidelidade de bytes do peer. → core guarda o plaintext decifrado (`InboundMessage { raw: Bytes }`, campo aditivo) | −20 bridge / +15 core | médio |
-| 11 | `benches/codec-memory` (1.945 linhas) é uma investigação concluída com recomendação não implementada | −1.945 | nenhum |
-| 12 | `ws` importado em `tests/helpers.ts` e no exemplo sem estar declarado (funciona só pelo shim do Bun); três tabelas de alias `Adv*` inconsistentes (a do `.d.ts` é type-only, então `proto.AdvDeviceIdentity.decode()` não tipa em lugar nenhum) | — | baixo |
-
-### 2.6 baileyrs (apêndice `baileyrs.md`)
-
-Mais de 60% do código não-proto do baileyrs é tradução entre **três formas do mesmo dado**: DTO do bridge → DTO "canônico" → DTO Baileys.
-
-| # | Achado | Δ baileyrs | O que o bridge precisa expor |
-| --- | --- | ---: | --- |
-| 1 | `Bridge/schema.ts` (1.175) + `types.ts` (769) + `primitives.ts` existem porque os eventos-objeto do bridge são inconsistentes com os próprios wire-batches do bridge: JID como struct vs string; chaves snake_case vs camelCase; timestamp RFC-3339 (com parser manual no baileyrs) vs unix; `Duration` como `{secs,nanos}`; `ReceiptType` em PascalCase porque `#[serde(from = "String")]` desliga o rename (mapa de 26 entradas com as duas grafias); `.action` tipado como `any`; `pair_success.id` declarado `Jid` mas é string. `adaptGroupAction` é um `switch` de 170 linhas fazendo `not_announce → notAnnounce` | −1.500 a −1.700 | Um shape de evento único: camelCase, JID string, unix seconds, `ReceiptType` correto, tipos de action exportados |
-| 2 | `run()` devolve `void`, então o baileyrs re-deriva "o socket morreu" de padrões de eventos: `terminal-close.ts` espelha `ConnectFailureReason::should_reconnect()`, `DISPATCHERS.disconnected`/`streamError` têm casos especiais, `terminal-close-reporter.ts` (158 linhas) tem watchdog de 60 s, `logout()` conta claims, `bridge-client-owner.ts` (206) é uma quarta máquina de estados | −300 a −400 | `run(): Promise<TerminalReason>` que resolve exatamente uma vez |
-| 3 | Hot path de mensagem aloca três objetos intermediários por mensagem (`hydrate` → `CanonicalMessage` de 18 campos → `WebMessageInfo` + `Long`); `adaptMessage`/`adaptMessageParts` (60 linhas) é código morto porque o bridge nunca emite `message` como evento-objeto | −120; −2 alocações/msg | nada (fusão local) |
-| 4 | History sync faz três passagens e um evento sintético falso antes de chegar em `messaging-history.set` — quatro cópias dos metadados, duas dos arrays, nos maiores payloads do sistema | −80; −1 cópia de grafo/batch | nada |
-| 5 | Três camadas de proto sobre o codec do bridge: `proto-types.d.ts` (19,6k) → `Compatibility/proto-runtime.ts` (898, o facade realmente mínimo) → `WAProto/index.d.ts` (14k, 790 KB copiados verbatim do Baileys upstream, único motivo de `protobufjs` ser dependência de **runtime** com zero imports em `src/`) | −150 src; −900 KB publicados; −1 dep runtime | schema compacto de campos como JSON; hook decode-onto-prototype |
-| 6 | `(await ctx.getClient()).x(...)` aparece **119 vezes** em `Socket/*.ts`; `privacy.ts` são nove métodos idênticos; um `forward(ctx, method, {map, check})` + tabelas | −250 a −300 | — |
-| 7 | `Socket/index.ts` (1.032) mistura lifecycle, init e ~25 métodos de feature inline; cinco mutexes construídos por socket que nada usa | ~0 (moves) | — |
-| 8 | ~820 linhas de maquinaria Signal/retry exportada e nunca ligada ao socket (`messageRetryManager: null`; `identity-change-handler` cujo evento é `noop`; `parseAndInjectE2ESessions` sem caller; media-retry HKDF em JS enquanto o socket usa `client.requestMediaReupload`) | −100 agora / −820 se a API permitir | — |
-| 9 | `legacy-store/device.ts` e `codecs/basic.ts` re-implementam em TS os formatos de bytes persistidos do core (`noise_key` como array de 64 números, LTHash de 128, `tc_token`, `device_list`, `lid_mapping`) — quando para sessões e sender keys o bridge **já** expõe codecs neutros (`importLegacySessionRecordV1`, `decodeSenderKeyRecordComponents`), que é o padrão certo | −350 | `encodeDeviceRecord/decodeDeviceRecord` + pares para os cinco stores JSON |
-| 10 | `exports["./lib/*"]` torna **todo módulo interno público** (cada refatoração acima é semver-visível); `@bufbuild/protobuf` sem uso; segundo TypeScript pinado só para `audit-core.ts` | — | — |
-| 11 | `scripts/compatibility/` (4,5k linhas): `audit-core.ts` e `type-contracts.ts` respondem a mesma pergunta; `KNOWN_WIRE_GAPS` duplica `NOT_ENCODED_FIELDS` do fuzz; `check-layer-boundaries.ts` faz grep em checkouts irmãos `../whatsapp-rust` — lint cross-repo que pertence ao CI daqueles repos | −300 a −500 | — |
-| 12 | Sete `makeHarness` e cinco `makeCtx` copiados verbatim entre testes | −200 | — |
-| 13 | `__fuzz__/harness/divergence.ts` (1.796) tem 25 entradas de registro e 1.000 linhas de matcher que duplicam `compare.ts` | ~0 (moves) | — |
-
-Quick wins de performance: `Socket/index.ts:943` e `Utils/messages.ts:1032` copiam **todo** Buffer de upload/download quando uma view zero-copy basta; `useBridgeStore.set` copia os dois lados para comparar igualdade enquanto `setMany` já usa `Buffer.compare`.
+O que a rodada adversarial **confirmou** sem ressalva: testes inline nos mega-arquivos; `mex_operations` 79% sem referência (recontagem independente: 21 módulos, 189 structs, 2.126 de 11.022 linhas); resolução PN⇄LID ×8; `BotBuilder` ×17 setters; `update_device_list(s)_guarded` duplicado; derive `ProtocolNode` sem filhos; duplicações em `wacore-binary`; 51 mocks de store libsignal; código morto listado (com duas ressalvas: `wrap_device_sent` é oráculo de teste e `PlaintextContent` é re-exportado); `wam-catalog` 132k para 8 eventos; 7 loops de retry inline no sqlite; 23 `_for_device`; 26 `_if_current`; quatro teardowns Drop; `proto_gen.rs` morto; `fromPartial`/`create` gerados e não declarados (recontagem: **10.900** linhas, mais que a v1); `TSIFY_STRUCTS` obsoleto; arquivos mortos em `ts/`; fixtures copiadas; `camel-long.test.ts` testa a si mesmo; 106 a 123 sites `(await ctx.getClient())`; event-object `message` morto no baileyrs; three copies de Buffer.
 
 ---
 
-## 3. Visão transversal: o que está na camada errada
+## 2. O que as vistas novas mostram
 
-### 3.1 O caminho de uma mensagem inbound hoje
+### 2.1 Histórico: onde o custo de manutenção realmente está
 
-```
-peer bytes ──Signal──▶ core: prost decode ─▶ Arc<wa::Message> em InboundMessage
-                       bridge: message_encode_into (re-encode prost)  ◀── custo puro
-                       bridge: wire batch (string table, packed header)
-                       JS:     ts-proto decode (whatsapp.ts)
-                       JS:     Object.defineProperty(toJSON) por raiz
-                       baileyrs: hydrate (re-parenta a árvore inteira)   ◀── desfaz a linha acima
-                       baileyrs: adaptBridgeMessageWire → CanonicalMessage (18 campos)
-                       baileyrs: canonicalMessageToWAMessage → WebMessageInfo + Long
-                       baileyrs: emitMessageUpsert
-```
+12 meses, 1.277 commits no core (91% de um autor; bus factor 1 nos três repos). A tabela de tamanho da v1 apontava para os arquivos errados.
 
-Sete transformações, das quais três são pares que se anulam (re-encode/decode, `toJSON`/`hydrate`, canonical/WAMessage). O maior custo evitável isolado é o par re-encode/decode; o segundo é o `hydrate`.
+| Arquivo | Linhas | Commits | Fixes | Taxa re-fix ≤7d | Veredito |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `src/client.rs` + `lifecycle.rs` + `accessors.rs` + `node_io.rs` | 8.8k | 334 | 105 (31%) | 0,89–0,90 | **Quente e frágil.** O split de junho moveu métodos; `client.rs` voltou de 914 para 2.185 linhas em 90 dias e ainda co-muda com seis arquivos a 0,67–0,82. Os últimos sete fixes de `lifecycle.rs` (29/07 a 02/09) são todos "reconexão vs. shutdown terminal", e cinco foram re-publicados como `deps!` no bridge. |
+| `src/retry.rs` | 5.4k | 117 | 32 | 0,68 | Quente e frágil; cresceu 16× no ano; compartilha 21 commits com `sender_keys.rs` (0,70). |
+| `src/send/mod.rs` | 8.2k | 222 (follow) | 51 | 0,91 | Quente e frágil. |
+| `src/message*` + `handlers/message*` | — | 208 | 72 (35%) | 0,83 | `receipt.rs` tem a maior sequência de fixes consecutivos do repo (9). |
+| `sqlite_store.rs` | 7.2k | 82 | 19 | 0,61 | Quente; co-muda com `store/traits.rs` em 40 dos 51 commits do trait (0,78). **O trait "agnóstico" não entrega evolução independente.** |
+| `signal_cache.rs` | 6.2k | 40 | 10 | — | 6 fixes em 23 dias de gates de durabilidade, encerrados em 07/08; nenhum desde. **Não abrir agora.** |
+| `src/plugins/mod.rs` | 6.6k | 8 | 0 | — | **Frio. Deixar.** |
+| `wacore/src/iq/groups.rs` | 5.8k | 43 | 6 | — | Cresce, não quebra. |
+| `history_sync.rs` | 4.8k | 33 | 8 | 0 | Estável. |
+| `wacore/src/voip/driver.rs` | 4.3k | 11 | 3 | — | Frio. |
+| VoIP total | 33.6k | 80 | 37 (46%) | — | Tem **três meses**; é curva de estabilização, não sinal de design. Refatorar agora é refatorar requisitos ainda em descoberta. |
 
-Outbound: `encodeProto('Message')` em JS → `waproto::codec::message_decode` no bridge → core re-encoda para o Signal. Aqui a decodificação dupla é inerente ("JS é dono do modelo de objeto"), mas a resolução por string em `encodeProto` a cada chamada não é.
+No bridge: `wasm_client.rs` é o hub (65 commits); `result_types.rs` mudou em **17 de 17** commits junto com ele; `js_transport`, `runtime`, `camel_serializer`, `proto`, `js_backend` a 0,84–0,92. O split de agosto em `wasm_client/*.rs` moveu 4.664 linhas; desde então a raiz teve 8 commits e os onze submódulos 5 somados. O codec proto teve 8 fixes (3 breaking) em 12 dias, cada um regenerando 1.200 a 24.000 linhas no mesmo commit.
 
-### 3.2 Quantas vezes cada contrato é declarado
+**A cascata entre repos custa edições, não dias.** Lag mediano zero em todos os saltos (o mesmo mantenedor faz os três no mesmo dia). O custo: 44 dos 62 pins do core no bridge exigiram edição manual de fonte (71%), sempre nos mesmos arquivos (`wasm_client.rs` 35×, `js_backend.rs`, `result_types.rs`, `errors.rs`); 21 dos 46 bumps do bridge no baileyrs idem (46%: `Socket/events.ts` 15×, `Bridge/types.ts`, `schema.ts`). 13 dos últimos 15 pins do bridge apontam para commits do core **não lançados**; 8 dos 12 `BREAKING` do bridge são `deps!` repassando o core; o core tem 158 commits não lançados com zero marcadores `!`. O marcador de breaking está sendo aplicado uma camada abaixo de onde a quebra nasce.
 
-| Contrato | core | bridge | baileyrs | Total |
+### 2.2 Defeitos de correção encontrados (não são arquitetura; são bugs)
+
+| # | Sev. | Onde | Defeito | Correção mínima |
 | --- | --- | --- | --- | --- |
-| Shape de `GroupMetadata` | `features/groups.rs` | `GroupMetadataResult` + conversor de 91 linhas + `.d.ts` gerada | `Bridge/types.ts` canonical + `Compatibility/group-metadata.ts` → `Types/GroupMetadata.ts` | **5** |
-| Taxonomia de erro | 39 enums `*Error` (13 com shape idêntico) + `IqError` gêmeo | 11 kinds via downcast de 8 tipos + `classify!` de 19 enums | `Boom`/`DisconnectReason` + `terminal-close.ts` | **3 tabelas que podem derivar** |
-| Lista de eventos | `EventKind` + `Event` + `kind()` (3 cópias à mão) | `WhatsAppEvent` union gerada por scraper `syn` | `AdapterMap` (58 entradas, 26 `noop`) + `DISPATCHERS` | **5** |
-| Ação de grupo (45 variantes) | `GroupNotificationAction` | `.d.ts` gerada | `CanonicalGroupAction` (camelCase) + `adaptGroupAction` 170 linhas | **3** |
-| JID | `Jid` struct | evento = struct `{user,server,...}`; resultado = string `user@server` | `asJidString` em todo adapter + `jidStr` duplicado | **2 representações no mesmo boundary** |
-| Codec protobuf | prost (`waproto`) | ts-proto 81k linhas + `proto-types.d.ts` 19,6k | `proto-runtime.ts` + `WAProto/index.d.ts` 14k copiado do upstream | **3 codecs, 4 declarações de tipo** |
-| Formato persistido do `Device` / stores JSON | `Device` serde + `in_memory.rs` | `js_backend.rs` (JSON + side-channel de `account`) | `legacy-store/device.ts` re-escreve o JSON à mão | **3** |
-| Política de reconexão / terminalidade | `ConnectFailureReason::should_reconnect()` | `Parked`/`withdraw` | `terminal-close.ts` espelha a tabela do core | **3** |
+| D1 | **Alta** | baileyrs `use-bridge-store.ts:231,242` | `touchCache` antes de `writeCritical`; `set` pula quando o cache é igual. Uma escrita Signal que falha (ENOSPC) não é retentada: o re-flush do core com bytes idênticos é "igual ao cache" e pulado, o gate é liberado sem nada no disco, e o ciphertext é publicado sob lease não durável (viola `signal_durability.md`). | Marcar cache só após a escrita resolver; evict no throw. |
+| D2 | **Alta** | baileyrs `use-bridge-store.ts:82-104` | `writeCritical` é `writeFile` in-place sem fsync/rename; `flushWrite` engole todo erro. SIGKILL no meio → sessão truncada → peer indecifrável. ENOSPC no history sync → 20k `msg_secret` perdidos em silêncio. | tmp + fsync + rename; propagar erros não-ENOENT. |
+| D3 | **Alta** | core `lifecycle.rs:757-761, 965-1003` | Com `setAutoReconnect(false)`, uma desconexão *esperada* (ex.: 515 após pareamento) sai do loop sem evento. O bridge `run()` é `void`, baileyrs fica em `connecting` para sempre; o watchdog de 60 s nunca arma. | Core: despachar evento terminal no `break`; ou bridge expor conclusão do loop. |
+| D4 | **Alta** | baileyrs `Socket/index.ts:297,442,905` vs. core `node_io.rs:1990` | baileyrs espelha `enable_auto_reconnect` localmente; o core o limpa sozinho em 402/405. Espelho `true` → `connecting` espúrio após close terminal; espelho `false` → dois `connection.update {close}`. | Consultar `reachability()` do bridge; guard de "uma vez" global. |
+| D5 | Média | bridge `wasm_client.rs:648,1301` | Canal de eventos `bounded(16_384)` com `try_send`; overflow = `warn!` e **evento descartado**, invisível ao host. O handler do core é síncrono, então back-pressure exige mudança de trait no core. | Contador `events_dropped` em `getMemoryDiagnostics` já; back-pressure depois. |
+| D6 | Média | bridge `js_backend.rs:1574-1603` | `Device`/`account` gravados em duas chaves sem atomicidade; `account = None` nunca apaga a chave antiga → re-pareamento na mesma pasta ressuscita o `ADVSignedDeviceIdentity` antigo. | Deletar em `None`; `js_put_many`. |
+| D7 | Média | bridge (11 sites) | Input do chamador reportado como `internal` (versão, `wantedPreKeyCount`, callbacks de store, tag em `sendNode`, bytes em `sendMessageBytes`...); `media.rs:430` mapeia `NotFound/DecryptionError → internal`; `From<JidError>` fixa `field: "jid"`. | `invalid_arg(field, …)` + parser de JID nomeado. |
+| D8 | Média | core `src/request.rs:240-242` | `from_response` copia 6 variantes de `wacore::IqError` com `_ => InternalChannelClosed`; qualquer variante nova vira "canal fechado". | Envolver (`Core(wacore::IqError)` + `response`) em vez de copiar. |
+| D9 | Baixa | sqlite `sqlite_store.rs` ×7 | Confirmado: dois loops usam backoff sem teto e avisam a cada tentativa; cinco **nunca logam**. Uma falha em `remove_prekey` é silenciosa, tornando invisível o hazard de prekey consumida. | Rotear por `with_retry`. |
+| D10 | Baixa | bridge `js_backend.rs:504-575` | TOCTOU entre `confirm_expired` e `js_delete_many`. | Compare-and-delete no store. |
+| D11 | Baixa | bridge/baileyrs | Atomicidade de `setMany` é promessa do host não declarada; seguro só porque o core re-flusha, o que D1 quebra. | Documentar no `JsStoreCallbacks`. |
+| D12 | Baixa | bridge | `ReceiptType::Other` serializa como `{Other: s}` no evento-objeto e flag+string no packed; baileyrs mapeia o objeto para `undefined`. `Receipt.timestamp` é RFC-3339 no objeto, `f64` no packed, inteiro em `IncomingCall`. | Um formato. |
 
-### 3.3 Regras violadas, em cada direção
+Também: `pair_success.id` declarado `Jid` em `generated_types.rs:1136` mas emitido como string (a interface gerada está morta e errada); `TemporaryBan.expire` é duração declarada como `number`; `toUnixSeconds` do baileyrs devolve **0** em falha de parse (epoch silencioso).
 
-**Política do core implementada no bridge** (deveria descer): backend KV com self-index e expiry (`js_backend.rs`), classificação de erros (`errors.rs`), gate de reconexão cancelável, merge de `DevicePropsOverride`, driver de upload com failover, throttle de spawn compensando thundering herd do offline-sync, serialização camelCase de prost (`camel_serializer.rs`), serde dos records Signal legados.
+### 2.3 Drift medido hoje
 
-**Política do core/bridge implementada no baileyrs** (deveria descer dois níveis ou um): terminalidade do run loop, formatos de bytes de `Device`/`sync_key`/`tc_token`, normalização de JID/timestamp/duração/receipt-type, `RECONNECTABLE_CONNECT_FAILURE_REASONS`.
+- **Eventos:** core 71 variantes → bridge 67 tipos (4 deliberadamente não despachados) → baileyrs 66 adapters, 16 `noop` incondicionais. Dois são lacunas reais: `self_push_name_updated` deveria alimentar `creds.update` (`me.name`) e `user_about_update` deveria alimentar `contacts.update` (`status`). Sete eventos do Baileys upstream o baileyrs nunca emite (`blocklist.*`, `newsletter-participants.update`, `chats.lock`, `messages.media-update`...).
+- **Erros:** dos 11 kinds do bridge, o baileyrs trata **2** por kind (`invalid-argument`, `no-recipient-device`). `serverCode`/`backoffSeconds`/`operation` não são lidos em lugar nenhum. De `DisconnectReason`, `restartRequired`, `multideviceMismatch`, `badSession`, `connectionLost` são **inalcançáveis**; `timedOut` só via QR esgotado; e `405` é emitido sem ser membro do enum.
+- **Ações de grupo:** 44 no core → 43 no `.d.ts` (falta `Unknown`) → 44 no canonical → **25 de 44 perdidas** no último salto (`group-notifications.ts:135-191` com `default: return null`): delete, link/unlink, suspended, revokeInvite, changeNumber...
+- **`IqError` gêmeos:** 6 variantes copiadas, `is_timeout`/`is_transport_unavailable` duplicados, dois braços de mapeamento no bridge. O split é real (wacore não tem transporte), a cópia é acidente.
+- **Proto:** `proto-types.d.ts` do bridge tem 1.637 nomes; `WAProto/index.d.ts` do baileyrs (cópia congelada de 23/07, perdeu duas regenerações de agosto) tem 1.127. 512 só no bridge; 2 só no baileyrs, ambos usados só em fuzz.
+- **Auditoria de declarações do baileyrs não é gate de CI.** `ci.yml` não roda `compat:audit:strict`. O README diz "checked rather than assumed"; para exports é manual.
 
-**Assunções do consumidor vazando para baixo** (o bridge não deve conhecer o baileyrs): `audio.rs`/`image_utils.rs`/`sticker_metadata.rs` são conveniências do Baileys (`generateWaveform`, `extractImageThumb`, EXIF de sticker) e nunca foram publicadas; `Defaults::{Skip,Keep,KeepPresent}` no `camel_serializer` são semântica do protobufjs. O primeiro grupo deve sair; o segundo é legítimo como decisão do boundary JS, mas deve ficar isolado em ~150 linhas, não em 813.
+### 2.4 Tempo de compilação, medido
 
-**APIs do core que só existem por causa do bridge**: `legacy-session-interop` (correto como feature; o que falta é serde nos tipos, não a feature), `danger-skip-cert-chain-verify` (correto), `js` em `wacore` (só encaminha `getrandom/wasm_js`, que o bridge já seta direto — remover).
+`cargo check --timings` do workspace default (4 cores, deps cacheadas), unidades mais caras:
 
-### 3.4 Arquitetura-alvo
+| Unidade | Tempo |
+| --- | ---: |
+| `waproto` (check) | 54,4 s |
+| `wacore` (check) | 30,2 s |
+| `whatsapp-rust` (check) | 20,6 s |
+| `syn` | 16,6 s |
+| `diesel` (check) | 14,0 s |
+| `waproto` build-script (run) | 13,4 s |
 
-Princípio: **cada regra em um só lugar, e esse lugar é a camada mais baixa que a entende.** O bridge vira um transportador de ~15k linhas; o baileyrs vira um adaptador de shape Baileys de ~20k.
+Incremental: `wacore` após `touch lib.rs` 111 s de parede; após `touch mex_operations.rs` 36 s; `whatsapp-rust` após `touch src/lib.rs` 40 s.
+
+Conclusão que a v1 não tinha: **`waproto` é a unidade mais cara do workspace**, quase o dobro de `wacore`. Podar as 752 mensagens do `.proto` para o fecho transitivo das ~140 usadas (o `build.rs` já reescreve o `FileDescriptorSet`) vale mais para o ciclo de desenvolvimento do que `mex_operations` e muito mais que `abprops` (que não custa build). No artefato wasm, `waproto` também é o maior dono da seção de código (17,5%).
+
+### 2.5 Consumidores externos, medidos
+
+- crates.io: `whatsapp-rust` tem dois dependentes reversos: `mendia` 1.16 (`^0.3`, usa 8 símbolos: `Bot`, `Client`, `Event`, `Message`...) e `opencrabs` 0.3.83 (`^0.6`, usa `wacore::store::traits::{Backend, SignalStore, DeviceStore}`, `appstate::*`, 39 tipos `waproto`; já foi quebrado por mudança no `Backend`). Mais `whatshell` (binário Rust via npm, `= 0.5.0`). Nenhum nomeia `features::*Error`, `_for_device`, nem os `pub fn` mortos do wacore. Todos atrasam de 1 a 4 minors.
+- npm: `@oxidezap/whatsapp-rust-bridge` 4.017 dl/mês; `@oxidezap/baileyrs` 3.320 e é o **único consumidor conhecido da API de cliente** do bridge. O `whatsapp-rust-bridge` sem escopo (0.5.5, repo antigo) tem **4,3 milhões** dl/mês porque é dependência de runtime do `baileys@7.0.0-rc14` upstream para exatamente dois símbolos (`LTHashAntiTampering`, `expandAppStateKeys`) que o pacote atual **não exporta mais**.
+- O bridge é dois produtos sob um nome: utilitários (até 03/2026, o que o upstream adotou) e motor de cliente (desde 03/2026, um consumidor). O README do bridge ainda descreve o primeiro.
+
+---
+
+## 3. Achados que sobrevivem, re-priorizados
+
+Critério: confirmado na verificação × quente no histórico × sem quebra de invariante. Estimativas já descontadas.
+
+### Prioridade 1 — onde os fixes se acumulam
+
+1. **Máquina de estados de reconexão/terminal (core `lifecycle.rs`, bridge `run()`, baileyrs `terminal-close*`/`bridge-client-owner`).** 105 fixes no hub, re-fix 0,9, D3 e D4 são bugs abertos hoje. Não é layout de arquivo: é decidir uma vez quem pode anunciar reconexão e quem detém o lock terminal, e expor a **conclusão** do loop com razão (`RunExit` no core; `run(): Promise<TerminalReason>` no bridge). Isso apaga `terminal-close.ts`, o espelho de `enable_auto_reconnect`, os casos especiais de `disconnected`/`streamError`, e a contagem de claims em `logout()`.
+2. **Durabilidade do store JS (D1, D2, D6, D11).** Três bugs de alta severidade no caminho que `signal_durability.md` protege com mais cuidado no core. Correção é pequena e local ao baileyrs/bridge.
+3. **`retry.rs` + `send/mod.rs` + recepção (`process_session_enc_batch` 747 linhas / 13 níveis).** Extrair `classify_decrypt_failure` e `prepare_group_send()`, preservando a disciplina de drop do `session_guard`. Retry possui estado de sender-key que pertence à camada Signal (21 commits compartilhados com `sender_keys.rs`).
+4. **`Client` hub.** Remover `Arc<>` dos ~35 campos nunca clonados (confirmado: 0 clones) encurta `assemble()`; sub-structs por domínio **depois** de estender `report_coverage.rs` para descer mais de um nível.
+
+### Prioridade 2 — volume gerado e tempo de compilação
+
+5. **`waproto` podado por `WANTED` transitivo** no `build.rs`: maior unidade de compilação (54 s) e maior dono do wasm.
+6. **`mex_operations` `WANTED`** (−8.900 linhas, 21 módulos usados). `abprops` idem, mas só por ruído de diff. `wam-catalog` como dados (−110k+; 8 eventos usados; membro do workspace pago em todo leg `--workspace`).
+7. **`fromPartial`/`create` fora do codec ts-proto** (−10.900 linhas geradas, ~−110 KB de bundle) e namespace lazy por tipo (a doc do próprio bridge mediu −1,9 MiB/processo e escreveu "não implementado aqui").
+8. **`wacore/Cargo.toml`: `exclude` dos 16 MB de `mlow/testdata`.** Uma linha; o crate publicado saiu de 289 KB (0.6.0) para 7,29 MB (0.7.0). Verificado que todo `include_*!` está sob `cfg(test)` e `tables.desc` fica fora da pasta.
+
+### Prioridade 3 — DRY mecânico, risco zero
+
+9. Mover `mod tests` inline (core: 8 arquivos ~23k linhas; wacore: `signal_cache`, `iq/groups`, `history_sync`, `stanza/call`, `usync`; bridge: `wasm_client.rs` −1.556).
+10. Fixtures compartilhadas: `InMemProtocolStore` sob `test-util` em `wacore-libsignal` (51 mocks), `TestClientBuilder` + `iq_result/iq_error` no core, `tests/helpers.ts` no bridge, `socket-harness.ts` no baileyrs. Para `appstate_sync.rs`, o alvo é `InMemoryBackend` + wrapper de falha, não `create_test_backend()` (é SQLite real, não injeta `fail_clear_macs`).
+11. Código morto confirmado: `proto_gen.rs`, `ts/{index.d.ts,macro.*,proto-types.ts}`, `benches/codec-memory` (após promover `equivalence.mjs` a teste), os `pub fn` do wacore listados (menos `wrap_device_sent`, que vira `cfg(test)`), `adaptMessage` no baileyrs.
+12. Duplicações locais: PN⇄LID ×8 → um resolvedor com `Keep::{Device,Bare}` explícito; `BotBuilder` sobre `ClientBuilder`; `update_device_list_guarded` → plural; `_if_current` ×26 → `entry_mut(id, Option<gen>)`; quatro teardowns → um; 7 loops de retry → `with_retry`; `js_fn.rs` para as seis cópias de "pegar função JS"; `forward()` no baileyrs para os 106 sites uniformes; `AttrSource`/`NodeLike` no `wacore-binary`; derive `ProtocolNode` com `#[child]`/`#[children]`.
+
+### Prioridade 4 — só com release major coordenado
+
+13. `_for_device` ×23 no sqlite (0.8 do storage; zero chamadores externos encontrados).
+14. Um shape de evento no bridge: camelCase + timestamps unix + `ReceiptType` correto + tipos de action exportados + `pair_success` corrigido. **JID continua struct** (Display é lossy). Isso reduz `schema.ts`/`types.ts`/`primitives.ts` em ~800 linhas, não 1.700.
+15. VoIP em crates próprios **com** `RelayData`/`hbh_srtp`/`rtcp` permanecendo em `wacore`, e só quando a curva de fixes achatar.
+
+---
+
+## 4. Arquitetura-alvo revisada
+
+A v1 assumia três repositórios e propunha ensinar o core a servir "qualquer binding" (serde camelCase, `classify()`, `ts-rs`) para preservar a fronteira. A avaliação de alternativas (`appendix/alternatives.md`) mostra que essa fronteira é a causa direta de ~6.500 linhas do bridge, via **regra do órfão**: o bridge não pode derivar `Tsify` em tipos que não possui, então raspa os fontes do core com `syn` (2.355 linhas, já divergiu), espelha 80 structs à mão, e reclassifica 15 enums de erro por downcast. E ninguém mais consome essa generalização: nenhum outro binding existe nem é pedido (`plugin_architecture.md`: "começa só com consumidor concreto").
+
+**Recomendação: dois repositórios, não três.** O bridge vira `bindings/wasm/` dentro do workspace do core, com `publish = false`, fora de `default-members`, e o npm `@oxidezap/whatsapp-rust-bridge` publicado de lá. **A direção de dependência não muda**: o core continua sem depender do binding. O que muda é que os tipos do core ganham `#[cfg_attr(feature = "ts", derive(Tsify))]` sob uma feature que só o binding liga, e o PR que quebra o wasm descobre isso no próprio PR, não um repo e um release depois.
 
 ```
-whatsapp-rust (core)
-  + serde (camelCase, u64→f64, i64→string) nos tipos de resultado, records Signal, DevicePropsOverride
-  + ErrorChainExt::classify() -> ErrorClass (11 classes)
-  + Client::reconnect_gate() { wait() -> Result<(), Withdrawn>, withdraw_all() }
-  + Client::run() -> TerminalReason; ConnectFailureReason::should_reconnect() já existe
-  + wacore::store::kv::KvBackend<S: KvStore>  (InMemoryBackend = KvBackend<HashMapKv>)
-  + InboundMessage.raw: Option<Bytes>  (plaintext decifrado, aditivo)
-  + Client::download_stream / upload_stream já existe
-  + waproto/build.rs: rename_all = "camelCase" + serialize_with 64-bit/bytes sob feature `js-serde`
-  + ts-rs sob feature `ts` para os payloads de evento (substitui o scraper syn do bridge)
-  + Event/EventKind/kind() de uma macro
-  − mex_operations/abprops/wam-catalog só WANTED; VoIP em crates próprios; família de traits libsignal do meio
+oxidezap/whatsapp-rust  (um workspace, um lock, um CI)
+├── wacore*, waproto, whatsapp-rust, adapters          crates publicados, como hoje
+├── (depois) wacore-mlow, wacore-voip, whatsapp-rust-voip   com RelayData/hbh_srtp/rtcp em wacore
+├── plugins/, tools/whatspec-codegen                   não publicados, como hoje
+└── bindings/wasm/   publish = false; npm @oxidezap/whatsapp-rust-bridge
+    ├── src/   ~15k linhas: wasm_client/* (141 dos 174 métodos são tabela; ~23 à mão),
+    │          js_* adapters, wire_batch, BridgeError como shape de fio, um shape de evento
+    ├── ts/    codec ts-proto sem fromPartial/create, namespace lazy, wire-info
+    └── sem codegen/, sem generated_types.rs, sem result_types espelhados,
+        sem signal_records/legacy_session DTOs, sem errors.rs classify
+    + entry point utilitário: LTHashAntiTampering, expandAppStateKeys (o que o upstream pede)
 
-whatsapp-rust-bridge
-  = adapters JS finos (JsKvStore ~250 linhas, js_fn.rs, transport, http, crypto, time)
-  = BridgeError como shape de fio + From<ErrorClass> de 30 linhas
-  = um shape de evento (camelCase, JID string, unix seconds), eventos e resultados pela mesma serialização
-  = wire batches (mantidos; uma StringTable só)
-  = codec ts-proto sem fromPartial/create, namespace lazy por tipo, tipos gerados a partir do descriptor
-  − js_backend policy, result_types espelhados, signal_records/legacy_session DTOs, errors.rs classify,
-    Parked, camel_serializer (→ ~150 linhas), upload loop, device_props merge, audio/image/sticker,
-    codegen/main.rs + proto_gen.rs, benches/codec-memory
-
-baileyrs
-  = shape Baileys: makeWASocket, forward() + tabelas, DISPATCHERS direto de WhatsAppEvent['type']
-  = proto-runtime.ts como único facade (schema compacto vindo do bridge)
-  = await client.run() como única fonte de "socket terminou"
-  − Bridge/types.ts, ~80% de schema.ts e primitives.ts, terminal-close.ts, WAProto/index.d.ts (790 KB),
-    protobufjs em runtime, legacy-store byte formats, exports["./lib/*"]
+oxidezap/baileyrs  (referência: Baileys upstream, não o core)
+├── Socket/* com forward(ctx, method, {map, check}); DISPATCHERS direto no tipo do bridge
+├── proto-runtime.ts como único facade; WAProto .d.ts gerado do descriptor do bridge
+│   com naming protobufjs (compat:audit:proto prova a paridade); protobufjs fora de runtime
+├── legacy-store/*, event-buffer, messages.ts, exports lib/*        promessa drop-in, ficam
+└── fuzz diferencial + audit de .d.ts                               custo permanente; fuzz do codec vai para bindings/wasm
 ```
 
-### 3.5 Estimativa consolidada
+O que isso custa ao core: +1–2 runners numa matriz de 25–30 (o core já roda quatro builds wasm32 por PR e carrega 305 cfgs `wasm32` e 113 pares `?Send` para um consumidor que não vê). O que isso abandona da v1: `ts-rs` e `ErrorChainExt::classify()` como **promessas públicas** do core (viram conveniências in-tree, livres para mudar).
 
-| Camada | Δ linhas (código) | Δ artefato publicado |
+Alternativas rejeitadas com evidência: fundir bridge no baileyrs (o motor mudaria por razões do core, dono errado); attribute macro `#[export_binding]` no core (coloca o modelo do wasm-bindgen e a política de gate `online()/unwaited()` num proc-macro do core); uniffi/Python (nenhum consumidor; runtime e `Send` incompatíveis com a configuração wasm); split de plugins/app-state/history-sync em crates (zero efeito no artefato: são alcançados por `connect()`).
+
+### Regra para o que WA Web tem e não temos, e vice-versa
+
+O repo já aplica bem "o que carregamos e WA Web não constrói" (`schemas_unlisted.rs`, `props::stale` com gatilho de remoção). Falta a direção oposta, e a regra proposta em `alternatives.md` §G resolve os 163k de linhas geradas com um princípio: **o que WA Web tem e não usamos é filtro de codegen (`WANTED`), não fonte; o que temos e WA Web não tem precisa de dono e data de expiração** (ex.: `legacy-session-interop` expira quando o baileyrs fechar a janela de migração).
+
+---
+
+## 5. Roteiro revisado
+
+Cada passo é entregável sozinho. Ordem por risco-por-linha e pelo que o histórico diz que dói.
+
+**Passo 0 — bugs (dias, patch releases).** D1, D2, D6 (store JS); D3/D4 (evento terminal no core + guard global no baileyrs); D5 (contador de drops); D7 (`internal` → `invalid-argument`); D8 (`IqError` por envolvimento); `pair_success`; as duas lacunas de eventos (`creds.update` name, `contacts.update` status); `@bufbuild/protobuf` para `dependencies` do bridge; `compat:audit:strict` no CI do baileyrs. **Antes de qualquer refatoração**: os quatro testes que raspam fonte (`report_coverage.rs`, `subsystem_boundary.rs`, `ab_prop_watch_coverage.rs`, o self-scan em `sqlite_store.rs:6903`) são o primeiro arquivo a atualizar em cada move.
+
+**Passo 1 — mecânico, risco zero (1–2 semanas).** Prioridade 3 inteira; `exclude` do testdata (patch de `wacore`); `WANTED` em mex e wam; `fromPartial`/`create` fora; arquivos mortos; `Arc<>` supérfluos no `Client`. Separar commits de comportamento de commits de regeneração no bridge (o core já faz: 14 de 14 regens são puros).
+
+**Passo 2 — bridge para `bindings/wasm` (um PR, sem mudança de superfície).** `git subtree add`; `publish = false`; job de CI filtrado por path; apagar `codegen/`; publicar 0.20.0 de lá; arquivar o repo antigo com ponteiro.
+
+**Passo 3 — feature `ts` no core (minor).** `Tsify`/serde nos tipos de resultado, payloads de evento, records Signal, `DevicePropsOverride`. Apagar `generated_types.rs`, ~75% de `result_types.rs`, `signal_records.rs`, `legacy_session.rs`, `device_props.rs`, `client_profile.rs`.
+
+**Passo 4 — core 0.8 + bridge major, em lote.** `RunExit`/`run() -> TerminalReason`; um shape de evento (JID continua struct); `waproto` podado; `FeatureError` só nos 5 que cabem; `_for_device` fora; `pub fn` mortos fora (com blanket impl de uma release para `opencrabs` se algum trait de store mudar). Um único ciclo de migração para consumidores que já atrasam 1–4 minors.
+
+**Passo 5 — baileyrs.** `forward()`; facade WAProto gerado; `protobufjs` fora de runtime (major do baileyrs, junto com qualquer estreitamento de `exports` que se decida); fuzz do codec para o bridge; `check-layer-boundaries.ts` vira lint do workspace.
+
+**Passo 6 — estrutura interna do core, contínuo.** `Client` em sub-structs (após o guard); `app_state.rs` em módulos; derive `ProtocolNode` com filhos; `AttrSource`/`NodeLike`; `BotBuilder`; PN⇄LID único; `flush_store` genérico (só o flush). VoIP e `signal_cache.rs` **só quando a taxa de fix achatar**, e VoIP com o desenho de ciclo resolvido.
+
+### Semver por pacote
+
+| Pacote | Passos 0–3 | Passo 4 | Passo 5 |
+| --- | --- | --- | --- |
+| `whatsapp-rust` | 0.7.x patch/minor (feature `ts` aditiva) | **0.8.0** (lote) | 0.8.x |
+| `wacore`, `wacore-libsignal`, `waproto` | 0.7.x (`exclude` é patch) | **0.8.0** | — |
+| `whatsapp-rust-sqlite-storage` | 0.7.x | **0.8.0** (`_for_device`) | — |
+| `@oxidezap/whatsapp-rust-bridge` | 0.20.0 (move de fonte, sem mudança) | **major** (shape de evento, `TerminalReason`) | — |
+| `@oxidezap/baileyrs` | patch (bugs) | minor | **major** (`protobufjs`, exports) |
+| `baileys` upstream (pina `whatsapp-rust-bridge@0.5.4`) | não afetado; opcionalmente oferecer os dois símbolos no entry point utilitário | — | — |
+
+### Estimativa consolidada (descontada)
+
+| Camada | Δ código | Δ artefato |
 | --- | ---: | --- |
-| whatsapp-rust | −30k a −35k geradas (mex, abprops, wam-catalog) + −5k a −7k código + ~25k testes movidos | `wacore` 22 → ~6 MiB; sem `build.rs` no default; VoIP fora do caminho crítico de clippy/doc |
-| whatsapp-rust-bridge | −6,6k Rust (−26%) + −11k TS geradas + −4,7k codegen/bench | −110 KB bundle; −1,9 MiB RSS/processo; −4 deps |
-| baileyrs | −4k a −4,5k (−20%) | −900 KB de `.d.ts`/schema; −1 dep runtime; hot path 3 → 1 alocação/msg |
+| whatsapp-rust | −30k geradas (mex, wam, waproto) + −3k a −4k código + ~25k testes movidos | `wacore` 7,3 MB → ~0,3 MB; `waproto` check 54 s → a medir após poda |
+| bridge | −6,5k Rust (a maioria pela regra do órfão, não por API nova no core) + −11k TS geradas + −3,1k codegen/bench | −110 KB bundle; −1,9 MiB RSS/processo |
+| baileyrs | −2k a −2,5k (a v1 dizia −4,5k; a metade era API drop-in) | −900 KB `.d.ts`; −1 dep runtime |
 
 ---
 
-## 4. Roteiro sugerido
+## 6. Verificado e que não precisa ser re-verificado
 
-Ordem por razão de valor/risco. Cada fase é independente e entregável sozinha.
+Mantido da v1 (locks através de `await`, alocação em hot path, gates fora do dono, sqlite sem N+1, layering do VoIP principiado, `wire_batch` não duplica protobuf, trait `Transport` do tamanho certo, socket do baileyrs sem padrão layered). Acrescentado nesta rodada:
 
-**Fase 0 — mecânica, risco zero (1–2 dias, todas as camadas)**
-1. Mover `mod tests` inline: core (8 arquivos, ~23k linhas), `wacore` (`signal_cache`, `iq/groups`, `history_sync`, `stanza/call`, `usync`), bridge (`wasm_client.rs` −1.556), `plugins/mod.rs`.
-2. `WANTED` em `emit/mex.rs` e `emit/abprops`; `wam-catalog` como dados + `call_sites.rs` só no teste `parity`.
-3. `wacore/Cargo.toml`: `exclude = ["src/voip/mlow/testdata/*"]`.
-4. Apagar código morto listado (`wacore` achado 9; bridge `proto_gen.rs`, `ts/{index.d.ts,macro.*,proto-types.ts}`, `benches/codec-memory`; baileyrs `adaptMessage`, `@bufbuild/protobuf`).
-5. `outputPartialMethods=false` no ts-proto; `REGISTRY` de 5 entradas; `encode` usa `fns`.
-6. Fixtures de teste compartilhadas nas três camadas (`InMemProtocolStore`, `TestClientBuilder`, `tests/helpers.ts`, `socket-harness.ts`).
-7. Os 58 `map_err(BridgeError::from)` redundantes; `js_fn.rs`; `js_bytes::to_vec` nos dois sites; sete loops de retry do sqlite → `with_retry`.
-
-**Fase 1 — core expõe o que os bindings precisam (release minor do core; 1–2 semanas)**
-1. `Serialize` camelCase nos tipos de resultado, `ResourceReport`, records Signal, `DevicePropsOverride`.
-2. `ErrorChainExt::classify()`; unificar os dois `IqError`.
-3. `reconnect_gate()`; `run() -> TerminalReason`.
-4. `KvBackend<S: KvStore>`; `InMemoryBackend` reescrito sobre ele (fixture pinando o esquema de chaves byte a byte).
-5. `InboundMessage.raw`; `download_stream`.
-6. `waproto/build.rs`: `rename_all = "camelCase"` sob feature.
-Depois disso o bridge apaga ~4.500 linhas em uma passagem.
-
-**Fase 2 — bridge emite um shape só (release major do bridge)**
-1. Eventos via a mesma serialização dos resultados: camelCase, JID string, unix seconds, `ReceiptType` correto, action types exportados, `pair_success` corrigido.
-2. Namespace proto lazy por tipo; tipos `.d.ts` do descriptor; schema compacto JSON exportado; codecs de `Device`/stores JSON.
-3. `ts-rs` no core substitui `codegen/main.rs`.
-Depois disso o baileyrs apaga `Bridge/types.ts`, 80% de `schema.ts`, `terminal-close.ts`, `WAProto/index.d.ts`.
-
-**Fase 3 — estrutura interna do core (sem mudança de API; contínuo)**
-1. VoIP em `wacore-mlow`, `wacore-voip`, `whatsapp-rust-voip`; dividir `client/voip.rs` e `handlers/call.rs` no gate.
-2. `Client` em sub-structs por domínio; campos de módulo único para structs de estado.
-3. Derive `ProtocolNode` com filhos; `AckOnlyIq`; `AttrSource`/`NodeLike` no `wacore-binary`.
-4. Apagar a família do meio de traits libsignal.
-5. `FeatureError` unificado; `BotBuilder` sobre `ClientBuilder`; resolvedor PN⇄LID único.
-6. `SignalStoreCache` single-flight (só com a matriz de chaos verde).
-
----
-
-## 5. O que foi verificado e não precisa ser re-verificado
-
-- Locks `std` mantidos através de `await` no core: nenhum em produção.
-- Alocações no hot path de recebimento/envio do core: já limpas; os itens restantes são `to_string()` de JID para chaves de log/cache.
-- Gates de feature fora do subsistema dono: dentro do teto documentado em `subsystem_boundary.md`.
-- Sqlite: sem N+1; batch usa `IN (...)`; `pool.get()` dentro de `spawn_blocking` é o shape correto do r2d2.
-- A divisão facade/engine/driver/registry/session do VoIP é principiada (um `CallPhase`, engine dono do estado de mídia). A duplicação é **dentro** das camadas, não entre elas.
-- `wire_batch.rs` do bridge não duplica protobuf nem `wacore-binary`; é framing de eventos. Usar `wacore-binary` ali seria errado.
-- Transport trait (`send/disconnect/resource_report`) é do tamanho certo para os três implementadores.
-- O padrão "layered socket" do Baileys upstream não existe no baileyrs; a composição por `make*Methods(ctx)` é boa.
+- Ordem mensagem→recibo é preservada no bridge (canal FIFO, lookahead `pending_event`, flush de envelope antes de callbacks); reordenação só se um callback devolver thenable, e os do baileyrs são síncronos.
+- `withdrawParkedCalls` toca só waiters de `online()`, nunca eventos.
+- O bridge lê `reachability()` do core em vez de espelhar; o único lag é `setAutoReconnect(false)` escrever o atômico sem notify.
+- `AttrParserRef::optional_u64` não é silencioso: adia o erro para `finish()`.
+- `HttpClient`: os métodos de streaming têm corpo default; um implementador wasm já implementa só `execute`.
+- `abprops` não custa binário nem build; só diff.
+- `differential_fast_path_matches_full_decode_oracle` cobre o walker de history sync.

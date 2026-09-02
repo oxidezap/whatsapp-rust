@@ -1,0 +1,29 @@
+== per-crate check durations from the workspace --timings run (top 20)
+units=279 total cpu-ish=344s
+   54.4s  waproto  (check)
+   30.2s  wacore  (check)
+   20.6s  whatsapp-rust  (check)
+   16.6s  syn 
+   14.0s  diesel  (check)
+   13.4s  waproto  build-script (run)
+   12.8s  serde  build-script
+   12.8s  serde_core  build-script
+   12.7s  libc  build-script
+    8.7s  libsqlite3-sys  build-script (run)
+    8.6s  buffa-codegen 
+    5.8s  syn 
+    5.6s  diesel_derives 
+    5.1s  whatsapp-rust-sqlite-storage  (check)
+    4.5s  ring  build-script (run)
+    4.0s  syn  (check)
+    3.8s  bon-macros 
+    3.8s  tokio  (check)
+    3.4s  darling_core 
+    3.4s  serde_derive 
+== incremental wall times (4 cores)
+wacore after touch lib.rs: 111.244 s
+wacore after touch mex_operations.rs: 36.106 s
+whatsapp-rust after touch src/lib.rs: 39.964 s
+whatsapp-rust after touch src/client.rs: 2.219 s
+wam-catalog check: 0.147 s
+done
