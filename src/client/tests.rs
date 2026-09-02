@@ -7643,9 +7643,10 @@ async fn a_late_finisher_cannot_widen_the_next_drains_semaphore() {
 /// reset moved back out, the teardown reaches it without waiting and the
 /// assertion below fails.
 ///
-/// Vacuous rather than flaky in the other direction: if the teardown had not
-/// reached the lock at all, the semaphore is still wide and the test passes,
-/// which is why it first waits for the generation bump that opens the teardown.
+/// Not vacuous, because it waits on `offline_terminal_gate_reached` rather
+/// than on elapsed scheduler turns: that flag is set on the line above the
+/// acquisition, so the teardown has provably arrived at the lock by the time
+/// the assertion runs.
 #[tokio::test]
 async fn the_permit_reset_is_inside_the_terminal_lock() {
     let client = offline_resume_test_client().await;
