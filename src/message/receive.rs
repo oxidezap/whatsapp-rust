@@ -114,10 +114,10 @@ async fn decrypt_session_message(
 }
 
 impl Client {
-    /// Test convenience: scope to the current generation. Production inbound
-    /// traffic always goes through the chat-lane worker, which passes its own
-    /// spawn generation.
-    #[cfg(test)]
+    /// Test and bench convenience: scope to the current generation. Production
+    /// inbound traffic always goes through the chat-lane worker, which passes
+    /// its own spawn generation.
+    #[cfg(any(test, feature = "bench-harness"))]
     pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<OwnedNodeRef>) {
         let generation = self.connection_generation.load(Ordering::Acquire);
         self.handle_incoming_message_scoped(node, generation).await

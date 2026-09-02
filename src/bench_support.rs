@@ -416,9 +416,10 @@ async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
 /// Backed by a real second client rather than a throwaway key set, because the
 /// acknowledgement only comes from the peer actually decrypting our first
 /// message and replying: the reply's ratchet step is what clears the initiator's
-/// pending pre-key. The second client is dropped afterwards — it exists to
-/// produce that one reply, not to be measured.
-async fn establish_acknowledged_session(client: &Arc<Client>, peer: &Jid) {
+/// pending pre-key. The send fixture drops the returned peer — it exists to
+/// produce that one reply, not to be measured; the receive fixture keeps it as
+/// the party that encrypts every measured stanza.
+async fn establish_acknowledged_session(client: &Arc<Client>, peer: &Jid) -> Arc<Client> {
     use wacore::libsignal::protocol::{
         CiphertextMessage, IdentityKey, PreKeyBundle, PreKeySignalMessage, SignalMessage,
         UsePQRatchet, message_decrypt, message_encrypt, process_prekey_bundle,
@@ -535,6 +536,7 @@ async fn establish_acknowledged_session(client: &Arc<Client>, peer: &Jid) {
             .expect("session must be loadable in setup"),
         "the own companion's session must be acknowledged; a pkmsg here measures first contact"
     );
+    peer_client
 }
 
 /// Put the client in the state a connected, post-offline-sync client is in: a
@@ -559,4 +561,275 @@ async fn install_offline_socket(client: &Arc<Client>) {
     client.set_connected_for_test(true);
     client.is_running.store(true, Ordering::Release);
     client.enter_live_mode_for_tests();
+}
+
+/// The peer of the receive fixture, from the same reserved block as the group
+/// members and outside every range they draw from.
+const PEER_USER: &str = "19045550190";
+
+/// Counts the `Event::Messages` batches the bus delivers, standing in for the one
+/// consumer a real client always has. A receive with no subscriber at all
+/// would let the dispatcher skip work production never skips.
+struct MessageCounter {
+    delivered: portable_atomic::AtomicU64,
+}
+
+impl wacore::types::events::EventHandler for MessageCounter {
+    fn handle_event(&self, event: Arc<wacore::types::events::Event>) {
+        if matches!(&*event, wacore::types::events::Event::Messages(_)) {
+            self.delivered.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn interest(&self) -> wacore::types::events::EventInterest {
+        wacore::types::events::EventInterest::of(&[wacore::types::events::EventKind::Messages])
+    }
+}
+
+/// A logged-in client receiving from one peer it already shares a session and
+/// a sender key with: the steady state every message after the first arrives
+/// in.
+///
+/// The inbound counterpart of [`GroupSendHarness`]. The peer is a second
+/// in-memory client whose Signal stores encrypt each measured stanza, so what
+/// this client decrypts is what a real peer would have sent, and what is
+/// measured is everything from the decoded stanza to the dispatched event:
+/// classification, the session or sender-key decrypt through the signal
+/// cache, plaintext handling, dispatch, and the delivery receipt written to
+/// the sink socket. The chat lane is not on the bill: a stanza enters at
+/// [`Client::handle_incoming_message`], which is what the lane worker awaits
+/// per message, so the queue hop is excluded by construction and the
+/// per-message work is not.
+pub struct ReceiveHarness {
+    runtime: tokio::runtime::Runtime,
+    client: Arc<Client>,
+    peer: Arc<Client>,
+    peer_jid: Jid,
+    own_address: wacore::libsignal::protocol::ProtocolAddress,
+    group: Jid,
+    group_sender_key: wacore::libsignal::protocol::SenderKeyName,
+    counter: Arc<MessageCounter>,
+    /// Dropping it would unsubscribe the counter.
+    _subscription: wacore::types::events::Subscription,
+    next_id: portable_atomic::AtomicU64,
+}
+
+impl ReceiveHarness {
+    /// Build the receiving client and its peer, drive both to the steady state
+    /// (acknowledged pairwise session, peer's sender key installed), and
+    /// subscribe one message consumer.
+    pub fn new() -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let fixture = runtime.block_on(build_receive_fixture());
+        Self {
+            runtime,
+            client: fixture.client,
+            peer: fixture.peer,
+            peer_jid: fixture.peer_jid,
+            own_address: fixture.own_address,
+            group: fixture.group,
+            group_sender_key: fixture.group_sender_key,
+            counter: fixture.counter,
+            _subscription: fixture.subscription,
+            next_id: portable_atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// A fresh 1:1 text message from the peer, encrypted with the acknowledged
+    /// session, as the decoded `<message>` the read loop hands over. Each call
+    /// advances the peer's sending chain, so stanzas must be received in the
+    /// order they were built.
+    pub fn dm_stanza(&self) -> Arc<wacore_binary::OwnedNodeRef> {
+        use wacore::libsignal::protocol::message_encrypt;
+
+        let plaintext = wacore::messages::MessageUtils::encode_and_pad(&wa::Message::text("bench"));
+        let ciphertext = self.runtime.block_on(async {
+            let mut adapter = self.peer.signal_adapter();
+            message_encrypt(
+                &plaintext,
+                &self.own_address,
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+            )
+            .await
+            .expect("peer encrypts to us")
+        });
+        let enc = wacore_binary::builder::NodeBuilder::new("enc")
+            .attr("type", "msg")
+            .attr("v", "2")
+            .bytes(ciphertext.serialize().to_vec())
+            .build();
+        let node = wacore_binary::builder::NodeBuilder::new("message")
+            .attr("from", self.peer_jid.to_string())
+            .attr("id", self.next_message_id())
+            .attr("t", wacore::time::now_secs().to_string())
+            .attr("type", "text")
+            .attr("notify", "Bench Peer")
+            .children([enc])
+            .build();
+        decoded(&node)
+    }
+
+    /// A fresh group text message from the peer under its sender key. Same
+    /// ordering requirement as [`Self::dm_stanza`].
+    pub fn group_stanza(&self) -> Arc<wacore_binary::OwnedNodeRef> {
+        use wacore::libsignal::protocol::group_encrypt;
+
+        let plaintext = wacore::messages::MessageUtils::encode_and_pad(&wa::Message::text("bench"));
+        let ciphertext = self.runtime.block_on(async {
+            let mut adapter = self.peer.signal_adapter();
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            group_encrypt(
+                &mut adapter.sender_key_store,
+                &self.group_sender_key,
+                &plaintext,
+                &mut rng,
+            )
+            .await
+            .expect("peer encrypts to the group")
+        });
+        let enc = wacore_binary::builder::NodeBuilder::new("enc")
+            .attr("type", "skmsg")
+            .attr("v", "2")
+            .bytes(ciphertext.serialized().to_vec())
+            .build();
+        let node = wacore_binary::builder::NodeBuilder::new("message")
+            .attr("from", self.group.to_string())
+            .attr("participant", self.peer_jid.to_string())
+            .attr("id", self.next_message_id())
+            .attr("t", wacore::time::now_secs().to_string())
+            .attr("type", "text")
+            .attr("notify", "Bench Peer")
+            .children([enc])
+            .build();
+        decoded(&node)
+    }
+
+    /// Receive one stanza, all the way to the dispatched event and the
+    /// delivery receipt on the sink socket.
+    pub fn receive(&self, node: Arc<wacore_binary::OwnedNodeRef>) {
+        self.runtime
+            .block_on(Arc::clone(&self.client).handle_incoming_message(node))
+    }
+
+    /// How many `Event::Messages` batches reached the subscriber so far (one
+    /// per received stanza in live mode). A benchmark
+    /// asserts this against its iteration count, so a silent decrypt failure
+    /// (which is fast) cannot pass for a receive.
+    pub fn messages_delivered(&self) -> u64 {
+        self.counter.delivered.load(Ordering::Relaxed)
+    }
+
+    fn next_message_id(&self) -> String {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        format!("3EB0BENCH{n:011}")
+    }
+}
+
+impl Default for ReceiveHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The decoded form the read loop produces: marshalled and decoded back, so
+/// attributes arrive wire-typed exactly as production sees them.
+fn decoded(node: &wacore_binary::node::Node) -> Arc<wacore_binary::OwnedNodeRef> {
+    let packed = wacore_binary::marshal::marshal(node).expect("marshal");
+    let bytes = wacore_binary::util::unpack(&packed)
+        .expect("unpack")
+        .into_owned();
+    Arc::new(wacore_binary::OwnedNodeRef::new(bytes).expect("decode"))
+}
+
+struct ReceiveFixture {
+    client: Arc<Client>,
+    peer: Arc<Client>,
+    peer_jid: Jid,
+    own_address: wacore::libsignal::protocol::ProtocolAddress,
+    group: Jid,
+    group_sender_key: wacore::libsignal::protocol::SenderKeyName,
+    counter: Arc<MessageCounter>,
+    subscription: wacore::types::events::Subscription,
+}
+
+async fn build_receive_fixture() -> ReceiveFixture {
+    use wacore::libsignal::protocol::create_sender_key_distribution_message;
+    use wacore::types::jid::{JidExt, make_sender_key_name};
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let pm = Arc::new(
+        PersistenceManager::new(backend)
+            .await
+            .expect("persistence manager"),
+    );
+    let (client, _sync_rx) = Client::new(
+        Arc::new(TokioRuntime),
+        pm,
+        Arc::new(SinkTransportFactory),
+        Arc::new(NoopHttpClient),
+        None,
+    )
+    .await;
+
+    let own_pn = Jid::new(OWN_USER, Server::Pn);
+    let own_lid = Jid::new("100000000000001", Server::Lid);
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetId(Some(own_pn.clone())))
+        .await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(own_lid)))
+        .await;
+
+    // The peer is a known device, as it is for any chat with history; an
+    // unknown one would fire a device sync on every message.
+    seed_registry(&client, PEER_USER, &[0]).await;
+    seed_registry(&client, OWN_USER, &[0, 1]).await;
+
+    let peer_jid = Jid::new(PEER_USER, Server::Pn);
+    let peer = establish_acknowledged_session(&client, &peer_jid).await;
+
+    // The peer's sender key for the group, installed the way an inbound SKDM
+    // installs it, so every measured skmsg finds its chain.
+    let group: Jid = GROUP_JID.parse().expect("group jid");
+    let group_sender_key = make_sender_key_name(&group, &peer_jid.to_protocol_address());
+    let skdm = {
+        let mut adapter = peer.signal_adapter();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        create_sender_key_distribution_message(
+            &group_sender_key,
+            &mut adapter.sender_key_store,
+            &mut rng,
+        )
+        .await
+        .expect("peer sender key")
+    };
+    client
+        .handle_sender_key_distribution_message(&group, &peer_jid, "bench-skdm", skdm.serialized())
+        .await;
+
+    let counter = Arc::new(MessageCounter {
+        delivered: portable_atomic::AtomicU64::new(0),
+    });
+    let subscription = client
+        .subscribe_handler(Arc::clone(&counter) as Arc<dyn wacore::types::events::EventHandler>);
+
+    install_offline_socket(&client).await;
+    settle_signal_flush_worker(&client).await;
+
+    ReceiveFixture {
+        client,
+        peer,
+        peer_jid,
+        own_address: own_pn.to_protocol_address(),
+        group,
+        group_sender_key,
+        counter,
+        subscription,
+    }
 }
