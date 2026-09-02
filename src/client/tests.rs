@@ -7585,25 +7585,24 @@ async fn wait_for_startup_sync_reports_a_teardown_without_waiting_out_its_timeou
     );
 }
 
-/// A drain that ends must not leave the next connection's drain unserialized.
-///
-/// The teardown resets the processing semaphore to one permit so the next
-/// drain commits its Signal state one stanza at a time. A finisher that had
-/// already claimed its stamp would otherwise widen it back to 64 after that
-/// reset, and the backlog would come down concurrently with nothing
-/// serializing the ratchet advances.
-#[tokio::test]
-async fn a_teardown_leaves_the_next_drain_on_one_permit() {
-    let client = offline_resume_test_client().await;
+/// `async_lock::Semaphore` does not report its count, so ask it the question
+/// the drain actually asks: can two stanzas be in flight at once?
+fn concurrent_permits(client: &Arc<Client>) -> bool {
+    let semaphore = client.read_message_semaphore().1;
+    let first = semaphore.try_acquire_arc();
+    let second = semaphore.try_acquire_arc();
+    first.is_some() && second.is_some()
+}
 
-    // `async_lock::Semaphore` does not report its count, so ask it the question
-    // the drain actually asks: can two stanzas be in flight at once?
-    let concurrent_permits = |client: &Arc<Client>| {
-        let semaphore = client.read_message_semaphore().1;
-        let first = semaphore.try_acquire_arc();
-        let second = semaphore.try_acquire_arc();
-        first.is_some() && second.is_some()
-    };
+/// A finisher that arrives after its teardown cannot widen the semaphore the
+/// next drain needs narrow.
+///
+/// This is the sequential half of the invariant: the finisher's own late
+/// publication is refused. The contended half, that the reset itself sits
+/// inside the lock, is [`the_permit_reset_is_inside_the_terminal_lock`].
+#[tokio::test]
+async fn a_late_finisher_cannot_widen_the_next_drains_semaphore() {
+    let client = offline_resume_test_client().await;
 
     arm_offline_drain(&client, 711, 700).await;
     let stale_generation = client.connection_generation.load(Ordering::Acquire);
@@ -7623,6 +7622,54 @@ async fn a_teardown_leaves_the_next_drain_on_one_permit() {
     assert!(
         !concurrent_permits(&client),
         "the next drain starts on one permit, whatever the old finisher does"
+    );
+}
+
+/// The permit reset happens under `offline_terminal_lock`, not before it.
+///
+/// Holding the lock is the only way to observe that from outside: while it is
+/// held, a teardown must not have narrowed the semaphore, because the reset is
+/// on the far side of the same lock a publishing finisher holds. With the
+/// reset moved back out, the teardown reaches it without waiting and the
+/// assertion below fails.
+///
+/// Vacuous rather than flaky in the other direction: if the teardown had not
+/// reached the lock at all, the semaphore is still wide and the test passes,
+/// which is why it first waits for the generation bump that opens the teardown.
+#[tokio::test]
+async fn the_permit_reset_is_inside_the_terminal_lock() {
+    let client = offline_resume_test_client().await;
+
+    arm_offline_drain(&client, 711, 700).await;
+    client.enter_live_mode_for_tests();
+    let generation = client.connection_generation.load(Ordering::Acquire);
+
+    let terminal_gate = client.offline_terminal_lock.lock().await;
+
+    let teardown = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.cleanup_connection_state().await }
+    });
+
+    // The bump is the first thing the teardown does, well before the lock.
+    crate::test_utils::poll_until("the teardown to start", || {
+        client.connection_generation.load(Ordering::Acquire) != generation
+    })
+    .await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        concurrent_permits(&client),
+        "the teardown narrowed the semaphore without the lock a finisher publishes under"
+    );
+
+    drop(terminal_gate);
+    teardown.await.expect("teardown must not panic");
+    assert!(
+        !concurrent_permits(&client),
+        "and once it has the lock, it does narrow it"
     );
 }
 
