@@ -991,6 +991,11 @@ struct VideoPlaneState {
     keyframe_required: bool,
     /// When the last PLI was sent to the peer, so a burst of gaps describing one
     /// loss costs one request. See [`CallEngine::request_peer_keyframe`].
+    ///
+    /// Cleared with the stream it describes, by [`Self::forget_inbound_stream`]:
+    /// a throttle is an interval between two complaints about the *same*
+    /// picture, and carrying it across a stream change would spend a new
+    /// stream's first recovery on the previous one's quota.
     peer_keyframe_asked_at: Option<Millis>,
     /// Whether the application has been told about the current requirement.
     ///
@@ -1021,6 +1026,25 @@ fn requests_keyframe(feedback: &[RtcpFeedback], video_ssrc: u32) -> bool {
             _ => false,
         }
     })
+}
+
+impl VideoPlaneState {
+    /// Forget which inbound stream this plane was reassembling.
+    ///
+    /// Both halves of that go together and neither is useful alone: the
+    /// depacketizer's SSRC is what a PLI names, and the throttle is an
+    /// interval between two complaints about one picture. Kept apart, a plane
+    /// either asks the peer to reset a stream it has moved on from, or spends
+    /// a new stream's first recovery on the previous one's quota -- and
+    /// recovery matters most exactly when a stream has just changed.
+    ///
+    /// Reassembly and rate state only. The pipeline deliberately outlives a
+    /// downgrade so its SRTP send sequence is not reused, and none of that is
+    /// touched here.
+    fn forget_inbound_stream(&mut self) {
+        self.pipe.reset_depacketizer();
+        self.peer_keyframe_asked_at = None;
+    }
 }
 
 /// Build the video pipeline for `self_lid` sending / `recv_peer_lid` receiving. `None` on a
@@ -1924,7 +1948,11 @@ impl CallEngine {
         // audio ones; a video plane enabled after this rekey must also start from the new LID.
         m.recv_peer_lid = answering_peer_lid.to_string();
         if let Some(v) = m.video.as_mut() {
-            return v.pipe.rekey_recv(&m.call_key, answering_peer_lid);
+            let rekeyed = v.pipe.rekey_recv(&m.call_key, answering_peer_lid);
+            // `rekey_recv` drops the reassembly; the rate state describes the
+            // same departed stream and goes with it.
+            v.peer_keyframe_asked_at = None;
+            return rekeyed;
         }
         true
     }
@@ -2110,17 +2138,12 @@ impl CallEngine {
             v.active = true;
             v.send_gated = send_gated;
             if was_off {
-                // Inbound decoded nothing while the plane was off, so what the
-                // depacketizer holds belongs to a stream this one cannot
-                // continue -- and its SSRC is what a PLI would name. Sending a
-                // recovery request for a stream the peer has moved on from asks
-                // it to reset something it no longer sends, so the plane comes
-                // back with nothing to address until a packet authenticates.
-                // Only from OFF: a send-gated plane was decoding all along, and
-                // resetting there would discard a stream still in progress. The
-                // send state is untouched either way -- this is reassembly only,
-                // and dropping the SRTP sequence would repeat a keystream.
-                v.pipe.reset_depacketizer();
+                // Inbound decoded nothing while the plane was off, so whatever
+                // it was reassembling belongs to a stream this one cannot
+                // continue. Only from OFF: a send-gated plane was decoding all
+                // along, and forgetting there would discard a stream still in
+                // progress.
+                v.forget_inbound_stream();
             }
             if needs_recovery {
                 v.keyframe_required = true;
@@ -9594,9 +9617,7 @@ mod tests {
 
         let transport = derive_srtcp_keys(&call_key, SELF_LID).unwrap();
         let (plain, _) = unprotect_srtcp(&transport, local_video_ssrc, protected).unwrap();
-        // 0x91, not 0x81: the native video profile sets bit 4 beside the FMT,
-        // which is the shape `whatsapp_feedback_profile_bit_is_not_part_of_fmt`
-        // already documents from the receive side.
+        // The builder emits the WhatsApp-profile header; see it for why.
         assert_eq!(&plain[..4], &[0x91, RTCP_PT_PSFB, 0, 2]);
         assert_eq!(&plain[4..8], &local_video_ssrc.to_be_bytes());
         assert_eq!(&plain[8..12], &peer_video_ssrc.to_be_bytes());
@@ -9635,18 +9656,25 @@ mod tests {
         eng.disable_video();
         assert!(eng.enable_video());
         assert!(
-            !eng.request_peer_keyframe(10_000),
+            !eng.request_peer_keyframe(300),
             "a plane with no authenticated inbound stream has nothing to ask about"
         );
 
-        // A packet on the new session restores it.
+        // A packet on the new session restores it -- and the new stream's first
+        // request is not spent on the previous one's throttle, which is why the
+        // time here is still inside `MIN_PEER_KEYFRAME_INTERVAL_MS` of the
+        // request at 200. Recovery matters most exactly when a stream changed.
         let video = peer_video
             .protect_video(&video_au(200))
             .pop()
             .expect("one-packet video AU");
-        eng.handle_input(10_001, Input::RelayPacket(&video));
+        eng.handle_input(400, Input::RelayPacket(&video));
         let _ = drain(&mut eng);
-        assert!(eng.request_peer_keyframe(20_000));
+        // At compile time, so shortening the interval below the 200ms these
+        // two requests are apart turns the test into a tautology loudly
+        // rather than quietly.
+        const _: () = assert!(400 - 200 < MIN_PEER_KEYFRAME_INTERVAL_MS);
+        assert!(eng.request_peer_keyframe(400));
     }
 
     /// A burst of gaps describing one loss costs one request, and the next is
