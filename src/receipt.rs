@@ -593,6 +593,18 @@ impl Client {
         // <error reason="lid" type="feature-incapable"> (the LID peer can't receive it).
         let receipt_type =
             wacore::stanza::receipt::downgrade_for_feature_incapable(nr, receipt_type);
+        // Retries feed the resend pipeline whether or not anything listens.
+        // Every other receipt exists only to become an `Event::Receipt`, which
+        // `dispatch` drops on the floor without a subscriber — so without one,
+        // stop before parsing `<participants>` (one `Jid` pair per member of
+        // a group read) or building the message-id list.
+        if !matches!(
+            receipt_type,
+            ReceiptType::Retry | ReceiptType::EncRekeyRetry
+        ) && !self.core.event_bus.has_handler_for(EventKind::Receipt)
+        {
+            return;
+        }
         let is_view = receipt_type_str == "view";
         let is_group = from.is_group();
         let default_sender = if is_group {
@@ -628,12 +640,6 @@ impl Client {
                 from.observe(),
                 users.len()
             );
-            // Pure event production from here on: `dispatch` would drop every
-            // one of these on the floor without a subscriber, so skip building
-            // N receipts (each with a `Jid` clone and a `Vec<String>`) up front.
-            if !self.core.event_bus.has_handler_for(EventKind::Receipt) {
-                return;
-            }
             for user in users {
                 // Missing `<user t>` means the server didn't disambiguate the
                 // per-user time; fall back to the stanza-level `t`.

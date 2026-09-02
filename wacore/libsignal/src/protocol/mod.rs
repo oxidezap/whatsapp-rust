@@ -45,7 +45,7 @@ pub use crate::store::sender_key_name::SenderKeyName;
 use error::Result;
 pub use error::SignalProtocolError;
 pub use group_cipher::{
-    create_sender_key_distribution_message, group_decrypt, group_encrypt,
+    create_sender_key_distribution_message, group_decrypt, group_decrypt_shared, group_encrypt,
     process_sender_key_distribution_message,
 };
 pub use identity_key::{IdentityKey, IdentityKeyPair};

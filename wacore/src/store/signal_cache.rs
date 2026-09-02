@@ -256,9 +256,21 @@ impl<V> UserIndexedCache<V> {
     }
 
     fn insert(&mut self, key: Arc<str>, value: V) -> Option<V> {
-        self.users
-            .insert(user_fingerprint(user_of_protocol_address(&key)));
-        self.map.insert(key, value)
+        // Overwrites are the common case — every send and decrypt writes its
+        // address back — and an address already in the map already has its
+        // user in the index, so the fingerprint (a scan for the separator and
+        // a hash of the user) is only computed for a new key.
+        match self.map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                Some(occupied.insert(value))
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                self.users
+                    .insert(user_fingerprint(user_of_protocol_address(vacant.key())));
+                vacant.insert(value);
+                None
+            }
+        }
     }
 
     /// Stamp to take before a cold read releases the lock.
@@ -519,8 +531,11 @@ impl SessionStoreState {
         }
         self.cache
             .insert(addr.clone(), SessionEntry::Present(Arc::new(record)));
-        self.dirty.insert(addr.clone());
-        self.deleted.remove(&addr);
+        // `deleted` is empty on every ordinary write-back; skip its hash.
+        if !self.deleted.is_empty() {
+            self.deleted.remove(&addr);
+        }
+        self.dirty.insert(addr);
     }
 
     fn checkout(&mut self, address: &str) -> CachedSessionCheckout {

@@ -795,7 +795,7 @@ message can overshoot substantially on its own.
 | `pdo_pending_requests` / `pdo_requested` | 30s TTL, 200 / 24h TTL, 512 | a repeated PDO request |
 | `sender_key_devices_cache` | 1h TTI, 500 | a redundant SKDM |
 | `session_recreate_history` | 1h TTL, 256 | one un-throttled recreate |
-| `session_locks` / `chat_lanes` / `group_distribution_locks` | 10 000 / 5 000 / 512 | nothing: an `evict_guard` refuses to evict a lock a task holds, so the map briefly exceeds capacity instead of minting a second lock for one key |
+| `session_locks` / `chat_lanes` / `group_distribution_locks` | 10 000 / 5 000 / 512 | nothing: an `evict_guard` refuses to evict a lock a task holds, so the map briefly exceeds capacity instead of minting a second lock for one key. A chat lane's worker, which holds the inbound-message future (~9 KiB) for its whole life, exits after `LANE_IDLE_TIMEOUT` (60 s) of silence; the entry then costs one closed channel until the chat's next message replaces it or FIFO eviction drops it |
 | `resend_rate_limiter` | 4 096, FIFO | fail-open by design — an evicted bucket is recreated full, so undersizing forgives rate, never over-throttles |
 | `group_devices_memo` / `skdm_warm_memo` / `dm_devices_memo` | 64 / 64 / 512 | a recompute |
 | `SignalStoreCache` sessions / identities / sender keys | 2 000 each (+1/8 slack before an eviction scan), *while flushes succeed* | nothing: only *clean* entries are evicted, so an unpersisted record is never dropped — which also means a backend that stops accepting writes leaves everything dirty and the maps grow past the cap. Correct, and the reason to watch the counts rather than trust the number |

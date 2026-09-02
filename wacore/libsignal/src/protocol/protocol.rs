@@ -721,7 +721,10 @@ pub struct SenderKeyMessage {
     message_version: u8,
     chain_id: u32,
     iteration: u32,
-    serialized: Box<[u8]>,
+    /// Reference-counted, as for [`SignalMessage`]: a received skmsg is a
+    /// slice of its frame buffer, so parsing it shares that allocation rather
+    /// than copying the whole message once per group message.
+    serialized: Bytes,
     /// Where the ciphertext sits inside `serialized`, as for [`SignalMessage`].
     /// A group message is decoded once per recipient device, so pointing at the
     /// bytes already owned here keeps the per-message copy out of the receive
@@ -766,11 +769,14 @@ impl SenderKeyMessage {
             .map_err(|_| SignalProtocolError::SignatureValidationFailed)?;
         serialized.extend_from_slice(&signature);
 
+        // Filled to exactly its reserved length, so `Bytes::from` takes the
+        // boxed-slice path and `into_serialized` recovers the allocation.
+        debug_assert_eq!(serialized.len(), serialized.capacity());
         Ok(Self {
             message_version,
             chain_id,
             iteration,
-            serialized: serialized.into_boxed_slice(),
+            serialized: Bytes::from(serialized),
             ciphertext_range,
         })
     }
@@ -832,20 +838,12 @@ impl SenderKeyMessage {
 
     #[inline]
     pub fn into_serialized(self) -> Box<[u8]> {
-        self.serialized
+        bytes_into_boxed_slice(self.serialized)
     }
-}
 
-impl AsRef<[u8]> for SenderKeyMessage {
-    fn as_ref(&self) -> &[u8] {
-        &self.serialized
-    }
-}
-
-impl TryFrom<&[u8]> for SenderKeyMessage {
-    type Error = SignalProtocolError;
-
-    fn try_from(value: &[u8]) -> Result<Self> {
+    /// Parse the wire form without taking ownership: version byte, the
+    /// protobuf, and where the ciphertext sits inside `value`.
+    fn parse(value: &[u8]) -> Result<(u8, u32, u32, Range<usize>)> {
         if value.len() < 1 + Self::SIGNATURE_LEN {
             return Err(SignalProtocolError::CiphertextMessageTooShort(value.len()));
         }
@@ -874,16 +872,38 @@ impl TryFrom<&[u8]> for SenderKeyMessage {
         let Some(ciphertext) = view.ciphertext else {
             return Err(SignalProtocolError::InvalidProtobufEncoding);
         };
-        // The view borrows `value`, and `serialized` below is a byte-identical
-        // copy of it, so the offsets carry over unchanged.
         let ciphertext_range = subslice_range(value, ciphertext)
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        Ok((message_version, chain_id, iteration, ciphertext_range))
+    }
+}
 
+impl AsRef<[u8]> for SenderKeyMessage {
+    fn as_ref(&self) -> &[u8] {
+        &self.serialized
+    }
+}
+
+impl TryFrom<&[u8]> for SenderKeyMessage {
+    type Error = SignalProtocolError;
+
+    fn try_from(value: &[u8]) -> Result<Self> {
+        Self::try_from(bytes_from_slice(value))
+    }
+}
+
+/// Zero-copy parse: the message keeps `value` as its storage, so a slice of a
+/// received frame is retained by refcount instead of copied.
+impl TryFrom<Bytes> for SenderKeyMessage {
+    type Error = SignalProtocolError;
+
+    fn try_from(value: Bytes) -> Result<Self> {
+        let (message_version, chain_id, iteration, ciphertext_range) = Self::parse(&value)?;
         Ok(SenderKeyMessage {
             message_version,
             chain_id,
             iteration,
-            serialized: Box::from(value),
+            serialized: value,
             ciphertext_range,
         })
     }

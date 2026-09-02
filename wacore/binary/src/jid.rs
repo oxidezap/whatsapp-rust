@@ -1103,6 +1103,24 @@ pub fn push_jid_to_compact(
     write_jid!(infallible buf, user, server, agent, device);
 }
 
+/// Render a borrowed JID into a `CompactString` sized to what it actually
+/// takes, so a group id or a LID that fits the 24 inline bytes never touches
+/// the heap. Reserving `user.len() + 20` up front, as the decoder used to,
+/// exceeded the inline budget for every user longer than four characters and
+/// heap-allocated unconditionally — once per JID token in a device-list or
+/// usync response.
+pub fn jid_ref_to_compact(j: &JidRef<'_>) -> CompactString {
+    let mut writer = JidStackWriter::new();
+    if write_jid_fallible(&mut writer, &j.user, j.server, j.agent, j.device).is_ok() {
+        return CompactString::from(writer.as_str());
+    }
+    // A user part too long for the stack buffer (never seen on the wire)
+    // still renders, just back through the heap.
+    let mut s = CompactString::with_capacity(j.user.len() + 20);
+    push_jid_to_compact(&j.user, j.server, j.agent, j.device, &mut s);
+    s
+}
+
 /// Stack writer sized for any realistic JID, so `Display` can emit a single
 /// `write_str`: a `ToString`-backed `String` then reserves once at the exact
 /// length instead of reallocating per fragment. Overflow errors out and the

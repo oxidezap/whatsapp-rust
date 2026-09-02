@@ -3552,6 +3552,7 @@ async fn active_chat_lane_survives_capacity_pressure() {
             ChatLane {
                 enqueue_lock: Arc::new(Mutex::new(())),
                 queue_tx,
+                worker_running: Arc::new(Mutex::new(())),
             },
             queue_rx,
         )

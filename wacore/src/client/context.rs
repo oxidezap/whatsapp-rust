@@ -311,6 +311,11 @@ impl GroupInfo {
             }
             self.participants.push(jid.clone());
         }
+        // Membership changes arrive one notification at a time and the list
+        // is read for hours between them, so trade a realloc per change for
+        // no doubling slack: a group that grew past its allocation by one
+        // member otherwise kept a second, empty copy of itself resident.
+        self.participants.shrink_to_fit();
         if let Some(pairs) = pairs {
             self.store_pairs(pairs);
         }
@@ -322,6 +327,7 @@ impl GroupInfo {
     pub fn remove_participants(&mut self, users_to_remove: &[&str]) {
         self.participants
             .retain(|p| !users_to_remove.iter().any(|u| *u == p.user));
+        self.participants.shrink_to_fit();
         // Each name can be either side of a mapping. The phone side is
         // resolved through the reverse index first, so a phone number shared
         // by two LIDs drops exactly the one that index names — which is what

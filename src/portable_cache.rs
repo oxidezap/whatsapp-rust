@@ -9,6 +9,7 @@
 //! same missing key run the initializer once.
 
 use async_lock::{Mutex as AsyncMutex, RwLock};
+use hashbrown::HashTable;
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, Hash, RandomState};
@@ -40,6 +41,20 @@ struct CacheEntry<V> {
     seq: u64,
 }
 
+/// One table slot: the key, its hash, and the entry.
+///
+/// The hash is kept so the table can grow without re-hashing every key and so
+/// the FIFO side can address a slot by `(hash, seq)` instead of holding a
+/// second copy of the key. Before this, `order` was a `BTreeMap<u64, K>`: every
+/// entry carried its key twice, and for a `String`, `Jid` or `SenderMessageId`
+/// key that second copy was a second heap allocation held for the entry's
+/// whole lifetime, across every cache the client keeps.
+struct Slot<K, V> {
+    key: K,
+    hash: u64,
+    entry: CacheEntry<V>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CapacityStats {
     pub entries: u64,
@@ -51,31 +66,42 @@ pub(crate) struct CapacityStats {
 ///
 /// - Max capacity with FIFO eviction
 /// - TTL (time-to-live) and TTI (time-to-idle)
-/// - Single-flight `get_with` / `get_with_by_ref`
+/// - Single-flight `get_with`
+///
+/// Uses `async_lock::RwLock` (runtime-agnostic, works on wasm32), so this
+/// compiles and runs on every target.
+///
+/// Both lazy and best-effort: expired entries are only removed lazily on
+/// access or in `run_pending_tasks`. `entry_count` may include
+/// expired-but-not-yet-evicted entries.
 pub struct PortableCache<K, V> {
     inner: Arc<RwLock<CacheInner<K, V>>>,
-    /// Per-key init locks for single-flight `get_with`.
+    /// Shared single-flight init-lock registry (see `InitLocks`).
     init_locks: Arc<InitLocks>,
     max_capacity: Option<u64>,
     ttl: Option<Duration>,
     tti: Option<Duration>,
-    /// Optional predicate gating capacity eviction: returns `true` if a value may
-    /// be evicted. Used by coordination-lock caches to protect an entry a live task
-    /// still holds (e.g. an `Arc<Mutex>` mid-lock), which would otherwise be
-    /// FIFO-evicted and re-minted, letting two writers race the guarded resource.
+    /// See [`PortableCacheBuilder::evict_guard`].
     evict_guard: Option<fn(&V) -> bool>,
-    /// Stores made by the TTI renewal path. Lets a test assert that a burst of
-    /// concurrent lookups renews once rather than once per queued writer.
     #[cfg(test)]
     tti_renewals: Arc<portable_atomic::AtomicU64>,
 }
 
 struct CacheInner<K, V> {
-    map: HashMap<K, CacheEntry<V>>,
-    /// FIFO eviction order keyed by monotonic sequence. `seq -> key`, so eviction
-    /// is `pop_first()` (O(log n)) and a targeted `remove_key` is O(log n) via the
-    /// entry's stored `seq` — instead of an O(n) scan over an insertion list.
-    order: BTreeMap<u64, K>,
+    /// Hashes keys once at insert; lookups with a borrowed `Q` hash through
+    /// the same state, which the `Borrow` contract keeps consistent with `K`.
+    hasher: RandomState,
+    table: HashTable<Slot<K, V>>,
+    /// FIFO eviction order, `seq -> hash`. Eviction is `pop_first()` (O(log n))
+    /// and a targeted `remove_key` is O(log n) via the entry's stored `seq`.
+    /// The hash plus the seq find the slot in `table`, so no key is stored here.
+    ///
+    /// Left empty for a cache that has no capacity bound: nothing could ever
+    /// pop it, so maintaining it would spend a `BTreeMap` node per entry on a
+    /// structure that is never read. The unbounded LID↔PN caches hold tens
+    /// of thousands of entries for the life of the process.
+    order: BTreeMap<u64, u64>,
+    track_order: bool,
     /// Next FIFO sequence to assign.
     next_seq: u64,
     capacity_evictions: u64,
@@ -86,14 +112,57 @@ impl<K, V> CacheInner<K, V>
 where
     K: Hash + Eq + Clone,
 {
-    fn new() -> Self {
+    fn new(track_order: bool) -> Self {
         Self {
-            map: HashMap::new(),
+            hasher: RandomState::new(),
+            table: HashTable::new(),
             order: BTreeMap::new(),
+            track_order,
             next_seq: 0,
             capacity_evictions: 0,
             capacity_eviction_blocks: 0,
         }
+    }
+
+    #[inline]
+    fn hash_of<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        self.hasher.hash_one(key)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    fn get<Q>(&self, key: &Q) -> Option<&CacheEntry<V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        self.table
+            .find(hash, |slot| slot.key.borrow() == key)
+            .map(|slot| &slot.entry)
+    }
+
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut CacheEntry<V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        self.table
+            .find_mut(hash, |slot| slot.key.borrow() == key)
+            .map(|slot| &mut slot.entry)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &CacheEntry<V>)> {
+        self.table.iter().map(|slot| (&slot.key, &slot.entry))
+    }
+
+    fn clear(&mut self) {
+        self.table.clear();
+        self.order.clear();
     }
 
     /// Borrowed removal: the `order` side is keyed by the entry's own `seq`,
@@ -104,22 +173,34 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let entry = self.map.remove(key)?;
-        self.order.remove(&entry.seq);
-        Some(entry)
+        let hash = self.hash_of(key);
+        let (slot, _) = self
+            .table
+            .find_entry(hash, |slot| slot.key.borrow() == key)
+            .ok()?
+            .remove();
+        self.order.remove(&slot.entry.seq);
+        Some(slot.entry)
     }
 
-    /// Evict entries until under `cap`. Outlined and never-inlined so the guarded
-    /// scan is compiled once per `<K, V>` (not duplicated into every `insert_new`
-    /// inline site), keeping the binary-size cost of the guard path small.
-    #[inline(never)]
+    /// Remove the slot the FIFO side named by `(hash, seq)`.
+    fn remove_by_seq(&mut self, hash: u64, seq: u64) -> bool {
+        self.table
+            .find_entry(hash, |slot| slot.entry.seq == seq)
+            .ok()
+            .map(|occupied| occupied.remove())
+            .is_some()
+    }
+
+    /// Evict oldest-first until below `cap`. With an `evict_guard`, skips entries
+    /// the guard reports as held (see [`PortableCacheBuilder::evict_guard`]).
     fn evict_to_capacity(&mut self, cap: u64, evict_guard: Option<fn(&V) -> bool>) {
-        while self.map.len() as u64 >= cap {
+        while self.table.len() as u64 >= cap {
             match evict_guard {
                 // Unguarded caches keep the single-pass pop_first() fast path.
                 None => match self.order.pop_first() {
-                    Some((_, oldest_key)) => {
-                        if self.map.remove(&oldest_key).is_some() {
+                    Some((seq, hash)) => {
+                        if self.remove_by_seq(hash, seq) {
                             self.capacity_evictions = self.capacity_evictions.saturating_add(1);
                         }
                     }
@@ -127,21 +208,23 @@ where
                 },
                 // Guarded: skip entries a live task still holds so a later lookup
                 // can't mint a duplicate; if every entry is held, allow temporary
-                // over-capacity rather than dropping a live entry. Remove by seq so
-                // the key isn't cloned.
+                // over-capacity rather than dropping a live entry.
                 Some(is_evictable) => {
-                    let mut victim_seq = None;
-                    for (seq, k) in self.order.iter() {
-                        if self.map.get(k).is_some_and(|e| is_evictable(&e.value)) {
-                            victim_seq = Some(*seq);
+                    let mut victim = None;
+                    for (&seq, &hash) in self.order.iter() {
+                        if self
+                            .table
+                            .find(hash, |slot| slot.entry.seq == seq)
+                            .is_some_and(|slot| is_evictable(&slot.entry.value))
+                        {
+                            victim = Some((seq, hash));
                             break;
                         }
                     }
-                    match victim_seq {
-                        Some(seq) => {
-                            if let Some(oldest_key) = self.order.remove(&seq)
-                                && self.map.remove(&oldest_key).is_some()
-                            {
+                    match victim {
+                        Some((seq, hash)) => {
+                            self.order.remove(&seq);
+                            if self.remove_by_seq(hash, seq) {
                                 self.capacity_evictions = self.capacity_evictions.saturating_add(1);
                             }
                         }
@@ -173,16 +256,32 @@ where
 
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.order.insert(seq, key.clone());
-        self.map.insert(
-            key,
-            CacheEntry {
-                value,
-                inserted_at: now,
-                last_accessed_at: now,
-                seq,
+        let hash = self.hash_of(&key);
+        if self.track_order {
+            self.order.insert(seq, hash);
+        }
+        self.table.insert_unique(
+            hash,
+            Slot {
+                key,
+                hash,
+                entry: CacheEntry {
+                    value,
+                    inserted_at: now,
+                    last_accessed_at: now,
+                    seq,
+                },
             },
+            |slot| slot.hash,
         );
+    }
+
+    /// Drop expired entries and the FIFO records that named them.
+    fn retain_unexpired(&mut self, mut is_expired: impl FnMut(&CacheEntry<V>) -> bool) {
+        let table = &mut self.table;
+        let order = &mut self.order;
+        table.retain(|slot| !is_expired(&slot.entry));
+        order.retain(|seq, hash| table.find(*hash, |slot| slot.entry.seq == *seq).is_some());
     }
 }
 
@@ -343,7 +442,9 @@ where
         );
 
         PortableCache {
-            inner: Arc::new(RwLock::new(CacheInner::new())),
+            inner: Arc::new(RwLock::new(CacheInner::new(
+                self.max_capacity.is_some_and(|cap| cap != u64::MAX),
+            ))),
             init_locks: Arc::new(InitLocks::new()),
             max_capacity: self.max_capacity,
             ttl: self.ttl,
@@ -408,7 +509,7 @@ where
     {
         let (value, renew_at) = {
             let guard = self.inner.read().await;
-            let entry = guard.map.get(key)?;
+            let entry = guard.get(key)?;
             // Read the clock after the lookup: a miss has no timestamp to
             // compare, and lookups that miss are a large share of the calls
             // (every negative registry probe, every warm-up).
@@ -421,7 +522,7 @@ where
                 let observed = (entry.seq, entry.inserted_at);
                 drop(guard);
                 let mut wguard = self.inner.write().await;
-                if let Some(e) = wguard.map.get(key)
+                if let Some(e) = wguard.get(key)
                     && (e.seq, e.inserted_at) == observed
                     && self.is_expired(e, now)
                 {
@@ -440,7 +541,7 @@ where
             // Re-decide under the lock: the key may have been invalidated (the
             // miss leaves it that way) or already refreshed by a racing renewal
             // or insert, whose newer stamp this lookup must leave alone.
-            if let Some(entry) = guard.map.get_mut(key)
+            if let Some(entry) = guard.get_mut(key)
                 && self.needs_tti_renewal(entry, now)
             {
                 entry.last_accessed_at = now;
@@ -457,7 +558,7 @@ where
         let now = self.entry_time();
         let mut guard = self.inner.write().await;
 
-        if let Some(entry) = guard.map.get_mut(&key) {
+        if let Some(entry) = guard.get_mut(&key) {
             entry.value = value;
             entry.inserted_at = now;
             entry.last_accessed_at = now;
@@ -490,19 +591,18 @@ where
         let mut guard = self.inner.write().await;
 
         if guard
-            .map
             .get(key)
             .is_some_and(|entry| self.is_expired(entry, now))
         {
             guard.remove_key(key);
         }
 
-        let (next, result) = update(guard.map.get(key).map(|entry| &entry.value));
+        let (next, result) = update(guard.get(key).map(|entry| &entry.value));
         let Some(next) = next else {
             return result;
         };
 
-        if let Some(entry) = guard.map.get_mut(key) {
+        if let Some(entry) = guard.get_mut(key) {
             entry.value = next;
             entry.inserted_at = now;
             entry.last_accessed_at = now;
@@ -524,7 +624,7 @@ where
         let now = self.entry_time();
         let mut guard = self.inner.write().await;
 
-        if let Some(entry) = guard.map.get_mut(&key) {
+        if let Some(entry) = guard.get_mut(&key) {
             let ret = value.clone();
             entry.value = value;
             entry.inserted_at = now;
@@ -572,8 +672,7 @@ where
     /// contention.
     pub async fn clear(&self) {
         let mut guard = self.inner.write().await;
-        guard.map.clear();
-        guard.order.clear();
+        guard.clear();
     }
 
     /// Sync invalidate. Spins briefly if the lock is held; kept for moka API
@@ -582,8 +681,7 @@ where
     pub fn invalidate_all(&self) {
         for _ in 0..64 {
             if let Some(mut guard) = self.inner.try_write() {
-                guard.map.clear();
-                guard.order.clear();
+                guard.clear();
                 return;
             }
             std::hint::spin_loop();
@@ -599,16 +697,13 @@ where
     }
 
     pub fn entry_count(&self) -> u64 {
-        self.inner
-            .try_read()
-            .map(|g| g.map.len() as u64)
-            .unwrap_or(0)
+        self.inner.try_read().map(|g| g.len() as u64).unwrap_or(0)
     }
 
     pub(crate) async fn capacity_stats(&self) -> CapacityStats {
         let guard = self.inner.read().await;
         CapacityStats {
-            entries: guard.map.len() as u64,
+            entries: guard.len() as u64,
             evictions: guard.capacity_evictions,
             eviction_blocks: guard.capacity_eviction_blocks,
         }
@@ -629,10 +724,7 @@ where
     /// degrade to an empty walk under write contention.
     pub async fn fold_entries<A>(&self, init: A, mut f: impl FnMut(A, &K, &V) -> A) -> A {
         let guard = self.inner.read().await;
-        guard
-            .map
-            .iter()
-            .fold(init, |acc, (k, e)| f(acc, k, &e.value))
+        guard.iter().fold(init, |acc, (k, e)| f(acc, k, &e.value))
     }
 
     /// Entry count plus estimated retained bytes, summing `per_entry` under a
@@ -643,8 +735,8 @@ where
         mut per_entry: impl FnMut(&K, &V) -> usize,
     ) -> wacore::stats::CollectionStats {
         let guard = self.inner.read().await;
-        let bytes: usize = guard.map.iter().map(|(k, e)| per_entry(k, &e.value)).sum();
-        wacore::stats::CollectionStats::new(guard.map.len() as u64, bytes as u64)
+        let bytes: usize = guard.iter().map(|(k, e)| per_entry(k, &e.value)).sum();
+        wacore::stats::CollectionStats::new(guard.len() as u64, bytes as u64)
     }
 
     /// Eager snapshot iterator over `(Arc<K>, V)`: snapshot, not lazy. Includes
@@ -669,7 +761,6 @@ where
 
     fn snapshot(guard: &CacheInner<K, V>) -> Vec<(Arc<K>, V)> {
         guard
-            .map
             .iter()
             .map(|(k, e)| (Arc::new(k.clone()), e.value.clone()))
             .collect()
@@ -757,12 +848,7 @@ where
         let now = self.entry_time();
         let mut guard = self.inner.write().await;
 
-        guard.map.retain(|_, entry| !self.is_expired(entry, now));
-
-        // Drop order entries whose keys were just expired out of the map.
-        // Borrow fields separately to satisfy the borrow checker.
-        let CacheInner { map, order, .. } = &mut *guard;
-        order.retain(|_, k| map.contains_key(k));
+        guard.retain_unexpired(|entry| self.is_expired(entry, now));
 
         drop(guard);
 
@@ -818,7 +904,7 @@ mod tests {
         assert_eq!(cache.get("key").await.as_deref(), Some("value"));
 
         let guard = cache.inner.read().await;
-        let entry = guard.map.get("key").expect("inserted cache entry");
+        let entry = guard.get("key").expect("inserted cache entry");
         assert_eq!(entry.inserted_at, Instant::ZERO);
         assert_eq!(entry.last_accessed_at, Instant::ZERO);
     }
@@ -1131,14 +1217,7 @@ mod tests {
         cache.insert("k".into(), 1).await;
 
         let stamp = |cache: PortableCache<String, u32>| async move {
-            cache
-                .inner
-                .read()
-                .await
-                .map
-                .get("k")
-                .unwrap()
-                .last_accessed_at
+            cache.inner.read().await.get("k").unwrap().last_accessed_at
         };
         let before = stamp(cache.clone()).await;
 
@@ -1168,14 +1247,7 @@ mod tests {
         cache.insert("k".into(), 1).await;
 
         let stamp = |cache: PortableCache<String, u32>| async move {
-            cache
-                .inner
-                .read()
-                .await
-                .map
-                .get("k")
-                .unwrap()
-                .last_accessed_at
+            cache.inner.read().await.get("k").unwrap().last_accessed_at
         };
         let before = stamp(cache.clone()).await;
 
@@ -1204,7 +1276,7 @@ mod tests {
 
         let identity = |cache: PortableCache<String, u32>| async move {
             let guard = cache.inner.read().await;
-            let e = guard.map.get("k").unwrap();
+            let e = guard.get("k").unwrap();
             (e.seq, e.inserted_at)
         };
 
@@ -1260,14 +1332,7 @@ mod tests {
         cache.insert("k".into(), 1).await;
 
         let stamp = |cache: PortableCache<String, u32>| async move {
-            cache
-                .inner
-                .read()
-                .await
-                .map
-                .get("k")
-                .unwrap()
-                .last_accessed_at
+            cache.inner.read().await.get("k").unwrap().last_accessed_at
         };
         let before = stamp(cache.clone()).await;
         assert_eq!(cache.tti_renewals(), 0);
@@ -1480,6 +1545,81 @@ mod tests {
                 "a hit reads once, to decide expiry"
             );
         }
+    }
+
+    /// A key wrapper that counts its clones. The cache used to clone every
+    /// key into its FIFO index, a second heap allocation per entry for the
+    /// life of the entry; the FIFO side now addresses slots by `(hash, seq)`.
+    #[derive(Debug)]
+    struct CountingKey(String, Arc<AtomicUsize>);
+
+    impl PartialEq for CountingKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 == other.0
+        }
+    }
+    impl Eq for CountingKey {}
+    impl Hash for CountingKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+
+    impl Clone for CountingKey {
+        fn clone(&self) -> Self {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            Self(self.0.clone(), Arc::clone(&self.1))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_insert_stores_the_key_once_and_never_clones_it() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let cache: PortableCache<CountingKey, u32> =
+            PortableCache::builder().max_capacity(8).build();
+        for i in 0..16u32 {
+            cache
+                .insert(CountingKey(format!("k{i}"), Arc::clone(&clones)), i)
+                .await;
+        }
+        assert_eq!(
+            cache.entry_count(),
+            8,
+            "FIFO eviction still bounds the cache"
+        );
+        assert_eq!(
+            clones.load(Ordering::Relaxed),
+            0,
+            "insert, eviction and the FIFO index must not clone the key"
+        );
+        cache
+            .remove(&CountingKey("k12".into(), Arc::clone(&clones)))
+            .await;
+        cache
+            .invalidate(&CountingKey("k13".into(), Arc::clone(&clones)))
+            .await;
+        assert_eq!(clones.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.entry_count(), 6);
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_cache_keeps_no_fifo_index() {
+        let unbounded: PortableCache<String, u32> = PortableCache::builder().build();
+        let effectively_unbounded: PortableCache<String, u32> =
+            PortableCache::builder().max_capacity(u64::MAX).build();
+        let bounded: PortableCache<String, u32> = PortableCache::builder().max_capacity(8).build();
+        for cache in [&unbounded, &effectively_unbounded, &bounded] {
+            for i in 0..4u32 {
+                cache.insert(format!("k{i}"), i).await;
+            }
+            assert_eq!(cache.get("k2").await, Some(2));
+        }
+        assert!(unbounded.inner.read().await.order.is_empty());
+        assert!(effectively_unbounded.inner.read().await.order.is_empty());
+        assert_eq!(bounded.inner.read().await.order.len(), 4);
+        // Removal on the unbounded caches still works without the index.
+        assert_eq!(unbounded.remove("k1").await, Some(1));
+        assert_eq!(unbounded.entry_count(), 3);
     }
 
     #[tokio::test]

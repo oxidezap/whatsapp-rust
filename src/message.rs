@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use wacore::libsignal::crypto::DecryptionError;
 use wacore::libsignal::protocol::SenderKeyStore;
-use wacore::libsignal::protocol::group_decrypt;
+use wacore::libsignal::protocol::group_decrypt_shared;
 use wacore::libsignal::protocol::{
     CiphertextMessage, DecryptionResult, IdentityChange, OwnedCiphertextMessage,
     PreKeySignalMessage, SignalMessage, SignalProtocolError, UsePQRatchet, message_decrypt,

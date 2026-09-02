@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use bytes::Bytes;
 use std::cell::RefCell;
 
 use rand::{CryptoRng, Rng, RngExt};
@@ -17,8 +18,8 @@ use crate::protocol::{
 };
 use crate::store::sender_key_name::SenderKeyName;
 
-/// Reusable buffer for cryptographic operations (encryption and decryption).
-/// Named generically since it's used for both ENCRYPTION_BUFFER and DECRYPTION_BUFFER.
+/// Reusable encrypt scratch: the ciphertext is copied out right-sized, so the
+/// buffer stays on the thread for the next message.
 struct CryptoBuffer {
     buffer: Vec<u8>,
 }
@@ -44,12 +45,6 @@ impl CryptoBuffer {
         &mut self.buffer
     }
 
-    /// Takes ownership of the buffer contents, replacing with a fresh pre-allocated buffer.
-    /// More efficient than `mem::take` + `reserve` since we swap with an already-allocated buffer.
-    fn take_buffer(&mut self) -> Vec<u8> {
-        std::mem::replace(&mut self.buffer, Vec::with_capacity(Self::INITIAL_CAPACITY))
-    }
-
     /// Copy the written bytes into a right-sized box, keeping the buffer for the
     /// next (small) message instead of handing away its capacity. A one-off
     /// large message's capacity is released here so it is not retained on this
@@ -65,7 +60,6 @@ impl CryptoBuffer {
 
 thread_local! {
     static ENCRYPTION_BUFFER: RefCell<CryptoBuffer> = RefCell::new(CryptoBuffer::new());
-    static DECRYPTION_BUFFER: RefCell<CryptoBuffer> = RefCell::new(CryptoBuffer::new());
 }
 
 /// Caller must hold `SenderKeyStore::sender_key_lock` for `sender_key_name`
@@ -210,6 +204,22 @@ pub async fn group_decrypt(
     sender_key_store: &mut dyn SenderKeyStore,
     sender_key_name: &SenderKeyName,
 ) -> Result<Vec<u8>> {
+    group_decrypt_shared(
+        Bytes::copy_from_slice(skm_bytes),
+        sender_key_store,
+        sender_key_name,
+    )
+    .await
+}
+
+/// [`group_decrypt`] for a caller that already holds the skmsg as `Bytes`
+/// (the receive path slices it out of the frame buffer): the message is
+/// parsed in place, so the whole skmsg is never copied.
+pub async fn group_decrypt_shared(
+    skm_bytes: Bytes,
+    sender_key_store: &mut dyn SenderKeyStore,
+    sender_key_name: &SenderKeyName,
+) -> Result<Vec<u8>> {
     let skm = SenderKeyMessage::try_from(skm_bytes)?;
 
     let chain_id = skm.chain_id();
@@ -261,36 +271,40 @@ pub async fn group_decrypt(
 
     let sender_key = get_sender_key(sender_key_state, skm.iteration())?;
 
-    let plaintext = DECRYPTION_BUFFER.with(|buffer| {
-        let mut buf_wrapper = buffer.borrow_mut();
-        let buf = buf_wrapper.get_buffer();
-        let ciphertext = skm.ciphertext()?;
-        if let Err(e) = aes_256_cbc_decrypt_into(
-            ciphertext,
-            sender_key.cipher_key(),
-            sender_key.iv(),
-            buf,
-        ) {
-            match e {
-                DecryptionErrorCrypto::BadKeyOrIv => {
-                    log::error!(
-                        "incoming sender key state corrupt for group {} sender {} (chain ID {chain_id})",
-                        sender_key_name.group_id(),
-                        sender_key_name.sender_id()
-                    );
-                    return Err(SignalProtocolError::InvalidSenderKeySession);
-                }
-                DecryptionErrorCrypto::BadCiphertext(msg) => {
-                    log::error!("sender key decryption failed: {msg}");
-                    return Err(SignalProtocolError::InvalidMessage(
-                        CiphertextMessageType::SenderKey,
-                        "decryption failed",
-                    ));
-                }
+    // Decrypt straight into the plaintext the caller keeps. CBC output is never
+    // longer than its input, so one exact reservation covers it. The
+    // thread-local scratch used here before handed its buffer away on every
+    // message and replaced it with a fresh 1 KiB allocation — one allocation
+    // per message either way, but the handed-away buffer also carried whatever
+    // capacity an earlier large message had grown it to, and the plaintext
+    // becomes the `Bytes` the message is dispatched and committed as, so that
+    // slack stayed pinned for the message's whole lifetime.
+    let ciphertext = skm.ciphertext()?;
+    let mut plaintext = Vec::with_capacity(ciphertext.len());
+    if let Err(e) = aes_256_cbc_decrypt_into(
+        ciphertext,
+        sender_key.cipher_key(),
+        sender_key.iv(),
+        &mut plaintext,
+    ) {
+        match e {
+            DecryptionErrorCrypto::BadKeyOrIv => {
+                log::error!(
+                    "incoming sender key state corrupt for group {} sender {} (chain ID {chain_id})",
+                    sender_key_name.group_id(),
+                    sender_key_name.sender_id()
+                );
+                return Err(SignalProtocolError::InvalidSenderKeySession);
+            }
+            DecryptionErrorCrypto::BadCiphertext(msg) => {
+                log::error!("sender key decryption failed: {msg}");
+                return Err(SignalProtocolError::InvalidMessage(
+                    CiphertextMessageType::SenderKey,
+                    "decryption failed",
+                ));
             }
         }
-        Ok::<Vec<u8>, SignalProtocolError>(buf_wrapper.take_buffer())
-    })?;
+    }
 
     sender_key_store
         .store_sender_key(sender_key_name, record)

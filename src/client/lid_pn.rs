@@ -461,6 +461,16 @@ impl Client {
         phone_number: &str,
         source: LearningSource,
     ) -> RecordOutcome {
+        // Answered before the mutation mutex: this runs for every message
+        // whose sender carries a `sender_alt`, and in the steady state the pair
+        // is already known both ways and persisted, so the answer is `Skipped`.
+        // Taking the process-wide mutex first serialized every chat lane on
+        // the receive path behind a lock that the common case never needed.
+        // The guarded body re-checks under the lock, so a concurrent write
+        // still sees a consistent view.
+        if self.lid_pn_cache.can_skip_relearn(phone_number, lid).await {
+            return RecordOutcome::Skipped;
+        }
         let guard = self.lid_pn_cache.lock_mutation().await;
         self.record_lid_pn_in_memory_guarded(lid, phone_number, source, &guard)
             .await

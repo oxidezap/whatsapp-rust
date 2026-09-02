@@ -38,11 +38,50 @@ fn push_enc_payload(bucket: &mut Vec<EncPayload>, stanza_enc_count: usize, paylo
     bucket.push(payload);
 }
 
+/// A `StdRng` that seeds itself on first draw.
+///
+/// The decrypt loop needs a CSPRNG only on the DH-ratchet step, which most
+/// stanzas never take; an eagerly seeded `StdRng` pulled 32 bytes of entropy
+/// and ran a ChaCha key schedule per stanza for a generator that was then
+/// dropped unused. `ThreadRng` would avoid the seeding but is `!Send`, and
+/// this lives across the awaits of a spawned lane worker.
+#[derive(Default)]
+struct LazyStdRng(Option<rand::rngs::StdRng>);
+
+impl LazyStdRng {
+    #[inline]
+    fn get(&mut self) -> &mut rand::rngs::StdRng {
+        self.0
+            .get_or_insert_with(rand::make_rng::<rand::rngs::StdRng>)
+    }
+}
+
+impl rand::TryRng for LazyStdRng {
+    type Error = std::convert::Infallible;
+
+    #[inline]
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        self.get().try_next_u32()
+    }
+
+    #[inline]
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        self.get().try_next_u64()
+    }
+
+    #[inline]
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.get().try_fill_bytes(dst)
+    }
+}
+
+impl rand::TryCryptoRng for LazyStdRng {}
+
 async fn decrypt_session_message(
     message: &mut ParsedSessionMessage,
     signal_address: &wacore::libsignal::protocol::ProtocolAddress,
     adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
-    rng: &mut rand::rngs::StdRng,
+    rng: &mut LazyStdRng,
 ) -> Result<DecryptionResult, SignalProtocolError> {
     match message {
         ParsedSessionMessage::Retained(message) => {
@@ -731,7 +770,7 @@ impl Client {
         let _t = wacore::telemetry::timer(wacore::telemetry::DECRYPT_DURATION);
 
         let mut adapter = self.signal_adapter();
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = LazyStdRng::default();
         let mut outcome = SessionBatchOutcome::default();
         // Buffer plaintexts to handle after the ratchet lock drops (see the drain
         // below for why that's safe).
@@ -1481,7 +1520,6 @@ impl Client {
             .await;
 
         for payload in payloads {
-            let ciphertext = &payload.ciphertext[..];
             let padding_version = payload.padding_version;
             let enc_index = payload.enc_index;
             let enc_type = payload.enc_type.as_wire_str();
@@ -1495,7 +1533,14 @@ impl Client {
 
             let decrypt_result = {
                 let _chain_guard = chain_lock.lock().await;
-                group_decrypt(ciphertext, &mut adapter.sender_key_store, &sender_key_name).await
+                // A refcount bump: the skmsg stays a slice of the frame buffer
+                // through parsing rather than being copied per message.
+                group_decrypt_shared(
+                    payload.ciphertext.clone(),
+                    &mut adapter.sender_key_store,
+                    &sender_key_name,
+                )
+                .await
             };
 
             match decrypt_result {
@@ -1958,7 +2003,7 @@ impl Client {
         signal_address: &wacore::libsignal::protocol::ProtocolAddress,
         parsed_message: &mut ParsedSessionMessage,
         adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
-        rng: &mut rand::rngs::StdRng,
+        rng: &mut LazyStdRng,
         enc_type: &'static str,
         padding_version: u8,
         enc_index: usize,

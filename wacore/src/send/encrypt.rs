@@ -679,14 +679,21 @@ pub async fn ensure_sessions_for_devices(
     let mut reusable_addr = crate::types::jid::make_reusable_protocol_address();
 
     for (idx, device_jid) in devices.iter().enumerate() {
+        // Resolved once per device: both the session probe and the prekey
+        // branch below want it, and the lookup is a boxed `async_trait` call
+        // into an async-locked cache.
+        let lid_jid = if device_jid.is_pn() {
+            resolver
+                .get_lid_for_phone(&device_jid.user)
+                .await
+                .map(|lid_user| Jid::lid_device(lid_user, device_jid.device))
+        } else {
+            None
+        };
         // WhatsApp Web's SignalAddress.toString() normalizes PN → LID before
         // creating signal addresses. We do the same: check LID session FIRST.
         // This prevents using stale PN sessions when a newer LID session exists.
-        if device_jid.is_pn()
-            && let Some(lid_user) = resolver.get_lid_for_phone(&device_jid.user).await
-        {
-            // Construct the LID JID with the same device ID
-            let lid_jid = Jid::lid_device(lid_user, device_jid.device);
+        if let Some(lid_jid) = &lid_jid {
             lid_jid.reset_protocol_address(&mut reusable_addr);
 
             if has_session_or_report(stores.session_store, &reusable_addr, resolver, devices)
@@ -697,7 +704,12 @@ pub async fn ensure_sessions_for_devices(
                     lid_jid.observe(),
                     device_jid.observe()
                 );
-                record_encryption_override(&mut encryption_overrides, devices.len(), idx, lid_jid);
+                record_encryption_override(
+                    &mut encryption_overrides,
+                    devices.len(),
+                    idx,
+                    lid_jid.clone(),
+                );
                 continue;
             }
         }
@@ -710,10 +722,7 @@ pub async fn ensure_sessions_for_devices(
         // No session found - need to fetch prekeys and create session.
         // Keep device_jid for prekey fetch (server returns bundles keyed by this),
         // but normalize to LID for the actual session creation.
-        if device_jid.is_pn()
-            && let Some(lid_user) = resolver.get_lid_for_phone(&device_jid.user).await
-        {
-            let lid_jid = Jid::lid_device(lid_user, device_jid.device);
+        if let Some(lid_jid) = lid_jid {
             log::debug!(
                 "Will create LID session {} for PN {} (no existing session)",
                 lid_jid.observe(),
@@ -814,123 +823,144 @@ pub async fn ensure_sessions_for_devices(
 
         // Parallel session establishment via process_prekey_bundle. Each
         // recipient device has an independent Signal session and an
-        // independent prekey bundle, so the X3DH derivation runs on a
-        // separate task per device, bounded at ENCRYPT_FANOUT_CONCURRENCY.
-        // Spawning goes through `Runtime::spawn` (the platform-agnostic
-        // abstraction) plus a oneshot channel for result delivery —
-        // `FuturesUnordered` handles the in-flight window.
+        // independent prekey bundle, so the X3DH derivations run on
+        // ENCRYPT_FANOUT_CONCURRENCY tasks. One task per chunk, not per
+        // device, as in the encrypt fan-out below: spawning per device cost a
+        // task, a oneshot channel, a boxed future and two boxed store clones
+        // for every device of a cold cohort, which is exactly when the cohort
+        // is largest. `process_prekey_bundle` writes through the Arc-backed
+        // cache, so one store clone serving a whole chunk persists every
+        // session it establishes.
         let prekey_bundles = std::sync::Arc::new(prekey_bundles);
         let total = indices_needing_prekeys.len();
-        let mut next_spawn = 0usize;
+        let num_chunks = ENCRYPT_FANOUT_CONCURRENCY.min(total);
 
-        let make_session_task = |spawn_idx: usize| {
-            let idx = indices_needing_prekeys[spawn_idx];
-            let lookup_jid = devices[idx].clone();
-            let encryption_jid = encryption_override_at(&encryption_overrides, idx)
-                .cloned()
-                .unwrap_or_else(|| lookup_jid.clone());
-            let counted_at_fetch =
-                batch_refused || server_named.iter().any(|device| device.jid == lookup_jid);
-
+        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        for chunk_idx in 0..num_chunks {
+            let chunk_start = chunk_idx * total / num_chunks;
+            let chunk_end = (chunk_idx + 1) * total / num_chunks;
+            // The 'static task can't borrow devices/encryption_overrides.
+            // `encryption_jid` is `None` when the device keys under its own
+            // address, so the common case clones one `Jid`, not two.
+            let jobs: Vec<(Jid, Option<Jid>, bool)> = (chunk_start..chunk_end)
+                .map(|spawn_idx| {
+                    let idx = indices_needing_prekeys[spawn_idx];
+                    let lookup_jid = devices[idx].clone();
+                    let encryption_jid =
+                        encryption_override_at(&encryption_overrides, idx).cloned();
+                    let counted_at_fetch =
+                        batch_refused || server_named.iter().any(|device| device.jid == lookup_jid);
+                    (lookup_jid, encryption_jid, counted_at_fetch)
+                })
+                .collect();
+            let chunk_len = jobs.len();
             let bundles = prekey_bundles.clone();
             let mut session_store = stores.session_store.clone_box();
             let mut identity_store = stores.identity_store.clone_box();
 
-            spawn_oneshot(runtime, async move {
+            let task = spawn_oneshot(runtime, async move {
                 let mut addr = crate::types::jid::make_reusable_protocol_address();
-                encryption_jid.reset_protocol_address(&mut addr);
-
-                let Some(bundle) = bundles.get(&lookup_jid) else {
-                    // No key material this round (usually the 406 cascade); the next
-                    // send re-fetches. Debug avoids one warn per skipped device.
-                    log::debug!(
-                        "No pre-key bundle returned for device {}. This device will be skipped for encryption.",
-                        addr
-                    );
-                    return SessionOutcome::Dropped {
-                        jid: lookup_jid,
-                        reason: (!counted_at_fetch).then_some(UnkeyableDevice::NoBundle),
-                        error: None,
-                    };
-                };
-
                 let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-                // No UntrustedIdentity recovery: WA Web's isTrustedIdentity is
-                // unconditional Ok(true) (TOFU), and save_identity inside
-                // process_prekey_bundle persists rotations transparently.
-                match process_prekey_bundle(
-                    &addr,
-                    &mut *session_store,
-                    &mut *identity_store,
-                    bundle,
-                    &mut rng,
-                    UsePQRatchet::No,
-                )
-                .await
-                {
-                    // Surface a replaced identity so the caller can react
-                    // (resolver has no 'static handle into this spawned task).
-                    Ok(IdentityChange::ReplacedExisting) => {
-                        SessionOutcome::Established(Some(encryption_jid))
-                    }
-                    Ok(IdentityChange::NewOrUnchanged) => SessionOutcome::Established(None),
-                    Err(error) => SessionOutcome::Dropped {
-                        jid: lookup_jid,
-                        reason: Some(UnkeyableDevice::SessionSetup),
-                        error: Some(
-                            anyhow::Error::new(error)
-                                .context(format!("failed to process pre-key bundle for {addr}")),
-                        ),
-                    },
-                }
-            })
-        };
+                let mut out = Vec::with_capacity(jobs.len());
+                for (lookup_jid, encryption_jid, counted_at_fetch) in jobs {
+                    encryption_jid
+                        .as_ref()
+                        .unwrap_or(&lookup_jid)
+                        .reset_protocol_address(&mut addr);
 
-        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-        while next_spawn < total && in_flight.len() < ENCRYPT_FANOUT_CONCURRENCY {
-            in_flight.push(make_session_task(next_spawn));
-            next_spawn += 1;
+                    let Some(bundle) = bundles.get(&lookup_jid) else {
+                        // No key material this round (usually the 406 cascade); the next
+                        // send re-fetches. Debug avoids one warn per skipped device.
+                        log::debug!(
+                            "No pre-key bundle returned for device {}. This device will be skipped for encryption.",
+                            addr
+                        );
+                        out.push(SessionOutcome::Dropped {
+                            jid: lookup_jid,
+                            reason: (!counted_at_fetch).then_some(UnkeyableDevice::NoBundle),
+                            error: None,
+                        });
+                        continue;
+                    };
+
+                    // No UntrustedIdentity recovery: WA Web's isTrustedIdentity is
+                    // unconditional Ok(true) (TOFU), and save_identity inside
+                    // process_prekey_bundle persists rotations transparently.
+                    out.push(
+                        match process_prekey_bundle(
+                            &addr,
+                            &mut *session_store,
+                            &mut *identity_store,
+                            bundle,
+                            &mut rng,
+                            UsePQRatchet::No,
+                        )
+                        .await
+                        {
+                            // Surface a replaced identity so the caller can react
+                            // (resolver has no 'static handle into this spawned task).
+                            Ok(IdentityChange::ReplacedExisting) => SessionOutcome::Established(
+                                Some(encryption_jid.unwrap_or(lookup_jid)),
+                            ),
+                            Ok(IdentityChange::NewOrUnchanged) => SessionOutcome::Established(None),
+                            Err(error) => SessionOutcome::Dropped {
+                                jid: lookup_jid,
+                                reason: Some(UnkeyableDevice::SessionSetup),
+                                error: Some(anyhow::Error::new(error).context(format!(
+                                    "failed to process pre-key bundle for {addr}"
+                                ))),
+                            },
+                        },
+                    );
+                }
+                out
+            });
+            in_flight.push(async move { (chunk_len, task.await) });
         }
-        while let Some(spawn_result) = in_flight.next().await {
-            match spawn_result {
-                // Some(jid) => establishing this session replaced a stored
-                // identity; notify the client so it can react off-path.
-                Ok(SessionOutcome::Established(Some(changed_jid))) => {
-                    resolver.on_local_identity_change(&changed_jid)
-                }
-                Ok(SessionOutcome::Established(None)) => {}
-                // Isolate the failure to this device so one participant can't abort
-                // the cohort's SKDM (matching WA Web GroupKeyDistributionMsg's
-                // per-device try/catch). The sessionless device is dropped by the
-                // fan-out below, which skips it when tallying its own drops.
-                Ok(SessionOutcome::Dropped { jid, reason, error }) => {
-                    if let Some(reason) = reason {
-                        resolver.on_unkeyable_devices(reason, 1);
-                    }
-                    unkeyed_devices.push(jid);
-                    if let Some(error) = error {
-                        log::warn!("Group session setup failed for a device, skipping it: {error}");
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
-                }
+        while let Some((chunk_len, spawn_result)) = in_flight.next().await {
+            let outcomes = match spawn_result {
+                Ok(outcomes) => outcomes,
                 Err(error) => {
-                    // The task took the device's identity with it, so this drop
-                    // cannot join `unkeyed_devices` — and must not be counted
-                    // here either, or the encrypt fan-out (which will fail for
-                    // the same device) would count it a second time.
+                    // The task took the devices' identities with it, so these
+                    // drops cannot join `unkeyed_devices` — and must not be
+                    // counted here either, or the encrypt fan-out (which will
+                    // fail for the same devices) would count them a second time.
                     log::warn!(
-                        "Session-establishment task did not deliver a result; skipping device."
+                        "Session-establishment task did not deliver a result; skipping {chunk_len} device(s)."
                     );
                     if first_error.is_none() {
                         first_error = Some(anyhow::Error::new(error));
                     }
+                    continue;
                 }
-            }
-            if next_spawn < total {
-                in_flight.push(make_session_task(next_spawn));
-                next_spawn += 1;
+            };
+            for outcome in outcomes {
+                match outcome {
+                    // Some(jid) => establishing this session replaced a stored
+                    // identity; notify the client so it can react off-path.
+                    SessionOutcome::Established(Some(changed_jid)) => {
+                        resolver.on_local_identity_change(&changed_jid)
+                    }
+                    SessionOutcome::Established(None) => {}
+                    // Isolate the failure to this device so one participant can't abort
+                    // the cohort's SKDM (matching WA Web GroupKeyDistributionMsg's
+                    // per-device try/catch). The sessionless device is dropped by the
+                    // fan-out below, which skips it when tallying its own drops.
+                    SessionOutcome::Dropped { jid, reason, error } => {
+                        if let Some(reason) = reason {
+                            resolver.on_unkeyable_devices(reason, 1);
+                        }
+                        unkeyed_devices.push(jid);
+                        if let Some(error) = error {
+                            log::warn!(
+                                "Group session setup failed for a device, skipping it: {error}"
+                            );
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
