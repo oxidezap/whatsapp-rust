@@ -109,6 +109,14 @@ pub struct MessageContext {
     pub message: Arc<wa::Message>,
     pub info: MessageInfo,
     pub client: Arc<Client>,
+    /// Disappearing-message timer of the chat this message arrived in, in
+    /// seconds, when the stanza carried one. Mirrors
+    /// [`InboundMessage::ephemeral_expiration`](wacore::types::events::InboundMessage::ephemeral_expiration).
+    pub ephemeral_expiration: Option<u32>,
+    /// For a decrypted newsletter comment, the key of the post it replies to.
+    /// Mirrors
+    /// [`InboundMessage::comment_target`](wacore::types::events::InboundMessage::comment_target).
+    pub comment_target: Option<Box<wa::MessageKey>>,
 }
 
 impl MessageContext {
@@ -119,19 +127,32 @@ impl MessageContext {
         Self::from_arc(Arc::new(message.clone()), info, client)
     }
 
+    /// Builds a context from a message and its info alone; the inbound-only
+    /// metadata (`ephemeral_expiration`, `comment_target`) is absent because
+    /// this constructor never sees the stanza it came from.
     pub fn from_arc(message: Arc<wa::Message>, info: &MessageInfo, client: Arc<Client>) -> Self {
         Self {
             message,
             info: info.clone(),
             client,
+            ephemeral_expiration: None,
+            comment_target: None,
         }
     }
 
+    /// Builds a context from a dispatched [`InboundMessage`], carrying every
+    /// field a handler could read off the event, not only `message` and `info`.
+    ///
+    /// [`InboundMessage`]: wacore::types::events::InboundMessage
     pub fn from_inbound(
         inbound: &wacore::types::events::InboundMessage,
         client: Arc<Client>,
     ) -> Self {
-        Self::from_arc(Arc::clone(&inbound.message), &inbound.info, client)
+        Self {
+            ephemeral_expiration: inbound.ephemeral_expiration,
+            comment_target: inbound.comment_target.clone(),
+            ..Self::from_arc(Arc::clone(&inbound.message), &inbound.info, client)
+        }
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.send_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
@@ -2291,6 +2312,64 @@ mod tests {
             MessageContext::from_arc(Arc::clone(&original), &MessageInfo::default(), bot.client());
 
         assert!(std::ptr::eq(Arc::as_ptr(&ctx.message), original_ptr));
+    }
+
+    #[tokio::test]
+    async fn from_inbound_keeps_the_inbound_only_metadata() {
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        // A message in a disappearing chat: the timer rides the event, not the
+        // shared info, and must still reach the handler's context.
+        let ephemeral = wacore::types::events::InboundMessage::builder()
+            .message(Arc::new(wa::Message::default()))
+            .info(Arc::new(react_info(
+                "15551230000@s.whatsapp.net",
+                "15551230000@s.whatsapp.net",
+                "MSGID01",
+                false,
+            )))
+            .ephemeral_expiration(86400)
+            .build();
+        let ctx = MessageContext::from_inbound(&ephemeral, bot.client());
+        assert_eq!(ctx.ephemeral_expiration, Some(86400));
+        assert!(ctx.comment_target.is_none());
+
+        // A newsletter comment: the parent post key rides the same way.
+        let parent = wa::MessageKey {
+            remote_jid: Some("120363000000000001@newsletter".to_string()),
+            id: Some("POSTID01".to_string()),
+            ..Default::default()
+        };
+        let comment = wacore::types::events::InboundMessage::builder()
+            .message(Arc::new(wa::Message::default()))
+            .info(Arc::new(react_info(
+                "120363000000000001@newsletter",
+                "120363000000000001@newsletter",
+                "MSGID02",
+                false,
+            )))
+            .comment_target(Box::new(parent.clone()))
+            .build();
+        let ctx = MessageContext::from_inbound(&comment, bot.client());
+        assert_eq!(ctx.comment_target.as_deref(), Some(&parent));
+        assert!(ctx.ephemeral_expiration.is_none());
+
+        // The info-only constructor has no stanza to read them from.
+        let plain = MessageContext::from_arc(
+            Arc::new(wa::Message::default()),
+            &MessageInfo::default(),
+            bot.client(),
+        );
+        assert!(plain.ephemeral_expiration.is_none());
+        assert!(plain.comment_target.is_none());
     }
 
     async fn test_context_with_info(info: MessageInfo) -> MessageContext {

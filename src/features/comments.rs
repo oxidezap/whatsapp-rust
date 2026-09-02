@@ -9,7 +9,8 @@
 //!
 //! Incoming comments are decrypted transparently on the receive path and
 //! dispatched as their inner body `Message`; the parent post key surfaces on
-//! `MessageInfo::comment_target`.
+//! `InboundMessage::comment_target` (and `MessageContext::comment_target` for
+//! a bot handler).
 
 use wacore_binary::Jid;
 use waproto::whatsapp as wa;

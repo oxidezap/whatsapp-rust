@@ -374,6 +374,11 @@ pub const PSA_USER: &str = "0";
 /// A message id, inline: WhatsApp ids are 20–32 hex/base64 characters, and
 /// every client-generated one is 22, so the common case pays no heap
 /// allocation per message, per receipt id and per dedup-cache key.
+///
+/// The inline budget is `size_of::<String>()`, 24 bytes on a 64-bit target.
+/// On a 32-bit target (wasm32, ESP32) it is 12, so a 22-character id still
+/// heap-allocates there: no worse than the `String` it replaced, and the
+/// `&str` surface is the same, but the allocation saving is 64-bit-only.
 pub type MessageId = CompactString;
 pub type MessageServerId = i32;
 #[derive(Debug)]
