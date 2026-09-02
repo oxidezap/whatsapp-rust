@@ -16,7 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
-use portable_atomic::{AtomicBool, AtomicUsize, Ordering};
+use portable_atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use zeroize::Zeroize;
 
 use crate::runtime::{BoxFuture, Runtime};
@@ -168,6 +168,26 @@ pub enum VideoControl {
 enum VideoControlMessage {
     State(VideoControl),
     ParticipantOrientationsReady,
+    /// A peer-keyframe request is pending; the urgency travels beside it. Every other state
+    /// change here is a discrete consumer action, so an unbounded queue costs nothing -- but a
+    /// sink is invited to ask on every dropped access unit, which is a run this queue would
+    /// otherwise grow to hold while the drive loop is busy. The engine's throttle only runs
+    /// after the dequeue, and so cannot bound what waits ahead of it.
+    PeerKeyframeRequested,
+}
+
+/// [`PendingPeerKeyframe`] slots, ordered so `fetch_max` raises urgency and never lowers it: a
+/// decoder that failed after asking politely still needs the throttle bypassed, and the request
+/// it is joining was queued at the lower one.
+const PEER_KEYFRAME_NONE: u8 = 0;
+const PEER_KEYFRAME_COALESCED: u8 = 1;
+const PEER_KEYFRAME_IMMEDIATE: u8 = 2;
+
+fn peer_keyframe_slot(urgency: KeyframeUrgency) -> u8 {
+    match urgency {
+        KeyframeUrgency::Coalesced => PEER_KEYFRAME_COALESCED,
+        KeyframeUrgency::Immediate => PEER_KEYFRAME_IMMEDIATE,
+    }
 }
 
 #[derive(Default)]
@@ -185,6 +205,7 @@ pub struct VideoControlSender {
     state: async_channel::Sender<VideoControlMessage>,
     orientation: async_channel::Sender<u8>,
     participant_orientations: Arc<PendingParticipantOrientations>,
+    peer_keyframe: Arc<AtomicU8>,
 }
 
 /// Receiving half of [`video_control_channel`].
@@ -192,6 +213,7 @@ pub struct VideoControlReceiver {
     state: async_channel::Receiver<VideoControlMessage>,
     orientation: async_channel::Receiver<u8>,
     participant_orientations: Arc<PendingParticipantOrientations>,
+    peer_keyframe: Arc<AtomicU8>,
     ready_participant_orientations: Mutex<VecDeque<(wacore_binary::Jid, u8)>>,
     /// `ready_participant_orientations.len()`, same role as [`PendingParticipantOrientations::len`].
     ready_participant_orientations_len: AtomicUsize,
@@ -202,16 +224,19 @@ pub fn video_control_channel() -> (VideoControlSender, VideoControlReceiver) {
     let (state_tx, state_rx) = async_channel::unbounded();
     let (orientation_tx, orientation_rx) = async_channel::bounded(1);
     let participant_orientations = Arc::new(PendingParticipantOrientations::default());
+    let peer_keyframe = Arc::new(AtomicU8::new(PEER_KEYFRAME_NONE));
     (
         VideoControlSender {
             state: state_tx,
             orientation: orientation_tx,
             participant_orientations: participant_orientations.clone(),
+            peer_keyframe: peer_keyframe.clone(),
         },
         VideoControlReceiver {
             state: state_rx,
             orientation: orientation_rx,
             participant_orientations,
+            peer_keyframe,
             ready_participant_orientations: Mutex::new(VecDeque::new()),
             ready_participant_orientations_len: AtomicUsize::new(0),
         },
@@ -275,6 +300,25 @@ impl VideoControlSender {
                     false
                 }
             }
+            VideoControl::RequestPeerKeyframe(urgency) => {
+                let previous = self
+                    .peer_keyframe
+                    .fetch_max(peer_keyframe_slot(urgency), Ordering::Relaxed);
+                if previous != PEER_KEYFRAME_NONE {
+                    return true;
+                }
+                if self
+                    .state
+                    .try_send(VideoControlMessage::PeerKeyframeRequested)
+                    .is_ok()
+                {
+                    true
+                } else {
+                    self.peer_keyframe
+                        .store(PEER_KEYFRAME_NONE, Ordering::Relaxed);
+                    false
+                }
+            }
             state => self
                 .state
                 .try_send(VideoControlMessage::State(state))
@@ -322,6 +366,21 @@ impl VideoControlReceiver {
     /// Whether both halves have lost every sender.
     pub fn is_closed(&self) -> bool {
         self.state.is_closed() && self.orientation.is_closed()
+    }
+
+    fn take_peer_keyframe_request(&self) -> Option<VideoControl> {
+        match self
+            .peer_keyframe
+            .swap(PEER_KEYFRAME_NONE, Ordering::Relaxed)
+        {
+            PEER_KEYFRAME_NONE => None,
+            PEER_KEYFRAME_IMMEDIATE => Some(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Immediate,
+            )),
+            _ => Some(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Coalesced,
+            )),
+        }
     }
 
     fn take_participant_orientation(&self) -> Option<VideoControl> {
@@ -376,6 +435,11 @@ impl VideoControlReceiver {
                         return Ok(orientation);
                     }
                 }
+                Ok(VideoControlMessage::PeerKeyframeRequested) => {
+                    if let Some(request) = self.take_peer_keyframe_request() {
+                        return Ok(request);
+                    }
+                }
                 Err(error) => break error,
             }
         };
@@ -400,6 +464,11 @@ impl VideoControlReceiver {
                 VideoControlMessage::ParticipantOrientationsReady => {
                     if let Some(orientation) = self.take_participant_orientation() {
                         return Ok(orientation);
+                    }
+                }
+                VideoControlMessage::PeerKeyframeRequested => {
+                    if let Some(request) = self.take_peer_keyframe_request() {
+                        return Ok(request);
                     }
                 }
             }
@@ -435,6 +504,11 @@ impl VideoControlReceiver {
                             Ok(VideoControlMessage::ParticipantOrientationsReady) => {
                                 if let Some(orientation) = self.take_participant_orientation() {
                                     return Ok(orientation);
+                                }
+                            }
+                            Ok(VideoControlMessage::PeerKeyframeRequested) => {
+                                if let Some(request) = self.take_peer_keyframe_request() {
+                                    return Ok(request);
                                 }
                             }
                             Err(_) => continue,
@@ -1870,6 +1944,61 @@ mod tests {
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("replacement already consumed"))
         }
+    }
+
+    /// What the engine's throttle cannot do: it runs after the dequeue, so a burst queued while
+    /// the drive loop is busy would sit in the mailbox whole before the first one reached it.
+    #[test]
+    fn video_control_channel_coalesces_peer_keyframe_requests() {
+        let (tx, rx) = video_control_channel();
+
+        for _ in 0..64 {
+            assert!(tx.send(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Coalesced
+            )));
+        }
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Coalesced
+            ))
+        ));
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+
+    /// Coalescing must not answer the decoder that failed with the routine request it joined --
+    /// nor the reverse, where a later routine ask would spend an already-queued bypass.
+    #[test]
+    fn a_pending_peer_keyframe_request_takes_the_higher_urgency() {
+        let (tx, rx) = video_control_channel();
+
+        assert!(tx.send(VideoControl::RequestPeerKeyframe(
+            KeyframeUrgency::Coalesced
+        )));
+        assert!(tx.send(VideoControl::RequestPeerKeyframe(
+            KeyframeUrgency::Immediate
+        )));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Immediate
+            ))
+        ));
+        assert_eq!(rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+
+        assert!(tx.send(VideoControl::RequestPeerKeyframe(
+            KeyframeUrgency::Immediate
+        )));
+        assert!(tx.send(VideoControl::RequestPeerKeyframe(
+            KeyframeUrgency::Coalesced
+        )));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(VideoControl::RequestPeerKeyframe(
+                KeyframeUrgency::Immediate
+            ))
+        ));
     }
 
     #[test]
