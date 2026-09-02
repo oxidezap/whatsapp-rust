@@ -1812,6 +1812,13 @@ pub struct Client {
     /// worker inside the flush and drive a concurrent generation change.
     #[cfg(test)]
     pub(crate) signal_flush_test_block: AtomicBool,
+    /// Set by `cleanup_connection_state` immediately before it takes
+    /// `offline_terminal_lock`. Lets a test prove the teardown reached the
+    /// lock rather than inferring it from elapsed scheduler turns: everything
+    /// the transition writes is on the far side of this point, so a test
+    /// holding the lock knows nothing has been reset yet when it fires.
+    #[cfg(test)]
+    pub(crate) offline_terminal_gate_reached: AtomicBool,
     /// Counts entries into the coalesced flush attempt, so a test can wait
     /// until a worker is actually inside the (blocked) flush.
     #[cfg(test)]

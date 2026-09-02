@@ -543,6 +543,8 @@ impl Client {
             #[cfg(test)]
             signal_flush_test_block: AtomicBool::new(false),
             #[cfg(test)]
+            offline_terminal_gate_reached: AtomicBool::new(false),
+            #[cfg(test)]
             signal_flush_test_in_attempt: AtomicU32::new(0),
             #[cfg(test)]
             app_state_key_share_prepare_test_failures: AtomicU32::new(0),
@@ -1856,6 +1858,9 @@ impl Client {
         // claimed its stamp could widen the semaphore back to 64 after this
         // reset, and the next connection would drain its backlog concurrently
         // with no permit serializing the Signal state.
+        #[cfg(test)]
+        self.offline_terminal_gate_reached
+            .store(true, Ordering::Release);
         let terminal_gate = self.offline_terminal_lock.lock().await;
         // Reset semaphore to 1 permit for next offline sync.
         self.swap_message_semaphore(1);

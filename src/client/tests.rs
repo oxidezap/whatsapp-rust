@@ -7652,7 +7652,6 @@ async fn the_permit_reset_is_inside_the_terminal_lock() {
 
     arm_offline_drain(&client, 711, 700).await;
     client.enter_live_mode_for_tests();
-    let generation = client.connection_generation.load(Ordering::Acquire);
 
     let terminal_gate = client.offline_terminal_lock.lock().await;
 
@@ -7661,14 +7660,14 @@ async fn the_permit_reset_is_inside_the_terminal_lock() {
         async move { client.cleanup_connection_state().await }
     });
 
-    // The bump is the first thing the teardown does, well before the lock.
-    crate::test_utils::poll_until("the teardown to start", || {
-        client.connection_generation.load(Ordering::Acquire) != generation
+    // Wait for the teardown to reach the lock itself, not for a guess at how
+    // many scheduler turns that takes: the flag is set on the line above the
+    // acquisition, so when it fires the reset is still ahead of the lock the
+    // test holds. Move the reset back out and it has already run by then.
+    crate::test_utils::poll_until("the teardown to reach the terminal lock", || {
+        client.offline_terminal_gate_reached.load(Ordering::Acquire)
     })
     .await;
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
 
     assert!(
         concurrent_permits(&client),
