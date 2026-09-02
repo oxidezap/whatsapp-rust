@@ -1245,6 +1245,18 @@ impl fmt::Debug for Event {
 pub struct InboundMessage {
     pub message: Arc<wa::Message>,
     pub info: Arc<MessageInfo>,
+    /// Ephemeral duration in seconds, from the decrypted message's
+    /// `contextInfo.expiration`. Lives here rather than on `info` because it
+    /// is only known after decryption, and `info` is shared with every
+    /// `<enc>` of the stanza by then: writing it there cost a deep copy of
+    /// the whole `MessageInfo` on every disappearing-chat message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_expiration: Option<u32>,
+    /// Parent post key when `message` is a decrypted CAG channel comment
+    /// (`enc_comment_message`). The inner `Message` proto has no slot for the
+    /// threading link, so it surfaces here. Boxed: rare.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_target: Option<Box<wa::MessageKey>>,
 }
 
 /// How a [`MessageBatch`] was delivered. This describes the delivery shape,
@@ -2722,7 +2734,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_get_decodes() {
         let lazy = lazy_from(vec![wa::Conversation {
-            id: "chat@s.whatsapp.net".to_string(),
+            id: "chat@s.whatsapp.net".into(),
             ..Default::default()
         }]);
 
@@ -2734,7 +2746,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_caches_decode() {
         let lazy = lazy_from(vec![wa::Conversation {
-            id: "test@g.us".to_string(),
+            id: "test@g.us".into(),
             ..Default::default()
         }]);
 
@@ -2775,7 +2787,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_decompress_yields_raw_proto() {
         let lazy = lazy_from(vec![wa::Conversation {
-            id: "raw@s.whatsapp.net".to_string(),
+            id: "raw@s.whatsapp.net".into(),
             ..Default::default()
         }]);
 
@@ -2792,7 +2804,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_everything_keeps_working_after_get() {
         let lazy = lazy_from(vec![wa::Conversation {
-            id: "kept@s.whatsapp.net".to_string(),
+            id: "kept@s.whatsapp.net".into(),
             ..Default::default()
         }]);
 
@@ -2817,11 +2829,11 @@ mod tests {
     fn lazy_history_sync_stream_iterates_conversations() {
         let lazy = lazy_from(vec![
             wa::Conversation {
-                id: "first@s.whatsapp.net".to_string(),
+                id: "first@s.whatsapp.net".into(),
                 ..Default::default()
             },
             wa::Conversation {
-                id: "second@s.whatsapp.net".to_string(),
+                id: "second@s.whatsapp.net".into(),
                 ..Default::default()
             },
         ]);
@@ -2847,7 +2859,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_clone_is_cheap_and_redecodes() {
         let lazy = lazy_from(vec![wa::Conversation {
-            id: "cloned@s.whatsapp.net".to_string(),
+            id: "cloned@s.whatsapp.net".into(),
             ..Default::default()
         }]);
 
@@ -2892,7 +2904,7 @@ mod tests {
         // A decompressed_size below the real inflated size trips the inflate
         // cap instead of silently over-allocating past the producer's count.
         let (compressed, raw_len) = make_compressed_history_sync(vec![wa::Conversation {
-            id: "capped@s.whatsapp.net".to_string(),
+            id: "capped@s.whatsapp.net".into(),
             ..Default::default()
         }]);
         let lazy = LazyHistorySync::new(compressed, raw_len - 1, 0, None, None);
@@ -2903,7 +2915,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_preserves_messages() {
         let conv = wa::Conversation {
-            id: "chat@s.whatsapp.net".to_string(),
+            id: "chat@s.whatsapp.net".into(),
             messages: vec![wa::HistorySyncMsg {
                 message: wa::WebMessageInfo {
                     key: wa::MessageKey {

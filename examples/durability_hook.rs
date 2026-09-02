@@ -118,7 +118,7 @@ impl InboundDurabilityHook for InboxArchiver {
                 let key: CommitKey = (
                     m.info.source.chat.to_string(),
                     m.info.source.sender.to_string(),
-                    m.info.id.clone(),
+                    m.info.id.to_string(),
                 );
                 // Dedup against the archive AND earlier entries of this same
                 // batch, so one fsync can never append a key twice.

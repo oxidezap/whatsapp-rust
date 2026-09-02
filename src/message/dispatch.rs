@@ -89,29 +89,27 @@ impl Client {
         wacore::telemetry::recv("decrypted");
         self.stats.record_message_received();
 
-        let mut info = Arc::clone(info);
-        if info.ephemeral_expiration.is_none()
-            && let Some(exp) = msg.get_base_message().get_ephemeral_expiration()
-        {
-            Arc::make_mut(&mut info).ephemeral_expiration = Some(exp);
-        }
+        // Both ride on the `InboundMessage`, not the shared `MessageInfo`:
+        // writing them into the `Arc` every `<enc>` of the stanza holds
+        // deep-copied the whole info on every disappearing-chat message.
+        let ephemeral_expiration = msg.get_base_message().get_ephemeral_expiration();
 
         // Keep this ordered with dispatch; add-on messages can immediately
         // reference the secret from the stanza just processed.
-        self.maybe_capture_inbound_msg_secret(&msg, &info).await;
+        self.maybe_capture_inbound_msg_secret(&msg, info).await;
         let decrypted = self
-            .maybe_decrypt_secret_encrypted_message(&msg, &info)
+            .maybe_decrypt_secret_encrypted_message(&msg, info)
             .await;
         // A decrypted comment surfaces as its inner body Message, which has no
-        // slot for the parent post key; carry the threading link on the info.
-        if decrypted.is_some()
-            && let Some(target) = msg
-                .enc_comment_message
+        // slot for the parent post key; carry the threading link beside it.
+        let comment_target = if decrypted.is_some() {
+            msg.enc_comment_message
                 .as_option()
                 .and_then(|c| c.target_message_key.as_option().cloned())
-        {
-            Arc::make_mut(&mut info).comment_target = Some(target);
-        }
+                .map(Box::new)
+        } else {
+            None
+        };
         let dispatch_msg = Arc::new(decrypted.unwrap_or(msg));
 
         // Newsletters never enter the commit pipeline: the plaintext stanza
@@ -126,7 +124,9 @@ impl Client {
                     .messages(Arc::from([wacore::types::events::InboundMessage::builder(
                     )
                     .message(dispatch_msg)
-                    .info(info)
+                    .info(Arc::clone(info))
+                    .maybe_ephemeral_expiration(ephemeral_expiration)
+                    .maybe_comment_target(comment_target)
                     .build()]))
                     .origin(wacore::types::events::BatchOrigin::Live)
                     .build(),
@@ -141,7 +141,9 @@ impl Client {
         self.commit_or_batch_inbound(
             wacore::types::events::InboundMessage::builder()
                 .message(dispatch_msg)
-                .info(info)
+                .info(Arc::clone(info))
+                .maybe_ephemeral_expiration(ephemeral_expiration)
+                .maybe_comment_target(comment_target)
                 .build(),
             track_commit,
         )

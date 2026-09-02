@@ -371,7 +371,10 @@ pub const BOT_SERVER: &str = "bot";
 pub const STATUS_BROADCAST_USER: &str = "status";
 pub const PSA_USER: &str = "0";
 
-pub type MessageId = String;
+/// A message id, inline: WhatsApp ids are 20–32 hex/base64 characters, and
+/// every client-generated one is 22, so the common case pays no heap
+/// allocation per message, per receipt id and per dedup-cache key.
+pub type MessageId = CompactString;
 pub type MessageServerId = i32;
 #[derive(Debug)]
 pub enum JidError {

@@ -322,7 +322,7 @@ impl BusinessNotification {
                         child.attrs().optional_string("status"),
                     ) {
                         subscriptions.push(BusinessSubscription {
-                            id: id.to_string(),
+                            id: id.into(),
                             status: status.to_string(),
                             expiration_date: child
                                 .attrs()

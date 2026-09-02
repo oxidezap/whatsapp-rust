@@ -423,7 +423,7 @@ impl Client {
 
         ChatMessageId {
             chat,
-            id: id.to_owned(),
+            id: id.into(),
         }
     }
 

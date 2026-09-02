@@ -18,9 +18,7 @@ use crate::client::Client;
 use crate::types::message::MessageInfo;
 use log::{debug, info, warn};
 use std::sync::Arc;
-use wacore::types::message::{
-    ChatMessageId, EditAttribute, MessageCategory, MessageSource, MsgMetaInfo,
-};
+use wacore::types::message::{ChatMessageId, EditAttribute, MessageCategory, MessageSource};
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
@@ -179,7 +177,7 @@ impl Client {
         let message_key = wa::MessageKey {
             remote_jid: Some(resolved_jid.to_string()),
             from_me: Some(info.source.is_from_me),
-            id: Some(info.id.clone()),
+            id: Some(info.id.to_string()),
             participant: participant.map(|p| p.to_string()),
         };
 
@@ -815,7 +813,7 @@ impl Client {
         let response_from_me = key.from_me.unwrap_or(false);
 
         let cache_key = match remote_jid_str.parse::<Jid>() {
-            Ok(jid) => ChatMessageId::new(jid, msg_id.to_owned()),
+            Ok(jid) => ChatMessageId::new(jid, msg_id.into()),
             Err(_) => {
                 warn!(
                     "PDO response has unparseable remote_jid: {}",
@@ -898,18 +896,15 @@ impl Client {
             return;
         };
 
-        {
+        let ephemeral_expiration = {
             use wacore::proto_helpers::MessageExt;
-            let mi = Arc::make_mut(&mut message_info);
-            if mi.ephemeral_expiration.is_none() {
-                mi.ephemeral_expiration = message.get_base_message().get_ephemeral_expiration();
-            }
-            mi.unavailable_request_id = if request_id.is_empty() {
-                None
-            } else {
-                Some(request_id.to_owned())
-            };
-        }
+            message.get_base_message().get_ephemeral_expiration()
+        };
+        Arc::make_mut(&mut message_info).unavailable_request_id = if request_id.is_empty() {
+            None
+        } else {
+            Some(request_id.to_owned())
+        };
 
         info!(
             "Dispatching PDO-recovered message {} from {} via phone (request_id={})",
@@ -928,6 +923,7 @@ impl Client {
                     )
                     .message(Arc::from(message))
                     .info(message_info)
+                    .maybe_ephemeral_expiration(ephemeral_expiration)
                     .build()]))
                     .origin(wacore::types::events::BatchOrigin::Live)
                     .build(),
@@ -994,7 +990,7 @@ impl Client {
             .unwrap_or_else(wacore::time::now_utc);
 
         Ok(MessageInfo {
-            id: id.unwrap_or_default().to_owned(),
+            id: id.unwrap_or_default().into(),
             server_id: 0,
             r#type: None,
             source: MessageSource {
@@ -1009,23 +1005,21 @@ impl Client {
                 recipient: None,
             },
             timestamp,
-            push_name: push_name.unwrap_or_default().to_owned(),
+            push_name: push_name.unwrap_or_default().into(),
             category: MessageCategory::default(),
             multicast: false,
             media_type: None,
             edit: EditAttribute::default(),
             bot_info: None,
-            meta_info: MsgMetaInfo::default(),
+            meta_info: None,
             verified_name: None,
             device_sent_meta: None,
-            ephemeral_expiration: None,
             is_offline: false,
             unavailable_request_id: None,
             server_timestamp_us: None,
             verified_level: None,
             verified_name_serial: None,
             peer_recipient_pn: None,
-            comment_target: None,
             bcl_participants: Vec::new(),
         })
     }
@@ -1292,7 +1286,7 @@ mod tests {
     ) -> std::sync::Arc<wacore::types::message::MessageInfo> {
         use wacore::types::message::{MessageInfo, MessageSource};
         std::sync::Arc::new(MessageInfo {
-            id: id.to_owned(),
+            id: id.into(),
             source: MessageSource {
                 chat: chat.parse().expect("chat jid"),
                 sender: sender.parse().expect("sender jid"),
@@ -1488,7 +1482,7 @@ mod tests {
 
         let chat = "120363000000000001@g.us";
         let msg_id = "PDO_ATTRIBUTION";
-        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.into());
 
         // Whoever holds the slot when the response lands is not who it answers.
         client
@@ -1506,7 +1500,7 @@ mod tests {
             key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
                 remote_jid: Some(chat.to_owned()),
                 from_me: Some(false),
-                id: Some(msg_id.to_owned()),
+                id: Some(msg_id.into()),
                 participant: Some("111222333444555@lid".to_owned()),
             }),
             message: buffa::MessageField::some(waproto::whatsapp::Message {
@@ -1564,7 +1558,7 @@ mod tests {
 
         let chat = "120363000000000001@g.us";
         let msg_id = "PDO_LID_ALIAS";
-        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.into());
 
         // What a LID-addressed group delivery leaves behind: LID in `sender`,
         // the PN the stanza carried in `sender_alt`.
@@ -1586,7 +1580,7 @@ mod tests {
             key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
                 remote_jid: Some(chat.to_owned()),
                 from_me: Some(false),
-                id: Some(msg_id.to_owned()),
+                id: Some(msg_id.into()),
                 // The phone answers in PN.
                 participant: Some("15550001234@s.whatsapp.net".to_owned()),
             }),
@@ -1644,11 +1638,11 @@ mod tests {
 
         let peer = "5511999998888@s.whatsapp.net";
         let msg_id = "PDO_DIRECTION";
-        let key = ChatMessageId::new(peer.parse().expect("chat jid"), msg_id.to_owned());
+        let key = ChatMessageId::new(peer.parse().expect("chat jid"), msg_id.into());
 
         // The slot holds the outgoing half of the conversation.
         let outgoing = MessageInfo {
-            id: msg_id.to_owned(),
+            id: msg_id.into(),
             source: MessageSource {
                 chat: peer.parse().expect("chat jid"),
                 sender: peer.parse().expect("chat jid"),
@@ -1673,7 +1667,7 @@ mod tests {
             key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
                 remote_jid: Some(peer.to_owned()),
                 from_me: Some(false),
-                id: Some(msg_id.to_owned()),
+                id: Some(msg_id.into()),
                 participant: None,
             }),
             message: buffa::MessageField::some(waproto::whatsapp::Message {
@@ -1762,11 +1756,11 @@ mod tests {
         let client = setup_reconstruct_client().await;
         let chat = "5511999998888@s.whatsapp.net";
         let msg_id = "PDO_ONCE_3";
-        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.into());
         // A DM: the chat jid is the sender, which is what the gate names.
         let gate_key = wacore::types::message::SenderMessageId::new(
             chat.parse().expect("chat jid"),
-            msg_id.to_owned(),
+            msg_id.into(),
             chat.parse().expect("chat jid"),
         );
 
@@ -1786,7 +1780,7 @@ mod tests {
             key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
                 remote_jid: Some(chat.to_owned()),
                 from_me: Some(false),
-                id: Some(msg_id.to_owned()),
+                id: Some(msg_id.into()),
                 participant: None,
             }),
             ..Default::default()

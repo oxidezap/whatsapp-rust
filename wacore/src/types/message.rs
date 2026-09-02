@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use wacore_binary::{CompactString, Jid, JidExt, MessageId, MessageServerId};
-use waproto::whatsapp as wa;
 
 use crate::WireEnum;
 use smallvec::SmallVec;
@@ -398,7 +397,9 @@ pub struct MessageInfo {
     /// The envelope's `type` attribute. `None` when the stanza carried none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#type: Option<StanzaMessageType>,
-    pub push_name: String,
+    /// The sender's `notify` display name. Inline up to 24 bytes, which
+    /// covers most names, so a message does not allocate for it.
+    pub push_name: CompactString,
     #[serde(serialize_with = "chrono::serde::ts_seconds::serialize")]
     pub timestamp: DateTime<Utc>,
     pub category: MessageCategory,
@@ -424,18 +425,22 @@ pub struct MessageInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<EncMediaType>,
     pub edit: EditAttribute,
+    /// The `<bot>` child. Boxed: most messages carry none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bot_info: Option<MsgBotInfo>,
-    pub meta_info: MsgMetaInfo,
+    pub bot_info: Option<Box<MsgBotInfo>>,
+    /// The `<meta>` and `<reporting>` children, `None` when the stanza carries
+    /// neither. Boxed: it is 280 bytes of mostly-absent fields, and every
+    /// `MessageInfo` is retained per message through the commit batch and
+    /// every consumer that keeps a message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta_info: Option<Box<MsgMetaInfo>>,
     /// Decoded `<verified_name>` child cert of business senders; the display
     /// name is in `.name`. Boxed: most messages carry none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_name: Option<Box<crate::stanza::business::VerifiedName>>,
+    /// Set on a self-fanout of an own outgoing message. Boxed: rare.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub device_sent_meta: Option<DeviceSentMeta>,
-    /// Ephemeral duration in seconds, extracted from `contextInfo.expiration`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ephemeral_expiration: Option<u32>,
+    pub device_sent_meta: Option<Box<DeviceSentMeta>>,
     /// Whether this message was delivered during offline sync.
     pub is_offline: bool,
     /// Set when this message was recovered via PDO rather than normal decryption.
@@ -461,11 +466,6 @@ pub struct MessageInfo {
     /// goes to the right routing target).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_recipient_pn: Option<Jid>,
-    /// Parent post key when the dispatched message is a decrypted CAG channel
-    /// comment (`enc_comment_message`). The inner `Message` proto has no slot
-    /// for the threading link, so it surfaces here.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub comment_target: Option<wa::MessageKey>,
     /// Broadcast-contact-list recipients from `<participants><to jid>` on an
     /// incoming broadcast/status stanza. Populated only for broadcasts; used to
     /// validate a `deviceSentMessage.phash` (WA Web `validateBclHash`). Empty
@@ -474,7 +474,20 @@ pub struct MessageInfo {
     pub bcl_participants: Vec<Jid>,
 }
 
+/// What [`MessageInfo::meta`] hands out for a stanza that carried no `<meta>`
+/// or `<reporting>` child: every field `None`, shared by every such message.
+static EMPTY_META: std::sync::LazyLock<MsgMetaInfo> =
+    std::sync::LazyLock::new(MsgMetaInfo::default);
+
 impl MessageInfo {
+    /// The `<meta>` and `<reporting>` data, or an all-`None` one when the
+    /// stanza carried neither. Readers that only look at a field go through
+    /// here; [`meta_info`](Self::meta_info) itself is `None` in that case so
+    /// the common message does not allocate it.
+    pub fn meta(&self) -> &MsgMetaInfo {
+        self.meta_info.as_deref().unwrap_or(&EMPTY_META)
+    }
+
     /// WA Web: expired status messages (>24h) are silently dropped — no retry receipts,
     /// no undecryptable events. Matches `WAWebMsgProcessingDecryptionHandler.E()`.
     pub fn is_expired_status(&self) -> bool {
@@ -514,7 +527,10 @@ mod tests {
     fn message_info_serde_omits_only_absent_optional_fields() {
         let mut info = MessageInfo::default();
         info.source.sender_alt = Some("15550000001@lid".parse().unwrap());
-        info.meta_info.target_id = Some("TARGET".into());
+        info.meta_info = Some(Box::new(MsgMetaInfo {
+            target_id: Some("TARGET".into()),
+            ..Default::default()
+        }));
         info.unavailable_request_id = Some("REQUEST".to_owned());
 
         let serialized = serde_json::to_value(info).expect("serialize message info");
@@ -538,7 +554,6 @@ mod tests {
         assert!(!root.contains_key("bot_info"));
         assert!(!root.contains_key("verified_name"));
         assert!(!root.contains_key("device_sent_meta"));
-        assert!(!root.contains_key("ephemeral_expiration"));
         assert_eq!(
             root.get("timestamp").and_then(|value| value.as_i64()),
             Some(0)

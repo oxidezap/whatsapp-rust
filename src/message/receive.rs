@@ -1895,7 +1895,7 @@ impl Client {
         // `WAWebHandleHistorySyncNotification` gates on `isMePrimaryNonLid`.
         if let Some(history_sync) = history_sync_taken {
             if info.source.is_from_me {
-                self.handle_history_sync(info.id.clone(), history_sync)
+                self.handle_history_sync(info.id.to_string(), history_sync)
                     .await;
             } else {
                 warn!(

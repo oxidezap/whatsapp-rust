@@ -133,7 +133,7 @@ mod tests {
     fn test_info(id: &str) -> Arc<MessageInfo> {
         use crate::types::message::MessageSource;
         Arc::new(MessageInfo {
-            id: id.to_string(),
+            id: id.into(),
             source: MessageSource {
                 chat: "100@g.us".parse().unwrap(),
                 sender: "200@s.whatsapp.net".parse().unwrap(),

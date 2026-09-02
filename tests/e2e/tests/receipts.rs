@@ -40,7 +40,7 @@ async fn test_delivery_receipt_online() -> anyhow::Result<()> {
             matches!(
                 e,
                 Event::Receipt(r)
-                if r.message_ids.contains(&msg_id)
+                if r.message_ids.iter().any(|id| *id == msg_id)
                     && r.r#type == ReceiptType::Delivered
             )
         })
@@ -83,7 +83,7 @@ async fn test_read_receipt_online() -> anyhow::Result<()> {
             matches!(
                 e,
                 Event::Receipt(r)
-                if r.message_ids.contains(&msg_id)
+                if r.message_ids.iter().any(|id| *id == msg_id)
                     && r.r#type == ReceiptType::Read
             )
         })
@@ -123,7 +123,7 @@ async fn test_delivery_receipt_offline_reconnect() -> anyhow::Result<()> {
                 matches!(
                     e,
                     Event::Receipt(r)
-                    if r.message_ids.contains(&msg_id)
+                    if r.message_ids.iter().any(|id| *id == msg_id)
                         && r.r#type == ReceiptType::Delivered
                 )
             },
@@ -141,7 +141,7 @@ async fn test_delivery_receipt_offline_reconnect() -> anyhow::Result<()> {
             matches!(
                 e,
                 Event::Receipt(r)
-                if r.message_ids.contains(&msg_id)
+                if r.message_ids.iter().any(|id| *id == msg_id)
                     && r.r#type == ReceiptType::Delivered
             )
         })
@@ -179,7 +179,7 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
         .wait_for_event(10, |e| {
             matches!(
                 e,
-                Event::Receipt(r) if r.message_ids.contains(&msg_id)
+                Event::Receipt(r) if r.message_ids.iter().any(|id| *id == msg_id)
                     && r.r#type == ReceiptType::Delivered
             )
         })
@@ -201,7 +201,7 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
             matches!(
                 e,
                 Event::Receipt(r)
-                if r.message_ids.contains(&msg_id)
+                if r.message_ids.iter().any(|id| *id == msg_id)
                     && r.r#type == ReceiptType::Read
             )
         })
@@ -250,7 +250,7 @@ async fn test_delivery_receipt_bidirectional_offline() -> anyhow::Result<()> {
             matches!(
                 e,
                 Event::Receipt(r)
-                if r.message_ids.contains(&msg_id)
+                if r.message_ids.iter().any(|id| *id == msg_id)
                     && r.r#type == ReceiptType::Delivered
             )
         })
@@ -292,7 +292,7 @@ async fn test_no_delivery_receipt_for_fully_offline() -> anyhow::Result<()> {
                 matches!(
                     e,
                     Event::Receipt(r)
-                    if r.message_ids.contains(&msg_id)
+                    if r.message_ids.iter().any(|id| *id == msg_id)
                         && r.r#type == ReceiptType::Delivered
                 )
             },
@@ -347,7 +347,7 @@ async fn test_group_delivery_receipt() -> anyhow::Result<()> {
             matches!(
                 e,
                 Event::Receipt(r)
-                if r.message_ids.contains(&msg_id)
+                if r.message_ids.iter().any(|id| *id == msg_id)
                     && r.r#type == ReceiptType::Delivered
             )
         })

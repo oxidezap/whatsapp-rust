@@ -229,6 +229,13 @@ impl From<CompactString> for NodeValue {
     }
 }
 
+impl From<&CompactString> for NodeValue {
+    #[inline]
+    fn from(s: &CompactString) -> Self {
+        NodeValue::String(s.clone())
+    }
+}
+
 impl From<Jid> for NodeValue {
     #[inline]
     fn from(jid: Jid) -> Self {

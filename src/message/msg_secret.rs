@@ -558,7 +558,7 @@ impl Client {
         // Chat scope for the secret lookup: prefer <meta target_chat_jid>;
         // fall back to the stanza's chat (matches WA Web `decryptMsmsgBotMessage`).
         let chat_for_lookup = info
-            .meta_info
+            .meta()
             .target_chat
             .as_ref()
             .unwrap_or(&info.source.chat)
@@ -569,7 +569,7 @@ impl Client {
         // The id used for the SECRET LOOKUP is `meta.target_id` (our outbound
         // id); the id used as HKDF input is the bot reply id (or
         // `bot_info.edit_target_id` when the bot is editing a prior reply).
-        let target_id = match info.meta_info.target_id.as_deref() {
+        let target_id = match info.meta().target_id.as_deref() {
             Some(id) => id,
             None => {
                 log::warn!(
@@ -839,7 +839,7 @@ impl Client {
     /// Resolve `target_sender` for a msmsg stanza: echo from `<meta>` when
     /// present, else fall back to our LID (sender on bot server) or PN.
     async fn resolve_msmsg_target_sender(&self, info: &Arc<MessageInfo>) -> Option<Jid> {
-        if let Some(ts) = info.meta_info.target_sender.as_ref() {
+        if let Some(ts) = info.meta().target_sender.as_ref() {
             return Some(ts.clone());
         }
         if info.source.sender.server == wacore_binary::Server::Bot {

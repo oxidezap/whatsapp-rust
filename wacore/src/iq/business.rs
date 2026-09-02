@@ -636,7 +636,7 @@ pub struct RemoveCoverPhotoSpec {
 
 impl RemoveCoverPhotoSpec {
     pub fn new(id: &str) -> Self {
-        Self { id: id.to_string() }
+        Self { id: id.into() }
     }
 }
 

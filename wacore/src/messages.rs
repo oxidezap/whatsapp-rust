@@ -1190,7 +1190,7 @@ pub fn parse_message_info(
         !id.is_empty(),
         "message stanza has an empty required 'id' attribute"
     );
-    let id = id.into_owned();
+    let id = CompactString::from(id.as_ref());
     let from = attrs.required_jid("from")?;
     let addressing_mode = attrs
         .optional_string("addressing_mode")
@@ -1340,8 +1340,11 @@ pub fn parse_message_info(
 
     // <meta> child attrs (WAWebHandleMsgParser b()) and <reporting> children
     // (I() function). Both are optional; absence is the common case.
-    let mut meta_info = crate::types::message::MsgMetaInfo::default();
+    // Built only when one of the children is present, so the common message
+    // carries no `MsgMetaInfo` at all.
+    let mut meta_info: Option<Box<crate::types::message::MsgMetaInfo>> = None;
     if let Some(meta) = node.get_optional_child("meta") {
+        let meta_info = meta_info.get_or_insert_with(Default::default);
         let mut ma = meta.attrs();
         meta_info.content_type = ma.optional_string("content_type").map(CompactString::from);
         meta_info.appdata = ma.optional_string("appdata").map(CompactString::from);
@@ -1364,11 +1367,13 @@ pub fn parse_message_info(
     if let Some(reporting) = node.get_optional_child("reporting")
         && let Some(tag) = reporting.get_optional_child("reporting_tag")
     {
+        let meta_info = meta_info.get_or_insert_with(Default::default);
         meta_info.reporting_tag = tag.content_bytes().map(ReportingBytes::from_slice);
     }
     if let Some(reporting) = node.get_optional_child("reporting")
         && let Some(token) = reporting.get_optional_child("reporting_token")
     {
+        let meta_info = meta_info.get_or_insert_with(Default::default);
         meta_info.reporting_token = token.content_bytes().map(ReportingBytes::from_slice);
         // WA Web `I()`: `c.maybeAttrInt("v")!=null?_:1`. Missing `v` is
         // not a parse failure — token format version defaults to 1.
@@ -1387,16 +1392,18 @@ pub fn parse_message_info(
     // but parsing it always is a strict superset.
     let bot_info = node.get_optional_child("bot").map(|bot_node| {
         let mut ba = bot_node.attrs();
-        crate::types::message::MsgBotInfo {
+        Box::new(crate::types::message::MsgBotInfo {
             edit_type: ba
                 .optional_string("edit")
                 .and_then(|s| crate::types::message::BotEditType::from_wire(s.as_ref())),
-            edit_target_id: ba.optional_string("edit_target_id").map(|s| s.into_owned()),
+            edit_target_id: ba
+                .optional_string("edit_target_id")
+                .map(|s| CompactString::from(s.as_ref())),
             edit_sender_timestamp_ms: ba
                 .optional_u64("sender_timestamp_ms")
                 .and_then(|ms| i64::try_from(ms).ok())
                 .and_then(crate::time::from_millis),
-        }
+        })
     });
 
     Ok(MessageInfo {
@@ -1406,7 +1413,7 @@ pub fn parse_message_info(
         r#type: stanza_type,
         push_name: attrs
             .optional_string("notify")
-            .map(|s| s.to_string())
+            .map(|s| CompactString::from(s.as_ref()))
             .unwrap_or_default(),
         timestamp: crate::time::from_secs_or_now(attrs.unix_time("t")),
         category,
@@ -1804,8 +1811,8 @@ mod parse_message_info_tests {
                 .build()])
             .build();
         let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
-        assert_eq!(info.meta_info.content_type.as_deref(), Some("add_on"));
-        assert!(info.meta_info.appdata.is_none());
+        assert_eq!(info.meta().content_type.as_deref(), Some("add_on"));
+        assert!(info.meta().appdata.is_none());
     }
 
     /// `<reporting><reporting_tag>{bytes}</reporting_tag>
@@ -1835,14 +1842,14 @@ mod parse_message_info_tests {
             .build();
         let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
         assert_eq!(
-            info.meta_info.reporting_tag.as_deref(),
+            info.meta().reporting_tag.as_deref(),
             Some(tag_bytes.as_slice())
         );
         assert_eq!(
-            info.meta_info.reporting_token.as_deref(),
+            info.meta().reporting_token.as_deref(),
             Some(token_bytes.as_slice())
         );
-        assert_eq!(info.meta_info.reporting_token_version, Some(2));
+        assert_eq!(info.meta().reporting_token_version, Some(2));
     }
 
     /// Missing `v` attr on `<reporting_token>` defaults the version to 1
@@ -1862,7 +1869,7 @@ mod parse_message_info_tests {
                 .build()])
             .build();
         let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
-        assert_eq!(info.meta_info.reporting_token_version, Some(1));
+        assert_eq!(info.meta().reporting_token_version, Some(1));
     }
 
     /// `<reporting>` with ONLY `<reporting_tag>` (no token) is also valid
@@ -1882,9 +1889,9 @@ mod parse_message_info_tests {
                 .build()])
             .build();
         let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
-        assert!(info.meta_info.reporting_tag.is_some());
-        assert!(info.meta_info.reporting_token.is_none());
-        assert!(info.meta_info.reporting_token_version.is_none());
+        assert!(info.meta().reporting_tag.is_some());
+        assert!(info.meta().reporting_token.is_none());
+        assert!(info.meta().reporting_token_version.is_none());
     }
 
     /// Message with no `<meta>` and no `<reporting>` leaves all the new
@@ -1899,10 +1906,10 @@ mod parse_message_info_tests {
             .attr("t", "1777415965")
             .build();
         let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
-        assert!(info.meta_info.content_type.is_none());
-        assert!(info.meta_info.appdata.is_none());
-        assert!(info.meta_info.reporting_tag.is_none());
-        assert!(info.meta_info.reporting_token.is_none());
+        assert!(info.meta().content_type.is_none());
+        assert!(info.meta().appdata.is_none());
+        assert!(info.meta().reporting_tag.is_none());
+        assert!(info.meta().reporting_token.is_none());
     }
 
     /// Symmetric branch: when `participant` is a LID, `sender_alt` must come
@@ -2193,12 +2200,13 @@ mod parse_message_info_tests {
 
         let poll = with_meta("poll");
         assert_eq!(poll.r#type, Some(T::Poll));
-        assert_eq!(poll.meta_info.poll_type, Some(PollType::Vote));
+        assert_eq!(poll.meta().poll_type, Some(PollType::Vote));
 
         let text = with_meta("text");
         assert_eq!(text.r#type, Some(T::Text));
         assert_eq!(
-            text.meta_info.poll_type, None,
+            text.meta().poll_type,
+            None,
             "polltype belongs to poll envelopes only"
         );
     }
@@ -2216,7 +2224,7 @@ mod parse_message_info_tests {
                 .attr("polltype", "retraction")
                 .build()])
             .build();
-        assert_eq!(parse(&node).meta_info.poll_type, None);
+        assert_eq!(parse(&node).meta().poll_type, None);
     }
 
     #[test]
@@ -2233,12 +2241,9 @@ mod parse_message_info_tests {
                 .build()])
             .build();
         let info = parse(&node);
+        assert_eq!(info.meta().thread_message_id.as_deref(), Some("PARENT-1"));
         assert_eq!(
-            info.meta_info.thread_message_id.as_deref(),
-            Some("PARENT-1")
-        );
-        assert_eq!(
-            info.meta_info
+            info.meta()
                 .thread_message_sender_jid
                 .as_ref()
                 .map(|jid| jid.user.as_str()),

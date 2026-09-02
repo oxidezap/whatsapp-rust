@@ -2978,7 +2978,7 @@ fn test_message_ack_source_node_own_device_addressing() {
     // Own-account branch: sender == `from` (device-qualified), chat is the
     // device-stripped recipient. `to` must come from sender, not chat.
     let info = MessageInfo {
-        id: "AC055553E56A2C12DE592DAD6353C477".to_string(),
+        id: "AC055553E56A2C12DE592DAD6353C477".into(),
         source: MessageSource {
             sender: "236395184570386@lid".parse().expect("sender"),
             chat: "156535032389744@lid".parse().expect("chat"),
@@ -3023,7 +3023,7 @@ fn test_message_ack_source_node_own_device_addressing() {
 fn test_message_ack_source_node_incoming_dm_addressing() {
     use crate::types::message::{MessageInfo, MessageSource};
     let info = MessageInfo {
-        id: "MSGID".to_string(),
+        id: "MSGID".into(),
         source: MessageSource {
             sender: "5511999998888:3@s.whatsapp.net".parse().expect("sender"),
             chat: "5511999998888@s.whatsapp.net".parse().expect("chat"),
@@ -3057,7 +3057,7 @@ fn test_message_ack_source_node_incoming_dm_addressing() {
 fn test_message_ack_source_node_status_addressing() {
     use crate::types::message::{MessageInfo, MessageSource};
     let info = MessageInfo {
-        id: "STATUSMSG".to_string(),
+        id: "STATUSMSG".into(),
         source: MessageSource {
             chat: "status@broadcast".parse().expect("status chat"),
             sender: "181531758878822@lid".parse().expect("participant"),
@@ -3096,7 +3096,7 @@ fn test_message_ack_source_node_group_addressing() {
     use crate::types::message::{MessageInfo, MessageSource};
     // Group branch: chat == group `from`, sender == participant.
     let info = MessageInfo {
-        id: "GROUPMSGID".to_string(),
+        id: "GROUPMSGID".into(),
         source: MessageSource {
             chat: "120363011111111111@g.us".parse().expect("group"),
             sender: "181531758878822@lid".parse().expect("participant"),
@@ -4020,7 +4020,7 @@ async fn a_panicking_observer_leaves_the_client_sending() {
 
 fn receipt_test_info(id: &str) -> Arc<crate::types::message::MessageInfo> {
     Arc::new(crate::types::message::MessageInfo {
-        id: id.to_string(),
+        id: id.into(),
         source: crate::types::message::MessageSource {
             chat: "15550001111@s.whatsapp.net".parse().unwrap(),
             sender: "15550001111@s.whatsapp.net".parse().unwrap(),
@@ -5020,7 +5020,7 @@ async fn memory_report_on_fresh_client() {
     // Retained bytes must appear once something is cached.
     let key = ChatMessageId::new(
         "559980000001@s.whatsapp.net".parse().unwrap(),
-        "3EB0TESTMSGID".to_string(),
+        "3EB0TESTMSGID".into(),
     );
     client
         .recent_messages

@@ -379,7 +379,7 @@ async fn batch_accumulates_undecryptable_and_dispatches_once() {
         .parse()
         .expect("test JID should be valid");
     let info = Arc::new(MessageInfo {
-        id: "BATCH_UNDEC_ONCE".to_string(),
+        id: "BATCH_UNDEC_ONCE".into(),
         source: crate::types::message::MessageSource {
             sender: sender_jid.clone(),
             chat: sender_jid.clone(),
@@ -973,7 +973,7 @@ async fn migration_plaintext_failure_nacks_without_signal_retry() {
     let bad_old_pn_msg = alice_old.encrypt(&bob_addr, &[0xff, 0x01]).await;
     let payloads = vec![enc_payload_from_ciphertext(&bad_old_pn_msg)];
     let info = Arc::new(MessageInfo {
-        id: "MIGRATION_BAD_PLAINTEXT".to_string(),
+        id: "MIGRATION_BAD_PLAINTEXT".into(),
         source: crate::types::message::MessageSource {
             sender: alice_lid.clone(),
             chat: alice_lid.clone(),
@@ -1102,7 +1102,7 @@ async fn test_badmac_preserves_session() {
     let enc_ref = enc_node.as_node_ref();
     let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
-        id: "BADMAC_TAMPER_MSG".to_string(),
+        id: "BADMAC_TAMPER_MSG".into(),
         source: crate::types::message::MessageSource {
             sender: alice.jid.clone(),
             chat: alice.jid.clone(),
@@ -1262,7 +1262,7 @@ async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
     let enc_ref = enc_node.as_node_ref();
     let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
-        id: "PROD_LOOP_REPRO_STALE".to_string(),
+        id: "PROD_LOOP_REPRO_STALE".into(),
         source: crate::types::message::MessageSource {
             sender: alice.jid.clone(),
             chat: alice.jid.clone(),
@@ -3326,13 +3326,13 @@ async fn test_pn_message_uses_pn_when_no_lid_mapping() {
 
 /// Helper to create a test MessageInfo with customizable fields
 fn create_test_message_info(chat: &str, msg_id: &str, sender: &str) -> MessageInfo {
-    use wacore::types::message::{EditAttribute, MessageCategory, MessageSource, MsgMetaInfo};
+    use wacore::types::message::{EditAttribute, MessageCategory, MessageSource};
 
     let chat_jid: Jid = chat.parse().expect("valid chat JID");
     let sender_jid: Jid = sender.parse().expect("valid sender JID");
 
     MessageInfo {
-        id: msg_id.to_string(),
+        id: msg_id.into(),
         server_id: 0,
         r#type: Some(wacore::types::message::StanzaMessageType::Text),
         source: MessageSource {
@@ -3347,23 +3347,21 @@ fn create_test_message_info(chat: &str, msg_id: &str, sender: &str) -> MessageIn
             recipient: None,
         },
         timestamp: wacore::time::now_utc(),
-        push_name: "Test User".to_string(),
+        push_name: "Test User".into(),
         category: MessageCategory::default(),
         multicast: false,
         media_type: None,
         edit: EditAttribute::default(),
         bot_info: None,
-        meta_info: MsgMetaInfo::default(),
+        meta_info: None,
         verified_name: None,
         device_sent_meta: None,
-        ephemeral_expiration: None,
         is_offline: false,
         unavailable_request_id: None,
         server_timestamp_us: None,
         verified_level: None,
         verified_name_serial: None,
         peer_recipient_pn: None,
-        comment_target: None,
         bcl_participants: Vec::new(),
     }
 }
@@ -5132,7 +5130,7 @@ async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
         .expect("test JID should be valid");
     let msg_id = "UNDEC_LOG_BATCH_OWNS_DISPATCH";
     let info = Arc::new(MessageInfo {
-        id: msg_id.to_string(),
+        id: msg_id.into(),
         source: crate::types::message::MessageSource {
             sender: sender.clone(),
             chat: sender.clone(),
@@ -5222,7 +5220,7 @@ async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
         .expect("test JID should be valid");
     let msg_id = "UNDEC_LOG_BRANCH_DISPATCHES";
     let info = Arc::new(MessageInfo {
-        id: msg_id.to_string(),
+        id: msg_id.into(),
         source: crate::types::message::MessageSource {
             sender: participant,
             chat: group.clone(),
@@ -7216,7 +7214,7 @@ async fn decrypt_failure_emits_transport_ack() {
     let sender: Jid = "236395184570386@lid".parse().expect("sender JID");
     let recipient: Jid = "156535032389744@lid".parse().expect("recipient JID");
     let info = Arc::new(MessageInfo {
-        id: "AC055553E56A2C12DE592DAD6353C477".to_string(),
+        id: "AC055553E56A2C12DE592DAD6353C477".into(),
         source: crate::types::message::MessageSource {
             sender: sender.clone(),
             chat: recipient.clone(),
@@ -7264,7 +7262,7 @@ async fn decrypt_failure_emits_transport_ack() {
 async fn self_fanout_decrypt_failure_acked_via_sender_receipt() {
     let (client, transport) = capturing_client("self_fanout_badmac").await;
     let info = Arc::new(MessageInfo {
-        id: "AC00000000000000000000000000BEEF".to_string(),
+        id: "AC00000000000000000000000000BEEF".into(),
         source: crate::types::message::MessageSource {
             sender: "100000000000001@lid".parse().expect("sender"),
             chat: "200000000000002@bot".parse().expect("chat"),
@@ -7326,7 +7324,7 @@ async fn self_fanout_decrypt_failure_acked_via_sender_receipt() {
 async fn bot_author_self_fanout_decrypt_failure_not_sender_receipt() {
     let (client, transport) = capturing_client("bot_author_badmac").await;
     let info = Arc::new(MessageInfo {
-        id: "OWNBOTFAIL1".to_string(),
+        id: "OWNBOTFAIL1".into(),
         source: crate::types::message::MessageSource {
             sender: "100000000000002@bot".parse().expect("sender"),
             chat: "300000000000003@lid".parse().expect("chat"),
@@ -7376,7 +7374,7 @@ async fn decrypt_failure_does_not_ack_when_retry_send_fails() {
     let (client, transport) = capturing_client("retry_fail_no_ack").await;
     let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
     let info = Arc::new(MessageInfo {
-        id: "NOACK1".to_string(),
+        id: "NOACK1".into(),
         source: crate::types::message::MessageSource {
             sender: sender.clone(),
             chat: sender.clone(),
@@ -7409,7 +7407,7 @@ async fn decrypt_failure_sends_retry_before_ack() {
     let (client, transport) = capturing_client("retry_before_ack").await;
     let sender: Jid = "5511777776666@s.whatsapp.net".parse().expect("sender");
     let info = Arc::new(MessageInfo {
-        id: "RBA1".to_string(),
+        id: "RBA1".into(),
         source: crate::types::message::MessageSource {
             sender: sender.clone(),
             chat: sender.clone(),
@@ -7466,7 +7464,7 @@ async fn decrypt_failure_sends_retry_before_ack() {
 async fn status_broadcast_decrypt_failure_acks_to_chat() {
     let (client, transport) = capturing_client("status_fail_ack").await;
     let info = Arc::new(MessageInfo {
-        id: "STATUSMSGID".to_string(),
+        id: "STATUSMSGID".into(),
         source: crate::types::message::MessageSource {
             sender: "236395184570386@lid".parse().expect("sender"),
             chat: "status@broadcast".parse().expect("status chat"),
@@ -7517,7 +7515,7 @@ async fn process_session_ct(
     let enc_ref = enc.as_node_ref();
     let payload = EncPayload::from_node_ref(&enc_ref, 0).unwrap();
     let info = Arc::new(MessageInfo {
-        id: id.to_string(),
+        id: id.into(),
         source: crate::types::message::MessageSource {
             sender: sender.clone(),
             chat: sender.clone(),
@@ -7573,7 +7571,7 @@ fn msmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
 
 fn group_message_info(id: &str, group: &Jid, sender: &Jid, is_from_me: bool) -> Arc<MessageInfo> {
     Arc::new(MessageInfo {
-        id: id.to_string(),
+        id: id.into(),
         source: crate::types::message::MessageSource {
             sender: sender.clone(),
             chat: group.clone(),
@@ -8354,7 +8352,7 @@ async fn error_message_ack_is_not_counted_as_positive_confirmation() {
     let (client, transport) = capturing_client("error_ack_not_positive").await;
     let id = "ERROR_ACK_NOT_POSITIVE";
     let info = Arc::new(MessageInfo {
-        id: id.to_string(),
+        id: id.into(),
         source: crate::types::message::MessageSource {
             sender: "146824178450530@lid".parse().expect("sender"),
             chat: "120363408782575448@g.us".parse().expect("group"),
@@ -8566,7 +8564,7 @@ async fn duplicate_message_is_acked_with_delivery_receipt() {
 async fn own_self_fanout_acked_via_sender_receipt() {
     let (client, transport) = capturing_client("own_ack").await;
     let own = Arc::new(MessageInfo {
-        id: "OWN1".to_string(),
+        id: "OWN1".into(),
         source: crate::types::message::MessageSource {
             sender: "100000000000001@lid".parse().expect("sender"),
             chat: "300000000000003@lid".parse().expect("chat"),
@@ -8617,7 +8615,7 @@ async fn own_self_fanout_acked_via_sender_receipt() {
 async fn bot_self_fanout_acked_via_sender_receipt() {
     let (client, transport) = capturing_client("bot_self_fanout").await;
     let own = Arc::new(MessageInfo {
-        id: "AC00000000000000000000000000BEEF".to_string(),
+        id: "AC00000000000000000000000000BEEF".into(),
         source: crate::types::message::MessageSource {
             // from = our own LID with its device (the server fans our
             // outgoing bot prompt back to this device); chat = the bot
@@ -8669,7 +8667,7 @@ async fn bot_self_fanout_acked_via_sender_receipt() {
 async fn own_bot_author_dm_acks_not_sender_receipt() {
     let (client, transport) = capturing_client("own_bot_author").await;
     let own = Arc::new(MessageInfo {
-        id: "OWNBOT1".to_string(),
+        id: "OWNBOT1".into(),
         source: crate::types::message::MessageSource {
             sender: "100000000000002@bot".parse().expect("sender"),
             chat: "300000000000003@lid".parse().expect("chat"),
@@ -12553,7 +12551,7 @@ async fn enc_reaction_inbound_decrypts_to_plaintext_shape() {
         ..Default::default()
     };
     let info = Arc::new(MessageInfo {
-        id: "REACT1".to_string(),
+        id: "REACT1".into(),
         source: MessageSource {
             chat: group.clone(),
             sender: reactor.clone(),
@@ -12659,7 +12657,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
         ..Default::default()
     };
     let info = Arc::new(MessageInfo {
-        id: COMMENT_ID.to_string(),
+        id: COMMENT_ID.into(),
         source: MessageSource {
             chat: group.clone(),
             sender: commenter.clone(),
@@ -12679,7 +12677,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
     'outer: while tokio::time::Instant::now() < deadline {
         while let Ok(event) = rx.try_recv() {
             if let Some(m) = event.messages().find(|m| m.info.id == COMMENT_ID) {
-                let (msg, info) = (&m.message, &m.info);
+                let msg = &m.message;
                 seen = true;
                 assert_eq!(
                     msg.extended_text_message
@@ -12693,7 +12691,7 @@ async fn enc_comment_inbound_dispatches_body_with_parent_link() {
                     "the envelope must not survive substitution"
                 );
                 assert_eq!(
-                    info.comment_target.as_ref().and_then(|k| k.id.as_deref()),
+                    m.comment_target.as_ref().and_then(|k| k.id.as_deref()),
                     Some(PARENT_ID),
                     "the parent post key must surface on the info"
                 );
@@ -12766,7 +12764,7 @@ async fn addon_decrypts_right_after_capture_without_flush() {
     };
     let mk_info = |id: &str| {
         Arc::new(MessageInfo {
-            id: id.to_string(),
+            id: id.into(),
             source: MessageSource {
                 chat: chat.parse().expect("chat"),
                 sender: chat.parse().expect("sender"),
@@ -13025,7 +13023,7 @@ async fn test_invalid_signed_prekey_id_sends_retry_receipt() {
     let enc_ref = enc_node.as_node_ref();
     let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
-        id: "INVALID_SPK_ID_MSG".to_string(),
+        id: "INVALID_SPK_ID_MSG".into(),
         source: crate::types::message::MessageSource {
             sender: alice.jid.clone(),
             chat: alice.jid.clone(),
@@ -13589,7 +13587,7 @@ fn enc_payload_at(enc_type: &str, bytes: Vec<u8>, enc_index: usize) -> EncPayloa
 
 fn dm_info(msg_id: &str, sender: &Jid) -> Arc<MessageInfo> {
     Arc::new(MessageInfo {
-        id: msg_id.to_string(),
+        id: msg_id.into(),
         source: crate::types::message::MessageSource {
             sender: sender.clone(),
             chat: sender.clone(),
@@ -13940,7 +13938,7 @@ async fn a_group_enc_without_a_sender_key_reports_no_sender_key() {
     let group: Jid = "120363000000000002@g.us".parse().unwrap();
     let participant: Jid = "5511900000003:1@s.whatsapp.net".parse().unwrap();
     let info = Arc::new(MessageInfo {
-        id: "ENCFAIL_NOSK".to_string(),
+        id: "ENCFAIL_NOSK".into(),
         source: crate::types::message::MessageSource {
             sender: participant,
             chat: group.clone(),
@@ -13993,7 +13991,7 @@ async fn a_skmsg_skipped_after_a_session_failure_reports_not_attempted() {
     let group: Jid = "120363000000000003@g.us".parse().unwrap();
     let participant: Jid = "5511900000004@s.whatsapp.net".parse().unwrap();
     let info = Arc::new(MessageInfo {
-        id: "ENCFAIL_SKIPPED".to_string(),
+        id: "ENCFAIL_SKIPPED".into(),
         source: crate::types::message::MessageSource {
             sender: participant.clone(),
             chat: group,
@@ -14049,7 +14047,7 @@ async fn session_encs_from_a_group_sender_report_not_attempted() {
     let group: Jid = "120363000000000004@g.us".parse().unwrap();
     let participant: Jid = "5511900000005@s.whatsapp.net".parse().unwrap();
     let info = Arc::new(MessageInfo {
-        id: "ENCFAIL_GROUPSENDER".to_string(),
+        id: "ENCFAIL_GROUPSENDER".into(),
         source: crate::types::message::MessageSource {
             sender: participant,
             chat: group.clone(),
@@ -14331,7 +14329,7 @@ async fn a_group_envelope_that_does_not_parse_reports_malformed_ciphertext() {
     let group: Jid = "120363000000000005@g.us".parse().unwrap();
     let participant: Jid = "5511900000009@s.whatsapp.net".parse().unwrap();
     let info = Arc::new(MessageInfo {
-        id: "ENCFAIL_SKMSG_PARSE".to_string(),
+        id: "ENCFAIL_SKMSG_PARSE".into(),
         source: crate::types::message::MessageSource {
             sender: participant,
             chat: group.clone(),
@@ -14587,7 +14585,7 @@ async fn a_skmsg_skipped_beside_a_duplicate_is_still_reported() {
     // to skip the group payload.
     let group: Jid = "120363000000000006@g.us".parse().unwrap();
     let redelivered = Arc::new(MessageInfo {
-        id: "ENCFAIL_DUP_REDELIVERED".to_string(),
+        id: "ENCFAIL_DUP_REDELIVERED".into(),
         source: crate::types::message::MessageSource {
             sender: alice.jid.clone(),
             chat: group,

@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn test_profile_picture_struct() {
         let pic = ProfilePicture {
-            id: "123456789".to_string(),
+            id: "123456789".into(),
             url: "https://example.com/pic.jpg".to_string(),
             direct_path: Some("/v/pic.jpg".to_string()),
             hash: None,

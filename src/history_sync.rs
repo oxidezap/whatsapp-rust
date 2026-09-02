@@ -839,7 +839,7 @@ mod tests {
         let history_sync = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: chat.to_string(),
+                id: chat.into(),
                 messages: vec![wa::HistorySyncMsg {
                     message: buffa::MessageField::some(wa::WebMessageInfo {
                         key: buffa::MessageField::some(wa::MessageKey {
@@ -927,7 +927,7 @@ mod tests {
         let history_sync = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: chat.to_string(),
+                id: chat.into(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -987,7 +987,7 @@ mod tests {
         let history_sync = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: chat.to_string(),
+                id: chat.into(),
                 messages: vec![wa::HistorySyncMsg {
                     message: buffa::MessageField::some(wa::WebMessageInfo {
                         key: buffa::MessageField::some(wa::MessageKey {
@@ -1078,7 +1078,7 @@ mod tests {
         let history_sync = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: chat.to_string(),
+                id: chat.into(),
                 messages,
                 ..Default::default()
             }],

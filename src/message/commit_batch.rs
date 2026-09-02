@@ -1086,7 +1086,7 @@ mod tests {
             self.batches
                 .lock()
                 .expect("hook lock")
-                .push(batch.iter().map(|m| m.info.id.clone()).collect());
+                .push(batch.iter().map(|m| m.info.id.to_string()).collect());
             Ok(())
         }
     }
@@ -1098,7 +1098,7 @@ mod tests {
                 ..Default::default()
             }))
             .info(Arc::new(MessageInfo {
-                id: id.to_string(),
+                id: id.into(),
                 source: MessageSource {
                     chat: "100@g.us".parse().unwrap(),
                     sender: "200@s.whatsapp.net".parse().unwrap(),

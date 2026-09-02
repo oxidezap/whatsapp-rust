@@ -31,7 +31,7 @@ async fn test_deferred_delivery_receipt() -> anyhow::Result<()> {
                 matches!(
                     e,
                     Event::Receipt(receipt)
-                    if receipt.message_ids.contains(&msg_id)
+                    if receipt.message_ids.iter().any(|id| *id == msg_id)
                         && receipt.r#type == ReceiptType::Delivered
                 )
             },
@@ -83,7 +83,7 @@ async fn test_bidirectional_offline_receipt() -> anyhow::Result<()> {
             matches!(
                 e,
                 Event::Receipt(receipt)
-                if receipt.message_ids.contains(&msg_id)
+                if receipt.message_ids.iter().any(|id| *id == msg_id)
                     && receipt.r#type == ReceiptType::Delivered
             )
         })
@@ -128,7 +128,7 @@ async fn test_deferred_delivery_receipt_on_reconnect() -> anyhow::Result<()> {
                 matches!(
                     e,
                     Event::Receipt(receipt)
-                    if receipt.message_ids.contains(&msg_id)
+                    if receipt.message_ids.iter().any(|id| *id == msg_id)
                         && receipt.r#type == ReceiptType::Delivered
                 )
             },
@@ -148,7 +148,7 @@ async fn test_deferred_delivery_receipt_on_reconnect() -> anyhow::Result<()> {
             matches!(
                 e,
                 Event::Receipt(receipt)
-                if receipt.message_ids.contains(&msg_id)
+                if receipt.message_ids.iter().any(|id| *id == msg_id)
                     && receipt.r#type == ReceiptType::Delivered
             )
         })

@@ -167,7 +167,7 @@ impl MessageContext {
         // info.source.chat, so remote_jid is omitted (WA Web parity).
         let chat = &self.info.source.chat;
         wacore::proto_helpers::build_quote_context_with_info(
-            &self.info.id,
+            self.info.id.as_str(),
             &self.info.source.sender,
             chat,
             chat,
@@ -184,7 +184,7 @@ impl MessageContext {
         wa::MessageKey {
             remote_jid: Some(self.info.source.chat.to_string()),
             from_me: Some(self.info.source.is_from_me),
-            id: Some(self.info.id.clone()),
+            id: Some(self.info.id.to_string()),
             participant: needs_participant.then(|| self.info.source.sender.to_string()),
         }
     }
@@ -2309,7 +2309,7 @@ mod tests {
     fn react_info(chat: &str, sender: &str, id: &str, is_group: bool) -> MessageInfo {
         use crate::types::message::MessageSource;
         MessageInfo {
-            id: id.to_string(),
+            id: id.into(),
             source: MessageSource {
                 chat: chat.parse().expect("chat jid"),
                 sender: sender.parse().expect("sender jid"),
