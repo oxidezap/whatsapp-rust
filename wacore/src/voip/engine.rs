@@ -9639,6 +9639,32 @@ mod tests {
         assert!(requests_keyframe(&summary.feedback, peer_video_ssrc));
     }
 
+    /// The documented group-call contract, pinned: whatever the plane holds,
+    /// a group call answers `false`. This does not exercise the promotion the
+    /// guard exists for -- inbound here never reached the direct plane, so the
+    /// SSRC is unset and the old code would also have refused. It fixes the
+    /// public behaviour so a later change cannot quietly start answering.
+    #[test]
+    fn a_group_call_never_asks_the_peer_for_a_keyframe() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).expect("engine");
+        let update = group_update("video");
+        eng.configure_group(GroupEngineConfig {
+            call_creator: update.call_creator.clone(),
+            self_jid: SELF_LID.parse().expect("self JID"),
+            initial_update: update,
+            direct_peer: None,
+        })
+        .expect("configure group");
+        eng.start(0, 1_700_000_000_000);
+        let _ = drain(&mut eng);
+
+        assert!(!eng.request_peer_keyframe(1_000));
+        // And not merely once, so a throttle cannot be mistaken for the refusal.
+        assert!(!eng.request_peer_keyframe(1_000_000));
+    }
+
     /// A plane coming back on has no inbound stream to complain about: the
     /// SSRC it held belongs to the session that ended.
     #[test]
