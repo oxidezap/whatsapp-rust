@@ -2074,6 +2074,16 @@ impl CallEngine {
     /// its own change. Stated rather than left silent, because the caller
     /// cannot tell this apart from a throttled request.
     pub fn request_peer_keyframe(&mut self, now: Millis) -> bool {
+        if self.group.is_some() {
+            // Refused here rather than left to fall out of an unset SSRC below.
+            // A call that authenticated video and *then* promoted to a group
+            // keeps this plane -- `configure_group_at` reads it and does not
+            // clear it -- so its depacketizer still names the direct stream
+            // while `on_rtp` has moved to the registry. Without this, that one
+            // transition would send a PLI for a stream nobody is sending any
+            // more and report success for it.
+            return false;
+        }
         let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut()) else {
             return false;
         };
@@ -9650,9 +9660,7 @@ mod tests {
         let _ = drain(&mut eng);
         assert!(eng.request_peer_keyframe(200));
 
-        // Downgrade to audio, then back. The pipeline is deliberately kept --
-        // rebuilding it would repeat an SRTP keystream -- so without the reset
-        // it would still name the stream that just ended.
+        // Downgrade to audio, then back.
         eng.disable_video();
         assert!(eng.enable_video());
         assert!(
