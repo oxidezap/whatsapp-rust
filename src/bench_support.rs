@@ -710,9 +710,22 @@ impl ReceiveHarness {
 
     /// Receive one stanza, all the way to the dispatched event and the
     /// delivery receipt on the sink socket.
+    ///
+    /// The receipt is not sent inline: `ack_received_message` hands it to a
+    /// detached worker that marshals and noise-encrypts it, and on this
+    /// current-thread runtime that worker only runs while something else is
+    /// awaiting. Flushing the outbound scope is what pulls that work into
+    /// the measured region instead of letting it leak into the next
+    /// iteration, or past the last one; with nothing tracked it returns at
+    /// once. The timeout only bounds a broken fixture and is never reached.
     pub fn receive(&self, node: Arc<wacore_binary::OwnedNodeRef>) {
-        self.runtime
-            .block_on(Arc::clone(&self.client).handle_incoming_message(node))
+        self.runtime.block_on(async {
+            Arc::clone(&self.client).handle_incoming_message(node).await;
+            self.client
+                .outbound_flush
+                .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
+                .await;
+        })
     }
 
     /// How many `Event::Messages` batches reached the subscriber so far (one
