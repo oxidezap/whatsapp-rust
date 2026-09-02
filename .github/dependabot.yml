@@ -68,6 +68,12 @@ updates:
     # the pairing the job's own comment asks for.
     ignore:
       - dependency-name: dtolnay/rust-toolchain
+    # This also stops the SHA pin in `signal-durability-nightly.yml` being
+    # refreshed, which is collateral rather than intent: an ignore is per
+    # dependency, not per use. That pin is a reproducibility anchor for a
+    # nightly job rather than a floor that has to track anything, so it going
+    # stale costs less than the MSRV job breaking every week. Bump it by hand
+    # if a fix in the action ever matters there.
 
   # No docker entry: the Dockerfile builds `FROM rust:alpine` and `FROM
   # scratch`, neither of which carries a version for the updater to bump. Add
