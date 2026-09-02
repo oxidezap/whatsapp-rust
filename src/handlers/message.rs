@@ -110,13 +110,15 @@ impl MessageHandler {
             }
         };
         // Still here when a racer published its own lane first, or when the
-        // already-replaced lane was joined above.
+        // already-replaced lane was joined above: the message goes in under
+        // that lane's own enqueue lock, like every other enqueue into it.
         let queued = pending.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(node) = queued
-            && let Err(e) = fresh.try_enqueue(node)
-        {
-            warn!("Failed to enqueue message for processing: {e}");
-            *cancelled = true;
+        if let Some(node) = queued {
+            let _fresh_guard = fresh.enqueue_lock.lock().await;
+            if let Err(e) = fresh.try_enqueue(node) {
+                warn!("Failed to enqueue message for processing: {e}");
+                *cancelled = true;
+            }
         }
 
         true

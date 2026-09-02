@@ -594,14 +594,13 @@ impl Client {
         let receipt_type =
             wacore::stanza::receipt::downgrade_for_feature_incapable(nr, receipt_type);
         // Retries feed the resend pipeline whether or not anything listens.
-        // Every other receipt exists only to become an `Event::Receipt`, which
-        // `dispatch` drops on the floor without a subscriber — so without one,
-        // stop before parsing `<participants>` (one `Jid` pair per member of
-        // a group read) or building the message-id list.
-        if !matches!(
-            receipt_type,
-            ReceiptType::Retry | ReceiptType::EncRekeyRetry
-        ) && !self.core.event_bus.has_handler_for(EventKind::Receipt)
+        // Every other receipt, `enc_rekey_retry` included (its branch below
+        // only logs and dispatches), exists only to become an `Event::Receipt`,
+        // which `dispatch` drops on the floor without a subscriber — so
+        // without one, stop before parsing `<participants>` (one `Jid` pair
+        // per member of a group read) or building the message-id list.
+        if receipt_type != ReceiptType::Retry
+            && !self.core.event_bus.has_handler_for(EventKind::Receipt)
         {
             return;
         }

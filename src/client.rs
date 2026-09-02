@@ -2043,11 +2043,6 @@ fn encode_ack_bytes(
     let mut buf = Vec::with_capacity(64);
     let mut encoder = Encoder::new_vec(&mut buf)?;
     encoder.write_node(&ack)?;
-    // The senders wrap this in `Bytes::from(Vec)`, which reuses the allocation
-    // only when `len == capacity` and otherwise boxes a separate shared
-    // header per frame. An ack is a few dozen bytes against the 64 reserved,
-    // so trim it here: a shrinking realloc is in place, the extra box was not.
-    buf.shrink_to_fit();
     Ok(buf)
 }
 

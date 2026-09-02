@@ -888,7 +888,16 @@ impl TryFrom<&[u8]> for SenderKeyMessage {
     type Error = SignalProtocolError;
 
     fn try_from(value: &[u8]) -> Result<Self> {
-        Self::try_from(bytes_from_slice(value))
+        // Validate before copying, so a malformed payload is rejected without
+        // ever owning it.
+        let (message_version, chain_id, iteration, ciphertext_range) = Self::parse(value)?;
+        Ok(SenderKeyMessage {
+            message_version,
+            chain_id,
+            iteration,
+            serialized: bytes_from_slice(value),
+            ciphertext_range,
+        })
     }
 }
 
