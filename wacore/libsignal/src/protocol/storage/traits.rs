@@ -291,7 +291,13 @@ pub trait SessionStore: ThreadSafe {
 }
 
 /// Result of returning a record from a cancellation-safe checkout.
+///
+/// A transient return value, moved out of as soon as it is matched, so the
+/// record-carrying arm costs nothing beyond the record itself; boxing it
+/// would add an allocation to a path that is done with the value by the next
+/// statement.
 #[doc(hidden)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionCheckoutStoreResult {
     Stored,
     Rejected,

@@ -472,6 +472,10 @@ impl SessionEntry {
     }
 }
 
+/// A transient return value, matched and moved out of by its caller on the
+/// per-message decrypt path; boxing the record arm would put an allocation on
+/// every checkout to save nothing, since the enum is never stored.
+#[allow(clippy::large_enum_variant)]
 enum CachedSessionCheckout {
     Missing(SessionCheckoutKey),
     Absent(SessionCheckoutKey),
