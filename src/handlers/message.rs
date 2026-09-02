@@ -78,7 +78,11 @@ impl MessageHandler {
 
         // A caller that queued behind this lock on the same stale lane finds
         // the replacement already cached and joins it instead of replacing
-        // it again.
+        // it again. Otherwise the fresh lane is published with this message
+        // already queued: an enqueue that finds it in the cache can only land
+        // behind it, so the hand-off keeps the chat's order even for enqueues
+        // that do not share the old lane's lock.
+        let pending = std::sync::Mutex::new(Some(node));
         let fresh = match client.chat_lanes.get(&chat_jid).await {
             Some(current) if !current.queue_tx.same_channel(&lane.queue_tx) => current,
             _ => {
@@ -86,12 +90,31 @@ impl MessageHandler {
                 client
                     .chat_lanes
                     .get_with_by_ref(&chat_jid, async {
-                        create_chat_lane(&client, Arc::clone(&lane.worker_running))
+                        let fresh = create_chat_lane(&client, Arc::clone(&lane.worker_running));
+                        let queued = pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+                        if let Some(node) = queued
+                            && let Err(e) = fresh.try_enqueue(node)
+                        {
+                            // Unreachable for a channel whose worker was just
+                            // spawned; put the node back so the retry below
+                            // reports it.
+                            let e_node = match e {
+                                async_channel::TrySendError::Full(q)
+                                | async_channel::TrySendError::Closed(q) => q.node,
+                            };
+                            *pending.lock().unwrap_or_else(|p| p.into_inner()) = Some(e_node);
+                        }
+                        fresh
                     })
                     .await
             }
         };
-        if let Err(e) = fresh.try_enqueue(node) {
+        // Still here when a racer published its own lane first, or when the
+        // already-replaced lane was joined above.
+        let queued = pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(node) = queued
+            && let Err(e) = fresh.try_enqueue(node)
+        {
             warn!("Failed to enqueue message for processing: {e}");
             *cancelled = true;
         }
