@@ -1,5 +1,8 @@
+use hmac::digest::KeyInit;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
+use sha2::{Sha256, Sha512};
 use std::collections::HashMap;
 use wacore_libsignal::crypto::CryptographicMac;
 use waproto::whatsapp as wa;
@@ -480,25 +483,28 @@ pub fn generate_content_mac(
     // We mirror that exactly so the HMAC input is bytewise identical.
     let mut key_data_length = [0u8; 8];
     key_data_length[7] = ((key_id.len() + 1) & 0xff) as u8;
-    let mut mac =
-        CryptographicMac::new("HmacSha512", key).expect("HmacSha512 is a valid algorithm");
+    // Typed HMACs rather than `CryptographicMac::new("...")`: these two run per
+    // decoded record, and the string-dispatched enum costs a name compare chain
+    // plus a Sha512-sized stack object on every call. Output is byte-identical.
+    let mut mac = Hmac::<Sha512>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(&op_byte);
     mac.update(key_id);
     mac.update(data);
     mac.update(&key_data_length);
-    let mut out = [0u8; 64];
-    mac.finalize_into(&mut out)
-        .expect("64 bytes is enough for HmacSha512");
+    let out = mac.finalize().into_bytes();
     let mut result = [0u8; 32];
     result.copy_from_slice(&out[..32]);
     result
 }
 
-pub fn generate_index_mac(index_json_bytes: &[u8], key: &[u8; 32]) -> Vec<u8> {
-    let mut mac =
-        CryptographicMac::new("HmacSha256", key).expect("HmacSha256 is a valid algorithm");
+fn index_mac_array(index_json_bytes: &[u8], key: &[u8; 32]) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(index_json_bytes);
-    mac.finalize()
+    mac.finalize().into_bytes().into()
+}
+
+pub fn generate_index_mac(index_json_bytes: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    index_mac_array(index_json_bytes, key).to_vec()
 }
 
 pub fn validate_index_mac(
@@ -506,7 +512,8 @@ pub fn validate_index_mac(
     expected_mac: &[u8],
     key: &[u8; 32],
 ) -> Result<(), AppStateError> {
-    if generate_index_mac(index_json_bytes, key).as_slice() != expected_mac {
+    // Compare against the stack array: no heap allocation per validated record.
+    if index_mac_array(index_json_bytes, key) != expected_mac {
         Err(AppStateError::MismatchingIndexMAC)
     } else {
         Ok(())

@@ -1218,8 +1218,9 @@ impl SqliteStore {
     ) -> Result<()> {
         let pool = self.pool.clone();
         let db_semaphore = self.db_semaphore.clone();
-        let address_owned = address.to_string();
-        let key_vec = key.to_vec();
+        // The key is a `Copy` array and the address is refcount-shared, so an
+        // attempt costs no heap allocation beyond the closure itself.
+        let address_owned: Arc<str> = Arc::from(address);
 
         const MAX_RETRIES: u32 = 5;
 
@@ -1232,7 +1233,6 @@ impl SqliteStore {
 
             let pool_clone = pool.clone();
             let address_clone = address_owned.clone();
-            let key_clone = key_vec.clone();
 
             let result =
                 crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
@@ -1241,13 +1241,13 @@ impl SqliteStore {
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
                     diesel::insert_into(identities::table)
                         .values((
-                            identities::address.eq(address_clone),
-                            identities::key.eq(&key_clone[..]),
+                            identities::address.eq(address_clone.as_ref()),
+                            identities::key.eq(&key[..]),
                             identities::device_id.eq(device_id),
                         ))
                         .on_conflict((identities::address, identities::device_id))
                         .do_update()
-                        .set(identities::key.eq(&key_clone[..]))
+                        .set(identities::key.eq(&key[..]))
                         .execute(&mut *conn)
                         .map_err(DieselOrStore::Diesel)?;
                     Ok(())
@@ -1350,8 +1350,11 @@ impl SqliteStore {
     ) -> Result<()> {
         let pool = self.pool.clone();
         let db_semaphore = self.db_semaphore.clone();
-        let address_owned = address.to_string();
-        let session_vec = session.to_vec();
+        // Copied once, then refcount-shared across attempts: this runs after
+        // every Signal encrypt/decrypt, and a session record is several KiB,
+        // so a per-attempt `Vec` clone was a memcpy on the happy path too.
+        let address_owned: Arc<str> = Arc::from(address);
+        let session_bytes = Bytes::copy_from_slice(session);
 
         const MAX_RETRIES: u32 = 5;
 
@@ -1364,7 +1367,7 @@ impl SqliteStore {
 
             let pool_clone = pool.clone();
             let address_clone = address_owned.clone();
-            let session_clone = session_vec.clone();
+            let session_clone = session_bytes.clone();
 
             let result =
                 crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
@@ -1373,13 +1376,13 @@ impl SqliteStore {
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
                     diesel::insert_into(sessions::table)
                         .values((
-                            sessions::address.eq(address_clone),
-                            sessions::record.eq(&session_clone),
+                            sessions::address.eq(address_clone.as_ref()),
+                            sessions::record.eq(session_clone.as_ref()),
                             sessions::device_id.eq(device_id),
                         ))
                         .on_conflict((sessions::address, sessions::device_id))
                         .do_update()
-                        .set(sessions::record.eq(&session_clone))
+                        .set(sessions::record.eq(session_clone.as_ref()))
                         .execute(&mut *conn)
                         .map_err(DieselOrStore::Diesel)?;
                     Ok(())
@@ -2046,7 +2049,8 @@ impl SignalStore for SqliteStore {
         let pool = self.pool.clone();
         let db_semaphore = self.db_semaphore.clone();
         let device_id = self.device_id;
-        let record = record.to_vec();
+        // One copy, then refcount clones per attempt (see put_session_for_device).
+        let record = Bytes::copy_from_slice(record);
 
         const MAX_RETRIES: u32 = 5;
 
@@ -2068,14 +2072,14 @@ impl SignalStore for SqliteStore {
                     diesel::insert_into(prekeys::table)
                         .values((
                             prekeys::id.eq(id as i32),
-                            prekeys::key.eq(&record_clone),
+                            prekeys::key.eq(record_clone.as_ref()),
                             prekeys::uploaded.eq(uploaded),
                             prekeys::device_id.eq(device_id),
                         ))
                         .on_conflict((prekeys::id, prekeys::device_id))
                         .do_update()
                         .set((
-                            prekeys::key.eq(&record_clone),
+                            prekeys::key.eq(record_clone.as_ref()),
                             prekeys::uploaded.eq(uploaded),
                         ))
                         .execute(&mut *conn)
@@ -2315,7 +2319,8 @@ impl SignalStore for SqliteStore {
         let pool = self.pool.clone();
         let db_semaphore = self.db_semaphore.clone();
         let device_id = self.device_id;
-        let record = record.to_vec();
+        // One copy, then refcount clones per attempt (see put_session_for_device).
+        let record = Bytes::copy_from_slice(record);
 
         const MAX_RETRIES: u32 = 5;
 
@@ -2337,12 +2342,12 @@ impl SignalStore for SqliteStore {
                     diesel::insert_into(signed_prekeys::table)
                         .values((
                             signed_prekeys::id.eq(id as i32),
-                            signed_prekeys::record.eq(&record_clone),
+                            signed_prekeys::record.eq(record_clone.as_ref()),
                             signed_prekeys::device_id.eq(device_id),
                         ))
                         .on_conflict((signed_prekeys::id, signed_prekeys::device_id))
                         .do_update()
-                        .set(signed_prekeys::record.eq(&record_clone))
+                        .set(signed_prekeys::record.eq(record_clone.as_ref()))
                         .execute(&mut *conn)
                         .map_err(DieselOrStore::Diesel)?;
                     Ok(())

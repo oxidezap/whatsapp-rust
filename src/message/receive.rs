@@ -331,7 +331,7 @@ impl Client {
             // `had_unknown_enc` means "produced no usable payload": either the
             // type is unrecognized or it's known but the body is empty.
             // Either way the stanza needs the fallback ack or the server replays.
-            if EncType::from_wire(enc_type.as_ref()).is_none() {
+            let Some(parsed_enc_type) = EncType::from_wire(enc_type.as_ref()) else {
                 log::warn!("Enc node has unknown type: {enc_type}");
                 self.report_raw_enc_decrypt_failure(
                     &info,
@@ -341,22 +341,23 @@ impl Client {
                 );
                 had_unknown_enc = true;
                 continue;
-            }
-
-            let payload = match EncPayload::from_owned_node(node, enc_node, enc_index) {
-                Some(p) => p,
-                None => {
-                    log::warn!("Enc node {enc_type} has no content");
-                    self.report_raw_enc_decrypt_failure(
-                        &info,
-                        enc_index,
-                        Some(enc_type.as_ref()),
-                        EncDecryptFailureReason::MalformedNode,
-                    );
-                    had_unknown_enc = true;
-                    continue;
-                }
             };
+
+            let payload =
+                match EncPayload::from_owned_node(node, enc_node, enc_index, parsed_enc_type) {
+                    Some(p) => p,
+                    None => {
+                        log::warn!("Enc node {enc_type} has no content");
+                        self.report_raw_enc_decrypt_failure(
+                            &info,
+                            enc_index,
+                            Some(enc_type.as_ref()),
+                            EncDecryptFailureReason::MalformedNode,
+                        );
+                        had_unknown_enc = true;
+                        continue;
+                    }
+                };
 
             let bucket = if payload.enc_type.is_bot_secret() {
                 &mut bot_payloads

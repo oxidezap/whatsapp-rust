@@ -94,10 +94,12 @@ impl EncPayload {
         ciphertext: bytes::Bytes,
         enc_node: &NodeRef<'_>,
         enc_index: usize,
+        enc_type: EncType,
     ) -> Option<Self> {
-        let enc_type = EncType::from_wire(enc_node.attrs().optional_string("type")?.as_ref())?;
-        let padding_version = enc_node.attrs().optional_u64("v").unwrap_or(2) as u8;
+        // One attribute pass: the caller already classified `type`, so only the
+        // remaining attributes are read here, through a single parser.
         let mut attrs = enc_node.attrs();
+        let padding_version = attrs.optional_u64("v").unwrap_or(2) as u8;
         Some(Self {
             ciphertext,
             enc_type,
@@ -111,25 +113,32 @@ impl EncPayload {
     }
 
     /// Zero-copy extraction from an OwnedNodeRef.
+    ///
+    /// `enc_type` is the node's already-parsed `type` attribute; the receive
+    /// loop validates it before calling, so it is not re-read here.
     pub(crate) fn from_owned_node(
         owner: &OwnedNodeRef,
         enc_node: &NodeRef<'_>,
         enc_index: usize,
+        enc_type: EncType,
     ) -> Option<Self> {
         Self::from_parts(
             owner.slice_bytes(enc_node.content_bytes()?),
             enc_node,
             enc_index,
+            enc_type,
         )
     }
 
     /// Copying extraction from a NodeRef (used in tests where there's no OwnedNodeRef).
     #[cfg(test)]
     pub(crate) fn from_node_ref(node: &NodeRef<'_>, enc_index: usize) -> Option<Self> {
+        let enc_type = EncType::from_wire(node.attrs().optional_string("type")?.as_ref())?;
         Self::from_parts(
             bytes::Bytes::copy_from_slice(node.content_bytes()?),
             node,
             enc_index,
+            enc_type,
         )
     }
 }

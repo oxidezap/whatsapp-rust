@@ -96,7 +96,14 @@ where
         }
     }
 
-    fn remove_key(&mut self, key: &K) -> Option<CacheEntry<V>> {
+    /// Borrowed removal: the `order` side is keyed by the entry's own `seq`,
+    /// so nothing here ever needs an owned `K`, and callers with a `&str` or
+    /// `&Jid` need not clone the key just to delete it.
+    fn remove_key<Q>(&mut self, key: &Q) -> Option<CacheEntry<V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let entry = self.map.remove(key)?;
         self.order.remove(&entry.seq);
         Some(entry)
@@ -385,14 +392,6 @@ where
         false
     }
 
-    fn find_key<Q>(inner: &CacheInner<K, V>, key: &Q) -> Option<K>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        inner.map.get_key_value(key).map(|(k, _)| k.clone())
-    }
-
     /// Whether `entry`'s access stamp has aged past [`TTI_RENEWAL_DIVISOR`]'s
     /// tolerance and is worth pushing forward under the write lock. A cache
     /// without TTI never renews.
@@ -420,14 +419,13 @@ where
                 // place. Removing without it could drop a replacement written
                 // while the guard was down and judge it by a stale `now`.
                 let observed = (entry.seq, entry.inserted_at);
-                let owned_key = Self::find_key(&guard, key)?;
                 drop(guard);
                 let mut wguard = self.inner.write().await;
                 if let Some(e) = wguard.map.get(key)
                     && (e.seq, e.inserted_at) == observed
                     && self.is_expired(e, now)
                 {
-                    wguard.remove_key(&owned_key);
+                    wguard.remove_key(key);
                 }
                 return None;
             }
@@ -495,9 +493,8 @@ where
             .map
             .get(key)
             .is_some_and(|entry| self.is_expired(entry, now))
-            && let Some(owned_key) = Self::find_key(&guard, key)
         {
-            guard.remove_key(&owned_key);
+            guard.remove_key(key);
         }
 
         let (next, result) = update(guard.map.get(key).map(|entry| &entry.value));
@@ -550,8 +547,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.inner.write().await;
-        let owned_key = Self::find_key(&guard, key)?;
-        let entry = guard.remove_key(&owned_key)?;
+        let entry = guard.remove_key(key)?;
         // Nothing to date until an entry is actually in hand.
         let now = self.entry_time();
         if self.is_expired(&entry, now) {
@@ -567,9 +563,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.inner.write().await;
-        if let Some(owned_key) = Self::find_key(&guard, key) {
-            guard.remove_key(&owned_key);
-        }
+        guard.remove_key(key);
     }
 
     /// Reliably remove all entries, awaiting the write lock. Prefer this in

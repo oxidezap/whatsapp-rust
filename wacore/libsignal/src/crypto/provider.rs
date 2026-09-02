@@ -329,8 +329,11 @@ impl SignalCryptoProvider for RustCryptoProvider {
         let encrypted_size = plaintext.len() + padding;
         let start = out.len();
 
+        // Append the plaintext first and zero only the padding tail: a
+        // `resize` over the whole length memsets bytes the next line overwrites.
+        out.reserve(encrypted_size);
+        out.extend_from_slice(plaintext);
         out.resize(start + encrypted_size, 0);
-        out[start..start + plaintext.len()].copy_from_slice(plaintext);
 
         let encryptor = cbc::Encryptor::<Aes256>::new(key.into(), iv.into());
         let written = encryptor
@@ -410,16 +413,18 @@ impl SignalCryptoProvider for RustCryptoProvider {
         }
         let (ct, tag) = ciphertext_with_tag.split_at(ciphertext_with_tag.len() - TAG);
 
-        // Decrypt into a scratch, verify tag; only commit to `out` on success
-        // so failures leave it untouched.
-        let mut scratch = ct.to_vec();
+        // Decrypt in place on `out`'s own tail, then verify the tag. A failure
+        // truncates back to the original length, so callers still observe
+        // `out` untouched, without a scratch allocation and a second copy.
+        let start = out.len();
         let mut dec =
             Aes256GcmDecryption::new(key, nonce, aad).map_err(|_| CryptoProviderError::BadInput)?;
-        dec.decrypt(&mut scratch);
-        dec.verify_tag(tag)
-            .map_err(|_| CryptoProviderError::AuthFailed)?;
-
-        out.extend_from_slice(&scratch);
+        out.extend_from_slice(ct);
+        dec.decrypt(&mut out[start..]);
+        if dec.verify_tag(tag).is_err() {
+            out.truncate(start);
+            return Err(CryptoProviderError::AuthFailed);
+        }
         Ok(())
     }
 

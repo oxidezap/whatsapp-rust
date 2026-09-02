@@ -524,7 +524,7 @@ impl Client {
         // evicted retry still triggers it.
         let sender_device_id = info.requester.device();
         let device_known = self
-            .has_device(&info.requester.user, sender_device_id)
+            .has_device_for_jid(&info.requester, sender_device_id)
             .await;
         if !device_known {
             // Parity with WA Web's MdRetryFromUnknownDevice WAM (id 2178), which

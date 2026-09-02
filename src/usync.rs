@@ -288,7 +288,7 @@ impl Client {
             // Preserve key_index values from existing records (set via account_sync)
             // Use alias-aware lookup (resolves LID ↔ PN) to find
             // existing record regardless of which key it was stored under
-            let mut existing_record = self.load_device_record(&user_list.user.user).await;
+            let mut existing_record = self.load_device_record_for_jid(&user_list.user).await;
 
             // Decode key-index-list if present (WA Web: handleKeyIndexResult)
             let decoded_key_index = user_list
@@ -450,7 +450,7 @@ impl Client {
         for own in device_snapshot.pn.iter().chain(device_snapshot.lid.iter()) {
             let bare = own.to_non_ad();
             // Carry the cached device_hash so an unchanged list is skipped server-side.
-            if let Some(record) = self.load_device_record(&bare.user).await
+            if let Some(record) = self.load_device_record_for_jid(&bare).await
                 && let Some(phash) = record.phash
             {
                 hashes.insert(bare.clone(), (String::from(phash), record.timestamp));

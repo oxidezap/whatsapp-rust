@@ -118,7 +118,12 @@ impl NoiseState {
     /// Per Noise spec § 5.2: when `protocol_name` is ≤ HASHLEN bytes, append
     /// zero bytes to make HASHLEN; otherwise hash with SHA256.
     pub fn new(pattern: impl AsRef<[u8]>, prologue: &[u8]) -> Result<Self> {
-        let pattern = pattern.as_ref();
+        Self::new_inner(pattern.as_ref(), prologue)
+    }
+
+    // The generic shell above is instantiated once per argument type at the
+    // call sites; the body lives here so it is compiled once.
+    fn new_inner(pattern: &[u8], prologue: &[u8]) -> Result<Self> {
         let h: [u8; 32] = if pattern.len() <= 32 {
             let mut h = [0u8; 32];
             h[..pattern.len()].copy_from_slice(pattern);

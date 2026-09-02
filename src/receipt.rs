@@ -1,5 +1,5 @@
 use crate::client::Client;
-use crate::types::events::{Event, Receipt};
+use crate::types::events::{Event, EventKind, Receipt};
 use crate::types::message::MessageInfo;
 use crate::types::presence::ReceiptType;
 use log::debug;
@@ -628,6 +628,12 @@ impl Client {
                 from.observe(),
                 users.len()
             );
+            // Pure event production from here on: `dispatch` would drop every
+            // one of these on the floor without a subscriber, so skip building
+            // N receipts (each with a `Jid` clone and a `Vec<String>`) up front.
+            if !self.core.event_bus.has_handler_for(EventKind::Receipt) {
+                return;
+            }
             for user in users {
                 // Missing `<user t>` means the server didn't disambiguate the
                 // per-user time; fall back to the stanza-level `t`.

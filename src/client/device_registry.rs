@@ -665,11 +665,27 @@ impl Client {
 
     /// WA Web: `isFromKnownDevice(author)` — local check only, no network.
     pub(crate) async fn is_from_known_device(&self, sender: &Jid) -> bool {
-        self.has_device(&sender.user, sender.device).await
+        self.has_device_for_jid(sender, sender.device).await
+    }
+
+    /// `has_device` for a caller holding the full `Jid`: the namespace picks
+    /// the single `lid_pn_cache` probe (see `resolve_lookup_keys_for_jid`).
+    /// Runs on every successful group decrypt and every retry receipt.
+    pub(crate) async fn has_device_for_jid(&self, jid: &Jid, device_id: u16) -> bool {
+        if device_id == 0 {
+            return true;
+        }
+        let lookup = self.resolve_lookup_keys_for_jid(jid).await;
+        self.has_device_in(&lookup, device_id).await
     }
 
     /// Check if a device exists for a user.
     /// Returns true for device_id 0 (primary device always exists).
+    ///
+    /// Every production caller holds a `Jid` and goes through
+    /// `has_device_for_jid`; this bare-user form remains for the tests that
+    /// probe a user under both of its namespaces.
+    #[cfg(test)]
     pub(crate) async fn has_device(&self, user: &str, device_id: u16) -> bool {
         if device_id == 0 {
             return true;
@@ -677,7 +693,10 @@ impl Client {
 
         // Borrowed keys avoid allocating the owned lookup variants on this hot path.
         let lookup = self.resolve_lookup_keys(user).await;
+        self.has_device_in(&lookup, device_id).await
+    }
 
+    async fn has_device_in(&self, lookup: &UserLookupKeys, device_id: u16) -> bool {
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
                 return record.devices.iter().any(|d| d.device_id() == device_id);
@@ -1255,7 +1274,24 @@ impl Client {
         user: &str,
     ) -> Option<wacore::store::traits::DeviceListRecord> {
         let lookup = self.resolve_lookup_keys(user).await;
+        self.load_device_record_in(&lookup).await
+    }
 
+    /// `load_device_record` for a caller holding the full `Jid`, so the known
+    /// namespace costs one `lid_pn_cache` probe instead of two per user of a
+    /// device-list response.
+    pub(crate) async fn load_device_record_for_jid(
+        &self,
+        jid: &Jid,
+    ) -> Option<wacore::store::traits::DeviceListRecord> {
+        let lookup = self.resolve_lookup_keys_for_jid(jid).await;
+        self.load_device_record_in(&lookup).await
+    }
+
+    async fn load_device_record_in(
+        &self,
+        lookup: &UserLookupKeys,
+    ) -> Option<wacore::store::traits::DeviceListRecord> {
         for key in lookup.all_keys() {
             if let Some(record) = self.device_registry_cache.get(key).await {
                 // Cold load-modify-persist path: callers mutate the owned record.

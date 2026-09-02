@@ -409,9 +409,21 @@ where
     }
 
     // Decode all mutations and collect MACs in a single pass
+    // SET and REMOVE are disjoint, and a patch is almost always all one or the
+    // other, so sizing both lists to the full count wasted one allocation.
+    let sets = patch
+        .mutations
+        .iter()
+        .filter(|m| {
+            matches!(
+                known_op(m.operation),
+                Ok(wa::syncd_mutation::SyncdOperation::SET)
+            )
+        })
+        .count();
     let mut mutations = Vec::with_capacity(patch.mutations.len());
-    let mut added_macs = Vec::with_capacity(patch.mutations.len());
-    let mut removed_index_macs = Vec::with_capacity(patch.mutations.len());
+    let mut added_macs = Vec::with_capacity(sets);
+    let mut removed_index_macs = Vec::with_capacity(patch.mutations.len() - sets);
 
     for m in &patch.mutations {
         if m.record.is_set() {
