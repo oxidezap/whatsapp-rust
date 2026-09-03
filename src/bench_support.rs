@@ -1208,19 +1208,24 @@ pub struct GroupScaleHarness {
 /// A fictitious member number: the reserved 555-01XX block, widened by a
 /// synthetic area-code index so the sweep can mint tens of thousands of
 /// distinct numbers. Never overlaps `member_user`'s range (its area codes
-/// start at 200 + index / 100, which the `NPAS` table never reaches). The
-/// area code must stay three digits, so the namespace ends at 70,000
+/// start at 200 + index / 100, which the `NPAS` table never reaches), and
+/// steps over 555 itself, which is an exchange and not an area code. The
+/// area code must stay three digits, so the namespace ends at 69,900
 /// members: a sweep past it would wrap onto index 0's number and merge two
 /// members' devices, which is a wrong fixture rather than a slower one.
 fn scale_member_pn(index: usize) -> String {
-    assert!(index < 70_000, "scale member PN namespace exhausted");
-    format!("1{:03}555{:04}", 200 + index / 100, 100 + index % 100)
+    assert!(index < 69_900, "scale member PN namespace exhausted");
+    let npa = 200 + index / 100;
+    let npa = if npa >= 555 { npa + 1 } else { npa };
+    format!("1{npa:03}555{:04}", 100 + index % 100)
 }
 
 /// A member LID in a block of its own, so no index can land on the own
-/// account's `100000000000001`.
+/// account's `100000000000001`. Five digits of index keep the LID at the
+/// fifteen the real ones have.
 fn scale_member_lid(index: usize) -> String {
-    format!("1000000001{:05}", index)
+    assert!(index < 100_000, "scale member LID namespace exhausted");
+    format!("1000000001{index:05}")
 }
 
 impl GroupScaleHarness {
