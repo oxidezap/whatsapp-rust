@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use buffa::MessageField;
 
-use hmac::{HmacReset, KeyInit, Mac};
+use hmac::{Hmac, HmacReset, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::protocol::counter_lease::CounterLease;
@@ -40,10 +40,23 @@ pub struct SenderMessageKey {
     seed: [u8; 32],
 }
 
+/// Group message keys run HKDF with no salt, so the extract step is HMAC
+/// keyed by a constant zero block. Same trick as `MESSAGE_KEY_EXTRACT_HMAC`
+/// on the pairwise ratchet: cloning the keyed state skips the ipad/opad key
+/// schedule (two SHA-256 compressions) on every group encrypt, every group
+/// decrypt, and every skipped key a forward jump buffers.
+static GROUP_KEY_EXTRACT_HMAC: std::sync::LazyLock<Hmac<Sha256>> = std::sync::LazyLock::new(|| {
+    Hmac::<Sha256>::new_from_slice(&[0u8; 32]).expect("32-byte HMAC key")
+});
+
 impl SenderMessageKey {
     pub fn new(iteration: u32, seed: [u8; 32]) -> Self {
+        let mut extract = GROUP_KEY_EXTRACT_HMAC.clone();
+        extract.update(&seed);
+        let prk = extract.finalize().into_bytes();
         let mut derived = [0u8; 48];
-        hkdf::Hkdf::<Sha256>::new(None, &seed)
+        hkdf::Hkdf::<Sha256>::from_prk(&prk)
+            .expect("PRK is hash-sized")
             .expand(b"WhisperGroup", &mut derived)
             .expect("valid output length");
         Self {
@@ -1009,6 +1022,26 @@ fn state_structure_pointed_bytes(state: &SenderKeyStateStructure) -> usize {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    /// The cached zero-key extract must stay byte-identical to
+    /// `Hkdf::new(None, seed)`, or every group message key would desync
+    /// from the peer.
+    #[test]
+    fn sender_message_key_matches_plain_hkdf() {
+        for i in 0..16u8 {
+            let seed = [i.wrapping_mul(31).wrapping_add(7); 32];
+            let key = super::SenderMessageKey::new(u32::from(i), seed);
+
+            let mut derived = [0u8; 48];
+            hkdf::Hkdf::<sha2::Sha256>::new(None, &seed)
+                .expand(b"WhisperGroup", &mut derived)
+                .expect("valid output length");
+
+            assert_eq!(key.iv(), &derived[0..16]);
+            assert_eq!(key.cipher_key(), &derived[16..48]);
+            assert_eq!(key.iteration(), u32::from(i));
+        }
+    }
+
     use super::*;
     // The protobuf encode helpers are only needed to build fixtures here; the
     // module itself no longer encodes anything.
