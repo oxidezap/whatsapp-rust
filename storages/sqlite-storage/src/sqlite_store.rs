@@ -3647,36 +3647,36 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn delete_expired_tc_tokens(&self, token_cutoff: i64, sender_cutoff: i64) -> Result<u32> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
-        crate::pool::spawn_blocking(move || -> Result<u32> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            // Remove a row only when its received token is expired-or-absent AND
-            // its sender bucket is expired-or-absent, so recent sender state
-            // survives an expired received token (and vice versa). A null
-            // sender_timestamp counts as stale.
-            let deleted = diesel::delete(
-                tc_tokens::table
-                    .filter(
-                        tc_tokens::token
-                            .eq(Vec::<u8>::new())
-                            .or(tc_tokens::token_timestamp.lt(token_cutoff)),
-                    )
-                    .filter(
-                        tc_tokens::sender_timestamp
-                            .is_null()
-                            .or(tc_tokens::sender_timestamp.lt(sender_cutoff)),
-                    )
-                    .filter(tc_tokens::device_id.eq(device_id)),
-            )
-            .execute(&mut *conn)
-            .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(deleted as u32)
+        // Through the write queue, like every other retention sweep: a bare
+        // `pool.get()` here would park a blocking thread on r2d2's 30 s
+        // connection timeout behind whatever holds the single connection, and
+        // then fail the sweep outright instead of waiting its turn.
+        self.with_retry("delete_expired_tc_tokens", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                // Remove a row only when its received token is expired-or-absent AND
+                // its sender bucket is expired-or-absent, so recent sender state
+                // survives an expired received token (and vice versa). A null
+                // sender_timestamp counts as stale.
+                let deleted = diesel::delete(
+                    tc_tokens::table
+                        .filter(
+                            tc_tokens::token
+                                .eq(Vec::<u8>::new())
+                                .or(tc_tokens::token_timestamp.lt(token_cutoff)),
+                        )
+                        .filter(
+                            tc_tokens::sender_timestamp
+                                .is_null()
+                                .or(tc_tokens::sender_timestamp.lt(sender_cutoff)),
+                        )
+                        .filter(tc_tokens::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(deleted as u32)
+            })
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn store_received_tc_token(
@@ -3851,23 +3851,19 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn delete_expired_sent_messages(&self, cutoff_timestamp: i64) -> Result<u32> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
-        crate::pool::spawn_blocking(move || -> Result<u32> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let deleted = diesel::delete(
-                sent_messages::table
-                    .filter(sent_messages::created_at.lt(cutoff_timestamp))
-                    .filter(sent_messages::device_id.eq(device_id)),
-            )
-            .execute(&mut *conn)
-            .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(deleted as u32)
+        self.with_retry("delete_expired_sent_messages", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                let deleted = diesel::delete(
+                    sent_messages::table
+                        .filter(sent_messages::created_at.lt(cutoff_timestamp))
+                        .filter(sent_messages::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(deleted as u32)
+            })
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn store_pending_inbound(
@@ -3947,23 +3943,19 @@ impl ProtocolStore for SqliteStore {
     }
 
     async fn delete_expired_pending_inbound(&self, cutoff_timestamp: i64) -> Result<u32> {
-        let pool = self.pool.clone();
         let device_id = self.device_id;
-        crate::pool::spawn_blocking(move || -> Result<u32> {
-            let mut conn = pool
-                .get()
-                .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let deleted = diesel::delete(
-                pending_inbound_messages::table
-                    .filter(pending_inbound_messages::inserted_at.lt(cutoff_timestamp))
-                    .filter(pending_inbound_messages::device_id.eq(device_id)),
-            )
-            .execute(&mut *conn)
-            .map_err(|e| StoreError::Database(Box::new(e)))?;
-            Ok(deleted as u32)
+        self.with_retry("delete_expired_pending_inbound", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                let deleted = diesel::delete(
+                    pending_inbound_messages::table
+                        .filter(pending_inbound_messages::inserted_at.lt(cutoff_timestamp))
+                        .filter(pending_inbound_messages::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(deleted as u32)
+            })
         })
         .await
-        .map_err(|e| StoreError::Database(Box::new(e)))?
     }
 
     async fn store_pending_inbound_batch(&self, rows: &[PendingInboundRow<'_>]) -> Result<()> {
@@ -7569,5 +7561,196 @@ mod share_for_device_tests {
             "no sibling may starve on the shared write queue: \
              fastest {fastest:?}, slowest {slowest:?}"
         );
+    }
+}
+
+/// The keepalive retention sweeps: what they delete, and that a busy write
+/// permit makes them wait their turn rather than fail.
+#[cfg(test)]
+mod retention_sweep_tests {
+    use super::read_routing_tests::TempDb;
+    use super::*;
+
+    /// Backdate one row's age column so a sweep with a "now" cutoff sees it as
+    /// expired. Both columns default to `strftime('%s','now')` on insert, so
+    /// there is no other way to write an old row.
+    async fn backdate(store: &SqliteStore, sql: &'static str) {
+        let pool = store.pool.clone();
+        crate::pool::spawn_blocking(move || {
+            let mut conn = pool.get().expect("connection");
+            diesel::sql_query(sql)
+                .execute(&mut *conn)
+                .expect("backdate");
+        })
+        .await
+        .expect("blocking join");
+    }
+
+    #[tokio::test]
+    async fn each_sweep_deletes_only_its_expired_rows() {
+        let db = TempDb::new("retention_sweeps");
+        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let now = wacore::time::now_secs();
+
+        store
+            .store_sent_message("1@s.whatsapp.net", "OLD", b"payload")
+            .await
+            .expect("store old sent");
+        store
+            .store_sent_message("1@s.whatsapp.net", "NEW", b"payload")
+            .await
+            .expect("store new sent");
+        backdate(
+            &store,
+            "UPDATE sent_messages SET created_at = created_at - 86400 WHERE message_id = 'OLD'",
+        )
+        .await;
+
+        store
+            .store_pending_inbound("1@s.whatsapp.net", "2@s.whatsapp.net", "OLD", b"msg")
+            .await
+            .expect("store old pending");
+        store
+            .store_pending_inbound("1@s.whatsapp.net", "2@s.whatsapp.net", "NEW", b"msg")
+            .await
+            .expect("store new pending");
+        backdate(
+            &store,
+            "UPDATE pending_inbound_messages SET inserted_at = inserted_at - 86400 WHERE id = 'OLD'",
+        )
+        .await;
+
+        // tc_tokens carry their own explicit timestamps, so no backdating.
+        store
+            .put_tc_token(
+                "old@lid",
+                &TcTokenEntry {
+                    token: vec![1],
+                    token_timestamp: now - 86_400,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .expect("store old token");
+        store
+            .put_tc_token(
+                "new@lid",
+                &TcTokenEntry {
+                    token: vec![2],
+                    token_timestamp: now,
+                    sender_timestamp: None,
+                },
+            )
+            .await
+            .expect("store new token");
+
+        let cutoff = now - 3600;
+        assert_eq!(
+            store
+                .delete_expired_sent_messages(cutoff)
+                .await
+                .expect("sweep sent"),
+            1
+        );
+        assert_eq!(
+            store
+                .delete_expired_pending_inbound(cutoff)
+                .await
+                .expect("sweep pending"),
+            1
+        );
+        assert_eq!(
+            store
+                .delete_expired_tc_tokens(cutoff, cutoff)
+                .await
+                .expect("sweep tokens"),
+            1
+        );
+
+        assert!(
+            store
+                .take_sent_message("1@s.whatsapp.net", "OLD")
+                .await
+                .expect("read sent")
+                .is_none(),
+            "the expired sent message is gone"
+        );
+        assert!(
+            store
+                .take_sent_message("1@s.whatsapp.net", "NEW")
+                .await
+                .expect("read sent")
+                .is_some(),
+            "the fresh sent message survives"
+        );
+        assert!(
+            store
+                .get_pending_inbound("1@s.whatsapp.net", "2@s.whatsapp.net", "OLD")
+                .await
+                .expect("read pending")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_pending_inbound("1@s.whatsapp.net", "2@s.whatsapp.net", "NEW")
+                .await
+                .expect("read pending")
+                .is_some()
+        );
+        assert!(store.get_tc_token("old@lid").await.expect("read").is_none());
+        assert!(store.get_tc_token("new@lid").await.expect("read").is_some());
+    }
+
+    /// The regression this routing exists for: with a bare `pool.get()` a sweep
+    /// issued while the single connection is checked out blocks a blocking
+    /// thread on r2d2's connection timeout and then errors. Through the write
+    /// permit it simply queues, so it completes.
+    #[tokio::test]
+    async fn a_sweep_completes_while_another_writer_holds_the_pool() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use wacore::appstate::processor::AppStateMutationMAC;
+
+        let db = TempDb::new("retention_under_write");
+        let store = Arc::new(SqliteStore::new(&db.url()).await.expect("store opens"));
+        store
+            .store_sent_message("1@s.whatsapp.net", "OLD", b"payload")
+            .await
+            .expect("store sent");
+
+        // Same shape as `benches/store_contention.rs`: back-to-back MAC upserts
+        // that keep the write permit busy for the whole sweep.
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let mut seed = 0u8;
+                while !stop.load(Ordering::Relaxed) {
+                    seed = seed.wrapping_add(1);
+                    let macs: Vec<AppStateMutationMAC> = (0..500)
+                        .map(|i: u64| {
+                            let mut index = [0u8; 32];
+                            index[..8].copy_from_slice(&i.to_be_bytes());
+                            index[8] = seed;
+                            AppStateMutationMAC {
+                                index_mac: index.to_vec(),
+                                value_mac: vec![0xC5; 32],
+                            }
+                        })
+                        .collect();
+                    let _ = store.put_mutation_macs("regular", 1, &macs).await;
+                }
+            })
+        };
+
+        let deleted = store
+            .delete_expired_sent_messages(wacore::time::now_secs() + 1)
+            .await
+            .expect("the sweep queues behind the writer instead of failing");
+        assert_eq!(deleted, 1);
+
+        stop.store(true, Ordering::Relaxed);
+        writer.await.expect("writer task");
     }
 }

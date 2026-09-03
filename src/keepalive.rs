@@ -249,60 +249,56 @@ impl Client {
     /// they enable/disable independently. `0` disables a sweep. TTLs are
     /// converted with a checked cast (absurd values clamp instead of wrapping
     /// the cutoff negative).
+    ///
+    /// One task running them in sequence, not three racing ones: every sweep
+    /// goes through the store's single write permit anyway, so racing them only
+    /// buys three blocking threads queueing for the same slot ahead of live
+    /// traffic. Failures are logged at `warn!` because a sweep that fails every
+    /// time is how a bounded table quietly stops being bounded.
     fn spawn_retention_cleanup(&self, sent_msg_ttl: u64) {
         let now = wacore::time::now_secs();
         let cutoff_for = |ttl: u64| now.saturating_sub(i64::try_from(ttl).unwrap_or(i64::MAX));
 
-        if sent_msg_ttl > 0 {
-            let backend = self.persistence_manager.backend();
-            let cutoff = cutoff_for(sent_msg_ttl);
-            self.runtime
-                .spawn(Box::pin(async move {
-                    if let Err(e) = backend.delete_expired_sent_messages(cutoff).await {
-                        log::debug!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
-                    }
-                }))
-                .detach();
-        }
-
+        let backend = self.persistence_manager.backend();
+        let sent_cutoff = (sent_msg_ttl > 0).then(|| cutoff_for(sent_msg_ttl));
         // Pending inbound buffer retention (inbound durability hook): a row a
         // permanently-failing hook never commits would otherwise linger once the
         // server stops redelivering it. Run unconditionally (not gated on the hook
         // being set now) so rows buffered by a hook in a previous run are still
         // swept after it is disabled. Backends without the buffer return 0 from
         // the default impl, so this is a cheap no-op there.
-        {
-            const PENDING_INBOUND_TTL_SECS: u64 = 7 * 24 * 60 * 60;
-            let backend = self.persistence_manager.backend();
-            let cutoff = cutoff_for(PENDING_INBOUND_TTL_SECS);
-            self.runtime
-                .spawn(Box::pin(async move {
-                    if let Err(e) = backend.delete_expired_pending_inbound(cutoff).await {
-                        log::debug!(target: "Client/Keepalive", "Pending inbound cleanup error: {e}");
-                    }
-                }))
-                .detach();
-        }
+        const PENDING_INBOUND_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+        let pending_cutoff = cutoff_for(PENDING_INBOUND_TTL_SECS);
+        let prune_msg_secrets = self.cache_config.msg_secret_policy.prunes();
 
-        // msg_secrets retention: prune rows whose per-row deadline has passed.
-        // expires_at is absolute, so the cutoff is simply "now"; per-kind
-        // horizons and never-expire (0) rows are baked in at write time.
-        if self.cache_config.msg_secret_policy.prunes() {
-            let backend = self.persistence_manager.backend();
-            self.runtime
-                .spawn(Box::pin(async move {
+        self.runtime
+            .spawn(Box::pin(async move {
+                if let Some(cutoff) = sent_cutoff
+                    && let Err(e) = backend.delete_expired_sent_messages(cutoff).await
+                {
+                    warn!(target: "Client/Keepalive", "Sent message cleanup error: {e}");
+                }
+
+                if let Err(e) = backend.delete_expired_pending_inbound(pending_cutoff).await {
+                    warn!(target: "Client/Keepalive", "Pending inbound cleanup error: {e}");
+                }
+
+                // msg_secrets retention: prune rows whose per-row deadline has passed.
+                // expires_at is absolute, so the cutoff is simply "now"; per-kind
+                // horizons and never-expire (0) rows are baked in at write time.
+                if prune_msg_secrets {
                     match backend.delete_expired_msg_secrets(now).await {
                         Ok(n) if n > 0 => {
-                            log::debug!(target: "Client/Keepalive", "Pruned {n} expired msg_secrets");
+                            debug!(target: "Client/Keepalive", "Pruned {n} expired msg_secrets");
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            log::debug!(target: "Client/Keepalive", "msg_secrets cleanup error: {e}");
+                            warn!(target: "Client/Keepalive", "msg_secrets cleanup error: {e}");
                         }
                     }
-                }))
-                .detach();
-        }
+                }
+            }))
+            .detach();
     }
 }
 
