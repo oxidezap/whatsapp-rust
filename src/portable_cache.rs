@@ -95,6 +95,77 @@ pub struct PortableCache<K, V> {
     tti_renewals: Arc<portable_atomic::AtomicU64>,
 }
 
+/// What the eviction walk asks the slot table, through one `dyn` hook so the
+/// walk itself is compiled once. The walk is the bulk of the eviction code
+/// and every `K`/`V` pair would otherwise carry its own copy; the table
+/// probes it wraps are small.
+enum ClockOp {
+    /// Is the entry held, hit since the last pass, or a victim?
+    Classify { seq: u64, hash: u64 },
+    /// Re-key the entry to `fresh`. Answers `Victim` when found, `Skip` when
+    /// the slot is gone.
+    Reseq { seq: u64, hash: u64, fresh: u64 },
+}
+
+enum ClockVerdict {
+    Skip,
+    SecondChance,
+    Victim,
+}
+
+enum ClockWalk {
+    Victim {
+        seq: u64,
+        hash: u64,
+    },
+    /// No victim, but at least one entry spent its second chance; the next
+    /// pass over the same entries finds them unreferenced.
+    Requeued,
+    /// Nothing evictable at all.
+    Blocked,
+}
+
+/// One pass of the second-chance walk over `order`, oldest first: the first
+/// unreferenced, unheld entry is the victim; entries hit since the last pass
+/// have their bit cleared (by `probe`) and re-queue behind everything
+/// inserted so far, so each can earn at most one more pass per hit and the
+/// scan cannot cycle.
+fn clock_walk(
+    order: &mut BTreeMap<u64, u64>,
+    next_seq: &mut u64,
+    probe: &mut dyn FnMut(ClockOp) -> ClockVerdict,
+) -> ClockWalk {
+    let mut victim = None;
+    let mut second_chance = Vec::new();
+    for (&seq, &hash) in order.iter() {
+        match probe(ClockOp::Classify { seq, hash }) {
+            ClockVerdict::Skip => continue,
+            ClockVerdict::SecondChance => second_chance.push((seq, hash)),
+            ClockVerdict::Victim => {
+                victim = Some((seq, hash));
+                break;
+            }
+        }
+    }
+    let requeued = !second_chance.is_empty();
+    for (seq, hash) in second_chance {
+        let fresh = *next_seq;
+        *next_seq += 1;
+        order.remove(&seq);
+        if matches!(
+            probe(ClockOp::Reseq { seq, hash, fresh }),
+            ClockVerdict::Victim
+        ) {
+            order.insert(fresh, hash);
+        }
+    }
+    match victim {
+        Some((seq, hash)) => ClockWalk::Victim { seq, hash },
+        None if requeued => ClockWalk::Requeued,
+        None => ClockWalk::Blocked,
+    }
+}
+
 struct CacheInner<K, V> {
     /// Hashes keys once at insert; lookups with a borrowed `Q` hash through
     /// the same state, which the `Borrow` contract keeps consistent with `K`.
@@ -228,41 +299,40 @@ where
     /// [`PortableCacheBuilder::evict_guard`]).
     fn evict_to_capacity(&mut self, cap: u64, evict_guard: Option<fn(&V) -> bool>) {
         while self.table.len() as u64 >= cap {
-            let mut victim = None;
-            let mut second_chance = Vec::new();
-            for (&seq, &hash) in self.order.iter() {
-                let Some(slot) = self.table.find(hash, |slot| slot.entry.seq == seq) else {
-                    continue;
-                };
-                if evict_guard.is_some_and(|is_evictable| !is_evictable(&slot.entry.value)) {
-                    continue;
+            let table = &mut self.table;
+            let walk = clock_walk(&mut self.order, &mut self.next_seq, &mut |op| match op {
+                ClockOp::Classify { seq, hash } => {
+                    match table.find(hash, |slot| slot.entry.seq == seq) {
+                        None => ClockVerdict::Skip,
+                        Some(slot)
+                            if evict_guard
+                                .is_some_and(|is_evictable| !is_evictable(&slot.entry.value)) =>
+                        {
+                            ClockVerdict::Skip
+                        }
+                        Some(slot)
+                            if slot
+                                .entry
+                                .referenced
+                                .swap(false, std::sync::atomic::Ordering::Relaxed) =>
+                        {
+                            ClockVerdict::SecondChance
+                        }
+                        Some(_) => ClockVerdict::Victim,
+                    }
                 }
-                if slot
-                    .entry
-                    .referenced
-                    .swap(false, std::sync::atomic::Ordering::Relaxed)
-                {
-                    second_chance.push((seq, hash));
-                    continue;
+                ClockOp::Reseq { seq, hash, fresh } => {
+                    match table.find_mut(hash, |slot| slot.entry.seq == seq) {
+                        Some(slot) => {
+                            slot.entry.seq = fresh;
+                            ClockVerdict::Victim
+                        }
+                        None => ClockVerdict::Skip,
+                    }
                 }
-                victim = Some((seq, hash));
-                break;
-            }
-            // Re-queued entries move behind everything inserted so far, bit
-            // cleared, so each can earn at most one more pass per hit and the
-            // scan cannot cycle.
-            let requeued = !second_chance.is_empty();
-            for (seq, hash) in second_chance {
-                let fresh = self.next_seq;
-                self.next_seq += 1;
-                self.order.remove(&seq);
-                if let Some(slot) = self.table.find_mut(hash, |slot| slot.entry.seq == seq) {
-                    slot.entry.seq = fresh;
-                    self.order.insert(fresh, hash);
-                }
-            }
-            match victim {
-                Some((seq, hash)) => {
+            });
+            match walk {
+                ClockWalk::Victim { seq, hash } => {
                     self.order.remove(&seq);
                     if self.remove_by_seq(hash, seq) {
                         self.capacity_evictions = self.capacity_evictions.saturating_add(1);
@@ -270,8 +340,8 @@ where
                 }
                 // Every candidate had a chance to spend; the next pass over
                 // the same entries finds them unreferenced.
-                None if requeued => continue,
-                None => {
+                ClockWalk::Requeued => continue,
+                ClockWalk::Blocked => {
                     self.capacity_eviction_blocks = self.capacity_eviction_blocks.saturating_add(1);
                     break;
                 }
