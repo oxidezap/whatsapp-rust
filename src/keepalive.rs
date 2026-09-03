@@ -166,6 +166,7 @@ impl Client {
                     if cleanup_counter >= 12 {
                         cleanup_counter = 0;
                         self.spawn_retention_cleanup(sent_msg_ttl);
+                        self.spawn_cache_maintenance();
                     }
 
                     // Same reason as the retention sweep above: driven by the
@@ -243,6 +244,47 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Sweep expired entries out of the in-process caches.
+    ///
+    /// The caches expire lazily: an entry is dropped on the access that finds
+    /// it stale, or on capacity pressure from a new insert. Neither happens on
+    /// a quiet connection, so without a timer a client that fanned out to a
+    /// large group set once kept every one of those records — up to the
+    /// 20 000-entry device registry — for as long as it stayed connected.
+    /// This is that timer. Store-backed caches expire on their own and the
+    /// wrappers no-op for them; capacity-only caches have nothing to expire
+    /// and are left alone.
+    ///
+    /// Runs on the keepalive's ~5-minute maintenance tick, not every tick and
+    /// never on the receive path: each sweep takes its cache's write lock for
+    /// a full walk of the table.
+    pub async fn run_cache_maintenance(&self) {
+        self.recent_messages.run_pending_tasks().await;
+        self.message_retry_counts.run_pending_tasks().await;
+        self.session_recreate_history.run_pending_tasks().await;
+        self.undecryptable_dispatched.run_pending_tasks().await;
+        self.dispatched_messages.run_pending_tasks().await;
+        self.pdo_pending_requests.run_pending_tasks().await;
+        self.pdo_requested.run_pending_tasks().await;
+        self.device_registry_cache.run_pending_tasks().await;
+        self.sender_key_device_cache.run_pending_tasks().await;
+        self.lid_pn_cache.run_pending_tasks().await;
+        // `get()`, not `get_group_cache()`: maintenance must not be what
+        // builds a cache the client never used.
+        if let Some(group_cache) = self.group_cache.get() {
+            group_cache.run_pending_tasks().await;
+        }
+    }
+
+    fn spawn_cache_maintenance(self: &Arc<Self>) {
+        let client = Arc::clone(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                client.run_cache_maintenance().await;
+            }))
+            .detach();
     }
 
     /// Fire-and-forget DB retention sweeps. Each TTL gates its own delete so

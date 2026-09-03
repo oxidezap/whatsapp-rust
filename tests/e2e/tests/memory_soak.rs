@@ -94,64 +94,23 @@ fn analyze_growth(label: &str, snapshots: &[Snapshot]) {
         first.round, last.round
     );
 
-    // Unbounded collections: must not grow beyond a small constant
-    let checks: Vec<(&str, usize, usize)> = vec![
-        (
-            "response_waiters",
-            first.diag.response_waiters,
-            last.diag.response_waiters,
-        ),
-        (
-            "node_waiters",
-            first.diag.node_waiters,
-            last.diag.node_waiters,
-        ),
-        (
-            "pending_retries",
-            first.diag.pending_retries,
-            last.diag.pending_retries,
-        ),
-        (
-            "presence_subscriptions",
-            first.diag.presence_subscriptions,
-            last.diag.presence_subscriptions,
-        ),
-        (
-            "app_state_key_requests",
-            first.diag.app_state_key_requests,
-            last.diag.app_state_key_requests,
-        ),
-        (
-            "app_state_syncing",
-            first.diag.app_state_syncing,
-            last.diag.app_state_syncing,
-        ),
-        (
-            "signal_sessions",
-            first.diag.signal_sessions.entries as usize,
-            last.diag.signal_sessions.entries as usize,
-        ),
-        (
-            "signal_identities",
-            first.diag.signal_identities.entries as usize,
-            last.diag.signal_identities.entries as usize,
-        ),
-        (
-            "signal_sender_keys",
-            first.diag.signal_sender_keys.entries as usize,
-            last.diag.signal_sender_keys.entries as usize,
-        ),
-        (
-            "chatstate_handlers",
-            first.diag.chatstate_handlers,
-            last.diag.chatstate_handlers,
-        ),
-        (
-            "custom_enc_handlers",
-            first.diag.custom_enc_handlers,
-            last.diag.custom_enc_handlers,
-        ),
-    ];
+    // Unbounded collections: must not grow beyond a small constant. The list
+    // comes from the report itself, so a collection added there is checked
+    // here without anyone editing this test.
+    let last_counts = last.diag.unbounded_counts();
+    let checks: Vec<(&str, usize, usize)> = first
+        .diag
+        .unbounded_counts()
+        .into_iter()
+        .zip(last_counts)
+        .map(|((name, first_val), (last_name, last_val))| {
+            assert_eq!(
+                name, last_name,
+                "unbounded_counts() must be stable in order"
+            );
+            (name, first_val as usize, last_val as usize)
+        })
+        .collect();
 
     let mut warnings = Vec::new();
     for (name, first_val, last_val) in &checks {

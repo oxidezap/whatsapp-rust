@@ -1716,6 +1716,12 @@ impl Client {
     /// pending/in-flight), then offline → batch for `doPendingDeviceSync`, online
     /// → invalidate + usync immediately. WA Web: online `syncDeviceListJob`,
     /// offline `OfflinePendingDeviceCache`.
+    ///
+    /// The online path releases its dedup entry when the refresh finishes.
+    /// Left in place, the entry outlived the refresh by the whole connection:
+    /// a user who added a second new device weeks later never got another
+    /// refresh, and every such user was retained until teardown. WA Web's
+    /// `syncDeviceListJob` is likewise keyed only while the job runs.
     pub(crate) async fn schedule_unknown_device_sync(
         self: &Arc<Self>,
         user_jid: Jid,
@@ -1739,6 +1745,14 @@ impl Client {
             let client = Arc::clone(self);
             self.runtime
                 .spawn(Box::pin(async move {
+                    // A guard, not a trailing call: the refresh can fail or be
+                    // cancelled with the runtime, and either way the dedup must
+                    // not outlive the work it was deduplicating.
+                    let released = Arc::clone(&client);
+                    let release_jid = user_jid.clone();
+                    let _release = scopeguard::guard((), move |()| {
+                        released.pending_device_sync.remove(&release_jid);
+                    });
                     client.invalidate_device_cache(&user_jid.user).await;
                     if let Err(e) = client.get_user_devices(&[user_jid]).await {
                         log::warn!("Immediate device sync failed: {e:?}");

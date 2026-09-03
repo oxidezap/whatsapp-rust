@@ -825,8 +825,18 @@ where
         self.max_capacity
     }
 
+    /// Best-effort entry count: a `try_read` that answers `0` while a writer
+    /// holds the lock. Fine on a hot path that only needs a hint; a report
+    /// wants [`entry_count_async`](Self::entry_count_async), which cannot
+    /// under-read a cache that is being written to.
     pub fn entry_count(&self) -> u64 {
         self.inner.try_read().map(|g| g.len() as u64).unwrap_or(0)
+    }
+
+    /// Entry count under an awaited read guard. Includes expired entries not
+    /// yet swept, like [`entry_count`](Self::entry_count).
+    pub async fn entry_count_async(&self) -> u64 {
+        self.inner.read().await.len() as u64
     }
 
     pub(crate) async fn capacity_stats(&self) -> CapacityStats {

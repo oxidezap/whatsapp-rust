@@ -434,6 +434,16 @@ pub struct MemoryReport {
     /// [`Self::lid_pn_lid_entries`]; bytes here cover only entries the LID
     /// map no longer holds (normally 0), so the total counts each once.
     pub lid_pn_pn_entries: CollectionStats,
+    /// Contact-hash → LID index of the LID/PN cache, one entry per identifier
+    /// (both sides of every pair). Bytes are the table alone: the LID it
+    /// points at is the entry's, already counted above. Unbounded with the
+    /// cache it indexes, and rebuilt from warm-up each process.
+    pub lid_pn_contact_hash_entries: CollectionStats,
+    /// PN → LID pairs this process has durably persisted, the dedup that lets
+    /// the learn path skip a re-persist. Bytes are the table alone (both
+    /// strings are the entry's). One entry per persisted contact for the
+    /// process lifetime.
+    pub lid_pn_persisted_entries: CollectionStats,
     pub recent_messages: CollectionStats,
     pub sender_key_device_cache: CollectionStats,
     pub group_devices_memo: CollectionStats,
@@ -485,9 +495,9 @@ pub struct MemoryReport {
     /// second refresh for the same user while one is outstanding.
     ///
     /// Offline entries are drained by `doPendingDeviceSync` at the end of the
-    /// backlog. Entries added by the *online* path are removed only by that
-    /// same drain or by teardown, so on a connection with no offline drain this
-    /// grows with the distinct users seen with an unknown device.
+    /// backlog; an entry the *online* path adds leaves when its refresh
+    /// finishes. A value that stays high outside a drain means refreshes are
+    /// not completing, not that many users were seen.
     pub pending_device_sync: usize,
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
@@ -496,6 +506,12 @@ pub struct MemoryReport {
     /// Groups with a metadata query in flight; normally zero.
     pub group_metadata_inflight: u64,
     pub chat_lanes: u64,
+    /// Inbound messages queued behind their chat's lane worker, summed over
+    /// every lane. The lanes are capacity-bounded; their queues are not, and
+    /// each queued message retains its whole frame, so a worker that is stuck
+    /// (a slow durability hook, a hung decrypt) shows up here as a backlog
+    /// that grows with the chat's inbound rate.
+    pub chat_lane_backlog: u64,
     pub group_distribution_locks: u64,
     /// Cumulative capacity evictions; poll successive reports to derive a rate.
     pub group_distribution_lock_evictions: u64,
@@ -614,12 +630,14 @@ pub struct SubsystemMemory {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 14] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 16] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
             ("lid_pn (lid):", &self.lid_pn_lid_entries),
             ("lid_pn (pn):", &self.lid_pn_pn_entries),
+            ("lid_pn (hash):", &self.lid_pn_contact_hash_entries),
+            ("lid_pn (persisted):", &self.lid_pn_persisted_entries),
             ("recent_messages:", &self.recent_messages),
             ("sk_device_cache:", &self.sender_key_device_cache),
             ("group_devices_memo:", &self.group_devices_memo),
@@ -654,6 +672,58 @@ impl MemoryReport {
         let total = total.saturating_add(self.plugin_event_queue.bytes);
         total
     }
+
+    /// The collections whose only bound is a drain or a lifecycle, by name
+    /// and entry count — the set a long-running soak compares between
+    /// snapshots. Kept here, beside the fields, so a collection added to the
+    /// report is added to the growth check in the same place, rather than to
+    /// a hand-copied list in a test that nothing keeps in step.
+    ///
+    /// Capacity-bounded caches are left out: they can only ever read their
+    /// cap. `lid_pn_*` maps are in, since their bound is the contact list.
+    pub fn unbounded_counts(&self) -> Vec<(&'static str, u64)> {
+        let n = |v: usize| u64::try_from(v).unwrap_or(u64::MAX);
+        vec![
+            ("lid_pn_lid_entries", self.lid_pn_lid_entries.entries),
+            ("lid_pn_pn_entries", self.lid_pn_pn_entries.entries),
+            (
+                "lid_pn_contact_hash_entries",
+                self.lid_pn_contact_hash_entries.entries,
+            ),
+            (
+                "lid_pn_persisted_entries",
+                self.lid_pn_persisted_entries.entries,
+            ),
+            ("history_sync_tasks", self.history_sync_tasks.entries),
+            ("inbound_commit_batch", self.inbound_commit_batch.entries),
+            ("msg_secret_buffer", n(self.msg_secret_buffer)),
+            ("pending_device_sync", n(self.pending_device_sync)),
+            ("ensure_inflight", self.ensure_inflight),
+            ("group_metadata_inflight", self.group_metadata_inflight),
+            ("chat_lane_backlog", self.chat_lane_backlog),
+            ("transport_ack_queue", n(self.transport_ack_queue)),
+            ("delivery_receipt_queue", n(self.delivery_receipt_queue)),
+            ("response_waiters", n(self.response_waiters)),
+            ("node_waiters", n(self.node_waiters)),
+            ("sent_node_waiters", n(self.sent_node_waiters)),
+            ("pending_retries", n(self.pending_retries)),
+            ("pending_lid_refreshes", n(self.pending_lid_refreshes)),
+            ("presence_subscriptions", n(self.presence_subscriptions)),
+            ("app_state_key_requests", n(self.app_state_key_requests)),
+            ("app_state_key_cache", n(self.app_state_key_cache)),
+            (
+                "app_state_recovery_requests",
+                n(self.app_state_recovery_requests),
+            ),
+            ("app_state_syncing", n(self.app_state_syncing)),
+            ("signal_sessions", self.signal_sessions.entries),
+            ("signal_identities", self.signal_identities.entries),
+            ("signal_sender_keys", self.signal_sender_keys.entries),
+            ("chatstate_handlers", n(self.chatstate_handlers)),
+            ("custom_enc_handlers", n(self.custom_enc_handlers)),
+            ("stanza_interceptors", n(self.stanza_interceptors)),
+        ]
+    }
 }
 
 impl std::fmt::Display for MemoryReport {
@@ -670,7 +740,7 @@ impl std::fmt::Display for MemoryReport {
         // transient retention: history sync, the inbound commit batch, then the
         // offline receipt buffer. Adding a cache to collections() means moving
         // this boundary, or the sections shift.
-        const TTL_BOUNDED: usize = 8;
+        const TTL_BOUNDED: usize = 10;
         const SIGNAL_CACHES: usize = 3;
         const HISTORY_SYNC: usize = TTL_BOUNDED + SIGNAL_CACHES;
         const COMMIT_BATCH: usize = HISTORY_SYNC + 1;
@@ -699,6 +769,7 @@ impl std::fmt::Display for MemoryReport {
             self.group_metadata_inflight
         )?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
+        writeln!(f, "  chat_lane_backlog:      {}", self.chat_lane_backlog)?;
         writeln!(
             f,
             "  group_dist_locks:       {} (evicted: {}, blocked: {})",

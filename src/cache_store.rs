@@ -253,9 +253,11 @@ where
     }
 
     /// Approximate entry count, delegating to the custom backend if available.
+    /// The in-process count is awaited, so unlike
+    /// [`entry_count`](Self::entry_count) it never reads `0` under write load.
     pub async fn entry_count_async(&self) -> u64 {
         match &self.inner {
-            Inner::Local(cache) => cache.entry_count(),
+            Inner::Local(cache) => cache.entry_count_async().await,
             Inner::Custom {
                 store, namespace, ..
             } => store.entry_count(namespace).await.unwrap_or(0),

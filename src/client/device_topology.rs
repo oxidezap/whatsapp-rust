@@ -243,8 +243,10 @@ impl DeviceRegistryCache {
         self.cache.memory_stats(|_k, v| v.heap_bytes()).await
     }
 
-    /// Test-only passthrough for cache maintenance flushes.
-    #[cfg(test)]
+    /// Sweep expired records (in-process backend only; a custom store expires
+    /// its own). Driven by [`Client::run_cache_maintenance`].
+    ///
+    /// [`Client::run_cache_maintenance`]: crate::client::Client::run_cache_maintenance
     pub(crate) async fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks().await;
     }

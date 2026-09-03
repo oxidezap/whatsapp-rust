@@ -4927,6 +4927,8 @@ async fn memory_report_display_sections_stay_aligned() {
     for name in [
         "group_cache:",
         "device_registry_cache:",
+        "lid_pn (hash):",
+        "lid_pn (persisted):",
         "recent_messages:",
         "group_devices_memo:",
         "dm_devices_memo:",
@@ -5002,6 +5004,150 @@ async fn memory_report_counts_the_offline_device_sync_queue() {
 
     client.pending_device_sync.take_all();
     assert_eq!(client.memory_report().await.pending_device_sync, 0);
+}
+
+/// The LID/PN cache's side maps grow with the contact list for the process
+/// lifetime, one entry per identifier and one per persisted pair, and were
+/// invisible to the report; the counts must surface and the bytes must be the
+/// table alone, since both maps hold the entry's own strings.
+#[tokio::test]
+async fn memory_report_counts_lid_pn_side_maps() {
+    let client = crate::test_utils::create_test_client_with_name("lid_pn_side_maps").await;
+    let before = client.memory_report().await;
+    assert_eq!(before.lid_pn_contact_hash_entries.entries, 0);
+    assert_eq!(before.lid_pn_persisted_entries.entries, 0);
+
+    let entry = crate::lid_pn_cache::LidPnEntry::new(
+        "100000000000002".to_string(),
+        "19045550180".to_string(),
+        LearningSource::Usync,
+    );
+    client.lid_pn_cache.add(&entry).await;
+    client
+        .lid_pn_cache
+        .mark_persisted(&entry.phone_number, &entry.lid)
+        .await;
+
+    let report = client.memory_report().await;
+    assert_eq!(
+        report.lid_pn_contact_hash_entries.entries, 2,
+        "both sides of a pair are hash-indexed"
+    );
+    assert_eq!(report.lid_pn_persisted_entries.entries, 1);
+    assert!(
+        report.lid_pn_contact_hash_entries.bytes > 0 && report.lid_pn_persisted_entries.bytes > 0,
+        "table structure is charged even though the strings are the entry's"
+    );
+    assert!(
+        report.lid_pn_contact_hash_entries.bytes < report.lid_pn_lid_entries.bytes,
+        "a side map must not re-charge the payload the entry map already counts"
+    );
+    let names: Vec<&str> = report
+        .unbounded_counts()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(names.contains(&"lid_pn_contact_hash_entries"));
+    assert!(names.contains(&"lid_pn_persisted_entries"));
+}
+
+/// A lane's queue is unbounded and each queued message retains its frame, so
+/// a stuck worker is a backlog the report has to show; the lane count alone
+/// reads the same whether the queues are empty or a million deep.
+#[tokio::test]
+async fn memory_report_sums_chat_lane_backlog() {
+    let client = crate::test_utils::create_test_client_with_name("chat_lane_backlog").await;
+    assert_eq!(client.memory_report().await.chat_lane_backlog, 0);
+
+    // A lane with no worker: nothing drains what is enqueued.
+    let chat: Jid = "120363000000000042@g.us".parse().unwrap();
+    let (queue_tx, _queue_rx) = async_channel::unbounded();
+    let lane = ChatLane {
+        enqueue_lock: Arc::new(Mutex::new(())),
+        queue_tx,
+        worker_running: Arc::new(Mutex::new(())),
+    };
+    client.chat_lanes.insert(chat.clone(), lane.clone()).await;
+    for id in ["A", "B", "C"] {
+        let node = NodeBuilder::new("message")
+            .attr("from", chat.clone())
+            .attr("id", id)
+            .build();
+        lane.try_enqueue(node_to_owned_ref(node))
+            .expect("an unbounded lane queue accepts every message");
+    }
+
+    let report = client.memory_report().await;
+    assert_eq!(report.chat_lanes, 1);
+    assert_eq!(report.chat_lane_backlog, 3);
+    assert!(
+        report
+            .unbounded_counts()
+            .contains(&("chat_lane_backlog", 3)),
+        "the backlog is a drain-bounded collection, so the soak compares it"
+    );
+}
+
+/// An online device refresh releases its dedup entry when it finishes. Left
+/// in place, the entry outlived the refresh by the whole connection: the user
+/// was retained until teardown, and a later unknown device from them never
+/// triggered another refresh.
+#[tokio::test]
+async fn online_device_sync_releases_its_dedup_entry() {
+    let client = crate::test_utils::create_test_client_with_name("online_device_sync").await;
+    let jid: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+
+    // Not connected, so the refresh fails; the release must not depend on it
+    // succeeding.
+    client
+        .schedule_unknown_device_sync(jid.clone(), false)
+        .await;
+    for _ in 0..1_000 {
+        if client.pending_device_sync.len() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        client.pending_device_sync.len(),
+        0,
+        "the dedup entry must leave with the refresh that took it"
+    );
+    assert!(
+        client.pending_device_sync.add(&jid),
+        "a later unknown device from the same user triggers a refresh again"
+    );
+}
+
+/// Expired entries leave a quiet cache only when something sweeps: nothing
+/// accesses them and nothing inserts, so without the maintenance tick the
+/// dedup gates hold five-minute-old keys for weeks.
+#[tokio::test]
+async fn cache_maintenance_sweeps_expired_entries() {
+    let mut cache_config = CacheConfig::default();
+    cache_config.dispatched_messages =
+        crate::cache_config::CacheEntryConfig::new(Some(Duration::from_millis(20)), 64);
+    let client = crate::test_utils::create_test_client_with_config(
+        "cache_maintenance",
+        Arc::new(MockHttpClient),
+        cache_config,
+    )
+    .await;
+
+    let chat: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+    let key =
+        wacore::types::message::SenderMessageId::new(chat.clone(), "3EB0EXPIRING".into(), chat);
+    client.dispatched_messages.insert(key, ()).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        client.dispatched_messages.entry_count_async().await,
+        1,
+        "a quiet cache keeps its expired entry until swept"
+    );
+
+    client.run_cache_maintenance().await;
+    assert_eq!(client.dispatched_messages.entry_count_async().await, 0);
+    assert_eq!(client.memory_report().await.dispatched_messages, 0);
 }
 
 #[tokio::test]
