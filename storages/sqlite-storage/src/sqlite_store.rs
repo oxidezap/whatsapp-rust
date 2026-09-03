@@ -567,6 +567,23 @@ fn parse_database_path(database_url: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
+/// The filesystem path behind a parsed database path, for sidecar files.
+///
+/// `parse_database_path` keeps a `file:` scheme because SQLite wants it back
+/// verbatim, but the WAL and shm sidecars live beside the *file* the scheme
+/// names: `file:db.sqlite?mode=rwc` writes `db.sqlite-wal`, not
+/// `file:db.sqlite-wal`. `file:///abs/path` is the same file as `/abs/path`.
+fn filesystem_path(database_path: &str) -> &str {
+    let path = database_path
+        .strip_prefix("file://")
+        .or_else(|| database_path.strip_prefix("file:"))
+        .unwrap_or(database_path);
+    // `file://localhost/abs` names the local file too; nothing else after the
+    // authority slashes is a path this crate would have opened.
+    path.strip_prefix("localhost/")
+        .map_or(path, |rest| &path[path.len() - rest.len() - 1..])
+}
+
 /// Whether the URI asks SQLite for shared cache.
 ///
 /// Only a `file:` URI carries query parameters; a bare path containing `?` is
@@ -4404,7 +4421,7 @@ impl DeviceStore for SqliteStore {
                 // The WAL is a sidecar file, so its size comes from the
                 // filesystem rather than a pragma. Absent for in-memory and
                 // non-WAL databases, which is exactly the honest answer there.
-                wal_bytes: std::fs::metadata(format!("{database_path}-wal"))
+                wal_bytes: std::fs::metadata(format!("{}-wal", filesystem_path(&database_path)))
                     .ok()
                     .map(|m| m.len()),
                 ..Default::default()
@@ -7688,6 +7705,51 @@ mod maintenance_tests {
 
     /// A single large transaction is what leaves a WAL permanently big, so this
     /// writes one and then checks that the pass hands the space back.
+    /// The parsed path keeps its `file:` scheme for SQLite's sake; the WAL
+    /// sidecar does not carry one, so the report must look beside the file the
+    /// scheme names.
+    #[test]
+    fn the_wal_sidecar_is_looked_up_beside_the_file_the_uri_names() {
+        assert_eq!(filesystem_path("/tmp/db.sqlite"), "/tmp/db.sqlite");
+        assert_eq!(filesystem_path("db.sqlite"), "db.sqlite");
+        assert_eq!(filesystem_path("file:db.sqlite"), "db.sqlite");
+        assert_eq!(filesystem_path("file:/tmp/db.sqlite"), "/tmp/db.sqlite");
+        assert_eq!(filesystem_path("file:///tmp/db.sqlite"), "/tmp/db.sqlite");
+        assert_eq!(
+            filesystem_path("file://localhost/tmp/db.sqlite"),
+            "/tmp/db.sqlite"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_uri_opened_store_reports_its_wal() {
+        let db = TempDb::new("maintenance_uri_wal");
+        let url = format!("file:{}?mode=rwc", db.url());
+        let store = SqliteStore::new(&url).await.expect("store opens by URI");
+        // One write so the WAL exists on disk.
+        store
+            .put_msg_secrets(vec![MsgSecretEntry {
+                chat: Arc::from("19045550180@s.whatsapp.net"),
+                sender: Arc::from("100000000000002@lid"),
+                msg_id: Arc::from("MSGURIWAL"),
+                secret: [0x7A; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+                expires_at: 0,
+                message_ts: 1_700_000_000,
+            }])
+            .await
+            .expect("seed one secret");
+        let report = DeviceStore::resource_report(&store).await;
+        assert_eq!(
+            report.wal_bytes,
+            Some(wal_bytes(&db)),
+            "a file: URI store must find the WAL beside the file it names"
+        );
+        assert!(
+            report.wal_bytes.is_some_and(|bytes| bytes > 0),
+            "the WAL exists after a write"
+        );
+    }
+
     #[tokio::test]
     async fn a_large_batch_leaves_no_oversized_wal_after_maintenance() {
         const ROWS: u64 = 100_000;
