@@ -331,9 +331,21 @@ impl<'a> Decoder<'a> {
     }
 
     /// Decode packed nibble/hex into a stack buffer, then create CompactString.
-    /// Max unpacked length is 254 bytes (127 packed × 2), so the stack buffer
+    /// Max unpacked length is 254 bytes (127 packed × 2), so the large buffer
     /// is always sufficient. Short values (≤24 bytes) are stored inline.
+    ///
+    /// The buffer is scratch, never input: `decode_packed_*` write exactly
+    /// `len * 2` bytes and only that prefix is read back, so nothing depends
+    /// on the zeros. Sizing it from that decoded length — known before the
+    /// buffer is declared — keeps the initialization proportional to the value
+    /// instead of to the format's 254-byte worst case, which a release build's
+    /// optimizer may or may not elide on its own. The array stays initialized
+    /// either way, so this needs no `unsafe` and nothing for Miri to prove.
     fn read_packed(&mut self, tag: u8) -> Result<CompactString> {
+        /// Covers every packed value a message stanza carries: a 22-character
+        /// id and a 10-digit timestamp both land well inside it.
+        const SMALL_PACKED: usize = 32;
+
         let packed_len_byte = self.read_u8()?;
         let is_half_byte = (packed_len_byte & 0x80) != 0;
         let len = (packed_len_byte & 0x7F) as usize;
@@ -343,12 +355,28 @@ impl<'a> Decoder<'a> {
         }
 
         let packed_data = self.read_bytes(len)?;
-        let mut buf = [0u8; 254];
+        if len * 2 <= SMALL_PACKED {
+            let mut buf = [0u8; SMALL_PACKED];
+            Self::decode_packed_into(tag, packed_data, &mut buf, is_half_byte)
+        } else {
+            let mut buf = [0u8; 254];
+            Self::decode_packed_into(tag, packed_data, &mut buf, is_half_byte)
+        }
+    }
+
+    /// Shared tail of [`read_packed`], over a scratch buffer the caller sized:
+    /// `buf` must hold `packed_data.len() * 2` bytes.
+    fn decode_packed_into(
+        tag: u8,
+        packed_data: &[u8],
+        buf: &mut [u8],
+        is_half_byte: bool,
+    ) -> Result<CompactString> {
         let mut pos = 0;
 
         match tag {
-            token::HEX_8 => Self::decode_packed_hex(packed_data, &mut buf, &mut pos),
-            token::NIBBLE_8 => Self::decode_packed_nibble(packed_data, &mut buf, &mut pos)?,
+            token::HEX_8 => Self::decode_packed_hex(packed_data, buf, &mut pos),
+            token::NIBBLE_8 => Self::decode_packed_nibble(packed_data, buf, &mut pos)?,
             _ => return Err(BinaryError::InvalidToken(tag)),
         }
 
