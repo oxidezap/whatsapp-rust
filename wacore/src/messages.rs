@@ -1168,6 +1168,181 @@ pub fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
     only
 }
 
+// Declares the enum from a single list so the slot count follows the variant
+// count; the wire key itself lives once per variant, in `#[wire = ...]`, and
+// `WireEnum` derives `TryFrom<&str>` and `as_str()` from it.
+macro_rules! message_attrs {
+    ($($variant:ident => $key:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, crate::WireEnum)]
+        enum MessageAttr {
+            $(
+                #[wire = $key]
+                $variant,
+            )+
+        }
+
+        impl MessageAttr {
+            const COUNT: usize = [$(stringify!($variant)),+].len();
+        }
+    };
+}
+
+message_attrs! {
+    Id => "id",
+    From => "from",
+    AddressingMode => "addressing_mode",
+    Participant => "participant",
+    ParticipantPn => "participant_pn",
+    ParticipantLid => "participant_lid",
+    Recipient => "recipient",
+    SenderPn => "sender_pn",
+    SenderLid => "sender_lid",
+    Category => "category",
+    Type => "type",
+    ServerId => "server_id",
+    Offline => "offline",
+    Sts => "sts",
+    VerifiedLevel => "verified_level",
+    VerifiedName => "verified_name",
+    PeerRecipientPn => "peer_recipient_pn",
+    Notify => "notify",
+    Timestamp => "t",
+    Edit => "edit",
+}
+
+/// The attributes [`parse_message_info`] reads off a `<message>` stanza,
+/// resolved in a single pass.
+///
+/// `AttrParserRef` answers a key by scanning the attribute slice, and that
+/// parser asks twenty questions, so a stanza's attributes were walked twenty
+/// times over to answer what one walk answers. Naming the set up front turns
+/// every read into an array index; the accessors below then apply exactly the
+/// rules `AttrParserRef` applies — same coercions, same error text, same order
+/// of errors, and a repeated key still resolving to its first occurrence — so
+/// only the lookup changed.
+struct MessageAttrs<'a> {
+    slots: [Option<&'a wacore_binary::node::ValueRef<'a>>; MessageAttr::COUNT],
+    errors: Vec<wacore_binary::BinaryError>,
+}
+
+impl<'a> MessageAttrs<'a> {
+    fn resolve(node: &'a wacore_binary::NodeRef<'a>) -> Self {
+        let mut slots = [None; MessageAttr::COUNT];
+        for (key, value) in node.attrs.as_slice() {
+            // First occurrence wins, as a scan for the key would have found it.
+            if let Ok(attr) = MessageAttr::try_from(&**key)
+                && slots[attr as usize].is_none()
+            {
+                slots[attr as usize] = Some(value);
+            }
+        }
+        Self {
+            slots,
+            errors: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn get(&self, attr: MessageAttr) -> Option<&'a wacore_binary::node::ValueRef<'a>> {
+        self.slots[attr as usize]
+    }
+
+    fn missing(&mut self, attr: MessageAttr) {
+        let key = attr.as_str();
+        self.errors
+            .push(wacore_binary::BinaryError::AttrParse(format!(
+                "Required attribute '{key}' not found"
+            )));
+    }
+
+    fn optional_string(&self, attr: MessageAttr) -> Option<std::borrow::Cow<'a, str>> {
+        self.get(attr).map(|value| value.as_str())
+    }
+
+    fn required_string(
+        &self,
+        attr: MessageAttr,
+    ) -> wacore_binary::Result<std::borrow::Cow<'a, str>> {
+        self.optional_string(attr)
+            .ok_or_else(|| wacore_binary::BinaryError::MissingAttr(attr.as_str().to_string()))
+    }
+
+    fn optional_jid(&mut self, attr: MessageAttr) -> Option<wacore_binary::Jid> {
+        let value = self.get(attr)?;
+        match value.to_jid() {
+            Some(jid) => Some(jid),
+            None => {
+                // to_jid() only returns None if it's a String that failed to parse
+                if let wacore_binary::node::ValueRef::String(s) = value {
+                    self.errors
+                        .push(wacore_binary::BinaryError::AttrParse(format!(
+                            "Invalid JID: {s}"
+                        )));
+                }
+                None
+            }
+        }
+    }
+
+    fn optional_jid_result(
+        &self,
+        attr: MessageAttr,
+    ) -> wacore_binary::Result<Option<wacore_binary::Jid>> {
+        match self.get(attr) {
+            None => Ok(None),
+            Some(wacore_binary::node::ValueRef::Jid(jid)) => Ok(Some(jid.to_owned())),
+            Some(wacore_binary::node::ValueRef::String(value)) => {
+                use std::str::FromStr as _;
+                wacore_binary::Jid::from_str(value)
+                    .map(Some)
+                    .map_err(wacore_binary::BinaryError::from)
+            }
+        }
+    }
+
+    fn required_jid(&self, attr: MessageAttr) -> wacore_binary::Result<wacore_binary::Jid> {
+        self.optional_jid_result(attr)?
+            .ok_or_else(|| wacore_binary::BinaryError::MissingAttr(attr.as_str().to_string()))
+    }
+
+    fn optional_u64(&mut self, attr: MessageAttr) -> Option<u64> {
+        let text = self.optional_string(attr)?;
+        match text.parse::<u64>() {
+            Ok(value) => Some(value),
+            Err(e) => {
+                let key = attr.as_str();
+                self.errors
+                    .push(wacore_binary::BinaryError::AttrParse(format!(
+                        "Failed to parse u64 from '{text}' for key '{key}': {e}"
+                    )));
+                None
+            }
+        }
+    }
+
+    fn unix_time(&mut self, attr: MessageAttr) -> i64 {
+        let Some(text) = self.optional_string(attr) else {
+            self.missing(attr);
+            return 0;
+        };
+        match text.parse::<i64>() {
+            Ok(value) => value,
+            Err(e) => {
+                let key = attr.as_str();
+                self.errors
+                    .push(wacore_binary::BinaryError::AttrParse(format!(
+                        "Failed to parse i64 from '{text}' for key '{key}': {e}"
+                    )));
+                0
+            }
+        }
+    }
+
+    fn into_errors(self) -> Vec<wacore_binary::BinaryError> {
+        self.errors
+    }
+}
+
 /// Parse a message stanza into a `MessageInfo` struct.
 ///
 /// This is a pure function that extracts message metadata from a node's
@@ -1184,28 +1359,28 @@ pub fn parse_message_info(
     };
     use wacore_binary::{JidExt as _, STATUS_BROADCAST_USER, Server};
 
-    let mut attrs = node.attrs();
-    let id = attrs.required_string("id")?;
+    let mut attrs = MessageAttrs::resolve(node);
+    let id = attrs.required_string(MessageAttr::Id)?;
     anyhow::ensure!(
         !id.is_empty(),
         "message stanza has an empty required 'id' attribute"
     );
     let id = CompactString::from(id.as_ref());
-    let from = attrs.required_jid("from")?;
+    let from = attrs.required_jid(MessageAttr::From)?;
     let addressing_mode = attrs
-        .optional_string("addressing_mode")
+        .optional_string(MessageAttr::AddressingMode)
         .and_then(|s| AddressingMode::try_from(s.as_ref()).ok());
 
     let mut source = if from.server == Server::Broadcast {
-        let participant = attrs.required_jid("participant")?;
+        let participant = attrs.required_jid(MessageAttr::Participant)?;
         let is_from_me = participant.matches_user_or_lid(own_jid, own_lid);
 
         // Match WAWebMsgParser: read participant_lid/_pn unconditionally so
         // the LID-PN cache can re-warm from the stanza.
         let sender_alt = if participant.server.is_pn_family() {
-            attrs.optional_jid("participant_lid")
+            attrs.optional_jid(MessageAttr::ParticipantLid)
         } else if participant.server.is_lid_family() {
-            attrs.optional_jid("participant_pn")
+            attrs.optional_jid(MessageAttr::ParticipantPn)
         } else {
             None
         };
@@ -1224,10 +1399,10 @@ pub fn parse_message_info(
             ..Default::default()
         }
     } else if from.is_group() {
-        let sender = attrs.required_jid("participant")?;
+        let sender = attrs.required_jid(MessageAttr::Participant)?;
         let sender_alt = match addressing_mode {
-            Some(AddressingMode::Lid) => attrs.optional_jid("participant_pn"),
-            Some(AddressingMode::Pn) => attrs.optional_jid("participant_lid"),
+            Some(AddressingMode::Lid) => attrs.optional_jid(MessageAttr::ParticipantPn),
+            Some(AddressingMode::Pn) => attrs.optional_jid(MessageAttr::ParticipantLid),
             None => None,
         };
 
@@ -1242,7 +1417,7 @@ pub fn parse_message_info(
             ..Default::default()
         }
     } else if from.matches_user_or_lid(own_jid, own_lid) {
-        let recipient = attrs.optional_jid_result("recipient")?;
+        let recipient = attrs.optional_jid_result(MessageAttr::Recipient)?;
         let chat = recipient
             .as_ref()
             .map(|r| r.to_non_ad())
@@ -1265,9 +1440,9 @@ pub fn parse_message_info(
         }
     } else {
         let sender_alt = if from.server == Server::Lid {
-            attrs.optional_jid("sender_pn")
+            attrs.optional_jid(MessageAttr::SenderPn)
         } else {
-            attrs.optional_jid("sender_lid")
+            attrs.optional_jid(MessageAttr::SenderLid)
         };
 
         MessageSource {
@@ -1297,7 +1472,7 @@ pub fn parse_message_info(
     };
 
     let category = attrs
-        .optional_string("category")
+        .optional_string(MessageAttr::Category)
         .map(|s| MessageCategory::from(s.as_ref()))
         .unwrap_or_default();
 
@@ -1306,11 +1481,11 @@ pub fn parse_message_info(
     // for an attribute nothing downstream needs, so absence is recorded as
     // `None` and an unrecognized value keeps its wire bytes.
     let stanza_type = attrs
-        .optional_string("type")
+        .optional_string(MessageAttr::Type)
         .map(|s| StanzaMessageType::from(s.as_ref()));
 
     let server_id = attrs
-        .optional_u64("server_id")
+        .optional_u64(MessageAttr::ServerId)
         .filter(|&v| (99..=2_147_476_647).contains(&v))
         .unwrap_or(0) as i32;
 
@@ -1319,24 +1494,24 @@ pub fn parse_message_info(
         source.chat.agent = 0;
     }
 
-    let is_offline = attrs.optional_string("offline").is_some();
+    let is_offline = attrs.get(MessageAttr::Offline).is_some();
 
     // Envelope enrichment (mirrors WAWebHandleMsgParser y() function).
     let server_timestamp_us = attrs
-        .optional_u64("sts")
+        .optional_u64(MessageAttr::Sts)
         .and_then(|v| i64::try_from(v).ok());
     let verified_level = attrs
-        .optional_string("verified_level")
+        .optional_string(MessageAttr::VerifiedLevel)
         .map(|s| s.into_owned());
     let verified_name_serial = attrs
-        .optional_u64("verified_name")
+        .optional_u64(MessageAttr::VerifiedName)
         .and_then(|v| i64::try_from(v).ok());
     // The display name only exists inside the <verified_name> child's cert protobuf.
     let verified_name = node
         .get_optional_child("verified_name")
         .and_then(|vn| crate::stanza::business::VerifiedName::try_from_node(vn).ok())
         .map(Box::new);
-    let peer_recipient_pn = attrs.optional_jid("peer_recipient_pn");
+    let peer_recipient_pn = attrs.optional_jid(MessageAttr::PeerRecipientPn);
 
     // <meta> child attrs (WAWebHandleMsgParser b()) and <reporting> children
     // (I() function). Both are optional; absence is the common case.
@@ -1406,24 +1581,36 @@ pub fn parse_message_info(
         })
     });
 
+    let push_name = attrs
+        .optional_string(MessageAttr::Notify)
+        .map(|s| CompactString::from(s.as_ref()))
+        .unwrap_or_default();
+    let timestamp = crate::time::from_secs_or_now(attrs.unix_time(MessageAttr::Timestamp));
+    // Parse from the borrowed attribute: `From<String>` immediately re-borrows
+    // it, so materializing a String first only buys a discarded allocation for
+    // every known variant.
+    let edit = attrs
+        .optional_string(MessageAttr::Edit)
+        .map(|s| EditAttribute::from(s.as_ref()))
+        .unwrap_or_default();
+
+    // The attribute parser accumulates non-fatal failures — an optional JID
+    // that would not parse, a `t` that is not a number — into a list this
+    // function has never inspected: the value degrades to absent or zero and
+    // the message is delivered anyway. The list is still built, in the same
+    // order and with the same text, so the day a caller wants it the behaviour
+    // it describes is the one that ran.
+    drop(attrs.into_errors());
+
     Ok(MessageInfo {
         source,
         id,
         server_id,
         r#type: stanza_type,
-        push_name: attrs
-            .optional_string("notify")
-            .map(|s| CompactString::from(s.as_ref()))
-            .unwrap_or_default(),
-        timestamp: crate::time::from_secs_or_now(attrs.unix_time("t")),
+        push_name,
+        timestamp,
         category,
-        // Parse from the borrowed attribute: `From<String>` immediately
-        // re-borrows it, so materializing a String first only buys a discarded
-        // allocation for every known variant.
-        edit: attrs
-            .optional_string("edit")
-            .map(|s| EditAttribute::from(s.as_ref()))
-            .unwrap_or_default(),
+        edit,
         is_offline,
         server_timestamp_us,
         verified_level,

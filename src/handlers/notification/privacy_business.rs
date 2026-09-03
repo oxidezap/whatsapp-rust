@@ -1,5 +1,5 @@
 use crate::client::Client;
-use crate::types::events::Event;
+use crate::types::events::{Event, EventKind};
 use log::{debug, info, warn};
 use std::sync::Arc;
 use wacore::stanza::business::BusinessNotification;
@@ -159,26 +159,6 @@ pub(crate) async fn handle_business_notification(client: &Arc<Client>, node: &No
         notification.jid
     );
 
-    let update_type = BusinessUpdateType::from(notification.notification_type.clone());
-    let verified_name = notification
-        .verified_name
-        .as_ref()
-        .and_then(|vn| vn.name.clone());
-
-    let event = Event::BusinessStatusUpdate(
-        BusinessStatusUpdate::builder()
-            .jid(notification.from.clone())
-            .update_type(update_type)
-            .timestamp(wacore::time::from_secs_or_now(notification.timestamp))
-            .maybe_target_jid(notification.jid.clone())
-            .maybe_hash(notification.hash.clone())
-            .maybe_verified_name(verified_name)
-            .product_ids(notification.product_ids.clone())
-            .collection_ids(notification.collection_ids.clone())
-            .subscriptions(notification.subscriptions.clone())
-            .build(),
-    );
-
     match notification.notification_type {
         wacore::stanza::business::BusinessNotificationType::RemoveJid
         | wacore::stanza::business::BusinessNotificationType::RemoveHash => {
@@ -215,7 +195,31 @@ pub(crate) async fn handle_business_notification(client: &Arc<Client>, node: &No
         _ => {}
     }
 
-    client.core.event_bus.dispatch(event);
+    client
+        .core
+        .event_bus
+        .dispatch_with(EventKind::BusinessStatusUpdate, || {
+            Event::BusinessStatusUpdate(
+                BusinessStatusUpdate::builder()
+                    .jid(notification.from.clone())
+                    .update_type(BusinessUpdateType::from(
+                        notification.notification_type.clone(),
+                    ))
+                    .timestamp(wacore::time::from_secs_or_now(notification.timestamp))
+                    .maybe_target_jid(notification.jid.clone())
+                    .maybe_hash(notification.hash.clone())
+                    .maybe_verified_name(
+                        notification
+                            .verified_name
+                            .as_ref()
+                            .and_then(|vn| vn.name.clone()),
+                    )
+                    .product_ids(notification.product_ids.clone())
+                    .collection_ids(notification.collection_ids.clone())
+                    .subscriptions(notification.subscriptions.clone())
+                    .build(),
+            )
+        });
 }
 
 #[cfg(test)]

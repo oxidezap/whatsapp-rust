@@ -5,7 +5,7 @@ use std::io::Write;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::marshal::{
     marshal, marshal_auto, marshal_exact, marshal_ref, marshal_ref_auto, marshal_ref_exact,
-    marshal_to, unmarshal_ref,
+    marshal_shallow, marshal_to, unmarshal_ref,
 };
 use wacore_binary::node::Node;
 use wacore_binary::util::{FORMAT_COMPRESSED, unpack};
@@ -228,14 +228,24 @@ fn bench_marshal_auto_many_children(bencher: divan::Bencher) {
         .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
-// The exact (plan + hint replay) strategy is the production send path for
-// message plaintext, so its worst case — many children, JID-heavy — gets its
-// own pin.
+// The shallow (estimate + single pass) strategy is the production send path
+// for message plaintext, so its worst case — many children, JID-heavy — gets
+// its own pin, against the exact (plan + hint replay) strategy it replaced on
+// the same shape. The sampled estimate is what the pair measures: many
+// children is where sampling has the most room to be wrong, and a reserve that
+// undershoots shows up here as the `Vec` growth it costs.
 #[divan::bench]
 fn bench_marshal_exact_many_children(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_many_children_node)
         .bench_refs(|node| black_box(marshal_exact(black_box(node)).unwrap()));
+}
+
+#[divan::bench]
+fn bench_marshal_shallow_many_children(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_many_children_node)
+        .bench_refs(|node| black_box(marshal_shallow(black_box(node)).expect("marshal_shallow")));
 }
 
 // Strategy comparison on one shape.
@@ -251,6 +261,13 @@ fn bench_marshal_exact_large(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_large_node)
         .bench_refs(|node| black_box(marshal_exact(black_box(node)).unwrap()));
+}
+
+#[divan::bench]
+fn bench_marshal_shallow_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_large_node)
+        .bench_refs(|node| black_box(marshal_shallow(black_box(node)).expect("marshal_shallow")));
 }
 
 #[divan::bench]

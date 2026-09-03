@@ -94,6 +94,89 @@ struct DeviceRow {
 
 /// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
 const ID_PARAM_CHUNK: usize = 900;
+
+/// The statements behind the app-state version and MAC writes, shared by the
+/// single-purpose methods and the fused per-patch commit so the two cannot
+/// drift.
+fn upsert_app_state_version(
+    conn: &mut SqliteConnection,
+    name: &str,
+    data: &[u8],
+    device_id: i32,
+) -> std::result::Result<(), DieselError> {
+    diesel::insert_into(app_state_versions::table)
+        .values((
+            app_state_versions::name.eq(name),
+            app_state_versions::state_data.eq(data),
+            app_state_versions::device_id.eq(device_id),
+        ))
+        .on_conflict((app_state_versions::name, app_state_versions::device_id))
+        .do_update()
+        .set(app_state_versions::state_data.eq(data))
+        .execute(conn)?;
+    Ok(())
+}
+
+fn insert_app_state_mutation_macs(
+    conn: &mut SqliteConnection,
+    name: &str,
+    version: u64,
+    mutations: &[AppStateMutationMAC],
+    device_id: i32,
+) -> std::result::Result<(), DieselError> {
+    let records: Vec<_> = mutations
+        .iter()
+        .map(|m| {
+            (
+                app_state_mutation_macs::name.eq(name),
+                app_state_mutation_macs::version.eq(version as i64),
+                app_state_mutation_macs::index_mac.eq(&m.index_mac),
+                app_state_mutation_macs::value_mac.eq(&m.value_mac),
+                app_state_mutation_macs::device_id.eq(device_id),
+            )
+        })
+        .collect();
+    // SQLite's variable limit is typically 999 or 32766; five columns per
+    // row keeps 100 rows at 500 parameters.
+    const CHUNK_SIZE: usize = 100;
+    for chunk in records.chunks(CHUNK_SIZE) {
+        diesel::insert_into(app_state_mutation_macs::table)
+            .values(chunk)
+            .on_conflict((
+                app_state_mutation_macs::name,
+                app_state_mutation_macs::index_mac,
+                app_state_mutation_macs::device_id,
+            ))
+            .do_update()
+            .set((
+                app_state_mutation_macs::version.eq(excluded(app_state_mutation_macs::version)),
+                app_state_mutation_macs::value_mac.eq(excluded(app_state_mutation_macs::value_mac)),
+            ))
+            .execute(conn)?;
+    }
+    Ok(())
+}
+
+fn delete_app_state_mutation_macs(
+    conn: &mut SqliteConnection,
+    name: &str,
+    index_macs: &[Vec<u8>],
+    device_id: i32,
+) -> std::result::Result<(), DieselError> {
+    const CHUNK_SIZE: usize = 500;
+    for chunk in index_macs.chunks(CHUNK_SIZE) {
+        diesel::delete(
+            app_state_mutation_macs::table.filter(
+                app_state_mutation_macs::name
+                    .eq(name)
+                    .and(app_state_mutation_macs::index_mac.eq_any(chunk))
+                    .and(app_state_mutation_macs::device_id.eq(device_id)),
+            ),
+        )
+        .execute(conn)?;
+    }
+    Ok(())
+}
 /// Eight bound columns per row keep this below SQLite's default 999-parameter
 /// limit while bounding Diesel's temporary insert-expression allocation.
 const MSG_SECRET_INSERT_CHUNK_SIZE: usize = 100;
@@ -200,8 +283,8 @@ pub struct SqliteStoreConfig {
     /// write lock.
     pub pool_size: u32,
     /// Extra connections reserved for read-only work, each free to run while a
-    /// write holds the write permit. `0` (default) keeps every operation on the
-    /// single queue, exactly as before this knob existed. This covers the
+    /// write holds the write permit. `0` keeps every operation on the single
+    /// queue, exactly as before this knob existed; the default is `1`. This covers the
     /// store's own reads (sessions, identities, sender keys) as well as
     /// [`SharedSqlite::read`](crate::SharedSqlite::read).
     ///
@@ -212,8 +295,8 @@ pub struct SqliteStoreConfig {
     /// path keeps its own, so a burst of readers can never starve the writer.
     ///
     /// Costs one connection's page cache ([`cache_size_kib`](Self::cache_size_kib))
-    /// each, which is why it is off by default in a process holding many
-    /// per-session stores.
+    /// each, which is the reason to set it to `0` in a process holding many
+    /// per-session stores that read rarely.
     pub read_pool_size: u32,
     /// `PRAGMA cache_size`, in KiB per connection.
     ///
@@ -252,7 +335,12 @@ impl Default for SqliteStoreConfig {
     fn default() -> Self {
         Self {
             pool_size: 1,
-            read_pool_size: 0,
+            // One reader connection by default (~100 KiB): without it every
+            // read waited out whatever the write permit was doing, and a
+            // `get_session` issued during a write-behind flush measured
+            // p50 7.2 ms / p99 22.8 ms against 0.17 ms / 4.0 ms with a
+            // reader pool. A process holding many stores can set it back to 0.
+            read_pool_size: 1,
             cache_size_kib: 512,
             mmap_size: None,
             busy_timeout: Duration::from_secs(30),
@@ -567,10 +655,12 @@ impl SqliteStore {
         } else {
             None
         };
+        // Info, not warn: the default asks for one reader, so an in-memory or
+        // rollback-journal database would otherwise warn on every open.
         if read_pool_size > 0
             && let Some(reason) = &declined
         {
-            log::warn!("sqlite-storage: read_pool_size={read_pool_size} ignored, {reason}");
+            log::info!("sqlite-storage: read_pool_size={read_pool_size} ignored, {reason}");
         }
         let reads = if read_pool_size > 0 && declined.is_none() {
             let manager = ConnectionManager::<SqliteConnection>::new(&db_url);
@@ -1688,22 +1778,14 @@ impl SqliteStore {
         device_id: i32,
     ) -> Result<()> {
         let name = name.to_string();
-        let data = crate::wire::encode_hash_state(&state);
+        // Behind an `Arc` so a retry attempt clones a refcount, not the
+        // encoded state; same shape as `put_lid_mappings`.
+        let data = Arc::new(crate::wire::encode_hash_state(&state));
         self.with_retry("set_app_state_version", || {
             let name = name.clone();
-            let data = data.clone();
+            let data = Arc::clone(&data);
             Box::new(move |conn: &mut SqliteConnection| {
-                diesel::insert_into(app_state_versions::table)
-                    .values((
-                        app_state_versions::name.eq(&name),
-                        app_state_versions::state_data.eq(&data),
-                        app_state_versions::device_id.eq(device_id),
-                    ))
-                    .on_conflict((app_state_versions::name, app_state_versions::device_id))
-                    .do_update()
-                    .set(app_state_versions::state_data.eq(&data))
-                    .execute(conn)?;
-                Ok(())
+                upsert_app_state_version(conn, &name, &data, device_id)
             })
         })
         .await
@@ -1720,50 +1802,18 @@ impl SqliteStore {
             return Ok(());
         }
         let name = name.to_string();
-        let mutations: Vec<AppStateMutationMAC> = mutations.to_vec();
+        // One owned copy of the batch, shared across retry attempts: a
+        // 3000-MAC snapshot apply cloned 6000 `Vec<u8>` per attempt before.
+        let mutations: Arc<[AppStateMutationMAC]> = Arc::from(mutations);
         self.with_retry("put_app_state_mutation_macs", || {
             let name = name.clone();
-            let mutations = mutations.clone();
+            let mutations = Arc::clone(&mutations);
             Box::new(move |conn: &mut SqliteConnection| {
-                let records: Vec<_> = mutations
-                    .iter()
-                    .map(|m| {
-                        (
-                            app_state_mutation_macs::name.eq(&name),
-                            app_state_mutation_macs::version.eq(version as i64),
-                            app_state_mutation_macs::index_mac.eq(&m.index_mac),
-                            app_state_mutation_macs::value_mac.eq(&m.value_mac),
-                            app_state_mutation_macs::device_id.eq(device_id),
-                        )
-                    })
-                    .collect();
-
-                // SQLite variable limit is typically 999 or 32766.
-                // Each row has 5 columns. 100 rows * 5 = 500 params, which is safe.
-                const CHUNK_SIZE: usize = 100;
-
                 // Chunking is a parameter-limit workaround, not a commit
                 // boundary: a reader that lands between two chunks must not see
                 // half a batch.
                 conn.transaction(|conn| {
-                    for chunk in records.chunks(CHUNK_SIZE) {
-                        diesel::insert_into(app_state_mutation_macs::table)
-                            .values(chunk)
-                            .on_conflict((
-                                app_state_mutation_macs::name,
-                                app_state_mutation_macs::index_mac,
-                                app_state_mutation_macs::device_id,
-                            ))
-                            .do_update()
-                            .set((
-                                app_state_mutation_macs::version
-                                    .eq(excluded(app_state_mutation_macs::version)),
-                                app_state_mutation_macs::value_mac
-                                    .eq(excluded(app_state_mutation_macs::value_mac)),
-                            ))
-                            .execute(conn)?;
-                    }
-                    Ok(())
+                    insert_app_state_mutation_macs(conn, &name, version, &mutations, device_id)
                 })
             })
         })
@@ -1780,28 +1830,50 @@ impl SqliteStore {
             return Ok(());
         }
         let name = name.to_string();
-        let index_macs: Vec<Vec<u8>> = index_macs.to_vec();
+        let index_macs: Arc<[Vec<u8>]> = Arc::from(index_macs);
         self.with_retry("delete_app_state_mutation_macs", || {
             let name = name.clone();
-            let index_macs = index_macs.clone();
+            let index_macs = Arc::clone(&index_macs);
             Box::new(move |conn: &mut SqliteConnection| {
-                // SQLite variable limit is usually 999 or higher.
-                // We use a safe chunk size to stay well within limits.
-                const CHUNK_SIZE: usize = 500;
-
                 conn.transaction(|conn| {
-                    for chunk in index_macs.chunks(CHUNK_SIZE) {
-                        diesel::delete(
-                            app_state_mutation_macs::table.filter(
-                                app_state_mutation_macs::name
-                                    .eq(&name)
-                                    .and(app_state_mutation_macs::index_mac.eq_any(chunk))
-                                    .and(app_state_mutation_macs::device_id.eq(device_id)),
-                            ),
-                        )
-                        .execute(conn)?;
-                    }
+                    delete_app_state_mutation_macs(conn, &name, &index_macs, device_id)?;
                     Ok(())
+                })
+            })
+        })
+        .await
+    }
+
+    /// One applied patch — version, removed MACs, added MACs — in ONE
+    /// transaction. The three single-purpose writes each cost a permit, a
+    /// `spawn_blocking` and a WAL commit (~65 us each on a file-backed store),
+    /// which for the small patches of a paged incremental sync was 155 us of
+    /// the 270 us a patch took to persist. Committing them together is also
+    /// strictly stronger than either order the sync loop used: the version
+    /// can no longer land without the MACs it pairs with.
+    pub async fn commit_app_state_patch_for_device(
+        &self,
+        name: &str,
+        state: &HashState,
+        removed_index_macs: &[Vec<u8>],
+        added: &[AppStateMutationMAC],
+        device_id: i32,
+    ) -> Result<()> {
+        let name = name.to_string();
+        let version = state.version;
+        let data = Arc::new(crate::wire::encode_hash_state(state));
+        let removed: Arc<[Vec<u8>]> = Arc::from(removed_index_macs);
+        let added: Arc<[AppStateMutationMAC]> = Arc::from(added);
+        self.with_retry("commit_app_state_patch", || {
+            let name = name.clone();
+            let data = Arc::clone(&data);
+            let removed = Arc::clone(&removed);
+            let added = Arc::clone(&added);
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    upsert_app_state_version(conn, &name, &data, device_id)?;
+                    delete_app_state_mutation_macs(conn, &name, &removed, device_id)?;
+                    insert_app_state_mutation_macs(conn, &name, version, &added, device_id)
                 })
             })
         })
@@ -2668,6 +2740,23 @@ impl AppSyncStore for SqliteStore {
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()> {
         self.delete_app_state_mutation_macs_for_device(name, index_macs, self.device_id)
             .await
+    }
+
+    async fn commit_patch(
+        &self,
+        name: &str,
+        state: HashState,
+        removed_index_macs: &[Vec<u8>],
+        added: &[AppStateMutationMAC],
+    ) -> Result<()> {
+        self.commit_app_state_patch_for_device(
+            name,
+            &state,
+            removed_index_macs,
+            added,
+            self.device_id,
+        )
+        .await
     }
 
     async fn clear_mutation_macs(&self, name: &str) -> Result<()> {

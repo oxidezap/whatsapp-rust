@@ -634,6 +634,32 @@ impl CoreEventBus {
             }
         }
     }
+
+    /// Dispatch an event that is only built when somebody is listening for
+    /// `kind`.
+    ///
+    /// [`Self::dispatch`] already costs nothing once it is called with no
+    /// interested handler — but the payload has been built by then, and for a
+    /// producer whose payload is a `Vec` (a group notification's participants,
+    /// a device list) or a set of owned strings that construction *is* the
+    /// whole cost of the notification for a consumer that does not want it.
+    /// Callers whose payload is a couple of `Jid` clones should keep using
+    /// `dispatch`: the closure buys nothing there and reads worse.
+    ///
+    /// `kind` must be the kind `build` returns; a mismatch would gate on one
+    /// kind and deliver another, so it is checked in debug builds.
+    pub fn dispatch_with(&self, kind: EventKind, build: impl FnOnce() -> Event) {
+        if !self.has_handler_for(kind) {
+            return;
+        }
+        let event = build();
+        debug_assert_eq!(
+            event.kind(),
+            kind,
+            "dispatch_with gated on a different kind than it built"
+        );
+        self.dispatch(event);
+    }
 }
 
 /// Payload of the retired [`Event::RetiredPushNameUpdate`], kept only so that

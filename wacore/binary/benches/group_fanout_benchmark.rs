@@ -11,7 +11,7 @@
 use divan::black_box;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::jid::Jid;
-use wacore_binary::marshal::marshal_exact;
+use wacore_binary::marshal::{marshal_exact, marshal_shallow};
 use wacore_binary::node::Node;
 
 fn main() {
@@ -83,14 +83,23 @@ fn create_skdm_fanout_node(width: usize) -> Node {
 // warm stanza grew a per-participant node") apart from a group that is merely
 // redistributing.
 //
-// `marshal_exact`, not `marshal_auto`: every outbound stanza goes through
-// `Client::marshal_node_for_send`, which picks the two-pass exact strategy.
-// The two differ in exactly what this sweep is measuring — one-pass reserves
-// and grows, two-pass plans the size first and replays a hint tape — so the
-// wrong one would track a path no group send takes.
+// Both marshal strategies, swept together: `marshal_shallow` is what
+// `Client::marshal_node_for_send` sends through today, and `marshal_exact` is
+// what it sent through before. They differ in exactly what this sweep
+// measures — one pass into a buffer reserved from a sampled estimate, against
+// a size-and-hint pass followed by a write pass — and the gap between them is
+// proportional to the width, so keeping the old arm is what makes the
+// replacement's slope readable rather than merely asserted.
 #[divan::bench(args = [8, 32, 128, 512])]
 fn bench_marshal_exact_group_fanout(bencher: divan::Bencher, width: usize) {
     bencher
         .with_inputs(|| create_skdm_fanout_node(width))
-        .bench_refs(|node| black_box(marshal_exact(black_box(node)).unwrap()));
+        .bench_refs(|node| black_box(marshal_exact(black_box(node)).expect("marshal_exact")));
+}
+
+#[divan::bench(args = [8, 32, 128, 512])]
+fn bench_marshal_shallow_group_fanout(bencher: divan::Bencher, width: usize) {
+    bencher
+        .with_inputs(|| create_skdm_fanout_node(width))
+        .bench_refs(|node| black_box(marshal_shallow(black_box(node)).expect("marshal_shallow")));
 }

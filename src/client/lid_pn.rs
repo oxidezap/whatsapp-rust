@@ -1158,7 +1158,7 @@ impl Client {
         self.get_lid_pn_entry_by_user(&jid.user, is_lid).await
     }
 
-    async fn get_lid_pn_entry_by_user(
+    pub(crate) async fn get_lid_pn_entry_by_user(
         &self,
         user: &str,
         is_lid: bool,

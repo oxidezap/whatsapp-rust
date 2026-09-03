@@ -1,6 +1,6 @@
 use crate::client::Client;
 use crate::lid_pn_cache::LearningSource;
-use crate::types::events::Event;
+use crate::types::events::{Event, EventKind};
 use log::{debug, warn};
 use std::sync::Arc;
 use wacore::types::events::{
@@ -271,15 +271,20 @@ pub(crate) async fn handle_contacts_notification(client: &Arc<Client>, node: &No
                 "Contact number changed: {} -> {} (old_lid={:?}, new_lid={:?})",
                 old_jid.observe(), new_jid.observe(), old_lid, new_lid
             );
-            client.core.event_bus.dispatch(Event::ContactNumberChanged(
-                ContactNumberChanged::builder()
-                    .old_jid(old_jid)
-                    .new_jid(new_jid)
-                    .maybe_old_lid(old_lid)
-                    .maybe_new_lid(new_lid)
-                    .timestamp(timestamp)
-                    .build(),
-            ));
+            client
+                .core
+                .event_bus
+                .dispatch_with(EventKind::ContactNumberChanged, || {
+                    Event::ContactNumberChanged(
+                        ContactNumberChanged::builder()
+                            .old_jid(old_jid)
+                            .new_jid(new_jid)
+                            .maybe_old_lid(old_lid)
+                            .maybe_new_lid(new_lid)
+                            .timestamp(timestamp)
+                            .build(),
+                    )
+                });
         }
         "sync" => {
             let after = child
