@@ -193,6 +193,15 @@ figures come from the `wacore::stats::HeapSize` trait:
   payload storage, and lifetime peaks. Inline payloads count while queued;
   external payloads contribute their `Vec` capacity once materialized.
 
+- Inflate state is not in the report: it is per thread, not per client.
+  `wacore_binary::zlib_pool` parks one `zlib_rs::Inflate` (one ~47.5 KB block,
+  state plus the 32 KB window) per thread that ever inflated anything, shared
+  by the one-shot path (`decompress_zlib_pooled`) and the streaming one
+  (`InflateReader`, and `NodeStream` over a compressed frame). A target that
+  cannot spare it sets `set_pool_retention(0)`; one that cannot allocate it
+  late calls `warm_pool()` on the read-loop thread while the heap is fresh.
+  `parked_states()` reports the count for the current thread.
+
 Semantics: honest estimates for attribution and leak detection, not
 byte-exact accounting. The e2e `memory_soak.rs` logs the byte totals next to
 RSS; its growth-bound assertions are on entry counts.

@@ -23,13 +23,14 @@
 //! Verified against WhatsApp Web JS (WASmaxOutAbPropsGetExperimentConfigRequest,
 //! WASmaxInAbPropsConfigs).
 
-use crate::iq::spec::IqSpec;
+use crate::iq::spec::{IqSpec, IqStreamSpec};
 use crate::protocol::ProtocolNode;
 use crate::request::InfoQuery;
+use std::collections::HashSet;
 use wacore_binary::CompactString;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, Server};
-use wacore_binary::{Node, NodeContent, NodeRef};
+use wacore_binary::{Node, NodeContent, NodeRef, NodeStream};
 
 /// IQ namespace for A/B props.
 pub const PROPS_NAMESPACE: &str = "abt";
@@ -345,6 +346,9 @@ pub struct PropsSpec {
     pub hash: Option<String>,
     /// Optional refresh ID (for emergency push updates).
     pub refresh_id: Option<u32>,
+    /// Codes to keep when the response is consumed as a stream; `None` keeps
+    /// every prop. See [`Self::retaining`].
+    pub retain: Option<HashSet<u32>>,
 }
 
 impl PropsSpec {
@@ -357,16 +361,82 @@ impl PropsSpec {
     pub fn with_hash(hash: impl Into<String>) -> Self {
         Self {
             hash: Some(hash.into()),
-            refresh_id: None,
+            ..Self::default()
         }
     }
 
     /// Create a props spec with a refresh_id for emergency push responses.
     pub fn with_refresh_id(refresh_id: u32) -> Self {
         Self {
-            hash: None,
             refresh_id: Some(refresh_id),
+            ..Self::default()
         }
+    }
+
+    /// Keep only these codes in the response.
+    ///
+    /// A full response carries the whole catalog, a few thousand props, of
+    /// which a client reads a couple of dozen. Filtering while the stream is
+    /// walked means the response never exists in memory as more than one
+    /// `<prop>` at a time plus what is kept. A response decoded as a tree is
+    /// filtered the same way, so the spec answers alike whichever way its
+    /// response arrived.
+    pub fn retaining(mut self, codes: impl IntoIterator<Item = u32>) -> Self {
+        self.retain = Some(codes.into_iter().collect());
+        self
+    }
+
+    fn keeps(&self, code: u32) -> bool {
+        self.retain.as_ref().is_none_or(|keep| keep.contains(&code))
+    }
+}
+
+impl IqStreamSpec for PropsSpec {
+    fn consume_response(
+        &self,
+        stream: &mut NodeStream<'_>,
+    ) -> Result<Self::Response, anyhow::Error> {
+        use crate::iq::node::optional_attr;
+
+        // Descend into <props>, skipping any sibling in front of it.
+        let mut response = loop {
+            let Some(head) = stream.open()? else {
+                return Err(anyhow::anyhow!("<props> child not found"));
+            };
+            if head.tag != "props" {
+                stream.close()?;
+                continue;
+            }
+            break PropsResponse {
+                ab_key: head.attr_str("ab_key").map(|s| s.into_owned()),
+                hash: head.attr_str("hash").map(|s| s.into_owned()),
+                refresh: head.attr_str("refresh").and_then(|s| s.parse().ok()),
+                refresh_id: head.attr_str("refresh_id").and_then(|s| s.parse().ok()),
+                delta_update: head
+                    .attr_str("delta_update")
+                    .map(|s| s == "true")
+                    .unwrap_or(false),
+                experiment_props: Vec::new(),
+            };
+        };
+
+        // The same selection `PropsResponse::try_from_node_ref` makes, one
+        // child at a time: experiment props only, sampling props skipped.
+        while let Some(child) = stream.next_child()? {
+            if child.tag == "prop"
+                && let Some(code_str) = optional_attr(&child, "config_code")
+                && let Ok(code) = code_str.parse::<u32>()
+                && code > 0
+                && self.keeps(code)
+                && let Some(value) = optional_attr(&child, "config_value")
+            {
+                response
+                    .experiment_props
+                    .push((code, CompactString::from(value.as_ref())));
+            }
+        }
+        stream.close()?;
+        Ok(response)
     }
 }
 
@@ -395,7 +465,13 @@ impl IqSpec for PropsSpec {
         use crate::iq::node::required_child;
 
         let props_node = required_child(response, "props")?;
-        PropsResponse::try_from_node_ref(props_node)
+        let mut parsed = PropsResponse::try_from_node_ref(props_node)?;
+        if self.retain.is_some() {
+            parsed
+                .experiment_props
+                .retain(|(code, _)| self.keeps(*code));
+        }
+        Ok(parsed)
     }
 }
 
@@ -646,5 +722,69 @@ mod tests {
 
         assert_eq!(parsed.event_code, prop.event_code);
         assert_eq!(parsed.sampling_weight, prop.sampling_weight);
+    }
+
+    /// The streamed consumer and the tree parser are two readings of one wire
+    /// format and must agree, with and without a retained-code filter, on a
+    /// response that also carries the sampling props and a leading sibling
+    /// the client has no use for.
+    #[test]
+    fn streamed_consume_matches_tree_parse() {
+        let props: Vec<Node> = (1..=300u32)
+            .flat_map(|i| {
+                let mut nodes = vec![
+                    NodeBuilder::new("prop")
+                        .attr("config_code", i)
+                        .attr("config_value", format!("v{i}"))
+                        .build(),
+                ];
+                if i % 10 == 0 {
+                    nodes.push(
+                        NodeBuilder::new("prop")
+                            .attr("event_code", i)
+                            .attr("sampling_weight", 100)
+                            .build(),
+                    );
+                }
+                nodes
+            })
+            .collect();
+        let props_node = NodeBuilder::new("props")
+            .attr("protocol", "1")
+            .attr("ab_key", "key")
+            .attr("hash", "h1")
+            .attr("refresh", 3600u32)
+            .attr("refresh_id", 5u32)
+            .attr("delta_update", "false")
+            .children(props)
+            .build();
+        let iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", "1")
+            .children(vec![NodeBuilder::new("unrelated").build(), props_node])
+            .build();
+        let packed = wacore_binary::marshal::marshal(&iq).unwrap();
+
+        for spec in [PropsSpec::new(), PropsSpec::new().retaining([3, 30, 999])] {
+            let owned = wacore_binary::OwnedNodeRef::new(packed[1..].to_vec()).unwrap();
+            let tree = spec.parse_response(owned.get()).unwrap();
+
+            let mut stream = NodeStream::from_packed(&packed).unwrap();
+            stream.open().unwrap().expect("root");
+            let streamed = spec.consume_response(&mut stream).unwrap();
+            stream.finish().unwrap();
+
+            assert_eq!(streamed.ab_key, tree.ab_key);
+            assert_eq!(streamed.hash, tree.hash);
+            assert_eq!(streamed.refresh, tree.refresh);
+            assert_eq!(streamed.refresh_id, tree.refresh_id);
+            assert_eq!(streamed.delta_update, tree.delta_update);
+            assert_eq!(streamed.experiment_props, tree.experiment_props);
+            if spec.retain.is_some() {
+                assert_eq!(streamed.experiment_props.len(), 2);
+            } else {
+                assert_eq!(streamed.experiment_props.len(), 300);
+            }
+        }
     }
 }

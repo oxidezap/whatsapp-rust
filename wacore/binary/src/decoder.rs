@@ -45,7 +45,26 @@ static NIBBLE_PAIRS: [[u8; 2]; 256] = {
 
 /// Node-nesting cap rejecting deep-`LIST` frames that would overflow the stack via
 /// unbounded `read_node_ref` recursion (real WA trees are well under 20 levels).
-const MAX_NODE_DEPTH: usize = 128;
+pub(crate) const MAX_NODE_DEPTH: usize = 128;
+
+/// A node's head as [`Decoder::read_node_open`] decodes it, its children left
+/// in the input.
+pub(crate) struct NodeOpen<'a> {
+    pub(crate) tag: NodeStr<'a>,
+    pub(crate) attrs: AttrsRef<'a>,
+    pub(crate) content: OpenContent<'a>,
+}
+
+/// What follows a node's attributes on the wire.
+#[derive(Debug, PartialEq)]
+pub enum OpenContent<'a> {
+    /// Nothing, or an empty list.
+    None,
+    /// A list of this many child nodes, each still to be decoded.
+    Children(usize),
+    /// A string or a byte payload: decoded whole, since it has no parts.
+    Scalar(NodeContentRef<'a>),
+}
 
 pub(crate) struct Decoder<'a> {
     data: &'a [u8],
@@ -437,11 +456,6 @@ impl<'a> Decoder<'a> {
         Ok(AttrsRef::from_vec(v))
     }
 
-    fn read_content(&mut self, depth: usize) -> Result<Option<NodeContentRef<'a>>> {
-        let tag = self.read_u8()?;
-        self.read_content_from_tag(tag, depth)
-    }
-
     #[inline(always)]
     fn read_content_from_tag(
         &mut self,
@@ -491,12 +505,18 @@ impl<'a> Decoder<'a> {
         self.read_node_ref_at(0)
     }
 
-    fn read_node_ref_at(&mut self, depth: usize) -> Result<NodeRef<'a>> {
-        // Reject before recursing, so a hostile deep-LIST frame errors instead of
-        // aborting the process on a stack overflow.
-        if depth >= MAX_NODE_DEPTH {
-            return Err(BinaryError::MaxDepthExceeded);
-        }
+    /// Bytes consumed so far: what a caller feeding this decoder from a larger
+    /// buffer has to drop once it is done with what was decoded.
+    #[inline]
+    pub(crate) fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Decode a node's head only: tag, attributes and what its content is,
+    /// leaving any child nodes unread for the caller to decode one at a time.
+    /// The counterpart of [`Self::read_node_ref_at`] for a node too large to
+    /// hold as a tree; it reads exactly the bytes that precede the first child.
+    pub(crate) fn read_node_open(&mut self) -> Result<NodeOpen<'a>> {
         let tag = self.read_u8()?;
         let list_size = self.read_list_size(tag)?;
         if list_size == 0 {
@@ -512,14 +532,187 @@ impl<'a> Decoder<'a> {
 
         let attrs = self.read_attributes(attr_count)?;
         let content = if has_content {
-            self.read_content(depth)?
+            let content_tag = self.read_u8()?;
+            match content_tag {
+                token::LIST_EMPTY => OpenContent::None,
+                token::LIST_8 | token::LIST_16 => {
+                    OpenContent::Children(self.read_list_size(content_tag)?)
+                }
+                // Depth 0 is fine: a scalar never recurses.
+                _ => match self.read_content_from_tag(content_tag, 0)? {
+                    Some(scalar) => OpenContent::Scalar(scalar),
+                    None => OpenContent::None,
+                },
+            }
         } else {
-            None
+            OpenContent::None
+        };
+
+        Ok(NodeOpen {
+            tag,
+            attrs,
+            content,
+        })
+    }
+
+    /// Walk past one value token without building anything: the measuring
+    /// pass of a streaming decode, which has to learn how many bytes a node
+    /// takes before it can decode it from a buffer it may still have to grow.
+    ///
+    /// Mirrors [`Self::read_value`] token for token, validation included: a
+    /// string that is not UTF-8 or a packed nibble outside its alphabet is an
+    /// error here as it is there, so a node the stream skips unread is held
+    /// to what the tree decoder would have rejected. The JID forms reuse the
+    /// readers because their layout is validation, not just length.
+    fn skip_value(&mut self) -> Result<()> {
+        let tag = self.read_u8()?;
+        self.skip_value_from_tag(tag)
+    }
+
+    fn skip_value_from_tag(&mut self, tag: u8) -> Result<()> {
+        match tag {
+            token::LIST_EMPTY => Ok(()),
+            token::BINARY_8 => {
+                let size = self.read_u8()? as usize;
+                self.read_string(size).map(drop)
+            }
+            token::BINARY_20 => {
+                let size = self.read_u20_be()? as usize;
+                self.read_string(size).map(drop)
+            }
+            token::BINARY_32 => {
+                let size = self.read_u32_be()? as usize;
+                self.read_string(size).map(drop)
+            }
+            token::JID_PAIR => self.read_jid_pair().map(drop),
+            token::AD_JID => self.read_ad_jid().map(drop),
+            token::INTEROP_JID => self.read_interop_jid().map(drop),
+            token::FB_JID => self.read_fb_jid().map(drop),
+            token::NIBBLE_8 | token::HEX_8 => {
+                let len = (self.read_u8()? & 0x7F) as usize;
+                let packed = self.read_bytes(len)?;
+                // Every byte is a valid hex pair; only nibbles have holes.
+                if tag == token::NIBBLE_8
+                    && let Some(&byte) = packed.iter().find(|&&byte| {
+                        let pair = NIBBLE_PAIRS[byte as usize];
+                        pair[0] == NIBBLE_INVALID || pair[1] == NIBBLE_INVALID
+                    })
+                {
+                    Self::unpack_nibble((byte & 0xF0) >> 4)?;
+                    Self::unpack_nibble(byte & 0x0F)?;
+                }
+                Ok(())
+            }
+            tag @ token::DICTIONARY_0..=token::DICTIONARY_3 => {
+                let index = self.read_u8()?;
+                token::get_double_token(tag - token::DICTIONARY_0, index)
+                    .map(drop)
+                    .ok_or(BinaryError::InvalidToken(tag))
+            }
+            _ => token::get_single_token(tag)
+                .map(drop)
+                .ok_or(BinaryError::InvalidToken(tag)),
+        }
+    }
+
+    /// Walk past a node's scalar content, whose tag has been read. Binary
+    /// content is opaque to [`Self::read_content_from_tag`] too, so only its
+    /// length is checked; anything else is a string value and validated as one.
+    fn skip_scalar_content(&mut self, tag: u8) -> Result<()> {
+        match tag {
+            token::BINARY_8 => {
+                let len = self.read_u8()? as usize;
+                self.read_bytes(len).map(drop)
+            }
+            token::BINARY_20 => {
+                let len = self.read_u20_be()? as usize;
+                self.read_bytes(len).map(drop)
+            }
+            token::BINARY_32 => {
+                let len = self.read_u32_be()? as usize;
+                self.read_bytes(len).map(drop)
+            }
+            _ => self.skip_value_from_tag(tag),
+        }
+    }
+
+    /// Walk past a node's head (through the child count, when it has one) and
+    /// report how many children were announced. The measuring twin of
+    /// [`Self::read_node_open`].
+    pub(crate) fn skip_node_open(&mut self) -> Result<usize> {
+        let tag = self.read_u8()?;
+        let list_size = self.read_list_size(tag)?;
+        if list_size == 0 {
+            return Err(BinaryError::InvalidNode);
+        }
+        // The same two shapes `read_node_open` refuses: a node with no tag,
+        // and an attribute whose key is not a string.
+        let tag_token = self.read_u8()?;
+        if tag_token == token::LIST_EMPTY {
+            return Err(BinaryError::InvalidNode);
+        }
+        self.skip_value_from_tag(tag_token)?;
+        let attr_count = (list_size - 1) / 2;
+        for _ in 0..attr_count {
+            let key_token = self.read_u8()?;
+            if key_token == token::LIST_EMPTY {
+                return Err(BinaryError::NonStringKey);
+            }
+            self.skip_value_from_tag(key_token)?;
+            self.skip_value()?;
+        }
+        if !list_size.is_multiple_of(2) {
+            return Ok(0);
+        }
+        let content_tag = self.read_u8()?;
+        match content_tag {
+            token::LIST_EMPTY => Ok(0),
+            token::LIST_8 | token::LIST_16 => self.read_list_size(content_tag),
+            _ => {
+                self.skip_scalar_content(content_tag)?;
+                Ok(0)
+            }
+        }
+    }
+
+    /// Walk past a whole node, subtree included. The measuring twin of
+    /// [`Self::read_node_ref_at`], with the same depth cap.
+    pub(crate) fn skip_node_at(&mut self, depth: usize) -> Result<()> {
+        if depth >= MAX_NODE_DEPTH {
+            return Err(BinaryError::MaxDepthExceeded);
+        }
+        let children = self.skip_node_open()?;
+        for _ in 0..children {
+            self.skip_node_at(depth + 1)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_node_ref_at(&mut self, depth: usize) -> Result<NodeRef<'a>> {
+        // Reject before recursing, so a hostile deep-LIST frame errors instead of
+        // aborting the process on a stack overflow.
+        if depth >= MAX_NODE_DEPTH {
+            return Err(BinaryError::MaxDepthExceeded);
+        }
+        // One head reader for both decoders: the tree is the head plus its
+        // children read whole, which is also what keeps the two in agreement
+        // on what a malformed head is.
+        let head = self.read_node_open()?;
+        let content = match head.content {
+            OpenContent::None => None,
+            OpenContent::Scalar(scalar) => Some(scalar),
+            OpenContent::Children(count) => {
+                let mut nodes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    nodes.push(self.read_node_ref_at(depth + 1)?);
+                }
+                Some(NodeContentRef::Nodes(nodes.into_boxed_slice()))
+            }
         };
 
         Ok(NodeRef {
-            tag,
-            attrs,
+            tag: head.tag,
+            attrs: head.attrs,
             content,
         })
     }

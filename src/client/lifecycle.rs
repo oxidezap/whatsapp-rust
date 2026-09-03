@@ -387,6 +387,7 @@ impl Client {
 
         let device_topology = device_topology::DeviceTopology::new();
         let sent_frame_tap = Arc::new(SentFrameTap::new(core.event_bus.clone()));
+        let stream_waiter_count = Arc::new(AtomicUsize::new(0));
         let this = Self {
             runtime: runtime.clone(),
             core,
@@ -417,7 +418,10 @@ impl Client {
             transport_factory,
             noise_socket: Arc::new(std::sync::Mutex::new(None)),
 
-            response_waiters: Arc::new(std::sync::Mutex::new(ResponseWaiterMap::default())),
+            response_waiters: Arc::new(std::sync::Mutex::new(
+                ResponseWaiterMap::with_stream_counter(Arc::clone(&stream_waiter_count)),
+            )),
+            stream_waiter_count,
             node_waiters: std::sync::Mutex::new(Vec::new()),
             node_waiter_count: AtomicUsize::new(0),
             sent_node_waiters: std::sync::Mutex::new(Vec::new()),
@@ -589,6 +593,7 @@ impl Client {
             override_version,
             app_version_fallback: std::sync::Mutex::new(None),
             skip_history_sync: AtomicBool::new(false),
+            ab_props_fetch: AtomicBool::new(true),
             automatic_presence: AtomicBool::new(true),
             wanted_pre_key_count: AtomicUsize::new(crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT),
             cache_config,

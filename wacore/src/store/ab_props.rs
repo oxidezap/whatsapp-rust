@@ -48,6 +48,13 @@ impl AbPropsCache {
             .extend(props.iter().map(|p| p.code));
     }
 
+    /// The codes a fetch has to keep: a snapshot of the interest set, taken at
+    /// request time so the response can be filtered as it streams in without
+    /// holding the lock across the read loop.
+    pub async fn interest(&self) -> HashSet<u32> {
+        self.interest.read().await.clone()
+    }
+
     /// True after the first full (non-delta) update.
     pub fn is_seeded(&self) -> bool {
         self.seeded.load(Ordering::Acquire)
