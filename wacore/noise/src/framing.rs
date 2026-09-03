@@ -1,4 +1,4 @@
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use log::trace;
 
 pub const FRAME_LENGTH_SIZE: usize = 3;
@@ -181,6 +181,35 @@ impl FrameDecoder {
     pub fn feed(&mut self, data: &[u8]) {
         self.reserve_for(data.len());
         self.buffer.extend_from_slice(data);
+    }
+
+    /// Feeds a transport read, adopting its allocation instead of copying it
+    /// when nothing else holds it.
+    ///
+    /// A read that arrives as its own uniquely-owned `Bytes` (one WebSocket
+    /// message, as the ESP32 and Tokio transports deliver it) was going to get
+    /// its own allocation here anyway once it is bigger than a chunk, since
+    /// `reserve_for` asks for exactly what such a read needs. Copying
+    /// it first meant two copies of the largest frame of a connection were
+    /// alive at once, which on a 400 KB microcontroller is the difference
+    /// between decoding a 28 KB props response and aborting on it. Reads that
+    /// fit in a chunk keep the amortized copy: a fresh allocation per small
+    /// frame is the trade the chunk exists to avoid. A read that shares its
+    /// buffer (a transport handing out views into a larger read buffer), or one
+    /// that lands while an earlier frame is still arriving, is copied as
+    /// [`Self::feed`] would.
+    pub fn feed_owned(&mut self, data: Bytes) {
+        if self.buffer.is_empty() && data.len() >= CHUNK_SIZE {
+            match data.try_into_mut() {
+                Ok(owned) => {
+                    self.grew_oversized |= owned.capacity() > MAX_IDLE_CAPACITY;
+                    self.buffer = owned;
+                }
+                Err(shared) => self.feed(&shared),
+            }
+        } else {
+            self.feed(&data);
+        }
     }
 
     /// Makes room for `incoming` more bytes.
@@ -767,5 +796,72 @@ mod tests {
         assert_eq!(buffer[3], 0);
         assert_eq!(buffer[4], 3);
         assert_eq!(&buffer[5..], &payload[..]);
+    }
+
+    /// A uniquely-owned read at least a chunk long is adopted, not copied: the
+    /// frame that comes out lives in the transport's allocation. This is the
+    /// receive path's largest transient on a memory-constrained target, so the
+    /// adoption is asserted by pointer, not inferred from a byte count.
+    #[test]
+    fn a_unique_read_larger_than_a_chunk_is_adopted_without_a_copy() {
+        let payload = payload(4 * CHUNK_SIZE, 0x5A);
+        let wire = Bytes::from(encode_frame(&payload, None).expect("encode"));
+        let wire_ptr = wire.as_ptr();
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed_owned(wire);
+        let frame = decoder.decode_frame().expect("whole frame");
+        assert_eq!(&frame[..], &payload[..]);
+        assert_eq!(
+            frame.as_ptr(),
+            // The frame starts right after the 3-byte length prefix of the
+            // adopted buffer.
+            wire_ptr.wrapping_add(FRAME_LENGTH_SIZE),
+            "the frame was copied out of a buffer the decoder could have adopted"
+        );
+    }
+
+    /// The two cases that must still copy: a read something else also holds,
+    /// and a read that lands behind a partially received frame. Both decode
+    /// exactly as `feed` would.
+    #[test]
+    fn shared_or_mid_frame_reads_fall_back_to_a_copy() {
+        let payload = payload(4 * CHUNK_SIZE, 0x3C);
+        let wire = Bytes::from(encode_frame(&payload, None).expect("encode"));
+
+        let shared = wire.clone();
+        let mut decoder = FrameDecoder::new();
+        decoder.feed_owned(shared);
+        let frame = decoder.decode_frame().expect("whole frame");
+        assert_eq!(&frame[..], &payload[..]);
+        assert_ne!(
+            frame.as_ptr(),
+            wire.as_ptr().wrapping_add(FRAME_LENGTH_SIZE)
+        );
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&wire[..1]);
+        decoder.feed_owned(wire.slice(1..));
+        let frame = decoder.decode_frame().expect("whole frame");
+        assert_eq!(&frame[..], &payload[..]);
+    }
+
+    /// Reads smaller than a chunk keep sharing the accumulation buffer: an
+    /// allocation per small stanza is what the chunk exists to avoid.
+    #[test]
+    fn a_small_unique_read_still_shares_the_accumulation_buffer() {
+        let first = encode_frame(&payload(64, 1), None).expect("encode");
+        let second = encode_frame(&payload(64, 2), None).expect("encode");
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed_owned(Bytes::from(first));
+        let a = decoder.decode_frame().expect("first frame");
+        decoder.feed_owned(Bytes::from(second));
+        let b = decoder.decode_frame().expect("second frame");
+        assert_eq!(
+            a.as_ptr().wrapping_add(a.len() + FRAME_LENGTH_SIZE),
+            b.as_ptr(),
+            "small frames should be laid out back to back in one chunk"
+        );
     }
 }
