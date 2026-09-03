@@ -46,9 +46,11 @@ pub trait IqSpec {
 /// the `<iq type="result">` element, before its first child, and the spec walks
 /// what it wants and keeps what it needs. Everything else about the request,
 /// including how an error response is reported, is the [`IqSpec`] the spec
-/// already is; [`IqSpec::parse_response`] stays the path for a response the
-/// client had to hold whole anyway (an error stanza, or a session with a raw
-/// node observer attached), so the two must agree on what they produce.
+/// already is. A result the client had to decode whole anyway (a session with
+/// a raw node observer attached) is replayed to [`Self::consume_response`]
+/// over the bytes that tree came from, so this is the only parser the client
+/// runs; [`IqSpec::parse_response`] is what a caller of `execute` gets, and
+/// the two should agree on what they produce.
 ///
 /// The stream runs on the read loop, so consumption should be work
 /// proportional to the response, not I/O.

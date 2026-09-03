@@ -191,11 +191,15 @@ impl<'a> NodeStream<'a> {
         if self.levels.len() >= MAX_NODE_DEPTH {
             return Err(BinaryError::MaxDepthExceeded);
         }
-        let used = self.measure(|decoder| decoder.skip_node_open().map(drop))?;
-        let mut decoder = Decoder::new(&self.source.available()[..used]);
-        let head = decoder.read_node_open()?;
-        self.pending = used;
-        self.levels.push(Level {
+        let Self {
+            source,
+            pending,
+            levels,
+            ..
+        } = self;
+        let (head, used) = Self::decode_next(source, |decoder| decoder.read_node_open())?;
+        *pending = used;
+        levels.push(Level {
             remaining: match head.content {
                 OpenContent::Children(n) => n,
                 _ => 0,
@@ -217,10 +221,11 @@ impl<'a> NodeStream<'a> {
             return Ok(None);
         }
         let depth = self.levels.len();
-        let used = self.measure(|decoder| decoder.skip_node_at(depth))?;
-        let mut decoder = Decoder::new(&self.source.available()[..used]);
-        let node = decoder.read_node_ref_at(depth)?;
-        self.pending = used;
+        let Self {
+            source, pending, ..
+        } = self;
+        let (node, used) = Self::decode_next(source, |decoder| decoder.read_node_ref_at(depth))?;
+        *pending = used;
         Ok(Some(node))
     }
 
@@ -236,7 +241,7 @@ impl<'a> NodeStream<'a> {
             // Skipping still walks every byte: the wire carries no lengths, so
             // a child's end is only known once its tokens have been read.
             let depth = self.levels.len();
-            let used = self.measure(|decoder| decoder.skip_node_at(depth))?;
+            let used = Self::skip_next(&mut self.source, |decoder| decoder.skip_node_at(depth))?;
             self.source.consume(used);
             self.consumed += used;
             remaining -= 1;
@@ -261,7 +266,7 @@ impl<'a> NodeStream<'a> {
         if !self.root_done {
             // Nothing was ever read; the root still has to be walked.
             self.root_done = true;
-            let used = self.measure(|decoder| decoder.skip_node_at(0))?;
+            let used = Self::skip_next(&mut self.source, |decoder| decoder.skip_node_at(0))?;
             self.source.consume(used);
             self.consumed += used;
         }
@@ -335,30 +340,72 @@ impl<'a> NodeStream<'a> {
         }
     }
 
-    /// Make the next node's bytes available and report how many there are.
+    /// Decode the next node out of the window, growing the window and decoding
+    /// again when it ends mid-node. Returns what `decode` produced and how
+    /// many bytes it took.
     ///
-    /// The wire carries no lengths, so the only way to learn a node's size is
-    /// to walk it; `measure` walks without decoding (no allocation), so the
-    /// node is then decoded once, from a slice known to hold all of it. A walk
-    /// that runs out of bytes is retried after the source has grown, asking
-    /// for double each time so the retries stay logarithmic in the node's
-    /// size; a source that cannot grow turns the shortfall into a real
-    /// `UnexpectedEof`.
-    fn measure(&mut self, mut walk: impl FnMut(&mut Decoder<'_>) -> Result<()>) -> Result<usize> {
+    /// The wire carries no lengths, so whether the window holds the whole node
+    /// is only known once the node has been read. Decoding straight from the
+    /// window and retrying on a short read costs one wasted attempt per window
+    /// boundary the node straddles, a few per frame; walking the node first to
+    /// size it (what [`Self::skip_next`] does) would cost a second pass over
+    /// every node, a quarter of the decode. Each retry asks for double the
+    /// window, so retries stay logarithmic in the node's size; a source that
+    /// cannot grow turns the shortfall into a real `UnexpectedEof`.
+    fn decode_next<'s, T>(
+        source: &'s mut Source<'_>,
+        decode: impl Fn(&mut Decoder<'s>) -> Result<T>,
+    ) -> Result<(T, usize)> {
         loop {
-            let have = self.source.available().len();
-            let mut decoder = Decoder::new(self.source.available());
+            let window: *const [u8] = source.available();
+            // SAFETY: `window` is a live slice of the source's buffer, and the
+            // buffer is not touched again on the path that keeps `bytes`: a
+            // successful decode returns at once, with `bytes` (and anything
+            // `T` borrows from it) bound to `'s`, the exclusive borrow of
+            // `source`, so no growth can follow while the value lives. On the
+            // short-read path neither `bytes` nor the decoder over it is used
+            // again once `grow` writes to the buffer. The raw pointer is what
+            // lets the borrow checker accept a borrow that is returned on one
+            // path and mutated past on the other (NLL problem case 3).
+            let bytes: &'s [u8] = unsafe { &*window };
+            let have = bytes.len();
+            let mut decoder = Decoder::new(bytes);
+            match decode(&mut decoder) {
+                Ok(value) => return Ok((value, decoder.position())),
+                Err(BinaryError::UnexpectedEof) => {}
+                Err(e) => return Err(e),
+            }
+            if !Self::grow(source, have)? {
+                return Err(BinaryError::UnexpectedEof);
+            }
+        }
+    }
+
+    /// Size the next node without decoding it (no allocation), growing the
+    /// window as [`Self::decode_next`] does. For nodes that are only skipped.
+    fn skip_next(
+        source: &mut Source<'_>,
+        walk: impl Fn(&mut Decoder<'_>) -> Result<()>,
+    ) -> Result<usize> {
+        loop {
+            let have = source.available().len();
+            let mut decoder = Decoder::new(source.available());
             match walk(&mut decoder) {
                 Ok(()) => return Ok(decoder.position()),
                 Err(BinaryError::UnexpectedEof) => {}
                 Err(e) => return Err(e),
             }
-            let want = have.max(64).saturating_mul(2);
-            let grew = self.source.ensure(want)? || self.source.available().len() > have;
-            if !grew {
+            if !Self::grow(source, have)? {
                 return Err(BinaryError::UnexpectedEof);
             }
         }
+    }
+
+    /// Grow the window past `have` bytes, asking for double. False when the
+    /// source has nothing more.
+    fn grow(source: &mut Source<'_>, have: usize) -> Result<bool> {
+        let want = have.max(64).saturating_mul(2);
+        Ok(source.ensure(want)? || source.available().len() > have)
     }
 }
 

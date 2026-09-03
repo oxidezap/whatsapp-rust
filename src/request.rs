@@ -465,10 +465,11 @@ impl Client {
     ///
     /// The response is walked on the read loop, inside the frame's decode, so
     /// it never exists as more than the inflate window and one child at a
-    /// time. An error response, or a response that arrives while a raw-node
-    /// observer is attached, is decoded whole and goes through the spec's
-    /// [`IqSpec::parse_response`](wacore::iq::spec::IqSpec::parse_response)
-    /// instead, which is why the trait requires both.
+    /// time. An error response is reported from its decoded tree, as
+    /// [`Client::execute`] reports one. A result that arrives while a raw-node
+    /// observer is attached is decoded whole for the observer, then replayed
+    /// to the spec's [`IqStreamSpec::consume_response`] from the node bytes it
+    /// was decoded from, so the spec has one parser whichever way it arrives.
     pub async fn execute_streaming<S>(&self, spec: S) -> Result<S::Response, IqError>
     where
         S: IqStreamSpec + Send + 'static,
@@ -486,14 +487,23 @@ impl Client {
         let request_utils = self.get_request_utils();
         let sink: StreamSink = Box::new(move |response| {
             let outcome = match response {
-                StreamedResponse::Stream(stream) => spec
-                    .consume_response(stream)
-                    // The trailer is what says every inflated byte was the one
-                    // the peer sent; a tree decode validates it too.
-                    .and_then(|parsed| stream.finish().map(|()| parsed).map_err(Into::into))
-                    .map_err(IqError::ParseError),
+                StreamedResponse::Stream(stream) => consume_streamed(&spec, stream),
                 StreamedResponse::Node(node) => match request_utils.parse_iq_response(node.get()) {
-                    Ok(()) => spec.parse_response(node.get()).map_err(IqError::ParseError),
+                    // One parser for both deliveries: the tree was decoded
+                    // from exactly these node bytes, so a stream over them
+                    // yields what the read loop would have, and the spec's
+                    // tree parser is never compiled into this path.
+                    Ok(()) => {
+                        let bytes = node.backing_bytes();
+                        let mut stream = wacore_binary::NodeStream::from_node_bytes(&bytes);
+                        match stream.open() {
+                            Ok(Some(_)) => consume_streamed(&spec, &mut stream),
+                            Ok(None) => Err(IqError::ParseError(anyhow::anyhow!(
+                                "decoded response has no root node"
+                            ))),
+                            Err(e) => Err(IqError::ParseError(e.into())),
+                        }
+                    }
                     Err(e) => Err(IqError::from_response(e, node)),
                 },
             };
@@ -693,6 +703,18 @@ impl Client {
 
         Ok(waiter_guard)
     }
+}
+
+/// Run `spec` over a stream positioned inside the `<iq type="result">` root
+/// and close the stream out: the trailer is what says every inflated byte was
+/// the one the peer sent, and a tree decode validates it too.
+fn consume_streamed<S: IqStreamSpec>(
+    spec: &S,
+    stream: &mut wacore_binary::NodeStream<'_>,
+) -> Result<S::Response, IqError> {
+    spec.consume_response(stream)
+        .and_then(|parsed| stream.finish().map(|()| parsed).map_err(Into::into))
+        .map_err(IqError::ParseError)
 }
 
 /// The IQ outcome counter, recorded once per request at the point its final
