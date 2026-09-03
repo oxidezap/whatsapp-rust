@@ -1855,6 +1855,11 @@ pub struct Client {
     /// off costs.
     pub(crate) ab_props_fetch: AtomicBool,
 
+    /// Whether the connection lifecycle may announce `available` on its own.
+    /// Set via [`BotBuilder::with_presence_policy`] or
+    /// [`Client::set_presence_policy`]; explicit presence calls are unaffected.
+    pub(crate) automatic_presence: AtomicBool,
+
     /// Number of one-time pre-keys generated per upload batch. Defaults to
     /// [`crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT`]; set via
     /// [`BotBuilder::with_wanted_pre_key_count`] or [`Client::set_wanted_pre_key_count`].

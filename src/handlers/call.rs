@@ -864,7 +864,10 @@ impl StanzaHandler for CallHandler {
                             drop(event_permit);
                             drop(_transition_guard);
                             if dispatch_call {
-                                client.core.event_bus.dispatch(Event::IncomingCall(call));
+                                client
+                                    .core
+                                    .event_bus
+                                    .dispatch(Event::IncomingCall(Box::new(call)));
                             }
                             replay_initial_group_controls(&client, buffered_initial_group_controls)
                                 .await;
@@ -1007,7 +1010,10 @@ impl StanzaHandler for CallHandler {
                         drop(event_permit);
                     }
                     if dispatch_call {
-                        client.core.event_bus.dispatch(Event::IncomingCall(call));
+                        client
+                            .core
+                            .event_bus
+                            .dispatch(Event::IncomingCall(Box::new(call)));
                     }
                     #[cfg(feature = "voip-runtime")]
                     replay_initial_group_controls(&client, buffered_initial_group_controls).await;
@@ -1204,7 +1210,10 @@ fn apply_waiting_room_update(
 async fn replay_initial_group_controls(client: &Client, controls: Vec<IncomingCall>) {
     for call in controls {
         if apply_current_group_control(client, &call).await {
-            client.core.event_bus.dispatch(Event::IncomingCall(call));
+            client
+                .core
+                .event_bus
+                .dispatch(Event::IncomingCall(Box::new(call)));
         }
     }
 }
@@ -3015,10 +3024,7 @@ mod tests {
         assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(matches!(
             global_rx.try_recv().as_deref(),
-            Ok(Event::IncomingCall(IncomingCall {
-                action: CallAction::Accept { .. },
-                ..
-            }))
+            Ok(Event::IncomingCall(call)) if matches!(call.action, CallAction::Accept { .. })
         ));
         assert!(!cancelled);
     }
@@ -3665,10 +3671,8 @@ mod tests {
         );
         assert!(matches!(
             global_rx.try_recv().as_deref(),
-            Ok(Event::IncomingCall(IncomingCall {
-                action: CallAction::VideoState { .. },
-                ..
-            }))
+            Ok(Event::IncomingCall(call))
+                if matches!(call.action, CallAction::VideoState { .. })
         ));
         let enabled = tokio::time::timeout(std::time::Duration::from_secs(2), enabled_waiter)
             .await

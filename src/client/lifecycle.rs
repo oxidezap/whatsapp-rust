@@ -595,6 +595,7 @@ impl Client {
             app_version_fallback: std::sync::Mutex::new(None),
             skip_history_sync: AtomicBool::new(false),
             ab_props_fetch: AtomicBool::new(true),
+            automatic_presence: AtomicBool::new(true),
             wanted_pre_key_count: AtomicUsize::new(crate::prekeys::DEFAULT_WANTED_PRE_KEY_COUNT),
             cache_config,
             self_weak: std::sync::OnceLock::new(),
