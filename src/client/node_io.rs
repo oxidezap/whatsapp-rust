@@ -1559,10 +1559,10 @@ impl Client {
                 // Pushname is already known, send presence and Connected immediately.
                 let device_snapshot = client_clone.persistence_manager.get_device_snapshot();
                 if !device_snapshot.push_name.is_empty() {
-                    if let Err(e) = client_clone.presence().set_available().await {
-                        warn!("Failed to send initial presence: {e:?}");
-                    } else {
-                        debug!("Initial presence sent successfully.");
+                    match client_clone.send_automatic_available().await {
+                        Ok(true) => debug!("Initial presence sent successfully."),
+                        Ok(false) => {}
+                        Err(e) => warn!("Failed to send initial presence: {e:?}"),
                     }
                 }
 

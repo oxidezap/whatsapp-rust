@@ -101,7 +101,7 @@ pub use newsletter::{
 
 pub use polls::{PollError, PollOptionResult, PollVoteCiphertext, Polls};
 
-pub use presence::{Presence, PresenceError, PresenceStatus};
+pub use presence::{Presence, PresenceError, PresencePolicy, PresenceStatus};
 
 pub use profile::{Profile, ProfileError, SetProfilePictureResponse};
 

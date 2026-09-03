@@ -8,6 +8,7 @@ use super::Client;
 #[cfg(feature = "client-lifecycle")]
 use super::{ClientLifecycle, LifecycleRegistration};
 use crate::cache_config::CacheConfig;
+use crate::features::PresencePolicy;
 use crate::http::HttpClient;
 #[cfg(feature = "plugins")]
 use crate::plugins::{
@@ -114,6 +115,7 @@ pub struct ClientBuilder {
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
     skip_history_sync: bool,
+    presence_policy: PresencePolicy,
     wanted_pre_key_count: Option<usize>,
     resend_rate_limit: Option<(u32, u32)>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
@@ -146,6 +148,7 @@ impl ClientBuilder {
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
             skip_history_sync: false,
+            presence_policy: PresencePolicy::default(),
             wanted_pre_key_count: None,
             resend_rate_limit: None,
             task_instrument: None,
@@ -269,6 +272,13 @@ impl ClientBuilder {
 
     pub fn with_skip_history_sync(mut self, skip: bool) -> Self {
         self.skip_history_sync = skip;
+        self
+    }
+
+    /// Choose who announces the account's own `available` presence; see
+    /// [`PresencePolicy`].
+    pub fn with_presence_policy(mut self, policy: PresencePolicy) -> Self {
+        self.presence_policy = policy;
         self
     }
 
@@ -522,6 +532,7 @@ impl ClientBuilder {
         if self.skip_history_sync {
             client.set_skip_history_sync(true);
         }
+        client.set_presence_policy(self.presence_policy);
         if let Some(count) = self.wanted_pre_key_count {
             client.set_wanted_pre_key_count(count);
         }
@@ -1146,6 +1157,7 @@ mod tests {
             .with_transport_factory(MockTransportFactory::new())
             .with_http_client(MockHttpClient)
             .with_skip_history_sync(true)
+            .with_presence_policy(PresencePolicy::Manual)
             .with_wanted_pre_key_count(123)
             .with_alloc_meter(Arc::clone(&meter))
             .with_background_saver_interval(Duration::from_secs(3600))
@@ -1155,6 +1167,7 @@ mod tests {
         let client = build.into_client();
 
         assert!(client.skip_history_sync_enabled());
+        assert_eq!(client.presence_policy(), PresencePolicy::Manual);
         assert_eq!(client.wanted_pre_key_count(), 123);
         assert!(
             client

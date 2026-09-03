@@ -39,6 +39,27 @@ impl From<crate::types::presence::Presence> for PresenceStatus {
     }
 }
 
+/// Who announces the account's own `available` presence.
+///
+/// The client sends `<presence type="available">` on its own at three points,
+/// matching WhatsApp Web: on connect when the push name is already known, when
+/// the push name arrives through the initial app-state sync, and when the
+/// server updates it. Explicit calls through [`Presence::set`] are unaffected
+/// by this setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PresencePolicy {
+    /// The client announces `available` at those points (default).
+    #[default]
+    Automatic,
+    /// The host owns every global presence transition. For a companion that
+    /// stays connected around the clock, the automatic announcements would
+    /// show the account online on every reconnect and, because the server
+    /// treats an available device as where the user reads, stop the phone
+    /// from being notified of new messages.
+    Manual,
+}
+
 /// Feature handle for presence operations.
 pub struct Presence<'a> {
     client: &'a Client,
@@ -239,6 +260,20 @@ impl Client {
     pub fn presence(&self) -> Presence<'_> {
         Presence::new(self)
     }
+
+    /// The `available` announcement the connection lifecycle makes on its
+    /// own. Returns `Ok(false)` when [`PresencePolicy::Manual`] suppressed it,
+    /// so callers can log the two outcomes apart. The policy is checked before
+    /// the push name, because a manual host must not be told that a stanza it
+    /// never asked for could not be sent.
+    pub(crate) async fn send_automatic_available(&self) -> Result<bool, PresenceError> {
+        if self.presence_policy() == PresencePolicy::Manual {
+            debug!("Automatic available presence suppressed by the manual policy");
+            return Ok(false);
+        }
+        self.presence().set_available().await?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +434,60 @@ mod tests {
                 e
             );
         }
+    }
+
+    /// The policy only decides the lifecycle's own announcement: manual mode
+    /// answers `Ok(false)` before the push-name check, while an explicit
+    /// `set_available` keeps validating and sending as before.
+    #[tokio::test]
+    async fn manual_policy_suppresses_only_the_automatic_announcement() {
+        let backend = create_test_backend().await;
+        let transport = TokioWebSocketTransportFactory::new();
+
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_transport_factory(transport)
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_presence_policy(PresencePolicy::Manual)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        let client = bot.client();
+        assert_eq!(client.presence_policy(), PresencePolicy::Manual);
+
+        // Push name is empty on a fresh device, so an announcement that got
+        // as far as the explicit path would fail rather than be skipped.
+        assert!(matches!(client.send_automatic_available().await, Ok(false)));
+        assert!(matches!(
+            client.presence().set_available().await,
+            Err(PresenceError::PushNameEmpty)
+        ));
+
+        client.set_presence_policy(PresencePolicy::Automatic);
+        assert_eq!(client.presence_policy(), PresencePolicy::Automatic);
+        assert!(matches!(
+            client.send_automatic_available().await,
+            Err(PresenceError::PushNameEmpty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn presence_policy_defaults_to_automatic() {
+        let backend = create_test_backend().await;
+        let transport = TokioWebSocketTransportFactory::new();
+
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_transport_factory(transport)
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        assert_eq!(bot.client().presence_policy(), PresencePolicy::Automatic);
     }
 
     #[tokio::test]

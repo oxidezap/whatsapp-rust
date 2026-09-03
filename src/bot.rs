@@ -1,5 +1,6 @@
 use crate::cache_config::CacheConfig;
 use crate::client::{Client, ClientBuilderError};
+use crate::features::PresencePolicy;
 use crate::pair_code::PairCodeOptions;
 #[cfg(feature = "plugins")]
 use crate::plugins::{ClientPlugin, PluginHostConfig, PluginRegistration, UntypedClientPlugin};
@@ -707,6 +708,7 @@ pub struct BotBuilder<
     device_props_override: Option<DevicePropsOverride>,
     pair_code_options: Option<PairCodeOptions>,
     skip_history_sync: bool,
+    presence_policy: PresencePolicy,
     initial_push_name: Option<String>,
     cache_config: CacheConfig,
     wanted_pre_key_count: Option<usize>,
@@ -736,6 +738,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             device_props_override: None,
             pair_code_options: None,
             skip_history_sync: false,
+            presence_policy: PresencePolicy::default(),
             initial_push_name: None,
             cache_config: CacheConfig::default(),
             wanted_pre_key_count: None,
@@ -769,6 +772,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
             skip_history_sync: self.skip_history_sync,
+            presence_policy: self.presence_policy,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
             wanted_pre_key_count: self.wanted_pre_key_count,
@@ -1364,6 +1368,15 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Choose who announces the account's own `available` presence.
+    ///
+    /// Default: [`PresencePolicy::Automatic`], which matches WhatsApp Web. See
+    /// [`PresencePolicy::Manual`] for the host that has to own it.
+    pub fn with_presence_policy(mut self, policy: PresencePolicy) -> Self {
+        self.presence_policy = policy;
+        self
+    }
+
     /// Set how many one-time pre-keys are generated and uploaded per batch.
     ///
     /// Defaults to WA Web's UPLOAD_KEYS_COUNT (812). The value is clamped to the
@@ -1508,6 +1521,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             .with_cache_config(self.cache_config)
             .with_custom_enc_handlers(self.custom_enc_handlers)
             .with_skip_history_sync(self.skip_history_sync)
+            .with_presence_policy(self.presence_policy)
             .with_background_saver_interval(std::time::Duration::from_secs(30));
         #[cfg(feature = "plugins")]
         let client_builder = client_builder

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::client::interceptor::{InterceptorHandle, Registration, StanzaInterceptor};
+use crate::features::PresencePolicy;
 
 /// Identity for span/error tagging. Named fields, not a tuple — LID/PN transposition would
 /// otherwise be a silent, unchecked bug at call sites.
@@ -230,6 +231,23 @@ impl Client {
     /// Returns `true` if history sync notifications are currently being skipped.
     pub fn skip_history_sync_enabled(&self) -> bool {
         self.skip_history_sync.load(Ordering::Relaxed)
+    }
+
+    /// Choose who announces the account's own `available` presence. Defaults
+    /// to [`PresencePolicy::Automatic`]. Applies from the next lifecycle
+    /// announcement on; changing it sends or retracts nothing by itself.
+    pub fn set_presence_policy(&self, policy: PresencePolicy) {
+        self.automatic_presence
+            .store(policy == PresencePolicy::Automatic, Ordering::Relaxed);
+    }
+
+    /// Returns the configured [`PresencePolicy`].
+    pub fn presence_policy(&self) -> PresencePolicy {
+        if self.automatic_presence.load(Ordering::Relaxed) {
+            PresencePolicy::Automatic
+        } else {
+            PresencePolicy::Manual
+        }
     }
 
     /// Set how many one-time pre-keys are generated per upload batch.
@@ -641,10 +659,12 @@ impl Client {
         let client_clone = self.clone();
         self.runtime
             .spawn(Box::pin(async move {
-                if let Err(e) = client_clone.presence().set_available().await {
-                    log::warn!("Failed to send presence after push name update: {:?}", e);
-                } else {
-                    log::debug!("Sent presence after push name update.");
+                match client_clone.send_automatic_available().await {
+                    Ok(true) => log::debug!("Sent presence after push name update."),
+                    Ok(false) => {}
+                    Err(e) => {
+                        log::warn!("Failed to send presence after push name update: {:?}", e);
+                    }
                 }
             }))
             .detach();
