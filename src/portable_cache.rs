@@ -251,6 +251,7 @@ where
             // Re-queued entries move behind everything inserted so far, bit
             // cleared, so each can earn at most one more pass per hit and the
             // scan cannot cycle.
+            let requeued = !second_chance.is_empty();
             for (seq, hash) in second_chance {
                 let fresh = self.next_seq;
                 self.next_seq += 1;
@@ -267,6 +268,9 @@ where
                         self.capacity_evictions = self.capacity_evictions.saturating_add(1);
                     }
                 }
+                // Every candidate had a chance to spend; the next pass over
+                // the same entries finds them unreferenced.
+                None if requeued => continue,
                 None => {
                     self.capacity_eviction_blocks = self.capacity_eviction_blocks.saturating_add(1);
                     break;
@@ -1176,6 +1180,21 @@ mod tests {
             cache.insert(format!("b{i}"), i).await;
         }
         assert_eq!(cache.get_no_touch("a").await, None);
+    }
+
+    /// When every entry has been hit since the last pass, the pass that spends
+    /// their chances must not end the eviction: the cache stays at capacity.
+    #[tokio::test]
+    async fn an_all_referenced_pass_still_evicts() {
+        let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(1).build();
+        cache.insert("a".to_string(), 1).await;
+        cache.get("a").await;
+        cache.insert("b".to_string(), 2).await;
+        let stats = cache.capacity_stats().await;
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.eviction_blocks, 0);
+        assert_eq!(cache.get_no_touch("a").await, None);
+        assert_eq!(cache.get_no_touch("b").await, Some(2));
     }
 
     #[tokio::test]
