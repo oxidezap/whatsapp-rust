@@ -3,6 +3,7 @@ use crate::types::events::{Event, EventKind};
 use log::{debug, warn};
 use std::sync::Arc;
 use wacore::appstate::patch_decode::WAPatchName;
+use wacore::runtime::BoxFuture;
 use wacore::stanza::groups::{GroupNotification, GroupNotificationAction};
 use wacore::types::events::{GroupUpdate, MexNotification};
 use wacore_binary::NodeContentRef;
@@ -94,7 +95,7 @@ pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef
                         return;
                     }
                     let scope = client_clone.sync_scope(None);
-                    let sync_fut: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> =
+                    let sync_fut: BoxFuture<'static, ()> =
                         Box::pin(run_server_sync_collections(client_clone, to_sync, scope));
                     sync_fut.await;
                 }
