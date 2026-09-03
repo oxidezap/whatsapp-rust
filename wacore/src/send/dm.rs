@@ -275,6 +275,15 @@ pub async fn prepare_dm_stanza(
     let recipient_devices = resolved_devices.recipient_devices();
     let own_other_devices = resolved_devices.own_other_devices();
     let total_devices = resolved_devices.devices().len();
+    // The memoized addresses are parallel to `devices()`, which is the
+    // recipient partition followed by our companions.
+    let (recipient_addresses, own_addresses) = match resolved_devices.signal_addressing() {
+        Some(addressing) => {
+            let (recipient, own) = addressing.encryption().split_at(recipient_devices.len());
+            (Some(recipient), Some(own))
+        }
+        None => (None, None),
+    };
 
     let phash = resolved_devices.phash();
 
@@ -324,6 +333,7 @@ pub async fn prepare_dm_stanza(
             hide_decrypt_fail,
             mediatype,
             &mut participant_nodes,
+            recipient_addresses,
         )
         .await?;
         includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
@@ -362,6 +372,7 @@ pub async fn prepare_dm_stanza(
             hide_decrypt_fail,
             mediatype,
             &mut participant_nodes,
+            own_addresses,
         )
         .await?;
         includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;

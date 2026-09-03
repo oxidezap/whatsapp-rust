@@ -76,7 +76,7 @@ pub use dm::*;
 pub use encrypt::*;
 pub use group::*;
 pub use peer::*;
-pub use resolved_devices::{ResolvedDmDevices, ResolvedGroupDevices};
+pub use resolved_devices::{DmSignalAddressing, ResolvedDmDevices, ResolvedGroupDevices};
 pub use status::*;
 
 #[cfg(test)]

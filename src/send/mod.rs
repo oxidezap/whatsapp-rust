@@ -298,6 +298,15 @@ where
     Box::pin(future)
 }
 
+/// Sort and deduplicate session lock keys into the one acquisition order.
+/// INVARIANT: every caller of `session_guards_for` passes keys that went
+/// through here, which is what keeps two sends overlapping on a device from
+/// deadlocking; the DM memo stores the sorted result and serves it as is.
+fn sort_session_lock_keys(keys: &mut Vec<Jid>) {
+    keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
+    keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
+}
+
 /// True when every SKDM target belongs to our own account (PN or LID user).
 /// Own devices are never memoized warm (WA Web's `!isMeDevice` guard on
 /// `markHasSenderKey`), so an own-only `needs` set is the permanent
@@ -2761,7 +2770,21 @@ impl Client {
                 )
                 .await?;
 
-            self.ensure_e2e_sessions(dm_devices.devices()).await?;
+            // Resolved once per memo entry: the session pre-check, the lock
+            // keys and the encrypt fan-out all address the same devices.
+            let addressing = match dm_devices.signal_addressing() {
+                Some(addressing) => addressing,
+                None => {
+                    let encryption = self.resolve_encryption_jids(dm_devices.devices()).await;
+                    let mut lock_keys = encryption.clone();
+                    sort_session_lock_keys(&mut lock_keys);
+                    dm_devices.signal_addressing_or_init(wacore::send::DmSignalAddressing::new(
+                        encryption, lock_keys,
+                    ))
+                }
+            };
+            self.ensure_e2e_sessions_resolved(addressing.encryption())
+                .await?;
 
             let mut extra_stanza_nodes = extra_stanza_nodes;
             // tctoken applies to 1:1 chats; status reactions share the fanout
@@ -2775,8 +2798,7 @@ impl Client {
                 debug!(target: "Client/TcToken", "Scheduled tc token issuance after send for {}", to.observe());
             }
 
-            let lock_jids = self.build_session_lock_keys(dm_devices.devices()).await;
-            let _session_guards = self.session_guards_for(&lock_jids).await;
+            let _session_guards = self.session_guards_for(addressing.lock_keys()).await;
 
             let mut store_adapter = self.signal_adapter();
 
@@ -2881,12 +2903,17 @@ impl Client {
     /// session locks (e.g. DM sends that encrypt for recipient + own devices).
     /// Resolve encryption JIDs and sort for deadlock-free lock acquisition.
     pub(crate) async fn build_session_lock_keys(&self, device_jids: &[Jid]) -> Vec<Jid> {
+        let mut keys = self.resolve_encryption_jids(device_jids).await;
+        sort_session_lock_keys(&mut keys);
+        keys
+    }
+
+    /// [`Self::resolve_encryption_jid`] over a device list, in order.
+    pub(crate) async fn resolve_encryption_jids(&self, device_jids: &[Jid]) -> Vec<Jid> {
         let mut keys: Vec<Jid> = Vec::with_capacity(device_jids.len());
         for jid in device_jids {
             keys.push(self.resolve_encryption_jid(jid).await);
         }
-        keys.sort_unstable_by(wacore::types::jid::cmp_for_lock_order);
-        keys.dedup_by(|a, b| wacore::types::jid::cmp_for_lock_order(a, b).is_eq());
         keys
     }
 
@@ -3872,6 +3899,145 @@ mod tests {
              inbound message: {window}"
         );
         assert_eq!(window.skdm_targets.hits, REGIME_SENDS, "{window}");
+    }
+
+    /// A warm DM resolves each device's Signal address once, memoizes it on
+    /// the device-memo entry, and serves it to every later send; a mapping
+    /// change for the peer produces a fresh entry re-resolved under the new
+    /// LID rather than a stale address. The lock keys the entry carries are in
+    /// the one acquisition order `session_guards_for` requires.
+    #[tokio::test]
+    async fn repeat_dm_sends_serve_memoized_signal_addressing() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use wacore::types::jid::cmp_for_lock_order;
+
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let own = Jid::from_str("5511000000001@s.whatsapp.net").unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(own.clone())))
+            .await;
+
+        // An unmigrated account sending to a PN whose LID it knows: the wire
+        // stays PN, every device's Signal address upgrades to LID.
+        let peer = Jid::from_str("5511000000020@s.whatsapp.net").unwrap();
+        let peer_lid = "200000000000020";
+        for (user, devices) in [
+            (own.user.as_str(), &[0u16][..]),
+            (peer.user.as_str(), &[0, 1]),
+        ] {
+            let record = DeviceListRecord {
+                user: user.into(),
+                devices: devices.iter().map(|d| DeviceInfo::new(*d, None)).collect(),
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            };
+            client
+                .device_registry_cache
+                .raw_insert_for_tests(Arc::from(user), Arc::new(record))
+                .await;
+        }
+        client
+            .add_lid_pn_mapping(
+                peer_lid,
+                &peer.user,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .expect("seeding the peer's lid-pn pair");
+        let sessions_under = |lid: &str| {
+            let client = Arc::clone(&client);
+            let lid = Jid::from_str(&format!("{lid}@lid")).unwrap();
+            async move {
+                for device in [0, 1] {
+                    crate::test_utils::seed_peer_session(&client, &lid.with_device(device)).await;
+                }
+            }
+        };
+        sessions_under(peer_lid).await;
+
+        let resolve = || async {
+            client
+                .resolve_dm_devices_memoized(
+                    &peer,
+                    &peer,
+                    &own,
+                    None,
+                    crate::cache::Freshness::CachePreferred,
+                )
+                .await
+                .expect("memoized DM resolve")
+        };
+
+        client
+            .send_message(peer.clone(), wa::Message::text("first"))
+            .await
+            .expect("first DM");
+        let first = resolve().await;
+        let addressing = first
+            .signal_addressing()
+            .expect("a send memoizes the Signal addressing on the entry it used");
+        assert_eq!(addressing.encryption().len(), first.devices().len());
+        for (device, address) in first.devices().iter().zip(addressing.encryption()) {
+            assert!(device.is_pn(), "the fan-out is PN-addressed: {device}");
+            assert!(
+                address.is_lid(),
+                "the Signal address upgrades to LID: {address}"
+            );
+            assert_eq!(address.user.as_str(), peer_lid);
+            assert_eq!(address.device, device.device);
+        }
+        assert!(
+            addressing
+                .lock_keys()
+                .windows(2)
+                .all(|pair| cmp_for_lock_order(&pair[0], &pair[1]).is_lt()),
+            "lock keys must be sorted and deduplicated in lock order"
+        );
+
+        client
+            .send_message(peer.clone(), wa::Message::text("second"))
+            .await
+            .expect("second DM");
+        let second = resolve().await;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a repeat DM must serve the same memo entry, addressing included"
+        );
+
+        // The peer remaps to a new LID: the mapping change bumps the topology
+        // the entry is stamped with, so the next send re-resolves under it.
+        let new_lid = "200000000000021";
+        client
+            .add_lid_pn_mapping(
+                new_lid,
+                &peer.user,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .expect("remapping the peer");
+        sessions_under(new_lid).await;
+        client
+            .send_message(peer.clone(), wa::Message::text("third"))
+            .await
+            .expect("third DM");
+        let third = resolve().await;
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "a mapping change must produce a fresh entry"
+        );
+        let addressing = third
+            .signal_addressing()
+            .expect("re-resolved on the fresh entry");
+        assert!(
+            addressing
+                .encryption()
+                .iter()
+                .all(|address| address.user.as_str() == new_lid),
+            "the fresh entry addresses the new LID: {:?}",
+            addressing.encryption()
+        );
     }
 
     /// The counters would be worthless if they only ever reported hits, so

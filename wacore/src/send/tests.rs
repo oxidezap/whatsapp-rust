@@ -5369,6 +5369,7 @@ mod local_identity_change_on_send {
                 false,
                 None,
                 nodes,
+                None,
             )
             .await
             .expect("fan-out into the caller's buffer")
@@ -5469,6 +5470,7 @@ mod local_identity_change_on_send {
                 false,
                 None,
                 &mut nodes,
+                None,
             )
             .await
             .expect("one bad device must not abort the fan-out");

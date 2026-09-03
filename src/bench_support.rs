@@ -563,6 +563,172 @@ async fn install_offline_socket(client: &Arc<Client>) {
     client.enter_live_mode_for_tests();
 }
 
+/// The recipient of the DM fixture, from the same reserved block and outside
+/// every range the other fixtures draw from.
+const DM_PEER_USER: &str = "19045550180";
+/// Its LID; ours is `100000000000001`.
+const DM_PEER_LID: &str = "100000000000002";
+
+/// How the DM fixture addresses its recipient. The two are different code
+/// paths per device, not a cosmetic switch: see each variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DmAddressing {
+    /// A 1:1-LID-migrated account sending to a LID. The recipient's devices
+    /// resolve under the LID and our companions are re-addressed to ours, so
+    /// no device needs a PN→LID lookup on the way to its Signal address. The
+    /// shape every migrated account sends in.
+    Lid,
+    /// An unmigrated account sending to a PN whose LID it knows. The wire
+    /// stays PN (the server rejects a LID stanza from such an account) while
+    /// every device's Signal address upgrades to LID, which is a mapping
+    /// lookup per device at each place the send resolves addresses.
+    PnWithKnownLid,
+}
+
+/// A logged-in client holding a resolved 1:1 recipient with `peer_devices`
+/// devices plus our own companion, warmed to the steady state a repeat DM
+/// starts from: every session acknowledged, the device memo populated.
+///
+/// The DM counterpart of [`GroupSendHarness`]; the same offline construction
+/// (sink transport, in-memory store, pre-seeded registry) and the same
+/// warm-up discipline. What it adds is the LID/PN mapping, which the group
+/// fixture never exercises and which is the per-device term a DM pays.
+pub struct DmSendHarness {
+    runtime: tokio::runtime::Runtime,
+    client: Arc<Client>,
+    to: Jid,
+}
+
+impl DmSendHarness {
+    pub fn new(peer_devices: usize, addressing: DmAddressing) -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let (client, to) = runtime.block_on(build_dm_fixture(peer_devices, addressing));
+        Self {
+            runtime,
+            client,
+            to,
+        }
+    }
+
+    /// One warm DM send through the real `Client::send_message`, from the
+    /// recipient resolution to the frame the noise socket writes.
+    pub fn warm_send(&self) {
+        self.runtime.block_on(async {
+            self.client
+                .send_message(self.to.clone(), wa::Message::text("bench"))
+                .await
+                .expect("offline DM send must reach the sink");
+        });
+    }
+
+    /// Per-term outcomes of the DM device memo so far; see
+    /// [`GroupSendHarness::memo_stats`].
+    pub fn memo_stats(&self) -> crate::client::DeviceMemoStats {
+        self.client.device_memo_stats()
+    }
+}
+
+async fn build_dm_fixture(peer_devices: usize, addressing: DmAddressing) -> (Arc<Client>, Jid) {
+    use wacore::types::lid_pn::{LearningSource, LidPnEntry};
+
+    assert!(peer_devices >= 1, "a recipient has at least its primary");
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let pm = Arc::new(
+        PersistenceManager::new(backend)
+            .await
+            .expect("persistence manager"),
+    );
+    let (client, _sync_rx) = Client::new(
+        Arc::new(TokioRuntime),
+        pm,
+        Arc::new(SinkTransportFactory),
+        Arc::new(NoopHttpClient),
+        None,
+    )
+    .await;
+
+    let own_pn = Jid::new(OWN_USER, Server::Pn);
+    let own_lid = Jid::new("100000000000001", Server::Lid);
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetId(Some(own_pn.clone())))
+        .await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(own_lid.clone())))
+        .await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLidMigrated(
+            addressing == DmAddressing::Lid,
+        ))
+        .await;
+
+    // The mapping a client that has exchanged messages with the peer holds.
+    // Seeded before the registry so the topology generation the memo stamps
+    // is past the write, as a warm client's is.
+    client
+        .lid_pn_cache
+        .add(&LidPnEntry::new(
+            DM_PEER_LID,
+            DM_PEER_USER,
+            LearningSource::Usync,
+        ))
+        .await;
+
+    let devices: Vec<u16> = (0..peer_devices)
+        .map(|d| u16::try_from(d).expect("device id fits"))
+        .collect();
+    // The registry is keyed by whichever user the lookup tries, so the same
+    // record sits under both of the peer's identifiers.
+    seed_registry(&client, DM_PEER_USER, &devices).await;
+    seed_registry(&client, DM_PEER_LID, &devices).await;
+    seed_registry(&client, OWN_USER, &[0, 1]).await;
+
+    // Sessions live under the Signal address the send resolves to, which is
+    // the LID for the peer in both shapes (WA Web's SignalAddress upgrades
+    // PN→LID whenever the mapping is known). Every one is acknowledged: a
+    // repeat DM re-encrypts to every device on every send, so a one-way
+    // X3DH would measure first contact forever, as `GroupSendHarness`
+    // explains for the companion.
+    let peer_lid = Jid::new(DM_PEER_LID, Server::Lid);
+    for device in &devices {
+        establish_acknowledged_session(&client, &peer_lid.with_device(*device)).await;
+    }
+    // Our companion is re-addressed to our LID for a LID recipient and stays
+    // PN otherwise (our own mapping is not in the cache, as it is not on a
+    // client that never sent itself a message).
+    let companion = match addressing {
+        DmAddressing::Lid => own_lid.with_device(1),
+        DmAddressing::PnWithKnownLid => own_pn.with_device(1),
+    };
+    establish_acknowledged_session(&client, &companion).await;
+
+    install_offline_socket(&client).await;
+
+    let to = match addressing {
+        DmAddressing::Lid => peer_lid,
+        DmAddressing::PnWithKnownLid => Jid::new(DM_PEER_USER, Server::Pn),
+    };
+
+    // Two sends outside every measurement: the first fills the device memo,
+    // the second is the first true repeat. A benchmark measures send three
+    // onwards.
+    for _ in 0..2 {
+        client
+            .send_message(to.clone(), wa::Message::text("warm-up"))
+            .await
+            .expect("offline DM send must reach the sink");
+    }
+    settle_signal_flush_worker(&client).await;
+
+    (client, to)
+}
+
 /// The peer of the receive fixture, from the same reserved block as the group
 /// members and outside every range they draw from.
 const PEER_USER: &str = "19045550190";
