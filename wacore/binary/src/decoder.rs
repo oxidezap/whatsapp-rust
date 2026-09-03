@@ -456,11 +456,6 @@ impl<'a> Decoder<'a> {
         Ok(AttrsRef::from_vec(v))
     }
 
-    fn read_content(&mut self, depth: usize) -> Result<Option<NodeContentRef<'a>>> {
-        let tag = self.read_u8()?;
-        self.read_content_from_tag(tag, depth)
-    }
-
     #[inline(always)]
     fn read_content_from_tag(
         &mut self,
@@ -699,29 +694,25 @@ impl<'a> Decoder<'a> {
         if depth >= MAX_NODE_DEPTH {
             return Err(BinaryError::MaxDepthExceeded);
         }
-        let tag = self.read_u8()?;
-        let list_size = self.read_list_size(tag)?;
-        if list_size == 0 {
-            return Err(BinaryError::InvalidNode);
-        }
-
-        let Some(tag) = self.read_value_as_string()? else {
-            return Err(BinaryError::InvalidNode);
-        };
-
-        let attr_count = (list_size - 1) / 2;
-        let has_content = list_size.is_multiple_of(2);
-
-        let attrs = self.read_attributes(attr_count)?;
-        let content = if has_content {
-            self.read_content(depth)?
-        } else {
-            None
+        // One head reader for both decoders: the tree is the head plus its
+        // children read whole, which is also what keeps the two in agreement
+        // on what a malformed head is.
+        let head = self.read_node_open()?;
+        let content = match head.content {
+            OpenContent::None => None,
+            OpenContent::Scalar(scalar) => Some(scalar),
+            OpenContent::Children(count) => {
+                let mut nodes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    nodes.push(self.read_node_ref_at(depth + 1)?);
+                }
+                Some(NodeContentRef::Nodes(nodes.into_boxed_slice()))
+            }
         };
 
         Ok(NodeRef {
-            tag,
-            attrs,
+            tag: head.tag,
+            attrs: head.attrs,
             content,
         })
     }

@@ -606,6 +606,10 @@ impl Client {
     /// The registration, send, timeout and cancellation machinery shared by
     /// every IQ, whatever the waiter delivers: `waiter` is registered under
     /// `req_id` before the send, `rx` is what it resolves.
+    ///
+    /// Only the wait is generic over what arrives; registration and the send
+    /// sit in [`Self::register_and_send`] so they are compiled once, not once
+    /// per delivered type.
     async fn send_and_wait_for<T>(
         &self,
         req_id: String,
@@ -616,6 +620,35 @@ impl Client {
         rx: futures::channel::oneshot::Receiver<T>,
     ) -> Result<T, IqError> {
         let _t = wacore::telemetry::timer(wacore::telemetry::IQ_DURATION);
+        // Per-connection: pending IQ requests are bound to the current socket;
+        // a reconnect aborts them (sender retries on the new connection).
+        // Subscribed before the send so a shutdown during it is not missed.
+        let shutdown = wacore::runtime::wait_for_shutdown(&self.connection_shutdown_signal());
+        let _waiter_guard = self
+            .register_and_send(req_id, send_fn, on_sent, waiter)
+            .await?;
+
+        futures::select! {
+            result = rt_timeout(&*self.runtime, timeout, rx).fuse() => {
+                match result {
+                    Ok(Ok(delivered)) => Ok(delivered),
+                    Ok(Err(_)) => Err(IqError::InternalChannelClosed),
+                    Err(_) => Err(IqError::Timeout),
+                }
+            }
+            _ = shutdown.fuse() => Err(IqError::NotConnected),
+        }
+    }
+
+    /// Register `waiter` under `req_id`, send the request, and hand back the
+    /// guard that removes the registration when the caller is done waiting.
+    async fn register_and_send(
+        &self,
+        req_id: String,
+        send_fn: IqSendFuture<'_>,
+        on_sent: Option<IqOnSent<'_>>,
+        waiter: ResponseWaiter,
+    ) -> Result<ResponseWaiterGuard, IqError> {
         if !self.is_running.load(Ordering::Relaxed) {
             return Err(IqError::NotConnected);
         }
@@ -631,16 +664,12 @@ impl Client {
             };
             cleanup_generation
         };
-        // RAII cleanup covers every exit below — including this future being
-        // dropped mid-await (cancellation), which the explicit paths can't
-        // catch. So the send-fail / timeout / shutdown arms no longer remove
+        // RAII cleanup covers every exit below — including the waiting future
+        // being dropped mid-await (cancellation), which the explicit paths
+        // can't catch. So the send-fail / timeout / shutdown arms never remove
         // the waiter by hand; the guard does it on drop.
-        let _waiter_guard =
+        let waiter_guard =
             ResponseWaiterGuard::new(self.response_waiters.clone(), req_id, cleanup_generation);
-
-        // Per-connection: pending IQ requests are bound to the current socket;
-        // a reconnect aborts them (sender retries on the new connection).
-        let shutdown = wacore::runtime::wait_for_shutdown(&self.connection_shutdown_signal());
 
         if !self.is_running.load(Ordering::Acquire) {
             return Err(IqError::NotConnected);
@@ -662,16 +691,7 @@ impl Client {
             on_sent();
         }
 
-        futures::select! {
-            result = rt_timeout(&*self.runtime, timeout, rx).fuse() => {
-                match result {
-                    Ok(Ok(delivered)) => Ok(delivered),
-                    Ok(Err(_)) => Err(IqError::InternalChannelClosed),
-                    Err(_) => Err(IqError::Timeout),
-                }
-            }
-            _ = shutdown.fuse() => Err(IqError::NotConnected),
-        }
+        Ok(waiter_guard)
     }
 }
 
