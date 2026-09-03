@@ -135,6 +135,10 @@ enum ClockWalk {
 /// compiled once, and each `<K, V>` cache contributes only the probe, which
 /// is the `find` its eviction hook already carries. A `retain` over the
 /// table and the order map would be a second full walk per instantiation.
+/// `inline(never)`: under fat LTO the optimizer would otherwise inline this
+/// into every instantiation of the caller, which is the duplication it exists
+/// to avoid.
+#[inline(never)]
 fn expiry_walk(
     order: &BTreeMap<u64, u64>,
     probe: &mut dyn FnMut(u64, u64) -> bool,
