@@ -395,7 +395,7 @@ impl Client {
         let Some(root) = stream.open()? else {
             return Err(wacore_binary::BinaryError::EmptyData);
         };
-        let sink = if root.tag == StanzaTag::Iq.as_str()
+        let sink = if matches!(StanzaTag::try_from(root.tag.as_ref()), Ok(StanzaTag::Iq))
             && root.attr_str("type").as_deref() == Some("result")
             && let Some(id) = root.attr_str("id")
         {

@@ -650,9 +650,20 @@ impl<'a> Decoder<'a> {
         if list_size == 0 {
             return Err(BinaryError::InvalidNode);
         }
-        self.skip_value()?;
+        // The same two shapes `read_node_open` refuses: a node with no tag,
+        // and an attribute whose key is not a string.
+        let tag_token = self.read_u8()?;
+        if tag_token == token::LIST_EMPTY {
+            return Err(BinaryError::InvalidNode);
+        }
+        self.skip_value_from_tag(tag_token)?;
         let attr_count = (list_size - 1) / 2;
-        for _ in 0..attr_count * 2 {
+        for _ in 0..attr_count {
+            let key_token = self.read_u8()?;
+            if key_token == token::LIST_EMPTY {
+                return Err(BinaryError::NonStringKey);
+            }
+            self.skip_value_from_tag(key_token)?;
             self.skip_value()?;
         }
         if !list_size.is_multiple_of(2) {

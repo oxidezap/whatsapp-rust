@@ -676,4 +676,44 @@ mod tests {
             assert!(stream.finish().is_err(), "{name}: finish must fail");
         }
     }
+
+    /// Two more shapes the tree decoder refuses (`InvalidNode` for a node
+    /// without a tag, `NonStringKey` for an attribute key that is not a
+    /// string), hand-built since no encoder writes them, and skipped by the
+    /// stream the same way.
+    #[test]
+    fn skipping_a_child_with_no_tag_or_a_non_string_key_fails_like_the_tree_decoder() {
+        use crate::token::{BINARY_8, LIST_8, LIST_EMPTY};
+        let root_head = [LIST_8, 2, BINARY_8, 2, b'i', b'q', LIST_8, 2];
+        let first = [LIST_8, 1, BINARY_8, 5, b'f', b'i', b'r', b's', b't'];
+        let no_tag = vec![LIST_8, 1, LIST_EMPTY];
+        let bad_key = vec![LIST_8, 3, BINARY_8, 1, b'p', LIST_EMPTY, BINARY_8, 1, b'v'];
+
+        for (name, child, expected) in [
+            ("no tag", no_tag, BinaryError::InvalidNode),
+            ("non-string key", bad_key, BinaryError::NonStringKey),
+        ] {
+            let mut packed = vec![crate::util::FORMAT_PLAIN];
+            packed.extend_from_slice(&root_head);
+            packed.extend_from_slice(&first);
+            packed.extend_from_slice(&child);
+            assert!(
+                matches!(&crate::marshal::unmarshal_ref(&packed[1..]), Err(e) if std::mem::discriminant(e) == std::mem::discriminant(&expected)),
+                "{name}: the tree decoder must reject the fixture with {expected:?}"
+            );
+
+            let mut stream = NodeStream::from_packed(&packed).unwrap();
+            stream.open().unwrap().expect("root");
+            stream.open().unwrap().expect("first");
+            stream.close().unwrap();
+            let err = stream.close().expect_err("skipping the rest must fail");
+            assert_eq!(
+                std::mem::discriminant(&err),
+                std::mem::discriminant(&expected),
+                "{name}: {err:?}"
+            );
+            let mut stream = NodeStream::from_packed(&packed).unwrap();
+            assert!(stream.finish().is_err(), "{name}: finish must fail");
+        }
+    }
 }
