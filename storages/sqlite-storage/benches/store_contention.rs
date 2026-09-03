@@ -144,6 +144,26 @@ fn read_under_write<R: Send + 'static>(
 }
 
 #[divan::bench]
+fn read_query_read_idle(bencher: divan::Bencher) {
+    let h = harness();
+    bencher.bench(|| {
+        h.runtime
+            .block_on(h.store.get_group_metadata(black_box(GROUP)))
+            .expect("read")
+    });
+}
+
+#[divan::bench]
+fn write_queue_read_idle(bencher: divan::Bencher) {
+    let h = harness();
+    bencher.bench(|| {
+        h.runtime
+            .block_on(h.store.get_devices(black_box(USER)))
+            .expect("read")
+    });
+}
+
+#[divan::bench]
 fn write_burst_alone(bencher: divan::Bencher) {
     let h = harness();
     let mut turn = 0usize;
