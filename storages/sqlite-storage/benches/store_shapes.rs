@@ -20,6 +20,7 @@
 
 use divan::black_box;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use wacore::appstate::hash::HashState;
 use wacore::appstate::processor::AppStateMutationMAC;
 use wacore::store::traits::{
@@ -46,7 +47,12 @@ struct Db {
 
 impl Db {
     fn open(tag: &str) -> Self {
+        // One blocking thread, never reaped: otherwise the `pthread_create`
+        // that follows tokio's ten-second idle timeout can land inside a
+        // measured iteration. Same reasoning as `signal_flush`.
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .thread_keep_alive(Duration::from_secs(24 * 60 * 60))
             .enable_all()
             .build()
             .expect("current-thread runtime");
