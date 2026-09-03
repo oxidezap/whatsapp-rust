@@ -20,6 +20,7 @@
 use bytes::Bytes;
 use divan::black_box;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use wacore::store::traits::SignalStore;
 use whatsapp_rust_sqlite_storage::SqliteStore;
 
@@ -45,7 +46,17 @@ struct Db {
 
 impl Db {
     fn open(tag: &str) -> Self {
+        // Every store call is one `spawn_blocking`. Tokio reaps an idle
+        // blocking thread after ten seconds and creates a fresh one on the
+        // next call, and each database sits idle while the other benchmarks
+        // in this binary run — so a `pthread_create` (stack `mmap`, TLS
+        // setup) can land inside a measured iteration and read as a
+        // regression that has nothing to do with the store. One thread, kept
+        // for the life of the process, keeps every iteration measuring the
+        // same work.
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .thread_keep_alive(Duration::from_secs(24 * 60 * 60))
             .enable_all()
             .build()
             .expect("current-thread runtime");
