@@ -4398,7 +4398,17 @@ impl DeviceStore for SqliteStore {
                 // by returning busy in its result row, and on some builds as
                 // SQLITE_BUSY, so a skipped truncate is the normal outcome and
                 // never a reason to fail the pass.
-                let _ = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE);").execute(conn);
+                //
+                // Only that outcome is swallowed, though: an I/O error, a full
+                // disk or a permission problem says the log could not be
+                // written back at all, which is exactly the condition this pass
+                // exists to catch — and discarding it would hand `with_retry`
+                // and the keepalive a success they could neither retry nor log.
+                if let Err(e) = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE);").execute(conn)
+                    && !is_retriable_sqlite_error(&e)
+                {
+                    return Err(e);
+                }
                 Ok(())
             })
         })
