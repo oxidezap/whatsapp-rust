@@ -1295,12 +1295,15 @@ async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
             .expect("persistence manager should initialize"),
     );
 
-    // Set a PN so the function doesn't fail early
+    // A PN so the probe does not fail early, and a LID so it reaches the
+    // session check at all: without an own LID it returns before probing.
     let own_pn = Jid::pn("559999999999");
     pm.modify_device(|device| {
         device.pn = Some(own_pn.clone());
     })
     .await;
+    pm.process_command(DeviceCommand::SetLid(Some(Jid::lid("100000000000002"))))
+        .await;
 
     // Pre-populate a session for the primary phone JID (device 0)
     let primary_phone_jid = own_pn.with_device(0);
@@ -1308,9 +1311,8 @@ async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
 
     // Create a dummy session record
     let dummy_session = SessionRecord::new_fresh();
-    {
-        let device_arc = pm.get_device_arc().await;
-        let device = device_arc.read().await;
+    let record_before = {
+        let device = pm.get_device_snapshot();
         device
             .store_session(&signal_addr, &dummy_session)
             .await
@@ -1322,10 +1324,6 @@ async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
             .await
             .expect("Failed to check session");
         assert!(exists, "Session should exist after store");
-    }
-    let record_before = {
-        let device_arc = pm.get_device_arc().await;
-        let device = device_arc.read().await;
         device
             .load_session(&signal_addr)
             .await
@@ -1357,8 +1355,7 @@ async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
     // A missing session loads as a fresh record, so existence is still checked
     // separately.
     {
-        let device_arc = pm.get_device_arc().await;
-        let device = device_arc.read().await;
+        let device = pm.get_device_snapshot();
         let exists = device
             .contains_session(&signal_addr)
             .await

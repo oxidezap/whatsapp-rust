@@ -712,16 +712,25 @@ impl AppStateProcessor {
     ///
     /// A key the backend does not have is left out rather than failing the list:
     /// the closure that needs it reports it missing, and the caller asks the
-    /// primary for it from that.
-    async fn prefetch_keys(&self, pl: &PatchList) -> HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>> {
+    /// primary for it from that. Any other failure is the backend's, and is
+    /// returned as such: swallowed, it would surface as that same missing-key
+    /// report and ask the primary for a key this side already holds.
+    async fn prefetch_keys(
+        &self,
+        pl: &PatchList,
+    ) -> Result<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>> {
         let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
         let mut keys = HashMap::with_capacity(key_ids.len());
         for key_id in key_ids {
-            if let Ok(expanded) = self.get_app_state_key(key_id).await {
-                keys.insert(key_id.to_vec(), expanded);
+            match self.get_app_state_key(key_id).await {
+                Ok(expanded) => {
+                    keys.insert(key_id.to_vec(), expanded);
+                }
+                Err(AppStateSyncError::KeyNotFound(_)) => {}
+                Err(error) => return Err(error.into()),
             }
         }
-        keys
+        Ok(keys)
     }
 
     /// Process an already-parsed single PatchList: download external blobs via
@@ -809,7 +818,7 @@ impl AppStateProcessor {
         validate_macs: bool,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
         // Arc so each blocking closure's handoff is a refcount bump, not a map copy.
-        let keys_map = Arc::new(self.prefetch_keys(&pl).await);
+        let keys_map = Arc::new(self.prefetch_keys(&pl).await?);
 
         let stored = self.backend.get_version(pl.name.as_str()).await?;
         let had_baseline = stored.as_ref().is_some_and(|s| s.has_baseline());
