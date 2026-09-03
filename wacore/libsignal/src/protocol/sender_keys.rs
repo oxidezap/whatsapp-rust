@@ -1029,10 +1029,10 @@ mod tests {
     fn sender_message_key_matches_plain_hkdf() {
         for i in 0..16u8 {
             let seed = [i.wrapping_mul(31).wrapping_add(7); 32];
-            let key = super::SenderMessageKey::new(u32::from(i), seed);
+            let key = SenderMessageKey::new(u32::from(i), seed);
 
             let mut derived = [0u8; 48];
-            hkdf::Hkdf::<sha2::Sha256>::new(None, &seed)
+            hkdf::Hkdf::<Sha256>::new(None, &seed)
                 .expand(b"WhisperGroup", &mut derived)
                 .expect("valid output length");
 
