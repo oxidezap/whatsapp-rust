@@ -283,11 +283,11 @@ impl Client {
     /// `is_offline` mirrors the single-entry path: skip the persist task for
     /// offline replays; mappings are re-learned from the next live event.
     ///
-    /// Takes owned `(lid, phone_number)` pairs; each `String` moves into the
-    /// `Arc<str>` of the `LidPnEntry` stored in the cache. The entries stay
-    /// alive across the backend write so the persisted markers share those
-    /// `Arc<str>`s; the storage row copies them into its own `String` fields,
-    /// which is the one copy the batch makes.
+    /// Takes owned `(lid, phone_number)` pairs. The record path borrows them,
+    /// so each is copied once into the `Arc<str>` fields of the `LidPnEntry`
+    /// stored in the cache. The entries stay alive across the backend write so
+    /// the persisted markers share those `Arc<str>`s; the storage row copies
+    /// them a second time into its own `String` fields.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.learn_lid_pn_batch", level = "debug", skip_all, fields(count = mappings.len(), is_offline = is_offline)))]
     pub(crate) async fn learn_lid_pn_mappings_batch(
         self: &Arc<Self>,
