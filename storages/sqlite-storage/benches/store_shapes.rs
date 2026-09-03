@@ -88,7 +88,7 @@ fn remove_db_files(path: &std::path::Path) {
 }
 
 /// One database slot per benchmark, so no benchmark inherits another's rows.
-const DB_SLOTS: usize = 11;
+const DB_SLOTS: usize = 14;
 static DBS: [OnceLock<Db>; DB_SLOTS] = [const { OnceLock::new() }; DB_SLOTS];
 
 fn db(slot: usize, tag: &str) -> &'static Db {
@@ -327,6 +327,68 @@ fn lid_pn_put_batch(bencher: divan::Bencher, n: usize) {
                 .block_on(d.store.put_lid_mappings(black_box(&entries)))
                 .expect("put batch")
         });
+}
+
+// ---------- sender key devices ----------
+
+const BENCH_GROUP: &str = "120363000000000001@g.us";
+
+fn sk_device_jid(id: u64) -> String {
+    format!("1000000{id:08}:{}@lid", id % 8)
+}
+
+/// The write half: one `set_sender_key_status` call marking `n` devices of a
+/// group as holding our sender key, the shape an SKDM distribution issues after
+/// a send. It is the write that pays for any index on this table.
+#[divan::bench(args = N)]
+fn sender_key_status_put(bencher: divan::Bencher, n: usize) {
+    let d = db(11, "skd-status");
+    bencher
+        .with_inputs(|| (0..n).map(|_| sk_device_jid(d.id())).collect::<Vec<_>>())
+        .bench_values(|jids| {
+            let entries: Vec<(&str, bool)> = jids.iter().map(|j| (j.as_str(), true)).collect();
+            d.runtime
+                .block_on(d.store.set_sender_key_status(BENCH_GROUP, &entries))
+                .expect("set status")
+        });
+}
+
+/// The read half it pairs with: `delete_sender_key_device_rows` filters on
+/// `device_jid`, which is not the leading column of either the primary key or
+/// `idx_sender_key_devices_group`. Deleting JIDs that are NOT in the table keeps
+/// the row count constant across iterations, so what is timed is purely the
+/// lookup — a full scan without a covering index, a seek with one.
+#[divan::bench(args = [10_000usize, 70_000])]
+fn sender_key_device_rows_delete(bencher: divan::Bencher, rows: usize) {
+    let (slot, tag) = if rows == 10_000 {
+        (12, "skd-del-10k")
+    } else {
+        (13, "skd-del-70k")
+    };
+    let d = db(slot, tag);
+    if d.next.load(portable_atomic::Ordering::Relaxed) == 0 {
+        // Spread over groups the way a real account is: one row per (group,
+        // participant device) we ever distributed an SKDM to.
+        const PER_GROUP: usize = 200;
+        for group in 0..rows.div_ceil(PER_GROUP) {
+            let group_jid = format!("12036300000000{group:04}@g.us");
+            let jids: Vec<String> = (0..PER_GROUP.min(rows - group * PER_GROUP))
+                .map(|_| sk_device_jid(d.id()))
+                .collect();
+            let entries: Vec<(&str, bool)> = jids.iter().map(|j| (j.as_str(), true)).collect();
+            d.runtime
+                .block_on(d.store.set_sender_key_status(&group_jid, &entries))
+                .expect("seed");
+        }
+    }
+    // SIGNAL_NAMESPACE_COUNT JIDs per call, which is what the device-removal
+    // path passes.
+    let absent = ["999999999999999:1@lid", "999999999999999:1@s.whatsapp.net"];
+    bencher.bench(|| {
+        d.runtime
+            .block_on(d.store.delete_sender_key_device_rows(black_box(&absent)))
+            .expect("delete")
+    });
 }
 
 // ---------- message secrets ----------

@@ -1,0 +1,11 @@
+-- `delete_sender_key_device_rows` filters `device_jid IN (...) AND device_id = ?`,
+-- and device_jid leads neither the primary key (group_jid, device_jid, device_id)
+-- nor idx_sender_key_devices_group, so it was a full table scan on a table that
+-- grows with (groups x participant devices) -- measured 770 us at 10k rows and
+-- 5.39 ms at 70k, linear in the row count, on the path every peer device-removal
+-- notification takes.
+--
+-- Unlike the device_id indexes this batch drops, this one IS read by a real
+-- query. device_id first (equality) then device_jid, matching the other
+-- per-account indexes here.
+CREATE INDEX idx_sender_key_devices_device_jid ON sender_key_devices (device_id, device_jid);
