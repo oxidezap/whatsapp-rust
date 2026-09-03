@@ -2771,16 +2771,25 @@ impl Client {
                 .await?;
 
             // Resolved once per memo entry: the session pre-check, the lock
-            // keys and the encrypt fan-out all address the same devices.
+            // keys and the encrypt fan-out all address the same devices. The
+            // list is built from `devices()` itself, so it is parallel by
+            // construction and the memo accepts it; a refusal still serves
+            // this send from the local value.
+            let resolved_here;
             let addressing = match dm_devices.signal_addressing() {
                 Some(addressing) => addressing,
                 None => {
                     let encryption = self.resolve_encryption_jids(dm_devices.devices()).await;
                     let mut lock_keys = encryption.clone();
                     sort_session_lock_keys(&mut lock_keys);
-                    dm_devices.signal_addressing_or_init(wacore::send::DmSignalAddressing::new(
-                        encryption, lock_keys,
-                    ))
+                    let built = wacore::send::DmSignalAddressing::new(encryption, lock_keys);
+                    match dm_devices.signal_addressing_or_init(built) {
+                        Ok(memoized) => memoized,
+                        Err(refused) => {
+                            resolved_here = refused;
+                            &resolved_here
+                        }
+                    }
                 }
             };
             self.ensure_e2e_sessions_resolved(addressing.encryption())

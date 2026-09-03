@@ -276,13 +276,15 @@ pub async fn prepare_dm_stanza(
     let own_other_devices = resolved_devices.own_other_devices();
     let total_devices = resolved_devices.devices().len();
     // The memoized addresses are parallel to `devices()`, which is the
-    // recipient partition followed by our companions.
+    // recipient partition followed by our companions. A list of any other
+    // length is not one this set produced, so it is ignored rather than
+    // trusted, and the fan-out resolves per device as it does without a memo.
     let (recipient_addresses, own_addresses) = match resolved_devices.signal_addressing() {
-        Some(addressing) => {
+        Some(addressing) if addressing.encryption().len() == total_devices => {
             let (recipient, own) = addressing.encryption().split_at(recipient_devices.len());
             (Some(recipient), Some(own))
         }
-        None => (None, None),
+        _ => (None, None),
     };
 
     let phash = resolved_devices.phash();

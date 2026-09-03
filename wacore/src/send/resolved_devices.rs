@@ -121,6 +121,9 @@ pub struct DmSignalAddressing {
 }
 
 impl DmSignalAddressing {
+    /// `encryption` must be parallel to the device set this is memoized on;
+    /// [`ResolvedDmDevices::signal_addressing_or_init`] refuses any other
+    /// length, and a consumer treats one as "not memoized".
     pub fn new(encryption: Vec<Jid>, lock_keys: Vec<Jid>) -> Self {
         Self {
             encryption: encryption.into_boxed_slice(),
@@ -177,8 +180,19 @@ impl ResolvedDmDevices {
     /// Memoize `addressing`, or return what an earlier send memoized. The
     /// caller resolved it from this same immutable device set, so whichever
     /// racer wins the cell holds the same answer.
-    pub fn signal_addressing_or_init(&self, addressing: DmSignalAddressing) -> &DmSignalAddressing {
-        self.signal.get_or_init(|| addressing)
+    ///
+    /// Refused, and handed back, when `addressing` does not carry one address
+    /// per device: such a list cannot be indexed by device, and a memo entry
+    /// lives across sends, so a malformed one must never be installed. The
+    /// caller may still use the returned value for its own send.
+    pub fn signal_addressing_or_init(
+        &self,
+        addressing: DmSignalAddressing,
+    ) -> Result<&DmSignalAddressing, DmSignalAddressing> {
+        if addressing.encryption().len() != self.devices().len() {
+            return Err(addressing);
+        }
+        Ok(self.signal.get_or_init(|| addressing))
     }
 
     /// Every device the stanza encrypts for, in partition order.
