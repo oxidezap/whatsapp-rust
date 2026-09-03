@@ -1298,10 +1298,8 @@ async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
     // A PN so the probe does not fail early, and a LID so it reaches the
     // session check at all: without an own LID it returns before probing.
     let own_pn = Jid::pn("559999999999");
-    pm.modify_device(|device| {
-        device.pn = Some(own_pn.clone());
-    })
-    .await;
+    pm.process_command(DeviceCommand::SetId(Some(own_pn.clone())))
+        .await;
     pm.process_command(DeviceCommand::SetLid(Some(Jid::lid("100000000000002"))))
         .await;
 
