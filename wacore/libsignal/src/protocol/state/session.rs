@@ -132,13 +132,40 @@ impl SkippedKey {
         }
     }
 
-    fn to_pb(&self) -> session_structure::chain::MessageKey {
-        match self {
-            Self::Seed { index, seed } => {
-                MessageKeyGenerator::new_from_seed(seed, *index).into_pb()
+    /// A chain's backlog as protobuf entries, every seed-only key sliced out
+    /// of one shared buffer: a store flush re-encodes the backlog of every
+    /// dirty chain, and after an offline drain that is hundreds of keys, so an
+    /// allocation per key per flush was the dominant flush cost. Legacy keys
+    /// keep their boxed protobuf and clone it as before.
+    fn to_pb_list(keys: &[Self]) -> Vec<session_structure::chain::MessageKey> {
+        let seed_count = keys
+            .iter()
+            .filter(|key| matches!(key, Self::Seed { .. }))
+            .count();
+        let mut seeds = bytes::BytesMut::with_capacity(seed_count * 32);
+        for key in keys {
+            if let Self::Seed { seed, .. } = key {
+                seeds.extend_from_slice(seed);
             }
-            Self::Legacy(pb) => (**pb).clone(),
         }
+        let seeds = seeds.freeze();
+        let mut next_seed = 0;
+        keys.iter()
+            .map(|key| match key {
+                Self::Seed { index, .. } => {
+                    let seed = seeds.slice(next_seed..next_seed + 32);
+                    next_seed += 32;
+                    session_structure::chain::MessageKey {
+                        cipher_key: None,
+                        mac_key: None,
+                        iv: None,
+                        index: Some(*index),
+                        seed: Some(seed),
+                    }
+                }
+                Self::Legacy(pb) => (**pb).clone(),
+            })
+            .collect()
     }
 
     /// Heap bytes hanging off this key: only the legacy arm owns any.
@@ -273,7 +300,7 @@ impl SessionState {
     fn fill_skipped(session: &mut SessionStructure, skipped: &[SkippedKeys]) {
         for (chain, keys) in session.receiver_chains.iter_mut().zip(skipped) {
             if let Some(keys) = keys {
-                chain.message_keys = keys.iter().map(SkippedKey::to_pb).collect();
+                chain.message_keys = SkippedKey::to_pb_list(keys);
             }
         }
     }

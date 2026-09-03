@@ -34,8 +34,11 @@ impl PendingDeviceSync {
         }
     }
 
+    /// Takes the set's allocation with it: the queue fills during an offline
+    /// drain and is empty the rest of the process lifetime, so `drain` would
+    /// pin the high-water table for nothing.
     pub(crate) fn take_all(&self) -> Vec<Jid> {
-        self.lock().drain().collect()
+        std::mem::take(&mut *self.lock()).into_iter().collect()
     }
 
     /// Users queued for the next `doPendingDeviceSync`, plus the users an

@@ -786,6 +786,106 @@ fn bench_group_decrypt_message(bencher: divan::Bencher) {
         });
 }
 
+/// Backlog depth a store flush re-encodes for a chain receiving out of order:
+/// a busy group after an offline window. Deep enough that the per-key cost
+/// dominates the fixed record cost, well under both caps.
+const SERIALIZE_BACKLOG: usize = 200;
+
+/// Bob's session after Alice sent `SERIALIZE_BACKLOG + 1` messages of which
+/// only the last arrived, so his receiver chain holds the backlog.
+fn setup_session_with_backlog() -> SessionRecord {
+    let (mut alice, mut bob, _) = setup_dm_with_inorder_subsequent_message();
+
+    futures::executor::block_on(async {
+        let mut rng = bench_rng();
+        let mut last = Vec::new();
+        for _ in 0..=SERIALIZE_BACKLOG {
+            let msg = message_encrypt(
+                b"skipped",
+                &bob.address,
+                &mut alice.session_store,
+                &mut alice.identity_store,
+            )
+            .await
+            .expect("alice encrypt");
+            last = msg.serialize().to_vec();
+        }
+        let last = CiphertextMessage::SignalMessage(
+            wacore_libsignal::protocol::SignalMessage::try_from(last.as_slice()).unwrap(),
+        );
+        message_decrypt(
+            &last,
+            &alice.address,
+            &mut bob.session_store,
+            &mut bob.identity_store,
+            &mut bob.prekey_store,
+            &bob.signed_prekey_store,
+            &mut rng,
+            UsePQRatchet::No,
+        )
+        .await
+        .expect("bob decrypts the last message");
+
+        bob.session_store
+            .load_session(&alice.address)
+            .await
+            .expect("load session")
+            .expect("session exists")
+    })
+}
+
+/// Store-flush cost of a session with a skipped-key backlog. The empty-backlog
+/// case is a borrow of the in-memory protobuf; this is the path that rebuilds it.
+#[divan::bench]
+fn bench_session_serialize_with_backlog(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_session_with_backlog)
+        .bench_refs(|record| black_box(record.serialize().expect("serialize session")));
+}
+
+/// Bob's sender key state after Alice encrypted `SERIALIZE_BACKLOG + 1` group
+/// messages of which only the last arrived.
+fn setup_sender_key_with_backlog() -> SenderKeyRecord {
+    let (mut alice, mut bob, sender_key_name) = setup_group_with_distribution();
+
+    futures::executor::block_on(async {
+        let mut rng = bench_rng();
+        let mut last = Vec::new();
+        for _ in 0..=SERIALIZE_BACKLOG {
+            let skm = group_encrypt(
+                &mut alice.sender_key_store,
+                &sender_key_name,
+                b"skipped",
+                &mut rng,
+            )
+            .await
+            .expect("group encrypt");
+            last = skm.serialized().to_vec();
+        }
+        let bob_sender_key_name = SenderKeyName::new(
+            sender_key_name.group_id().to_string(),
+            alice.address.name().to_string(),
+        );
+        group_decrypt(&last, &mut bob.sender_key_store, &bob_sender_key_name)
+            .await
+            .expect("bob decrypts the last message");
+
+        bob.sender_key_store
+            .load_sender_key(&bob_sender_key_name)
+            .await
+            .expect("load sender key")
+            .expect("sender key exists")
+    })
+}
+
+/// Store-flush cost of a sender key record with a skipped-key backlog.
+#[divan::bench]
+fn bench_sender_key_serialize_with_backlog(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_sender_key_with_backlog)
+        .bench_refs(|record| black_box(record.serialize().expect("serialize sender key")));
+}
+
 fn setup_conversation_data() -> (User, User) {
     setup_dm_users()
 }

@@ -579,7 +579,7 @@ impl Client {
         // After the write, not before: a failed persist stays un-marked so the
         // next live message retries instead of skipping.
         self.lid_pn_cache
-            .mark_persisted(&storage_entry.phone_number, &storage_entry.lid)
+            .mark_persisted(&entry.phone_number, &entry.lid)
             .await;
 
         if needs_migration {
@@ -617,11 +617,11 @@ impl Client {
     ) -> Result<Vec<LidPnMappingEntry>> {
         use anyhow::anyhow;
 
-        // Consume entries so `lid`/`phone_number` move into storage rather
-        // than being cloned. Only `learning_source` is allocated, and only
-        // because `LidPnMappingEntry.learning_source` is a `String` field.
+        // The storage row copies `lid`/`phone_number` into `String`s because
+        // `LidPnMappingEntry` is a `String` type; the cache's persisted marker
+        // keeps sharing the entry's `Arc<str>` pair instead.
         let storage: Vec<LidPnMappingEntry> = entries
-            .into_iter()
+            .iter()
             .map(|entry| LidPnMappingEntry {
                 lid: entry.lid.to_string(),
                 phone_number: entry.phone_number.to_string(),
@@ -637,7 +637,7 @@ impl Client {
             .await
             .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
 
-        for entry in &storage {
+        for entry in &entries {
             self.lid_pn_cache
                 .mark_persisted(&entry.phone_number, &entry.lid)
                 .await;
@@ -1645,7 +1645,10 @@ mod tests {
             .await;
         assert_eq!(retry.migration_flags, vec![true]);
 
-        client.lid_pn_cache.mark_persisted(phone, lid).await;
+        client
+            .lid_pn_cache
+            .mark_persisted(&Arc::from(phone), &Arc::from(lid))
+            .await;
         let durable = client
             .record_lid_pn_batch_in_memory(mapping(), LearningSource::Other)
             .await;

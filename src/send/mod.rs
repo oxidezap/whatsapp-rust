@@ -2546,11 +2546,25 @@ impl Client {
             .await
             {
                 Ok(prepared) => {
-                    skdm_update = Some(SkdmUpdate {
-                        to_str: to_str.clone(),
-                        devices: prepared.skdm_devices,
-                        stale_users: prepared.stale_device_users,
-                    });
+                    // Own devices are never marked warm (see
+                    // `update_sender_key_devices`), so an own-only SKDM set —
+                    // every warm send — would only be filtered back to nothing
+                    // after a device snapshot; skip building the update for it.
+                    let devices = if skdm_needs_only_own_devices(
+                        &prepared.skdm_devices,
+                        Some(own_jid),
+                        Some(own_lid),
+                    ) {
+                        Vec::new()
+                    } else {
+                        prepared.skdm_devices
+                    };
+                    skdm_update = (!devices.is_empty() || !prepared.stale_device_users.is_empty())
+                        .then(|| SkdmUpdate {
+                            to_str,
+                            devices,
+                            stale_users: prepared.stale_device_users,
+                        });
                     outbound_msg_secret = prepared.message_secret;
                     outbound_group_sender_identity = Some(prepared.sender_identity);
                     group_ack_phash = prepared.phash;

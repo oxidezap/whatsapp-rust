@@ -308,9 +308,12 @@ impl LidPnCache {
             .is_some_and(|stored| stored.as_ref() == lid)
     }
 
-    pub(crate) async fn mark_persisted(&self, phone: &str, lid: &str) {
+    /// Takes the entry's own identifiers: this map holds one pair per
+    /// persisted contact for the process lifetime, so re-allocating both
+    /// strings here would duplicate every mapping's payload a third time.
+    pub(crate) async fn mark_persisted(&self, phone: &Arc<str>, lid: &Arc<str>) {
         self.persisted
-            .insert(Arc::from(phone), Arc::from(lid))
+            .insert(Arc::clone(phone), Arc::clone(lid))
             .await;
     }
 
@@ -560,7 +563,9 @@ mod tests {
         let pn = "559980000099";
         let (lid_a, lid_b) = ("100000000000001", "100000000000002");
         assert!(!cache.is_persisted(pn, lid_a).await);
-        cache.mark_persisted(pn, lid_a).await;
+        cache
+            .mark_persisted(&Arc::from(pn), &Arc::from(lid_a))
+            .await;
         assert!(cache.is_persisted(pn, lid_a).await);
         // A remap to a new LID is not persisted (even a stale mark of the old
         // LID never satisfies the new pair), so it re-persists.
@@ -578,7 +583,7 @@ mod tests {
                 LearningSource::PeerPnMessage,
             ))
             .await;
-        cache.mark_persisted(pn, lid).await;
+        cache.mark_persisted(&Arc::from(pn), &Arc::from(lid)).await;
         assert!(cache.can_skip_relearn(pn, lid).await);
 
         // Evict the reverse (LID -> PN) entry: the fast path must stop skipping

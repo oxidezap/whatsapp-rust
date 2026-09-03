@@ -164,6 +164,16 @@ pub fn needs_device_identity(
 /// 16 on Oracle ARM64; 32 gives only ~10% more for double the task overhead.
 const ENCRYPT_FANOUT_CONCURRENCY: usize = 16;
 
+/// Recipient-device count up to which a send encrypts inline instead of
+/// fanning out. Five is a 1:1 recipient's ceiling (primary plus four
+/// companions), and at that size the fan-out is a net loss: an `Arc<[u8]>`
+/// copy of the plaintext, a task + oneshot per chunk, and two store clones per
+/// chunk against ~2 µs of pairwise crypto per device. `bench_dm_send_5_way_fanout`
+/// measured 77 µs spawned vs. 69 µs inline; the plateau above (8 devices inline)
+/// was within noise of 5, so the DM ceiling is the threshold rather than a tuned
+/// number.
+const INLINE_ENCRYPT_DEVICES: usize = 5;
+
 /// What one session-establishment task did with its device, shipped back to the
 /// orchestrator because a spawned task holds no borrow of the resolver.
 enum SessionOutcome {
@@ -1118,31 +1128,30 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
     // The wire-order of `<to>` participants does not need to match the input
     // device order: WA Web's `phash` (computed both client and server side)
     // sorts before hashing, as does our `participant_list_hash`.
-    if devices.len() == 1 {
-        // Single recipient device: the parallel fan-out is pure overhead here
-        // (an Arc<[u8]> copy of the plaintext, a spawned task + oneshot channel,
-        // a FuturesUnordered, and two store clones), with no parallelism to gain.
-        // Encrypt inline.
-        let device_jid = devices[0].clone();
-        let addr = encryption_override_at(&encryption_overrides, 0)
-            .unwrap_or(&devices[0])
-            .to_protocol_address();
-        let res = encrypt_one_device(
-            plaintext_to_encrypt,
-            &addr,
-            &mut *stores.session_store,
-            &mut *stores.identity_store,
-            device_jid,
-        )
-        .await;
-        push_raw_result(
-            res,
-            &mut encrypted,
-            &mut includes_prekey_message,
-            &mut first_error,
-            &unkeyed_devices,
-            &mut unkeyed_at_encrypt,
-        );
+    if devices.len() <= INLINE_ENCRYPT_DEVICES {
+        // Rationale on the constant: no parallelism worth its spawn cost at
+        // this size, so encrypt sequentially on the caller's task.
+        for (idx, device) in devices.iter().enumerate() {
+            let addr = encryption_override_at(&encryption_overrides, idx)
+                .unwrap_or(device)
+                .to_protocol_address();
+            let res = encrypt_one_device(
+                plaintext_to_encrypt,
+                &addr,
+                &mut *stores.session_store,
+                &mut *stores.identity_store,
+                device.clone(),
+            )
+            .await;
+            push_raw_result(
+                res,
+                &mut encrypted,
+                &mut includes_prekey_message,
+                &mut first_error,
+                &unkeyed_devices,
+                &mut unkeyed_at_encrypt,
+            );
+        }
     } else {
         // One task per chunk, not per device: the per-device fan-out allocated a
         // task + oneshot + two store clones for every recipient. Same parallelism,

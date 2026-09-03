@@ -106,11 +106,24 @@ impl StoredMessageKey {
         }
     }
 
-    fn as_protobuf(&self) -> sender_key_state_structure::SenderMessageKey {
-        sender_key_state_structure::SenderMessageKey {
-            iteration: Some(self.iteration),
-            seed: Some(bytes::Bytes::copy_from_slice(&self.seed)),
+    /// The backlog as protobuf entries, with every seed a slice of one shared
+    /// buffer: a store flush re-encodes the whole backlog of every dirty state,
+    /// and a busy group's out-of-order window is hundreds of keys, so one
+    /// allocation per key per flush was the dominant flush cost. `Bytes::slice`
+    /// is a refcount bump.
+    fn as_protobuf_list(keys: &[Self]) -> Vec<sender_key_state_structure::SenderMessageKey> {
+        let mut seeds = bytes::BytesMut::with_capacity(keys.len() * 32);
+        for key in keys {
+            seeds.extend_from_slice(&key.seed);
         }
+        let seeds = seeds.freeze();
+        keys.iter()
+            .enumerate()
+            .map(|(i, key)| sender_key_state_structure::SenderMessageKey {
+                iteration: Some(key.iteration),
+                seed: Some(seeds.slice(i * 32..(i + 1) * 32)),
+            })
+            .collect()
     }
 }
 
@@ -554,11 +567,7 @@ impl SenderKeyState {
             "backlog and chain key must live only in their Copy/Arc fields; the protobuf copies stay empty"
         );
         let mut state = self.state.clone();
-        state.sender_message_keys = self
-            .message_keys
-            .iter()
-            .map(StoredMessageKey::as_protobuf)
-            .collect();
+        state.sender_message_keys = StoredMessageKey::as_protobuf_list(&self.message_keys);
         state.sender_chain_key = self
             .sender_chain
             .as_ref()
@@ -574,10 +583,7 @@ impl SenderKeyState {
         );
         let message_keys = std::sync::Arc::try_unwrap(self.message_keys)
             .unwrap_or_else(|shared| shared.as_ref().clone());
-        self.state.sender_message_keys = message_keys
-            .iter()
-            .map(StoredMessageKey::as_protobuf)
-            .collect();
+        self.state.sender_message_keys = StoredMessageKey::as_protobuf_list(&message_keys);
         self.state.sender_chain_key = self
             .sender_chain
             .as_ref()
