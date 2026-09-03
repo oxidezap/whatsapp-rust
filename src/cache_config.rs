@@ -160,8 +160,12 @@ impl CacheStores {
 pub struct CacheConfig {
     /// Group metadata cache (time_to_live). Default: 1h TTL, 250 entries.
     pub group_cache: CacheEntryConfig,
-    /// Device registry cache (time_to_live). Default: 1h TTL, 5000 entries
-    /// (holds a large group's per-member device set; a near-max group is ~1024).
+    /// Device registry cache (time_to_live): one entry per contact whose
+    /// device list is known. Default: 1h TTL, 20000 entries. It only ever
+    /// holds what has been resolved, so the bound costs nothing until an
+    /// account approaches it; past it, the per-group device memos still
+    /// answer warm sends, and a memo recompute reads the evicted members in
+    /// one batched backend query rather than one query each.
     pub device_registry_cache: CacheEntryConfig,
     /// LID-to-phone cache. WAWebLidPnCache uses plain Maps with no expiry
     /// and no size cap; evicting a still-valid mapping silently downgrades
@@ -215,6 +219,15 @@ pub struct CacheConfig {
     /// Soft cap: a live lane is never evicted, so the map may briefly exceed
     /// this under concurrent fan-out instead of breaking tracker ordering.
     pub group_distribution_locks_capacity: u64,
+    /// Per-group resolved-device memo capacity: the device list a group send
+    /// fans out to plus its member index, ~10 KiB at 256 members. Also bounds
+    /// the SKDM warm-target memo, which is keyed the same way. Eviction is
+    /// least-recently-used, so an account active in more groups than this
+    /// re-resolves only its least active ones; below it, a warm send never
+    /// re-resolves. Default: 512.
+    pub group_devices_memo_capacity: u64,
+    /// Per-1:1-chat resolved-device memo capacity. Default: 512.
+    pub dm_devices_memo_capacity: u64,
     /// Per-chat resend rate-limiter capacity: one token-bucket entry per group
     /// recently driving retry resends. Keep above the count of concurrently
     /// storming groups: eviction is FIFO and fail-open (an evicted bucket is
@@ -299,6 +312,11 @@ impl std::fmt::Debug for CacheConfig {
                 &self.group_distribution_locks_capacity,
             )
             .field(
+                "group_devices_memo_capacity",
+                &self.group_devices_memo_capacity,
+            )
+            .field("dm_devices_memo_capacity", &self.dm_devices_memo_capacity)
+            .field(
                 "resend_rate_limiter_capacity",
                 &self.resend_rate_limiter_capacity,
             )
@@ -340,9 +358,11 @@ impl Default for CacheConfig {
 
         Self {
             group_cache: CacheEntryConfig::new(one_hour, 250),
-            // One entry per group member; 1000 was below a near-max (~1024) group,
-            // so large-group warm sends thrashed to the serial per-user DB path.
-            device_registry_cache: CacheEntryConfig::new(one_hour, 5_000),
+            // One entry per contact. 5000 was below an account in a few
+            // dozen mid-sized groups, whose every memo recompute then paid a
+            // backend read per member; the bound is a ceiling, not a
+            // preallocation, so a small account pays nothing for it.
+            device_registry_cache: CacheEntryConfig::new(one_hour, 20_000),
             lid_pn_cache: CacheEntryConfig::new(None, u64::MAX),
             recent_messages: CacheEntryConfig::new(five_min, 0),
             // 1h so the MAX_DECRYPT_RETRIES cap survives spaced redeliveries; a
@@ -360,6 +380,12 @@ impl Default for CacheConfig {
             session_locks_capacity: 10_000,
             chat_lanes_capacity: 5_000,
             group_distribution_locks_capacity: 512,
+            // 64 was a hard cliff: the memo evicted oldest-first, so an
+            // account rotating over 65 groups had a hit rate of exactly zero
+            // and every group send re-resolved every member (~470 us at 256
+            // members before any crypto ran).
+            group_devices_memo_capacity: 512,
+            dm_devices_memo_capacity: 512,
             resend_rate_limiter_capacity: 4_096,
             sent_message_ttl_secs: 7200,
             // Bounded by default: seed only the still-relevant slice of history

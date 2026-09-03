@@ -780,6 +780,14 @@ impl ProtocolStore for InMemoryBackend {
         Ok(self.state.lock().await.device_lists.get(user).cloned())
     }
 
+    async fn get_devices_batch(&self, users: &[&str]) -> Result<Vec<DeviceListRecord>> {
+        let state = self.state.lock().await;
+        Ok(users
+            .iter()
+            .filter_map(|user| state.device_lists.get(*user).cloned())
+            .collect())
+    }
+
     async fn delete_devices(&self, user: &str) -> Result<()> {
         self.state.lock().await.device_lists.remove(user);
         Ok(())

@@ -160,6 +160,55 @@ where
         self.table.iter().map(|slot| (&slot.key, &slot.entry))
     }
 
+    /// Whether `entry` has aged into the older half of the eviction order and
+    /// is worth moving to the back under the write lock. Half is the
+    /// tolerance: a hot entry then costs one write per `cap / 2` inserts
+    /// instead of one per read, and after a touch it is never among the next
+    /// `cap / 2` evicted. A cache without a bound never renews.
+    fn needs_order_renewal(&self, entry: &CacheEntry<V>, max_capacity: Option<u64>) -> bool {
+        match max_capacity {
+            Some(cap) if self.track_order => self.next_seq.saturating_sub(entry.seq) > cap / 2,
+            _ => false,
+        }
+    }
+
+    /// Move `key`'s entry to the back of the eviction order, if it is still
+    /// the entry observed (a re-insert already gave it a fresh sequence).
+    fn renew_order<Q>(&mut self, key: &Q, observed_seq: u64)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        let seq = self.next_seq;
+        let Some(slot) = self.table.find_mut(hash, |slot| slot.key.borrow() == key) else {
+            return;
+        };
+        if slot.entry.seq != observed_seq {
+            return;
+        }
+        slot.entry.seq = seq;
+        self.next_seq += 1;
+        self.order.remove(&observed_seq);
+        self.order.insert(seq, hash);
+    }
+
+    /// Bytes the table and the eviction order themselves hold, on top of the
+    /// entries: hashbrown's buckets (a slot plus a control byte each, at its
+    /// power-of-two capacity) and one B-tree node share per ordered entry.
+    fn structural_bytes(&self) -> usize {
+        // A `BTreeMap<u64, u64>` leaf holds up to 11 pairs and averages
+        // roughly two thirds full, so the per-entry share is a little over
+        // the pair itself; 8 bytes of overhead is the conservative round-up.
+        const ORDER_NODE_SHARE: usize = 2 * size_of::<u64>() + 8;
+        let order = if self.track_order {
+            self.order.len() * ORDER_NODE_SHARE
+        } else {
+            0
+        };
+        wacore::stats::hash_table_bytes(self.table.capacity(), size_of::<Slot<K, V>>()) + order
+    }
+
     fn clear(&mut self) {
         self.table.clear();
         self.order.clear();
@@ -507,7 +556,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (value, renew_at) = {
+        let (value, renew_at, renew_order) = {
             let guard = self.inner.read().await;
             let entry = guard.get(key)?;
             // Read the clock after the lookup: a miss has no timestamp to
@@ -533,21 +582,28 @@ where
             (
                 entry.value.clone(),
                 self.needs_tti_renewal(entry, now).then_some(now),
+                guard
+                    .needs_order_renewal(entry, self.max_capacity)
+                    .then_some(entry.seq),
             )
         };
 
-        if let Some(now) = renew_at {
+        if renew_at.is_some() || renew_order.is_some() {
             let mut guard = self.inner.write().await;
             // Re-decide under the lock: the key may have been invalidated (the
             // miss leaves it that way) or already refreshed by a racing renewal
             // or insert, whose newer stamp this lookup must leave alone.
-            if let Some(entry) = guard.get_mut(key)
+            if let Some(now) = renew_at
+                && let Some(entry) = guard.get_mut(key)
                 && self.needs_tti_renewal(entry, now)
             {
                 entry.last_accessed_at = now;
                 #[cfg(test)]
                 self.tti_renewals
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(observed_seq) = renew_order {
+                guard.renew_order(key, observed_seq);
             }
         }
 
@@ -727,16 +783,22 @@ where
         guard.iter().fold(init, |acc, (k, e)| f(acc, k, &e.value))
     }
 
-    /// Entry count plus estimated retained bytes, summing `per_entry` under a
-    /// single awaited read guard so the pair is mutually consistent (and never
-    /// the empty best-effort snapshot [`iter`](Self::iter) can degrade to).
+    /// Entry count plus estimated retained bytes: the table and eviction
+    /// order the cache itself holds, plus `per_entry` summed over the entries,
+    /// under a single awaited read guard so the pair is mutually consistent
+    /// (and never the empty best-effort snapshot [`iter`](Self::iter) can
+    /// degrade to). Callers charge only what their entries point at; the
+    /// slots and order nodes are charged here, once, for every cache.
     pub async fn memory_stats(
         &self,
         mut per_entry: impl FnMut(&K, &V) -> usize,
     ) -> wacore::stats::CollectionStats {
         let guard = self.inner.read().await;
         let bytes: usize = guard.iter().map(|(k, e)| per_entry(k, &e.value)).sum();
-        wacore::stats::CollectionStats::new(guard.len() as u64, bytes as u64)
+        wacore::stats::CollectionStats::new(
+            guard.len() as u64,
+            (bytes + guard.structural_bytes()) as u64,
+        )
     }
 
     /// Eager snapshot iterator over `(Arc<K>, V)`: snapshot, not lazy. Includes
@@ -1065,6 +1127,40 @@ mod tests {
                 eviction_blocks: 1,
             }
         );
+    }
+
+    /// A bounded cache is least-recently-used, not first-in-first-out: an
+    /// entry that keeps being read outlives everything inserted after it,
+    /// while an entry never read again is evicted in insertion order.
+    #[tokio::test]
+    async fn a_read_entry_outlives_entries_inserted_after_it() {
+        let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(8).build();
+        cache.insert("hot".to_string(), 1).await;
+        cache.insert("cold".to_string(), 2).await;
+        for i in 0..64u32 {
+            cache.insert(format!("filler-{i}"), i).await;
+            assert_eq!(cache.get("hot").await, Some(1), "hot entry evicted after {i} inserts");
+        }
+        assert_eq!(cache.get("cold").await, None, "an unread entry must age out");
+        assert_eq!(cache.entry_count(), 8);
+    }
+
+    /// Renewal costs a write lock, so a fresh entry is not renewed on every
+    /// read: only once it has aged into the older half of the order.
+    #[tokio::test]
+    async fn a_fresh_entry_is_not_reordered_on_every_read() {
+        let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(8).build();
+        cache.insert("a".to_string(), 1).await;
+        let seq_before = cache.inner.read().await.get("a").map(|e| e.seq);
+        for _ in 0..3 {
+            cache.get("a").await;
+        }
+        assert_eq!(cache.inner.read().await.get("a").map(|e| e.seq), seq_before);
+        for i in 0..5u32 {
+            cache.insert(format!("b{i}"), i).await;
+        }
+        cache.get("a").await;
+        assert!(cache.inner.read().await.get("a").map(|e| e.seq) > seq_before);
     }
 
     #[tokio::test]

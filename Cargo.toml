@@ -345,6 +345,11 @@ name = "client_dm_send"
 harness = false
 required-features = ["bench-harness"]
 
+[[bench]]
+name = "client_group_scale"
+harness = false
+required-features = ["bench-harness"]
+
 # The `Cache<Jid, _>` lookup shape `chat_lanes` runs per inbound message. No
 # `required-features`: it reaches only the public cache, so it builds (and is
 # regression-gated) in a plain `cargo bench`.

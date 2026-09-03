@@ -36,7 +36,7 @@ fn fingerprint_hasher() -> &'static RandomState {
     HASHER.get_or_init(RandomState::new)
 }
 
-fn fingerprint(user: &str) -> u64 {
+pub(crate) fn fingerprint(user: &str) -> u64 {
     fingerprint_hasher().hash_one(user)
 }
 
@@ -47,15 +47,46 @@ impl MemberIndex {
         }
     }
 
+    /// Index one set of identifiers in a single call.
+    pub(crate) fn from_users<'a>(users: impl IntoIterator<Item = &'a str>) -> Self {
+        let users = users.into_iter();
+        let mut builder = Self::builder(users.size_hint().0);
+        for user in users {
+            builder.insert(user);
+        }
+        builder.build()
+    }
+
     /// Whether `user` may be a member. `true` is "possibly", `false` is
     /// definite — see the type's note on which direction is safe.
+    #[cfg(test)]
     pub(crate) fn contains(&self, user: &str) -> bool {
         self.fingerprints.binary_search(&fingerprint(user)).is_ok()
     }
 
-    #[cfg(test)]
+    /// Whether the two indexes share a fingerprint, with the same asymmetry
+    /// as [`contains`](Self::contains): `true` is "possibly". A merge walk
+    /// over the two sorted slices, so a topology change that touched hundreds
+    /// of users is checked against a memo in one pass.
+    pub(crate) fn intersects(&self, other: &MemberIndex) -> bool {
+        let (mut left, mut right) = (self.fingerprints.iter(), other.fingerprints.iter());
+        let (mut l, mut r) = (left.next(), right.next());
+        while let (Some(a), Some(b)) = (l, r) {
+            match a.cmp(b) {
+                std::cmp::Ordering::Equal => return true,
+                std::cmp::Ordering::Less => l = left.next(),
+                std::cmp::Ordering::Greater => r = right.next(),
+            }
+        }
+        false
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.fingerprints.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.fingerprints.is_empty()
     }
 }
 

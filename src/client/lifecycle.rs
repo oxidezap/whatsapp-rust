@@ -3,15 +3,6 @@
 use super::*;
 use wacore::net::DisconnectReason;
 
-/// Max groups with a cached resolved-device snapshot. LRU eviction covers
-/// accounts in more groups; an evicted entry just recomputes on next send.
-const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
-
-/// Max 1:1 chats with a cached resolved-device snapshot. Higher than the
-/// group bound because a bot's active DM set is typically much wider; each
-/// entry is only the device list plus its member set.
-const DM_DEVICES_MEMO_CAPACITY: u64 = 512;
-
 /// `authenticated_generation` when no connection has published one.
 ///
 /// Not zero: that is a real generation, the one a freshly built client is on,
@@ -568,10 +559,10 @@ impl Client {
             device_memos_enabled: cache_config.cache_stores.device_registry_cache.is_none()
                 && cache_config.cache_stores.lid_pn_cache.is_none(),
             group_devices_memo: Cache::builder()
-                .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
+                .max_capacity(cache_config.group_devices_memo_capacity)
                 .build(),
             dm_devices_memo: Cache::builder()
-                .max_capacity(DM_DEVICES_MEMO_CAPACITY)
+                .max_capacity(cache_config.dm_devices_memo_capacity)
                 .build(),
             #[cfg(test)]
             dm_devices_memo_recomputes: AtomicU64::new(0),
@@ -582,7 +573,7 @@ impl Client {
                 .evict_guard(|m| Arc::strong_count(m) <= 1)
                 .build(),
             skdm_warm_memo: Cache::builder()
-                .max_capacity(GROUP_DEVICES_MEMO_CAPACITY)
+                .max_capacity(cache_config.group_devices_memo_capacity)
                 .build(),
             stanza_router: Self::create_stanza_router(),
             synchronous_ack: false,

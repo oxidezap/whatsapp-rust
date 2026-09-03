@@ -650,7 +650,12 @@ const RESERVED_ITERATION_FIELD: u32 = super::local_field::COUNTER_RESERVATION_FI
 impl SenderKeyRecord {
     pub fn new_empty() -> Self {
         Self {
-            states: VecDeque::with_capacity(consts::MAX_SENDER_KEY_STATES),
+            // Not pre-sized to `MAX_SENDER_KEY_STATES`: a receive-side record
+            // holds one state for the life of the chain and only a rotation
+            // adds a second, so the four spare 256-byte slots were a 1 KiB
+            // allocation per sender learned — 255 of them on joining a large
+            // group — that the first `group_decrypt` clone dropped anyway.
+            states: VecDeque::new(),
             lease: CounterLease::default(),
         }
     }
