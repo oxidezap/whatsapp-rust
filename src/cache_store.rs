@@ -241,6 +241,17 @@ where
         }
     }
 
+    /// Entry count plus table bytes only (see
+    /// [`PortableCache::structural_stats`]). Custom stores report zero.
+    ///
+    /// [`PortableCache::structural_stats`]: crate::portable_cache::PortableCache::structural_stats
+    pub async fn structural_stats(&self) -> wacore::stats::CollectionStats {
+        match &self.inner {
+            Inner::Local(cache) => cache.structural_stats().await,
+            Inner::Custom { .. } => wacore::stats::CollectionStats::default(),
+        }
+    }
+
     /// Approximate entry count (sync). Returns `0` for custom backends.
     ///
     /// For diagnostics that need custom backend counts, use

@@ -201,8 +201,8 @@ impl LidPnCache {
         // What they add is table structure, which `memory_stats` charges
         // itself — and that is the part that grows with the contact count for
         // the whole process lifetime, which is why they are reported at all.
-        let contact_hash = self.contact_hash_to_lid.memory_stats(|_, _| 0).await;
-        let persisted = self.persisted.memory_stats(|_, _| 0).await;
+        let contact_hash = self.contact_hash_to_lid.structural_stats().await;
+        let persisted = self.persisted.structural_stats().await;
         LidPnMemory {
             lid,
             pn,
