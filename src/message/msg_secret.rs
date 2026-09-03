@@ -856,21 +856,29 @@ impl Client {
     /// a terminal miss.
     pub(crate) async fn alternate_msg_secret_jid(
         &self,
-        backend: &Arc<dyn crate::store::traits::Backend>,
+        _backend: &Arc<dyn crate::store::traits::Backend>,
         primary_sender: &Jid,
     ) -> Result<Option<Jid>, crate::store::error::StoreError> {
-        let alternate = match primary_sender.server {
-            wacore_binary::Server::Lid => backend
-                .get_lid_mapping(&primary_sender.user)
-                .await?
-                .map(|m| Jid::new(m.phone_number, wacore_binary::Server::Pn)),
-            wacore_binary::Server::Pn => backend
-                .get_pn_mapping(&primary_sender.user)
-                .await?
-                .map(|m| Jid::new(m.lid, wacore_binary::Server::Lid)),
-            _ => None,
+        // Cache-aside, like every other LID<->PN question the client asks:
+        // the mapping cache is warmed from the whole table at startup and
+        // never expires, so this went to SQLite — on the write queue, twice
+        // per secret-encrypted message — for an answer already in memory.
+        let is_lid = match primary_sender.server {
+            wacore_binary::Server::Lid => true,
+            wacore_binary::Server::Pn => false,
+            _ => return Ok(None),
         };
-        Ok(alternate)
+        let entry = self
+            .get_lid_pn_entry_by_user(&primary_sender.user, is_lid)
+            .await
+            .map_err(|e| crate::store::error::StoreError::Database(e.into()))?;
+        Ok(entry.map(|entry| {
+            if is_lid {
+                Jid::new(&*entry.phone_number, wacore_binary::Server::Pn)
+            } else {
+                Jid::new(&*entry.lid, wacore_binary::Server::Lid)
+            }
+        }))
     }
 
     async fn alternate_msg_secret_lookup(

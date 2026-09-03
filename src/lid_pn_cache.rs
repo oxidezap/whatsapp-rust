@@ -256,7 +256,21 @@ impl LidPnCache {
         self.add_guarded(entry, &guard).await;
     }
 
-    pub(crate) async fn add_guarded(&self, entry: &LidPnEntry, _guard: &LidPnMutationGuard<'_>) {
+    pub(crate) async fn add_guarded(&self, entry: &LidPnEntry, guard: &LidPnMutationGuard<'_>) {
+        self.add_guarded_impl(entry, guard, true).await;
+    }
+
+    /// The write behind [`add_guarded`](Self::add_guarded). `record_topology`
+    /// is `false` only for the startup warm-up, which records ONE global
+    /// change for the whole batch instead: thousands of per-entry records
+    /// would overflow the topology log's bound and poison every memo anyway,
+    /// after thousands of lock round trips the single record does not pay.
+    async fn add_guarded_impl(
+        &self,
+        entry: &LidPnEntry,
+        _guard: &LidPnMutationGuard<'_>,
+        record_topology: bool,
+    ) {
         let should_update_pn = match self.pn_to_entry.get(&*entry.phone_number).await {
             Some(existing) => existing.created_at <= entry.created_at,
             None => true,
@@ -288,7 +302,7 @@ impl LidPnCache {
                 .await;
         }
 
-        if let Some(topology) = self.topology.get() {
+        if record_topology && let Some(topology) = self.topology.get() {
             topology.record([&*entry.lid, &*entry.phone_number]);
         }
     }
@@ -327,7 +341,7 @@ impl LidPnCache {
         let guard = self.lock_mutation().await;
 
         for entry in entries {
-            self.add_guarded(&entry, &guard).await;
+            self.add_guarded_impl(&entry, &guard, false).await;
             // `warm_up` only accepts durable rows. Mark the pair that won the
             // PN-side timestamp resolution so a live re-learn neither writes
             // it again nor repeats discovery migrations.
@@ -340,6 +354,11 @@ impl LidPnCache {
                 self.mark_persisted(&entry.phone_number, &entry.lid).await;
             }
             count += 1;
+        }
+        // The blast radius of a warm-up is the whole mapping table, which is
+        // what a global change says; see `add_guarded_impl`.
+        if let Some(topology) = self.topology.get() {
+            topology.record_global();
         }
 
         log::debug!(

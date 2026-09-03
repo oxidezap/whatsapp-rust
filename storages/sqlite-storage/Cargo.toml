@@ -44,5 +44,13 @@ portable-atomic = { workspace = true }
 name = "signal_flush"
 harness = false
 
+[[bench]]
+name = "store_shapes"
+harness = false
+
+[[bench]]
+name = "store_contention"
+harness = false
+
 [lints]
 workspace = true
