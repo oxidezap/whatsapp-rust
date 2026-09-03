@@ -1938,13 +1938,6 @@ impl Client {
         // Drop stale media connection (auth tokens become invalid on reconnect)
         *self.media_conn.write().await = None;
 
-        // Clear app state key cache — keys will be re-fetched from DB on demand
-        // main took the processor out of the mutex before awaiting so the guard
-        // did not span the clear; the write-once cell has no guard to span, so
-        // the borrow is the whole of it.
-        if let Some(proc) = self.app_state_processor.get() {
-            proc.clear_key_cache().await;
-        }
         #[cfg(feature = "client-lifecycle")]
         drop(scope_close);
     }

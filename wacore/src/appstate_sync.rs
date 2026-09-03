@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -176,9 +176,10 @@ pub enum RecoveryOutcome {
 pub struct AppStateProcessor {
     pub backend: Arc<dyn Backend>,
     pub runtime: Arc<dyn crate::runtime::Runtime>,
-    /// Keyed by the raw key id: the lookup runs once per mutation, and a
-    /// base64 key meant encoding (and allocating) the id for every one of them.
-    key_cache: Arc<Mutex<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>>>,
+    /// Expanded app-state keys, keyed by the raw key id: the lookup runs once
+    /// per mutation, and a base64 key meant encoding (and allocating) the id for
+    /// every one of them.
+    key_cache: Arc<Mutex<KeyCache>>,
     /// Collections a recovery has been asked of the primary for.
     ///
     /// Held here rather than beside the connection because it has to outlive the
@@ -188,12 +189,61 @@ pub struct AppStateProcessor {
     recovery_requested: Arc<Mutex<HashMap<String, RecoveryRequest>>>,
 }
 
+/// Expanded app-state keys, bounded and keyed by raw key id.
+///
+/// An expanded key is a pure function of its key id — HKDF over bytes the
+/// backend stores and never rewrites — so a cached entry can never go stale and
+/// the only reason to drop one is memory. That makes a small capacity the whole
+/// bound this needs: entries survive reconnects (a reconnect used to empty the
+/// map, paying a backend read plus an HKDF expansion again for keys that had not
+/// changed), and an account that references many distinct key ids over a long
+/// connection still cannot grow it without limit.
+///
+/// [`CAPACITY`](Self::CAPACITY) is well above what a sync touches — WA Web sends
+/// a handful of key ids per collection — so eviction is the pathological case,
+/// not the steady state, and oldest-first is enough: an evicted key costs one
+/// backend read to come back.
+#[derive(Default)]
+struct KeyCache {
+    keys: HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>,
+    /// Insertion order, oldest first. Only ids currently in `keys`.
+    order: VecDeque<Vec<u8>>,
+}
+
+impl KeyCache {
+    const CAPACITY: usize = 32;
+
+    fn get(&self, key_id: &[u8]) -> Option<Arc<ExpandedAppStateKeys>> {
+        self.keys.get(key_id).cloned()
+    }
+
+    fn insert(&mut self, key_id: Vec<u8>, expanded: Arc<ExpandedAppStateKeys>) {
+        if self.keys.insert(key_id.clone(), expanded).is_none() {
+            self.order.push_back(key_id);
+            while self.order.len() > Self::CAPACITY
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.keys.remove(&oldest);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// The map the blocking snapshot/patch closures look keys up in.
+    fn snapshot(&self) -> HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>> {
+        self.keys.clone()
+    }
+}
+
 impl AppStateProcessor {
     pub fn new(backend: Arc<dyn Backend>, runtime: Arc<dyn crate::runtime::Runtime>) -> Self {
         Self {
             runtime,
             backend,
-            key_cache: Arc::new(Mutex::new(HashMap::new())),
+            key_cache: Arc::new(Mutex::new(KeyCache::default())),
             recovery_requested: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -351,7 +401,7 @@ impl AppStateProcessor {
     ) -> std::result::Result<Arc<ExpandedAppStateKeys>, AppStateSyncError> {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD_NO_PAD;
-        if let Some(cached) = self.key_cache.lock().await.get(key_id).cloned() {
+        if let Some(cached) = self.key_cache.lock().await.get(key_id) {
             return Ok(cached);
         }
         let key_opt = self.backend.get_sync_key(key_id).await?;
@@ -640,20 +690,18 @@ impl AppStateProcessor {
         Ok(RecoveryOutcome::Applied(mutations))
     }
 
-    /// Clear the in-memory key cache (e.g. on reconnect).
-    /// Keys will be re-fetched from the database backend on next access.
+    /// Drop every cached key, so the next access re-expands from the backend.
+    ///
+    /// Not part of the reconnect path: [`KeyCache`] bounds itself, and an
+    /// expanded key is a pure function of a key id that never changes, so
+    /// emptying it across reconnects only bought DB reads and HKDF expansions.
+    /// Kept for a caller that genuinely wants the memory back now.
     pub async fn clear_key_cache(&self) {
-        *self.key_cache.lock().await = HashMap::new();
+        *self.key_cache.lock().await = KeyCache::default();
     }
 
     /// Expanded app-state keys held in memory, for `Client::memory_report()`.
-    ///
-    /// The cache has neither a capacity cap nor a TTL: it gains an entry per
-    /// distinct key id the server's patches reference and is emptied only by
-    /// [`Self::clear_key_cache`] on reconnect, so a long-lived connection is its
-    /// only bound. That is why the count is worth reporting — the backend stays
-    /// authoritative, so a cap would be safe here, but nothing has measured how
-    /// many distinct keys a real account accumulates.
+    /// Bounded by [`KeyCache::CAPACITY`].
     pub async fn cached_key_count(&self) -> usize {
         self.key_cache.lock().await.len()
     }
@@ -780,7 +828,7 @@ impl AppStateProcessor {
             true
         });
         if snapshot_fresh && let Some(snapshot) = pl.snapshot.take() {
-            let keys_map = self.key_cache.lock().await.clone();
+            let keys_map = self.key_cache.lock().await.snapshot();
             let collection_name_owned = collection_name.to_string();
 
             // Offload CPU-intensive snapshot processing to a blocking thread. The
@@ -879,7 +927,7 @@ impl AppStateProcessor {
 
         // Snapshot the key cache once for all patches (prefetch_keys already populated
         // it); Arc so the per-patch closure handoff is a refcount bump, not a map copy.
-        let keys_map = Arc::new(self.key_cache.lock().await.clone());
+        let keys_map = Arc::new(self.key_cache.lock().await.snapshot());
         let collection_name_owned = collection_name.to_string();
 
         // Each patch moves into its blocking closure and comes back via the return
@@ -1299,5 +1347,51 @@ mod dedup_tests {
                 *b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod key_cache_tests {
+    use super::*;
+
+    fn expanded(byte: u8) -> Arc<ExpandedAppStateKeys> {
+        Arc::new(expand_app_state_keys(&[byte; 32]))
+    }
+
+    /// The cap is the whole bound: entries are never invalidated, only crowded
+    /// out, and the oldest is the one that goes.
+    #[test]
+    fn the_key_cache_keeps_the_newest_entries_up_to_its_capacity() {
+        let mut cache = KeyCache::default();
+        for i in 0..(KeyCache::CAPACITY + 4) {
+            cache.insert(vec![i as u8], expanded(i as u8));
+        }
+
+        assert_eq!(cache.len(), KeyCache::CAPACITY);
+        for evicted in 0..4u8 {
+            assert!(
+                cache.get(&[evicted]).is_none(),
+                "key {evicted} is one of the four oldest and must have been evicted"
+            );
+        }
+        for kept in 4..(KeyCache::CAPACITY + 4) {
+            assert!(
+                cache.get(&[kept as u8]).is_some(),
+                "key {kept} must be kept"
+            );
+        }
+    }
+
+    /// Re-expanding a key already held must not consume a second slot: the same
+    /// key id can be looked up any number of times.
+    #[test]
+    fn re_inserting_a_key_id_does_not_grow_the_cache() {
+        let mut cache = KeyCache::default();
+        for _ in 0..(KeyCache::CAPACITY * 2) {
+            cache.insert(vec![7], expanded(7));
+        }
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(&[7]).is_some());
     }
 }
