@@ -126,7 +126,9 @@ struct InMemoryState {
     lid_mappings: HashMap<String, LidPnMappingEntry>,
     /// Reverse index: phone_number -> lid
     pn_to_lid: HashMap<String, String>,
-    base_keys: HashMap<BaseKeyKey, Vec<u8>>,
+    /// `(base_key, created_at)`; the timestamp is what the retention sweep
+    /// prunes on, mirroring the SQLite column.
+    base_keys: HashMap<BaseKeyKey, (Vec<u8>, i64)>,
     /// Keyed by `Arc<str>`, shared with each record's own `user`.
     device_lists: HashMap<Arc<str>, DeviceListRecord>,
     group_metadata: HashMap<String, Vec<u8>>,
@@ -737,7 +739,7 @@ impl ProtocolStore for InMemoryBackend {
     async fn save_base_key(&self, address: &str, message_id: &str, base_key: &[u8]) -> Result<()> {
         self.state.lock().await.base_keys.insert(
             (address.to_string(), message_id.to_string()),
-            base_key.to_vec(),
+            (base_key.to_vec(), crate::time::now_secs()),
         );
         Ok(())
     }
@@ -752,7 +754,7 @@ impl ProtocolStore for InMemoryBackend {
         let same = s
             .base_keys
             .get(&(address.to_string(), message_id.to_string()))
-            .is_some_and(|stored| stored == current_base_key);
+            .is_some_and(|(stored, _)| stored == current_base_key);
         Ok(same)
     }
 
@@ -763,6 +765,14 @@ impl ProtocolStore for InMemoryBackend {
             .base_keys
             .remove(&(address.to_string(), message_id.to_string()));
         Ok(())
+    }
+
+    async fn delete_expired_base_keys(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let mut s = self.state.lock().await;
+        let before = s.base_keys.len();
+        s.base_keys
+            .retain(|_, (_, created_at)| *created_at >= cutoff_timestamp);
+        Ok((before - s.base_keys.len()) as u32)
     }
 
     // --- Device Registry ---
@@ -1267,11 +1277,11 @@ impl DeviceStore for InMemoryBackend {
         });
         account!(state.pn_to_lid, |k: &String, v: &String| k.capacity()
             + v.capacity());
-        account!(state.base_keys, |k: &BaseKeyKey, v: &Vec<u8>| k
+        account!(state.base_keys, |k: &BaseKeyKey, v: &(Vec<u8>, i64)| k
             .0
             .capacity()
             + k.1.capacity()
-            + v.capacity());
+            + v.0.capacity());
         // The key and the record's `user` are one allocation, counted once.
         account!(state.device_lists, |_k: &Arc<str>, v: &DeviceListRecord| {
             v.user.len()

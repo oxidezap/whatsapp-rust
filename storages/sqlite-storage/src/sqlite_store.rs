@@ -3241,6 +3241,22 @@ impl ProtocolStore for SqliteStore {
         Ok(())
     }
 
+    async fn delete_expired_base_keys(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let device_id = self.device_id;
+        self.with_retry("delete_expired_base_keys", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                let deleted = diesel::delete(
+                    base_keys::table
+                        .filter(base_keys::created_at.lt(cutoff_timestamp as i32))
+                        .filter(base_keys::device_id.eq(device_id)),
+                )
+                .execute(conn)?;
+                Ok(deleted as u32)
+            })
+        })
+        .await
+    }
+
     async fn update_device_list(&self, record: DeviceListRecord) -> Result<()> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
@@ -7699,6 +7715,52 @@ mod retention_sweep_tests {
         );
         assert!(store.get_tc_token("old@lid").await.expect("read").is_none());
         assert!(store.get_tc_token("new@lid").await.expect("read").is_some());
+    }
+
+    /// `base_keys` had no deletion path for its common case (a peer retries
+    /// once, the resend decrypts, no retry #3 ever arrives), so the row stayed
+    /// for the life of the database.
+    #[tokio::test]
+    async fn the_base_key_sweep_deletes_only_backdated_rows() {
+        let db = TempDb::new("base_key_sweep");
+        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let now = wacore::time::now_secs();
+
+        store
+            .save_base_key("1@s.whatsapp.net.0", "OLD", &[0xAA; 32])
+            .await
+            .expect("save old");
+        store
+            .save_base_key("1@s.whatsapp.net.0", "NEW", &[0xBB; 32])
+            .await
+            .expect("save new");
+        backdate(
+            &store,
+            "UPDATE base_keys SET created_at = created_at - 7200 WHERE message_id = 'OLD'",
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .delete_expired_base_keys(now - 3600)
+                .await
+                .expect("sweep base keys"),
+            1
+        );
+        assert!(
+            !store
+                .has_same_base_key("1@s.whatsapp.net.0", "OLD", &[0xAA; 32])
+                .await
+                .expect("read old"),
+            "the expired base key is gone"
+        );
+        assert!(
+            store
+                .has_same_base_key("1@s.whatsapp.net.0", "NEW", &[0xBB; 32])
+                .await
+                .expect("read new"),
+            "a base key inside the retry window survives"
+        );
     }
 
     /// The regression this routing exists for: with a bare `pool.get()` a sweep

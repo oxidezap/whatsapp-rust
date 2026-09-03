@@ -298,6 +298,15 @@ impl Client {
         // the default impl, so this is a cheap no-op there.
         const PENDING_INBOUND_TTL_SECS: u64 = 7 * 24 * 60 * 60;
         let pending_cutoff = cutoff_for(PENDING_INBOUND_TTL_SECS);
+        // A base key is recorded when a peer's retry #2 arrives and is read back
+        // only by a retry #3 for the same message. One retry conversation is the
+        // whole lifetime of the row: past that window it answers a question
+        // nobody asks again, and before this sweep existed the common case (no
+        // retry #3) kept it forever. An hour is generous — the retries it guards
+        // arrive seconds apart — and a too-short TTL only degrades collision
+        // detection to "no collision", the behaviour that predates the check.
+        const BASE_KEY_TTL_SECS: u64 = 60 * 60;
+        let base_key_cutoff = cutoff_for(BASE_KEY_TTL_SECS);
         let prune_msg_secrets = self.cache_config.msg_secret_policy.prunes();
 
         self.runtime
@@ -310,6 +319,10 @@ impl Client {
 
                 if let Err(e) = backend.delete_expired_pending_inbound(pending_cutoff).await {
                     warn!(target: "Client/Keepalive", "Pending inbound cleanup error: {e}");
+                }
+
+                if let Err(e) = backend.delete_expired_base_keys(base_key_cutoff).await {
+                    warn!(target: "Client/Keepalive", "Base key cleanup error: {e}");
                 }
 
                 // msg_secrets retention: prune rows whose per-row deadline has passed.
