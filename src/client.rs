@@ -634,14 +634,14 @@ impl MemoryReport {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
-            ("lid_pn (lid):", &self.lid_pn_lid_entries),
-            ("lid_pn (pn):", &self.lid_pn_pn_entries),
-            ("lid_pn (hash):", &self.lid_pn_contact_hash_entries),
-            ("lid_pn (persisted):", &self.lid_pn_persisted_entries),
             ("recent_messages:", &self.recent_messages),
             ("sk_device_cache:", &self.sender_key_device_cache),
             ("group_devices_memo:", &self.group_devices_memo),
             ("dm_devices_memo:", &self.dm_devices_memo),
+            ("lid_pn (lid):", &self.lid_pn_lid_entries),
+            ("lid_pn (pn):", &self.lid_pn_pn_entries),
+            ("lid_pn (hash):", &self.lid_pn_contact_hash_entries),
+            ("lid_pn (persisted):", &self.lid_pn_persisted_entries),
             ("signal_sessions:", &self.signal_sessions),
             ("signal_identities:", &self.signal_identities),
             ("signal_sender_keys:", &self.signal_sender_keys),
@@ -736,13 +736,18 @@ impl std::fmt::Display for MemoryReport {
             writeln!(f, "  {name:<22} {:>7} entries {:>10} B", c.entries, c.bytes)
         }
         // First TTL_BOUNDED entries of collections() are the TTL-bounded
-        // caches; the next SIGNAL_CACHES are Signal store caches. The rest are
-        // transient retention: history sync, the inbound commit batch, then the
-        // offline receipt buffer. Adding a cache to collections() means moving
-        // this boundary, or the sections shift.
-        const TTL_BOUNDED: usize = 10;
+        // caches; the next LID_PN_MAPS are the LID/PN maps, which have no
+        // TTL and are bounded by the contact list, so they get their own
+        // heading rather than passing as bounded-cache activity; the next
+        // SIGNAL_CACHES are Signal store caches. The rest are transient
+        // retention: history sync, the inbound commit batch, then the offline
+        // receipt buffer. Adding a cache to collections() means moving this
+        // boundary, or the sections shift.
+        const TTL_BOUNDED: usize = 6;
+        const LID_PN_MAPS: usize = 4;
+        const LID_PN_END: usize = TTL_BOUNDED + LID_PN_MAPS;
         const SIGNAL_CACHES: usize = 3;
-        const HISTORY_SYNC: usize = TTL_BOUNDED + SIGNAL_CACHES;
+        const HISTORY_SYNC: usize = LID_PN_END + SIGNAL_CACHES;
         const COMMIT_BATCH: usize = HISTORY_SYNC + 1;
         const OFFLINE_RECEIPTS: usize = COMMIT_BATCH + 1;
         let collections = self.collections();
@@ -760,6 +765,10 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "  dispatched_messages:    {}", self.dispatched_messages)?;
         writeln!(f, "  pdo_pending_requests:   {}", self.pdo_pending_requests)?;
         writeln!(f, "  pdo_requested:          {}", self.pdo_requested)?;
+        writeln!(f, "--- LID/PN maps (bounded by the contact list) ---")?;
+        for (name, c) in &collections[TTL_BOUNDED..LID_PN_END] {
+            line(f, name, c)?;
+        }
         writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
         writeln!(f, "  ensure_inflight:        {}", self.ensure_inflight)?;
@@ -822,7 +831,7 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
         writeln!(f, "--- Signal store caches ---")?;
-        for (name, c) in &collections[TTL_BOUNDED..TTL_BOUNDED + SIGNAL_CACHES] {
+        for (name, c) in &collections[LID_PN_END..LID_PN_END + SIGNAL_CACHES] {
             line(f, name, c)?;
         }
         if !self.subsystems.is_empty() {

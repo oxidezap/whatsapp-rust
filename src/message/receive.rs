@@ -1743,16 +1743,18 @@ impl Client {
                 user_jid.observe()
             );
             let client = Arc::clone(self);
+            // A guard, not a trailing call, and built before the spawn rather
+            // than inside the task: the refresh can fail, be cancelled with the
+            // runtime, or be dropped before its first poll, and in every case
+            // the dedup must not outlive the work it was deduplicating.
+            let released = Arc::clone(self);
+            let release_jid = user_jid.clone();
+            let release = scopeguard::guard((), move |()| {
+                released.pending_device_sync.remove(&release_jid);
+            });
             self.runtime
                 .spawn(Box::pin(async move {
-                    // A guard, not a trailing call: the refresh can fail or be
-                    // cancelled with the runtime, and either way the dedup must
-                    // not outlive the work it was deduplicating.
-                    let released = Arc::clone(&client);
-                    let release_jid = user_jid.clone();
-                    let _release = scopeguard::guard((), move |()| {
-                        released.pending_device_sync.remove(&release_jid);
-                    });
+                    let _release = release;
                     client.invalidate_device_cache(&user_jid.user).await;
                     if let Err(e) = client.get_user_devices(&[user_jid]).await {
                         log::warn!("Immediate device sync failed: {e:?}");

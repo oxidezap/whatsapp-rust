@@ -1002,12 +1002,15 @@ where
     }
 
     pub async fn run_pending_tasks(&self) {
-        let now = self.entry_time();
-        let mut guard = self.inner.write().await;
-
-        guard.retain_unexpired(|entry| self.is_expired(entry, now));
-
-        drop(guard);
+        // Nothing can be expired without a TTL or TTI, so a cache configured
+        // with neither (the coordination caches, the default LID/PN maps)
+        // skips the write lock and the table walk; only the init-lock sweep
+        // below applies to it.
+        if self.ttl.is_some() || self.tti.is_some() {
+            let now = self.entry_time();
+            let mut guard = self.inner.write().await;
+            guard.retain_unexpired(|entry| self.is_expired(entry, now));
+        }
 
         // Clean up init locks not actively held. `get()`, not `init_locks()`: a
         // cache that never single-flighted has no registry to sweep, and building

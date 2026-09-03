@@ -4921,14 +4921,14 @@ async fn memory_report_display_sections_stay_aligned() {
     let ttl_start = rendered
         .find("--- TTL-bounded caches ---")
         .expect("ttl section");
+    let lid_pn_start = rendered.find("--- LID/PN maps").expect("lid/pn section");
     let signal_start = rendered.find("--- Signal store").expect("signal section");
-    let ttl_block = &rendered[ttl_start..signal_start];
+    let ttl_block = &rendered[ttl_start..lid_pn_start];
+    let lid_pn_block = &rendered[lid_pn_start..signal_start];
 
     for name in [
         "group_cache:",
         "device_registry_cache:",
-        "lid_pn (hash):",
-        "lid_pn (persisted):",
         "recent_messages:",
         "group_devices_memo:",
         "dm_devices_memo:",
@@ -4936,6 +4936,23 @@ async fn memory_report_display_sections_stay_aligned() {
         assert!(
             ttl_block.contains(name),
             "{name} must render under the TTL-bounded heading, got:\n{rendered}"
+        );
+    }
+    // No TTL bounds these; a contact-list-sized map rendered as a TTL-bounded
+    // cache would make sustained growth read as normal cache activity.
+    for name in [
+        "lid_pn (lid):",
+        "lid_pn (pn):",
+        "lid_pn (hash):",
+        "lid_pn (persisted):",
+    ] {
+        assert!(
+            lid_pn_block.contains(name),
+            "{name} must render under the LID/PN heading, got:\n{rendered}"
+        );
+        assert!(
+            !ttl_block.contains(name),
+            "{name} must not render as a TTL-bounded cache, got:\n{rendered}"
         );
     }
     for name in [
@@ -5117,6 +5134,38 @@ async fn online_device_sync_releases_its_dedup_entry() {
         client.pending_device_sync.add(&jid),
         "a later unknown device from the same user triggers a refresh again"
     );
+}
+
+/// A runtime may drop a spawned future before its first poll. The release
+/// guard is built before the spawn and moved into the task, so even then the
+/// dedup entry leaves with the work it was deduplicating.
+#[tokio::test]
+async fn online_device_sync_releases_its_dedup_entry_when_never_polled() {
+    let pm = Arc::new(
+        PersistenceManager::new(crate::test_utils::create_test_backend().await)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let (client, _rx) = Client::new_with_cache_config(
+        Arc::new(DropSpawnRuntime),
+        pm,
+        Arc::new(crate::transport::mock::MockTransportFactory::new()),
+        Arc::new(MockHttpClient),
+        None,
+        CacheConfig::default(),
+    )
+    .await;
+    let jid: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+
+    client
+        .schedule_unknown_device_sync(jid.clone(), false)
+        .await;
+    assert_eq!(
+        client.pending_device_sync.len(),
+        0,
+        "a task dropped before its first poll must still release its entry"
+    );
+    assert!(client.pending_device_sync.add(&jid));
 }
 
 /// Expired entries leave a quiet cache only when something sweeps: nothing
