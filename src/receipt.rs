@@ -575,6 +575,16 @@ impl Client {
         let receipt_type_cow = attrs.optional_string("type");
         let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
         let receipt_type = ReceiptType::parse(receipt_type_str);
+        // `id` is the one other attribute read ahead of the gate: a receipt
+        // without one is a protocol error worth the warning whether or not
+        // anything is subscribed, and the read is a single inline copy.
+        let stanza_id = match attrs.optional_string("id") {
+            Some(id) => wacore_binary::MessageId::from(id.as_ref()),
+            None => {
+                log::warn!("Receipt stanza missing required 'id' attribute");
+                return;
+            }
+        };
         // Retries feed the resend pipeline whether or not anything listens.
         // Every other receipt, `enc_rekey_retry` included (its branch below
         // only logs and dispatches), exists only to become an `Event::Receipt`,
@@ -592,13 +602,6 @@ impl Client {
             return;
         }
         let from = attrs.jid("from");
-        let stanza_id = match attrs.optional_string("id") {
-            Some(id) => wacore_binary::MessageId::from(id.as_ref()),
-            None => {
-                log::warn!("Receipt stanza missing required 'id' attribute");
-                return;
-            }
-        };
         let participant = attrs.optional_jid("participant");
         let recipient = attrs.optional_jid("recipient");
         // participant_pn -> sender_alt so the LID-PN cache warms from receipts too.
