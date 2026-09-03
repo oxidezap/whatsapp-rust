@@ -935,7 +935,12 @@ pub enum Event {
 
     /// Incoming `<call>` stanza from the server (offer, preaccept, accept,
     /// reject, terminate). Mirror of WA Web's inbound call signaling.
-    IncomingCall(IncomingCall),
+    ///
+    /// Boxed for the same reason as [`Event::HistorySync`]: at 432 bytes it was
+    /// one of the two variants setting the size of every `Event`, and every
+    /// dispatched event is one `Arc` allocation of that size whatever its
+    /// payload. A `<presence>` is not obliged to pay for a call offer.
+    IncomingCall(Box<IncomingCall>),
 
     /// A call that must not ring (e.g. an offer replayed from the offline queue on reconnect).
     /// Surfaced separately from [`IncomingCall`] so a consumer cannot accidentally auto-accept a
@@ -2336,8 +2341,13 @@ pub struct GroupUpdate {
     /// Whether participant identity information was incomplete in the source stanza.
     #[builder(default)]
     pub has_incomplete_participant_information: bool,
-    /// The specific action
-    pub action: crate::stanza::groups::GroupNotificationAction,
+    /// The specific action.
+    ///
+    /// Boxed, like the `action` of every sync-action payload in this file
+    /// (`ContactUpdate`, `PinUpdate`, `MuteUpdate`, …): at 288 bytes it made
+    /// `GroupUpdate` the largest variant of `Event`, and `Event` is what sizes
+    /// the single `Arc` allocation every dispatch makes, group update or not.
+    pub action: Box<crate::stanza::groups::GroupNotificationAction>,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
@@ -2649,13 +2659,37 @@ mod tests {
         assert_eq!(R::from_server(429, "something-else"), None);
     }
 
+    /// Every dispatched event is one `Arc<Event>` allocation sized by the
+    /// largest variant, whatever the payload actually is — so one fat variant
+    /// taxes `Event::Presence` (48 bytes of payload) and every aggregated read
+    /// receipt's per-participant fan-out alike. Boxing `IncomingCall` (432) and
+    /// `GroupUpdate`'s action (288 of its 528) took the enum from 528 bytes to
+    /// this ceiling, which `LoggedOut` (328) now sets, with `TemporaryBan`
+    /// (312) behind it.
+    ///
+    /// The number is not sacred; the order of magnitude is. Raising it means a
+    /// new variant just made every event bigger, and the fix is almost always
+    /// to box that variant's payload rather than to edit this line.
+    #[test]
+    fn event_stays_under_its_size_ceiling() {
+        const CEILING: usize = 328;
+        let size = size_of::<Event>();
+        assert!(
+            size <= CEILING,
+            "size_of::<Event>() is {size}, over the {CEILING}-byte ceiling: some \
+             variant's payload grew and now every dispatched event pays for it"
+        );
+    }
+
     #[test]
     fn group_update_builder_defaults_additive_scalar_fields() {
         let update = GroupUpdate::builder()
             .group_jid("120363000000000001@g.us".parse().unwrap())
             .timestamp(DateTime::<Utc>::UNIX_EPOCH)
             .is_lid_addressing_mode(false)
-            .action(crate::stanza::groups::GroupNotificationAction::Unlocked)
+            .action(Box::new(
+                crate::stanza::groups::GroupNotificationAction::Unlocked,
+            ))
             .build();
 
         assert_eq!(update.action_index, 0);
