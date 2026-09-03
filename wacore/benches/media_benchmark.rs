@@ -77,8 +77,8 @@ fn media_encrypt_video_10mb_with_sidecar(bencher: Bencher) {
 }
 
 /// The buffered upload API on the same 10 MiB video, output buffer included:
-/// what a caller of `encrypt_media` pays, growth of the ciphertext `Vec` and
-/// all, where the arm above measures the crypto into a pre-sized buffer.
+/// what a caller of `encrypt_media` pays, ciphertext `Vec` allocation and all,
+/// where the arm above measures the crypto into a pre-sized buffer.
 #[divan::bench]
 fn media_encrypt_video_10mb_buffered_api(bencher: Bencher) {
     let plaintext = payload(10 * MB);
