@@ -68,9 +68,8 @@ async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
 
     // reconnect_immediately() causes near-instant reconnect, keeping B offline
     // well within the 3s TTL window
-    client_b.client.reconnect_immediately().await;
+    client_b.reconnect_immediately().await?;
     info!("B disconnected (will reconnect immediately)");
-    client_b.wait_for_disconnected(5).await?;
 
     client_a.client.chatstate().send_composing(&jid_b).await?;
     info!("A sent typing indicator to offline B");

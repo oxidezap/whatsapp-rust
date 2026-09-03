@@ -558,6 +558,30 @@ impl TestClient {
         }
     }
 
+    /// Drop the connection and let the run loop bring it straight back.
+    ///
+    /// Returns once the disconnect is a fact. `reconnect_immediately()` awaits
+    /// the transport teardown itself, so by the time it returns the run loop
+    /// may already be authenticated again and `is_connected()` never reads
+    /// false; the connection generation advances on the teardown and cannot
+    /// be missed.
+    pub async fn reconnect_immediately(&self) -> anyhow::Result<()> {
+        let before = self.client.connection_generation();
+        self.client.reconnect_immediately().await;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if !self.client.is_connected() || self.client.connection_generation() > before {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow::anyhow!(
+                    "Timed out after 5s waiting for the connection to be torn down"
+                ));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+        }
+    }
+
     /// Take the client offline and keep it there until [`come_back_online`](Self::come_back_online).
     ///
     /// `reconnect()` opens the offline window on the library's own backoff

@@ -2003,6 +2003,15 @@ impl Client {
         self.is_connected.load(Ordering::Acquire)
     }
 
+    /// The connection generation: a counter that advances when a connection
+    /// ends and again when the next one authenticates. Two samples that
+    /// differ prove a disconnect happened between them, which
+    /// [`is_connected`](Self::is_connected) cannot: a reconnect can complete
+    /// between two polls of that flag and leave no trace.
+    pub fn connection_generation(&self) -> u64 {
+        self.connection_generation.load(Ordering::Acquire)
+    }
+
     /// Force the connected flag for tests that exercise connected-only
     /// operations. Also reached by the `bench-harness` fixture, which drives
     /// the same connected-only send path with no socket behind it.
