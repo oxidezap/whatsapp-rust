@@ -4,7 +4,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use std::borrow::Cow;
 
 /// Protocol frames larger than 16 MiB after decompression are rejected.
-const MAX_DECOMPRESSED_SIZE: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_DECOMPRESSED_SIZE: u64 = 16 * 1024 * 1024;
 
 /// A plaintext frame is a format byte followed by the node bytes the decoder
 /// reads. The byte is a flag set with a single defined bit, [`FORMAT_COMPRESSED`];

@@ -1,6 +1,6 @@
 use crate::client::Client;
 use crate::client::ClientError;
-use crate::client::ResponseWaiter;
+use crate::client::{ResponseWaiter, StreamSink, StreamedResponse};
 use crate::socket::error::{EncryptSendError, SocketError};
 use futures::FutureExt;
 use std::num::NonZeroU64;
@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use thiserror::Error;
+use wacore::iq::spec::IqStreamSpec;
 use wacore::runtime::timeout as rt_timeout;
 use wacore_binary::Node;
 
@@ -459,6 +460,78 @@ impl Client {
             .map_err(IqError::ParseError)
     }
 
+    /// [`Client::execute`] for a spec whose response is consumed as it is
+    /// decoded rather than handed over as a tree; see [`IqStreamSpec`].
+    ///
+    /// The response is walked on the read loop, inside the frame's decode, so
+    /// it never exists as more than the inflate window and one child at a
+    /// time. An error response, or a response that arrives while a raw-node
+    /// observer is attached, is decoded whole and goes through the spec's
+    /// [`IqSpec::parse_response`](wacore::iq::spec::IqSpec::parse_response)
+    /// instead, which is why the trait requires both.
+    pub async fn execute_streaming<S>(&self, spec: S) -> Result<S::Response, IqError>
+    where
+        S: IqStreamSpec + Send + 'static,
+        S::Response: Send + 'static,
+    {
+        let req_id = self.generate_request_id();
+        let mut buf = Vec::new();
+        let prepared = match spec.encode_iq_direct(&req_id, &mut buf) {
+            Ok(true) => PreparedIq::Encoded(buf),
+            Ok(false) => PreparedIq::Query(Box::new(spec.build_iq())),
+            Err(e) => return Err(IqError::EncodeError(e)),
+        };
+
+        let (tx, rx) = futures::channel::oneshot::channel::<Result<S::Response, IqError>>();
+        let request_utils = self.get_request_utils();
+        let sink: StreamSink = Box::new(move |response| {
+            let outcome = match response {
+                StreamedResponse::Stream(stream) => spec
+                    .consume_response(stream)
+                    // The trailer is what says every inflated byte was the one
+                    // the peer sent; a tree decode validates it too.
+                    .and_then(|parsed| stream.finish().map(|()| parsed).map_err(Into::into))
+                    .map_err(IqError::ParseError),
+                StreamedResponse::Node(node) => match request_utils.parse_iq_response(node.get()) {
+                    Ok(()) => spec.parse_response(node.get()).map_err(IqError::ParseError),
+                    Err(e) => Err(IqError::from_response(e, node)),
+                },
+            };
+            // A receiver gone away is a cancelled request; nothing to report.
+            let _ = tx.send(outcome);
+        });
+
+        let (timeout, send_fn): (Duration, IqSendFuture<'_>) = match prepared {
+            PreparedIq::Encoded(buf) => (
+                DEFAULT_IQ_TIMEOUT,
+                Box::pin(async move { self.send_raw_bytes(buf).await }),
+            ),
+            PreparedIq::Query(iq) => {
+                let mut iq = *iq;
+                let timeout = iq.timeout.unwrap_or(DEFAULT_IQ_TIMEOUT);
+                iq.id = Some(req_id.clone());
+                let node = self
+                    .get_request_utils()
+                    .build_iq_node(iq, Some(req_id.clone()));
+                (timeout, Box::pin(async move { self.send_node(node).await }))
+            }
+        };
+
+        let result = self
+            .send_and_wait_for(
+                req_id,
+                timeout,
+                send_fn,
+                None,
+                ResponseWaiter::Stream(sink),
+                rx,
+            )
+            .await
+            .and_then(|outcome| outcome);
+        record_iq_outcome(&result);
+        result
+    }
+
     /// Non-generic tail of [`Client::execute`]: sends the already-prepared IQ
     /// and waits for the response node.
     async fn execute_prepared(
@@ -506,44 +579,103 @@ impl Client {
         send_fn: IqSendFuture<'_>,
         on_sent: Option<IqOnSent<'_>>,
     ) -> Result<Arc<wacore_binary::OwnedNodeRef>, IqError> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let result = self
+            .send_and_wait_for(
+                req_id,
+                timeout,
+                send_fn,
+                on_sent,
+                ResponseWaiter::Iq(tx),
+                rx,
+            )
+            .await
+            .and_then(|response_node| {
+                match self
+                    .get_request_utils()
+                    .parse_iq_response(response_node.get())
+                {
+                    Ok(()) => Ok(response_node),
+                    Err(e) => Err(IqError::from_response(e, &response_node)),
+                }
+            });
+        record_iq_outcome(&result);
+        result
+    }
+
+    /// The registration, send, timeout and cancellation machinery shared by
+    /// every IQ, whatever the waiter delivers: `waiter` is registered under
+    /// `req_id` before the send, `rx` is what it resolves.
+    ///
+    /// Only the wait is generic over what arrives; registration and the send
+    /// sit in [`Self::register_and_send`] so they are compiled once, not once
+    /// per delivered type.
+    async fn send_and_wait_for<T>(
+        &self,
+        req_id: String,
+        timeout: Duration,
+        send_fn: IqSendFuture<'_>,
+        on_sent: Option<IqOnSent<'_>>,
+        waiter: ResponseWaiter,
+        rx: futures::channel::oneshot::Receiver<T>,
+    ) -> Result<T, IqError> {
         let _t = wacore::telemetry::timer(wacore::telemetry::IQ_DURATION);
+        // Per-connection: pending IQ requests are bound to the current socket;
+        // a reconnect aborts them (sender retries on the new connection).
+        // Subscribed before the send so a shutdown during it is not missed.
+        let shutdown = wacore::runtime::wait_for_shutdown(&self.connection_shutdown_signal());
+        let _waiter_guard = self
+            .register_and_send(req_id, send_fn, on_sent, waiter)
+            .await?;
+
+        futures::select! {
+            result = rt_timeout(&*self.runtime, timeout, rx).fuse() => {
+                match result {
+                    Ok(Ok(delivered)) => Ok(delivered),
+                    Ok(Err(_)) => Err(IqError::InternalChannelClosed),
+                    Err(_) => Err(IqError::Timeout),
+                }
+            }
+            _ = shutdown.fuse() => Err(IqError::NotConnected),
+        }
+    }
+
+    /// Register `waiter` under `req_id`, send the request, and hand back the
+    /// guard that removes the registration when the caller is done waiting.
+    async fn register_and_send(
+        &self,
+        req_id: String,
+        send_fn: IqSendFuture<'_>,
+        on_sent: Option<IqOnSent<'_>>,
+        waiter: ResponseWaiter,
+    ) -> Result<ResponseWaiterGuard, IqError> {
         if !self.is_running.load(Ordering::Relaxed) {
-            wacore::telemetry::iq("error");
             return Err(IqError::NotConnected);
         }
 
-        let (tx, rx) = futures::channel::oneshot::channel();
         let cleanup_generation = {
             let mut waiters = self.response_waiters_guard();
             // Explicit IDs are accepted by both InfoQuery and send_iq_node. Never
             // overwrite an older waiter. The per-registration generation also
             // prevents an older guard from removing a later reuse of this ID.
-            let Some(cleanup_generation) =
-                waiters.try_insert_guarded(req_id.clone(), ResponseWaiter::Iq(tx))
+            let Some(cleanup_generation) = waiters.try_insert_guarded(req_id.clone(), waiter)
             else {
-                wacore::telemetry::iq("error");
                 return Err(IqError::DuplicateRequestId(req_id));
             };
             cleanup_generation
         };
-        // RAII cleanup covers every exit below — including this future being
-        // dropped mid-await (cancellation), which the explicit paths can't
-        // catch. So the send-fail / timeout / shutdown arms no longer remove
+        // RAII cleanup covers every exit below — including the waiting future
+        // being dropped mid-await (cancellation), which the explicit paths
+        // can't catch. So the send-fail / timeout / shutdown arms never remove
         // the waiter by hand; the guard does it on drop.
-        let _waiter_guard =
+        let waiter_guard =
             ResponseWaiterGuard::new(self.response_waiters.clone(), req_id, cleanup_generation);
 
-        // Per-connection: pending IQ requests are bound to the current socket;
-        // a reconnect aborts them (sender retries on the new connection).
-        let shutdown = wacore::runtime::wait_for_shutdown(&self.connection_shutdown_signal());
-
         if !self.is_running.load(Ordering::Acquire) {
-            wacore::telemetry::iq("error");
             return Err(IqError::NotConnected);
         }
 
         if let Err(e) = send_fn.await {
-            wacore::telemetry::iq("error");
             return match e {
                 ClientError::Socket(s_err) => Err(IqError::Socket(s_err)),
                 ClientError::EncryptSend(es_err) => Err(IqError::EncryptSend(es_err)),
@@ -559,27 +691,18 @@ impl Client {
             on_sent();
         }
 
-        let request_utils = self.get_request_utils();
-        let result = futures::select! {
-            result = rt_timeout(&*self.runtime, timeout, rx).fuse() => {
-                match result {
-                    Ok(Ok(response_node)) => match request_utils.parse_iq_response(response_node.get()) {
-                        Ok(()) => Ok(response_node),
-                        Err(e) => Err(IqError::from_response(e, &response_node)),
-                    },
-                    Ok(Err(_)) => Err(IqError::InternalChannelClosed),
-                    Err(_) => Err(IqError::Timeout),
-                }
-            }
-            _ = shutdown.fuse() => Err(IqError::NotConnected),
-        };
-        wacore::telemetry::iq(match &result {
-            Ok(_) => "ok",
-            Err(IqError::Timeout) => "timeout",
-            Err(_) => "error",
-        });
-        result
+        Ok(waiter_guard)
     }
+}
+
+/// The IQ outcome counter, recorded once per request at the point its final
+/// result is known (a rejection stanza counts as an error, not a delivery).
+fn record_iq_outcome<T>(result: &Result<T, IqError>) {
+    wacore::telemetry::iq(match result {
+        Ok(_) => "ok",
+        Err(IqError::Timeout) => "timeout",
+        Err(_) => "error",
+    });
 }
 
 #[cfg(test)]

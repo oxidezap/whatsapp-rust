@@ -1,7 +1,7 @@
 //! Inbound node I/O: read loop, frame decryption, node routing, acks and stream errors.
 
 use super::*;
-use crate::client::{PhashWaiter, ResponseWaiter};
+use crate::client::{PhashWaiter, ResponseWaiter, StreamedResponse};
 use wacore::net::DisconnectReason;
 use wacore::stanza::wire_tags::StanzaTag;
 
@@ -36,6 +36,16 @@ impl ReadLoopError {
             Self::NotStarted(_) | Self::ChannelClosed => DisconnectReason::Unknown,
         }
     }
+}
+
+/// What became of a frame the read loop looked at before decoding it whole.
+enum FrameRoute {
+    /// A streaming waiter consumed it; there is no node to process.
+    Streamed,
+    /// Not for a waiter, and compressed: its node bytes, inflated in one buffer.
+    Inflated(Vec<u8>),
+    /// Not for a waiter, and plain: the caller's bytes are the node bytes.
+    Untouched,
 }
 
 /// Borrows instead of taking `ValueRef::to_jid`'s owned `Jid`: this runs once
@@ -218,13 +228,13 @@ impl Client {
                                 self.stats.mark_recv_activity();
                                 let wire_bytes = data.len();
 
-                                // Dropped before any await below: the payload is
-                                // a view into the websocket's shared read buffer,
-                                // so holding it while a node is processed keeps
-                                // that allocation alive alongside the decoder's
-                                // copy of the same bytes.
-                                frame_decoder.feed(&data);
-                                drop(data);
+                                // Consumed here, before any await below: a read
+                                // the transport still shares is copied and
+                                // released, so the node processed further down
+                                // never keeps a second copy of its bytes alive;
+                                // a read the transport handed over outright is
+                                // adopted without either.
+                                frame_decoder.feed_owned(data);
 
                                 // Process all complete frames.
                                 // Frame decryption must be sequential (noise protocol counter),
@@ -327,6 +337,32 @@ impl Client {
             }
         };
 
+        // Only while a streaming waiter is pending, and only when no observer
+        // needs every node as a tree: the peek reads the root's head twice for
+        // a plain frame, which the ordinary path is not asked to pay.
+        if self.stream_waiter_count.load(Ordering::Acquire) > 0
+            && self.node_waiter_count.load(Ordering::Acquire) == 0
+            && !self.raw_node_forwarding_enabled()
+        {
+            match self.route_frame_to_stream(&decrypted_payload) {
+                Ok(FrameRoute::Streamed) => return None,
+                Ok(FrameRoute::Inflated(node_bytes)) => {
+                    return match wacore_binary::OwnedNodeRef::new(node_bytes) {
+                        Ok(owned) => Some(owned),
+                        Err(e) => {
+                            log::warn!(target: "Client/Recv", "Failed to unmarshal node: {e}");
+                            None
+                        }
+                    };
+                }
+                Ok(FrameRoute::Untouched) => {}
+                Err(e) => {
+                    log::warn!(target: "Client/Recv", "Failed to decode frame: {e}");
+                    return None;
+                }
+            }
+        }
+
         let buffer = match wacore_binary::util::unpack_bytes(decrypted_payload) {
             Ok(data) => data,
             Err(e) => {
@@ -341,6 +377,43 @@ impl Client {
                 log::warn!(target: "Client/Recv", "Failed to unmarshal node: {e}");
                 None
             }
+        }
+    }
+
+    /// Look at a decrypted frame's root before deciding how to decode it.
+    ///
+    /// An `<iq type="result">` whose id a streaming waiter is registered under
+    /// is consumed by that waiter here, on the read loop, and never becomes a
+    /// tree. Anything else is handed back for the ordinary decode: a compressed
+    /// frame as its inflated node bytes (the peek already inflated the head,
+    /// and the rest follows into the same buffer), a plain one untouched.
+    fn route_frame_to_stream(
+        &self,
+        packed: &[u8],
+    ) -> Result<FrameRoute, wacore_binary::BinaryError> {
+        let mut stream = wacore_binary::NodeStream::from_packed(packed)?;
+        let Some(root) = stream.open()? else {
+            return Err(wacore_binary::BinaryError::EmptyData);
+        };
+        let sink = if matches!(StanzaTag::try_from(root.tag.as_ref()), Ok(StanzaTag::Iq))
+            && root.attr_str("type").as_deref() == Some("result")
+            && let Some(id) = root.attr_str("id")
+        {
+            self.response_waiters_guard().take_stream(&id)
+        } else {
+            None
+        };
+        if let Some(sink) = sink {
+            // No node exists for this response, so nothing that observes nodes
+            // (`subsystem::on_response`, the per-stanza debug log) sees it;
+            // a session with such an observer attached never gets here.
+            debug!(target: "Client/Recv", "<iq type=\"result\"> consumed as a stream");
+            sink(StreamedResponse::Stream(&mut stream));
+            return Ok(FrameRoute::Streamed);
+        }
+        match stream.into_inflated() {
+            Some(inflated) => Ok(FrameRoute::Inflated(inflated?)),
+            None => Ok(FrameRoute::Untouched),
         }
     }
 
@@ -523,6 +596,12 @@ impl Client {
                     if sender.send(Arc::clone(&node)).is_err() {
                         warn!(target: "Client/IQ", "Failed to send IQ response to waiter. Receiver was likely dropped.");
                     }
+                }
+                // A response the frame path did not stream (an error stanza,
+                // or one held whole for an observer) still resolves its waiter.
+                ResponseWaiter::Stream(sink) => {
+                    subsystem::on_response(self, nr);
+                    sink(StreamedResponse::Node(&node));
                 }
                 ResponseWaiter::Phash(_) => {
                     warn!(target: "Client/IQ", "IQ id collided with a pending phash waiter; dropping the phash check");
@@ -1261,7 +1340,14 @@ impl Client {
                     "Sending background initialization queries (Props, Blocklist, Privacy, Digest, Devices)..."
                 );
 
-                let props_fut = bg_client.fetch_props();
+                let props_fut = async {
+                    if bg_client.ab_props_fetch_enabled() {
+                        bg_client.fetch_props().await
+                    } else {
+                        debug!("AB props fetch disabled by the client; flags stay at their registry defaults");
+                        Ok(())
+                    }
+                };
                 let binding = bg_client.blocking();
                 let blocklist_fut = binding.get_blocklist();
                 let privacy_fut = bg_client.fetch_privacy_settings();
@@ -1629,6 +1715,7 @@ impl Client {
                 }
             }
             ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
+            ResponseWaiter::Stream(_) => Self::warn_ack_for_stream_waiter(),
         }
         true
     }
@@ -1652,8 +1739,16 @@ impl Client {
                 }
             }
             ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
+            ResponseWaiter::Stream(_) => Self::warn_ack_for_stream_waiter(),
         }
         true
+    }
+
+    /// Streaming waiters are registered under IQ ids only, so an `<ack>`
+    /// reaching one means the id spaces collided; the waiter is dropped and
+    /// its request times out.
+    fn warn_ack_for_stream_waiter() {
+        warn!(target: "Client/IQ", "ack id collided with a pending streaming IQ waiter; dropping the waiter");
     }
 
     /// `<ack refresh_lid="true">`: the server telling us the LID mapping we hold
@@ -2225,6 +2320,270 @@ mod tests {
             "post-login future grew to {largest} B (spawned: {spawned:?}); \
              the limit is {MAX_POST_LOGIN_FUTURE_BYTES} B",
         );
+    }
+
+    /// One streaming IQ on a client whose transport is a channel the test
+    /// feeds: the request goes out through the real socket, and the response
+    /// comes back through the real read loop.
+    mod streaming_iq {
+        use super::*;
+        use crate::client::ResponseWaiter;
+        use crate::test_utils::{create_iq_test_client, poll_until};
+        use std::sync::atomic::Ordering;
+        use wacore::handshake::NoiseCipher;
+        use wacore::iq::props::PropsSpec;
+        use wacore::net::DisconnectReason;
+        use wacore_binary::builder::NodeBuilder;
+        use wacore_binary::marshal::marshal;
+        use wacore_binary::util::FORMAT_COMPRESSED;
+
+        /// The test socket runs one zero key on independent counters, so the
+        /// first request decrypts with counter 0 and the first injected frame
+        /// must be encrypted with counter 0.
+        fn cipher() -> NoiseCipher {
+            NoiseCipher::new(&[0u8; 32]).expect("32-byte key")
+        }
+
+        fn request_id(framed: &[u8]) -> String {
+            let mut plain = framed[wacore::framing::FRAME_LENGTH_SIZE..].to_vec();
+            cipher()
+                .decrypt_in_place_with_counter(0, &mut plain)
+                .expect("the captured request decrypts with the test key");
+            let node = wacore_binary::marshal::unmarshal_packed_ref(&plain).expect("an <iq>");
+            node.attrs()
+                .optional_string("id")
+                .expect("an id")
+                .into_owned()
+        }
+
+        fn frame(packed: Vec<u8>, counter: u32) -> bytes::Bytes {
+            let mut ciphertext = packed;
+            cipher()
+                .encrypt_in_place_with_counter(counter, &mut ciphertext)
+                .expect("encrypt");
+            bytes::Bytes::from(wacore::framing::encode_frame(&ciphertext, None).expect("frame"))
+        }
+
+        fn compressed(packed: &[u8]) -> Vec<u8> {
+            use std::io::Write;
+            let mut e = flate2::write::ZlibEncoder::new(
+                vec![FORMAT_COMPRESSED],
+                flate2::Compression::default(),
+            );
+            e.write_all(&packed[1..]).expect("compress");
+            e.finish().expect("compress")
+        }
+
+        fn props_result(id: &str, count: u32) -> Vec<u8> {
+            let props = NodeBuilder::new("props")
+                .attr("protocol", "1")
+                .attr("hash", "h")
+                .children((1..=count).map(|code| {
+                    NodeBuilder::new("prop")
+                        .attr("config_code", code)
+                        .attr("config_value", if code % 2 == 0 { "true" } else { "0" })
+                        .build()
+                }))
+                .build();
+            marshal(
+                &NodeBuilder::new("iq")
+                    .attr("from", "s.whatsapp.net")
+                    .attr("type", "result")
+                    .attr("id", id)
+                    .children(vec![props])
+                    .build(),
+            )
+            .expect("marshal")
+        }
+
+        struct Harness {
+            client: Arc<Client>,
+            transport: Arc<crate::transport::mock::CapturingMockTransport>,
+            events: async_channel::Sender<crate::transport::TransportEvent>,
+        }
+
+        impl Harness {
+            async fn new() -> Self {
+                let (client, transport) = create_iq_test_client().await;
+                let (events, receiver) = async_channel::bounded(8);
+                *client.transport_events.lock().await = Some(receiver);
+                Self {
+                    client,
+                    transport,
+                    events,
+                }
+            }
+
+            /// Start the request, and hand back its id once it is on the wire.
+            async fn start(
+                &self,
+                spec: PropsSpec,
+            ) -> (
+                tokio::task::JoinHandle<
+                    Result<wacore::iq::props::PropsResponse, crate::request::IqError>,
+                >,
+                String,
+            ) {
+                let client = Arc::clone(&self.client);
+                let pending = tokio::spawn(async move { client.execute_streaming(spec).await });
+                let transport = Arc::clone(&self.transport);
+                poll_until("the props request to be written", || {
+                    transport.sent_count() >= 1
+                })
+                .await;
+                let id = request_id(&self.transport.sent().remove(0));
+                (pending, id)
+            }
+
+            /// Start the read loop and feed it one response frame. The loop
+            /// keeps running until [`Self::close`]: a close sent right behind
+            /// the frame would tear the waiter map down under a response
+            /// still being processed off the loop.
+            async fn deliver(&self, packed: Vec<u8>) -> tokio::task::JoinHandle<()> {
+                let client = Arc::clone(&self.client);
+                let reader = tokio::spawn(async move {
+                    client.connection_for_test().read_until_disconnected().await;
+                });
+                self.events
+                    .send(crate::transport::TransportEvent::DataReceived(frame(
+                        packed, 0,
+                    )))
+                    .await
+                    .expect("frame accepted");
+                reader
+            }
+
+            async fn close(&self, reader: tokio::task::JoinHandle<()>) {
+                self.events
+                    .send(crate::transport::TransportEvent::Disconnected(
+                        DisconnectReason::StreamEnded,
+                    ))
+                    .await
+                    .expect("close accepted");
+                tokio::time::timeout(Duration::from_secs(10), reader)
+                    .await
+                    .expect("the read loop ends at the close")
+                    .expect("the reader task");
+            }
+        }
+
+        /// The frame path: a compressed result for a streaming waiter is
+        /// consumed inside the decode and resolves the request, filtered to
+        /// the retained codes, with no tree ever built for it.
+        #[tokio::test]
+        async fn a_compressed_result_is_streamed_to_its_waiter() {
+            let h = Harness::new().await;
+            let (pending, id) = h.start(PropsSpec::new().retaining([2, 3, 4000])).await;
+            assert_eq!(h.client.stream_waiter_count.load(Ordering::Acquire), 1);
+
+            let reader = h.deliver(compressed(&props_result(&id, 3000))).await;
+
+            let response = pending.await.expect("task").expect("the response resolves");
+            h.close(reader).await;
+            assert_eq!(response.hash.as_deref(), Some("h"));
+            assert_eq!(
+                response.experiment_props,
+                vec![(2, "true".into()), (3, "0".into())]
+            );
+            assert_eq!(
+                h.client.stream_waiter_count.load(Ordering::Acquire),
+                0,
+                "the map must give the count back once the waiter is taken"
+            );
+            assert!(h.client.response_waiters_guard().is_empty());
+        }
+
+        /// A plain (uncompressed) result takes the same route.
+        #[tokio::test]
+        async fn a_plain_result_is_streamed_too() {
+            let h = Harness::new().await;
+            let (pending, id) = h.start(PropsSpec::new().retaining([1])).await;
+            let reader = h.deliver(props_result(&id, 50)).await;
+            let response = pending.await.expect("task").expect("the response resolves");
+            h.close(reader).await;
+            assert_eq!(response.experiment_props, vec![(1, "0".into())]);
+        }
+
+        /// With a raw-node observer attached every frame has to become a tree
+        /// anyway, so the response is decoded whole, reaches the observer, and
+        /// still resolves the streaming waiter through the tree parser.
+        #[tokio::test]
+        async fn an_observed_session_decodes_the_result_whole_and_still_resolves() {
+            let h = Harness::new().await;
+            let raw = Arc::new(crate::test_utils::TestEventCollector::default());
+            h.client
+                .core
+                .event_bus
+                .subscribe_handler(raw.clone())
+                .detach();
+            let _lease = h.client.acquire_raw_node_forwarding();
+
+            let (pending, id) = h.start(PropsSpec::new().retaining([5])).await;
+            let reader = h.deliver(compressed(&props_result(&id, 300))).await;
+
+            let response = pending.await.expect("task").expect("the response resolves");
+            h.close(reader).await;
+            assert_eq!(response.experiment_props, vec![(5, "0".into())]);
+            let observed: Vec<String> = raw
+                .events()
+                .iter()
+                .filter_map(|event| match &**event {
+                    Event::RawNode(node) => Some(node.tag().to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(observed, vec!["iq".to_string()]);
+        }
+
+        /// An error stanza is never streamed: it is decoded whole and reported
+        /// exactly as it is for a tree-parsed request.
+        #[tokio::test]
+        async fn an_error_result_is_reported_as_a_server_error() {
+            let h = Harness::new().await;
+            let (pending, id) = h.start(PropsSpec::new()).await;
+            let error = marshal(
+                &NodeBuilder::new("iq")
+                    .attr("from", "s.whatsapp.net")
+                    .attr("type", "error")
+                    .attr("id", id.as_str())
+                    .children(vec![
+                        NodeBuilder::new("error")
+                            .attr("code", "503")
+                            .attr("text", "service-unavailable")
+                            .build(),
+                    ])
+                    .build(),
+            )
+            .expect("marshal");
+            let reader = h.deliver(compressed(&error)).await;
+            let err = pending.await.expect("task").expect_err("a rejection");
+            h.close(reader).await;
+            assert!(
+                matches!(err, crate::request::IqError::ServerError { code: 503, .. }),
+                "{err:?}"
+            );
+            assert_eq!(h.client.stream_waiter_count.load(Ordering::Acquire), 0);
+        }
+
+        /// Cancelling the request removes the waiter and its count with it.
+        #[tokio::test]
+        async fn a_cancelled_streaming_request_leaves_no_count_behind() {
+            let h = Harness::new().await;
+            let (pending, _id) = h.start(PropsSpec::new()).await;
+            assert_eq!(h.client.stream_waiter_count.load(Ordering::Acquire), 1);
+            pending.abort();
+            let _ = pending.await;
+            assert_eq!(h.client.stream_waiter_count.load(Ordering::Acquire), 0);
+            assert!(h.client.response_waiters_guard().is_empty());
+
+            // And a waiter of another kind under the same id is left alone.
+            let (tx, _rx) = futures::channel::oneshot::channel();
+            h.client
+                .response_waiters_guard()
+                .try_insert_guarded("x".to_string(), ResponseWaiter::Iq(tx));
+            assert!(h.client.response_waiters_guard().take_stream("x").is_none());
+            assert!(!h.client.response_waiters_guard().is_empty());
+        }
     }
 
     fn ack(attrs: &[(&'static str, &str)]) -> Node {

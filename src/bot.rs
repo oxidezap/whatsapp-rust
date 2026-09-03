@@ -710,6 +710,7 @@ pub struct BotBuilder<
     device_props_override: Option<DevicePropsOverride>,
     pair_code_options: Option<PairCodeOptions>,
     skip_history_sync: bool,
+    ab_props_fetch: bool,
     presence_policy: PresencePolicy,
     initial_push_name: Option<String>,
     cache_config: CacheConfig,
@@ -740,6 +741,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             device_props_override: None,
             pair_code_options: None,
             skip_history_sync: false,
+            ab_props_fetch: true,
             presence_policy: PresencePolicy::default(),
             initial_push_name: None,
             cache_config: CacheConfig::default(),
@@ -774,6 +776,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
             skip_history_sync: self.skip_history_sync,
+            ab_props_fetch: self.ab_props_fetch,
             presence_policy: self.presence_policy,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
@@ -1370,6 +1373,14 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Whether to fetch the server's A/B props catalog on connect. On by
+    /// default; see [`ClientBuilder::with_ab_props_fetch`](crate::client::ClientBuilder::with_ab_props_fetch) for what turning
+    /// it off costs and which targets would want to.
+    pub fn with_ab_props_fetch(mut self, enabled: bool) -> Self {
+        self.ab_props_fetch = enabled;
+        self
+    }
+
     /// Choose who announces the account's own `available` presence.
     ///
     /// Default: [`PresencePolicy::Automatic`], which matches WhatsApp Web. See
@@ -1523,6 +1534,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             .with_cache_config(self.cache_config)
             .with_custom_enc_handlers(self.custom_enc_handlers)
             .with_skip_history_sync(self.skip_history_sync)
+            .with_ab_props_fetch(self.ab_props_fetch)
             .with_presence_policy(self.presence_policy)
             .with_background_saver_interval(std::time::Duration::from_secs(30));
         #[cfg(feature = "plugins")]
@@ -2221,6 +2233,32 @@ mod tests {
             .expect("Failed to build bot");
 
         assert!(!bot.client().skip_history_sync_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_bot_builder_ab_props_fetch_forwards_to_the_client() {
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_ab_props_fetch(false)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot with ab props fetch off");
+        assert!(!bot.client().ab_props_fetch_enabled());
+
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+        assert!(bot.client().ab_props_fetch_enabled());
     }
 
     #[tokio::test]

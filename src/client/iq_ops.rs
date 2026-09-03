@@ -30,7 +30,14 @@ impl Client {
             }
         };
 
-        let response = self.execute(spec).await?;
+        // Streamed, keeping only the watched codes: a full response is a few
+        // thousand props, and as a decoded tree it is the largest thing a
+        // login allocates by an order of magnitude (about 700 KB on a 64-bit
+        // host for a 34 KB payload; more than a microcontroller's whole heap).
+        // `apply_props` filters against the same set again, cheaply, so the
+        // cache stays the one place that decides what is kept.
+        let spec = spec.retaining(self.ab_props.interest().await);
+        let response = self.execute_streaming(spec).await?;
 
         if response.delta_update {
             debug!(

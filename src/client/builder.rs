@@ -115,6 +115,7 @@ pub struct ClientBuilder {
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
     skip_history_sync: bool,
+    ab_props_fetch: bool,
     presence_policy: PresencePolicy,
     wanted_pre_key_count: Option<usize>,
     resend_rate_limit: Option<(u32, u32)>,
@@ -148,6 +149,7 @@ impl ClientBuilder {
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
             skip_history_sync: false,
+            ab_props_fetch: true,
             presence_policy: PresencePolicy::default(),
             wanted_pre_key_count: None,
             resend_rate_limit: None,
@@ -272,6 +274,27 @@ impl ClientBuilder {
 
     pub fn with_skip_history_sync(mut self, skip: bool) -> Self {
         self.skip_history_sync = skip;
+        self
+    }
+
+    /// Whether to fetch the server's A/B props catalog on connect, as WA Web
+    /// does. On by default.
+    ///
+    /// The catalog is the largest frame of an ordinary login (a few thousand
+    /// props, ~30 KB compressed) and the client keeps a couple of dozen of
+    /// them. It is consumed as a stream, so on a host it costs nothing worth
+    /// turning off; the switch exists for a client on a heap of a few hundred
+    /// KB that cannot afford even the compressed frame plus the inflate state
+    /// (~80 KB together) at the moment it arrives.
+    ///
+    /// Turned off, every flag reads as its registry default, the value WA Web
+    /// itself uses before its first fetch: the server sees no `abt` request
+    /// (whatsmeow never sends one) and accepts the client either way, but an
+    /// account the server has 1:1-LID-migrated is not recognised as such from
+    /// the props (`lid_one_on_one_migration_enabled` defaults to off), and
+    /// privacy-token and trusted-contact-token gates run on their defaults.
+    pub fn with_ab_props_fetch(mut self, enabled: bool) -> Self {
+        self.ab_props_fetch = enabled;
         self
     }
 
@@ -531,6 +554,9 @@ impl ClientBuilder {
         }
         if self.skip_history_sync {
             client.set_skip_history_sync(true);
+        }
+        if !self.ab_props_fetch {
+            client.set_ab_props_fetch(false);
         }
         client.set_presence_policy(self.presence_policy);
         if let Some(count) = self.wanted_pre_key_count {

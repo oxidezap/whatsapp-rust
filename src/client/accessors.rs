@@ -228,6 +228,16 @@ impl Client {
         self.skip_history_sync.store(enabled, Ordering::Relaxed);
     }
 
+    /// Whether the A/B props catalog is fetched on connect; see
+    /// [`ClientBuilder::with_ab_props_fetch`](crate::ClientBuilder::with_ab_props_fetch).
+    pub fn set_ab_props_fetch(&self, enabled: bool) {
+        self.ab_props_fetch.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn ab_props_fetch_enabled(&self) -> bool {
+        self.ab_props_fetch.load(Ordering::Relaxed)
+    }
+
     /// Returns `true` if history sync notifications are currently being skipped.
     pub fn skip_history_sync_enabled(&self) -> bool {
         self.skip_history_sync.load(Ordering::Relaxed)
