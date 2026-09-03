@@ -474,6 +474,68 @@ pub struct MessageInfo {
     pub bcl_participants: Vec<Jid>,
 }
 
+impl crate::stats::HeapSize for MessageSource {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        self.chat.heap_bytes()
+            + self.sender.heap_bytes()
+            + [
+                &self.sender_alt,
+                &self.recipient_alt,
+                &self.broadcast_list_owner,
+                &self.recipient,
+            ]
+            .iter()
+            .filter_map(|jid| jid.as_ref())
+            .map(HeapSize::heap_bytes)
+            .sum::<usize>()
+    }
+}
+
+/// A floor, deliberately: the boxed sub-structs are charged their own
+/// `size_of` but not walked. All four are absent on the overwhelming majority
+/// of messages, and what they point at is small next to the box itself, so
+/// descending would add code to the report for digits it would not change.
+impl crate::stats::HeapSize for MessageInfo {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        self.source.heap_bytes()
+            + self.id.heap_bytes()
+            + self.push_name.heap_bytes()
+            + self
+                .bot_info
+                .as_ref()
+                .map_or(0, |_| size_of::<MsgBotInfo>())
+            + self
+                .meta_info
+                .as_ref()
+                .map_or(0, |_| size_of::<MsgMetaInfo>())
+            + self
+                .verified_name
+                .as_ref()
+                .map_or(0, |_| size_of::<crate::stanza::business::VerifiedName>())
+            + self
+                .device_sent_meta
+                .as_ref()
+                .map_or(0, |_| size_of::<DeviceSentMeta>())
+            + self
+                .unavailable_request_id
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + self.verified_level.as_ref().map_or(0, HeapSize::heap_bytes)
+            + self
+                .peer_recipient_pn
+                .as_ref()
+                .map_or(0, HeapSize::heap_bytes)
+            + self.bcl_participants.capacity() * size_of::<Jid>()
+            + self
+                .bcl_participants
+                .iter()
+                .map(HeapSize::heap_bytes)
+                .sum::<usize>()
+    }
+}
+
 /// What [`MessageInfo::meta`] hands out for a stanza that carried no `<meta>`
 /// or `<reporting>` child: every field `None`, shared by every such message.
 static EMPTY_META: std::sync::LazyLock<MsgMetaInfo> =

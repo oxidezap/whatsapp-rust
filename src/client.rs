@@ -463,6 +463,14 @@ pub struct MemoryReport {
     /// `InboundCommitBatcher::pending_stats`). Live traffic commits
     /// immediately, so outside an offline drain this is normally zero.
     pub inbound_commit_batch: CollectionStats,
+    /// Delivery receipts held back during an offline drain, to be flushed as
+    /// aggregate `<receipt>` stanzas (WA Web `sendAggregateOfflineReceipts`).
+    ///
+    /// Bounded by the same commit batch that fills it — the buffer is flushed
+    /// per batch snapshot, so it tops out at the batch's 400 messages — and
+    /// empty outside the drain. Reported because it is the largest transient
+    /// the drain retains after that batch itself.
+    pub offline_receipt_buffer: CollectionStats,
     /// `messageSecret` captures buffered for write-behind persistence — from
     /// live receives and sends as well as an offline drain, so a slow backend
     /// can saturate this with no drain in progress.
@@ -606,7 +614,7 @@ pub struct SubsystemMemory {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 13] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 14] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -621,6 +629,7 @@ impl MemoryReport {
             ("signal_sender_keys:", &self.signal_sender_keys),
             ("history_sync_tasks:", &self.history_sync_tasks),
             ("inbound_commit_batch:", &self.inbound_commit_batch),
+            ("offline_receipts:", &self.offline_receipt_buffer),
         ]
     }
 
@@ -657,14 +666,15 @@ impl std::fmt::Display for MemoryReport {
             writeln!(f, "  {name:<22} {:>7} entries {:>10} B", c.entries, c.bytes)
         }
         // First TTL_BOUNDED entries of collections() are the TTL-bounded
-        // caches; the next SIGNAL_CACHES are Signal store caches. The last two
-        // are transient retention: history sync, then the inbound commit batch.
-        // Adding a cache to collections() means moving this boundary, or the
-        // sections shift.
+        // caches; the next SIGNAL_CACHES are Signal store caches. The rest are
+        // transient retention: history sync, the inbound commit batch, then the
+        // offline receipt buffer. Adding a cache to collections() means moving
+        // this boundary, or the sections shift.
         const TTL_BOUNDED: usize = 8;
         const SIGNAL_CACHES: usize = 3;
         const HISTORY_SYNC: usize = TTL_BOUNDED + SIGNAL_CACHES;
         const COMMIT_BATCH: usize = HISTORY_SYNC + 1;
+        const OFFLINE_RECEIPTS: usize = COMMIT_BATCH + 1;
         let collections = self.collections();
         writeln!(f, "=== Memory Report ===")?;
         writeln!(f, "--- TTL-bounded caches ---")?;
@@ -765,6 +775,11 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "--- Transient retention ---")?;
         line(f, collections[COMMIT_BATCH].0, &self.inbound_commit_batch)?;
+        line(
+            f,
+            collections[OFFLINE_RECEIPTS].0,
+            &self.offline_receipt_buffer,
+        )?;
         writeln!(f, "  msg_secret_buffer:      {}", self.msg_secret_buffer)?;
         writeln!(f, "  pending_device_sync:    {}", self.pending_device_sync)?;
         #[cfg(feature = "plugins")]

@@ -366,6 +366,21 @@ impl Client {
                 ),
                 None => (0, 0),
             };
+        let offline_receipt_buffer = {
+            let buffer = self
+                .offline_receipt_buffer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            // The `Arc`s are the drain's only remaining hold on these
+            // `MessageInfo`s by the time they are buffered, so each is charged
+            // in full: its allocation, its struct, and what it points at.
+            let bytes = buffer.capacity() * size_of::<Arc<crate::types::message::MessageInfo>>()
+                + buffer
+                    .iter()
+                    .map(|info| size_of::<crate::types::message::MessageInfo>() + info.heap_bytes())
+                    .sum::<usize>();
+            CollectionStats::new(buffer.len() as u64, bytes as u64)
+        };
         let (commit_batch_entries, commit_batch_bytes) = self.inbound_commit_batch.pending_stats();
         let inbound_commit_batch =
             CollectionStats::new(commit_batch_entries as u64, commit_batch_bytes as u64);
@@ -438,6 +453,7 @@ impl Client {
             history_sync_tasks_peak: history_sync_activity.tasks_peak as u64,
             history_sync_payload_bytes_peak: history_sync_activity.payload_bytes_peak as u64,
             inbound_commit_batch,
+            offline_receipt_buffer,
             msg_secret_buffer,
             pending_device_sync,
             session_locks: self.session_locks.entry_count(),

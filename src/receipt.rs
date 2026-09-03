@@ -3506,6 +3506,53 @@ mod tests {
         }
     }
 
+    /// `agent_docs/observability.md` makes reporting every retained collection
+    /// the rule, and this is the drain's largest transient after the commit
+    /// batch itself. Empty must read as zero, not as absent.
+    #[tokio::test]
+    async fn memory_report_accounts_for_the_offline_receipt_buffer() {
+        // Built like `offline_receipt_buffer_protocol`'s client, not through the
+        // test helper: a fresh client is in drain mode, which is what makes an
+        // offline message buffer instead of acking 1:1.
+        let pm = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let (client, _rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            client.memory_report().await.offline_receipt_buffer.entries,
+            0
+        );
+
+        let peer = "19045550180@s.whatsapp.net";
+        for id in ["OFFR1", "OFFR2", "OFFR3"] {
+            client.ack_received_message(&offline_info(id, peer, peer, false));
+        }
+
+        let reported = client.memory_report().await.offline_receipt_buffer;
+        assert_eq!(reported.entries, 3);
+        assert!(
+            reported.bytes >= 3 * size_of::<MessageInfo>() as u64,
+            "each buffered MessageInfo must be charged, got {} B",
+            reported.bytes,
+        );
+
+        client.clear_offline_receipt_buffer();
+        assert_eq!(
+            client.memory_report().await.offline_receipt_buffer.entries,
+            0
+        );
+    }
+
     #[tokio::test]
     async fn offline_receipt_buffer_protocol() {
         let backend = crate::test_utils::create_test_backend().await;
