@@ -4291,6 +4291,7 @@ dependencies = [
  "buffa",
  "buffa-build",
  "bytes",
+ "codspeed-divan-compat",
  "diesel",
  "diesel_migrations",
  "libsqlite3-sys",

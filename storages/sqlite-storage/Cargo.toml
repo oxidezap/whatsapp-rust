@@ -37,7 +37,12 @@ buffa-build = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+divan = { workspace = true }
 portable-atomic = { workspace = true }
+
+[[bench]]
+name = "signal_flush"
+harness = false
 
 [lints]
 workspace = true

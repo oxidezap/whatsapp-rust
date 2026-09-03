@@ -563,6 +563,17 @@ pub trait SignalStore: Send + Sync {
     /// Delete an identity key.
     async fn delete_identity(&self, address: &str) -> Result<()>;
 
+    /// Delete several identity keys. The flush issues one call per address
+    /// it dropped, and an identity reset drops many at once, so a backend with
+    /// transactions should override this with a single one; the default is the
+    /// per-address loop.
+    async fn delete_identities_batch(&self, addresses: &[Arc<str>]) -> Result<()> {
+        for address in addresses {
+            self.delete_identity(address).await?;
+        }
+        Ok(())
+    }
+
     // --- Session Operations ---
 
     /// Get an encrypted session for an address.
@@ -582,6 +593,16 @@ pub trait SignalStore: Send + Sync {
 
     /// Delete a session.
     async fn delete_session(&self, address: &str) -> Result<()>;
+
+    /// Delete several sessions in one backend operation. Same contract as
+    /// [`Self::delete_identities_batch`]: the default loops, a transactional
+    /// backend should not.
+    async fn delete_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<()> {
+        for address in addresses {
+            self.delete_session(address).await?;
+        }
+        Ok(())
+    }
 
     /// Check if a session exists. Default implementation uses `get_session`.
     async fn has_session(&self, address: &str) -> Result<bool> {
@@ -636,6 +657,16 @@ pub trait SignalStore: Send + Sync {
     /// Remove a pre-key.
     async fn remove_prekey(&self, id: u32) -> Result<()>;
 
+    /// Remove several pre-keys in one backend operation: an offline drain
+    /// consumes one per `pkmsg`, and the flush deletes them together once
+    /// their sessions are durable. The default loops.
+    async fn remove_prekeys_batch(&self, ids: &[u32]) -> Result<()> {
+        for id in ids {
+            self.remove_prekey(*id).await?;
+        }
+        Ok(())
+    }
+
     /// Get the maximum pre-key ID currently stored, or 0 if none exist.
     /// Used for migration when `next_pre_key_id` counter is not yet initialized.
     async fn get_max_prekey_id(&self) -> Result<u32>;
@@ -673,6 +704,14 @@ pub trait SignalStore: Send + Sync {
 
     /// Delete a sender key.
     async fn delete_sender_key(&self, address: &str) -> Result<()>;
+
+    /// Delete several sender keys in one backend operation. The default loops.
+    async fn delete_sender_keys_batch(&self, addresses: &[Arc<str>]) -> Result<()> {
+        for address in addresses {
+            self.delete_sender_key(address).await?;
+        }
+        Ok(())
+    }
 }
 
 /// WhatsApp app state synchronization storage.

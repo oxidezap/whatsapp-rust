@@ -1725,9 +1725,11 @@ impl SignalStoreCache {
                     state.reservation_pending.remove(address);
                 }
             }
-            for address in &deleted_keys {
-                backend.delete_session(address).await?;
-                state.reservation_pending.remove(address);
+            if !deleted_keys.is_empty() {
+                backend.delete_sessions_batch(&deleted_keys).await?;
+                for address in &deleted_keys {
+                    state.reservation_pending.remove(address);
+                }
             }
 
             for key in &dirty_keys {
@@ -1798,11 +1800,11 @@ impl SignalStoreCache {
                             deletable.push(*id);
                         }
                     }
-                    for id in &deletable {
-                        backend.remove_prekey(*id).await?;
-                    }
-                    for id in &deletable {
-                        removed.remove(id);
+                    if !deletable.is_empty() {
+                        backend.remove_prekeys_batch(&deletable).await?;
+                        for id in &deletable {
+                            removed.remove(id);
+                        }
                     }
                 }
             }
@@ -1829,8 +1831,8 @@ impl SignalStoreCache {
             if !batch.is_empty() {
                 backend.put_identities_batch(&batch).await?;
             }
-            for address in &deleted_keys {
-                backend.delete_identity(address).await?;
+            if !deleted_keys.is_empty() {
+                backend.delete_identities_batch(&deleted_keys).await?;
             }
 
             for key in &dirty_keys {
@@ -1849,6 +1851,7 @@ impl SignalStoreCache {
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
 
             let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::new();
+            let mut deleted: Vec<Arc<str>> = Vec::new();
             for name in &dirty_keys {
                 match state.cache.get(name.as_ref()) {
                     Some(Some(record)) => {
@@ -1857,11 +1860,14 @@ impl SignalStoreCache {
                             .map_err(|e| anyhow::anyhow!("sender key serialize for {name}: {e}"))?;
                         batch.push((name.clone(), bytes::Bytes::from(bytes)));
                     }
-                    Some(None) => {
-                        backend.delete_sender_key(name).await?;
-                        state.wire_gate_pending.remove(name);
-                    }
+                    Some(None) => deleted.push(name.clone()),
                     None => {}
+                }
+            }
+            if !deleted.is_empty() {
+                backend.delete_sender_keys_batch(&deleted).await?;
+                for name in &deleted {
+                    state.wire_gate_pending.remove(name);
                 }
             }
             if !batch.is_empty() {

@@ -1934,6 +1934,36 @@ impl SignalStore for SqliteStore {
             .await
     }
 
+    /// One transaction, one `IN` list per chunk: the per-address delete is a
+    /// `spawn_blocking`, a pool checkout and a WAL commit each, and the flush
+    /// issues these for every entry it dropped.
+    async fn delete_identities_batch(&self, items: &[Arc<str>]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let device_id = self.device_id;
+        let items = Arc::new(items.to_vec());
+        self.with_retry("delete_identities_batch", || {
+            let items = items.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for chunk in items.chunks(ID_PARAM_CHUNK) {
+                        diesel::delete(
+                            identities::table
+                                .filter(identities::device_id.eq(device_id))
+                                .filter(
+                                    identities::address.eq_any(chunk.iter().map(|a| a.as_ref())),
+                                ),
+                        )
+                        .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
+    }
+
     async fn get_session(&self, address: &str) -> Result<Option<Bytes>> {
         Ok(self
             .get_session_for_device(address, self.device_id)
@@ -2043,6 +2073,32 @@ impl SignalStore for SqliteStore {
     async fn delete_session(&self, address: &str) -> Result<()> {
         self.delete_session_for_device(address, self.device_id)
             .await
+    }
+
+    /// See `delete_identities_batch`.
+    async fn delete_sessions_batch(&self, items: &[Arc<str>]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let device_id = self.device_id;
+        let items = Arc::new(items.to_vec());
+        self.with_retry("delete_sessions_batch", || {
+            let items = items.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for chunk in items.chunks(ID_PARAM_CHUNK) {
+                        diesel::delete(
+                            sessions::table
+                                .filter(sessions::device_id.eq(device_id))
+                                .filter(sessions::address.eq_any(chunk.iter().map(|a| a.as_ref()))),
+                        )
+                        .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
     }
 
     async fn store_prekey(&self, id: u32, record: &[u8], uploaded: bool) -> Result<()> {
@@ -2301,6 +2357,32 @@ impl SignalStore for SqliteStore {
         .await
     }
 
+    /// See `delete_identities_batch`.
+    async fn remove_prekeys_batch(&self, items: &[u32]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let device_id = self.device_id;
+        let items = Arc::new(items.to_vec());
+        self.with_retry("remove_prekeys_batch", || {
+            let items = items.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for chunk in items.chunks(ID_PARAM_CHUNK) {
+                        diesel::delete(
+                            prekeys::table
+                                .filter(prekeys::device_id.eq(device_id))
+                                .filter(prekeys::id.eq_any(chunk.iter().map(|id| *id as i32))),
+                        )
+                        .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
+    }
+
     async fn get_max_prekey_id(&self) -> Result<u32> {
         let device_id = self.device_id;
         self.read_query(move |conn| {
@@ -2500,6 +2582,34 @@ impl SignalStore for SqliteStore {
     async fn delete_sender_key(&self, address: &str) -> Result<()> {
         self.delete_sender_key_for_device(address, self.device_id)
             .await
+    }
+
+    /// See `delete_identities_batch`.
+    async fn delete_sender_keys_batch(&self, items: &[Arc<str>]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let device_id = self.device_id;
+        let items = Arc::new(items.to_vec());
+        self.with_retry("delete_sender_keys_batch", || {
+            let items = items.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for chunk in items.chunks(ID_PARAM_CHUNK) {
+                        diesel::delete(
+                            sender_keys::table
+                                .filter(sender_keys::device_id.eq(device_id))
+                                .filter(
+                                    sender_keys::address.eq_any(chunk.iter().map(|a| a.as_ref())),
+                                ),
+                        )
+                        .execute(conn)?;
+                    }
+                    Ok(())
+                })
+            })
+        })
+        .await
     }
 }
 
