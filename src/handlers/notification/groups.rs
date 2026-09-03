@@ -2,6 +2,7 @@ use crate::client::Client;
 use crate::types::events::{Event, EventKind};
 use log::{debug, warn};
 use std::sync::Arc;
+use wacore::appstate::patch_decode::WAPatchName;
 use wacore::stanza::groups::{GroupNotification, GroupNotificationAction};
 use wacore::types::events::{GroupUpdate, MexNotification};
 use wacore_binary::NodeContentRef;
@@ -16,7 +17,6 @@ fn clone_or_take_last<T: Clone>(value: &mut Option<T>, is_last: bool) -> Option<
 /// collection nodes synchronously and spawns the async sync task.
 pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef<'_>) {
     use std::str::FromStr;
-    use wacore::appstate::patch_decode::WAPatchName;
 
     let mut collections = Vec::new();
     if let Some(children) = nr.children() {
@@ -93,21 +93,37 @@ pub(crate) fn handle_server_sync_notification(client: &Arc<Client>, nr: &NodeRef
                         log::debug!(target: "Client/AppState", "server_sync task cancelled: connection generation changed during version check");
                         return;
                     }
-                    let requested = to_sync.clone();
                     let scope = client_clone.sync_scope(None);
-                    let result = client_clone.sync_collections_batched(to_sync, scope).await;
-                    if !client_clone.is_shutting_down() {
-                        client_clone.report_background_sync(
-                            "app state sync from server_sync",
-                            scope,
-                            crate::client::SyncSettles::JustTheCollections,
-                            &requested,
-                            result,
-                        );
-                    }
+                    let sync_fut: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> =
+                        Box::pin(run_server_sync_collections(client_clone, to_sync, scope));
+                    sync_fut.await;
                 }
             }))
             .detach();
+    }
+}
+
+/// The heavy half of the `server_sync` task, kept out of the spawned future's
+/// layout on purpose. Awaiting `sync_collections_batched` inline unified its
+/// ~8 KiB state machine into the task every notification allocates, so the
+/// dispatch site awaits this through a boxed `dyn Future`: the no-op path
+/// that only checks versions pays nothing, and the box is allocated solely
+/// when a sync actually runs.
+async fn run_server_sync_collections(
+    client: Arc<Client>,
+    to_sync: Vec<WAPatchName>,
+    scope: crate::client::SyncScope,
+) {
+    let requested = to_sync.clone();
+    let result = client.sync_collections_batched(to_sync, scope).await;
+    if !client.is_shutting_down() {
+        client.report_background_sync(
+            "app state sync from server_sync",
+            scope,
+            crate::client::SyncSettles::JustTheCollections,
+            &requested,
+            result,
+        );
     }
 }
 
@@ -570,4 +586,242 @@ pub(crate) fn handle_disappearing_mode_notification(client: &Arc<Client>, node: 
                 .setting_timestamp(setting_timestamp)
                 .build(),
         ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_impl::TokioRuntime;
+    use crate::store::persistence_manager::PersistenceManager;
+    use crate::test_utils::{MockHttpClient, create_test_backend};
+    use crate::transport::mock::MockTransportFactory;
+    use std::future::Future;
+    use std::mem::size_of_val;
+    use std::pin::Pin;
+    use std::time::Duration;
+    use wacore::runtime::{AbortHandle, Runtime};
+    use wacore_binary::builder::NodeBuilder;
+    use wacore_binary::node::Node;
+
+    /// Records the concrete size of every future handed to the runtime.
+    ///
+    /// Same probe as the post-login task ceiling in `crate::client::node_io`:
+    /// `size_of_val` on the unsized `dyn Future` behind the `Pin<Box<_>>`
+    /// reads the vtable, so what it reports is exactly the coroutine layout
+    /// the boxing allocated.
+    struct SizingRuntime {
+        inner: TokioRuntime,
+        sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for SizingRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            self.sizes
+                .lock()
+                .expect("sizes mutex")
+                .push(size_of_val(&*future));
+            self.inner.spawn(future)
+        }
+
+        fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+            self.sizes
+                .lock()
+                .expect("sizes mutex")
+                .push(size_of_val(&*future));
+            self.inner.spawn_detached(future);
+        }
+
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            self.inner.sleep(duration)
+        }
+
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            self.inner.spawn_blocking(f)
+        }
+
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            self.inner.yield_now()
+        }
+    }
+
+    fn server_sync_node(collections: &[(&str, u64)]) -> Node {
+        NodeBuilder::new("notification")
+            .attr("type", "server_sync")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "server-sync-1")
+            .attr("t", "1704067200")
+            .children(collections.iter().map(|(name, version)| {
+                NodeBuilder::new("collection")
+                    .attr("name", *name)
+                    .attr("version", version.to_string())
+                    .build()
+            }))
+            .build()
+    }
+
+    /// The `server_sync` task is spawned on every burst the server sends during
+    /// connect and reconnect, so its future is allocated once per notification
+    /// even when the version check inside finds nothing to do. Awaiting the
+    /// sync engine inline put the union of its locals in there (8,072 B
+    /// measured on x86_64); awaiting it behind a boxed `dyn Future` keeps the
+    /// task to its own locals (152 B). This pins the shape, not the exact
+    /// number: a future above the bound means the engine has been inlined
+    /// back in.
+    #[tokio::test]
+    async fn the_server_sync_task_does_not_carry_the_sync_engine() {
+        const MAX_SERVER_SYNC_FUTURE_BYTES: usize = 512;
+
+        let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        // Seed the announced version, so the task in the background takes the
+        // version-check exit instead of driving a sync against a client with
+        // no socket.
+        persistence_manager
+            .backend()
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                wacore::appstate::hash::HashState {
+                    version: 7,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the test backend should accept a version");
+        let client = Client::builder()
+            .with_runtime(SizingRuntime {
+                inner: TokioRuntime,
+                sizes: sizes.clone(),
+            })
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .build()
+            .await
+            .expect("client build")
+            .into_client();
+
+        // Only what this dispatch spawns: construction has already recorded
+        // its own, and the spawn below happens inline in this call.
+        let before = sizes.lock().expect("sizes mutex").len();
+        let node = server_sync_node(&[("regular", 7)]);
+        let node_ref = node.as_node_ref();
+        handle_server_sync_notification(&client, &node_ref);
+
+        let spawned = sizes.lock().expect("sizes mutex")[before..].to_vec();
+        assert_eq!(
+            spawned.len(),
+            1,
+            "dispatching server_sync must spawn exactly one task, spawned: {spawned:?}"
+        );
+        assert!(
+            spawned[0] < MAX_SERVER_SYNC_FUTURE_BYTES,
+            "server_sync future grew to {} B (spawned: {spawned:?}); \
+             the limit is {MAX_SERVER_SYNC_FUTURE_BYTES} B",
+            spawned[0],
+        );
+    }
+
+    /// A collection the server announces ahead of the local version must reach
+    /// the sync engine: the notification path ends in an IQ on the wire, and
+    /// the answered round persists a version for the collection.
+    #[tokio::test]
+    async fn a_stale_server_sync_drives_a_sync_and_persists_a_version() {
+        use crate::client::batch_result;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .expect("the test backend should be readable")
+                .is_none(),
+            "the collection starts with no local version"
+        );
+
+        let node = server_sync_node(&[("regular", 1)]);
+        let node_ref = node.as_node_ref();
+        handle_server_sync_notification(&client, &node_ref);
+
+        // The engine asks the server exactly what the direct-call harness
+        // answers with an empty collection result, which counts as synced.
+        let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let sent = sent.get().to_owned();
+        let id = sent
+            .attrs()
+            .optional_string("id")
+            .expect("every IQ carries an id")
+            .into_owned();
+        let response = batch_result(&id, &[("regular", None)]);
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stored = client
+                    .persistence_manager
+                    .backend()
+                    .get_version(WAPatchName::Regular.as_str())
+                    .await
+                    .expect("the test backend should stay readable");
+                if stored.is_some() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the answered sync must persist a version for the collection");
+        assert!(
+            !transport.sent().is_empty(),
+            "a stale server_sync must engage the sync engine on the wire"
+        );
+    }
+
+    /// A collection already at (or ahead of) the announced version syncs
+    /// nothing: the version check inside the task filters it before any IQ.
+    /// An unrecognized collection name never even reaches the task.
+    #[tokio::test]
+    async fn a_current_server_sync_sends_nothing() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .persistence_manager
+            .backend()
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                wacore::appstate::hash::HashState {
+                    version: 5,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the test backend should accept a version");
+
+        for collections in [
+            // Local version 5 >= server version 5: filtered by the check.
+            vec![("regular", 5)],
+            // Unknown names are dropped while parsing: nothing to spawn for.
+            vec![("not-a-collection", 9)],
+        ] {
+            let node = server_sync_node(&collections);
+            let node_ref = node.as_node_ref();
+            handle_server_sync_notification(&client, &node_ref);
+        }
+
+        // The checks above are two local store reads; a sync that ran by
+        // mistake would have an IQ on the wire long before this elapses.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            transport.sent().is_empty(),
+            "an up-to-date server_sync must not reach the wire"
+        );
+    }
 }
