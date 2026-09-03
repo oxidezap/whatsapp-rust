@@ -212,11 +212,13 @@ impl MessageContext {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.edit_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
+    /// Edit a message of ours in this chat; see [`Client::edit_message`] for
+    /// what the returned result describes.
     pub async fn edit_message(
         &self,
         original_message_id: impl Into<String>,
         new_message: wa::Message,
-    ) -> Result<String, crate::send::SendError> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.client
             .edit_message(&self.info.source.chat, original_message_id, new_message)
             .await
@@ -228,7 +230,7 @@ impl MessageContext {
         &self,
         message_id: impl Into<String>,
         revoke_type: crate::send::RevokeType,
-    ) -> Result<(), crate::send::SendError> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.client
             .revoke_message(&self.info.source.chat, message_id, revoke_type)
             .await

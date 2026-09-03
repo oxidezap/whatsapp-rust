@@ -167,7 +167,11 @@ pub trait MessageExt {
     ///
     /// Forwards the message body as-is, so existing media is relayed from the same
     /// CDN blob (mediaKey/url are carried over) rather than re-uploaded.
-    fn prepare_for_forward(&self) -> Box<wa::Message>;
+    ///
+    /// Returned by value, unlike [`prepare_for_quote`](Self::prepare_for_quote),
+    /// so the send path can place the copy straight into the allocation it
+    /// hands back as `SendResult::message` instead of re-homing a `Box`.
+    fn prepare_for_forward(&self) -> wa::Message;
 
     /// Sets context_info on the first supported message field.
     ///
@@ -369,7 +373,7 @@ impl MessageExt for wa::Message {
         Box::new(msg)
     }
 
-    fn prepare_for_forward(&self) -> Box<wa::Message> {
+    fn prepare_for_forward(&self) -> wa::Message {
         // WA Web's `FREQUENTLY_FORWARDED_SENTINEL` (Constants/Deprecated): the
         // score saturates by jumping here at the >= 5 threshold, not at 5.
         const FREQUENTLY_FORWARDED_SENTINEL: u32 = 127;
@@ -396,7 +400,7 @@ impl MessageExt for wa::Message {
                             n
                         });
                         ctx.is_forwarded = Some(true);
-                        return Box::new(msg);
+                        return msg;
                     }
                 )+
             };
@@ -417,7 +421,7 @@ impl MessageExt for wa::Message {
                     ..Default::default()
                 });
         }
-        Box::new(msg)
+        msg
     }
 
     fn set_context_info(&mut self, context: wa::ContextInfo) -> bool {

@@ -532,11 +532,31 @@ pub(crate) struct DmDeltaResend<'a> {
 }
 
 /// Result of a successfully sent message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct SendResult {
     pub message_id: String,
     pub to: Jid,
+    /// The message this send encoded, exactly as the pipeline handed it to
+    /// the encoder: after every change the send applied on the caller's
+    /// behalf ([`SendOptions::ephemeral_expiration`], forward preparation) and
+    /// including the whole of what this crate built for an edit, a revoke, a
+    /// pin, a poll or a status.
+    ///
+    /// Not a copy of the wire bytes: when the message carries no
+    /// `message_context_info` of its own, the plaintext the recipient decrypts
+    /// additionally carries the reporting-token context (a `message_secret`
+    /// and its version) the pipeline splices onto the encoding, and the copy
+    /// for our own devices is wrapped in a `DeviceSentMessage`. Both are
+    /// delivery metadata rather than content; reporting them here would cost a
+    /// decode of the plaintext we just encoded, so a caller that needs the
+    /// exact wire form reads it from the echo the account's other devices
+    /// receive.
+    ///
+    /// Shared rather than owned so that a host publishing the send to several
+    /// consumers hands out the pointer, the same shape an inbound
+    /// message arrives in, and so that cloning the result stays cheap.
+    pub message: std::sync::Arc<wa::Message>,
     /// For a DM, what the recipient half of the fan-out actually encrypted for.
     /// `None` for every other send shape: a group, a status, a peer sync and a
     /// newsletter plaintext each answer a different question about who was
@@ -999,10 +1019,12 @@ impl Client {
         to: impl Into<Jid>,
         message: wa::Message,
     ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
-        // Sync-prologue box: a plain async fn would hold the ~1 KB message
-        // by value in every embedder's frame.
+        // Sync-prologue allocation: a plain async fn would hold the ~1 KB
+        // message by value in every embedder's frame. An `Arc` rather than a
+        // `Box` because the same allocation is what `SendResult::message`
+        // hands back, so the send never copies the message again.
         let to = to.into();
-        let message = Box::new(message);
+        let message = std::sync::Arc::new(message);
         async move {
             // Box::pin: the inner future carries ~1 KB of pre-encrypt locals.
             Box::pin(self.send_message_with_options_inner(to, message, SendOptions::default()))
@@ -1018,7 +1040,7 @@ impl Client {
     ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         use wacore::proto_helpers::MessageBuilderExt;
         let to = to.into();
-        let message = Box::new(wa::Message::text(text));
+        let message = std::sync::Arc::new(wa::Message::text(text));
         async move {
             Box::pin(self.send_message_with_options_inner(to, message, SendOptions::default()))
                 .await
@@ -1042,7 +1064,9 @@ impl Client {
     ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         use wacore::proto_helpers::MessageExt;
         let to = to.into();
-        let body = message.get_base_message().prepare_for_forward();
+        // Same sync-prologue `Arc` as `send_message`: the prepared copy is
+        // built straight into the allocation the result hands back.
+        let body = std::sync::Arc::new(message.get_base_message().prepare_for_forward());
         async move {
             Box::pin(self.send_message_with_options_inner(to, body, SendOptions::default())).await
         }
@@ -1057,9 +1081,9 @@ impl Client {
     ) -> impl Future<Output = Result<SendResult, SendError>> + '_ {
         // Thin generic shim: the large async body below stays monomorphic so
         // each `Into<Jid>` instantiation does not duplicate the state machine.
-        // Sync-prologue box + Box::pin as in send_message.
+        // Sync-prologue `Arc` + Box::pin as in send_message.
         let to = to.into();
-        let message = Box::new(message);
+        let message = std::sync::Arc::new(message);
         async move { Box::pin(self.send_message_with_options_inner(to, message, options)).await }
     }
 
@@ -1080,7 +1104,7 @@ impl Client {
     async fn send_message_with_options_inner(
         &self,
         to: Jid,
-        mut message: Box<wa::Message>,
+        mut message: std::sync::Arc<wa::Message>,
         options: SendOptions,
     ) -> Result<SendResult, SendError> {
         #[cfg(feature = "tracing")]
@@ -1105,7 +1129,9 @@ impl Client {
             && exp > 0
         {
             use wacore::proto_helpers::MessageExt;
-            if !message.set_ephemeral_expiration(exp) {
+            // The shim above created this `Arc` and nothing else holds it, so
+            // `make_mut` edits in place and never clones.
+            if !std::sync::Arc::make_mut(&mut message).set_ephemeral_expiration(exp) {
                 // Bare `conversation` messages have no contextInfo field.
                 log::warn!("Could not set contextInfo.expiration on this message type");
             }
@@ -1153,6 +1179,7 @@ impl Client {
                 message_id: request_id,
                 to: result_to,
                 recipient_fanout: None,
+                message,
             });
         }
 
@@ -1186,6 +1213,7 @@ impl Client {
             message_id: request_id,
             to: result_to,
             recipient_fanout,
+            message,
         })
     }
 
@@ -1462,6 +1490,7 @@ impl Client {
             message_id: request_id,
             to,
             recipient_fanout: None,
+            message: std::sync::Arc::new(message),
         })
     }
 
@@ -2013,6 +2042,52 @@ impl Client {
         group_info: &wacore::client::context::GroupInfo,
     ) -> Result<Node, anyhow::Error> {
         Ok(wacore::send::ensure_status_participants(stanza, group_info))
+    }
+
+    /// Send a message this crate built on the caller's behalf (an edit, a
+    /// revoke, a pin) under an explicit stanza `edit` attribute, and hand back
+    /// the same [`SendResult`] a caller-built send gets, message included: the
+    /// only way a caller can see what those sends put in the chat.
+    ///
+    /// `borrowed_stanza_id` names the outer stanza after another message (see
+    /// [`EditOptions::stanza_id`]), so the pipeline binds no id-keyed state to
+    /// it. `None` names the send with a fresh id, like every other send.
+    pub(crate) async fn send_built_message(
+        &self,
+        to: Jid,
+        message: wa::Message,
+        edit: EditAttribute,
+        borrowed_stanza_id: Option<String>,
+    ) -> Result<SendResult, SendError> {
+        // Sampled here and lent down, the way `send_message_with_options_inner`
+        // does it, so the send still names its message and stamps its instant
+        // exactly once.
+        let sent_at = SendInstant::now();
+        let borrowed_message_id = borrowed_stanza_id.is_some();
+        let request_id = borrowed_stanza_id
+            .unwrap_or_else(|| self.generate_message_id_at(sent_at.unix_secs_u64()));
+        let message = std::sync::Arc::new(message);
+        let result_to = to.clone();
+        let recipient_fanout = self
+            .send_message_impl(
+                to,
+                &message,
+                SendPipelineOptions {
+                    sent_at: Some(sent_at),
+                    request_id: Some(&request_id),
+                    edit: Some(edit),
+                    borrowed_message_id,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(SendError::from_anyhow)?;
+        Ok(SendResult {
+            message_id: request_id,
+            to: result_to,
+            recipient_fanout,
+            message,
+        })
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.impl", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
@@ -3638,11 +3713,11 @@ mod tests {
                 .await;
         }
 
-        async fn revoke(&self, message_id: &str, revoke_type: RevokeType) {
+        async fn revoke(&self, message_id: &str, revoke_type: RevokeType) -> SendResult {
             self.client
                 .revoke_message(self.group.clone(), message_id, revoke_type)
                 .await
-                .expect("revoke should reach the wire");
+                .expect("revoke should reach the wire")
         }
 
         fn admin_revoke(&self) -> RevokeType {
@@ -3706,6 +3781,43 @@ mod tests {
         assert!(
             fixture.frame_len(1) < fixture.frame_len(0),
             "a revoke that distributes nothing must be smaller than the cold send"
+        );
+    }
+
+    /// A group revoke's result is named by the stanza it went out under and
+    /// carries the key the admin revoke was built with: the original sender
+    /// exactly as given, since the receiving side matches it against the
+    /// target's own key.
+    #[tokio::test]
+    async fn a_group_revoke_result_names_the_stanza_it_sent() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("first message warms the group").await;
+
+        let result = fixture
+            .revoke("3EB0FAKEREVOKED02", fixture.admin_revoke())
+            .await;
+        let revoke = fixture.stanza(1).await;
+        assert_eq!(
+            attr_value(&revoke, "id").as_deref(),
+            Some(result.message_id.as_str()),
+            "the result is named by the stanza the revoke went out under"
+        );
+        assert_eq!(result.to, fixture.group);
+        assert!(
+            result.recipient_fanout.is_none(),
+            "a group send does not describe itself in a DM's terms"
+        );
+        let key = result
+            .message
+            .protocol_message
+            .as_option()
+            .and_then(|pm| pm.key.as_option())
+            .expect("the revoke is keyed by the target");
+        assert_eq!(key.id.as_deref(), Some("3EB0FAKEREVOKED02"));
+        assert_eq!(key.from_me, Some(false));
+        assert_eq!(
+            key.participant.as_deref(),
+            Some(fixture.member.to_non_ad_string().as_str())
         );
     }
 
@@ -7696,6 +7808,223 @@ mod tests {
         assert!(
             result.recipient_fanout.is_none(),
             "a status send must not describe itself in a DM's terms"
+        );
+    }
+
+    /// `SendResult::message` is the message as the pipeline encoded it: the
+    /// caller's content plus what the send applied on the caller's behalf
+    /// (here the expiration from `SendOptions`), and without the
+    /// reporting-token context the wire plaintext gains, which the outbound
+    /// secret buffer holds instead. A host that shares one client between
+    /// several consumers reads this to show the others what one of them sent,
+    /// because WhatsApp echoes a send to every device except the sending one.
+    #[tokio::test]
+    async fn a_result_carries_the_message_as_the_send_encoded_it() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+
+        let result = client
+            .send_message_with_options(
+                peer_pn.clone(),
+                wa::Message {
+                    extended_text_message: buffa::MessageField::some(
+                        wa::message::ExtendedTextMessage {
+                            text: Some("hi".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
+                },
+                SendOptions::default().with_ephemeral_expiration(86_400),
+            )
+            .await
+            .expect("connected test client should complete the send");
+
+        let sent = result
+            .message
+            .extended_text_message
+            .as_option()
+            .expect("the content the caller passed");
+        assert_eq!(sent.text.as_deref(), Some("hi"));
+        assert_eq!(
+            sent.context_info.as_option().and_then(|c| c.expiration),
+            Some(86_400),
+            "what the send applied on the caller's behalf is part of what it reports"
+        );
+        assert!(
+            result.message.message_context_info.is_unset(),
+            "the reporting-token context is spliced onto the wire plaintext, \
+             not onto the reported message"
+        );
+        assert!(
+            client
+                .msg_secret_buffer
+                .lookup(
+                    &peer_pn.to_non_ad_string(),
+                    &client.pn().expect("own pn").to_non_ad_string(),
+                    &result.message_id,
+                )
+                .is_some(),
+            "the secret the wire copy carries is still held for the message's add-ons"
+        );
+    }
+
+    /// An edit's result describes the edit: the stanza it went out under and
+    /// the protocol message this crate wrapped the caller's content in. The
+    /// stanza id is the edit's own (the original's would be deduplicated away
+    /// by the server) unless the caller borrowed one through `EditOptions`.
+    #[tokio::test]
+    async fn an_edit_reports_its_own_stanza_and_the_container_it_built() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+        let waiter = client.wait_for_sent_node(
+            crate::client::NodeFilter::tag("message")
+                .attr("edit", EditAttribute::MessageEdit.to_string_val()),
+        );
+
+        let result = client
+            .edit_message(peer_pn.clone(), "ORIGINAL", wa::Message::text("new"))
+            .await
+            .expect("connected test client should complete the edit");
+
+        let stanza = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("the edit reaches the wire")
+            .expect("sent node waiter resolves");
+        assert_eq!(
+            stanza.attrs().optional_string("id").as_deref(),
+            Some(result.message_id.as_str()),
+            "the result is named by the stanza the edit went out under"
+        );
+        assert_ne!(
+            result.message_id, "ORIGINAL",
+            "an edit is named by its own id, or the server drops it as a duplicate"
+        );
+        assert_eq!(result.to, peer_pn);
+        let container = result
+            .message
+            .protocol_message
+            .as_option()
+            .expect("the edit is a protocol message");
+        assert_eq!(
+            container.r#type,
+            Some(wa::message::protocol_message::Type::MessageEdit)
+        );
+        assert_eq!(
+            container.key.as_option().and_then(|k| k.id.as_deref()),
+            Some("ORIGINAL"),
+            "keyed by the message being edited"
+        );
+        assert_eq!(
+            container
+                .edited_message
+                .as_option()
+                .and_then(|m| m.conversation.as_deref()),
+            Some("new"),
+            "carrying the caller's replacement content"
+        );
+
+        let borrowed = client
+            .edit_message_with_options(
+                peer_pn.clone(),
+                "ORIGINAL",
+                wa::Message::text("newer"),
+                EditOptions {
+                    stanza_id: Some("BORROWED".into()),
+                },
+            )
+            .await
+            .expect("connected test client should complete the edit");
+        assert_eq!(
+            borrowed.message_id, "BORROWED",
+            "a borrowed stanza id is what the edit was named with"
+        );
+    }
+
+    /// The sends that build their whole message inside this crate (a revoke,
+    /// a pin, a poll) report it the same way, so a caller sees what each put in
+    /// the chat without re-implementing the builder that made it.
+    #[tokio::test]
+    async fn a_revoke_a_pin_and_a_poll_report_the_message_this_crate_built() {
+        let (client, _transport) = crate::test_utils::create_iq_test_client().await;
+        let (peer_pn, _peer_lid) = seed_dm_wire_namespace_state(&client).await;
+
+        let revoke = client
+            .revoke_message(peer_pn.clone(), "TARGET", RevokeType::Sender)
+            .await
+            .expect("connected test client should complete the revoke");
+        assert_ne!(
+            revoke.message_id, "TARGET",
+            "a revoke is named by its own id, not the target's"
+        );
+        assert_eq!(revoke.to, peer_pn);
+        let container = revoke
+            .message
+            .protocol_message
+            .as_option()
+            .expect("the revoke is a protocol message");
+        assert_eq!(
+            container.r#type,
+            Some(wa::message::protocol_message::Type::Revoke)
+        );
+        let key = container.key.as_option().expect("keyed by the target");
+        assert_eq!(key.id.as_deref(), Some("TARGET"));
+        assert_eq!(key.from_me, Some(true));
+        assert_eq!(
+            key.remote_jid.as_deref(),
+            Some(peer_pn.to_string().as_str())
+        );
+
+        let target = wa::MessageKey {
+            remote_jid: Some(peer_pn.to_string()),
+            from_me: Some(true),
+            id: Some("TARGET".into()),
+            participant: None,
+        };
+        let pin = client
+            .pin_message(peer_pn.clone(), target.clone(), PinDuration::Days30)
+            .await
+            .expect("connected test client should complete the pin");
+        let pinned = pin
+            .message
+            .pin_in_chat_message
+            .as_option()
+            .expect("the pin is a pinInChatMessage");
+        assert_eq!(
+            pinned.r#type,
+            Some(wa::message::pin_in_chat_message::Type::PinForAll)
+        );
+        assert_eq!(pinned.key.as_option(), Some(&target));
+        assert_eq!(
+            pin.message
+                .message_context_info
+                .as_option()
+                .and_then(|c| c.message_add_on_duration_in_secs),
+            Some(PinDuration::Days30.as_secs()),
+            "the duration the pin was sent with"
+        );
+
+        let options = ["yes".to_string(), "no".to_string()];
+        let (poll, secret) = client
+            .polls()
+            .create(peer_pn.clone(), "lunch?", &options, 1)
+            .await
+            .expect("connected test client should complete the poll");
+        let creation = poll
+            .message
+            .poll_creation_message_v3
+            .as_option()
+            .expect("a single-select poll is the v3 shape");
+        assert_eq!(creation.name.as_deref(), Some("lunch?"));
+        assert_eq!(creation.options.len(), 2);
+        assert_eq!(
+            poll.message
+                .message_context_info
+                .as_option()
+                .and_then(|c| c.message_secret.as_deref()),
+            Some(secret.as_slice()),
+            "a poll's own secret is part of the message it built, so the wire \
+             copy and the reported one agree on it"
         );
     }
 

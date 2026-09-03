@@ -159,12 +159,20 @@ impl Client {
         }
     }
 
+    /// Edit a message you own (`original_id`), replacing its content with
+    /// `new_content`.
+    ///
+    /// The returned [`SendResult`](crate::send::SendResult) describes the edit
+    /// itself: `message_id` is the edit stanza's own fresh id (never
+    /// `original_id`, which the server would deduplicate against the original
+    /// and drop), and `message` the protocol message this crate built around
+    /// `new_content`, keyed by `original_id`.
     pub async fn edit_message(
         &self,
         to: impl Into<Jid>,
         original_id: impl Into<String>,
         new_content: wa::Message,
-    ) -> Result<String, crate::send::SendError> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.edit_message_inner(to.into(), original_id.into(), new_content, None)
             .await
     }
@@ -180,14 +188,15 @@ impl Client {
     /// id (the edit skips outbound-secret and retry-cache persistence, leaving
     /// the original message's state intact), and whether the collision is
     /// honored is server/client dependent — treat it as best-effort. See
-    /// [`crate::send::EditOptions::stanza_id`].
+    /// [`crate::send::EditOptions::stanza_id`]. The result's `message_id` is
+    /// then the borrowed id.
     pub async fn edit_message_with_options(
         &self,
         to: impl Into<Jid>,
         original_id: impl Into<String>,
         new_content: wa::Message,
         options: crate::send::EditOptions,
-    ) -> Result<String, crate::send::SendError> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.edit_message_inner(
             to.into(),
             original_id.into(),
@@ -208,7 +217,7 @@ impl Client {
         original_id: String,
         new_content: wa::Message,
         request_id: Option<String>,
-    ) -> Result<String, crate::send::SendError> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         // WhatsApp Web uses getMeUserLidOrJidForChat(chat, EditMessage) which
         // returns LID for LID-addressing groups and PN otherwise.
         let participant = if to.is_group() {
@@ -228,7 +237,7 @@ impl Client {
 
         let edit_container_message = crate::send::build_edit_message(
             &to,
-            original_id.clone(),
+            original_id,
             participant,
             new_content,
             wacore::time::now_millis(),
@@ -242,21 +251,13 @@ impl Client {
         // want to pin the outer stanza id pass it via `request_id`; that id is
         // borrowed from another message, so id-keyed state (retry cache, outbound
         // secret) must not be bound to it.
-        let borrowed_message_id = request_id.is_some();
-        self.send_message_impl(
+        self.send_built_message(
             to,
-            &edit_container_message,
-            crate::send::SendPipelineOptions {
-                edit: Some(crate::types::message::EditAttribute::MessageEdit),
-                request_id: request_id.as_deref(),
-                borrowed_message_id,
-                ..Default::default()
-            },
+            edit_container_message,
+            crate::types::message::EditAttribute::MessageEdit,
+            request_id,
         )
         .await
-        .map_err(crate::send::SendError::from_anyhow)?;
-
-        Ok(original_id)
     }
 
     /// Edit a message via the message-secret encrypted path (`secret_encrypted_message`
@@ -267,13 +268,17 @@ impl Client {
     /// `message_secret` is the *original* message's 32-byte secret (you generated it when
     /// you sent that message). You can only edit your own messages, so the original
     /// sender and the editor are both you.
+    ///
+    /// Returns the edit's own [`SendResult`](crate::send::SendResult), like
+    /// [`Client::edit_message`]; here `message` is the `secretEncryptedMessage`
+    /// envelope, so `new_content` is not readable from it.
     pub async fn edit_message_encrypted(
         &self,
         to: impl Into<Jid>,
         original_id: impl Into<String>,
         message_secret: &[u8],
         new_content: wa::Message,
-    ) -> Result<String, crate::send::SendError> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.edit_message_encrypted_inner(
             to.into(),
             original_id.into(),
@@ -290,7 +295,7 @@ impl Client {
         original_id: String,
         message_secret: &[u8],
         new_content: wa::Message,
-    ) -> Result<String, crate::send::SendError> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         use crate::send::SendError;
         // Newsletters/channels are plaintext (no message-secret addon crypto) and the
         // E2E send path rejects them, so an encrypted edit can't apply there; fail with
@@ -331,18 +336,13 @@ impl Client {
             new_content,
         )?;
 
-        self.send_message_impl(
+        self.send_built_message(
             to,
-            &envelope,
-            crate::send::SendPipelineOptions {
-                edit: Some(crate::types::message::EditAttribute::MessageEdit),
-                ..Default::default()
-            },
+            envelope,
+            crate::types::message::EditAttribute::MessageEdit,
+            None,
         )
         .await
-        .map_err(SendError::from_anyhow)?;
-
-        Ok(original_id)
     }
 
     /// Send a server-side reaction (used by both newsletter and status reactions).

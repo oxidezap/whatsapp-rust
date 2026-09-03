@@ -11,12 +11,16 @@ impl Client {
     /// * `message_id` - The ID of the message to delete
     /// * `revoke_type` - Use `RevokeType::Sender` to delete your own message,
     ///   or `RevokeType::Admin { original_sender }` to delete another user's message as group admin
+    ///
+    /// The returned [`SendResult`] describes the revoke itself: `message_id`
+    /// is the revoke stanza's own fresh id, and `message` the protocol message
+    /// it carried, keyed by the message being deleted.
     pub async fn revoke_message(
         &self,
         to: impl Into<Jid>,
         message_id: impl Into<String>,
         revoke_type: RevokeType,
-    ) -> Result<(), SendError> {
+    ) -> Result<SendResult, SendError> {
         self.revoke_message_inner(to.into(), message_id.into(), revoke_type)
             .await
     }
@@ -27,7 +31,7 @@ impl Client {
         to: Jid,
         message_id: String,
         revoke_type: RevokeType,
-    ) -> Result<(), SendError> {
+    ) -> Result<SendResult, SendError> {
         self.require_pn().map_err(SendError::from_anyhow)?;
 
         let (from_me, participant, edit_attr) = match &revoke_type {
@@ -62,17 +66,8 @@ impl Client {
         //
         // A revoke is an ordinary group message: the sender key goes only to devices
         // that do not have it yet, like every other send.
-        self.send_message_impl(
-            to,
-            &revoke_message,
-            SendPipelineOptions {
-                edit: Some(edit_attr),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(SendError::from_anyhow)?;
-        Ok(())
+        self.send_built_message(to, revoke_message, edit_attr, None)
+            .await
     }
 
     /// Keep (or un-keep) a message in a disappearing chat for everyone.
@@ -98,12 +93,15 @@ impl Client {
     }
 
     /// Pin a message in a chat for all participants.
+    ///
+    /// The returned [`SendResult`] describes the pin itself: its own fresh
+    /// `message_id`, and in `message` the `pinInChatMessage` that was sent.
     pub async fn pin_message(
         &self,
         chat: impl Into<Jid>,
         key: wa::MessageKey,
         duration: PinDuration,
-    ) -> Result<(), SendError> {
+    ) -> Result<SendResult, SendError> {
         self.send_pin(
             chat.into(),
             key,
@@ -113,12 +111,13 @@ impl Client {
         .await
     }
 
-    /// Unpin a previously pinned message.
+    /// Unpin a previously pinned message. Returns the unpin's own
+    /// [`SendResult`], like [`Client::pin_message`].
     pub async fn unpin_message(
         &self,
         chat: impl Into<Jid>,
         key: wa::MessageKey,
-    ) -> Result<(), SendError> {
+    ) -> Result<SendResult, SendError> {
         self.send_pin(
             chat.into(),
             key,
@@ -135,7 +134,7 @@ impl Client {
         key: wa::MessageKey,
         pin_type: wa::message::pin_in_chat_message::Type,
         duration_secs: u32,
-    ) -> Result<(), SendError> {
+    ) -> Result<SendResult, SendError> {
         let message = wa::Message {
             pin_in_chat_message: buffa::MessageField::some(wa::message::PinInChatMessage {
                 key: buffa::MessageField::some(key),
@@ -149,16 +148,7 @@ impl Client {
             ..Default::default()
         };
 
-        self.send_message_impl(
-            chat,
-            &message,
-            SendPipelineOptions {
-                edit: Some(EditAttribute::PinInChat),
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(SendError::from_anyhow)?;
-        Ok(())
+        self.send_built_message(chat, message, EditAttribute::PinInChat, None)
+            .await
     }
 }
