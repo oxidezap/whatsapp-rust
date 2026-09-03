@@ -50,16 +50,20 @@ impl<'a> Presence<'a> {
     }
 
     async fn build_subscription_node(&self, jid: &Jid) -> Node {
-        let mut builder = NodeBuilder::new("presence")
+        // Include tctoken if available (no t attribute, matching WhatsApp Web)
+        let token = self.client.lookup_tc_token_for_jid(jid).await;
+        Self::subscription_node_with_token(jid, token)
+    }
+
+    fn subscription_node_with_token(jid: &Jid, token: Option<Vec<u8>>) -> Node {
+        let builder = NodeBuilder::new("presence")
             .attr("type", "subscribe")
             .attr("to", jid);
 
-        // Include tctoken if available (no t attribute, matching WhatsApp Web)
-        if let Some(token) = self.client.lookup_tc_token_for_jid(jid).await {
-            builder = builder.children([build_tc_token_node(&token)]);
+        match token {
+            Some(token) => builder.children([build_tc_token_node(&token)]).build(),
+            None => builder.build(),
         }
-
-        builder.build()
     }
 
     fn build_unsubscription_node(&self, jid: &Jid) -> Node {
@@ -177,6 +181,13 @@ impl<'a> Presence<'a> {
     }
 }
 
+/// How many presence re-subscriptions a reconnect keeps in flight at once.
+///
+/// Matched to the noise sender's own job channel (`bounded(8)`): the point of
+/// the window is to give that sender several frames to coalesce, and a window
+/// wider than its queue only blocks on it.
+const RESUBSCRIBE_WINDOW: usize = 8;
+
 impl Client {
     fn lock_presence_subscriptions(
         &self,
@@ -202,6 +213,21 @@ impl Client {
         self.lock_presence_subscriptions().iter().cloned().collect()
     }
 
+    /// Re-subscribe to every tracked contact's presence, a window at a time.
+    ///
+    /// Two things make the window the right unit rather than the JID. The
+    /// tcToken lookup is one store read per contact, and the whole window's
+    /// worth collapses into a single backend call. And awaiting each
+    /// `send_node` in turn guarantees the noise sender never has more than one
+    /// job queued, so every stanza became its own transport write — one TLS
+    /// record, one WebSocket frame and one syscall per contact; issuing a
+    /// window at once is what lets the sender coalesce them, exactly as the
+    /// transport-ack worker does.
+    ///
+    /// The window is what bounds it: a client tracking hundreds of contacts
+    /// still has at most [`RESUBSCRIBE_WINDOW`] stanzas in flight, and the
+    /// generation / connection checks run per window, so a reconnect landing
+    /// mid-walk still stops it within one window rather than after the lot.
     pub(crate) async fn resubscribe_presence_subscriptions(&self, expected_generation: u64) {
         let subscribed_jids = self.tracked_presence_subscriptions();
         if subscribed_jids.is_empty() {
@@ -213,7 +239,7 @@ impl Client {
             subscribed_jids.len()
         );
 
-        for jid in subscribed_jids {
+        for window in subscribed_jids.chunks(RESUBSCRIBE_WINDOW) {
             if self
                 .connection_generation
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -228,9 +254,34 @@ impl Client {
                 return;
             }
 
-            if let Err(err) = self.presence().re_subscribe_when_active(&jid).await {
-                warn!("Failed to re-subscribe to presence for {jid}: {err:?}");
+            // An `unsubscribe` may land at any point in the walk, so the
+            // tracking set is re-read here and again after the lookup — never
+            // taken from the snapshot above, which would let this undo it.
+            let pending: Vec<Jid> = window
+                .iter()
+                .filter(|jid| self.is_presence_subscription_tracked(jid))
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                continue;
             }
+
+            let tokens = self.lookup_tc_tokens_for_jids(&pending).await;
+            let sends = pending.iter().zip(tokens).filter_map(|(jid, token)| {
+                // Re-read after the lookup, which awaited. An `unsubscribe`
+                // landing in that window has already sent its own stanza, so
+                // subscribing now would leave the peer subscribed while we no
+                // longer track it.
+                self.is_presence_subscription_tracked(jid).then(|| {
+                    let node = Presence::subscription_node_with_token(jid, token);
+                    async move {
+                        if let Err(err) = self.send_node(node).await {
+                            warn!("Failed to re-subscribe to presence for {jid}: {err:?}");
+                        }
+                    }
+                })
+            });
+            futures::future::join_all(sends).await;
         }
     }
 
@@ -481,28 +532,60 @@ mod tests {
         );
     }
 
-    /// The resubscribe loop snapshots the tracked set, then re-checks each JID
-    /// before sending. This gates the send so an `unsubscribe` lands after the
-    /// snapshot was taken but before the loop reaches that JID.
+    /// Awaiting each subscribe in turn left the noise sender with one job
+    /// queued at a time, so every stanza became its own transport write. A
+    /// window's worth in flight is what gives the sender something to coalesce.
     #[tokio::test]
-    async fn resubscribe_skips_a_jid_unsubscribed_mid_loop() {
-        use crate::client::NodeFilter;
+    async fn resubscribe_batches_its_stanzas_into_fewer_transport_writes() {
+        use std::sync::atomic::Ordering;
+
+        const TRACKED: usize = 24;
+
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        for i in 0..TRACKED {
+            let jid: Jid = format!("1904555{i:04}@s.whatsapp.net")
+                .parse()
+                .expect("valid jid");
+            client.track_presence_subscription(jid);
+        }
+
+        let generation = client.connection_generation.load(Ordering::SeqCst);
+        client.resubscribe_presence_subscriptions(generation).await;
+
+        assert_eq!(
+            transport.sent_count(),
+            TRACKED,
+            "every tracked contact is still re-subscribed exactly once"
+        );
+        assert!(
+            transport.write_count() < TRACKED,
+            "{TRACKED} frames reached the transport in {} writes; the point of \
+             the window is that the sender coalesces them",
+            transport.write_count(),
+        );
+    }
+
+    /// The resubscribe walk snapshots the tracked set, then re-checks each JID
+    /// before building and sending its stanza. This gates the first window's
+    /// first write so an `unsubscribe` lands after the snapshot was taken but
+    /// before the walk reaches the window that JID is in.
+    #[tokio::test]
+    async fn resubscribe_skips_a_jid_unsubscribed_before_its_window() {
         use bytes::Bytes;
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         struct GatedTransport {
+            inner: Arc<crate::transport::mock::CapturingMockTransport>,
             started: async_channel::Sender<()>,
             release: async_channel::Receiver<()>,
             gate_next_send: AtomicBool,
-            sends: Arc<AtomicUsize>,
         }
 
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         impl crate::transport::Transport for GatedTransport {
-            async fn send(&self, _data: Bytes) -> Result<(), anyhow::Error> {
-                self.sends.fetch_add(1, Ordering::AcqRel);
+            async fn send(&self, data: Bytes) -> Result<(), anyhow::Error> {
                 if self.gate_next_send.swap(false, Ordering::AcqRel) {
                     self.started
                         .send(())
@@ -513,7 +596,7 @@ mod tests {
                         .await
                         .map_err(|_| anyhow::anyhow!("gate closed"))?;
                 }
-                Ok(())
+                self.inner.send(data).await
             }
 
             async fn disconnect(&self) {}
@@ -523,58 +606,71 @@ mod tests {
 
         let (started_tx, started_rx) = async_channel::bounded(1);
         let (release_tx, release_rx) = async_channel::bounded(1);
-        let sends = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(crate::transport::mock::CapturingMockTransport::new());
         let gated = crate::socket::NoiseSocket::new(
             Arc::new(TokioRuntime),
             Arc::new(GatedTransport {
+                inner: captured.clone(),
                 started: started_tx,
                 release: release_rx,
                 gate_next_send: AtomicBool::new(true),
-                sends: sends.clone(),
             }),
             wacore::handshake::NoiseCipher::new(&[0u8; 32]).expect("valid key"),
             wacore::handshake::NoiseCipher::new(&[0u8; 32]).expect("valid key"),
         );
         *client.noise_socket.lock().unwrap() = Some(Arc::new(gated));
 
-        let first: Jid = "12025550111@s.whatsapp.net".parse().expect("valid jid");
-        let second: Jid = "12025550122@s.whatsapp.net".parse().expect("valid jid");
-        client.track_presence_subscription(first.clone());
-        client.track_presence_subscription(second.clone());
+        // One full window plus one, so there is a JID the walk has not reached
+        // when the first window's first write blocks.
+        for i in 0..=RESUBSCRIBE_WINDOW {
+            let jid: Jid = format!("1202555{i:04}@s.whatsapp.net")
+                .parse()
+                .expect("valid jid");
+            client.track_presence_subscription(jid);
+        }
+        // The set is not modified between this read and the walk's own, and a
+        // `HashSet` iterates one state in one order, so this is the order the
+        // walk will use — which is what makes "in the second window" true.
+        let walk_order = client.tracked_presence_subscriptions();
+        let unsubscribed = walk_order[RESUBSCRIBE_WINDOW].clone();
 
-        // Which JID the set yields first is not fixed, so learn it from the
-        // stanza rather than assuming an iteration order.
-        let sent = client.wait_for_sent_node(NodeFilter::tag("presence"));
         let generation = client.connection_generation.load(Ordering::SeqCst);
         let resubscribe = {
             let client = client.clone();
             tokio::spawn(async move { client.resubscribe_presence_subscriptions(generation).await })
         };
 
-        let node = sent.await.expect("the loop sends the first subscribe");
-        let sent_to = node
-            .attrs
-            .get("to")
-            .cloned()
-            .expect("subscribe carries a target");
-        started_rx.recv().await.expect("the first send is gated");
-
-        let unsubscribed = if sent_to == first.to_string() {
-            second
-        } else {
-            first
-        };
+        started_rx.recv().await.expect("the first write is gated");
         client.untrack_presence_subscription(&unsubscribed);
-
         release_tx.send(()).await.expect("gate released");
         resubscribe
             .await
             .expect("resubscribe task should not panic");
 
+        let targets: Vec<String> =
+            crate::test_utils::decrypt_wire_frames(&captured.sent(), &[0u8; 32])
+                .iter()
+                .map(|plaintext| {
+                    let unpacked =
+                        wacore_binary::util::unpack(plaintext).expect("a sent frame unpacks");
+                    let node = wacore_binary::OwnedNodeRef::new(unpacked.into_owned())
+                        .expect("a sent frame decodes");
+                    node.get()
+                        .get_attr("to")
+                        .map(|to| to.to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+
         assert_eq!(
-            sends.load(Ordering::Acquire),
-            1,
-            "only the JID still tracked when the loop reached it may be re-subscribed"
+            targets.len(),
+            RESUBSCRIBE_WINDOW,
+            "the window that was in flight is re-subscribed; the next one is not, \
+             because the JID it held was untracked first"
+        );
+        assert!(
+            !targets.contains(&unsubscribed.to_string()),
+            "a JID unsubscribed before its window is reached must not be re-subscribed"
         );
         assert!(
             !client

@@ -918,6 +918,21 @@ pub trait ProtocolStore: Send + Sync {
     /// Get a trusted contact token for a JID (stored under LID).
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>>;
 
+    /// Get the trusted contact tokens for several JIDs at once, in the order
+    /// asked, `None` where the backend holds no row.
+    ///
+    /// The reconnect presence re-subscribe looks one of these up per tracked
+    /// contact, which is a query per contact against one store — the shape this
+    /// exists to collapse. The default is a loop for third-party backends; the
+    /// built-in stores override it with a single query.
+    async fn get_tc_tokens(&self, jids: &[String]) -> Result<Vec<Option<TcTokenEntry>>> {
+        let mut entries = Vec::with_capacity(jids.len());
+        for jid in jids {
+            entries.push(self.get_tc_token(jid).await?);
+        }
+        Ok(entries)
+    }
+
     /// Store or update a trusted contact token for a JID.
     async fn put_tc_token(&self, jid: &str, entry: &TcTokenEntry) -> Result<()>;
 

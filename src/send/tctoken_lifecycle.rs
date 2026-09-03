@@ -350,6 +350,49 @@ impl Client {
         }
     }
 
+    /// The live tcTokens for several JIDs at once, in the order asked.
+    ///
+    /// One backend call and one AB-props read for the whole set, where
+    /// [`lookup_tc_token_for_jid`](Self::lookup_tc_token_for_jid) does both per
+    /// JID. The reconnect presence re-subscribe walks the entire tracked
+    /// contact set, so per-JID is a query per contact against one store.
+    pub(crate) async fn lookup_tc_tokens_for_jids(&self, jids: &[Jid]) -> Vec<Option<Vec<u8>>> {
+        use wacore::iq::tctoken::is_tc_token_expired_with;
+
+        if jids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut token_keys = Vec::with_capacity(jids.len());
+        for jid in jids {
+            token_keys.push(self.resolve_tc_token_key(jid).await);
+        }
+        let tc_config = self.tc_token_config().await;
+        let entries = match self
+            .persistence_manager
+            .backend()
+            .get_tc_tokens(&token_keys)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(e) => {
+                log::warn!(target: "Client/TcToken", "Failed to get {} tc_tokens: {e}", token_keys.len());
+                return vec![None; jids.len()];
+            }
+        };
+
+        entries
+            .into_iter()
+            .map(|entry| {
+                entry.filter(|entry| {
+                    !entry.token.is_empty()
+                        && !is_tc_token_expired_with(entry.token_timestamp, &tc_config)
+                })
+            })
+            .map(|entry| entry.map(|entry| entry.token))
+            .collect()
+    }
+
     /// Build tctoken timing config from AB props, falling back to defaults.
     pub(crate) async fn tc_token_config(&self) -> wacore::iq::tctoken::TcTokenConfig {
         use wacore::iq::abprops::web;

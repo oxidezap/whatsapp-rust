@@ -3397,6 +3397,52 @@ impl ProtocolStore for SqliteStore {
         .await
     }
 
+    async fn get_tc_tokens(&self, jids: &[String]) -> Result<Vec<Option<TcTokenEntry>>> {
+        if jids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Same write-queue ordering as the single-JID read above, for the same
+        // reason: one `IN (...)` instead of one query per JID, still behind the
+        // permit that orders it against a concurrent touch.
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let wanted = jids.to_vec();
+        self.with_semaphore(move || -> Result<Vec<Option<TcTokenEntry>>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let mut found: std::collections::HashMap<String, TcTokenEntry> =
+                std::collections::HashMap::with_capacity(wanted.len());
+            // Chunked so a large tracked set cannot exceed SQLite's bound-
+            // parameter limit (999 by default, and `device_id` takes one).
+            for chunk in wanted.chunks(500) {
+                let rows: Vec<(String, Vec<u8>, i64, Option<i64>)> = tc_tokens::table
+                    .select((
+                        tc_tokens::jid,
+                        tc_tokens::token,
+                        tc_tokens::token_timestamp,
+                        tc_tokens::sender_timestamp,
+                    ))
+                    .filter(tc_tokens::jid.eq_any(chunk))
+                    .filter(tc_tokens::device_id.eq(device_id))
+                    .load(&mut *conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                for (jid, token, token_timestamp, sender_timestamp) in rows {
+                    found.insert(
+                        jid,
+                        TcTokenEntry {
+                            token,
+                            token_timestamp,
+                            sender_timestamp,
+                        },
+                    );
+                }
+            }
+            Ok(wanted.iter().map(|jid| found.get(jid).cloned()).collect())
+        })
+        .await
+    }
+
     async fn put_tc_token(&self, jid: &str, entry: &TcTokenEntry) -> Result<()> {
         let pool = self.pool.clone();
         let device_id = self.device_id;
@@ -5080,6 +5126,50 @@ mod tests {
         assert_eq!(loaded.token, vec![1, 2, 3, 4, 5]);
         assert_eq!(loaded.token_timestamp, 1707000000);
         assert_eq!(loaded.sender_timestamp, Some(1707000100));
+    }
+
+    /// The batched read answers positionally, so a caller can zip it against the
+    /// JIDs it asked for — including the ones the store holds nothing for.
+    #[tokio::test]
+    async fn test_tc_tokens_batched_get_answers_in_the_order_asked() {
+        let store = create_test_store().await;
+
+        for (jid, byte) in [("a@lid", 1u8), ("c@lid", 3u8)] {
+            store
+                .put_tc_token(
+                    jid,
+                    &TcTokenEntry {
+                        token: vec![byte],
+                        token_timestamp: 1000 + i64::from(byte),
+                        sender_timestamp: None,
+                    },
+                )
+                .await
+                .expect("put failed");
+        }
+
+        let asked: Vec<String> = ["c@lid", "b@lid", "a@lid", "c@lid"]
+            .iter()
+            .map(|jid| (*jid).to_string())
+            .collect();
+        let got = store
+            .get_tc_tokens(&asked)
+            .await
+            .expect("batched get failed");
+
+        assert_eq!(
+            got.iter()
+                .map(|entry| entry.as_ref().map(|entry| entry.token.clone()))
+                .collect::<Vec<_>>(),
+            vec![Some(vec![3]), None, Some(vec![1]), Some(vec![3])],
+        );
+        assert!(
+            store
+                .get_tc_tokens(&[])
+                .await
+                .expect("an empty batch is not an error")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -6997,6 +7087,11 @@ mod read_routing_tests {
             "get_tc_token",
             "prepare_privacy_token schedules off this timestamp, so a stale read \
              issues a duplicate token and bypasses the configured interval",
+        ),
+        (
+            "get_tc_tokens",
+            "the batched form of get_tc_token, and it answers the same callers, so \
+             it has to order against a concurrent touch the same way",
         ),
         (
             "has_signal_state_for_user",
