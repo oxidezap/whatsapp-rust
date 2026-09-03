@@ -1264,15 +1264,15 @@ pub struct Client {
     pub(crate) inbound_commit_batch: crate::message::commit_batch::InboundCommitBatcher,
     pub(crate) media_conn: Arc<RwLock<Option<crate::mediaconn::MediaConn>>>,
 
-    pub(crate) is_logged_in: Arc<AtomicBool>,
+    pub(crate) is_logged_in: AtomicBool,
     #[cfg(feature = "client-lifecycle")]
     pub(crate) login_transition: std::sync::Mutex<()>,
-    pub(crate) is_connecting: Arc<AtomicBool>,
-    pub(crate) is_running: Arc<AtomicBool>,
+    pub(crate) is_connecting: AtomicBool,
+    pub(crate) is_running: AtomicBool,
     /// Whether the noise socket is established (connected to WhatsApp servers).
     /// Uses an AtomicBool instead of probing the noise_socket mutex to avoid
     /// TOCTOU races where `try_lock()` fails due to contention, not disconnection.
-    is_connected: Arc<AtomicBool>,
+    is_connected: AtomicBool,
 
     /// whatsmeow's `sendActiveReceipts`: 0 = inactive (default), 1 = active
     /// (presence available), 2 = forced. When 0, delivery receipts use `type="inactive"`.
@@ -1284,7 +1284,7 @@ pub struct Client {
     /// process, the next connect skips IK and falls back to XX so a stale
     /// cached `serverStaticPublic` doesn't trap us in a loop. Reset to 0 on
     /// any successful handshake (XX, IK, or XXfallback).
-    pub(crate) ik_handshake_failures: Arc<AtomicU32>,
+    pub(crate) ik_handshake_failures: AtomicU32,
     /// Terminal shutdown (process-wide). Fired ONLY by `disconnect()`.
     /// Long-lived subscribers that must outlive reconnect cycles (saver,
     /// device registry cleanup) subscribe here.
@@ -1347,7 +1347,7 @@ pub struct Client {
     /// Wrapped in Mutex to allow replacing on reconnect.
     pub(crate) message_processing_semaphore: std::sync::Mutex<Arc<async_lock::Semaphore>>,
     /// Bumped on every semaphore swap so stale Arc clones are rejected.
-    pub(crate) message_semaphore_generation: Arc<AtomicU64>,
+    pub(crate) message_semaphore_generation: AtomicU64,
 
     /// Per-device session locks for Signal protocol operations.
     /// Prevents race conditions when multiple messages from the same sender
@@ -1394,7 +1394,7 @@ pub struct Client {
     /// `OnceLock` keeps the read on that path down to an atomic load.
     pub group_cache: std::sync::OnceLock<Arc<GroupCache>>,
 
-    pub(crate) expected_disconnect: Arc<AtomicBool>,
+    pub(crate) expected_disconnect: AtomicBool,
     /// Set by `reconnect()` to suppress the "Message loop exited with an error" warning.
     /// Unlike `expected_disconnect`, this does NOT skip the reconnect backoff.
     pub(crate) intentional_reconnect: AtomicBool,
@@ -1473,7 +1473,7 @@ pub struct Client {
     /// Fired by [`Client::pause`] and [`Client::resume`], and by nothing else,
     /// so the run loop's reconnect backoff can watch it without the spurious
     /// wakes that would collapse the delay it exists to serve.
-    pub(crate) pause_state_notifier: Arc<event_listener::Event>,
+    pub(crate) pause_state_notifier: event_listener::Event,
     /// Set by [`Client::pause`] for the connection it tears down, consumed by
     /// the run loop's post-connection branch. A one-shot fact rather than a
     /// re-read of `paused`, because a [`Client::resume`] can land between the
@@ -1493,17 +1493,17 @@ pub struct Client {
     pub(crate) connection_publish: Mutex<()>,
     /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
     /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
-    pub(crate) auto_reconnect_errors: Arc<AtomicU32>,
+    pub(crate) auto_reconnect_errors: AtomicU32,
     /// When the last successful authentication (`<success>`) landed, or unset.
     /// Gates the WA Web `resetDelay` backoff reset (see [`should_reset_backoff`]).
     /// Monotonic: it only ever answers how long the connection has been up, and
     /// a wall clock would let a resumed laptop declare a seconds-old connection
     /// stable, or a backwards adjustment withhold the reset indefinitely.
-    pub(crate) connected_at: Arc<wacore::time::AtomicInstant>,
+    pub(crate) connected_at: wacore::time::AtomicInstant,
     /// Set when an explicit backoff penalty was applied this connection (429
     /// rate-limit, manual `reconnect()`); cleared on the next `<success>`. Keeps
     /// the stability reset from erasing a deliberate penalty (WA Web `cancelReset`).
-    pub(crate) backoff_reset_suppressed: Arc<AtomicBool>,
+    pub(crate) backoff_reset_suppressed: AtomicBool,
 
     pub(crate) needs_initial_full_sync: Arc<app_state::BootstrapGate>,
 
@@ -1525,7 +1525,7 @@ pub struct Client {
     /// are user-paced, so there is nothing to gain from finer granularity.
     pub(crate) app_state_send_lock: Arc<Mutex<()>>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
-    pub(crate) initial_app_state_keys_received: Arc<AtomicBool>,
+    pub(crate) initial_app_state_keys_received: AtomicBool,
 
     /// Prevents concurrent prekey upload operations (matches WA Web's dedup set in `handlePreKeyLow`).
     pub(crate) prekey_upload_lock: Arc<Mutex<()>>,
@@ -1534,11 +1534,11 @@ pub struct Client {
     pub(crate) signed_pre_key_rotation_lock: Arc<Mutex<()>>,
     /// Notifier for when offline sync (ib offline stanza) is received.
     /// WhatsApp Web waits for this before sending passive tasks (prekey upload, active IQ, presence).
-    pub(crate) offline_sync_notifier: Arc<event_listener::Event>,
+    pub(crate) offline_sync_notifier: event_listener::Event,
     /// Flag indicating offline sync has completed (received ib offline stanza).
     /// Flips only AFTER the drain-tail commit, so the tail's acks still join
     /// the aggregate offline-receipt drain.
-    pub(crate) offline_sync_completed: Arc<AtomicBool>,
+    pub(crate) offline_sync_completed: AtomicBool,
     /// Highest connection generation whose drain finisher has started, held as
     /// `generation + 1` so zero reads as "none yet". Separate from
     /// `offline_sync_completed` because the finish runs off the read loop and
@@ -1549,7 +1549,7 @@ pub struct Client {
     /// completion descheduled past its own connection would otherwise claim
     /// the boolean after a teardown cleared it, and the next connection's
     /// completion would find the guard taken and never start a finisher.
-    pub(crate) offline_sync_finish_started: Arc<AtomicU64>,
+    pub(crate) offline_sync_finish_started: AtomicU64,
     /// Highest connection generation whose resume already published a terminal
     /// event, either `OfflineSyncCompleted` or `OfflineSyncInterrupted`, held
     /// as `generation + 1` so zero reads as "none yet".
@@ -1561,7 +1561,7 @@ pub struct Client {
     /// next drain's preview. A claim therefore fails both for a drain already
     /// reported and for one a *newer* drain has overtaken, and nothing has to
     /// reopen the guard for the next drain: its own higher stamp does that.
-    pub(crate) offline_terminal_reported: Arc<AtomicU64>,
+    pub(crate) offline_terminal_reported: AtomicU64,
     /// Delivery receipts buffered during offline sync, flushed as aggregate
     /// `<receipt>` stanzas at completion (WA Web `sendAggregateOfflineReceipts`).
     /// Empty (zero capacity) outside the offline window.
@@ -1601,15 +1601,15 @@ pub struct Client {
     pub(crate) offline_batch: Arc<offline_resume::OfflineBatchCoordinator>,
     /// Notifier for when the noise socket is established (before login).
     /// Use this to wait for the socket to be ready for sending messages.
-    pub(crate) socket_ready_notifier: Arc<event_listener::Event>,
+    pub(crate) socket_ready_notifier: event_listener::Event,
     /// Set to `true` only when `dispatch_connected()` fires (once the critical
     /// sync has an answer, clean or not). Reset on each new connection attempt.
     /// Used by `wait_for_connected()` to avoid a false-positive fast path when
     /// the client is logged in but critical app state hasn't been asked for yet.
-    pub(crate) is_ready: Arc<AtomicBool>,
+    pub(crate) is_ready: AtomicBool,
     /// Notifier for when the client is fully connected and logged in.
     /// Triggered after Event::Connected is dispatched.
-    pub(crate) connected_notifier: Arc<event_listener::Event>,
+    pub(crate) connected_notifier: event_listener::Event,
     /// The `connection_generation` that `<success>` finished publishing.
     ///
     /// `is_logged_in` is set by the dedup swap that has to come *before* the
@@ -1618,7 +1618,7 @@ pub struct Client {
     /// Work that bound a scope in that window had every attempt rejected as
     /// retired. This lags `connection_generation` by exactly that window, so
     /// equality means the generation a caller is about to bind is the final one.
-    pub(crate) authenticated_generation: Arc<AtomicU64>,
+    pub(crate) authenticated_generation: AtomicU64,
     /// Fired whenever the answer to *can work reach the server, and is it still
     /// worth waiting* may have changed: the session authenticated, or the client
     /// became terminal.
@@ -1633,7 +1633,7 @@ pub struct Client {
     /// the `Arc<Client>` whose drop would have been the only other way out.
     ///
     /// Every terminal transition must fire this. See [`Client::is_terminal`].
-    pub(crate) session_state_notifier: Arc<event_listener::Event>,
+    pub(crate) session_state_notifier: event_listener::Event,
     pub(crate) major_sync_task_sender: async_channel::Sender<MajorSyncTask>,
     pub(crate) pairing_cancellation_tx: Arc<Mutex<Option<async_channel::Sender<()>>>>,
     /// Asks the QR rotation task to re-render the ref it is already showing.

@@ -13,7 +13,7 @@ use hashbrown::HashTable;
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, Hash, RandomState};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use wacore::runtime::BoxFuture;
 use wacore::sync_marker::MaybeSend;
@@ -76,8 +76,13 @@ pub(crate) struct CapacityStats {
 /// expired-but-not-yet-evicted entries.
 pub struct PortableCache<K, V> {
     inner: Arc<RwLock<CacheInner<K, V>>>,
-    /// Shared single-flight init-lock registry (see `InitLocks`).
-    init_locks: Arc<InitLocks>,
+    /// Shared single-flight init-lock registry (see `InitLocks`), built on the
+    /// first [`get_with`](Self::get_with) rather than at construction: a client
+    /// builds ~20 of these caches and most of them are only ever `get`/`insert`ed,
+    /// so an eager registry was 20 allocations of pure structure per client for a
+    /// single-flight path they never take. [`Clone`] forces it, so clones of one
+    /// cache still share one registry — which is what makes the flight single.
+    init_locks: OnceLock<Arc<InitLocks>>,
     max_capacity: Option<u64>,
     ttl: Option<Duration>,
     tti: Option<Duration>,
@@ -445,7 +450,7 @@ where
             inner: Arc::new(RwLock::new(CacheInner::new(
                 self.max_capacity.is_some_and(|cap| cap != u64::MAX),
             ))),
-            init_locks: Arc::new(InitLocks::new()),
+            init_locks: OnceLock::new(),
             max_capacity: self.max_capacity,
             ttl: self.ttl,
             tti: self.tti,
@@ -457,6 +462,14 @@ where
 }
 
 // -- PortableCache impl --
+
+impl<K, V> PortableCache<K, V> {
+    /// The single-flight registry, built on first use. Unbounded impl block so
+    /// [`Clone`] can force it too, keeping every clone on one registry.
+    fn init_locks(&self) -> &Arc<InitLocks> {
+        self.init_locks.get_or_init(|| Arc::new(InitLocks::new()))
+    }
+}
 
 impl<K, V> PortableCache<K, V>
 where
@@ -806,13 +819,14 @@ where
     /// per-key lock, with a double-checked `get` so a collided or racing key
     /// still resolves to the first inserted value.
     async fn get_with_slow(&self, key: K, init: BoxFuture<'_, V>) -> V {
-        let hash = self.init_locks.hash_of(&key);
+        let registry = self.init_locks();
+        let hash = registry.hash_of(&key);
         // The cleanup guard holds the sole long-lived Arc so its Drop sees an
         // exact strong count if this future is cancelled at any await below.
         let mut cleanup = InitLockCleanup {
-            registry: &self.init_locks,
+            registry,
             hash,
-            lock: Some(self.init_locks.acquire(hash).await),
+            lock: Some(registry.acquire(hash).await),
         };
 
         let value = {
@@ -833,7 +847,7 @@ where
 
         let init_mutex = cleanup.disarm();
         drop(cleanup);
-        self.init_locks.reclaim(hash, &init_mutex).await;
+        registry.reclaim(hash, &init_mutex).await;
         value
     }
 
@@ -852,8 +866,12 @@ where
 
         drop(guard);
 
-        // Clean up init locks not actively held.
-        self.init_locks.retain_active().await;
+        // Clean up init locks not actively held. `get()`, not `init_locks()`: a
+        // cache that never single-flighted has no registry to sweep, and building
+        // one here would undo the lazy construction.
+        if let Some(registry) = self.init_locks.get() {
+            registry.retain_active().await;
+        }
     }
 }
 
@@ -861,7 +879,7 @@ impl<K, V> Clone for PortableCache<K, V> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            init_locks: Arc::clone(&self.init_locks),
+            init_locks: OnceLock::from(Arc::clone(self.init_locks())),
             max_capacity: self.max_capacity,
             ttl: self.ttl,
             tti: self.tti,
@@ -1870,7 +1888,7 @@ mod tests {
         let _ = cache.get_with("key1".to_string(), async { 1 }).await;
         let _ = cache.get_with_by_ref("key2", async { 2 }).await;
 
-        let locks = cache.init_locks.map.lock().await;
+        let locks = cache.init_locks().map.lock().await;
         assert!(
             locks.is_empty(),
             "init locks must be reclaimed after get_with"
@@ -1894,7 +1912,7 @@ mod tests {
         // Poll (bounded) until the in-flight init registers its lock.
         let mut registered = false;
         for _ in 0..400 {
-            if !cache.init_locks.map.lock().await.is_empty() {
+            if !cache.init_locks().map.lock().await.is_empty() {
                 registered = true;
                 break;
             }
@@ -1909,7 +1927,7 @@ mod tests {
         // any run_pending_tasks call.
         let mut reclaimed = false;
         for _ in 0..400 {
-            if cache.init_locks.map.lock().await.is_empty() {
+            if cache.init_locks().map.lock().await.is_empty() {
                 reclaimed = true;
                 break;
             }
@@ -1963,8 +1981,8 @@ mod tests {
             PortableCache::builder().max_capacity(16).build();
         let (a, b) = (CollidingKey("a"), CollidingKey("b"));
         assert_eq!(
-            cache.init_locks.hash_of(&a),
-            cache.init_locks.hash_of(&b),
+            cache.init_locks().hash_of(&a),
+            cache.init_locks().hash_of(&b),
             "test premise: both keys must share one init-lock slot"
         );
 
