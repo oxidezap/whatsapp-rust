@@ -37,7 +37,7 @@ use super::member_index::MemberIndex;
 ///
 /// A bound, not a preallocation: the deque grows into it, because a session
 /// that never touches a group never writes an entry.
-const TOPOLOGY_LOG_CAPACITY: usize = 4096;
+pub(crate) const TOPOLOGY_LOG_CAPACITY: usize = 4096;
 
 struct TopologyLog {
     /// (generation, the users that change touched), oldest first.

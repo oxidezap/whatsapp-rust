@@ -1796,11 +1796,15 @@ mod tests {
         );
 
         // Log overflow past the memo's stamp: cannot prove cleanliness,
-        // must recompute.
+        // must recompute. One change wider than the whole log is the
+        // cheapest way to overflow it.
         setup_device_record(&client, user_a, &[0]).await;
-        for _ in 0..300 {
-            client.device_topology.record(["5511000000003"]);
-        }
+        let flood: Vec<String> = (0..=crate::client::device_topology::TOPOLOGY_LOG_CAPACITY)
+            .map(|i| format!("5511{i:09}"))
+            .collect();
+        client
+            .device_topology
+            .record(flood.iter().map(String::as_str));
         let after_overflow = client
             .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
             .await

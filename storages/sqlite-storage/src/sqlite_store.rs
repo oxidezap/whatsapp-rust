@@ -119,8 +119,8 @@ fn device_registry_row_to_record(
     // Decoded as a `Vec` and converted, so this reuses the `Vec<DeviceInfo>`
     // codec the crate already instantiates rather than stamping a second one
     // for `Box<[_]>`.
-    let devices: Vec<DeviceInfo> = serde_json::from_str(&devices_json)
-        .map_err(|e| StoreError::Serialization(Box::new(e)))?;
+    let devices: Vec<DeviceInfo> =
+        serde_json::from_str(&devices_json).map_err(|e| StoreError::Serialization(Box::new(e)))?;
     Ok(DeviceListRecord {
         user: Arc::from(user),
         devices: devices.into_boxed_slice(),
@@ -7035,6 +7035,7 @@ mod read_routing_tests {
             "promoted into device_registry_cache unconditionally, so a stale row \
              overwrites a newer entry and sends omit a linked device",
         ),
+        ("get_devices_batch", "same as get_devices"),
         (
             "get_tc_token",
             "prepare_privacy_token schedules off this timestamp, so a stale read \

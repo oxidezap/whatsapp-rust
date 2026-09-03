@@ -1139,9 +1139,17 @@ mod tests {
         cache.insert("cold".to_string(), 2).await;
         for i in 0..64u32 {
             cache.insert(format!("filler-{i}"), i).await;
-            assert_eq!(cache.get("hot").await, Some(1), "hot entry evicted after {i} inserts");
+            assert_eq!(
+                cache.get("hot").await,
+                Some(1),
+                "hot entry evicted after {i} inserts"
+            );
         }
-        assert_eq!(cache.get("cold").await, None, "an unread entry must age out");
+        assert_eq!(
+            cache.get("cold").await,
+            None,
+            "an unread entry must age out"
+        );
         assert_eq!(cache.entry_count(), 8);
     }
 

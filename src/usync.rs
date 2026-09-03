@@ -16,15 +16,20 @@ const DEVICE_REFRESH_MAX_ATTEMPTS: usize = 3;
 #[inline]
 /// Every user a device-list response speaks for, in both namespaces, as the
 /// member set a topology change is checked against.
-fn device_response_users(response: &DeviceListResponse) -> crate::client::member_index::MemberIndex {
+fn device_response_users(
+    response: &DeviceListResponse,
+) -> crate::client::member_index::MemberIndex {
     crate::client::member_index::MemberIndex::from_users(
         response
             .device_lists
             .iter()
             .map(|device_list| device_list.user.user.as_str())
-            .chain(response.lid_mappings.iter().flat_map(|mapping| {
-                [mapping.phone_number.as_str(), mapping.lid.as_str()]
-            })),
+            .chain(
+                response
+                    .lid_mappings
+                    .iter()
+                    .flat_map(|mapping| [mapping.phone_number.as_str(), mapping.lid.as_str()]),
+            ),
     )
 }
 

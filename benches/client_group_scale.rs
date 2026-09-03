@@ -49,8 +49,12 @@ fn shared(label: &'static str, groups: usize) -> &'static GroupScaleHarness {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("fixture registry");
-    map.entry((label, groups))
-        .or_insert_with(|| Box::leak(Box::new(GroupScaleHarness::new(groups, SCALE_GROUP_MEMBERS))))
+    map.entry((label, groups)).or_insert_with(|| {
+        Box::leak(Box::new(GroupScaleHarness::new(
+            groups,
+            SCALE_GROUP_MEMBERS,
+        )))
+    })
 }
 
 /// One warm pass over every group, per group.
