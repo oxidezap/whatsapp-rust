@@ -778,7 +778,6 @@ impl std::fmt::Display for MemoryReport {
             self.group_metadata_inflight
         )?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
-        writeln!(f, "  chat_lane_backlog:      {}", self.chat_lane_backlog)?;
         writeln!(
             f,
             "  group_dist_locks:       {} (evicted: {}, blocked: {})",
@@ -798,6 +797,7 @@ impl std::fmt::Display for MemoryReport {
         )?;
         writeln!(f, "  skdm_warm_memo:         {}", self.skdm_warm_memo)?;
         writeln!(f, "--- Unbounded collections ---")?;
+        writeln!(f, "  chat_lane_backlog:      {}", self.chat_lane_backlog)?;
         writeln!(f, "  transport_ack_queue:    {}", self.transport_ack_queue)?;
         writeln!(
             f,

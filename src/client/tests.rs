@@ -4966,6 +4966,23 @@ async fn memory_report_display_sections_stay_aligned() {
         );
     }
 
+    // The lanes are capped; their queues are not, so the backlog belongs with
+    // the drain-bounded collections, not beside the lane count.
+    let capacity_start = rendered
+        .find("--- Capacity-only caches ---")
+        .expect("capacity section");
+    let unbounded_start = rendered
+        .find("--- Unbounded collections ---")
+        .expect("unbounded section");
+    assert!(
+        !rendered[capacity_start..unbounded_start].contains("chat_lane_backlog:"),
+        "chat_lane_backlog must not render as capacity-bounded, got:\n{rendered}"
+    );
+    assert!(
+        rendered[unbounded_start..signal_start].contains("chat_lane_backlog:"),
+        "chat_lane_backlog must render under the unbounded heading, got:\n{rendered}"
+    );
+
     // The last two `collections()` entries are transient retention, one section
     // each. Their order is what the two boundary constants encode, so a cache
     // appended to `collections()` without moving them lands here.
