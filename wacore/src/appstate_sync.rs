@@ -692,7 +692,7 @@ impl AppStateProcessor {
 
     /// Drop every cached key, so the next access re-expands from the backend.
     ///
-    /// Not part of the reconnect path: [`KeyCache`] bounds itself, and an
+    /// Not part of the reconnect path: the cache bounds itself, and an
     /// expanded key is a pure function of a key id that never changes, so
     /// emptying it across reconnects only bought DB reads and HKDF expansions.
     /// Kept for a caller that genuinely wants the memory back now.
@@ -701,7 +701,7 @@ impl AppStateProcessor {
     }
 
     /// Expanded app-state keys held in memory, for `Client::memory_report()`.
-    /// Bounded by [`KeyCache::CAPACITY`].
+    /// Bounded by `KeyCache::CAPACITY`.
     pub async fn cached_key_count(&self) -> usize {
         self.key_cache.lock().await.len()
     }
