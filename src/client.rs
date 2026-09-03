@@ -1080,6 +1080,22 @@ pub(crate) struct OfflineSyncMetrics {
 
 type ResponseWaiterSender = futures::channel::oneshot::Sender<Arc<wacore_binary::OwnedNodeRef>>;
 
+/// What a streaming waiter is handed when its response arrives.
+pub(crate) enum StreamedResponse<'s, 'a> {
+    /// An `<iq type="result">` decoded on demand: the stream stands inside the
+    /// root element, before its first child.
+    Stream(&'s mut wacore_binary::NodeStream<'a>),
+    /// The response held whole: an error stanza, or a session with an observer
+    /// that needs every node as a tree.
+    Node(&'s Arc<wacore_binary::OwnedNodeRef>),
+}
+
+/// The consumer of a streamed IQ response. Runs on the read loop, once.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type StreamSink = Box<dyn FnOnce(StreamedResponse<'_, '_>) + Send>;
+#[cfg(target_arch = "wasm32")]
+pub(crate) type StreamSink = Box<dyn FnOnce(StreamedResponse<'_, '_>)>;
+
 /// What a pending ack/IQ entry is waiting to do once the response arrives.
 ///
 /// A phash check used to be an `Iq` waiter plus a spawned task holding the
@@ -1092,6 +1108,10 @@ pub(crate) enum ResponseWaiter {
     Iq(ResponseWaiterSender),
     /// Compare the server's `phash` against ours; act only if they differ.
     Phash(PhashWaiter),
+    /// Consume the response on the read loop as it is decoded, so a response
+    /// larger than the heap can afford as a tree never becomes one. See
+    /// [`Client::execute_streaming`].
+    Stream(StreamSink),
 }
 
 pub(crate) struct PhashWaiter {
@@ -1133,9 +1153,48 @@ pub(crate) struct ResponseWaiterMap {
     /// Advanced once per sweep. Registration reads it under the lock it already
     /// takes, so a waiter records its age without touching a clock.
     sweep_epoch: u64,
+    /// How many `Stream` entries are in the map, mirrored outside the lock so
+    /// the read loop can tell whether a frame might be one to stream without
+    /// taking it per frame. Maintained here, by every path that adds or
+    /// removes an entry, so no caller keeps its own count.
+    stream_waiters: Arc<AtomicUsize>,
 }
 
 impl ResponseWaiterMap {
+    /// A map whose `Stream` count is published through `counter`.
+    pub(crate) fn with_stream_counter(counter: Arc<AtomicUsize>) -> Self {
+        Self {
+            stream_waiters: counter,
+            ..Self::default()
+        }
+    }
+
+    fn note_added(&self, waiter: &ResponseWaiter) {
+        if matches!(waiter, ResponseWaiter::Stream(_)) {
+            self.stream_waiters.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn note_removed(&self, waiter: &ResponseWaiter) {
+        if matches!(waiter, ResponseWaiter::Stream(_)) {
+            self.stream_waiters.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Take the `Stream` waiter registered under `request_id`, leaving any
+    /// other kind of waiter where it is.
+    pub(crate) fn take_stream(&mut self, request_id: &str) -> Option<StreamSink> {
+        if !matches!(
+            self.entries.get(request_id).map(|entry| &entry.waiter),
+            Some(ResponseWaiter::Stream(_))
+        ) {
+            return None;
+        }
+        match self.remove(request_id) {
+            Some(ResponseWaiter::Stream(sink)) => Some(sink),
+            _ => None,
+        }
+    }
     fn next_generation(&mut self) -> NonZeroU64 {
         loop {
             self.last_generation = self.last_generation.wrapping_add(1);
@@ -1150,16 +1209,14 @@ impl ResponseWaiterMap {
         request_id: String,
         waiter: ResponseWaiter,
     ) -> Option<NonZeroU64> {
-        use std::collections::hash_map::Entry;
-
-        let generation = self.next_generation();
-        match self.entries.entry(request_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(ResponseWaiterEntry { generation, waiter });
-                Some(generation)
-            }
-            Entry::Occupied(_) => None,
+        if self.entries.contains_key(&request_id) {
+            return None;
         }
+        let generation = self.next_generation();
+        self.note_added(&waiter);
+        self.entries
+            .insert(request_id, ResponseWaiterEntry { generation, waiter });
+        Some(generation)
     }
 
     pub(crate) fn insert(
@@ -1168,13 +1225,23 @@ impl ResponseWaiterMap {
         waiter: ResponseWaiter,
     ) -> Option<ResponseWaiter> {
         let generation = self.next_generation();
-        self.entries
+        self.note_added(&waiter);
+        let replaced = self
+            .entries
             .insert(request_id, ResponseWaiterEntry { generation, waiter })
-            .map(|entry| entry.waiter)
+            .map(|entry| entry.waiter);
+        if let Some(replaced) = &replaced {
+            self.note_removed(replaced);
+        }
+        replaced
     }
 
     pub(crate) fn remove(&mut self, request_id: &str) -> Option<ResponseWaiter> {
-        self.entries.remove(request_id).map(|entry| entry.waiter)
+        let removed = self.entries.remove(request_id).map(|entry| entry.waiter);
+        if let Some(removed) = &removed {
+            self.note_removed(removed);
+        }
+        removed
     }
 
     /// The epoch a waiter registered now belongs to.
@@ -1193,7 +1260,7 @@ impl ResponseWaiterMap {
         let epoch = self.sweep_epoch;
         self.entries.retain(|_, entry| match &entry.waiter {
             ResponseWaiter::Phash(waiter) => waiter.registered_epoch >= epoch,
-            ResponseWaiter::Iq(_) => true,
+            ResponseWaiter::Iq(_) | ResponseWaiter::Stream(_) => true,
         });
         self.sweep_epoch = self.sweep_epoch.wrapping_add(1);
     }
@@ -1204,7 +1271,7 @@ impl ResponseWaiterMap {
             .get(request_id)
             .is_some_and(|entry| entry.generation == cleanup_generation)
         {
-            self.entries.remove(request_id);
+            self.remove(request_id);
         }
     }
 
@@ -1213,6 +1280,7 @@ impl ResponseWaiterMap {
     /// may outlive a disconnect and must never match a later registration.
     pub(crate) fn clear(&mut self) {
         self.entries = HashMap::new();
+        self.stream_waiters.store(0, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -1337,6 +1405,11 @@ pub struct Client {
     /// is what lets `ResponseWaiterGuard` remove a cancelled waiter from `Drop`
     /// (an async lock couldn't). See `send_and_wait_iq`.
     pub(crate) response_waiters: Arc<std::sync::Mutex<ResponseWaiterMap>>,
+    /// How many `response_waiters` entries want their response streamed, kept
+    /// by the map and read by the read loop per frame: while it is zero no
+    /// frame is peeked at before it is decoded whole, so the path every other
+    /// frame takes is untouched by the streaming one.
+    pub(crate) stream_waiter_count: Arc<AtomicUsize>,
 
     /// Generic node waiters for waiting on specific stanzas by tag/attributes.
     /// Uses std::sync::Mutex (not tokio) since the critical section is trivial.
@@ -1785,6 +1858,11 @@ pub struct Client {
     /// When true, history sync notifications are acknowledged but not downloaded
     /// or processed. Set via `BotBuilder::skip_history_sync()`.
     pub(crate) skip_history_sync: AtomicBool,
+
+    /// Whether the A/B props catalog is fetched on connect. Set via
+    /// `ClientBuilder::with_ab_props_fetch`; see there for what turning it
+    /// off costs.
+    pub(crate) ab_props_fetch: AtomicBool,
 
     /// Whether the connection lifecycle may announce `available` on its own.
     /// Set via [`BotBuilder::with_presence_policy`] or

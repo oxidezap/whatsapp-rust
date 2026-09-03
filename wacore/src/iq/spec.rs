@@ -34,3 +34,30 @@ pub trait IqSpec {
         response: &wacore_binary::NodeRef<'_>,
     ) -> Result<Self::Response, anyhow::Error>;
 }
+
+/// An [`IqSpec`] whose response can be consumed as it is decoded, without ever
+/// being held as a tree.
+///
+/// A response of thousands of small children (the A/B props catalog) costs
+/// more as a decoded tree than as wire bytes by an order of magnitude, and on
+/// a target with a few hundred KB of heap it cannot be decoded that way at
+/// all. A spec that implements this reads the response through a
+/// [`NodeStream`](wacore_binary::NodeStream) instead: the client hands it the stream positioned inside
+/// the `<iq type="result">` element, before its first child, and the spec walks
+/// what it wants and keeps what it needs. Everything else about the request,
+/// including how an error response is reported, is the [`IqSpec`] the spec
+/// already is; [`IqSpec::parse_response`] stays the path for a response the
+/// client had to hold whole anyway (an error stanza, or a session with a raw
+/// node observer attached), so the two must agree on what they produce.
+///
+/// The stream runs on the read loop, so consumption should be work
+/// proportional to the response, not I/O.
+pub trait IqStreamSpec: IqSpec {
+    /// Consume the `<iq type="result">` response from a stream positioned
+    /// inside the root element, before its first child. Children not read
+    /// before returning are skipped by the client.
+    fn consume_response(
+        &self,
+        stream: &mut wacore_binary::NodeStream<'_>,
+    ) -> Result<Self::Response, anyhow::Error>;
+}

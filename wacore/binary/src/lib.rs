@@ -7,12 +7,14 @@ pub mod error;
 pub mod jid;
 pub mod marshal;
 pub mod node;
+pub mod stream;
 pub mod token;
 pub mod util;
 pub mod zlib_pool;
 
 pub use attrs::{AttrParser, AttrParserRef};
 pub use compact_str::CompactString;
+pub use decoder::OpenContent;
 pub use error::{BinaryError, Result};
 pub use jid::{
     BOT_SERVER, BROADCAST_SERVER, DEFAULT_USER_SERVER, DeviceKey, GROUP_SERVER, HIDDEN_USER_SERVER,
@@ -27,3 +29,4 @@ pub use marshal::{
 pub use node::{
     Attrs, Node, NodeContent, NodeContentRef, NodeRef, NodeStr, NodeValue, OwnedNodeRef,
 };
+pub use stream::{NodeStream, OpenNode};

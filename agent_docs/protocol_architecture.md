@@ -14,6 +14,7 @@ Non-obvious parts:
 - **`try_from_node_ref(&NodeRef<'_>)` is the canonical parse path**, not the owned `try_from_node`. The owned form is a defaulted convenience that borrows and delegates. Implement and call the ref form.
 - **`IqSpec` has an optional encode fast path** that writes the `<iq>` stanza straight into a pre-sized buffer and skips the `Node` intermediate. Returning `false` falls back to `build_iq()` + marshal, so it is safe to leave unimplemented — but do not add a second hand-rolled encoder next to it.
 - **Constructors take `&Jid`**, never `Jid`, so callers are not forced to clone.
+- **A response too large to hold as a tree implements `IqStreamSpec` too** (`wacore/src/iq/spec.rs`) and is sent with `client.execute_streaming(spec)`. The read loop then hands the spec a `wacore_binary::NodeStream` positioned inside the `<iq type="result">` and the spec walks the children one at a time (`open` descends, `next_child` decodes one child whole, `close` skips the rest), keeping only what it needs. `PropsSpec` is the worked example: the A/B catalog is ~2,700 `<prop>` children and a tree of it costs ~770 KB on a 64-bit host for a 30 KB frame, where the stream costs the 4 KB inflate window. `parse_response` stays required and must produce the same answer, because an error stanza, or a session with a raw-node observer attached, is still decoded whole. `wacore/tests/props_stream_memory.rs` measures the frame's cost at the allocator and is the regression gate for it.
 
 ## Derive macros
 
