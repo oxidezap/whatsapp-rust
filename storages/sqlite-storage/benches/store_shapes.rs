@@ -88,7 +88,7 @@ fn remove_db_files(path: &std::path::Path) {
 }
 
 /// One database slot per benchmark, so no benchmark inherits another's rows.
-const DB_SLOTS: usize = 10;
+const DB_SLOTS: usize = 11;
 static DBS: [OnceLock<Db>; DB_SLOTS] = [const { OnceLock::new() }; DB_SLOTS];
 
 fn db(slot: usize, tag: &str) -> &'static Db {
@@ -358,7 +358,7 @@ fn msg_secrets_put_batch(bencher: divan::Bencher, n: usize) {
 /// to when the backend keeps up with the producer.
 #[divan::bench(args = N)]
 fn msg_secrets_put_each(bencher: divan::Bencher, n: usize) {
-    let d = db(9, "msg-secrets");
+    let d = db(10, "msg-secrets-each");
     bencher
         .with_inputs(|| (0..n).map(|_| secret_entry(d.id())).collect::<Vec<_>>())
         .bench_values(|entries| {

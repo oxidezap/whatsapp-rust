@@ -360,8 +360,12 @@ impl LidPnCache {
         }
         // One record for the batch; see `add_guarded_impl`. A batch wider
         // than the log's bound overflows it, which poisons every memo once,
-        // exactly what per-entry records would have done.
-        if let Some(topology) = self.topology.get() {
+        // exactly what per-entry records would have done. An empty batch
+        // changed nothing and records nothing: a generation bump with no
+        // users would still send every memo through a restamp.
+        if !touched.is_empty()
+            && let Some(topology) = self.topology.get()
+        {
             topology.record(touched.iter().map(|id| &**id));
         }
 
