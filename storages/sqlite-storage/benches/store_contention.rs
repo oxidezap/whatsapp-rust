@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
+use std::time::Duration;
 use wacore::appstate::processor::AppStateMutationMAC;
 use wacore::store::traits::{AppSyncStore, DeviceInfo, DeviceListRecord, ProtocolStore};
 use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
@@ -57,13 +58,52 @@ fn macs(n: usize, seed: u8) -> Vec<AppStateMutationMAC> {
 const USER: &str = "190455501800";
 const GROUP: &str = "120363000000000001@g.us";
 
+/// Reader connections the store is configured with.
+const READ_POOL: u32 = 4;
+
+/// Blocking threads the store can occupy at once: one per reader connection
+/// plus the write queue's. Pinned, pre-spawned and never reaped; see
+/// `prewarm_blocking_pool`.
+const BLOCKING_THREADS: usize = READ_POOL as usize + 1;
+
+/// Force every blocking thread the store can use into existence before the
+/// first sample.
+///
+/// Each store call is one `spawn_blocking`. Tokio creates a blocking thread on
+/// demand and reaps it after ten seconds of idling, so a reader thread left
+/// idle by the write-only benchmarks in this binary is gone by the time a
+/// contended read runs again — and the `pthread_create` (stack `mmap`, TLS
+/// setup) and the matching teardown (`__libc_thread_freeres`, ~70 us on the
+/// simulated CPU) then land inside a measured iteration and read as a change
+/// in the store. Parking one job per thread on a barrier spawns all of them at
+/// once; `thread_keep_alive` keeps them for the life of the process.
+fn prewarm_blocking_pool(runtime: &tokio::runtime::Runtime) {
+    let barrier = Arc::new(std::sync::Barrier::new(BLOCKING_THREADS));
+    runtime.block_on(async {
+        let jobs: Vec<_> = (0..BLOCKING_THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                tokio::task::spawn_blocking(move || {
+                    barrier.wait();
+                })
+            })
+            .collect();
+        for job in jobs {
+            job.await.expect("prewarm blocking thread");
+        }
+    });
+}
+
 fn harness() -> &'static Harness {
     HARNESS.get_or_init(|| {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
+            .max_blocking_threads(BLOCKING_THREADS)
+            .thread_keep_alive(Duration::from_secs(24 * 60 * 60))
             .enable_all()
             .build()
             .expect("runtime");
+        prewarm_blocking_pool(&runtime);
         let path =
             std::env::temp_dir().join(format!("wa-store-contention-{}.db", std::process::id()));
         remove_db_files(&path);
@@ -71,7 +111,7 @@ fn harness() -> &'static Harness {
         let store = runtime
             .block_on(SqliteStore::with_config(
                 &url,
-                SqliteStoreConfig::default().with_read_pool_size(4),
+                SqliteStoreConfig::default().with_read_pool_size(READ_POOL),
             ))
             .expect("open store");
         runtime.block_on(async {
