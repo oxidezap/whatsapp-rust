@@ -82,19 +82,17 @@ fn media_encrypt_video_10mb_with_sidecar(bencher: Bencher) {
 #[divan::bench]
 fn media_encrypt_video_10mb_buffered_api(bencher: Bencher) {
     let plaintext = payload(10 * MB);
-    bencher
-        .counter(BytesCount::new(plaintext.len()))
-        .bench(|| {
-            black_box(
-                encrypt_media_with_key_and_sidecar(
-                    black_box(&plaintext),
-                    MediaType::Video,
-                    Some(&MEDIA_KEY),
-                    None,
-                )
-                .unwrap(),
+    bencher.counter(BytesCount::new(plaintext.len())).bench(|| {
+        black_box(
+            encrypt_media_with_key_and_sidecar(
+                black_box(&plaintext),
+                MediaType::Video,
+                Some(&MEDIA_KEY),
+                None,
             )
-        });
+            .expect("buffered encryption"),
+        )
+    });
 }
 
 /// The streaming upload path: 8 KiB reads, encrypt, flush whole runs to the
