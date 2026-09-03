@@ -3205,6 +3205,50 @@ fn test_fibonacci_backoff_max_900s() {
     );
 }
 
+/// The sequence stops changing at the cap, so the work of computing it must
+/// stop there too. The counter feeding this is only reset by a connection that
+/// stays up 30 s, so on a link that flaps for weeks it is the one input here
+/// with no natural bound.
+#[test]
+fn fibonacci_backoff_stops_at_the_cap_instead_of_counting_out_the_attempt() {
+    let capped = fibonacci_backoff(20);
+    let far_past_the_cap = fibonacci_backoff(u32::MAX);
+    for (label, delay) in [
+        ("attempt 20", capped),
+        ("attempt u32::MAX", far_past_the_cap),
+    ] {
+        let ms = delay.as_millis() as u64;
+        assert!(
+            (810_000..=990_000).contains(&ms),
+            "{label} should be the 900s cap (±10% jitter), got {ms}ms"
+        );
+    }
+}
+
+/// The counter itself saturates, so a month of flapping cannot run it up (or,
+/// with the 429 handler adding five at a time, wrap it). The delay is pinned at
+/// the cap long before the ceiling, so nothing about the schedule moves.
+#[test]
+fn reconnect_attempts_saturate_at_the_ceiling() {
+    assert_eq!(next_backoff_attempt(0), 1);
+    assert_eq!(
+        next_backoff_attempt(MAX_BACKOFF_ATTEMPTS - 1),
+        MAX_BACKOFF_ATTEMPTS
+    );
+    assert_eq!(
+        next_backoff_attempt(MAX_BACKOFF_ATTEMPTS),
+        MAX_BACKOFF_ATTEMPTS
+    );
+    assert_eq!(next_backoff_attempt(u32::MAX), MAX_BACKOFF_ATTEMPTS);
+    const {
+        assert!(
+            MAX_BACKOFF_ATTEMPTS > 17,
+            "the ceiling must sit past the attempt at which the delay reaches \
+             its cap, so saturating never changes a wait"
+        )
+    };
+}
+
 #[test]
 fn test_fibonacci_backoff_first_attempt_is_1s() {
     let delay = fibonacci_backoff(0);
@@ -7300,6 +7344,18 @@ async fn arm_offline_drain(client: &Arc<Client>, total: usize, delivered: usize)
     offline_resume::send_first_batch(Arc::clone(client), total).await;
 }
 
+/// Stand in for the next connection opening, after a fixture has torn the
+/// previous one down by hand.
+///
+/// `connect_internal` resets the per-connection shutdown notifier before it
+/// publishes a socket, and that notifier is sticky: without this step the
+/// teardown's fired signal still stands on the "new" connection, and everything
+/// that watches it — the offline-delivery wait, the inactivity watchdog —
+/// correctly stands down on sight.
+fn open_next_connection_for_test(client: &Arc<Client>) {
+    client.reset_connection_shutdown();
+}
+
 fn drain_offline_sync_events(
     rx: &async_channel::Receiver<Arc<Event>>,
 ) -> (Vec<(i32, i32)>, Vec<i32>) {
@@ -7468,6 +7524,7 @@ async fn a_later_drain_still_reports_its_own_outcome() {
 
     arm_offline_drain(&client, 711, 700).await;
     client.cleanup_connection_state().await;
+    open_next_connection_for_test(&client);
 
     // The real path: an `<ib><offline_preview count>` on the next connection,
     // processed inline like any other stanza.
@@ -7512,6 +7569,7 @@ async fn a_finisher_left_behind_by_two_connections_reports_nothing() {
     client.cleanup_connection_state().await;
 
     // A whole new connection and a new drain, which reports its own outcome.
+    open_next_connection_for_test(&client);
     let live_generation = client.connection_generation.load(Ordering::Acquire);
     arm_offline_drain(&client, 25, 25).await;
     client
@@ -7554,6 +7612,7 @@ async fn a_stale_completion_does_not_consume_the_next_connection_finisher() {
         .await;
 
     // The next connection's drain still gets its own finisher and its own event.
+    open_next_connection_for_test(&client);
     let live_generation = client.connection_generation.load(Ordering::Acquire);
     arm_offline_drain(&client, 25, 25).await;
     client
@@ -7564,6 +7623,73 @@ async fn a_stale_completion_does_not_consume_the_next_connection_finisher() {
     let (interrupted, completed) = drain_offline_sync_events(&rx);
     assert_eq!(interrupted.len(), 1, "the first drain's interruption");
     assert_eq!(completed, vec![25], "the second drain still completes");
+}
+
+/// The wait belongs to a connection, so it must end when that connection does
+/// — and it must not mark the sync complete on the way out.
+///
+/// Every caller of this helper (the post-login task, the prekey-low top-up, the
+/// dirty-bits handler, the send path's session pre-flight) was otherwise parked
+/// here for the full timeout after the socket was already gone. Over a month of
+/// reconnects that is one such task per reconnect, each holding the client and
+/// each waiting on a connection that no longer exists.
+#[tokio::test(start_paused = true)]
+async fn wait_for_offline_delivery_end_returns_when_its_connection_ends() {
+    let client = offline_resume_test_client().await;
+    arm_offline_drain(&client, 711, 5).await;
+
+    let started = tokio::time::Instant::now();
+    let waiter = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .wait_for_offline_delivery_end_with_timeout(Duration::from_secs(60))
+                .await;
+        })
+    };
+
+    // Sticky, so this cannot lose the race against the waiter's subscription:
+    // a signal fired first is still observed by a later subscriber.
+    client.notify_connection_shutdown();
+
+    tokio::time::timeout(Duration::from_secs(600), waiter)
+        .await
+        .expect("the wait must end with its connection")
+        .expect("the waiting task must not panic");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the wait ran for {:?}; a teardown must release it rather than let it \
+         serve out the timeout",
+        started.elapsed()
+    );
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Relaxed),
+        "a sync belonging to a connection that ended must not be marked complete"
+    );
+}
+
+/// The inactivity watchdog waits a minute at a time, and its whole job is to
+/// complete a drain the *server* stopped feeding. A drain the *connection*
+/// stopped feeding is the other case — the backlog was never acked and the
+/// server redelivers it — so a teardown has to stop the watchdog rather than
+/// let it wake a minute later and declare the resume finished.
+#[tokio::test(start_paused = true)]
+async fn the_inactivity_watchdog_stops_with_its_connection() {
+    let client = offline_resume_test_client().await;
+    // Arms the coordinator and spawns the production watchdog.
+    arm_offline_drain(&client, 711, 5).await;
+
+    client.notify_connection_shutdown();
+
+    // Well past the window the watchdog would otherwise have completed in.
+    tokio::time::sleep(Duration::from_secs(600)).await;
+
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "a resume whose connection ended is reported as interrupted, not \
+         completed by a watchdog that outlived it"
+    );
 }
 
 /// The startup waiter reports a teardown as soon as it happens.

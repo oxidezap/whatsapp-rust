@@ -46,6 +46,31 @@ fn classify_keepalive_error(e: &IqError) -> KeepaliveResult {
     }
 }
 
+/// Consecutive unanswered pings after which the connection is torn down rather
+/// than pinged again.
+///
+/// Three, because a ping is only sent when the link has been *idle* for at
+/// least `KEEP_ALIVE_INTERVAL_MIN` (the recent-activity early return skips it
+/// otherwise), so three of them in a row is roughly a minute in which nothing
+/// arrived AND nothing we sent was answered. A busy connection cannot reach
+/// this count: every inbound frame resets it on the activity path, and most
+/// ticks on such a connection never ping at all.
+///
+/// The hole this closes is the half-open socket the dead-socket watchdog is
+/// blind to by design: `is_dead_socket_at` is cancelled by any receive, so a
+/// link that still delivers inbound frames while our writes go nowhere looks
+/// alive to it forever — and every send, ack and receipt is silently lost for
+/// the rest of the session. Reconnect-looping against a merely slow server is
+/// bounded by the two resets (`Ok` and recent activity) and by
+/// `should_reset_backoff`, which keeps escalating the Fibonacci delay until a
+/// connection stays up 30 s.
+fn keepalive_failures_are_terminal(error_count: u32) -> bool {
+    error_count >= KEEPALIVE_MAX_CONSECUTIVE_FAILURES
+}
+
+/// See [`keepalive_failures_are_terminal`].
+const KEEPALIVE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
 /// Whether a keepalive ping error is just collateral of a teardown already
 /// being handled elsewhere (the connection is gone, so the ping had nowhere to
 /// go) rather than a genuine failure the keepalive surfaced first.
@@ -127,14 +152,23 @@ impl Client {
     // connection (tens of minutes), polluting duration/throughput metrics and
     // only reporting at disconnect. Per-ping visibility comes from
     // `wa.conn.keepalive.ping` on send_keepalive.
-    pub(crate) async fn keepalive_loop(self: Arc<Self>) {
+    ///
+    /// `shutdown_signal` and `generation` are taken from the caller rather than
+    /// read here, and both for the same reason: this task's first poll can be
+    /// arbitrarily late. Subscribing inside it let a `reset_connection_shutdown`
+    /// that already ran hand it the *next* connection's notifier, and reading
+    /// the generation here would pin it to the same wrong connection — either
+    /// way the previous connection's keepalive never exits and two of them ping
+    /// the same socket. Captured at the spawn, they name the connection this
+    /// loop was started for, whenever it happens to start.
+    pub(crate) async fn keepalive_loop(
+        self: Arc<Self>,
+        shutdown_signal: wacore::runtime::ShutdownSignal,
+        generation: u64,
+    ) {
         let mut error_count = 0u32;
         let mut cleanup_counter = 0u32;
         let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
-        // Capture the per-connection signal once — re-subscribing each iteration
-        // would let a racing reset_connection_shutdown swap the underlying
-        // notifier mid-loop and strand this task on the next connection's signal.
-        let shutdown_signal = self.connection_shutdown_signal();
         // Seeded once, not per tick: a fresh `StdRng` costs OS entropy and a
         // 320-byte state to draw one number, and this loop wakes every 15-30 s
         // on every connected client (measured 14.8 us vs 808 ns for the draw
@@ -156,6 +190,21 @@ impl Client {
                 _ = self.runtime.sleep(interval).fuse() => {
                     if !self.is_connected() {
                         debug!(target: "Client/Keepalive", "Not connected, exiting keepalive loop.");
+                        return;
+                    }
+                    // The connected flag alone cannot tell "still my connection"
+                    // from "someone else's": a reconnect that completes before
+                    // this task is first polled leaves it true again, and the
+                    // loop would go on pinging a socket it was never started
+                    // for, alongside that connection's own keepalive.
+                    let current = self.connection_generation.load(
+                        std::sync::atomic::Ordering::Acquire,
+                    );
+                    if current != generation {
+                        debug!(
+                            target: "Client/Keepalive",
+                            "Connection generation moved on ({generation} -> {current}), exiting keepalive loop.",
+                        );
                         return;
                     }
 
@@ -213,6 +262,14 @@ impl Client {
                         KeepaliveResult::TransientFailure => {
                             error_count += 1;
                             warn!(target: "Client/Keepalive", "Keepalive timeout, error count: {error_count}");
+                            if keepalive_failures_are_terminal(error_count) {
+                                warn!(
+                                    target: "Client/Keepalive",
+                                    "{error_count} consecutive unanswered pings, forcing reconnect.",
+                                );
+                                self.reconnect_immediately().await;
+                                return;
+                            }
                         }
                     }
 
@@ -311,6 +368,73 @@ mod tests {
     use super::*;
     use crate::socket::error::{EncryptSendError, SocketError};
     use wacore_binary::builder::NodeBuilder;
+
+    /// Three, and the two below it are not. The counter was already being
+    /// computed and logged; this is the decision that makes it load-bearing.
+    #[test]
+    fn three_consecutive_unanswered_pings_are_terminal() {
+        assert!(!keepalive_failures_are_terminal(0));
+        assert!(!keepalive_failures_are_terminal(1));
+        assert!(
+            !keepalive_failures_are_terminal(2),
+            "two unanswered pings is a slow server, not a broken one"
+        );
+        assert!(keepalive_failures_are_terminal(3));
+        assert!(keepalive_failures_are_terminal(4));
+    }
+
+    /// A keepalive belongs to the connection it was started for. Its first poll
+    /// can land after that connection is gone — the spawn only promises the
+    /// task will run — and `is_connected()` is true again by then if a
+    /// reconnect has completed, so without the generation check the old loop
+    /// would go on pinging the new connection's socket alongside its own
+    /// keepalive: two pingers on one socket, and one more with every reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_exits_when_its_connection_generation_is_retired() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let stale_generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        // The connection this loop was started for is retired, and (as after a
+        // reconnect) the client is connected again on a newer one.
+        client
+            .connection_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            client
+                .clone()
+                .keepalive_loop(client.connection_shutdown_signal(), stale_generation),
+        )
+        .await
+        .expect("a keepalive on a retired generation must exit at its first tick");
+        assert_eq!(
+            transport.sent_count(),
+            0,
+            "a retired keepalive must not ping the connection that replaced it"
+        );
+
+        // The control, and the reason the assertion above is about the
+        // generation rather than about a fixture that could not have sent
+        // anything: the same loop on the live generation does ping (and then
+        // ends itself, because nothing answers it).
+        let live_generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            client
+                .clone()
+                .keepalive_loop(client.connection_shutdown_signal(), live_generation),
+        )
+        .await
+        .expect("an unanswered ping ends the loop through the dead-socket check");
+        assert!(
+            transport.sent_count() >= 1,
+            "the fixture must be able to send a ping at all"
+        );
+    }
 
     #[test]
     fn test_classify_timeout_is_transient() {

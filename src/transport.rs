@@ -47,6 +47,62 @@ pub mod mock {
         }
     }
 
+    /// A transport that accepts calls and never answers them.
+    ///
+    /// Stands in for the socket a teardown cannot rely on: a connection whose
+    /// peer has gone away without a FIN is not refused, it is retried by the
+    /// kernel until `tcp_retries2` gives up (~15 minutes on Linux), and both
+    /// `send` and the close queue behind that. Anything that awaits either of
+    /// them unbounded is parked for the same quarter of an hour.
+    pub struct StallingMockTransport {
+        sends_started: std::sync::atomic::AtomicUsize,
+        disconnects_started: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StallingMockTransport {
+        pub fn new() -> Self {
+            Self {
+                sends_started: std::sync::atomic::AtomicUsize::new(0),
+                disconnects_started: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Sends that entered the transport and never came back out.
+        pub fn sends_started(&self) -> usize {
+            self.sends_started
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        /// Closes that entered the transport and never came back out.
+        pub fn disconnects_started(&self) -> usize {
+            self.disconnects_started
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    impl Default for StallingMockTransport {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl Transport for StallingMockTransport {
+        async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+            self.sends_started
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            std::future::pending::<()>().await;
+            unreachable!("a stalled send never resolves")
+        }
+
+        async fn disconnect(&self) {
+            self.disconnects_started
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            std::future::pending::<()>().await;
+        }
+    }
+
     /// Splits one transport write into the length-prefixed frames it carries,
     /// each returned with its 3-byte prefix intact so callers keep seeing what
     /// a single-frame write used to look like. A trailing partial frame (which

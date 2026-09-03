@@ -2172,6 +2172,23 @@ pub(crate) fn should_reset_backoff(
         })
 }
 
+/// Ceiling on the consecutive-failure count that drives the reconnect backoff.
+///
+/// The delay is already pinned at the 900 s cap from attempt 17 on, so every
+/// value past that names the same wait — what would keep growing is only the
+/// number itself, which `stats().reconnect_errors` reports and which a 429 adds
+/// five to at a time. A link that flaps for weeks would run it up without
+/// bound, so it saturates here instead: far enough beyond the cap that the
+/// schedule is untouched, close enough that the counter stays a number a
+/// consumer can read.
+pub(crate) const MAX_BACKOFF_ATTEMPTS: u32 = 64;
+
+/// The consecutive-failure count that follows `previous`, saturating at
+/// [`MAX_BACKOFF_ATTEMPTS`].
+pub(crate) fn next_backoff_attempt(previous: u32) -> u32 {
+    previous.saturating_add(1).min(MAX_BACKOFF_ATTEMPTS)
+}
+
 /// Computes a reconnect delay matching WhatsApp Web's Fibonacci backoff:
 /// `{ algo: { type: "fibonacci", first: 1000, second: 1000 }, jitter: 0.1, max: 9e5 }`
 ///
@@ -2183,6 +2200,13 @@ fn fibonacci_backoff(attempt: u32) -> Duration {
     let mut a: u64 = 1000;
     let mut b: u64 = 1000;
     for _ in 0..attempt {
+        // Every step past the cap yields the cap again, so the loop stops at
+        // the first one instead of counting out an attempt number nothing else
+        // bounds. Same clamp `prekeys.rs` applies to its own retry exponent,
+        // and the same reason.
+        if a >= MAX_MS {
+            break;
+        }
         let next = a.saturating_add(b).min(MAX_MS);
         a = b;
         b = next;
@@ -2192,8 +2216,11 @@ fn fibonacci_backoff(attempt: u32) -> Duration {
     // ±10% jitter (WA Web: jitter: 0.1)
     let jitter_range = base / 10;
     let jitter = if jitter_range > 0 {
-        rand::make_rng::<rand::rngs::StdRng>().random_range(0..=(jitter_range * 2)) as i64
-            - jitter_range as i64
+        // The thread-local generator, not a fresh `StdRng`: seeding one runs a
+        // full ChaCha key schedule off OS entropy to draw a single number
+        // (measured at 14.8 us against 808 ns for the draw, which is why
+        // `keepalive_loop` hoists its own out of the loop).
+        rand::rng().random_range(0..=(jitter_range * 2)) as i64 - jitter_range as i64
     } else {
         0
     };
