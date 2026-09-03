@@ -573,15 +573,66 @@ fn parse_database_path(database_url: &str) -> Result<String> {
 /// verbatim, but the WAL and shm sidecars live beside the *file* the scheme
 /// names: `file:db.sqlite?mode=rwc` writes `db.sqlite-wal`, not
 /// `file:db.sqlite-wal`. `file:///abs/path` is the same file as `/abs/path`.
-fn filesystem_path(database_path: &str) -> &str {
-    let path = database_path
+///
+/// The scheme is also what decides whether `%20` is an escape: inside a URI
+/// SQLite decodes it, so `file:/tmp/my%20db.sqlite` opens `/tmp/my db.sqlite`
+/// and writes `/tmp/my db.sqlite-wal`. A bare path is a filename SQLite passes
+/// through untouched, where the same three characters are themselves the name
+/// — so decoding happens only on the URI branch, and `Cow` keeps the common
+/// case (no escape to expand) allocation-free.
+fn filesystem_path(database_path: &str) -> std::borrow::Cow<'_, str> {
+    let Some(path) = database_path
         .strip_prefix("file://")
         .or_else(|| database_path.strip_prefix("file:"))
-        .unwrap_or(database_path);
+    else {
+        return std::borrow::Cow::Borrowed(database_path);
+    };
     // `file://localhost/abs` names the local file too; nothing else after the
     // authority slashes is a path this crate would have opened.
-    path.strip_prefix("localhost/")
-        .map_or(path, |rest| &path[path.len() - rest.len() - 1..])
+    let path = path
+        .strip_prefix("localhost/")
+        .map_or(path, |rest| &path[path.len() - rest.len() - 1..]);
+    percent_decode(path)
+}
+
+/// Expand `%HH` escapes, the way SQLite does when it parses a URI filename.
+///
+/// A `%` that does not introduce two hex digits stays literal, which is also
+/// SQLite's behaviour: it decodes what it recognizes and copies the rest.
+fn percent_decode(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.contains('%') {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1).zip(bytes.get(i + 2)))
+            .flatten()
+            .and_then(|(hi, lo)| {
+                Some(
+                    (char::from(*hi).to_digit(16)? << 4) as u8
+                        | char::from(*lo).to_digit(16)? as u8,
+                )
+            });
+        match decoded {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    // A decoded escape can only be invalid UTF-8 if the URI carried one, in
+    // which case the original text is the closest thing to a usable path.
+    String::from_utf8(out).map_or_else(
+        |_| std::borrow::Cow::Borrowed(path),
+        std::borrow::Cow::Owned,
+    )
 }
 
 /// Whether the URI asks SQLite for shared cache.
@@ -7718,6 +7769,59 @@ mod maintenance_tests {
         assert_eq!(
             filesystem_path("file://localhost/tmp/db.sqlite"),
             "/tmp/db.sqlite"
+        );
+        // Escapes are a URI feature: decoded behind a scheme, literal without
+        // one (a file really named `my%20db.sqlite` opens by that name).
+        assert_eq!(
+            filesystem_path("file:/tmp/my%20db.sqlite"),
+            "/tmp/my db.sqlite"
+        );
+        assert_eq!(
+            filesystem_path("file:///tmp/a%2Fb%3Fc.sqlite"),
+            "/tmp/a/b?c.sqlite"
+        );
+        assert_eq!(
+            filesystem_path("/tmp/my%20db.sqlite"),
+            "/tmp/my%20db.sqlite"
+        );
+        // A `%` that introduces no hex pair stays as it is, like SQLite's own
+        // parser.
+        assert_eq!(filesystem_path("file:/tmp/100%.sqlite"), "/tmp/100%.sqlite");
+        assert_eq!(filesystem_path("file:/tmp/a%2.sqlite"), "/tmp/a%2.sqlite");
+    }
+
+    /// The escaped counterpart of the test below: SQLite opens the decoded
+    /// name, so the sidecar probe has to decode too or it reports no WAL for a
+    /// database that has one.
+    #[tokio::test]
+    async fn a_percent_encoded_uri_store_reports_its_wal() {
+        let db = TempDb::new("maintenance uri wal");
+        let url = format!("file:{}?mode=rwc", db.url().replace(' ', "%20"));
+        assert!(url.contains("%20"), "the fixture path must carry an escape");
+        let store = SqliteStore::new(&url)
+            .await
+            .expect("store opens by an escaped URI");
+        store
+            .put_msg_secrets(vec![MsgSecretEntry {
+                chat: Arc::from("19045550180@s.whatsapp.net"),
+                sender: Arc::from("100000000000002@lid"),
+                msg_id: Arc::from("MSGURIESCAPED"),
+                secret: [0x7A; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+                expires_at: 0,
+                message_ts: 1_700_000_000,
+            }])
+            .await
+            .expect("seed one secret");
+
+        let report = DeviceStore::resource_report(&store).await;
+        assert_eq!(
+            report.wal_bytes,
+            Some(wal_bytes(&db)),
+            "an escaped URI must resolve to the same WAL the database wrote"
+        );
+        assert!(
+            report.wal_bytes.is_some_and(|bytes| bytes > 0),
+            "the WAL exists after a write"
         );
     }
 
