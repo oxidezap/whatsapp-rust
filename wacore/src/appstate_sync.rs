@@ -231,11 +231,6 @@ impl KeyCache {
     fn len(&self) -> usize {
         self.keys.len()
     }
-
-    /// The map the blocking snapshot/patch closures look keys up in.
-    fn snapshot(&self) -> HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>> {
-        self.keys.clone()
-    }
 }
 
 impl AppStateProcessor {
@@ -706,14 +701,27 @@ impl AppStateProcessor {
         self.key_cache.lock().await.len()
     }
 
-    /// Pre-fetch and cache all keys needed for a patch list.
-    async fn prefetch_keys(&self, pl: &PatchList) -> Result<()> {
+    /// Every key a patch list references, expanded, as the one map its blocking
+    /// snapshot and patch closures look keys up in.
+    ///
+    /// Returned rather than read back out of `key_cache`: that cache is bounded,
+    /// so a list referencing more keys than it holds would have evicted its first
+    /// keys by the time its last was fetched, and the closures would then report
+    /// a key the backend has as missing. Each key still passes through the cache
+    /// on its way here, so the next list reuses whatever fits.
+    ///
+    /// A key the backend does not have is left out rather than failing the list:
+    /// the closure that needs it reports it missing, and the caller asks the
+    /// primary for it from that.
+    async fn prefetch_keys(&self, pl: &PatchList) -> HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>> {
         let key_ids = collect_key_id_refs_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
+        let mut keys = HashMap::with_capacity(key_ids.len());
         for key_id in key_ids {
-            // This will fetch and cache if not already cached
-            let _ = self.get_app_state_key(key_id).await;
+            if let Ok(expanded) = self.get_app_state_key(key_id).await {
+                keys.insert(key_id.to_vec(), expanded);
+            }
         }
-        Ok(())
+        keys
     }
 
     /// Process an already-parsed single PatchList: download external blobs via
@@ -800,8 +808,8 @@ impl AppStateProcessor {
         mut pl: PatchList,
         validate_macs: bool,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
-        // Pre-fetch all keys we'll need
-        self.prefetch_keys(&pl).await?;
+        // Arc so each blocking closure's handoff is a refcount bump, not a map copy.
+        let keys_map = Arc::new(self.prefetch_keys(&pl).await);
 
         let stored = self.backend.get_version(pl.name.as_str()).await?;
         let had_baseline = stored.as_ref().is_some_and(|s| s.has_baseline());
@@ -828,7 +836,7 @@ impl AppStateProcessor {
             true
         });
         if snapshot_fresh && let Some(snapshot) = pl.snapshot.take() {
-            let keys_map = self.key_cache.lock().await.snapshot();
+            let keys_map = Arc::clone(&keys_map);
             let collection_name_owned = collection_name.to_string();
 
             // Offload CPU-intensive snapshot processing to a blocking thread. The
@@ -925,9 +933,6 @@ impl AppStateProcessor {
             self.backend.clear_mutation_macs(collection_name).await?;
         }
 
-        // Snapshot the key cache once for all patches (prefetch_keys already populated
-        // it); Arc so the per-patch closure handoff is a refcount bump, not a map copy.
-        let keys_map = Arc::new(self.key_cache.lock().await.snapshot());
         let collection_name_owned = collection_name.to_string();
 
         // Each patch moves into its blocking closure and comes back via the return

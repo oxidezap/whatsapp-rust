@@ -492,32 +492,80 @@ impl crate::stats::HeapSize for MessageSource {
     }
 }
 
-/// A floor, deliberately: the boxed sub-structs are charged their own
-/// `size_of` but not walked. All four are absent on the overwhelming majority
-/// of messages, and what they point at is small next to the box itself, so
-/// descending would add code to the report for digits it would not change.
+impl crate::stats::HeapSize for MsgBotInfo {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        self.edit_target_id.as_ref().map_or(0, HeapSize::heap_bytes)
+    }
+}
+
+impl crate::stats::HeapSize for MsgMetaInfo {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        let spilled = |bytes: &Option<ReportingBytes>| {
+            bytes
+                .as_ref()
+                .filter(|b| b.spilled())
+                .map_or(0, |b| b.capacity())
+        };
+        [
+            &self.target_id,
+            &self.thread_message_id,
+            &self.content_type,
+            &self.appdata,
+        ]
+        .iter()
+        .filter_map(|s| s.as_ref())
+        .map(HeapSize::heap_bytes)
+        .sum::<usize>()
+            + [
+                &self.target_sender,
+                &self.target_chat,
+                &self.thread_message_sender_jid,
+            ]
+            .iter()
+            .filter_map(|jid| jid.as_ref())
+            .map(HeapSize::heap_bytes)
+            .sum::<usize>()
+            + spilled(&self.reporting_tag)
+            + spilled(&self.reporting_token)
+    }
+}
+
+impl crate::stats::HeapSize for DeviceSentMeta {
+    fn heap_bytes(&self) -> usize {
+        self.destination_jid.heap_bytes() + self.phash.heap_bytes()
+    }
+}
+
+/// Every allocation the message owns, the boxed sub-structs and the fallback
+/// enum payloads included. All of them are absent on the overwhelming majority
+/// of messages, but a buffer that retains whole messages
+/// (`offline_receipt_buffer`) is exactly where a report that skipped them would
+/// read quietest while it grows.
 impl crate::stats::HeapSize for MessageInfo {
     fn heap_bytes(&self) -> usize {
         use crate::stats::HeapSize;
+        fn boxed<T: HeapSize>(value: &Option<Box<T>>) -> usize {
+            value
+                .as_ref()
+                .map_or(0, |v| size_of::<T>() + v.heap_bytes())
+        }
         self.source.heap_bytes()
             + self.id.heap_bytes()
             + self.push_name.heap_bytes()
-            + self
-                .bot_info
-                .as_ref()
-                .map_or(0, |_| size_of::<MsgBotInfo>())
-            + self
-                .meta_info
-                .as_ref()
-                .map_or(0, |_| size_of::<MsgMetaInfo>())
-            + self
-                .verified_name
-                .as_ref()
-                .map_or(0, |_| size_of::<crate::stanza::business::VerifiedName>())
-            + self
-                .device_sent_meta
-                .as_ref()
-                .map_or(0, |_| size_of::<DeviceSentMeta>())
+            + match &self.category {
+                MessageCategory::Other(value) => value.heap_bytes(),
+                _ => 0,
+            }
+            + match &self.edit {
+                EditAttribute::Unknown(value) => value.heap_bytes(),
+                _ => 0,
+            }
+            + boxed(&self.bot_info)
+            + boxed(&self.meta_info)
+            + boxed(&self.verified_name)
+            + boxed(&self.device_sent_meta)
             + self
                 .unavailable_request_id
                 .as_ref()
@@ -583,6 +631,55 @@ mod tests {
             EditAttribute::from("99"),
             EditAttribute::Unknown("99".to_owned())
         );
+    }
+
+    /// The fallback enum payloads and the boxed sub-structs are the only places
+    /// a `MessageInfo` can hold an allocation the report would otherwise miss.
+    #[test]
+    fn message_info_heap_bytes_counts_the_fallback_strings_and_boxed_metadata() {
+        use crate::stanza::business::VerifiedName;
+        use crate::stats::HeapSize;
+
+        let baseline = MessageInfo::default().heap_bytes();
+
+        let category = "some-category";
+        let edit = "99";
+        let business = "Fictitious Business";
+        let certificate = vec![0u8; 64];
+        let target_id = "a-target-id-longer-than-twenty-four-bytes";
+        let destination = "19045550180@s.whatsapp.net";
+
+        let mut info = MessageInfo {
+            category: MessageCategory::Other(category.to_owned()),
+            edit: EditAttribute::Unknown(edit.to_owned()),
+            ..Default::default()
+        };
+        info.verified_name = Some(Box::new(VerifiedName {
+            name: Some(business.to_owned()),
+            serial: None,
+            issuer: None,
+            certificate: Some(certificate.clone()),
+        }));
+        info.meta_info = Some(Box::new(MsgMetaInfo {
+            target_id: Some(target_id.into()),
+            ..Default::default()
+        }));
+        info.device_sent_meta = Some(Box::new(DeviceSentMeta {
+            destination_jid: destination.to_owned(),
+            phash: String::new(),
+        }));
+
+        let expected = baseline
+            + category.len()
+            + edit.len()
+            + size_of::<VerifiedName>()
+            + business.len()
+            + certificate.capacity()
+            + size_of::<MsgMetaInfo>()
+            + target_id.len()
+            + size_of::<DeviceSentMeta>()
+            + destination.len();
+        assert_eq!(info.heap_bytes(), expected);
     }
 
     #[test]

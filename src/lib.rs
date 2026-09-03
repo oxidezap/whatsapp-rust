@@ -45,8 +45,8 @@ pub(crate) mod test_alloc {
         }
     }
 
-    /// Smallest (live bytes, allocations) delta observed while running `op`,
-    /// retrying until it reaches `expected`.
+    /// The quietest (live bytes, allocations) delta observed while running `op`,
+    /// retrying until one sample is within `expected` on both counts.
     ///
     /// Same contract and the same reason as [`min_allocs`]: both counters are
     /// process-wide, so a sibling test thread allocating inside the window
@@ -72,9 +72,15 @@ pub(crate) mod test_alloc {
             );
             // Dropped outside the window: what it frees is not this window's.
             drop(held);
-            best = (best.0.min(bytes), best.1.min(allocs));
-            if best <= expected {
-                break;
+            let sample = (bytes, allocs);
+            if sample.0 <= expected.0 && sample.1 <= expected.1 {
+                return sample;
+            }
+            // Always one real window, never minima stitched from two: ambient
+            // traffic inflates both counters together, so the sample with the
+            // fewest allocations is the quietest one this window saw.
+            if (sample.1, sample.0) < (best.1, best.0) {
+                best = sample;
             }
         }
         best

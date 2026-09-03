@@ -48,6 +48,18 @@ pub struct VerifiedName {
     pub certificate: Option<Vec<u8>>,
 }
 
+impl crate::stats::HeapSize for VerifiedName {
+    fn heap_bytes(&self) -> usize {
+        use crate::stats::HeapSize;
+        [&self.name, &self.serial, &self.issuer]
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .map(HeapSize::heap_bytes)
+            .sum::<usize>()
+            + self.certificate.as_ref().map_or(0, HeapSize::heap_bytes)
+    }
+}
+
 impl VerifiedName {
     pub fn try_from_node(node: &NodeRef<'_>) -> Result<Self> {
         use wacore_binary::NodeContentRef;

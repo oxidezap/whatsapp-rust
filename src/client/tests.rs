@@ -1323,6 +1323,16 @@ async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
             .expect("Failed to check session");
         assert!(exists, "Session should exist after store");
     }
+    let record_before = {
+        let device_arc = pm.get_device_arc().await;
+        let device = device_arc.read().await;
+        device
+            .load_session(&signal_addr)
+            .await
+            .expect("Failed to load the stored session")
+            .serialize()
+            .expect("a stored session serializes")
+    };
 
     let (client, _rx) = Client::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
@@ -1342,8 +1352,10 @@ async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
         "log_primary_phone_session_state should succeed when session exists"
     );
 
-    // Verify the session was NOT replaced (still has the same record)
-    // This is the critical assertion - if session was replaced, it would cause MAC failures
+    // The critical assertion: a replaced record is what caused the MAC failures,
+    // and `contains_session` alone cannot tell a replaced record from the original.
+    // A missing session loads as a fresh record, so existence is still checked
+    // separately.
     {
         let device_arc = pm.get_device_arc().await;
         let device = device_arc.read().await;
@@ -1352,6 +1364,16 @@ async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
             .await
             .expect("Failed to check session");
         assert!(exists, "Session should still exist after the call");
+        let record_after = device
+            .load_session(&signal_addr)
+            .await
+            .expect("Failed to load the session after the probe")
+            .serialize()
+            .expect("a stored session serializes");
+        assert_eq!(
+            record_after, record_before,
+            "the probe must leave the existing session record untouched"
+        );
     }
 
     info!("✅ test_primary_phone_session_probe_leaves_an_existing_session_alone passed");

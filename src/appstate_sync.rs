@@ -961,6 +961,80 @@ mod tests {
         );
     }
 
+    /// The processor's key cache is bounded, so a patch list that references
+    /// more keys than it holds must still apply in full: the keys a list needs
+    /// come from the backend, and the cache only decides what the *next* list
+    /// gets to reuse.
+    #[tokio::test]
+    async fn a_patch_list_referencing_more_keys_than_the_cache_holds_still_applies() {
+        const KEYS: usize = 40;
+
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        let mut patches = Vec::with_capacity(KEYS);
+        for i in 0..KEYS {
+            let key_id = format!("key-{i:02}").into_bytes();
+            let master_key = [i as u8; 32];
+            backend
+                .set_sync_key(
+                    &key_id,
+                    AppStateSyncKey {
+                        key_data: master_key.to_vec(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("test backend should accept sync key");
+            let keys = expand_app_state_keys(&master_key);
+            let plaintext = wa::SyncActionData {
+                value: buffa::MessageField::some(wa::SyncActionValue {
+                    timestamp: Some(1000 + i as i64),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let mutation = create_encrypted_mutation(
+                wa::syncd_mutation::SyncdOperation::SET,
+                &[i as u8; 32],
+                &plaintext,
+                &keys,
+                &key_id,
+            );
+            patches.push(wa::SyncdPatch {
+                mutations: vec![mutation],
+                version: buffa::MessageField::some(wa::SyncdVersion {
+                    version: Some(i as u64 + 1),
+                }),
+                key_id: buffa::MessageField::some(wa::KeyId { id: Some(key_id) }),
+                ..Default::default()
+            });
+        }
+        let patch_list = PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches,
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+
+        let (mutations, state, _) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("every key is in the backend, so every patch applies");
+
+        assert_eq!(mutations.len(), KEYS);
+        assert_eq!(state.version, KEYS as u64);
+        assert!(
+            processor.cached_key_count().await < KEYS,
+            "the cache holds fewer keys than this list referenced; that eviction \
+             is what the list had to survive"
+        );
+    }
+
     /// Builds a snapshot resync (incoming v2 over persisted v1) that carries one
     /// record, after seeding an unrelated stale MAC at v1. Returns the backend,
     /// processor, the patch list, and the stale index MAC that the resync must drop.
