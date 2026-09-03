@@ -2659,13 +2659,9 @@ mod tests {
         assert_eq!(R::from_server(429, "something-else"), None);
     }
 
-    /// Every dispatched event is one `Arc<Event>` allocation sized by the
-    /// largest variant, whatever the payload actually is — so one fat variant
-    /// taxes `Event::Presence` (48 bytes of payload) and every aggregated read
-    /// receipt's per-participant fan-out alike. Boxing `IncomingCall` (432) and
-    /// `GroupUpdate`'s action (288 of its 528) took the enum from 528 bytes to
-    /// this ceiling, which `LoggedOut` (328) now sets, with `TemporaryBan`
-    /// (312) behind it.
+    /// `size_of::<Event>()` sizes every dispatched event (see the boxed
+    /// variants' docs for why). The ceiling is set by `LoggedOut` (328), with
+    /// `TemporaryBan` (312) behind it.
     ///
     /// The number is not sacred; the order of magnitude is. Raising it means a
     /// new variant just made every event bigger, and the fix is almost always
