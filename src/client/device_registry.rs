@@ -4195,7 +4195,7 @@ mod tests {
         use wacore::types::message::AddressingMode;
 
         let mut participants = Vec::with_capacity(members);
-        let mut lid_to_pn = std::collections::HashMap::with_capacity(members);
+        let mut lid_to_pn = HashMap::with_capacity(members);
         for i in 0..members {
             let lid_user = wacore_binary::CompactString::from(format!("1000000{i:08}"));
             let pn_user = wacore_binary::CompactString::from(format!("5511{i:09}"));
