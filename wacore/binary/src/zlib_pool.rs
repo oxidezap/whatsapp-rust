@@ -476,6 +476,46 @@ fn decompress_with(
     Ok(scratch)
 }
 
+/// Fixture support shared by this crate's test modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A zlib stream carrying `data` verbatim in stored (uncompressed) deflate
+    /// blocks, hand-built so the fixture costs no compressor.
+    ///
+    /// A real compressor cannot be used under Miri: zlib-rs's *deflate* state
+    /// frees its buffers from `deflate::end` while a `&mut` into them is still
+    /// protected, which Miri rejects. That is the compression half, which this
+    /// crate never runs (inflate is the whole production path), so the fixture
+    /// side steps around it rather than the tests being dropped from the
+    /// Miri gate. Blocks are 64 KB at most, so longer data spans several.
+    pub(crate) fn stored_zlib(data: &[u8]) -> Vec<u8> {
+        // 0x78 0x01: deflate, 32 KB window, and (0x78 << 8 | 0x01) % 31 == 0 as
+        // the header check requires.
+        let mut out = vec![0x78, 0x01];
+        let mut blocks = data.chunks(u16::MAX as usize).peekable();
+        if blocks.peek().is_none() {
+            out.extend_from_slice(&[0x01, 0, 0, 0xff, 0xff]);
+        }
+        while let Some(block) = blocks.next() {
+            let len = block.len() as u16;
+            // BFINAL on the last block, BTYPE=00 (stored), then the
+            // byte-aligned LEN/!LEN pair.
+            out.push(u8::from(blocks.peek().is_none()));
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(block);
+        }
+
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        out.extend_from_slice(&(((b << 16) | a).to_be_bytes()));
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,34 +541,7 @@ mod tests {
             .collect()
     }
 
-    /// A zlib stream carrying `data` verbatim in one stored (uncompressed)
-    /// deflate block, hand-built so the fixture costs no compressor.
-    ///
-    /// `zlib()` above cannot be used under Miri: zlib-rs 0.6.6's *deflate* state
-    /// frees its buffers from `deflate::end` while a `&mut` into them is still
-    /// protected, which Miri rejects. That is the compression half, which this
-    /// crate never runs — inflate is the whole production path — so the fixture
-    /// side steps around it rather than the test being dropped.
-    fn stored_zlib(data: &[u8]) -> Vec<u8> {
-        assert!(data.len() <= u16::MAX as usize, "one stored block only");
-        // 0x78 0x01: deflate, 32 KB window, and (0x78 << 8 | 0x01) % 31 == 0 as
-        // the header check requires.
-        let mut out = vec![0x78, 0x01];
-        let len = data.len() as u16;
-        // BFINAL=1, BTYPE=00 (stored), then the byte-aligned LEN/!LEN pair.
-        out.push(0x01);
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&(!len).to_le_bytes());
-        out.extend_from_slice(data);
-
-        let (mut a, mut b) = (1u32, 0u32);
-        for &byte in data {
-            a = (a + byte as u32) % 65521;
-            b = (b + a) % 65521;
-        }
-        out.extend_from_slice(&(((b << 16) | a).to_be_bytes()));
-        out
-    }
+    use super::test_support::stored_zlib;
 
     // Tests sized in hundreds of KB to MB reach window refill and the growth
     // projection, which puts a full inflate cycle hours out of reach of Miri's
@@ -769,7 +782,13 @@ mod tests {
 
     /// Retention zero: nothing is parked, `warm_pool` has nothing to do, and
     /// both paths still inflate correctly on a fresh state each time.
+    ///
+    /// Not under Miri: this is the one test that drops an `Inflate`, and
+    /// zlib-rs 0.6.7's `inflate::end` frees the state from behind a `&mut`
+    /// into it, the same shape as the deflate half `stored_zlib` exists to
+    /// avoid. Every other test parks its state instead.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn retention_zero_parks_nothing() {
         let _guard = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         drain_pool();

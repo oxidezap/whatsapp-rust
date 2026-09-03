@@ -368,14 +368,15 @@ mod tests {
     use crate::builder::NodeBuilder;
     use crate::marshal::marshal;
     use crate::node::{Node, NodeContent, NodeContentRef};
-    use flate2::Compression;
-    use flate2::write::ZlibEncoder;
-    use std::io::Write;
+    use crate::zlib_pool::test_support::stored_zlib;
 
+    /// The compressed form of a packed payload. Stored blocks, not deflate:
+    /// the inflate path is what is under test, and a real compressor is not
+    /// Miri-clean (see `stored_zlib`).
     fn compress(node_bytes: &[u8]) -> Vec<u8> {
-        let mut e = ZlibEncoder::new(vec![FORMAT_COMPRESSED], Compression::default());
-        e.write_all(node_bytes).unwrap();
-        e.finish().unwrap()
+        let mut out = vec![FORMAT_COMPRESSED];
+        out.extend_from_slice(&stored_zlib(node_bytes));
+        out
     }
 
     /// The same node as a plain packed payload and as a compressed one.
@@ -414,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn walks_children_one_at_a_time_in_both_forms() {
         let node = props_iq(2000);
         let expected: Vec<Node> = match &node.content {
@@ -531,6 +533,7 @@ mod tests {
     /// `finish` applies the tree decoder's strictness: trailing bytes behind the
     /// root, and a compressed stream without its trailer, are errors.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn finish_rejects_leftover_bytes_and_a_truncated_stream() {
         let node = props_iq(10);
         let mut packed = marshal(&node).unwrap();
@@ -578,6 +581,7 @@ mod tests {
     /// A stream that only looked at the root's head can still hand over the
     /// whole payload, identical to what the one-shot unpack produces.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn into_inflated_after_peeking_the_root_matches_unpack() {
         let node = props_iq(500);
         let packed = marshal(&node).unwrap();
@@ -600,6 +604,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn depth_is_capped_like_the_tree_decoder() {
         let mut node = NodeBuilder::new("leaf").build();
         for _ in 0..(MAX_NODE_DEPTH + 2) {
