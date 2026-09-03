@@ -1349,211 +1349,19 @@ impl Client {
             let needs_initial_sync = flag_set || needs_pushname_from_sync;
 
             if needs_initial_sync {
-                // === Fresh pairing path ===
-                // Like WhatsApp Web's syncCriticalData(): await critical collections before
-                // dispatching Connected, so blocklist/privacy settings are applied first.
-                debug!(
-                    target: "Client/AppState",
-                    "Starting Initial App State Sync (flag_set={flag_set}, needs_pushname={needs_pushname_from_sync})"
-                );
-
-                const CRITICAL_COLLECTIONS: [WAPatchName; 2] =
-                    [WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow];
-                // Single deadline for the whole critical path (key-share grace + batched
-                // IQ + missing-key fallback). Matches WhatsApp Web's WAWebSyncBootstrap
-                // 180s critical-data deadline. Armed before the wait so every step below
-                // is bounded by the same clock.
-                const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
-                let critical_deadline = wacore::time::Instant::now()
-                    + Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS);
-                // Claimed by whichever of the sync and the watchdog gets there
-                // first, and never by both. A plain "the sync finished" flag is not
-                // enough: `reconnect_immediately` sets `expected_disconnect` and
-                // then awaits seconds of bounded flushes before it closes the
-                // socket, so a sync landing in that window would abort the
-                // watchdog mid-teardown and leave the connection up, flagged for a
-                // disconnect that never comes, with `dispatch_connected` declining
-                // to announce it. The claim is also not a push_name check, which
-                // was never a reliable proxy: a business account gets push_name
-                // set from business_name at pairing (src/pair.rs) while still
-                // needing the full sync.
-                let critical_sync_settled =
-                    Arc::new(AtomicBool::new(false));
-                let timeout_client = client_clone.clone();
-                let timeout_generation = task_generation;
-                let timeout_rt = client_clone.runtime.clone();
-                let timeout_settled = critical_sync_settled.clone();
-                let critical_sync_timeout_handle = timeout_rt.spawn(Box::pin(async move {
-                    timeout_client.runtime.sleep(Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS)).await;
-                    // Check generation — if connection was replaced, this timeout is stale
-                    if timeout_client.connection_generation.load(Ordering::SeqCst)
-                        != timeout_generation
-                    {
-                        return;
-                    }
-                    if timeout_settled.swap(true, Ordering::SeqCst) {
-                        debug!(
-                            target: "Client/AppState",
-                            "Critical sync timeout fired but the sync already settled"
-                        );
-                    } else {
-                        warn!(
-                            target: "Client/AppState",
-                            "Critical app state sync produced no answer within {CRITICAL_SYNC_TIMEOUT_SECS}s. \
-                             Reconnecting to retry."
-                        );
-                        // WhatsApp Web does socketLogout here which clears device identity.
-                        // We reconnect instead — preserving credentials and keeping the
-                        // run loop active so auto-reconnect can retry the sync.
-                        timeout_client.reconnect_immediately().await;
-                    }
-                }));
-
-                // Brief grace for the auto-shared key that the primary sends at pairing
-                // (the WA Web primary path). The listener is registered before the flag
-                // check because the notifier is not sticky — a key-share landing in the
-                // load→listen gap would otherwise be missed. This wait is only an
-                // optimization to avoid a redundant explicit key request in the common
-                // fast case; if the key is late (heavy history sync) or never
-                // auto-shared, the batched sync below falls back to an explicit
-                // AppStateSyncKeyRequest bounded by `critical_deadline`, so correctness
-                // does not depend on this grace.
-                const KEY_SHARE_GRACE_SECS: u64 = 10;
-                let key_share_listener = client_clone.initial_keys_synced_notifier.listen();
-                if !client_clone
-                    .initial_app_state_keys_received
-                    .load(Ordering::Relaxed)
-                {
-                    debug!(
-                        target: "Client/AppState",
-                        "Waiting up to {KEY_SHARE_GRACE_SECS}s for the auto-shared app state key..."
-                    );
-                    let _ = rt_timeout(
-                        &*client_clone.runtime,
-                        Duration::from_secs(KEY_SHARE_GRACE_SECS),
-                        key_share_listener,
-                    )
-                    .await;
-
-                    // Check if connection was replaced while waiting
-                    check_generation!();
-                }
-
-                // Await critical collections via batched IQ before dispatching Connected.
-                // The deadline lets the missing-key fallback recover a late/never-shared
-                // key on this connection instead of stalling to the watchdog.
-                check_generation!();
-                let critical_scope = client_clone.sync_scope(Some(critical_deadline));
-                let result = client_clone
-                    .sync_collections_batched(CRITICAL_COLLECTIONS.to_vec(), critical_scope)
-                    .await;
-
-                // Whatever it says, this is the answer the watchdog was waiting
-                // for, so it stands down here rather than per branch. It cannot
-                // be the retry for a bad answer: the collection that failed
-                // would fail the same way on every reconnect, and the two would
-                // loop for good, announcing and dropping a live session every
-                // 180s, since `needs_pushname_from_sync` is derived from the
-                // persisted push name and survives even a restart. What did not
-                // sync rides along with the background sync instead, on this
-                // connection, which is also where a late app state key lands.
-                if critical_sync_settled.swap(true, Ordering::SeqCst) {
-                    // The watchdog claimed it first and is already retiring this
-                    // connection. Aborting it now would strand the teardown, and
-                    // announcing a connection it is closing would be a lie; the
-                    // replacement it brings up announces itself. detach() because
-                    // dropping the handle would abort the task.
-                    debug!(
-                        target: "Client/AppState",
-                        "Critical app state sync answered after the watchdog fired; leaving the reconnect to it"
-                    );
-                    critical_sync_timeout_handle.detach();
-                    return;
-                }
-                critical_sync_timeout_handle.abort();
-
-                // WA Web's answer to a critical collection it cannot get is to
-                // notify the primary and log out (`WAWebSyncdFatal`), which a
-                // library must not do on a consumer's behalf. Having chosen to
-                // keep the session, it owes the consumer the other half: the
-                // connection is announced and the gap is reported, because by
-                // this point `set_passive(false)` has already been sent and
-                // offline stanzas are being delivered to a consumer that still
-                // believes nothing ever connected.
-                let outcome = match result {
-                    Ok(outcome) => {
-                        if !outcome.all_synced() {
-                            warn!(
-                                target: "Client/AppState",
-                                "Critical app state sync incomplete (fatal={:?} retryable={:?} skipped={:?}); connecting anyway",
-                                outcome.fatal, outcome.retryable, outcome.skipped
-                            );
-                        }
-                        outcome
-                    }
-                    Err(e) => {
-                        client_clone.log_sync_error("critical app state sync", &e);
-                        BatchedSyncOutcome::all_retryable(&CRITICAL_COLLECTIONS)
-                    }
-                };
-                let plan = CriticalSyncPlan::from_outcome(&outcome);
-
-                if !client_clone
-                    .finish_critical_bootstrap(critical_scope, &plan, &outcome)
-                    .await
-                {
-                    return;
-                }
-
-                let critical_retry = plan.retry;
-                let critical_refused = plan.stranded;
-
-                // Spawn remaining non-critical collections in background
-                let sync_client = client_clone.clone();
-                let sync_generation = task_generation;
-                client_clone.runtime.spawn_detached(Box::pin(async move {
-                    if sync_client.connection_generation.load(Ordering::SeqCst) != sync_generation {
-                        debug!("App state sync cancelled: connection generation changed");
-                        return;
-                    }
-
-                    // Any critical collection the bootstrap handed over goes
-                    // first: it is the one the account actually needs.
-                    let mut to_sync = critical_retry;
-                    to_sync.extend([
-                        WAPatchName::RegularLow,
-                        WAPatchName::RegularHigh,
-                        WAPatchName::Regular,
-                    ]);
-                    let requested = to_sync.clone();
-                    let scope = sync_client.sync_scope(None);
-                    let result = sync_client.sync_collections_batched(to_sync, scope).await;
-
-                    let complete = !critical_refused
-                        && result.as_ref().is_ok_and(|outcome| outcome.all_synced());
-
-                    // Settled before the report, because reporting dispatches to
-                    // consumer handlers synchronously and one of them
-                    // disconnecting would retire the scope and take this
-                    // decision with it — leaving an unfinished bootstrap
-                    // unarmed, which is the failure this path exists to prevent.
-                    // `settle_bootstrap` is what makes the "only for this
-                    // connection" part impossible to forget.
-                    sync_client.settle_bootstrap(scope, !complete);
-
-                    // A refused critical collection is not in `requested` and
-                    // never will be retried, but it is why the bootstrap is
-                    // unfinished. Handing that to the scheduler keeps a later
-                    // clean round from standing the gate down on its behalf.
-                    sync_client.report_background_sync_stranded(
-                        "non-critical app state sync",
-                        scope,
-                        SyncSettles::InitialSync,
-                        &requested,
-                        critical_refused,
-                        result,
-                    );
-                }));
+                // Boxed, and the arm behind its own `async fn`, because a Rust
+                // async block reserves the union of every branch's live locals:
+                // inlined here, the fresh-pairing arm's watchdog handle,
+                // key-share listener, batched-sync future, outcome and plan
+                // added ~7 KB to a task that is spawned on every connection and
+                // stays parked through the whole offline drain — for a branch
+                // that runs once per device lifetime.
+                Box::pin(client_clone.run_initial_app_state_sync(
+                    task_generation,
+                    flag_set,
+                    needs_pushname_from_sync,
+                ))
+                .await;
             } else {
                 // === Reconnection path ===
                 // Pushname is already known, send presence and Connected immediately.
@@ -1576,6 +1384,231 @@ impl Client {
 
                 client_clone.dispatch_connected(task_generation).await;
             }
+        }));
+    }
+
+    /// The fresh-pairing arm of the post-login sequence: await the critical
+    /// app-state collections (WA Web's `syncCriticalData`) under a 180 s
+    /// watchdog, then hand the rest to a background sync.
+    ///
+    /// Its own `async fn` so the caller can box it — see the call site in
+    /// [`Self::handle_success`]. Returning early here is what returning from
+    /// the post-login task was before the extraction: nothing follows this arm.
+    async fn run_initial_app_state_sync(
+        self: &Arc<Self>,
+        task_generation: u64,
+        flag_set: bool,
+        needs_pushname_from_sync: bool,
+    ) {
+        macro_rules! check_generation {
+            () => {
+                if self.connection_generation.load(Ordering::SeqCst) != task_generation {
+                    debug!("Post-login task cancelled: connection generation changed");
+                    return;
+                }
+            };
+        }
+
+        // === Fresh pairing path ===
+        // Like WhatsApp Web's syncCriticalData(): await critical collections before
+        // dispatching Connected, so blocklist/privacy settings are applied first.
+        debug!(
+            target: "Client/AppState",
+            "Starting Initial App State Sync (flag_set={flag_set}, needs_pushname={needs_pushname_from_sync})"
+        );
+
+        const CRITICAL_COLLECTIONS: [WAPatchName; 2] =
+            [WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow];
+        // Single deadline for the whole critical path (key-share grace + batched
+        // IQ + missing-key fallback). Matches WhatsApp Web's WAWebSyncBootstrap
+        // 180s critical-data deadline. Armed before the wait so every step below
+        // is bounded by the same clock.
+        const CRITICAL_SYNC_TIMEOUT_SECS: u64 = 180;
+        let critical_deadline =
+            wacore::time::Instant::now() + Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS);
+        // Claimed by whichever of the sync and the watchdog gets there
+        // first, and never by both. A plain "the sync finished" flag is not
+        // enough: `reconnect_immediately` sets `expected_disconnect` and
+        // then awaits seconds of bounded flushes before it closes the
+        // socket, so a sync landing in that window would abort the
+        // watchdog mid-teardown and leave the connection up, flagged for a
+        // disconnect that never comes, with `dispatch_connected` declining
+        // to announce it. The claim is also not a push_name check, which
+        // was never a reliable proxy: a business account gets push_name
+        // set from business_name at pairing (src/pair.rs) while still
+        // needing the full sync.
+        let critical_sync_settled = Arc::new(AtomicBool::new(false));
+        let timeout_client = self.clone();
+        let timeout_generation = task_generation;
+        let timeout_rt = self.runtime.clone();
+        let timeout_settled = critical_sync_settled.clone();
+        let critical_sync_timeout_handle = timeout_rt.spawn(Box::pin(async move {
+            timeout_client.runtime.sleep(Duration::from_secs(CRITICAL_SYNC_TIMEOUT_SECS)).await;
+            // Check generation — if connection was replaced, this timeout is stale
+            if timeout_client.connection_generation.load(Ordering::SeqCst)
+                != timeout_generation
+            {
+                return;
+            }
+            if timeout_settled.swap(true, Ordering::SeqCst) {
+                debug!(
+                    target: "Client/AppState",
+                    "Critical sync timeout fired but the sync already settled"
+                );
+            } else {
+                warn!(
+                    target: "Client/AppState",
+                    "Critical app state sync produced no answer within {CRITICAL_SYNC_TIMEOUT_SECS}s. \
+                     Reconnecting to retry."
+                );
+                // WhatsApp Web does socketLogout here which clears device identity.
+                // We reconnect instead — preserving credentials and keeping the
+                // run loop active so auto-reconnect can retry the sync.
+                timeout_client.reconnect_immediately().await;
+            }
+        }));
+
+        // Brief grace for the auto-shared key that the primary sends at pairing
+        // (the WA Web primary path). The listener is registered before the flag
+        // check because the notifier is not sticky — a key-share landing in the
+        // load→listen gap would otherwise be missed. This wait is only an
+        // optimization to avoid a redundant explicit key request in the common
+        // fast case; if the key is late (heavy history sync) or never
+        // auto-shared, the batched sync below falls back to an explicit
+        // AppStateSyncKeyRequest bounded by `critical_deadline`, so correctness
+        // does not depend on this grace.
+        const KEY_SHARE_GRACE_SECS: u64 = 10;
+        let key_share_listener = self.initial_keys_synced_notifier.listen();
+        if !self.initial_app_state_keys_received.load(Ordering::Relaxed) {
+            debug!(
+                target: "Client/AppState",
+                "Waiting up to {KEY_SHARE_GRACE_SECS}s for the auto-shared app state key..."
+            );
+            let _ = rt_timeout(
+                &*self.runtime,
+                Duration::from_secs(KEY_SHARE_GRACE_SECS),
+                key_share_listener,
+            )
+            .await;
+
+            // Check if connection was replaced while waiting
+            check_generation!();
+        }
+
+        // Await critical collections via batched IQ before dispatching Connected.
+        // The deadline lets the missing-key fallback recover a late/never-shared
+        // key on this connection instead of stalling to the watchdog.
+        check_generation!();
+        let critical_scope = self.sync_scope(Some(critical_deadline));
+        let result = self
+            .sync_collections_batched(CRITICAL_COLLECTIONS.to_vec(), critical_scope)
+            .await;
+
+        // Whatever it says, this is the answer the watchdog was waiting
+        // for, so it stands down here rather than per branch. It cannot
+        // be the retry for a bad answer: the collection that failed
+        // would fail the same way on every reconnect, and the two would
+        // loop for good, announcing and dropping a live session every
+        // 180s, since `needs_pushname_from_sync` is derived from the
+        // persisted push name and survives even a restart. What did not
+        // sync rides along with the background sync instead, on this
+        // connection, which is also where a late app state key lands.
+        if critical_sync_settled.swap(true, Ordering::SeqCst) {
+            // The watchdog claimed it first and is already retiring this
+            // connection. Aborting it now would strand the teardown, and
+            // announcing a connection it is closing would be a lie; the
+            // replacement it brings up announces itself. detach() because
+            // dropping the handle would abort the task.
+            debug!(
+                target: "Client/AppState",
+                "Critical app state sync answered after the watchdog fired; leaving the reconnect to it"
+            );
+            critical_sync_timeout_handle.detach();
+            return;
+        }
+        critical_sync_timeout_handle.abort();
+
+        // WA Web's answer to a critical collection it cannot get is to
+        // notify the primary and log out (`WAWebSyncdFatal`), which a
+        // library must not do on a consumer's behalf. Having chosen to
+        // keep the session, it owes the consumer the other half: the
+        // connection is announced and the gap is reported, because by
+        // this point `set_passive(false)` has already been sent and
+        // offline stanzas are being delivered to a consumer that still
+        // believes nothing ever connected.
+        let outcome = match result {
+            Ok(outcome) => {
+                if !outcome.all_synced() {
+                    warn!(
+                        target: "Client/AppState",
+                        "Critical app state sync incomplete (fatal={:?} retryable={:?} skipped={:?}); connecting anyway",
+                        outcome.fatal, outcome.retryable, outcome.skipped
+                    );
+                }
+                outcome
+            }
+            Err(e) => {
+                self.log_sync_error("critical app state sync", &e);
+                BatchedSyncOutcome::all_retryable(&CRITICAL_COLLECTIONS)
+            }
+        };
+        let plan = CriticalSyncPlan::from_outcome(&outcome);
+
+        if !self
+            .finish_critical_bootstrap(critical_scope, &plan, &outcome)
+            .await
+        {
+            return;
+        }
+
+        let critical_retry = plan.retry;
+        let critical_refused = plan.stranded;
+
+        // Spawn remaining non-critical collections in background
+        let sync_client = self.clone();
+        let sync_generation = task_generation;
+        self.runtime.spawn_detached(Box::pin(async move {
+            if sync_client.connection_generation.load(Ordering::SeqCst) != sync_generation {
+                debug!("App state sync cancelled: connection generation changed");
+                return;
+            }
+
+            // Any critical collection the bootstrap handed over goes
+            // first: it is the one the account actually needs.
+            let mut to_sync = critical_retry;
+            to_sync.extend([
+                WAPatchName::RegularLow,
+                WAPatchName::RegularHigh,
+                WAPatchName::Regular,
+            ]);
+            let requested = to_sync.clone();
+            let scope = sync_client.sync_scope(None);
+            let result = sync_client.sync_collections_batched(to_sync, scope).await;
+
+            let complete =
+                !critical_refused && result.as_ref().is_ok_and(|outcome| outcome.all_synced());
+
+            // Settled before the report, because reporting dispatches to
+            // consumer handlers synchronously and one of them
+            // disconnecting would retire the scope and take this
+            // decision with it — leaving an unfinished bootstrap
+            // unarmed, which is the failure this path exists to prevent.
+            // `settle_bootstrap` is what makes the "only for this
+            // connection" part impossible to forget.
+            sync_client.settle_bootstrap(scope, !complete);
+
+            // A refused critical collection is not in `requested` and
+            // never will be retried, but it is why the bootstrap is
+            // unfinished. Handing that to the scheduler keeps a later
+            // clean round from standing the gate down on its behalf.
+            sync_client.report_background_sync_stranded(
+                "non-critical app state sync",
+                scope,
+                SyncSettles::InitialSync,
+                &requested,
+                critical_refused,
+                result,
+            );
         }));
     }
 
@@ -2093,6 +2126,107 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_impl::TokioRuntime;
+    use crate::store::persistence_manager::PersistenceManager;
+    use crate::test_utils::{MockHttpClient, create_test_backend};
+    use crate::transport::mock::MockTransportFactory;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::time::Duration;
+    use wacore::runtime::{AbortHandle, Runtime};
+
+    /// Records the concrete size of every future handed to the runtime.
+    ///
+    /// `size_of_val` on the unsized `dyn Future` behind the `Pin<Box<_>>` reads
+    /// the vtable, so what it reports is exactly the coroutine layout the boxing
+    /// allocated — the thing a task's resident cost is made of.
+    struct SizingRuntime {
+        inner: TokioRuntime,
+        sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for SizingRuntime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
+            self.sizes
+                .lock()
+                .expect("sizes mutex")
+                .push(size_of_val(&*future));
+            self.inner.spawn(future)
+        }
+
+        fn spawn_detached(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+            self.sizes
+                .lock()
+                .expect("sizes mutex")
+                .push(size_of_val(&*future));
+            self.inner.spawn_detached(future);
+        }
+
+        fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            self.inner.sleep(duration)
+        }
+
+        fn spawn_blocking(
+            &self,
+            f: Box<dyn FnOnce() + Send + 'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            self.inner.spawn_blocking(f)
+        }
+
+        fn yield_now(&self) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
+            self.inner.yield_now()
+        }
+    }
+
+    /// The post-login task is spawned on every connection and stays parked in
+    /// `wait_for_offline_delivery_end` for the whole offline drain, so its
+    /// future is resident for minutes on a client with a backlog. Inlining the
+    /// fresh-pairing arm — a branch that runs once per device lifetime — put the
+    /// union of its locals in there and made it 8,224 B; boxing the arm brought
+    /// it to ~1.2 KB. This pins the shape, not the exact number: a future above
+    /// the bound means an arm has been inlined back in.
+    #[tokio::test]
+    async fn the_post_login_task_does_not_carry_the_fresh_pairing_arm() {
+        const MAX_POST_LOGIN_FUTURE_BYTES: usize = 2048;
+
+        let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let persistence_manager = Arc::new(
+            PersistenceManager::new(create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let client = Client::builder()
+            .with_runtime(SizingRuntime {
+                inner: TokioRuntime,
+                sizes: sizes.clone(),
+            })
+            .with_persistence_manager(persistence_manager)
+            .with_transport_factory(MockTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .build()
+            .await
+            .expect("client build")
+            .into_client();
+
+        // Only what `<success>` spawns: construction and `start_services` have
+        // already recorded theirs.
+        let before = sizes.lock().expect("sizes mutex").len();
+        let success = NodeBuilder::new("success").build();
+        client.handle_success(&success.as_node_ref()).await;
+
+        let spawned = sizes.lock().expect("sizes mutex")[before..].to_vec();
+        assert!(
+            !spawned.is_empty(),
+            "<success> must spawn the post-login task"
+        );
+        let largest = spawned.iter().copied().max().unwrap_or(0);
+        assert!(
+            largest < MAX_POST_LOGIN_FUTURE_BYTES,
+            "post-login future grew to {largest} B (spawned: {spawned:?}); \
+             the limit is {MAX_POST_LOGIN_FUTURE_BYTES} B",
+        );
+    }
 
     fn ack(attrs: &[(&'static str, &str)]) -> Node {
         attrs
