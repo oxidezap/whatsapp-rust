@@ -4,12 +4,32 @@ use futures::FutureExt;
 use log::{debug, warn};
 use rand::RngExt;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use wacore::iq::spec::IqSpec;
 use wacore::protocol::keepalive::{
     KEEP_ALIVE_INTERVAL_MAX, KEEP_ALIVE_INTERVAL_MIN, KEEP_ALIVE_RESPONSE_DEADLINE, elapsed_since,
     elapsed_since_at, is_dead_socket_at,
 };
+
+/// Keepalive ticks between two mid-session maintenance passes (~6 h).
+///
+/// The tick interval is drawn uniformly from
+/// [`KEEP_ALIVE_INTERVAL_MIN`, `KEEP_ALIVE_INTERVAL_MAX`], so a tick count is
+/// converted at the midpoint and the real period lands somewhere in 4-9 h. That
+/// spread is fine because nothing here is scheduled *by* this cadence: the
+/// signed pre-key rotation gates itself on its own 27-day interval and the
+/// tcToken prune is idempotent. The cadence only has to be short enough that a
+/// connection which never drops still reaches them, which the connect-only
+/// callers could not promise.
+const MAINTENANCE_TICKS: u32 = ticks_for(6 * 60 * 60);
+
+/// Keepalive ticks that cover `period_secs`, at the midpoint of the randomized
+/// interval.
+const fn ticks_for(period_secs: u64) -> u32 {
+    let midpoint = (KEEP_ALIVE_INTERVAL_MIN.as_secs() + KEEP_ALIVE_INTERVAL_MAX.as_secs()) / 2;
+    (period_secs / midpoint) as u32
+}
 
 #[derive(Debug, PartialEq)]
 enum KeepaliveResult {
@@ -130,6 +150,7 @@ impl Client {
     pub(crate) async fn keepalive_loop(self: Arc<Self>) {
         let mut error_count = 0u32;
         let mut cleanup_counter = 0u32;
+        let mut maintenance_counter = 0u32;
         let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
         // Capture the per-connection signal once — re-subscribing each iteration
         // would let a racing reset_connection_shutdown swap the underlying
@@ -166,6 +187,14 @@ impl Client {
                     if cleanup_counter >= 12 {
                         cleanup_counter = 0;
                         self.spawn_retention_cleanup(sent_msg_ttl);
+                    }
+
+                    // Same placement and the same reason, on a much coarser
+                    // counter: see MAINTENANCE_TICKS.
+                    maintenance_counter += 1;
+                    if maintenance_counter >= MAINTENANCE_TICKS {
+                        maintenance_counter = 0;
+                        self.spawn_session_maintenance();
                     }
 
                     // Same reason as the retention sweep above: driven by the
@@ -300,6 +329,49 @@ impl Client {
             }))
             .detach();
     }
+
+    /// Mid-session key and token maintenance, on the keepalive tick.
+    ///
+    /// Both jobs used to run only from the connect-time background init
+    /// (`client/node_io.rs`), which is fine for a process that reconnects often
+    /// and useless for one that does not: a session held for longer than the
+    /// 27-day rotation cadence never rotated its signed pre-key, and pruned
+    /// tcTokens exactly once, at hour zero. The connect-time calls stay — they
+    /// are the ones that cover a freshly started process.
+    fn spawn_session_maintenance(self: &Arc<Self>) {
+        let client = Arc::clone(self);
+        let generation = self.connection_generation.load(Ordering::SeqCst);
+        self.runtime
+            .spawn(Box::pin(async move {
+                client.run_session_maintenance(generation).await;
+            }))
+            .detach();
+    }
+
+    /// The body of [`Self::spawn_session_maintenance`]; separate so a test can
+    /// await the pass instead of racing a detached task.
+    pub(crate) async fn run_session_maintenance(&self, generation: u64) {
+        // Only the rotation is generation-gated: it uploads the new key over
+        // this connection, so a reconnect between the tick and the upload means
+        // a newer background init already owns the work — the same guard the
+        // connect-time caller applies. The tcToken prune is a local delete and
+        // is correct on any generation.
+        if self.connection_generation.load(Ordering::SeqCst) == generation {
+            let rotation = self.maybe_rotate_signed_pre_key().await;
+            if let Err(e) = rotation
+                && !self.is_shutting_down()
+            {
+                warn!(target: "Client/Keepalive", "Signed pre-key rotation check failed: {e:?}");
+            }
+        }
+
+        let pruned = self.tc_token().prune_expired().await;
+        if let Err(e) = pruned
+            && !self.is_shutting_down()
+        {
+            warn!(target: "Client/Keepalive", "Failed to prune expired tc_tokens: {e:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +379,25 @@ mod tests {
     use super::*;
     use crate::socket::error::{EncryptSendError, SocketError};
     use wacore_binary::builder::NodeBuilder;
+
+    // The maintenance cadence is a tick count, so the interval it really lands
+    // on depends on where each randomized tick falls. Both ends must stay in
+    // "a few times a day": short enough that a weeks-long connection reaches
+    // the 27-day rotation check with room to spare, long enough that the pass
+    // is not competing with real traffic for the write permit.
+    #[test]
+    fn the_maintenance_cadence_lands_in_hours_not_minutes_or_days() {
+        let fastest = MAINTENANCE_TICKS as u64 * KEEP_ALIVE_INTERVAL_MIN.as_secs();
+        let slowest = MAINTENANCE_TICKS as u64 * KEEP_ALIVE_INTERVAL_MAX.as_secs();
+        assert!(
+            (4 * 3600..=6 * 3600).contains(&fastest),
+            "fastest maintenance period was {fastest}s"
+        );
+        assert!(
+            (6 * 3600..=12 * 3600).contains(&slowest),
+            "slowest maintenance period was {slowest}s"
+        );
+    }
 
     #[test]
     fn test_classify_timeout_is_transient() {

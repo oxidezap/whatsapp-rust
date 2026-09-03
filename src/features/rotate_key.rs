@@ -660,6 +660,40 @@ mod tests {
         uploaded
     }
 
+    /// P3: the rotation used to have exactly one non-test caller, the
+    /// connect-time background init, so a process that held one connection past
+    /// the 27-day cadence never rotated at all. The keepalive maintenance pass
+    /// reaches the same self-gating check with no reconnect in between.
+    #[tokio::test]
+    async fn the_keepalive_maintenance_pass_rotates_without_a_reconnect() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let before = client
+            .persistence_manager
+            .get_device_snapshot()
+            .signed_pre_key_id;
+        make_rotation_due(&client).await;
+
+        let generation = client
+            .connection_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let pass = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.run_session_maintenance(generation).await })
+        };
+        let uploaded = answer_rotation(&client, &transport, 0, iq_result).await;
+        pass.await.expect("the maintenance pass must not panic");
+
+        let after = client.persistence_manager.get_device_snapshot();
+        assert_ne!(
+            after.signed_pre_key_id, before,
+            "the keepalive pass must rotate a due key"
+        );
+        assert_eq!(
+            after.signed_pre_key_id, uploaded,
+            "the promoted key is the one the pass uploaded"
+        );
+    }
+
     /// The bug this batch exists for: 202 and 249 logins over 13 days were
     /// observed in production, so an upload failure that leaves the cadence
     /// untouched re-runs the whole stage/retain/upload flow on every one of
