@@ -655,10 +655,12 @@ impl SqliteStore {
         } else {
             None
         };
+        // Info, not warn: the default asks for one reader, so an in-memory or
+        // rollback-journal database would otherwise warn on every open.
         if read_pool_size > 0
             && let Some(reason) = &declined
         {
-            log::warn!("sqlite-storage: read_pool_size={read_pool_size} ignored, {reason}");
+            log::info!("sqlite-storage: read_pool_size={read_pool_size} ignored, {reason}");
         }
         let reads = if read_pool_size > 0 && declined.is_none() {
             let manager = ConnectionManager::<SqliteConnection>::new(&db_url);
