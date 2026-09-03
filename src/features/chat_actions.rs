@@ -82,7 +82,7 @@ pub fn message_key(
 /// Returns `true` if handled, `false` if unknown (so other handlers can try).
 pub(crate) fn dispatch_chat_mutation(
     event_bus: &wacore::types::events::CoreEventBus,
-    m: &Mutation,
+    m: &mut Mutation,
     full_sync: bool,
 ) -> bool {
     if m.index.is_empty() {
@@ -145,14 +145,14 @@ pub(crate) fn dispatch_chat_mutation(
 
     match kind.as_str() {
         "mute" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.mute_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.mute_action.take()
             {
                 event_bus.dispatch(Event::MuteUpdate(
                     MuteUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -160,14 +160,14 @@ pub(crate) fn dispatch_chat_mutation(
             true
         }
         "pin" | "pin_v1" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.pin_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.pin_action.take()
             {
                 event_bus.dispatch(Event::PinUpdate(
                     PinUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -175,14 +175,14 @@ pub(crate) fn dispatch_chat_mutation(
             true
         }
         "archive" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.archive_chat_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.archive_chat_action.take()
             {
                 event_bus.dispatch(Event::ArchiveUpdate(
                     ArchiveUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -190,8 +190,8 @@ pub(crate) fn dispatch_chat_mutation(
             true
         }
         "star" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.star_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.star_action.take()
                 && let Some((message_id, from_me, participant_jid)) =
                     parse_message_key_fields(kind, &m.index)
             {
@@ -202,7 +202,7 @@ pub(crate) fn dispatch_chat_mutation(
                         .message_id(message_id)
                         .from_me(from_me)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -220,14 +220,14 @@ pub(crate) fn dispatch_chat_mutation(
             true
         }
         "contact" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.contact_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.contact_action.take()
             {
                 event_bus.dispatch(Event::ContactUpdate(
                     ContactUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -235,14 +235,14 @@ pub(crate) fn dispatch_chat_mutation(
             true
         }
         "mark_chat_as_read" | "markChatAsRead" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.mark_chat_as_read_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.mark_chat_as_read_action.take()
             {
                 event_bus.dispatch(Event::MarkChatAsReadUpdate(
                     MarkChatAsReadUpdate::builder()
                         .jid(jid)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -250,8 +250,8 @@ pub(crate) fn dispatch_chat_mutation(
             true
         }
         "deleteChat" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.delete_chat_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.delete_chat_action.take()
             {
                 // delete_media is in index[2], not in the proto (which only has messageRange)
                 let delete_media = m.index.get(2).is_none_or(|v| v != "0");
@@ -260,7 +260,7 @@ pub(crate) fn dispatch_chat_mutation(
                         .jid(jid)
                         .delete_media(delete_media)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -268,8 +268,8 @@ pub(crate) fn dispatch_chat_mutation(
             true
         }
         "clearChat" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.clear_chat_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.clear_chat_action.take()
             {
                 // deleteStarred/deleteMedia live in the index (index[2]/index[3]),
                 // not in ClearChatAction (which only has messageRange). WA Web's send
@@ -282,7 +282,7 @@ pub(crate) fn dispatch_chat_mutation(
                         .delete_starred(delete_starred)
                         .delete_media(delete_media)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -290,15 +290,15 @@ pub(crate) fn dispatch_chat_mutation(
             true
         }
         "userStatusMute" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.user_status_mute_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.user_status_mute_action.take()
             {
                 event_bus.dispatch(Event::UserStatusMuteUpdate(
                     UserStatusMuteUpdate::builder()
                         .jid(jid)
                         .muted(act.muted.unwrap_or(false))
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -306,8 +306,8 @@ pub(crate) fn dispatch_chat_mutation(
             true
         }
         "deleteMessageForMe" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.delete_message_for_me_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.delete_message_for_me_action.take()
                 && let Some((message_id, from_me, participant_jid)) =
                     parse_message_key_fields(kind, &m.index)
             {
@@ -318,7 +318,7 @@ pub(crate) fn dispatch_chat_mutation(
                         .message_id(message_id)
                         .from_me(from_me)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -1323,7 +1323,7 @@ mod registry_tests {
         let seen: Arc<Mutex<Vec<Arc<Event>>>> = Arc::new(Mutex::new(Vec::new()));
         bus.subscribe_handler(Arc::new(Recorder(seen.clone())))
             .detach();
-        let handled = dispatch_chat_mutation(&bus, m, full_sync);
+        let handled = dispatch_chat_mutation(&bus, &mut m.clone(), full_sync);
         let events = seen.lock().unwrap().clone();
         (handled, events)
     }

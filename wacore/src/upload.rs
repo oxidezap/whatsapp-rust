@@ -600,7 +600,9 @@ pub fn encrypt_media_with_key_and_sidecar(
         Some(key) => MediaEncryptor::with_key_and_sidecar(*key, media_type, want_sidecar)?,
         None => MediaEncryptor::new_with_sidecar(media_type, want_sidecar)?,
     };
-    let mut data_to_upload = Vec::new();
+    // Exact up front: the doubling ladder from an empty Vec copied a 16 MiB
+    // video twice over on its way to 32 MiB of capacity.
+    let mut data_to_upload = Vec::with_capacity(encrypted_len(plaintext.len()));
     enc.update(plaintext, &mut data_to_upload);
     let info = enc.finalize(&mut data_to_upload)?;
     Ok(EncryptedMedia {

@@ -76,6 +76,27 @@ fn media_encrypt_video_10mb_with_sidecar(bencher: Bencher) {
     bench_encrypt(bencher, 10 * MB, MediaType::Video, true);
 }
 
+/// The buffered upload API on the same 10 MiB video, output buffer included:
+/// what a caller of `encrypt_media` pays, growth of the ciphertext `Vec` and
+/// all, where the arm above measures the crypto into a pre-sized buffer.
+#[divan::bench]
+fn media_encrypt_video_10mb_buffered_api(bencher: Bencher) {
+    let plaintext = payload(10 * MB);
+    bencher
+        .counter(BytesCount::new(plaintext.len()))
+        .bench(|| {
+            black_box(
+                encrypt_media_with_key_and_sidecar(
+                    black_box(&plaintext),
+                    MediaType::Video,
+                    Some(&MEDIA_KEY),
+                    None,
+                )
+                .unwrap(),
+            )
+        });
+}
+
 /// The streaming upload path: 8 KiB reads, encrypt, flush whole runs to the
 /// writer. A `Vec` writer keeps this a measurement of crypto plus buffer
 /// traffic; against a real `File` the write batching is worth much more.

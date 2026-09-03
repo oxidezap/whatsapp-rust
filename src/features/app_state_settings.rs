@@ -19,7 +19,7 @@ use waproto::whatsapp as wa;
 /// Returns `true` if handled, `false` if the mutation is not one of them.
 pub(crate) fn dispatch_app_state_setting_mutation(
     event_bus: &wacore::types::events::CoreEventBus,
-    m: &Mutation,
+    m: &mut Mutation,
     full_sync: bool,
 ) -> bool {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
@@ -37,15 +37,15 @@ pub(crate) fn dispatch_app_state_setting_mutation(
 
     // WA Web counts a mutation whose `isPreviewsDisabled` is absent as a
     // malformed action value and applies nothing, so there is no flag to report.
-    if let Some(val) = &m.action_value
-        && let Some(act) = val.privacy_setting_disable_link_previews_action.as_option()
+    if let Some(val) = &mut m.action_value
+        && let Some(act) = val.privacy_setting_disable_link_previews_action.take()
         && let Some(disabled) = act.is_previews_disabled
     {
         event_bus.dispatch(Event::DisableLinkPreviewsUpdate(
             DisableLinkPreviewsUpdate::builder()
                 .previews_disabled(disabled)
                 .timestamp(time)
-                .action(Box::new(act.clone()))
+                .action(Box::new(act))
                 .from_full_sync(full_sync)
                 .build(),
         ));
@@ -125,7 +125,7 @@ mod tests {
         let bus = CoreEventBus::new();
         let rec = Arc::new(Recorder::default());
         bus.subscribe_handler(rec.clone()).detach();
-        let handled = dispatch_app_state_setting_mutation(&bus, m, false);
+        let handled = dispatch_app_state_setting_mutation(&bus, &mut m.clone(), false);
         let events = rec.events.lock().unwrap().clone();
         (handled, events)
     }

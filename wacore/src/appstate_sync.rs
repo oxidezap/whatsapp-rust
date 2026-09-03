@@ -72,16 +72,13 @@ pub fn collect_unique_index_macs(mutations: &[wa::SyncdMutation]) -> Vec<IndexMa
 const MAC_DEDUP_SCAN_LIMIT: usize = 64;
 
 fn lookup_app_state_key(
-    keys_map: &HashMap<String, Arc<ExpandedAppStateKeys>>,
+    keys_map: &HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>,
     key_id: &[u8],
 ) -> Result<Arc<ExpandedAppStateKeys>, crate::appstate::AppStateError> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD_NO_PAD;
-    let id_b64 = STANDARD_NO_PAD.encode(key_id);
     // Return the Arc (refcount bump) instead of deep-cloning the 160-byte
     // ExpandedAppStateKeys; the callback runs once per mutation (up to ~1000/patch).
     keys_map
-        .get(&id_b64)
+        .get(key_id)
         .map(Arc::clone)
         .ok_or(crate::appstate::AppStateError::KeyNotFound)
 }
@@ -101,7 +98,7 @@ fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) ->
     {
         let data =
             download(ext).with_context(|| format!("download external snapshot for {name:?}"))?;
-        let snapshot = waproto::codec::syncd_snapshot_decode(data.as_slice())
+        let snapshot = waproto::codec::syncd_snapshot_decode(&data)
             .with_context(|| format!("decode external snapshot for {name:?}"))?;
         pl.snapshot = Some(snapshot);
     }
@@ -115,18 +112,25 @@ fn download_external_blobs(pl: &mut PatchList, download: &BlobDownloadFn<'_>) ->
                 .unwrap_or(0);
             let data = download(ext)
                 .with_context(|| format!("download external mutations for {name:?} v{v}"))?;
-            let ext_mutations = waproto::codec::syncd_mutations_decode(data.as_slice())
+            let ext_mutations = waproto::codec::syncd_mutations_decode(&data)
                 .with_context(|| format!("decode external mutations for {name:?} v{v}"))?;
             patch.mutations = ext_mutations.mutations;
+            // Consumed: the reference is what marks a patch as still external,
+            // so leaving it would make the next pass (`missing_key_ids_after_inline`
+            // runs before `process_one_patch_list`) download and decode the
+            // blob — routinely multi-MB — a second time.
+            patch.external_mutations = buffa::MessageField::none();
         }
     }
     Ok(())
 }
 
 /// External-blob resolver as a trait object, so the large download/decode/apply
-/// bodies below instantiate once instead of per closure type.
+/// bodies below instantiate once instead of per closure type. Returns `Bytes`
+/// so a resolver serving from a prefetch map hands out a refcount instead of
+/// copying the blob.
 pub type BlobDownloadFn<'a> =
-    dyn Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync + 'a;
+    dyn Fn(&wa::ExternalBlobReference) -> Result<bytes::Bytes> + Send + Sync + 'a;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -172,7 +176,9 @@ pub enum RecoveryOutcome {
 pub struct AppStateProcessor {
     pub backend: Arc<dyn Backend>,
     pub runtime: Arc<dyn crate::runtime::Runtime>,
-    key_cache: Arc<Mutex<HashMap<String, Arc<ExpandedAppStateKeys>>>>,
+    /// Keyed by the raw key id: the lookup runs once per mutation, and a
+    /// base64 key meant encoding (and allocating) the id for every one of them.
+    key_cache: Arc<Mutex<HashMap<Vec<u8>, Arc<ExpandedAppStateKeys>>>>,
     /// Collections a recovery has been asked of the primary for.
     ///
     /// Held here rather than beside the connection because it has to outlive the
@@ -345,14 +351,17 @@ impl AppStateProcessor {
     ) -> std::result::Result<Arc<ExpandedAppStateKeys>, AppStateSyncError> {
         use base64::Engine;
         use base64::engine::general_purpose::STANDARD_NO_PAD;
-        let id_b64 = STANDARD_NO_PAD.encode(key_id);
-        if let Some(cached) = self.key_cache.lock().await.get(&id_b64).cloned() {
+        if let Some(cached) = self.key_cache.lock().await.get(key_id).cloned() {
             return Ok(cached);
         }
         let key_opt = self.backend.get_sync_key(key_id).await?;
-        let key = key_opt.ok_or_else(|| AppStateSyncError::KeyNotFound(id_b64.clone()))?;
+        let key = key_opt
+            .ok_or_else(|| AppStateSyncError::KeyNotFound(STANDARD_NO_PAD.encode(key_id)))?;
         let expanded = Arc::new(expand_app_state_keys(&key.key_data));
-        self.key_cache.lock().await.insert(id_b64, expanded.clone());
+        self.key_cache
+            .lock()
+            .await
+            .insert(key_id.to_vec(), expanded.clone());
         Ok(expanded)
     }
 
@@ -1138,7 +1147,7 @@ mod external_blob_tests {
             direct_path: Some("/blob".into()),
             ..Default::default()
         }));
-        let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Err(anyhow!("simulated failure"))
         };
         assert!(download_external_blobs(&mut pl, &download).is_err());
@@ -1152,8 +1161,9 @@ mod external_blob_tests {
             direct_path: Some("/blob".into()),
             ..Default::default()
         }));
-        let download =
-            |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> { Ok(vec![0xFF, 0xFF, 0xFF]) };
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
+            Ok(bytes::Bytes::from_static(&[0xFF, 0xFF, 0xFF]))
+        };
         assert!(download_external_blobs(&mut pl, &download).is_err());
     }
 
@@ -1174,16 +1184,47 @@ mod external_blob_tests {
             snapshot_ref: None,
             error: None,
         };
-        let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
             Err(anyhow!("simulated failure"))
         };
         assert!(download_external_blobs(&mut pl, &download).is_err());
     }
 
+    /// The missing-key probe inlines before `process_one_patch_list` inlines
+    /// again; the second pass must find nothing left to fetch.
+    #[test]
+    fn external_mutations_are_fetched_once() {
+        let mut pl = PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches: vec![wa::SyncdPatch {
+                external_mutations: buffa::MessageField::some(wa::ExternalBlobReference {
+                    direct_path: Some("/mutations".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+        let fetches = std::sync::atomic::AtomicUsize::new(0);
+        // An empty buffer decodes as a `SyncdMutations` with no mutations.
+        let download = |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
+            fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(bytes::Bytes::new())
+        };
+        download_external_blobs(&mut pl, &download).expect("first inline");
+        download_external_blobs(&mut pl, &download).expect("second inline");
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(pl.patches[0].external_mutations.is_unset());
+    }
+
     #[test]
     fn no_external_refs_is_ok() {
         let mut pl = pl_with_snapshot_ref(None);
-        let download = |_: &wa::ExternalBlobReference| -> Result<Vec<u8>> { Ok(Vec::new()) };
+        let download =
+            |_: &wa::ExternalBlobReference| -> Result<bytes::Bytes> { Ok(bytes::Bytes::new()) };
         assert!(download_external_blobs(&mut pl, &download).is_ok());
     }
 }

@@ -1493,7 +1493,8 @@ mod tests {
             error: None,
         };
 
-        let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<Vec<u8>> {
+        let snapshot_bytes = bytes::Bytes::from(snapshot_bytes);
+        let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<bytes::Bytes> {
             Ok(snapshot_bytes.clone())
         };
 

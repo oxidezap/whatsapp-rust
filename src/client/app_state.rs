@@ -831,7 +831,7 @@ impl Client {
     async fn pre_download_external_blobs(
         &self,
         patch_lists: &[wacore::appstate::patch_decode::PatchList],
-    ) -> HashMap<String, Vec<u8>> {
+    ) -> HashMap<String, bytes::Bytes> {
         use futures::StreamExt;
 
         // Kept only so a failed download logs the right message (snapshot vs patch).
@@ -891,7 +891,9 @@ impl Client {
                         debug!(target: "Client/AppState", "Downloaded external snapshot ({} bytes)", bytes.len());
                     }
                     if let Some(path) = path {
-                        pre_downloaded.insert(path, bytes);
+                        // `Bytes::from(Vec)` moves; the resolvers below then
+                        // hand out refcounts instead of copying the blob.
+                        pre_downloaded.insert(path, bytes::Bytes::from(bytes));
                     }
                 }
                 Err(e) => match kind {
@@ -2125,7 +2127,7 @@ impl Client {
             // concurrently (independent CDN GETs, keyed by directPath).
             let pre_downloaded = self.pre_download_external_blobs(&patch_lists).await;
 
-            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
                 if let Some(path) = &ext.direct_path {
                     if let Some(bytes) = pre_downloaded.get(path) {
                         Ok(bytes.clone())
@@ -2323,8 +2325,8 @@ impl Client {
                 // the set, which is what keeps it from reading as a full sync.
                 let full_sync = replaying_snapshot.contains(&name);
                 wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                for m in mutations {
-                    self.dispatch_app_state_mutation(&m, full_sync).await;
+                for mut m in mutations {
+                    self.dispatch_app_state_mutation(&mut m, full_sync).await;
                 }
 
                 // No version write here. `process_one_patch_list` already
@@ -2512,7 +2514,7 @@ impl Client {
                 .pre_download_external_blobs(std::slice::from_ref(&pl))
                 .await;
 
-            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
                 if let Some(path) = &ext.direct_path {
                     if let Some(bytes) = pre_downloaded.get(path) {
                         Ok(bytes.clone())
@@ -2577,9 +2579,9 @@ impl Client {
                 .await;
 
             wacore::telemetry::appstate_mutations(mutations.len() as u64);
-            for m in mutations {
+            for mut m in mutations {
                 debug!(target: "Client/AppState", "Dispatching mutation kind={} index_len={} full_sync={}", m.index.first().map(|s| s.as_str()).unwrap_or(""), m.index.len(), full_sync);
-                self.dispatch_app_state_mutation(&m, full_sync).await;
+                self.dispatch_app_state_mutation(&mut m, full_sync).await;
             }
 
             // A collection the server refused advances nothing: the processor
@@ -3142,7 +3144,7 @@ impl Client {
             let pre_downloaded = self
                 .pre_download_external_blobs(std::slice::from_ref(&list))
                 .await;
-            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
                 let path = ext
                     .direct_path
                     .as_ref()
@@ -3161,8 +3163,8 @@ impl Client {
                 // clean apply.
                 Ok((mutations, _, list)) => {
                     wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                    for m in &mutations {
-                        self.dispatch_app_state_mutation(m, false).await;
+                    for mut m in mutations {
+                        self.dispatch_app_state_mutation(&mut m, false).await;
                     }
                     if let Some(refused) = &list.error {
                         debug!(
@@ -3433,8 +3435,8 @@ impl Client {
                 // would lose a mute or an archive for good. And what they
                 // describe is the account, not the session that learned it,
                 // which is why the ordinary sync path dispatches the same way.
-                for m in &mutations {
-                    self.dispatch_app_state_mutation(m, true).await;
+                for mut m in mutations {
+                    self.dispatch_app_state_mutation(&mut m, true).await;
                 }
             }
             Ok(wacore::appstate_sync::RecoveryOutcome::Retired) => {
@@ -3548,9 +3550,12 @@ impl Client {
         }
     }
 
+    /// `&mut` so a dispatcher can move the action out of the mutation into
+    /// its event instead of deep-cloning it: a full sync dispatches every
+    /// mutation of every collection through here.
     pub(crate) async fn dispatch_app_state_mutation(
         &self,
-        m: &crate::appstate_sync::Mutation,
+        m: &mut crate::appstate_sync::Mutation,
         full_sync: bool,
     ) {
         use wacore::types::events::Event;

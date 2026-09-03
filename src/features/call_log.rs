@@ -54,7 +54,7 @@ use waproto::whatsapp as wa;
 /// it on the mutations it is not.
 pub(crate) fn dispatch_call_log_mutation(
     event_bus: &wacore::types::events::CoreEventBus,
-    m: &Mutation,
+    m: &mut Mutation,
     full_sync: bool,
     is_own_jid: impl FnOnce(&Jid) -> bool,
 ) -> bool {
@@ -93,9 +93,9 @@ pub(crate) fn dispatch_call_log_mutation(
 
     let Some(record) = m
         .action_value
-        .as_ref()
-        .and_then(|value| value.call_log_action.as_option())
-        .and_then(|action| action.call_log_record.as_option())
+        .as_mut()
+        .and_then(|value| value.call_log_action.as_option_mut())
+        .and_then(|action| action.call_log_record.take())
     else {
         log::warn!("Skipping call_log mutation for {call_id}: missing record in action value");
         return true;
@@ -107,7 +107,7 @@ pub(crate) fn dispatch_call_log_mutation(
             .call_id(call_id)
             .from_me(from_me)
             .timestamp(timestamp)
-            .record(Box::new(record.clone()))
+            .record(Box::new(record))
             .from_full_sync(full_sync)
             .build(),
     ));
@@ -179,7 +179,8 @@ mod tests {
         let bus = CoreEventBus::new();
         let recorder = Arc::new(Recorder::default());
         bus.subscribe_handler(recorder.clone()).detach();
-        let handled = dispatch_call_log_mutation(&bus, mutation, full_sync, is_own_jid);
+        let handled =
+            dispatch_call_log_mutation(&bus, &mut mutation.clone(), full_sync, is_own_jid);
         let events = recorder.events.lock().unwrap().clone();
         (handled, events)
     }

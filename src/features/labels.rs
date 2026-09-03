@@ -27,7 +27,7 @@ use waproto::whatsapp as wa;
 /// Returns `true` if handled, `false` if the mutation is not a label kind.
 pub(crate) fn dispatch_label_mutation(
     event_bus: &wacore::types::events::CoreEventBus,
-    m: &Mutation,
+    m: &mut Mutation,
     full_sync: bool,
 ) -> bool {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set || m.index.is_empty() {
@@ -53,14 +53,14 @@ pub(crate) fn dispatch_label_mutation(
 
     match kind {
         "label_edit" => {
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.label_edit_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.label_edit_action.take()
             {
                 event_bus.dispatch(Event::LabelEditUpdate(
                     LabelEditUpdate::builder()
                         .label_id(label_id)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -78,8 +78,8 @@ pub(crate) fn dispatch_label_mutation(
                 log::warn!("Skipping label_message mutation: missing or empty message id in index");
                 return true;
             };
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.label_association_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.label_association_action.take()
             {
                 event_bus.dispatch(Event::MessageLabelAssociationUpdate(
                     MessageLabelAssociationUpdate::builder()
@@ -87,7 +87,7 @@ pub(crate) fn dispatch_label_mutation(
                         .chat_jid(chat_jid)
                         .message_id(message_id)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -98,15 +98,15 @@ pub(crate) fn dispatch_label_mutation(
             let Some(chat_jid) = parse_association_chat_jid(kind, &m.index) else {
                 return true;
             };
-            if let Some(val) = &m.action_value
-                && let Some(act) = val.label_association_action.as_option()
+            if let Some(val) = &mut m.action_value
+                && let Some(act) = val.label_association_action.take()
             {
                 event_bus.dispatch(Event::LabelAssociationUpdate(
                     LabelAssociationUpdate::builder()
                         .label_id(label_id)
                         .chat_jid(chat_jid)
                         .timestamp(time)
-                        .action(Box::new(act.clone()))
+                        .action(Box::new(act))
                         .from_full_sync(full_sync)
                         .build(),
                 ));
@@ -376,7 +376,7 @@ mod tests {
         let bus = CoreEventBus::new();
         let rec = Arc::new(Recorder::default());
         bus.subscribe_handler(rec.clone()).detach();
-        let handled = dispatch_label_mutation(&bus, m, false);
+        let handled = dispatch_label_mutation(&bus, &mut m.clone(), false);
         let events = rec.events.lock().unwrap().clone();
         (handled, events)
     }

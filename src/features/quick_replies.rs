@@ -22,7 +22,7 @@ use waproto::whatsapp as wa;
 /// Returns `true` if handled, `false` if the mutation is not a quick reply.
 pub(crate) fn dispatch_quick_reply_mutation(
     event_bus: &wacore::types::events::CoreEventBus,
-    m: &Mutation,
+    m: &mut Mutation,
     full_sync: bool,
 ) -> bool {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
@@ -43,14 +43,14 @@ pub(crate) fn dispatch_quick_reply_mutation(
         .unwrap_or(0);
     let time = wacore::time::from_millis_or_now(ts);
 
-    if let Some(val) = &m.action_value
-        && let Some(act) = val.quick_reply_action.as_option()
+    if let Some(val) = &mut m.action_value
+        && let Some(act) = val.quick_reply_action.take()
     {
         event_bus.dispatch(Event::QuickReplyUpdate(
             QuickReplyUpdate::builder()
                 .id(id)
                 .timestamp(time)
-                .action(Box::new(act.clone()))
+                .action(Box::new(act))
                 .from_full_sync(full_sync)
                 .build(),
         ));
@@ -197,7 +197,7 @@ mod tests {
         let bus = CoreEventBus::new();
         let rec = Arc::new(Recorder::default());
         bus.subscribe_handler(rec.clone()).detach();
-        let handled = dispatch_quick_reply_mutation(&bus, m, false);
+        let handled = dispatch_quick_reply_mutation(&bus, &mut m.clone(), false);
         let events = rec.events.lock().unwrap().clone();
         (handled, events)
     }
