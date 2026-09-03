@@ -564,6 +564,15 @@ pub struct StorageResourceReport {
     /// Pages/entries currently backing the store, when known (SQLite: database
     /// page count). A size indicator, not part of the memory total.
     pub pages: Option<u64>,
+    /// How many of [`Self::pages`] are on the store's free list, when known
+    /// (SQLite: `freelist_count`). Deleted rows hand their pages here, not back
+    /// to the filesystem, so this is the part of the file the retention sweeps
+    /// have already emptied and only a `VACUUM` would return.
+    pub free_pages: Option<u64>,
+    /// Bytes the write-ahead log occupies on disk, when known. Not part of the
+    /// memory total: it is file size, and it is the figure that shows whether a
+    /// single huge transaction has left the log permanently large.
+    pub wal_bytes: Option<u64>,
     /// Bytes read from the backing store this session, if the backend counts it.
     pub io_read_bytes: Option<u64>,
     /// Bytes written to the backing store this session, if the backend counts it.

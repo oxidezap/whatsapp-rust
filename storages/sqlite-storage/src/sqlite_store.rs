@@ -489,6 +489,13 @@ impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
             format!("PRAGMA cache_size = -{};", self.cache_size_kib),
             "PRAGMA temp_store = memory;".to_string(),
             "PRAGMA foreign_keys = ON;".to_string(),
+            // A WAL grows to the largest single transaction ever committed and,
+            // with no limit set, stays that size for the life of the file: an
+            // auto-checkpoint only resets the WAL, it never shortens it. The
+            // history-sync msg_secrets seed is one such transaction, so a
+            // month-long process pays its peak forever. 32 MiB is well above any
+            // ordinary commit here, so the cap only ever trims the outlier.
+            "PRAGMA journal_size_limit = 33554432;".to_string(),
         ];
         // Opt-in: emit mmap_size only for a non-zero value, so the default keeps
         // SQLite's mmap off (current behavior).
@@ -4279,6 +4286,33 @@ impl DeviceStore for SqliteStore {
         Ok(())
     }
 
+    async fn maintenance(&self) -> Result<()> {
+        self.with_retry("maintenance", || {
+            Box::new(move |conn: &mut SqliteConnection| {
+                // Caps how many index rows each ANALYZE samples. Without it the
+                // first `optimize` over a table with hundreds of thousands of
+                // rows scans whole indexes; with it the pass stays in
+                // milliseconds, which is what makes it safe on a live connection.
+                diesel::sql_query("PRAGMA analysis_limit = 400;").execute(conn)?;
+                // A no-op unless a table has changed materially since the last
+                // ANALYZE, so calling it every pass costs nothing on an idle
+                // database and keeps query plans honest as tables grow past the
+                // sizes the built-in heuristics assume.
+                diesel::sql_query("PRAGMA optimize;").execute(conn)?;
+                // Opportunistic: TRUNCATE is the only checkpoint mode that
+                // returns the -wal file's blocks to the filesystem, and it
+                // declines rather than blocks when a reader still holds a
+                // snapshot (the reader pool, or another process). It reports that
+                // by returning busy in its result row, and on some builds as
+                // SQLITE_BUSY, so a skipped truncate is the normal outcome and
+                // never a reason to fail the pass.
+                let _ = diesel::sql_query("PRAGMA wal_checkpoint(TRUNCATE);").execute(conn);
+                Ok(())
+            })
+        })
+        .await
+    }
+
     /// Per-session storage memory, the largest per-session chunk in the
     /// profiling that motivated this (the default 512 KiB page cache).
     ///
@@ -4303,6 +4337,7 @@ impl DeviceStore for SqliteStore {
         // pool's, so a report that counted only one pool would under-state a
         // read-enabled store by the whole reader side.
         let read_pool = self.reads.as_ref().map(|reads| reads.pool.clone());
+        let database_path = self.database_path.clone();
         crate::pool::spawn_blocking(move || {
             // Non-blocking checkout: this report is best-effort, so contention
             // (e.g. a long write holding the only connection) degrades to "not
@@ -4339,6 +4374,15 @@ impl DeviceStore for SqliteStore {
             wacore::stats::StorageResourceReport {
                 memory_bytes: Some(per_conn_cache.saturating_mul(open_connections)),
                 pages: Some(page_count),
+                // Both are separately optional: a missing one is "not reported",
+                // and neither is worth discarding the memory estimate over.
+                free_pages: pragma_i64(&mut conn, "freelist_count").map(|n| n.max(0) as u64),
+                // The WAL is a sidecar file, so its size comes from the
+                // filesystem rather than a pragma. Absent for in-memory and
+                // non-WAL databases, which is exactly the honest answer there.
+                wal_bytes: std::fs::metadata(format!("{database_path}-wal"))
+                    .ok()
+                    .map(|m| m.len()),
                 ..Default::default()
             }
         })
@@ -7576,6 +7620,87 @@ mod share_for_device_tests {
             slowest < fastest * 10 + Duration::from_secs(1),
             "no sibling may starve on the shared write queue: \
              fastest {fastest:?}, slowest {slowest:?}"
+        );
+    }
+}
+
+/// Periodic engine maintenance: the WAL cap and the `maintenance()` pass.
+#[cfg(test)]
+mod maintenance_tests {
+    use super::read_routing_tests::TempDb;
+    use super::*;
+
+    /// The `-wal` sidecar's size, or 0 when it has already been truncated away.
+    fn wal_bytes(db: &TempDb) -> u64 {
+        std::fs::metadata(format!("{}-wal", db.url()))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_fresh_store_runs_maintenance_and_caps_its_wal() {
+        let db = TempDb::new("maintenance_fresh");
+        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+
+        #[derive(diesel::QueryableByName)]
+        struct Limit {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            journal_size_limit: i64,
+        }
+        let mut conn = store.pool.get().expect("connection");
+        let limit: Limit = diesel::sql_query("PRAGMA journal_size_limit")
+            .get_result(&mut *conn)
+            .expect("read journal_size_limit");
+        assert_eq!(
+            limit.journal_size_limit, 33_554_432,
+            "on_acquire caps the WAL at 32 MiB"
+        );
+        drop(conn);
+
+        DeviceStore::maintenance(&store)
+            .await
+            .expect("maintenance succeeds on a fresh store");
+    }
+
+    /// A single large transaction is what leaves a WAL permanently big, so this
+    /// writes one and then checks that the pass hands the space back.
+    #[tokio::test]
+    async fn a_large_batch_leaves_no_oversized_wal_after_maintenance() {
+        const ROWS: u64 = 100_000;
+        const LIMIT: u64 = 33_554_432;
+
+        let db = TempDb::new("maintenance_wal");
+        let store = SqliteStore::new(&db.url()).await.expect("store opens");
+        let entries: Vec<MsgSecretEntry> = (0..ROWS)
+            .map(|i| MsgSecretEntry {
+                chat: Arc::from(format!("1904555{:04}@s.whatsapp.net", i % 10_000).as_str()),
+                sender: Arc::from("100000000000002@lid"),
+                msg_id: Arc::from(format!("MSG{i:016X}").as_str()),
+                secret: [0x7A; wacore::reporting_token::MESSAGE_SECRET_SIZE],
+                expires_at: 0,
+                message_ts: 1_700_000_000,
+            })
+            .collect();
+        store.put_msg_secrets(entries).await.expect("seed secrets");
+
+        DeviceStore::maintenance(&store)
+            .await
+            .expect("maintenance succeeds");
+
+        let after = wal_bytes(&db);
+        assert!(
+            after <= LIMIT,
+            "the WAL must be back under the 32 MiB cap, was {after} bytes"
+        );
+
+        // The same figures an operator would read out of `resource_report`.
+        let report = DeviceStore::resource_report(&store).await;
+        assert!(report.pages.is_some_and(|p| p > 0), "page count reported");
+        assert!(report.free_pages.is_some(), "freelist reported");
+        assert_eq!(
+            report.wal_bytes,
+            Some(after),
+            "the report's WAL size is the file's"
         );
     }
 }

@@ -24,6 +24,14 @@ use wacore::protocol::keepalive::{
 /// callers could not promise.
 const MAINTENANCE_TICKS: u32 = ticks_for(6 * 60 * 60);
 
+/// Keepalive ticks between two storage-engine maintenance passes (~1 h).
+///
+/// Its own, shorter cadence than [`MAINTENANCE_TICKS`]: the backend pass is
+/// local work with no IQ behind it, and the WAL truncation half only takes
+/// effect on a pass that finds no reader holding a snapshot, so trying more
+/// often is how it eventually succeeds.
+const ENGINE_MAINTENANCE_TICKS: u32 = ticks_for(60 * 60);
+
 /// Keepalive ticks that cover `period_secs`, at the midpoint of the randomized
 /// interval.
 const fn ticks_for(period_secs: u64) -> u32 {
@@ -151,6 +159,7 @@ impl Client {
         let mut error_count = 0u32;
         let mut cleanup_counter = 0u32;
         let mut maintenance_counter = 0u32;
+        let mut engine_maintenance_counter = 0u32;
         let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
         // Capture the per-connection signal once — re-subscribing each iteration
         // would let a racing reset_connection_shutdown swap the underlying
@@ -195,6 +204,12 @@ impl Client {
                     if maintenance_counter >= MAINTENANCE_TICKS {
                         maintenance_counter = 0;
                         self.spawn_session_maintenance();
+                    }
+
+                    engine_maintenance_counter += 1;
+                    if engine_maintenance_counter >= ENGINE_MAINTENANCE_TICKS {
+                        engine_maintenance_counter = 0;
+                        self.spawn_engine_maintenance();
                     }
 
                     // Same reason as the retention sweep above: driven by the
@@ -361,6 +376,21 @@ impl Client {
             .detach();
     }
 
+    /// Storage-engine upkeep: whatever the backend needs to stay in shape over
+    /// a session measured in weeks. A no-op for backends that don't implement
+    /// it, and cheap enough for a live connection by contract
+    /// (`DeviceStore::maintenance`).
+    fn spawn_engine_maintenance(&self) {
+        let backend = self.persistence_manager.backend();
+        self.runtime
+            .spawn(Box::pin(async move {
+                if let Err(e) = backend.maintenance().await {
+                    warn!(target: "Client/Keepalive", "Storage maintenance error: {e}");
+                }
+            }))
+            .detach();
+    }
+
     /// The body of [`Self::spawn_session_maintenance`]; separate so a test can
     /// await the pass instead of racing a detached task.
     pub(crate) async fn run_session_maintenance(&self, generation: u64) {
@@ -409,6 +439,24 @@ mod tests {
         assert!(
             (6 * 3600..=12 * 3600).contains(&slowest),
             "slowest maintenance period was {slowest}s"
+        );
+    }
+
+    // The engine pass is the shorter of the two cadences, and deliberately so:
+    // its WAL truncation only lands on a pass that finds no reader holding a
+    // snapshot.
+    #[test]
+    fn the_engine_cadence_is_shorter_than_the_session_cadence() {
+        const { assert!(ENGINE_MAINTENANCE_TICKS < MAINTENANCE_TICKS) };
+        let fastest = ENGINE_MAINTENANCE_TICKS as u64 * KEEP_ALIVE_INTERVAL_MIN.as_secs();
+        let slowest = ENGINE_MAINTENANCE_TICKS as u64 * KEEP_ALIVE_INTERVAL_MAX.as_secs();
+        assert!(
+            (30 * 60..=3600).contains(&fastest),
+            "fastest engine period was {fastest}s"
+        );
+        assert!(
+            (3600..=2 * 3600).contains(&slowest),
+            "slowest engine period was {slowest}s"
         );
     }
 

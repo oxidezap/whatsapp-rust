@@ -1220,6 +1220,22 @@ pub trait DeviceStore: Send + Sync {
     async fn resource_report(&self) -> crate::stats::StorageResourceReport {
         crate::stats::StorageResourceReport::default()
     }
+
+    /// Periodic engine upkeep the client calls on a coarse timer (roughly
+    /// hourly) while connected — statistics refresh, log truncation, whatever a
+    /// backend needs to stay in shape across a session measured in weeks rather
+    /// than minutes.
+    ///
+    /// Defaulted to a no-op and placed on `DeviceStore` for the same reason as
+    /// [`Self::resource_report`]: a default on an already-implemented sub-trait
+    /// composes through `Arc<dyn Backend>` without forcing every external
+    /// backend to add an impl. It must be cheap enough to run on a live
+    /// connection and safe to call when nothing has changed; anything that takes
+    /// an exclusive lock on the whole database (SQLite's `VACUUM`) belongs in an
+    /// explicit embedder call, not here.
+    async fn maintenance(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Per-outbound-message secret storage for addon-style decryption.
