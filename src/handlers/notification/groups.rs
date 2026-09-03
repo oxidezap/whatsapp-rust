@@ -277,7 +277,7 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
                         .has_incomplete_participant_information(
                             notification.has_incomplete_participant_information,
                         )
-                        .action(action)
+                        .action(Box::new(action))
                         .build(),
                 )
             });
