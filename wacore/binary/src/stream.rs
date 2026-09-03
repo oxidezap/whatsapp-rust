@@ -628,4 +628,52 @@ mod tests {
             Err(BinaryError::EmptyData)
         ));
     }
+
+    /// A child the stream skips unread is still held to the tree decoder's
+    /// validation: a string that is not UTF-8, or a packed digit outside the
+    /// nibble alphabet, fails `close` and `finish` as it fails `unmarshal_ref`.
+    #[test]
+    fn skipping_a_malformed_child_fails_like_the_tree_decoder() {
+        let node = NodeBuilder::new("iq")
+            .children(vec![
+                NodeBuilder::new("first").build(),
+                prop(1, "hello"),
+                prop(2, "12345"),
+            ])
+            .build();
+        let packed = marshal(&node).unwrap();
+
+        // "hello" is a BINARY_8 string; a 0xFF inside it is not UTF-8.
+        let mut bad_utf8 = packed.clone();
+        let at = bad_utf8
+            .windows(5)
+            .position(|w| w == b"hello")
+            .expect("the value is stored verbatim");
+        bad_utf8[at] = 0xFF;
+        // "12345" is packed as nibbles 0x12 0x34 0x5F; nibble 0xC is not a digit.
+        let mut bad_nibble = packed.clone();
+        let at = bad_nibble
+            .windows(3)
+            .position(|w| w == [0x12, 0x34, 0x5F])
+            .expect("the digits are nibble-packed");
+        bad_nibble[at] = 0xC2;
+
+        for (name, bytes) in [("utf-8", bad_utf8), ("nibble", bad_nibble)] {
+            assert!(
+                crate::marshal::unmarshal_ref(&bytes[1..]).is_err(),
+                "{name}: the tree decoder must reject the fixture"
+            );
+            let mut stream = NodeStream::from_packed(&bytes).unwrap();
+            stream.open().unwrap().expect("root");
+            stream.open().unwrap().expect("first");
+            stream.close().unwrap();
+            assert!(
+                stream.close().is_err(),
+                "{name}: skipping the rest must fail"
+            );
+
+            let mut stream = NodeStream::from_packed(&bytes).unwrap();
+            assert!(stream.finish().is_err(), "{name}: finish must fail");
+        }
+    }
 }

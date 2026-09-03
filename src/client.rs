@@ -1194,20 +1194,14 @@ impl ResponseWaiterMap {
         request_id: String,
         waiter: ResponseWaiter,
     ) -> Option<NonZeroU64> {
-        use std::collections::hash_map::Entry;
-
-        let generation = self.next_generation();
-        match self.entries.entry(request_id) {
-            Entry::Vacant(entry) => {
-                let streams = matches!(waiter, ResponseWaiter::Stream(_));
-                entry.insert(ResponseWaiterEntry { generation, waiter });
-                if streams {
-                    self.stream_waiters.fetch_add(1, Ordering::AcqRel);
-                }
-                Some(generation)
-            }
-            Entry::Occupied(_) => None,
+        if self.entries.contains_key(&request_id) {
+            return None;
         }
+        let generation = self.next_generation();
+        self.note_added(&waiter);
+        self.entries
+            .insert(request_id, ResponseWaiterEntry { generation, waiter });
+        Some(generation)
     }
 
     pub(crate) fn insert(

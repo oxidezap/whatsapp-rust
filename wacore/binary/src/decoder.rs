@@ -563,23 +563,31 @@ impl<'a> Decoder<'a> {
     /// Walk past one value token without building anything: the measuring
     /// pass of a streaming decode, which has to learn how many bytes a node
     /// takes before it can decode it from a buffer it may still have to grow.
-    /// Mirrors [`Self::read_value`] token for token; the JID forms reuse the
+    ///
+    /// Mirrors [`Self::read_value`] token for token, validation included: a
+    /// string that is not UTF-8 or a packed nibble outside its alphabet is an
+    /// error here as it is there, so a node the stream skips unread is held
+    /// to what the tree decoder would have rejected. The JID forms reuse the
     /// readers because their layout is validation, not just length.
     fn skip_value(&mut self) -> Result<()> {
         let tag = self.read_u8()?;
+        self.skip_value_from_tag(tag)
+    }
+
+    fn skip_value_from_tag(&mut self, tag: u8) -> Result<()> {
         match tag {
             token::LIST_EMPTY => Ok(()),
             token::BINARY_8 => {
                 let size = self.read_u8()? as usize;
-                self.read_bytes(size).map(drop)
+                self.read_string(size).map(drop)
             }
             token::BINARY_20 => {
                 let size = self.read_u20_be()? as usize;
-                self.read_bytes(size).map(drop)
+                self.read_string(size).map(drop)
             }
             token::BINARY_32 => {
                 let size = self.read_u32_be()? as usize;
-                self.read_bytes(size).map(drop)
+                self.read_string(size).map(drop)
             }
             token::JID_PAIR => self.read_jid_pair().map(drop),
             token::AD_JID => self.read_ad_jid().map(drop),
@@ -587,7 +595,18 @@ impl<'a> Decoder<'a> {
             token::FB_JID => self.read_fb_jid().map(drop),
             token::NIBBLE_8 | token::HEX_8 => {
                 let len = (self.read_u8()? & 0x7F) as usize;
-                self.read_bytes(len).map(drop)
+                let packed = self.read_bytes(len)?;
+                // Every byte is a valid hex pair; only nibbles have holes.
+                if tag == token::NIBBLE_8
+                    && let Some(&byte) = packed.iter().find(|&&byte| {
+                        let pair = NIBBLE_PAIRS[byte as usize];
+                        pair[0] == NIBBLE_INVALID || pair[1] == NIBBLE_INVALID
+                    })
+                {
+                    Self::unpack_nibble((byte & 0xF0) >> 4)?;
+                    Self::unpack_nibble(byte & 0x0F)?;
+                }
+                Ok(())
             }
             tag @ token::DICTIONARY_0..=token::DICTIONARY_3 => {
                 let index = self.read_u8()?;
@@ -598,6 +617,27 @@ impl<'a> Decoder<'a> {
             _ => token::get_single_token(tag)
                 .map(drop)
                 .ok_or(BinaryError::InvalidToken(tag)),
+        }
+    }
+
+    /// Walk past a node's scalar content, whose tag has been read. Binary
+    /// content is opaque to [`Self::read_content_from_tag`] too, so only its
+    /// length is checked; anything else is a string value and validated as one.
+    fn skip_scalar_content(&mut self, tag: u8) -> Result<()> {
+        match tag {
+            token::BINARY_8 => {
+                let len = self.read_u8()? as usize;
+                self.read_bytes(len).map(drop)
+            }
+            token::BINARY_20 => {
+                let len = self.read_u20_be()? as usize;
+                self.read_bytes(len).map(drop)
+            }
+            token::BINARY_32 => {
+                let len = self.read_u32_be()? as usize;
+                self.read_bytes(len).map(drop)
+            }
+            _ => self.skip_value_from_tag(tag),
         }
     }
 
@@ -623,9 +663,7 @@ impl<'a> Decoder<'a> {
             token::LIST_EMPTY => Ok(0),
             token::LIST_8 | token::LIST_16 => self.read_list_size(content_tag),
             _ => {
-                // A scalar: step back over the tag and skip it as a value.
-                self.position -= 1;
-                self.skip_value()?;
+                self.skip_scalar_content(content_tag)?;
                 Ok(0)
             }
         }
