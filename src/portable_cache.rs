@@ -37,8 +37,15 @@ struct CacheEntry<V> {
     // matching moka's timer semantics.
     inserted_at: Instant,
     last_accessed_at: Instant,
-    /// FIFO sequence number; the key for this entry in `CacheInner::order`.
+    /// Eviction sequence number; the key for this entry in `CacheInner::order`.
     seq: u64,
+    /// Set by every hit, cleared by the eviction scan: the second-chance bit
+    /// of CLOCK. A hit costs one relaxed store under the read lock; the
+    /// reordering it earns is paid by the eviction that would have dropped
+    /// the entry, which re-queues it at the back instead. Moving the entry
+    /// on the hit itself needed the write lock, and once every entry was
+    /// being moved on every pass a warm read cost three times what it had.
+    referenced: portable_atomic::AtomicBool,
 }
 
 /// One table slot: the key, its hash, and the entry.
@@ -64,7 +71,8 @@ pub(crate) struct CapacityStats {
 
 /// Portable, runtime-agnostic in-process cache.
 ///
-/// - Max capacity with FIFO eviction
+/// - Max capacity with second-chance (CLOCK) eviction: least recently used
+///   leaves first, and a hit costs one atomic store
 /// - TTL (time-to-live) and TTI (time-to-idle)
 /// - Single-flight `get_with`
 ///
@@ -92,9 +100,11 @@ struct CacheInner<K, V> {
     /// the same state, which the `Borrow` contract keeps consistent with `K`.
     hasher: RandomState,
     table: HashTable<Slot<K, V>>,
-    /// FIFO eviction order, `seq -> hash`. Eviction is `pop_first()` (O(log n))
-    /// and a targeted `remove_key` is O(log n) via the entry's stored `seq`.
-    /// The hash plus the seq find the slot in `table`, so no key is stored here.
+    /// Eviction order, `seq -> hash`, oldest first; an entry given a second
+    /// chance is re-keyed to the back. Eviction walks from the front (O(log n)
+    /// per step) and a targeted `remove_key` is O(log n) via the entry's
+    /// stored `seq`. The hash plus the seq find the slot in `table`, so no key
+    /// is stored here.
     ///
     /// Left empty for a cache that has no capacity bound: nothing could ever
     /// pop it, so maintaining it would spend a `BTreeMap` node per entry on a
@@ -160,39 +170,6 @@ where
         self.table.iter().map(|slot| (&slot.key, &slot.entry))
     }
 
-    /// Whether `entry` has aged into the older half of the eviction order and
-    /// is worth moving to the back under the write lock. Half is the
-    /// tolerance: a hot entry then costs one write per `cap / 2` inserts
-    /// instead of one per read, and after a touch it is never among the next
-    /// `cap / 2` evicted. A cache without a bound never renews.
-    fn needs_order_renewal(&self, entry: &CacheEntry<V>, max_capacity: Option<u64>) -> bool {
-        match max_capacity {
-            Some(cap) if self.track_order => self.next_seq.saturating_sub(entry.seq) > cap / 2,
-            _ => false,
-        }
-    }
-
-    /// Move `key`'s entry to the back of the eviction order, if it is still
-    /// the entry observed (a re-insert already gave it a fresh sequence).
-    fn renew_order<Q>(&mut self, key: &Q, observed_seq: u64)
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let hash = self.hash_of(key);
-        let seq = self.next_seq;
-        let Some(slot) = self.table.find_mut(hash, |slot| slot.key.borrow() == key) else {
-            return;
-        };
-        if slot.entry.seq != observed_seq {
-            return;
-        }
-        slot.entry.seq = seq;
-        self.next_seq += 1;
-        self.order.remove(&observed_seq);
-        self.order.insert(seq, hash);
-    }
-
     /// Bytes the table and the eviction order themselves hold, on top of the
     /// entries: hashbrown's buckets (a slot plus a control byte each, at its
     /// power-of-two capacity) and one B-tree node share per ordered entry.
@@ -241,48 +218,58 @@ where
             .is_some()
     }
 
-    /// Evict oldest-first until below `cap`. With an `evict_guard`, skips entries
-    /// the guard reports as held (see [`PortableCacheBuilder::evict_guard`]).
+    /// Evict until below `cap`: oldest first, except that an entry hit since
+    /// it was last considered gets a second chance (its bit is cleared and it
+    /// re-queues at the back), so what leaves is the least recently *used*
+    /// entry rather than the least recently inserted. With an `evict_guard`,
+    /// entries the guard reports as held are skipped so a later lookup cannot
+    /// mint a duplicate; if every entry is held, the cache runs over capacity
+    /// for a while rather than dropping a live one (see
+    /// [`PortableCacheBuilder::evict_guard`]).
     fn evict_to_capacity(&mut self, cap: u64, evict_guard: Option<fn(&V) -> bool>) {
         while self.table.len() as u64 >= cap {
-            match evict_guard {
-                // Unguarded caches keep the single-pass pop_first() fast path.
-                None => match self.order.pop_first() {
-                    Some((seq, hash)) => {
-                        if self.remove_by_seq(hash, seq) {
-                            self.capacity_evictions = self.capacity_evictions.saturating_add(1);
-                        }
+            let mut victim = None;
+            let mut second_chance = Vec::new();
+            for (&seq, &hash) in self.order.iter() {
+                let Some(slot) = self.table.find(hash, |slot| slot.entry.seq == seq) else {
+                    continue;
+                };
+                if evict_guard.is_some_and(|is_evictable| !is_evictable(&slot.entry.value)) {
+                    continue;
+                }
+                if slot
+                    .entry
+                    .referenced
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    second_chance.push((seq, hash));
+                    continue;
+                }
+                victim = Some((seq, hash));
+                break;
+            }
+            // Re-queued entries move behind everything inserted so far, bit
+            // cleared, so each can earn at most one more pass per hit and the
+            // scan cannot cycle.
+            for (seq, hash) in second_chance {
+                let fresh = self.next_seq;
+                self.next_seq += 1;
+                self.order.remove(&seq);
+                if let Some(slot) = self.table.find_mut(hash, |slot| slot.entry.seq == seq) {
+                    slot.entry.seq = fresh;
+                    self.order.insert(fresh, hash);
+                }
+            }
+            match victim {
+                Some((seq, hash)) => {
+                    self.order.remove(&seq);
+                    if self.remove_by_seq(hash, seq) {
+                        self.capacity_evictions = self.capacity_evictions.saturating_add(1);
                     }
-                    None => break,
-                },
-                // Guarded: skip entries a live task still holds so a later lookup
-                // can't mint a duplicate; if every entry is held, allow temporary
-                // over-capacity rather than dropping a live entry.
-                Some(is_evictable) => {
-                    let mut victim = None;
-                    for (&seq, &hash) in self.order.iter() {
-                        if self
-                            .table
-                            .find(hash, |slot| slot.entry.seq == seq)
-                            .is_some_and(|slot| is_evictable(&slot.entry.value))
-                        {
-                            victim = Some((seq, hash));
-                            break;
-                        }
-                    }
-                    match victim {
-                        Some((seq, hash)) => {
-                            self.order.remove(&seq);
-                            if self.remove_by_seq(hash, seq) {
-                                self.capacity_evictions = self.capacity_evictions.saturating_add(1);
-                            }
-                        }
-                        None => {
-                            self.capacity_eviction_blocks =
-                                self.capacity_eviction_blocks.saturating_add(1);
-                            break;
-                        }
-                    }
+                }
+                None => {
+                    self.capacity_eviction_blocks = self.capacity_eviction_blocks.saturating_add(1);
+                    break;
                 }
             }
         }
@@ -319,6 +306,7 @@ where
                     inserted_at: now,
                     last_accessed_at: now,
                     seq,
+                    referenced: portable_atomic::AtomicBool::new(false),
                 },
             },
             |slot| slot.hash,
@@ -556,7 +544,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let (value, renew_at, renew_order) = {
+        let (value, renew_at) = {
             let guard = self.inner.read().await;
             let entry = guard.get(key)?;
             // Read the clock after the lookup: a miss has no timestamp to
@@ -579,31 +567,29 @@ where
                 }
                 return None;
             }
+            if guard.track_order {
+                entry
+                    .referenced
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             (
                 entry.value.clone(),
                 self.needs_tti_renewal(entry, now).then_some(now),
-                guard
-                    .needs_order_renewal(entry, self.max_capacity)
-                    .then_some(entry.seq),
             )
         };
 
-        if renew_at.is_some() || renew_order.is_some() {
+        if let Some(now) = renew_at {
             let mut guard = self.inner.write().await;
             // Re-decide under the lock: the key may have been invalidated (the
             // miss leaves it that way) or already refreshed by a racing renewal
             // or insert, whose newer stamp this lookup must leave alone.
-            if let Some(now) = renew_at
-                && let Some(entry) = guard.get_mut(key)
+            if let Some(entry) = guard.get_mut(key)
                 && self.needs_tti_renewal(entry, now)
             {
                 entry.last_accessed_at = now;
                 #[cfg(test)]
                 self.tti_renewals
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            if let Some(observed_seq) = renew_order {
-                guard.renew_order(key, observed_seq);
             }
         }
 
@@ -906,6 +892,17 @@ where
     }
 
     /// Evict expired entries and clean up unused init locks.
+    /// Test-only read that leaves the second-chance bit alone, so a test can
+    /// observe eviction order without feeding it.
+    #[cfg(test)]
+    async fn get_no_touch<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.inner.read().await.get(key).map(|e| e.value.clone())
+    }
+
     pub async fn run_pending_tasks(&self) {
         let now = self.entry_time();
         let mut guard = self.inner.write().await;
@@ -1153,22 +1150,32 @@ mod tests {
         assert_eq!(cache.entry_count(), 8);
     }
 
-    /// Renewal costs a write lock, so a fresh entry is not renewed on every
-    /// read: only once it has aged into the older half of the order.
+    /// A hit never takes the write lock or moves the entry: the second
+    /// chance is spent by the eviction that reaches it, which re-queues it
+    /// once and drops it the next time round if nothing read it again.
     #[tokio::test]
-    async fn a_fresh_entry_is_not_reordered_on_every_read() {
-        let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(8).build();
+    async fn a_hit_is_spent_by_one_eviction_pass() {
+        let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(4).build();
         cache.insert("a".to_string(), 1).await;
         let seq_before = cache.inner.read().await.get("a").map(|e| e.seq);
-        for _ in 0..3 {
-            cache.get("a").await;
-        }
-        assert_eq!(cache.inner.read().await.get("a").map(|e| e.seq), seq_before);
-        for i in 0..5u32 {
+        cache.get("a").await;
+        assert_eq!(
+            cache.inner.read().await.get("a").map(|e| e.seq),
+            seq_before,
+            "a hit must not reorder under the read lock"
+        );
+        // Filling past capacity reaches `a` first; the hit re-queues it
+        // behind the fillers instead of evicting it.
+        for i in 0..4u32 {
             cache.insert(format!("b{i}"), i).await;
         }
-        cache.get("a").await;
+        assert_eq!(cache.get_no_touch("a").await, Some(1));
         assert!(cache.inner.read().await.get("a").map(|e| e.seq) > seq_before);
+        // Not read since: the next pass over it evicts.
+        for i in 4..8u32 {
+            cache.insert(format!("b{i}"), i).await;
+        }
+        assert_eq!(cache.get_no_touch("a").await, None);
     }
 
     #[tokio::test]
@@ -1222,6 +1229,7 @@ mod tests {
             inserted_at: inserted,
             last_accessed_at: inserted,
             seq: 0,
+            referenced: portable_atomic::AtomicBool::new(false),
         };
 
         assert!(!cache.is_expired(&entry, inserted + tti - Duration::from_nanos(1)));
@@ -1255,6 +1263,7 @@ mod tests {
             inserted_at: stamped,
             last_accessed_at: stamped,
             seq: 0,
+            referenced: portable_atomic::AtomicBool::new(false),
         };
 
         assert!(!cache.needs_tti_renewal(&entry, stamped));
@@ -1295,6 +1304,7 @@ mod tests {
             inserted_at: stamped,
             last_accessed_at: stamped,
             seq: 0,
+            referenced: portable_atomic::AtomicBool::new(false),
         };
 
         // Never late: gone by `real_access + tti` at the very latest.
