@@ -3749,17 +3749,19 @@ mod tests {
             false,
         );
 
-        // Time is not advanced here on purpose: both tasks are parked in their
-        // first backoff sleep, which is exactly the state being asserted about.
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-
-        assert_eq!(
-            Arc::strong_count(&client),
-            before,
-            "a retry parked in its backoff must hold the client weakly"
-        );
+        // Time is not advanced here on purpose: both tasks park in their first
+        // backoff sleep, which is exactly the state being asserted about. Polled
+        // rather than counted in yields, because under a loaded test host the
+        // spawned tasks may not have reached their sleep after any fixed number
+        // of yields; a task that held the client across its backoff would keep
+        // the count above `before` for the whole (minutes-long) sleep, which the
+        // poll's deadline turns into a failure. `<=` tolerates a startup task
+        // releasing its own clone in the meantime.
+        crate::test_utils::poll_until(
+            "both retry schedulers to park in their backoff holding the client weakly",
+            || Arc::strong_count(&client) <= before,
+        )
+        .await;
     }
 
     #[tokio::test]
