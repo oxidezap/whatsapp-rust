@@ -932,21 +932,18 @@ impl AppStateProcessor {
 
             new_mutations.extend(result.mutations);
 
-            // Persist state and MACs
+            // Persist state and MACs: one backend call per patch, so a
+            // transactional backend commits the version with the MACs it
+            // pairs with instead of paying three round trips.
             state.bootstrapped |= !pl.has_more_patches;
             self.backend
-                .set_version(collection_name, state.clone())
+                .commit_patch(
+                    collection_name,
+                    state.clone(),
+                    &result.removed_index_macs,
+                    &result.added_macs,
+                )
                 .await?;
-            if !result.removed_index_macs.is_empty() {
-                self.backend
-                    .delete_mutation_macs(collection_name, &result.removed_index_macs)
-                    .await?;
-            }
-            if !result.added_macs.is_empty() {
-                self.backend
-                    .put_mutation_macs(collection_name, state.version, &result.added_macs)
-                    .await?;
-            }
         }
         pl.patches = processed_patches;
 

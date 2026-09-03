@@ -781,6 +781,33 @@ pub trait AppSyncStore: Send + Sync {
     /// Delete mutation MACs by their index MACs.
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()>;
 
+    /// Persist one applied patch as a unit: the collection's new version, the
+    /// index MACs the patch removed and the MACs it added.
+    ///
+    /// The default issues the three single-purpose writes in that order, so a
+    /// backend without transactions keeps its current behaviour. A backend
+    /// with them should override this with one: a paged incremental sync
+    /// commits hundreds of small patches, and on SQLite each write was its own
+    /// permit, `spawn_blocking` and WAL commit — two thirds of what a small
+    /// patch cost to persist.
+    async fn commit_patch(
+        &self,
+        name: &str,
+        state: HashState,
+        removed_index_macs: &[Vec<u8>],
+        added: &[AppStateMutationMAC],
+    ) -> Result<()> {
+        let version = state.version;
+        self.set_version(name, state).await?;
+        if !removed_index_macs.is_empty() {
+            self.delete_mutation_macs(name, removed_index_macs).await?;
+        }
+        if !added.is_empty() {
+            self.put_mutation_macs(name, version, added).await?;
+        }
+        Ok(())
+    }
+
     /// Delete every mutation MAC for a collection. Called on snapshot re-sync so the
     /// MAC store is rebuilt from the snapshot, matching the ltHash baseline; leftover
     /// entries would corrupt the next patch's ltHash.

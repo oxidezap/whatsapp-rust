@@ -71,9 +71,13 @@ impl<'a> InflateReader<'a> {
     /// record genuinely exceeds it. Allocated per reader, never retained.
     const CHUNK: usize = 64 * 1024;
     /// Cap on retained free-list entries, so concurrently-alive readers on one
-    /// thread don't grow the pool unbounded. Sequential readers are the norm and
-    /// leave one entry parked; the cap only binds when readers nest.
-    const POOL_MAX: usize = 4;
+    /// thread don't grow the pool unbounded. Sequential readers are the norm —
+    /// a bootstrap history sync inflates its blobs one after another — and one
+    /// parked entry is all that case ever checks out, so a deeper pool only
+    /// retains ~46 KB of zlib state per extra slot, per thread that ever
+    /// inflated anything, for the life of the process. Nested readers still
+    /// work; they just build their state instead of finding it parked.
+    const POOL_MAX: usize = 1;
 
     pub fn new(input: &'a [u8], max: u64) -> Self {
         let decomp = INFLATE_POOL.with(|p| p.borrow_mut().pop()).map_or_else(

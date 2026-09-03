@@ -4,7 +4,7 @@ use crate::{
     BinaryError, Node, NodeRef, Result,
     decoder::Decoder,
     encoder::{Encoder, build_marshaled_node_plan, build_marshaled_node_ref_plan},
-    node::{NodeContent, NodeContentRef},
+    node::{NodeContent, NodeContentRef, NodeValue},
 };
 
 const DEFAULT_MARSHAL_CAPACITY: usize = 1024;
@@ -16,6 +16,18 @@ const AUTO_MAX_HINT_CAPACITY: usize = 512 * 1024;
 const AUTO_ATTR_ESTIMATE: usize = 24;
 const AUTO_CHILD_ESTIMATE: usize = 96;
 const AUTO_GRANDCHILD_ESTIMATE: usize = 40;
+
+/// Per node, before its own strings: `write_list_start`'s widest form
+/// (`LIST_16`: tag + u16), plus slack.
+const SHALLOW_NODE_OVERHEAD: usize = 4;
+/// A JID never encodes longer than its user plus the tag, agent, device,
+/// integrator and server-token bytes around it.
+const SHALLOW_JID_OVERHEAD: usize = 12;
+/// Children measured individually before the rest are extrapolated from them.
+const SHALLOW_CHILD_SAMPLE: usize = 32;
+/// Ceiling on the shallow reserve. An estimate this far out is a bug in the
+/// estimator, and past it one `Vec` growth is cheaper than trusting the guess.
+const SHALLOW_MAX_CAPACITY: usize = 4 * 1024 * 1024;
 
 /// Decode node bytes: the buffer without the format byte, which is what the
 /// receive path holds after [`unpack`](crate::util::unpack) and what
@@ -102,6 +114,22 @@ pub fn marshal_exact(node: &Node) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
+/// Serialize a `Node` in one pass, into a buffer reserved from a shallow size
+/// estimate.
+///
+/// The reserve comes from the node's own byte lengths, which bound the
+/// encoding from above: a key, a token value, a JID and a packed id all encode
+/// shorter than they measure, so the sum overshoots by a modest constant and
+/// the write allocates exactly once. An undershoot — a tree whose sampled
+/// children are unrepresentative — costs a `Vec` growth, never a wrong
+/// encoding, which is what lets the estimate sample rather than walk.
+///
+/// Against [`marshal_exact`]: one traversal instead of two, at the price of a
+/// buffer that is a little larger than the payload.
+pub fn marshal_shallow(node: &Node) -> Result<Vec<u8>> {
+    marshal_with_capacity(node, shallow_capacity_node(node))
+}
+
 /// Zero-copy serialization of a `NodeRef` directly into a writer.
 /// This avoids the allocation overhead of converting to an owned `Node` first.
 pub fn marshal_ref_to(node: &NodeRef<'_>, writer: &mut impl Write) -> Result<()> {
@@ -164,6 +192,75 @@ fn marshal_ref_with_capacity(node: &NodeRef<'_>, capacity: usize) -> Result<Vec<
     let mut payload = Vec::with_capacity(capacity);
     marshal_ref_to_vec(node, &mut payload)?;
     Ok(payload)
+}
+
+/// Upper bound on a node's encoded size, from the lengths it already carries.
+///
+/// Breadth is sampled, depth is not. Sampling bounds the walk exactly where the
+/// tree is wide — the fan-out shapes this exists for — while a chain of narrow
+/// nodes is walked in full, because there the estimate costs no more than the
+/// encoder's own recursion over the same nodes and a depth cutoff would guess
+/// at whatever payload sits below it.
+fn shallow_capacity_node(node: &Node) -> usize {
+    let mut estimate = 0;
+    accumulate_shallow_estimate(node, &mut estimate);
+    estimate.min(SHALLOW_MAX_CAPACITY)
+}
+
+/// What a raw string of `len` bytes costs on the wire: the `BINARY_8`/`_20`/
+/// `_32` tag and its length field. Every other encoding of the same string —
+/// a token, a packed id, a JID — is shorter, which is what makes the sum of
+/// these an upper bound rather than a guess.
+#[inline]
+fn shallow_string_estimate(len: usize) -> usize {
+    const BINARY_20_LIMIT: usize = 1 << 20;
+    let header = if len < 256 {
+        2
+    } else if len < BINARY_20_LIMIT {
+        4
+    } else {
+        5
+    };
+    len + header
+}
+
+#[inline]
+fn shallow_value_estimate(value: &NodeValue) -> usize {
+    match value {
+        NodeValue::String(text) => shallow_string_estimate(text.len()),
+        NodeValue::Jid(jid) => jid.user.len() + SHALLOW_JID_OVERHEAD,
+    }
+}
+
+fn accumulate_shallow_estimate(node: &Node, estimate: &mut usize) {
+    *estimate += SHALLOW_NODE_OVERHEAD + shallow_string_estimate(node.tag.len());
+    for (key, value) in node.attrs.iter() {
+        *estimate += shallow_string_estimate(key.len()) + shallow_value_estimate(value);
+    }
+
+    match &node.content {
+        Some(NodeContent::Bytes(bytes)) => *estimate += shallow_string_estimate(bytes.len()),
+        Some(NodeContent::String(text)) => *estimate += shallow_string_estimate(text.len()),
+        Some(NodeContent::Nodes(children)) => {
+            if *estimate >= SHALLOW_MAX_CAPACITY {
+                return;
+            }
+            let sampled = children.len().min(SHALLOW_CHILD_SAMPLE);
+            let before = *estimate;
+            for child in &children[..sampled] {
+                accumulate_shallow_estimate(child, estimate);
+            }
+            // Every child past the sample is charged the sample's mean, rounded
+            // up. A fan-out is homogeneous by construction — one `<to>` per
+            // device — so this lands within the per-node slack; a tree that
+            // hides its bulk past the 32nd child pays one growth for it.
+            let remaining = children.len() - sampled;
+            if remaining > 0 {
+                *estimate += (*estimate - before).div_ceil(sampled) * remaining;
+            }
+        }
+        None => {}
+    }
 }
 
 #[inline]

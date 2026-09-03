@@ -53,8 +53,8 @@ async fn test_expired_chatstate_not_delivered() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Uses `reconnect_immediately()` instead of `reconnect()` to ensure B is offline
-/// for less than the TTL (3s with CHATSTATE_TTL_SECS=3).
+/// Holds B offline only for as long as the send takes, so the window stays
+/// well under the TTL (3s with CHATSTATE_TTL_SECS=3).
 #[tokio::test]
 async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -66,14 +66,19 @@ async fn test_fresh_chatstate_delivered_on_reconnect() -> anyhow::Result<()> {
 
     info!("B={jid_b}");
 
-    // reconnect_immediately() causes near-instant reconnect, keeping B offline
-    // well within the 3s TTL window
-    client_b.client.reconnect_immediately().await;
-    info!("B disconnected (will reconnect immediately)");
-    client_b.wait_for_disconnected(5).await?;
+    // `go_offline` makes the offline window a fact, and closing it right after
+    // the send keeps the window well within the 3s TTL. `reconnect_immediately`
+    // could not: its teardown is awaited inside the call, so the run loop was
+    // often back online before the harness could observe the drop, and the
+    // chatstate then went through the ordinary online path instead of the
+    // offline queue this test is about.
+    client_b.go_offline().await?;
+    info!("B disconnected (held offline until the chatstate is queued)");
 
     client_a.client.chatstate().send_composing(&jid_b).await?;
     info!("A sent typing indicator to offline B");
+
+    client_b.come_back_online();
 
     let event = client_b
         .wait_for_event(15, |e| matches!(e, Event::ChatPresence(_)))

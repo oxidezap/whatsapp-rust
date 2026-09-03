@@ -128,9 +128,12 @@ impl Client {
             self.resolve_sent_node_waiters(&Arc::new(node.clone()));
         }
 
-        // Exact two-pass sizing: typical stanzas are a few hundred bytes, so
-        // the 1 KiB default reserve of the one-pass path mostly over-allocates.
-        wacore_binary::marshal::marshal_exact(&node).map_err(|e| {
+        // One pass over the tree, into a buffer reserved from the node's own
+        // byte lengths. The exact two-pass sizing this replaced bought a
+        // perfectly sized buffer with a second full traversal — and the buffer
+        // is transient (it goes straight into the frame), while the traversal
+        // is paid on every send and grows with the fan-out width.
+        wacore_binary::marshal::marshal_shallow(&node).map_err(|e| {
             error!("Failed to marshal node: {e:?}");
             SocketError::Marshal(e).into()
         })
