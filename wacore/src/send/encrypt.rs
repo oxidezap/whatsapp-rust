@@ -677,12 +677,10 @@ pub async fn ensure_sessions_for_devices_resolved(
     devices: &[Jid],
     signal_addresses: Option<&[Jid]>,
 ) -> Result<SessionPlan> {
-    debug_assert!(
-        signal_addresses.is_none_or(|addrs| addrs.len() == devices.len()),
-        "signal addresses must be parallel to the device list"
-    );
     // A list that is not parallel to `devices` cannot be indexed by device;
-    // resolving per device is always correct, so that is the fallback.
+    // resolving per device is always correct, so that is the fallback in
+    // every build rather than a debug-only assertion that would make a
+    // malformed caller panic in tests and silently degrade in release.
     let signal_addresses = signal_addresses.filter(|addrs| addrs.len() == devices.len());
     // Per-device LID upgrade map: encryption_overrides[i] mirrors devices[i].
     // None = use devices[i] as-is; Some(jid) = use this LID-upgraded version.
