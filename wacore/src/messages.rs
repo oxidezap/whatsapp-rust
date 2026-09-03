@@ -1168,32 +1168,21 @@ pub fn is_sender_key_distribution_only(msg: &mut wa::Message) -> bool {
     only
 }
 
-// Declares the enum and both of its key mappings from a single list, so a wire
-// key can never end up in one direction and not the other.
+// Declares the enum from a single list so the slot count follows the variant
+// count; the wire key itself lives once per variant, in `#[wire = ...]`, and
+// `WireEnum` derives `TryFrom<&str>` and `as_str()` from it.
 macro_rules! message_attrs {
     ($($variant:ident => $key:literal),+ $(,)?) => {
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, crate::WireEnum)]
         enum MessageAttr {
-            $($variant,)+
+            $(
+                #[wire = $key]
+                $variant,
+            )+
         }
 
         impl MessageAttr {
             const COUNT: usize = [$(stringify!($variant)),+].len();
-
-            #[inline]
-            fn from_key(key: &str) -> Option<Self> {
-                match key {
-                    $($key => Some(Self::$variant),)+
-                    _ => None,
-                }
-            }
-
-            #[inline]
-            fn key(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $key,)+
-                }
-            }
         }
     };
 }
@@ -1241,7 +1230,7 @@ impl<'a> MessageAttrs<'a> {
         let mut slots = [None; MessageAttr::COUNT];
         for (key, value) in node.attrs.as_slice() {
             // First occurrence wins, as a scan for the key would have found it.
-            if let Some(attr) = MessageAttr::from_key(key)
+            if let Ok(attr) = MessageAttr::try_from(&**key)
                 && slots[attr as usize].is_none()
             {
                 slots[attr as usize] = Some(value);
@@ -1259,7 +1248,7 @@ impl<'a> MessageAttrs<'a> {
     }
 
     fn missing(&mut self, attr: MessageAttr) {
-        let key = attr.key();
+        let key = attr.as_str();
         self.errors
             .push(wacore_binary::BinaryError::AttrParse(format!(
                 "Required attribute '{key}' not found"
@@ -1275,7 +1264,7 @@ impl<'a> MessageAttrs<'a> {
         attr: MessageAttr,
     ) -> wacore_binary::Result<std::borrow::Cow<'a, str>> {
         self.optional_string(attr)
-            .ok_or_else(|| wacore_binary::BinaryError::MissingAttr(attr.key().to_string()))
+            .ok_or_else(|| wacore_binary::BinaryError::MissingAttr(attr.as_str().to_string()))
     }
 
     fn optional_jid(&mut self, attr: MessageAttr) -> Option<wacore_binary::Jid> {
@@ -1313,7 +1302,7 @@ impl<'a> MessageAttrs<'a> {
 
     fn required_jid(&self, attr: MessageAttr) -> wacore_binary::Result<wacore_binary::Jid> {
         self.optional_jid_result(attr)?
-            .ok_or_else(|| wacore_binary::BinaryError::MissingAttr(attr.key().to_string()))
+            .ok_or_else(|| wacore_binary::BinaryError::MissingAttr(attr.as_str().to_string()))
     }
 
     fn optional_u64(&mut self, attr: MessageAttr) -> Option<u64> {
@@ -1321,7 +1310,7 @@ impl<'a> MessageAttrs<'a> {
         match text.parse::<u64>() {
             Ok(value) => Some(value),
             Err(e) => {
-                let key = attr.key();
+                let key = attr.as_str();
                 self.errors
                     .push(wacore_binary::BinaryError::AttrParse(format!(
                         "Failed to parse u64 from '{text}' for key '{key}': {e}"
@@ -1339,7 +1328,7 @@ impl<'a> MessageAttrs<'a> {
         match text.parse::<i64>() {
             Ok(value) => value,
             Err(e) => {
-                let key = attr.key();
+                let key = attr.as_str();
                 self.errors
                     .push(wacore_binary::BinaryError::AttrParse(format!(
                         "Failed to parse i64 from '{text}' for key '{key}': {e}"
