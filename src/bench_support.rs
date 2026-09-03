@@ -1173,3 +1173,231 @@ async fn build_receive_fixture() -> ReceiveFixture {
         subscription,
     }
 }
+
+// ===========================================================================
+// Group-scale fixture: many groups, many members, no crypto.
+// ===========================================================================
+
+/// Group counts the scale sweep runs. The claim under test is how the
+/// per-group device memo behaves as a function of how many groups an account
+/// is active in, so the sweep has to cross the bound the memo used to have
+/// (64) by a wide margin on both sides.
+pub const GROUP_COUNTS: &[usize] = &[16, 64, 256];
+
+/// Members per group in the scale sweep. Large enough that a recompute is
+/// dominated by per-member work, small enough that 256 groups of them build
+/// in seconds under instrumentation.
+pub const SCALE_GROUP_MEMBERS: usize = 64;
+
+/// A client holding `groups` groups of `members` distinct members each, with
+/// the registry, the LID↔PN mappings, the group metadata and the device memos
+/// a client that has sent to all of them holds.
+///
+/// No Signal sessions and no sends: the questions this fixture answers — is a
+/// warm group's device list served from the memo, and what does one group's
+/// device-list refresh cost every other group — are settled before any crypto
+/// runs, and a send fixture at this scale would spend all of its time
+/// establishing sessions that never get used.
+pub struct GroupScaleHarness {
+    runtime: tokio::runtime::Runtime,
+    client: Arc<Client>,
+    groups: Vec<(Jid, Arc<GroupInfo>)>,
+    own_sending_jid: Jid,
+}
+
+/// A fictitious member number: the reserved 555-01XX block, widened by a
+/// synthetic area-code index so the sweep can mint tens of thousands of
+/// distinct numbers. Never overlaps `member_user`'s range (its area codes
+/// start at 200 + index / 100, which the `NPAS` table never reaches), and
+/// steps over 555 itself, which is an exchange and not an area code. The
+/// area code must stay three digits, so the namespace ends at 69,900
+/// members: a sweep past it would wrap onto index 0's number and merge two
+/// members' devices, which is a wrong fixture rather than a slower one.
+fn scale_member_pn(index: usize) -> String {
+    assert!(index < 69_900, "scale member PN namespace exhausted");
+    let npa = 200 + index / 100;
+    let npa = if npa >= 555 { npa + 1 } else { npa };
+    format!("1{npa:03}555{:04}", 100 + index % 100)
+}
+
+/// A member LID in a block of its own, so no index can land on the own
+/// account's `100000000000001`. Five digits of index keep the LID at the
+/// fifteen the real ones have.
+fn scale_member_lid(index: usize) -> String {
+    assert!(index < 100_000, "scale member LID namespace exhausted");
+    format!("1000000001{index:05}")
+}
+
+impl GroupScaleHarness {
+    /// Build the fixture and resolve every group once, so the memos hold
+    /// whatever they can hold for this many groups.
+    pub fn new(groups: usize, members: usize) -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let (client, group_list, own) = runtime.block_on(build_scale_fixture(groups, members));
+        let harness = Self {
+            runtime,
+            client,
+            groups: group_list,
+            own_sending_jid: own,
+        };
+        harness.resolve_all();
+        harness
+    }
+
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Resolve every group's device list through the memoized resolver, in
+    /// order, the way a client round-robining over its groups does. Returns
+    /// the memo counters for this pass only.
+    pub fn resolve_all(&self) -> crate::client::DeviceMemoStats {
+        self.resolve_range(0, self.groups.len())
+    }
+
+    /// Resolve groups `[from, to)` once and return the memo outcomes.
+    pub fn resolve_range(&self, from: usize, to: usize) -> crate::client::DeviceMemoStats {
+        let before = self.client.device_memo_stats();
+        self.runtime.block_on(async {
+            for (group, info) in &self.groups[from..to] {
+                let _ = self
+                    .client
+                    .resolve_group_devices_memoized(group, info, &self.own_sending_jid)
+                    .await
+                    .expect("offline resolve");
+            }
+        });
+        self.client.device_memo_stats().since(&before)
+    }
+
+    /// Re-publish group `index`'s member records through the real usync
+    /// write path, which is what a device-list refresh for that group does.
+    /// Returns the topology generation before and after.
+    pub fn refresh_group_registry(&self, index: usize) -> (u64, u64) {
+        self.runtime.block_on(async {
+            let (_, info) = &self.groups[index];
+            let mut records = Vec::with_capacity(info.participants.len());
+            for participant in &info.participants {
+                if participant.user == self.own_sending_jid.user {
+                    continue;
+                }
+                records.push(DeviceListRecord {
+                    user: Arc::from(participant.user.as_str()),
+                    devices: vec![DeviceInfo::new(0, None)].into_boxed_slice(),
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                });
+            }
+            let before = self.client.device_topology.current();
+            let guard = self.client.device_topology.lock_registry().await;
+            self.client
+                .update_device_lists_guarded(records, &guard)
+                .await
+                .expect("registry batch write");
+            drop(guard);
+            (before, self.client.device_topology.current())
+        })
+    }
+
+    /// The client's `memory_report()`, rendered.
+    pub fn memory_report(&self) -> String {
+        self.runtime
+            .block_on(async { self.client.memory_report().await.to_string() })
+    }
+}
+
+async fn build_scale_fixture(
+    groups: usize,
+    members: usize,
+) -> (Arc<Client>, Vec<(Jid, Arc<GroupInfo>)>, Jid) {
+    let backend = Arc::new(InMemoryBackend::new());
+    let pm = Arc::new(
+        PersistenceManager::new(backend)
+            .await
+            .expect("persistence manager"),
+    );
+    let (client, _sync_rx) = Client::new(
+        Arc::new(TokioRuntime),
+        pm,
+        Arc::new(SinkTransportFactory),
+        Arc::new(NoopHttpClient),
+        None,
+    )
+    .await;
+
+    let own_pn = Jid::new(OWN_USER, Server::Pn);
+    let own_lid = Jid::new("100000000000001", Server::Lid);
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetId(Some(own_pn.clone())))
+        .await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(own_lid)))
+        .await;
+    seed_registry(&client, OWN_USER, &[0, 1]).await;
+    // Our own record is inserted first, so it is the first the bounded
+    // registry cache evicts once the members outnumber its capacity; the
+    // backend row is what answers for it then.
+    let mut backend_records: Vec<DeviceListRecord> = Vec::with_capacity(groups * members + 1);
+    backend_records.push(DeviceListRecord {
+        user: Arc::from(OWN_USER),
+        devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(1, None)].into_boxed_slice(),
+        timestamp: wacore::time::now_secs(),
+        phash: None,
+        raw_id: None,
+    });
+
+    // Distinct members across groups, the worst case for every per-user
+    // cache. LID-addressed, with the PN mapping known, as a current group is.
+    let mut group_list = Vec::with_capacity(groups);
+    for g in 0..groups {
+        let mut participants = Vec::with_capacity(members + 1);
+        for m in 0..members {
+            let index = g * members + m;
+            let pn = scale_member_pn(index);
+            let lid = scale_member_lid(index);
+            seed_registry(&client, &lid, &[0]).await;
+            backend_records.push(DeviceListRecord {
+                user: Arc::from(lid.as_str()),
+                devices: vec![DeviceInfo::new(0, None)].into_boxed_slice(),
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            });
+            client
+                .lid_pn_cache
+                .add(&crate::lid_pn_cache::LidPnEntry::new(
+                    lid.as_str(),
+                    pn.as_str(),
+                    crate::lid_pn_cache::LearningSource::Usync,
+                ))
+                .await;
+            participants.push(Jid::new(lid.as_str(), Server::Lid));
+        }
+        participants.push(own_pn.to_non_ad());
+        let info = Arc::new(GroupInfo::new(participants, AddressingMode::Lid));
+        let group: Jid = format!("12036300000000{g:04}@g.us")
+            .parse()
+            .expect("group jid");
+        client
+            .get_group_cache()
+            .insert(group.clone(), Arc::clone(&info))
+            .await;
+        group_list.push((group, info));
+    }
+
+    client
+        .persistence_manager
+        .backend()
+        .update_device_lists(backend_records)
+        .await
+        .expect("seed device rows");
+
+    install_offline_socket(&client).await;
+    (client, group_list, own_pn)
+}

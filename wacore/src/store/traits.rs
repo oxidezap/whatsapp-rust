@@ -915,6 +915,22 @@ pub trait ProtocolStore: Send + Sync {
     /// Get all known devices for a user.
     async fn get_devices(&self, user: &str) -> Result<Option<DeviceListRecord>>;
 
+    /// Batched variant of `get_devices`: the records stored under any of
+    /// `users`, in no particular order, with absent users left out. Backends
+    /// should override with one query; the default loops for correctness.
+    /// Resolving a cold large group reads one record per member, and a
+    /// round trip per member through the write queue cost ~30x one
+    /// `IN (...)` query at 256 members on SQLite.
+    async fn get_devices_batch(&self, users: &[&str]) -> Result<Vec<DeviceListRecord>> {
+        let mut records = Vec::with_capacity(users.len());
+        for user in users {
+            if let Some(record) = self.get_devices(user).await? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     /// Delete a device list record, forcing a network re-fetch on next query.
     async fn delete_devices(&self, user: &str) -> Result<()>;
 

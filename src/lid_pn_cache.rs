@@ -583,9 +583,11 @@ mod tests {
             )])
             .await;
 
-        assert!(topology.unchanged_for(before, |user| user == "unrelated"));
-        assert!(!topology.unchanged_for(before, |user| user == "pn1"));
-        assert!(!topology.unchanged_for(before, |user| user == "lid1"));
+        use crate::client::member_index::MemberIndex;
+        let members = |user: &str| MemberIndex::from_users([user]);
+        assert!(topology.unchanged_for(before, &members("unrelated")));
+        assert!(!topology.unchanged_for(before, &members("pn1")));
+        assert!(!topology.unchanged_for(before, &members("lid1")));
     }
 
     #[tokio::test]

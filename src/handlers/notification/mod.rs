@@ -1247,7 +1247,7 @@ mod tests {
             Some("5511999999999"),
             "old owner comes from notification.participant"
         );
-        match &group_update.action {
+        match &*group_update.action {
             GroupNotificationAction::ChangeNumber {
                 new_owner,
                 sub_group_suggestions,

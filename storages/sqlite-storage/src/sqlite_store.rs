@@ -95,6 +95,41 @@ struct DeviceRow {
 /// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
 const ID_PARAM_CHUNK: usize = 900;
 
+/// The `device_registry` columns a record is rebuilt from, in
+/// [`DeviceRegistryRow`] order.
+const DEVICE_REGISTRY_COLUMNS: (
+    device_registry::user_id,
+    device_registry::devices_json,
+    device_registry::timestamp,
+    device_registry::phash,
+    device_registry::raw_id,
+) = (
+    device_registry::user_id,
+    device_registry::devices_json,
+    device_registry::timestamp,
+    device_registry::phash,
+    device_registry::raw_id,
+);
+
+type DeviceRegistryRow = (String, String, i32, Option<String>, Option<i32>);
+
+fn device_registry_row_to_record(
+    (user, devices_json, timestamp, phash, raw_id): DeviceRegistryRow,
+) -> Result<DeviceListRecord> {
+    // Decoded as a `Vec` and converted, so this reuses the `Vec<DeviceInfo>`
+    // codec the crate already instantiates rather than stamping a second one
+    // for `Box<[_]>`.
+    let devices: Vec<DeviceInfo> =
+        serde_json::from_str(&devices_json).map_err(|e| StoreError::Serialization(Box::new(e)))?;
+    Ok(DeviceListRecord {
+        user: Arc::from(user),
+        devices: devices.into_boxed_slice(),
+        timestamp: timestamp as i64,
+        phash: phash.map(Box::<str>::from),
+        raw_id: raw_id.map(|r| r as u32),
+    })
+}
+
 /// The statements behind the app-state version and MAC writes, shared by the
 /// single-purpose methods and the fused per-patch commit so the two cannot
 /// drift.
@@ -177,6 +212,7 @@ fn delete_app_state_mutation_macs(
     }
     Ok(())
 }
+
 /// Eight bound columns per row keep this below SQLite's default 999-parameter
 /// limit while bounding Diesel's temporary insert-expression allocation.
 const MSG_SECRET_INSERT_CHUNK_SIZE: usize = 100;
@@ -3324,37 +3360,44 @@ impl ProtocolStore for SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            let row: Option<(String, String, i32, Option<String>, Option<i32>)> =
-                device_registry::table
-                    .select((
-                        device_registry::user_id,
-                        device_registry::devices_json,
-                        device_registry::timestamp,
-                        device_registry::phash,
-                        device_registry::raw_id,
-                    ))
-                    .filter(device_registry::user_id.eq(&user))
+            let row: Option<DeviceRegistryRow> = device_registry::table
+                .select(DEVICE_REGISTRY_COLUMNS)
+                .filter(device_registry::user_id.eq(&user))
+                .filter(device_registry::device_id.eq(device_id))
+                .first(&mut *conn)
+                .optional()
+                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            row.map(device_registry_row_to_record).transpose()
+        })
+        .await
+    }
+
+    async fn get_devices_batch(&self, users: &[&str]) -> Result<Vec<DeviceListRecord>> {
+        if users.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Same queue as `get_devices`, for the same reason: every row that
+        // comes back is promoted into the registry cache unconditionally.
+        let pool = self.pool.clone();
+        let device_id = self.device_id;
+        let users: Vec<String> = users.iter().map(|user| user.to_string()).collect();
+        self.with_semaphore(move || -> Result<Vec<DeviceListRecord>> {
+            let mut conn = pool
+                .get()
+                .map_err(|e| StoreError::Connection(Box::new(e)))?;
+            let mut records = Vec::with_capacity(users.len());
+            for chunk in users.chunks(ID_PARAM_CHUNK) {
+                let rows: Vec<DeviceRegistryRow> = device_registry::table
+                    .select(DEVICE_REGISTRY_COLUMNS)
+                    .filter(device_registry::user_id.eq_any(chunk.iter().map(String::as_str)))
                     .filter(device_registry::device_id.eq(device_id))
-                    .first(&mut *conn)
-                    .optional()
+                    .load(&mut *conn)
                     .map_err(|e| StoreError::Database(Box::new(e)))?;
-            match row {
-                Some((user, devices_json, timestamp, phash, raw_id)) => {
-                    // Decoded as a `Vec` and converted, so this reuses the
-                    // `Vec<DeviceInfo>` codec the crate already instantiates
-                    // rather than stamping a second one for `Box<[_]>`.
-                    let devices: Vec<DeviceInfo> = serde_json::from_str(&devices_json)
-                        .map_err(|e| StoreError::Serialization(Box::new(e)))?;
-                    Ok(Some(DeviceListRecord {
-                        user: Arc::from(user),
-                        devices: devices.into_boxed_slice(),
-                        timestamp: timestamp as i64,
-                        phash: phash.map(Box::<str>::from),
-                        raw_id: raw_id.map(|r| r as u32),
-                    }))
+                for row in rows {
+                    records.push(device_registry_row_to_record(row)?);
                 }
-                None => Ok(None),
             }
+            Ok(records)
         })
         .await
     }
@@ -7172,6 +7215,7 @@ mod read_routing_tests {
             "promoted into device_registry_cache unconditionally, so a stale row \
              overwrites a newer entry and sends omit a linked device",
         ),
+        ("get_devices_batch", "same as get_devices"),
         (
             "get_tc_token",
             "prepare_privacy_token schedules off this timestamp, so a stale read \

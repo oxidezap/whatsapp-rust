@@ -345,6 +345,11 @@ name = "client_dm_send"
 harness = false
 required-features = ["bench-harness"]
 
+[[bench]]
+name = "client_group_scale"
+harness = false
+required-features = ["bench-harness"]
+
 # The inbound counterpart: the non-message stanzas (`<receipt>`, `<presence>`,
 # `<notification>`, `<ack>`) the read loop handles without a decrypt. Its
 # regression signal is bytes per stanza, not wall time; the target's own header

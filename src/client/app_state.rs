@@ -3664,9 +3664,14 @@ impl Client {
 
                 // WhatsApp Web sends presence immediately when receiving pushname
                 if old.is_empty() && !new_name.is_empty() {
-                    debug!(target: "Client/AppState", "Sending presence after receiving initial pushname from app state sync");
-                    if let Err(e) = self.presence().set_available().await {
-                        warn!(target: "Client/AppState", "Failed to send presence after pushname sync: {e:?}");
+                    match self.send_automatic_available().await {
+                        Ok(true) => {
+                            debug!(target: "Client/AppState", "Sent presence after receiving initial pushname from app state sync");
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(target: "Client/AppState", "Failed to send presence after pushname sync: {e:?}");
+                        }
                     }
                 }
             } else {

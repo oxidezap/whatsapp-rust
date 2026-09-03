@@ -14,15 +14,23 @@ use wacore_binary::Jid;
 const DEVICE_REFRESH_MAX_ATTEMPTS: usize = 3;
 
 #[inline]
-fn device_response_contains_user(response: &DeviceListResponse, user: &str) -> bool {
-    response
-        .device_lists
-        .iter()
-        .any(|device_list| device_list.user.user == user)
-        || response
-            .lid_mappings
+/// Every user a device-list response speaks for, in both namespaces, as the
+/// member set a topology change is checked against.
+fn device_response_users(
+    response: &DeviceListResponse,
+) -> crate::client::member_index::MemberIndex {
+    crate::client::member_index::MemberIndex::from_users(
+        response
+            .device_lists
             .iter()
-            .any(|mapping| mapping.phone_number == user || mapping.lid == user)
+            .map(|device_list| device_list.user.user.as_str())
+            .chain(
+                response
+                    .lid_mappings
+                    .iter()
+                    .flat_map(|mapping| [mapping.phone_number.as_str(), mapping.lid.as_str()]),
+            ),
+    )
 }
 
 pub use wacore::iq::usync::{
@@ -59,35 +67,17 @@ impl Client {
         &self,
         jids: Vec<Jid>,
     ) -> Result<Vec<Jid>, anyhow::Error> {
-        let input_len = jids.len();
-        let mut jids_to_fetch: Vec<Jid> = Vec::with_capacity(input_len);
-        let mut all_devices = Vec::with_capacity(input_len * 2);
-
-        // Resolve the LOCAL registry scan concurrently (the network usync below is
-        // already one batched IQ) — a cold-cache large group would otherwise
-        // serialize 256+ per-user cache/DB reads. Order is irrelevant (phash sorts,
-        // encrypt fan-out is order-agnostic). A None result means an empty/corrupt
-        // record, which falls through to the network below (WA Web always keeps
-        // device 0). The stream owns each JID and is drained incrementally, so
-        // no second result Vec is materialized.
-        use futures::StreamExt;
-        // Bounded fan-out over the independent per-user registry reads.
-        const DEVICE_LIST_RESOLVE_CONCURRENCY: usize = 16;
-        let mut resolved = futures::stream::iter(jids.into_iter().map(Jid::into_non_ad))
-            .map(|jid| async move {
-                let devices = self.get_devices_from_registry(&jid).await;
-                (jid, devices)
-            })
-            .buffer_unordered(DEVICE_LIST_RESOLVE_CONCURRENCY);
-
-        while let Some((jid, devices)) = resolved.next().await {
-            match devices {
-                Some(devices) => all_devices.extend(devices),
-                None => {
-                    jids_to_fetch.push(jid);
-                }
-            }
-        }
+        // One batched registry pass: the cache answers per user, and every
+        // user it cannot answer goes to the backend in ONE read. The
+        // previous per-user fan-out (16 concurrent `get_devices`) bought
+        // nothing, because the backend read is on the single write permit
+        // and the permit re-serialized them. Order is irrelevant (phash
+        // sorts, encrypt fan-out is order-agnostic). An unresolved user is
+        // one with no usable record anywhere (WA Web always keeps device 0,
+        // so an empty record counts as none) and falls through to the
+        // network below.
+        let jids: Vec<Jid> = jids.into_iter().map(Jid::into_non_ad).collect();
+        let (mut all_devices, mut jids_to_fetch) = self.get_devices_from_registry_batch(jids).await;
 
         if !jids_to_fetch.is_empty() {
             wacore::types::jid::sort_dedup_by_user(&mut jids_to_fetch);
@@ -250,9 +240,7 @@ impl Client {
         let registry_guard = self.device_topology.lock_registry().await;
         if !self
             .device_topology
-            .unchanged_for(topology_generation, |user| {
-                device_response_contains_user(response, user)
-            })
+            .unchanged_for(topology_generation, &device_response_users(response))
         {
             return Ok(None);
         }
@@ -283,12 +271,20 @@ impl Client {
         // Signal sessions or registry snapshot are discarded.
         let mut pending_identity_resets = Vec::new();
 
+        // The existing records for the whole response in one alias-aware
+        // (LID <-> PN) batch, so a response covering a large group does not
+        // pay a serialized backend read per member before it can be applied.
+        let users: Vec<&Jid> = response
+            .device_lists
+            .iter()
+            .map(|user_list| &user_list.user)
+            .collect();
+        let mut existing_records = self.load_device_records_batch(&users).await.into_iter();
+
         for user_list in &response.device_lists {
             // Update device registry (single source of truth for device lists).
             // Preserve key_index values from existing records (set via account_sync)
-            // Use alias-aware lookup (resolves LID ↔ PN) to find
-            // existing record regardless of which key it was stored under
-            let mut existing_record = self.load_device_record_for_jid(&user_list.user).await;
+            let mut existing_record = existing_records.next().flatten();
 
             // Decode key-index-list if present (WA Web: handleKeyIndexResult)
             let decoded_key_index = user_list
