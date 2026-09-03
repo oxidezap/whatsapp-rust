@@ -2399,10 +2399,13 @@ mod tests {
             || std::array::from_fn::<_, CLIENTS, _>(|_| build()),
         );
 
+        // The aggregate is what is compared: dividing first would let a total
+        // up to `CLIENTS - 1` over the scaled budget round down into it.
         let bytes_per_client = bytes / CLIENTS as i64;
         let allocs_per_client = allocs / CLIENTS as u64;
         assert!(
-            bytes_per_client <= MAX_BYTES_PER_CLIENT && allocs_per_client <= MAX_ALLOCS_PER_CLIENT,
+            bytes <= MAX_BYTES_PER_CLIENT * CLIENTS as i64
+                && allocs <= MAX_ALLOCS_PER_CLIENT * CLIENTS as u64,
             "a Client costs {bytes_per_client} B in {allocs_per_client} allocations; \
              the budget is {MAX_BYTES_PER_CLIENT} B / {MAX_ALLOCS_PER_CLIENT} allocations",
         );
