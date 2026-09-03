@@ -345,6 +345,15 @@ name = "client_dm_send"
 harness = false
 required-features = ["bench-harness"]
 
+# The inbound counterpart: the non-message stanzas (`<receipt>`, `<presence>`,
+# `<notification>`, `<ack>`) the read loop handles without a decrypt. Its
+# regression signal is bytes per stanza, not wall time; the target's own header
+# says why.
+[[bench]]
+name = "inbound_stanza"
+harness = false
+required-features = ["bench-harness"]
+
 # The `Cache<Jid, _>` lookup shape `chat_lanes` runs per inbound message. No
 # `required-features`: it reaches only the public cache, so it builds (and is
 # regression-gated) in a plain `cargo bench`.

@@ -14,7 +14,7 @@
 #[allow(clippy::disallowed_types)]
 pub(crate) mod test_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
     pub(crate) static ALLOCS: AtomicU64 = AtomicU64::new(0);
     /// Bytes currently live, as a wrapping signed counter: allocation adds, free
@@ -24,12 +24,20 @@ pub(crate) mod test_alloc {
     /// than it allocates from being a panic in debug.
     pub(crate) static LIVE_BYTES: AtomicI64 = AtomicI64::new(0);
 
+    /// Size of the largest single block requested since it was last reset.
+    /// Separate from `ALLOCS` because the two answer different questions: a
+    /// count catches work that should not happen at all, this catches one
+    /// allocation that should not be *that big* — a boxed future sized for
+    /// every arm of a dispatch, say, which costs one allocation either way.
+    pub(crate) static MAX_BLOCK: AtomicUsize = AtomicUsize::new(0);
+
     struct CountingAlloc;
 
     unsafe impl GlobalAlloc for CountingAlloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             LIVE_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
+            MAX_BLOCK.fetch_max(layout.size(), Ordering::Relaxed);
             unsafe { System.alloc(layout) }
         }
 
@@ -41,6 +49,7 @@ pub(crate) mod test_alloc {
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
             LIVE_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+            MAX_BLOCK.fetch_max(new_size, Ordering::Relaxed);
             unsafe { System.realloc(ptr, layout, new_size) }
         }
     }
@@ -112,6 +121,31 @@ pub(crate) mod test_alloc {
             let after = ALLOCS.load(Ordering::Relaxed);
             drop(value);
             min = min.min(after - before);
+            if min <= expected {
+                break;
+            }
+        }
+        min
+    }
+
+    /// Smallest "largest single block" observed while running `op`, retrying
+    /// until it reaches `expected`.
+    ///
+    /// Same discipline and the same reason as [`min_allocs`]: `MAX_BLOCK` is
+    /// process-wide, so a sibling test thread's large allocation lands in this
+    /// window's maximum. Taking the minimum across windows makes that cost
+    /// iterations rather than a false failure, while a block the measured code
+    /// really does allocate is in *every* window and survives the minimum.
+    pub(crate) fn min_max_block<T>(expected: usize, mut op: impl FnMut() -> T) -> usize {
+        const BUDGET: u32 = 10_000;
+
+        let mut min = usize::MAX;
+        for _ in 0..BUDGET {
+            MAX_BLOCK.store(0, Ordering::Relaxed);
+            let value = std::hint::black_box(op());
+            let observed = MAX_BLOCK.load(Ordering::Relaxed);
+            drop(value);
+            min = min.min(observed);
             if min <= expected {
                 break;
             }

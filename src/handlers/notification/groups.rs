@@ -1,5 +1,5 @@
 use crate::client::Client;
-use crate::types::events::Event;
+use crate::types::events::{Event, EventKind};
 use log::{debug, warn};
 use std::sync::Arc;
 use wacore::stanza::groups::{GroupNotification, GroupNotificationAction};
@@ -239,43 +239,48 @@ pub(crate) async fn handle_group_notification(client: &Arc<Client>, node: Arc<Ow
         );
 
         let is_last_action = action_index + 1 == action_count;
-        client.core.event_bus.dispatch(Event::GroupUpdate(
-            GroupUpdate::builder()
-                .group_jid(notification.group_jid.clone())
-                .maybe_notification_id(clone_or_take_last(
-                    &mut notification.notification_id,
-                    is_last_action,
-                ))
-                .maybe_notify(clone_or_take_last(&mut notification.notify, is_last_action))
-                .maybe_offline(clone_or_take_last(
-                    &mut notification.offline,
-                    is_last_action,
-                ))
-                .action_index(u32::try_from(action_index).unwrap_or(u32::MAX))
-                .maybe_participant(clone_or_take_last(
-                    &mut notification.participant,
-                    is_last_action,
-                ))
-                .maybe_participant_pn(clone_or_take_last(
-                    &mut notification.participant_pn,
-                    is_last_action,
-                ))
-                .maybe_participant_username(clone_or_take_last(
-                    &mut notification.participant_username,
-                    is_last_action,
-                ))
-                .maybe_participant_country_code(clone_or_take_last(
-                    &mut notification.participant_country_code,
-                    is_last_action,
-                ))
-                .timestamp(timestamp)
-                .is_lid_addressing_mode(notification.is_lid_addressing_mode)
-                .has_incomplete_participant_information(
-                    notification.has_incomplete_participant_information,
+        client
+            .core
+            .event_bus
+            .dispatch_with(EventKind::GroupUpdate, || {
+                Event::GroupUpdate(
+                    GroupUpdate::builder()
+                        .group_jid(notification.group_jid.clone())
+                        .maybe_notification_id(clone_or_take_last(
+                            &mut notification.notification_id,
+                            is_last_action,
+                        ))
+                        .maybe_notify(clone_or_take_last(&mut notification.notify, is_last_action))
+                        .maybe_offline(clone_or_take_last(
+                            &mut notification.offline,
+                            is_last_action,
+                        ))
+                        .action_index(u32::try_from(action_index).unwrap_or(u32::MAX))
+                        .maybe_participant(clone_or_take_last(
+                            &mut notification.participant,
+                            is_last_action,
+                        ))
+                        .maybe_participant_pn(clone_or_take_last(
+                            &mut notification.participant_pn,
+                            is_last_action,
+                        ))
+                        .maybe_participant_username(clone_or_take_last(
+                            &mut notification.participant_username,
+                            is_last_action,
+                        ))
+                        .maybe_participant_country_code(clone_or_take_last(
+                            &mut notification.participant_country_code,
+                            is_last_action,
+                        ))
+                        .timestamp(timestamp)
+                        .is_lid_addressing_mode(notification.is_lid_addressing_mode)
+                        .has_incomplete_participant_information(
+                            notification.has_incomplete_participant_information,
+                        )
+                        .action(action)
+                        .build(),
                 )
-                .action(action)
-                .build(),
-        ));
+            });
     }
 
     // Also dispatch legacy generic notification for backward compatibility
@@ -489,15 +494,20 @@ pub(crate) fn handle_mex_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
         "mex notification received: op_name={op_name} offline={}",
         offline.is_some()
     );
-    client.core.event_bus.dispatch(Event::MexNotification(
-        MexNotification::builder()
-            .op_name(op_name)
-            .maybe_from(from)
-            .maybe_stanza_id(stanza_id)
-            .maybe_offline(offline)
-            .payload(payload)
-            .build(),
-    ));
+    client
+        .core
+        .event_bus
+        .dispatch_with(EventKind::MexNotification, || {
+            Event::MexNotification(
+                MexNotification::builder()
+                    .op_name(op_name)
+                    .maybe_from(from)
+                    .maybe_stanza_id(stanza_id)
+                    .maybe_offline(offline)
+                    .payload(payload)
+                    .build(),
+            )
+        });
 }
 
 /// Handle `<notification type="disappearing_mode">` — a contact changed

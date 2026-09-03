@@ -256,7 +256,21 @@ impl LidPnCache {
         self.add_guarded(entry, &guard).await;
     }
 
-    pub(crate) async fn add_guarded(&self, entry: &LidPnEntry, _guard: &LidPnMutationGuard<'_>) {
+    pub(crate) async fn add_guarded(&self, entry: &LidPnEntry, guard: &LidPnMutationGuard<'_>) {
+        self.add_guarded_impl(entry, guard, true).await;
+    }
+
+    /// The write behind [`add_guarded`](Self::add_guarded). `record_topology`
+    /// is `false` only for the startup warm-up, which records the whole batch
+    /// as one scoped change instead of one lock round trip per entry. Scoped,
+    /// not global: the warm-up task runs concurrently with the first live
+    /// refreshes, and a global change would restart every one of them.
+    async fn add_guarded_impl(
+        &self,
+        entry: &LidPnEntry,
+        _guard: &LidPnMutationGuard<'_>,
+        record_topology: bool,
+    ) {
         let should_update_pn = match self.pn_to_entry.get(&*entry.phone_number).await {
             Some(existing) => existing.created_at <= entry.created_at,
             None => true,
@@ -288,7 +302,7 @@ impl LidPnCache {
                 .await;
         }
 
-        if let Some(topology) = self.topology.get() {
+        if record_topology && let Some(topology) = self.topology.get() {
             topology.record([&*entry.lid, &*entry.phone_number]);
         }
     }
@@ -325,9 +339,12 @@ impl LidPnCache {
         let start = wacore::time::Instant::now();
         let mut count = 0;
         let guard = self.lock_mutation().await;
+        let mut touched: Vec<Arc<str>> = Vec::new();
 
         for entry in entries {
-            self.add_guarded(&entry, &guard).await;
+            self.add_guarded_impl(&entry, &guard, false).await;
+            touched.push(Arc::clone(&entry.lid));
+            touched.push(Arc::clone(&entry.phone_number));
             // `warm_up` only accepts durable rows. Mark the pair that won the
             // PN-side timestamp resolution so a live re-learn neither writes
             // it again nor repeats discovery migrations.
@@ -340,6 +357,16 @@ impl LidPnCache {
                 self.mark_persisted(&entry.phone_number, &entry.lid).await;
             }
             count += 1;
+        }
+        // One record for the batch; see `add_guarded_impl`. A batch wider
+        // than the log's bound overflows it, which poisons every memo once,
+        // exactly what per-entry records would have done. An empty batch
+        // changed nothing and records nothing: a generation bump with no
+        // users would still send every memo through a restamp.
+        if !touched.is_empty()
+            && let Some(topology) = self.topology.get()
+        {
+            topology.record(touched.iter().map(|id| &**id));
         }
 
         log::debug!(
@@ -535,6 +562,30 @@ mod tests {
         assert!(cache.can_skip_relearn("pn1", "lid1").await);
         assert!(cache.can_skip_relearn("pn2", "lid2").await);
         assert!(cache.can_skip_relearn("pn3", "lid3").await);
+    }
+
+    /// The startup warm-up races the first live refreshes, so it must record
+    /// the batch as a scoped change: a refresh of a user it did not touch
+    /// keeps its result, one of a user it did recomputes.
+    #[tokio::test]
+    async fn warm_up_records_a_scoped_change() {
+        let cache = LidPnCache::new();
+        let topology = crate::client::device_topology::DeviceTopology::new();
+        cache.attach_topology(Arc::clone(&topology));
+        let before = topology.current();
+
+        cache
+            .warm_up([LidPnEntry::with_timestamp(
+                "lid1".to_string(),
+                "pn1".to_string(),
+                1,
+                LearningSource::Other,
+            )])
+            .await;
+
+        assert!(topology.unchanged_for(before, |user| user == "unrelated"));
+        assert!(!topology.unchanged_for(before, |user| user == "pn1"));
+        assert!(!topology.unchanged_for(before, |user| user == "lid1"));
     }
 
     #[tokio::test]

@@ -566,7 +566,18 @@ impl Client {
     pub(crate) fn handle_receipt_inline(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
         let nr = node.get();
         let mut attrs = nr.attrs();
-        let from = attrs.jid("from");
+        // `type` is read before anything else because it is the only attribute
+        // the subscriber gate below needs, and this runs on the read loop: a
+        // client with no Receipt handler is meant to leave here having parsed
+        // one attribute, not the whole stanza. `<receipt>` reaches this
+        // function inline exactly when nothing is subscribed
+        // (`processes_inline`), so that is the common case, not the rare one.
+        let receipt_type_cow = attrs.optional_string("type");
+        let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
+        let receipt_type = ReceiptType::parse(receipt_type_str);
+        // `id` is the one other attribute read ahead of the gate: a receipt
+        // without one is a protocol error worth the warning whether or not
+        // anything is subscribed, and the read is a single inline copy.
         let stanza_id = match attrs.optional_string("id") {
             Some(id) => wacore_binary::MessageId::from(id.as_ref()),
             None => {
@@ -574,8 +585,23 @@ impl Client {
                 return;
             }
         };
-        let receipt_type_cow = attrs.optional_string("type");
-        let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
+        // Retries feed the resend pipeline whether or not anything listens.
+        // Every other receipt, `enc_rekey_retry` included (its branch below
+        // only logs and dispatches), exists only to become an `Event::Receipt`,
+        // which `dispatch` drops on the floor without a subscriber — so
+        // without one, stop before the `from` JID, the `<participants>` scan
+        // (one `Jid` pair per member of a group read) and the message-id list.
+        //
+        // Gating on the raw parsed type is what lets the gate come first:
+        // `downgrade_for_feature_incapable` below only ever rewrites
+        // `Delivered` to `Sent`, so no stanza it touches can turn into the
+        // `Retry` this gate lets through.
+        if receipt_type != ReceiptType::Retry
+            && !self.core.event_bus.has_handler_for(EventKind::Receipt)
+        {
+            return;
+        }
+        let from = attrs.jid("from");
         let participant = attrs.optional_jid("participant");
         let recipient = attrs.optional_jid("recipient");
         // participant_pn -> sender_alt so the LID-PN cache warms from receipts too.
@@ -588,22 +614,10 @@ impl Client {
             .and_then(wacore::time::from_secs)
             .unwrap_or_else(wacore::time::now_utc);
 
-        let receipt_type = ReceiptType::parse(receipt_type_str);
         // WA Web downgrades a delivery ack to "sent" (not delivered) when the receipt carries
         // <error reason="lid" type="feature-incapable"> (the LID peer can't receive it).
         let receipt_type =
             wacore::stanza::receipt::downgrade_for_feature_incapable(nr, receipt_type);
-        // Retries feed the resend pipeline whether or not anything listens.
-        // Every other receipt, `enc_rekey_retry` included (its branch below
-        // only logs and dispatches), exists only to become an `Event::Receipt`,
-        // which `dispatch` drops on the floor without a subscriber — so
-        // without one, stop before parsing `<participants>` (one `Jid` pair
-        // per member of a group read) or building the message-id list.
-        if receipt_type != ReceiptType::Retry
-            && !self.core.event_bus.has_handler_for(EventKind::Receipt)
-        {
-            return;
-        }
         let is_view = receipt_type_str == "view";
         let is_group = from.is_group();
         let default_sender = if is_group {
