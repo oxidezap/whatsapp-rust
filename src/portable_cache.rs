@@ -130,6 +130,28 @@ enum ClockWalk {
     Blocked,
 }
 
+/// The `(seq, hash)` pairs in `order` whose entry `probe` reports expired.
+/// Same shape as [`clock_walk`], and for the same reason: the walk is
+/// compiled once, and each `<K, V>` cache contributes only the probe, which
+/// is the `find` its eviction hook already carries. A `retain` over the
+/// table and the order map would be a second full walk per instantiation.
+/// `inline(never)`: under fat LTO the optimizer would otherwise inline this
+/// into every instantiation of the caller, which is the duplication it exists
+/// to avoid.
+#[inline(never)]
+fn expiry_walk(
+    order: &BTreeMap<u64, u64>,
+    probe: &mut dyn FnMut(u64, u64) -> bool,
+) -> Vec<(u64, u64)> {
+    let mut expired = Vec::new();
+    for (&seq, &hash) in order.iter() {
+        if probe(seq, hash) {
+            expired.push((seq, hash));
+        }
+    }
+    expired
+}
+
 /// One pass of the second-chance walk over `order`, oldest first: the first
 /// unreferenced, unheld entry is the victim; entries hit since the last pass
 /// have their bit cleared (by `probe`) and re-queue behind everything
@@ -182,10 +204,11 @@ struct CacheInner<K, V> {
     /// stored `seq`. The hash plus the seq find the slot in `table`, so no key
     /// is stored here.
     ///
-    /// Left empty for a cache that has no capacity bound: nothing could ever
-    /// pop it, so maintaining it would spend a `BTreeMap` node per entry on a
-    /// structure that is never read. The unbounded LID↔PN caches hold tens
-    /// of thousands of entries for the life of the process.
+    /// Left empty for a cache that has neither a capacity bound nor a time
+    /// bound: nothing could ever pop or expire an entry, so maintaining it
+    /// would spend a `BTreeMap` node per entry on a structure that is never
+    /// read. The unbounded LID↔PN caches hold tens of thousands of entries
+    /// for the life of the process.
     order: BTreeMap<u64, u64>,
     track_order: bool,
     /// Next FIFO sequence to assign.
@@ -392,12 +415,24 @@ where
         );
     }
 
-    /// Drop expired entries and the FIFO records that named them.
+    /// Drop expired entries and the FIFO records that named them. Driven by
+    /// `order`, which every cache that expires by time maintains (see
+    /// `PortableCacheBuilder::build`), so the walk itself is [`expiry_walk`].
     fn retain_unexpired(&mut self, mut is_expired: impl FnMut(&CacheEntry<V>) -> bool) {
-        let table = &mut self.table;
-        let order = &mut self.order;
-        table.retain(|slot| !is_expired(&slot.entry));
-        order.retain(|seq, hash| table.find(*hash, |slot| slot.entry.seq == *seq).is_some());
+        debug_assert!(
+            self.track_order,
+            "a cache that expires by time tracks order; the sweep walks it"
+        );
+        let table = &self.table;
+        let expired = expiry_walk(&self.order, &mut |seq, hash| {
+            table
+                .find(hash, |slot| slot.entry.seq == seq)
+                .is_some_and(|slot| is_expired(&slot.entry))
+        });
+        for (seq, hash) in expired {
+            self.order.remove(&seq);
+            self.remove_by_seq(hash, seq);
+        }
     }
 }
 
@@ -557,10 +592,15 @@ where
             "a cache with an evict_guard holds live coordination objects and must not expire by time"
         );
 
+        // Order is what eviction pops and what the expiry sweep walks, so a
+        // cache with either a capacity bound or a time bound keeps it. A cache
+        // with neither (the default LID/PN maps) is never swept and skips the
+        // BTreeMap node per entry.
+        let track_order = self.max_capacity.is_some_and(|cap| cap != u64::MAX)
+            || self.ttl.is_some()
+            || self.tti.is_some();
         PortableCache {
-            inner: Arc::new(RwLock::new(CacheInner::new(
-                self.max_capacity.is_some_and(|cap| cap != u64::MAX),
-            ))),
+            inner: Arc::new(RwLock::new(CacheInner::new(track_order))),
             init_locks: OnceLock::new(),
             max_capacity: self.max_capacity,
             ttl: self.ttl,
@@ -825,8 +865,18 @@ where
         self.max_capacity
     }
 
+    /// Best-effort entry count: a `try_read` that answers `0` while a writer
+    /// holds the lock. Fine on a hot path that only needs a hint; a report
+    /// wants [`entry_count_async`](Self::entry_count_async), which cannot
+    /// under-read a cache that is being written to.
     pub fn entry_count(&self) -> u64 {
         self.inner.try_read().map(|g| g.len() as u64).unwrap_or(0)
+    }
+
+    /// Entry count under an awaited read guard. Includes expired entries not
+    /// yet swept, like [`entry_count`](Self::entry_count).
+    pub async fn entry_count_async(&self) -> u64 {
+        self.inner.read().await.len() as u64
     }
 
     pub(crate) async fn capacity_stats(&self) -> CapacityStats {
@@ -854,6 +904,14 @@ where
     pub async fn fold_entries<A>(&self, init: A, mut f: impl FnMut(A, &K, &V) -> A) -> A {
         let guard = self.inner.read().await;
         guard.iter().fold(init, |acc, (k, e)| f(acc, k, &e.value))
+    }
+
+    /// Entry count plus the bytes of the table and eviction order alone, for
+    /// a cache whose payload is already charged elsewhere. No per-entry walk,
+    /// so nothing is instantiated per `<K, V>` beyond the size arithmetic.
+    pub async fn structural_stats(&self) -> wacore::stats::CollectionStats {
+        let guard = self.inner.read().await;
+        wacore::stats::CollectionStats::new(guard.len() as u64, guard.structural_bytes() as u64)
     }
 
     /// Entry count plus estimated retained bytes: the table and eviction
@@ -992,12 +1050,15 @@ where
     }
 
     pub async fn run_pending_tasks(&self) {
-        let now = self.entry_time();
-        let mut guard = self.inner.write().await;
-
-        guard.retain_unexpired(|entry| self.is_expired(entry, now));
-
-        drop(guard);
+        // Nothing can be expired without a TTL or TTI, so a cache configured
+        // with neither (the coordination caches, the default LID/PN maps)
+        // skips the write lock and the table walk; only the init-lock sweep
+        // below applies to it.
+        if self.ttl.is_some() || self.tti.is_some() {
+            let now = self.entry_time();
+            let mut guard = self.inner.write().await;
+            guard.retain_unexpired(|entry| self.is_expired(entry, now));
+        }
 
         // Clean up init locks not actively held. `get()`, not `init_locks()`: a
         // cache that never single-flighted has no registry to sweep, and building

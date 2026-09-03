@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use futures::FutureExt;
 use log::{debug, warn};
 use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
@@ -163,11 +164,25 @@ pub(crate) async fn send_first_batch(client: Arc<Client>, total: usize) {
 /// connection is reported as interrupted instead.
 pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, timeout: Duration) {
     let runtime = client.runtime.clone();
+    // Subscribed at the spawn, for the connection whose generation this
+    // watchdog was armed with — subscribing inside the task would pick up
+    // whatever notifier a teardown had already installed.
+    let shutdown = client.connection_shutdown_signal();
     runtime
         .spawn(Box::pin(async move {
             let mut seen = client.offline_batch.stanza_activity();
             loop {
-                client.runtime.sleep(timeout).await;
+                // Raced rather than merely re-checked after waking: the window
+                // is a minute long, so on a teardown this task otherwise stays
+                // scheduled — holding the whole client graph alive through its
+                // `Arc` — for up to that long after the connection it belongs
+                // to is gone, once per connection. The checks below are
+                // unchanged and still decide everything; this only stops the
+                // waiting early.
+                futures::select! {
+                    _ = client.runtime.sleep(timeout).fuse() => {}
+                    _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => return,
+                }
                 if !client.offline_batch.is_armed_for(generation)
                     || client.connection_generation.load(Ordering::Acquire) != generation
                     || client.offline_sync_completed.load(Ordering::Acquire)

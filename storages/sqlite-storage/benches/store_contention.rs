@@ -1,12 +1,18 @@
-//! Read latency while the single write permit is busy, with a reader pool
-//! configured. `get_group_metadata` routes through `read_query` (reader
-//! connection); `get_devices` and `get_msg_secret_with_ts` are on the
-//! `ON_THE_WRITE_QUEUE` allowlist and take the write permit instead.
+//! Reads alongside a write burst, with a reader pool configured.
+//! `get_group_metadata` routes through `read_query` (reader connection);
+//! `get_devices` and `get_msg_secret_with_ts` are on the `ON_THE_WRITE_QUEUE`
+//! allowlist and take the write permit instead. Each contended sample is one
+//! burst, holding the permit before the read is issued, and one read, both
+//! awaited, so the work per sample is fixed; see `read_under_write` for why a
+//! background writer is not measurable here and how the two are ordered.
 
 use divan::black_box;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 use wacore::appstate::processor::AppStateMutationMAC;
 use wacore::store::traits::{AppSyncStore, DeviceInfo, DeviceListRecord, ProtocolStore};
 use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
@@ -14,7 +20,6 @@ use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
 fn main() {
     divan::main();
     if let Some(h) = HARNESS.get() {
-        h.stop.store(true, Ordering::Relaxed);
         remove_db_files(&h.path);
     }
 }
@@ -23,7 +28,6 @@ struct Harness {
     runtime: tokio::runtime::Runtime,
     store: SqliteStore,
     path: std::path::PathBuf,
-    stop: AtomicBool,
 }
 
 static HARNESS: OnceLock<Harness> = OnceLock::new();
@@ -89,30 +93,70 @@ fn harness() -> &'static Harness {
                 .put_group_metadata(GROUP, &vec![0x2A; 4096])
                 .await
                 .expect("seed group");
+            for seed in BURST_SEEDS {
+                store
+                    .put_mutation_macs("regular", 1, &macs(BURST_ROWS, seed))
+                    .await
+                    .expect("seed burst rows");
+            }
         });
         Harness {
             runtime,
             store,
             path,
-            stop: AtomicBool::new(false),
         }
     })
 }
 
-/// A writer that keeps the single write permit busy: 2 000-row MAC upserts
-/// back to back, the shape a snapshot apply or a flush has.
-fn start_writer(h: &'static Harness) -> tokio::task::JoinHandle<()> {
-    h.stop.store(false, Ordering::Relaxed);
-    h.runtime.spawn(async move {
-        let mut seed = 0u8;
-        while !h.stop.load(Ordering::Relaxed) {
-            seed = seed.wrapping_add(1);
-            let _ = h
-                .store
-                .put_mutation_macs("regular", 1, &macs(2_000, seed))
-                .await;
-        }
+/// The write burst a snapshot apply or a flush has: a 2 000-row MAC upsert.
+/// Two fixed row sets, alternated, so every measured burst after the seeding
+/// in `harness` is an upsert of rows that exist: the same work each time,
+/// not a table that grows with the iteration count.
+const BURST_ROWS: usize = 2_000;
+const BURST_SEEDS: [u8; 2] = [1, 2];
+
+/// One read issued while one write burst holds the write permit, both
+/// awaited.
+///
+/// A free-running writer thread is what this used to be, and CodSpeed's
+/// deterministic instruments cannot measure it: they count instructions, not
+/// time, so what a sample contained was however much of the writer's loop
+/// happened to overlap the read, anywhere from none to a whole burst (a 100x
+/// spread between two runs of the same code). Issuing exactly one burst per
+/// sample makes the work per sample constant; the read's own cost, and any
+/// serialization the store puts between the two, is the delta over the burst
+/// alone (`write_burst_alone`) and over the idle read.
+///
+/// The burst is polled once before the read is issued, and that poll is what
+/// orders them: the store's write path takes the write permit on its first
+/// poll (it is free between samples, the previous burst having been awaited)
+/// and only then parks on its blocking job. A read on the write queue thus
+/// queues behind the burst, and a read on a reader connection runs beside a
+/// write in progress, whatever the scheduler does with either task.
+fn read_under_write<R>(
+    h: &'static Harness,
+    rows: &[AppStateMutationMAC],
+    read: impl Future<Output = R>,
+) -> R {
+    h.runtime.block_on(async {
+        let mut burst = pin!(h.store.put_mutation_macs("regular", 1, rows));
+        let finished = poll_fn(|cx| Poll::Ready(burst.as_mut().poll(cx).is_ready())).await;
+        assert!(!finished, "the burst finished before the read was issued");
+        let out = read.await;
+        burst.await.expect("write burst");
+        out
     })
+}
+
+/// The row sets the bursts alternate between; see `BURST_SEEDS`.
+fn burst_rows() -> impl Fn() -> Vec<AppStateMutationMAC> {
+    let turn = AtomicUsize::new(0);
+    move || {
+        macs(
+            BURST_ROWS,
+            BURST_SEEDS[turn.fetch_add(1, Ordering::Relaxed) % 2],
+        )
+    }
 }
 
 #[divan::bench]
@@ -136,27 +180,34 @@ fn write_queue_read_idle(bencher: divan::Bencher) {
 }
 
 #[divan::bench]
+fn write_burst_alone(bencher: divan::Bencher) {
+    let h = harness();
+    bencher.with_inputs(burst_rows()).bench_refs(|rows| {
+        h.runtime
+            .block_on(h.store.put_mutation_macs("regular", 1, rows))
+            .expect("write burst")
+    });
+}
+
+#[divan::bench]
 fn read_query_read_under_write(bencher: divan::Bencher) {
     let h = harness();
-    let writer = start_writer(h);
-    bencher.bench(|| {
-        h.runtime
-            .block_on(h.store.get_group_metadata(black_box(GROUP)))
-            .expect("read")
+    bencher.with_inputs(burst_rows()).bench_refs(|rows| {
+        read_under_write(h, rows, async {
+            h.store
+                .get_group_metadata(black_box(GROUP))
+                .await
+                .expect("read")
+        })
     });
-    h.stop.store(true, Ordering::Relaxed);
-    let _ = h.runtime.block_on(writer);
 }
 
 #[divan::bench]
 fn write_queue_read_under_write(bencher: divan::Bencher) {
     let h = harness();
-    let writer = start_writer(h);
-    bencher.bench(|| {
-        h.runtime
-            .block_on(h.store.get_devices(black_box(USER)))
-            .expect("read")
+    bencher.with_inputs(burst_rows()).bench_refs(|rows| {
+        read_under_write(h, rows, async {
+            h.store.get_devices(black_box(USER)).await.expect("read")
+        })
     });
-    h.stop.store(true, Ordering::Relaxed);
-    let _ = h.runtime.block_on(writer);
 }

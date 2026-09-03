@@ -131,9 +131,10 @@ impl ResendRateLimiter {
         self.throttled_total.load(Ordering::Relaxed)
     }
 
-    /// Number of chats holding a live bucket (diagnostics).
-    pub(crate) fn entry_count(&self) -> u64 {
-        self.buckets.entry_count()
+    /// Number of chats holding a live bucket (diagnostics). Awaited, so a
+    /// report taken during a resend burst does not read `0`.
+    pub(crate) async fn entry_count_async(&self) -> u64 {
+        self.buckets.entry_count_async().await
     }
 }
 
@@ -207,7 +208,7 @@ mod tests {
             assert!(limiter.try_acquire(&c).await);
         }
         assert_eq!(
-            limiter.entry_count(),
+            limiter.entry_count_async().await,
             0,
             "disabled limiter creates no buckets"
         );

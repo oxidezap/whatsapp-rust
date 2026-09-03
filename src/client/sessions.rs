@@ -1,6 +1,7 @@
 //! E2E Session management for Client.
 
 use anyhow::Result;
+use futures::FutureExt;
 use rand::rngs::StdRng;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -556,78 +557,118 @@ impl Client {
     }
 
     pub(crate) async fn wait_for_offline_delivery_end_with_timeout(&self, timeout: Duration) {
+        /// Why the wait ended, when it did not run out of time.
+        enum Wake {
+            /// The offline sync signalled completion.
+            Sync,
+            /// The connection this wait belongs to ended under it.
+            ConnectionEnded,
+        }
+
         let wait_generation = self.connection_generation.load(Ordering::Acquire);
+        // Subscribed before the completion check, so a teardown landing in the
+        // window between the two still wakes this wait.
+        let shutdown = self.connection_shutdown_signal();
         let offline_fut = self.offline_sync_notifier.listen();
         if self.offline_sync_completed.load(Ordering::Relaxed) {
             return;
         }
 
-        if wacore::runtime::timeout(&*self.runtime, timeout, offline_fut)
-            .await
-            .is_err()
-        {
-            // Guard: don't complete sync for a stale connection generation.
-            // A reconnect may have happened while we were waiting, making this
-            // timeout belong to the old connection.
-            if self.connection_generation.load(Ordering::Acquire) != wait_generation
-                || self.expected_disconnect.load(Ordering::Relaxed)
-            {
+        // Raced against the per-connection shutdown, because every caller of
+        // this helper is doing something for *this* connection — the post-login
+        // task, the prekey-low top-up, the dirty-bits handler, the send path's
+        // session pre-flight — and a teardown makes all of it moot. Without the
+        // arm they parked here for the whole timeout after the socket was gone,
+        // which on a reconnect-heavy month is a task per reconnect sitting on a
+        // connection that no longer exists.
+        //
+        // The shutdown arm deliberately does NOT complete the sync: completion
+        // is a claim about a live connection's backlog, and the timeout path
+        // below is the only place entitled to make it (behind the same
+        // generation guard it always had).
+        let waited = wacore::runtime::timeout(&*self.runtime, timeout, async {
+            futures::select! {
+                _ = offline_fut.fuse() => Wake::Sync,
+                _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => Wake::ConnectionEnded,
+            }
+        })
+        .await;
+
+        match waited {
+            Ok(Wake::Sync) => return,
+            Ok(Wake::ConnectionEnded) => {
                 log::debug!(
                     target: "Client/OfflineSync",
-                    "Offline sync timeout ignored: connection generation changed or disconnected",
+                    "Offline sync wait ended with its connection (generation {} -> {}); leaving the sync uncompleted",
+                    wait_generation,
+                    self.connection_generation.load(Ordering::Acquire),
                 );
                 return;
             }
+            Err(_) => {}
+        }
 
-            let processed = self
-                .offline_sync_metrics
-                .processed_messages
-                .load(Ordering::Acquire);
-            let expected = self
-                .offline_sync_metrics
-                .total_messages
-                .load(Ordering::Acquire);
-            log::warn!(
+        // Guard: don't complete sync for a stale connection generation.
+        // A reconnect may have happened while we were waiting, making this
+        // timeout belong to the old connection.
+        if self.connection_generation.load(Ordering::Acquire) != wait_generation
+            || self.expected_disconnect.load(Ordering::Relaxed)
+        {
+            log::debug!(
                 target: "Client/OfflineSync",
-                "Offline sync timed out after {:?} (processed {} of {} items); marking sync complete",
-                timeout,
-                processed,
-                expected,
+                "Offline sync timeout ignored: connection generation changed or disconnected",
             );
-            self.complete_offline_sync_for_generation(
-                i32::try_from(processed).unwrap_or(i32::MAX),
-                wait_generation,
-            )
-            .await;
-            // The finisher runs as a spawned task; keep this helper's contract
-            // that live state is in place when it returns (callers start
-            // session/send work right after). Ticked so a reconnect or
-            // shutdown mid-commit cannot strand this waiter, and bounded by a
-            // second `timeout` window: when the marker-triggered finisher was
-            // ALREADY running and its tail commit/hook is stuck, the
-            // complete_offline_sync above started nothing, and an unbounded
-            // wait here would defeat this helper's whole point — callers
-            // proceed and the finisher keeps running in the background.
-            let deadline = wacore::time::Instant::now() + timeout;
-            loop {
-                let listener = self.offline_sync_notifier.listen();
-                if self.offline_sync_completed.load(Ordering::Acquire)
-                    || self.connection_generation.load(Ordering::Acquire) != wait_generation
-                    || self.expected_disconnect.load(Ordering::Relaxed)
-                {
-                    return;
-                }
-                if wacore::time::Instant::now() >= deadline {
-                    log::warn!(
-                        target: "Client/OfflineSync",
-                        "Drain finisher still running {:?} after the offline sync timeout; proceeding without it",
-                        timeout,
-                    );
-                    return;
-                }
-                let _ = wacore::runtime::timeout(&*self.runtime, Duration::from_secs(1), listener)
-                    .await;
+            return;
+        }
+
+        let processed = self
+            .offline_sync_metrics
+            .processed_messages
+            .load(Ordering::Acquire);
+        let expected = self
+            .offline_sync_metrics
+            .total_messages
+            .load(Ordering::Acquire);
+        log::warn!(
+            target: "Client/OfflineSync",
+            "Offline sync timed out after {:?} (processed {} of {} items); marking sync complete",
+            timeout,
+            processed,
+            expected,
+        );
+        self.complete_offline_sync_for_generation(
+            i32::try_from(processed).unwrap_or(i32::MAX),
+            wait_generation,
+        )
+        .await;
+        // The finisher runs as a spawned task; keep this helper's contract
+        // that live state is in place when it returns (callers start
+        // session/send work right after). Ticked so a reconnect or
+        // shutdown mid-commit cannot strand this waiter, and bounded by a
+        // second `timeout` window: when the marker-triggered finisher was
+        // ALREADY running and its tail commit/hook is stuck, the
+        // complete_offline_sync above started nothing, and an unbounded
+        // wait here would defeat this helper's whole point — callers
+        // proceed and the finisher keeps running in the background.
+        let deadline = wacore::time::Instant::now() + timeout;
+        loop {
+            let listener = self.offline_sync_notifier.listen();
+            if self.offline_sync_completed.load(Ordering::Acquire)
+                || self.connection_generation.load(Ordering::Acquire) != wait_generation
+                || self.expected_disconnect.load(Ordering::Relaxed)
+            {
+                return;
             }
+            if wacore::time::Instant::now() >= deadline {
+                log::warn!(
+                    target: "Client/OfflineSync",
+                    "Drain finisher still running {:?} after the offline sync timeout; proceeding without it",
+                    timeout,
+                );
+                return;
+            }
+            let _ =
+                wacore::runtime::timeout(&*self.runtime, Duration::from_secs(1), listener).await;
         }
     }
 

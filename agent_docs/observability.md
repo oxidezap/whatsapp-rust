@@ -780,12 +780,13 @@ Against that, the two preallocated bounded queues a session owns:
 
 | queue | capacity | payload | retained |
 | --- | ---: | ---: | ---: |
-| `major_sync_task_sender` (`Client::new`) | 32 | 56 B | 2 816 B |
+| `major_sync_task_sender` (`Client::new`) | 8 | 56 B | ~0.5 KiB |
 | transport events (`EVENT_CHANNEL_CAPACITY`, per connection) | 64 | 40 B | 3 840 B |
 
-So the sync queue is ~11% of a constructed client — but a connected session's
-marginal cost is ~530 KiB (see the table further up), against which both queues
-together are ~1.2%. **Neither is worth making lazy.** The sync queue's receiver
+(The sync queue was measured at 2 816 B when its capacity was 32; the 8-slot
+figure is computed, not re-measured.) So the sync queue is ~2% of a constructed
+client — and a connected session's marginal cost is ~530 KiB (see the table
+further up), against which both queues together are under 1%. **Neither is worth making lazy.** The sync queue's receiver
 is handed to `Bot::build` to spawn its worker, so deferring the allocation means
 an `Option` plus a builder handoff that no longer has a receiver to give; the
 transport queue is created by the transport at connect, and every connected
@@ -824,7 +825,7 @@ message can overshoot substantially on its own.
 | collection | bound | what eviction costs |
 | --- | --- | --- |
 | `group_cache` | 1h TTL, 250 | re-query on miss |
-| `device_registry_cache` | 1h TTL, 5 000 | store stays authoritative |
+| `device_registry_cache` | 1h TTL, 20 000 | store stays authoritative |
 | `recent_messages` | 5m TTL, 0 (disabled) | DB is authoritative |
 | `message_retry_counts` | 1h TTL, 500, FIFO | a forgiven `MAX_DECRYPT_RETRIES` — see below |
 | `undecryptable_dispatched` | 5m TTL, 1 000 | a duplicate event |
@@ -838,11 +839,21 @@ message can overshoot substantially on its own.
 | `SignalStoreCache::sender_key_locks` | 2 000, idle-only | nothing: only locks held solely by the map are dropped |
 | `inbound_commit_batch` | 400 messages / 4 MiB, checked after insert | commits early, no loss; overshoots by one message |
 | `msg_secret_buffer` | 4 096, except on cancellation | nothing: a producer that would exceed it parks on `capacity_available`, and a cancelled one force-buffers past the mark rather than losing captures |
-| device-topology changed-users log | 256 | a memo recompute; overflow can never serve stale data |
+| device-topology changed-users log | 4 096 | a memo recompute; overflow can never serve stale data |
 | `AbPropsCache` | the compile-time `WATCHED` interest set | server props outside it are discarded at parse |
 | `CallRegistry` pre-offer controls / ringing group calls / event queues | 64 entries or 1 MiB each | fail-closed admission |
 | `PendingCallLinkJoins` transitions | 32 | fail-closed |
-| `major_sync_task_sender` / transport events / noise send jobs | 32 / 64 / 8 | backpressure, no loss |
+| `major_sync_task_sender` / transport events / noise send jobs | 8 / 64 / 8 | backpressure, no loss |
+
+**A TTL is a bound only if something sweeps.** `PortableCache` expires lazily:
+an entry leaves on the access that finds it stale or under capacity pressure
+from a new insert, and a quiet connection does neither. So the keepalive's
+~5-minute maintenance tick also runs `Client::run_cache_maintenance`, which
+sweeps every TTL/TTI cache above (store-backed ones expire on their own and
+no-op). Between sweeps `memory_report()` counts include expired entries, which
+is why a count can exceed what a lookup would find; a report taken right after
+a sweep is the exact one. Capacity-only caches are not swept — they have nothing
+to expire.
 
 ### What is unbounded, and why it stays that way
 
@@ -860,14 +871,25 @@ the bound is a drain or a lifecycle, so the count is the only warning available.
   already requested or loses the dedup that keeps a stuck sender from re-asking
   every few seconds. Growth is self-limiting anyway: each new key id costs a peer
   message on the wire.
-- **`pending_device_sync`** — one entry per distinct user seen with an unknown
-  device. Offline entries are drained by `doPendingDeviceSync` at the end of the
-  backlog; entries the *online* path adds are removed only by that same drain or
-  by teardown, so a connection that never drains keeps them for its lifetime,
-  which also suppresses a second immediate refresh for those users. A cap would
-  skip a device refresh and leave the next send to that user addressed to a stale
-  device list, so the fix if this ever matters is a removal on the online path,
-  not a ceiling.
+- **`pending_device_sync`** — one entry per user with a device refresh pending
+  or in flight. Offline entries are drained by `doPendingDeviceSync` at the end
+  of the backlog; an entry the *online* path adds is released by a `scopeguard`
+  when its refresh finishes, so outside a drain the set holds only what is in
+  flight. (It used to hold online entries for the connection's lifetime, which
+  also meant a user who added a second new device weeks later never got another
+  refresh.) A cap would skip a device refresh and leave the next send to that
+  user addressed to a stale device list, so the bound stays the drain.
+- **Chat-lane queues** (`chat_lane_backlog`) — the lanes are capped, their
+  `async_channel::unbounded` queues are not, and each queued message retains
+  its whole inbound frame. The bound is the worker draining it; a backlog that
+  grows is a worker that is stuck (a slow durability hook, a hung decrypt), and
+  the count is the signal. Capping the queue would drop or redeliver messages
+  the server already considers delivered.
+- **`lid_pn_cache` side maps** (`lid_pn_contact_hash_entries`,
+  `lid_pn_persisted_entries`) — unbounded with the cache they index, one entry
+  per identifier and one per persisted pair. Their payload is the entry's own
+  strings, so the report charges them table structure only; that structure is
+  what grows with the contact list, ~10% on top of the entries themselves.
 - **`AppStateProcessor::key_cache`** — expanded app-state keys, one entry per
   distinct key id the server's patches reference, with no cap and no TTL;
   emptied only by `clear_key_cache` on reconnect. The backend stays

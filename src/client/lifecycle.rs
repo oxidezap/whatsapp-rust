@@ -21,6 +21,41 @@ impl Client {
     /// long is the reconnect backoff counter reset to its base.
     pub(crate) const STABLE_CONNECTION_RESET: Duration = Duration::from_secs(30);
 
+    /// How long a teardown waits for the socket to close before walking away
+    /// from it.
+    ///
+    /// A close is a network write that shares the transport's sink with every
+    /// send, so it queues behind whatever is already in flight there; on a
+    /// black-holed connection that write is not refused, it is retried by the
+    /// kernel until `tcp_retries2` runs out (~15 minutes on Linux). Every
+    /// teardown path here runs on the caller's thread of control — the run loop
+    /// for a reconnect, the application's for `disconnect()` — so an untimed
+    /// close parks the whole client behind a socket the OS has not finished
+    /// failing. Two seconds is far past what a live socket needs (the close
+    /// frame is one small write) and far short of what a dead one costs.
+    ///
+    /// Walking away is safe: the transport is dropped with the connection
+    /// state, and the close is best-effort anyway — the server drops a session
+    /// whose socket stops answering.
+    pub(crate) const TRANSPORT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Close `transport`, bounded by [`Self::TRANSPORT_CLOSE_TIMEOUT`].
+    async fn close_transport_bounded(&self, transport: &Arc<dyn crate::transport::Transport>) {
+        if rt_timeout(
+            &*self.runtime,
+            Self::TRANSPORT_CLOSE_TIMEOUT,
+            transport.disconnect(),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                "Transport close did not finish in {:?}; abandoning the socket",
+                Self::TRANSPORT_CLOSE_TIMEOUT
+            );
+        }
+    }
+
     /// Create a runtime-validated low-level client builder.
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
@@ -806,7 +841,17 @@ impl Client {
                 self.auto_reconnect_errors.store(0, Ordering::Relaxed);
             }
 
-            let error_count = self.auto_reconnect_errors.fetch_add(1, Ordering::SeqCst);
+            // Saturating, not a bare increment: this counter is only ever reset
+            // by a connection that stayed up 30 s, so a link that flaps for a
+            // month climbs it forever. See `MAX_BACKOFF_ATTEMPTS` — the delay
+            // stopped changing long before the ceiling, so nothing about the
+            // schedule moves.
+            let error_count = self
+                .auto_reconnect_errors
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |previous| {
+                    Some(next_backoff_attempt(previous))
+                })
+                .unwrap_or_else(|previous| previous);
             // WA Web: Fibonacci backoff with 10% jitter, max 900s.
             // algo: { type: "fibonacci", first: 1000, second: 1000 }
             // jitter: 0.1, max: 9e5
@@ -953,8 +998,18 @@ impl Client {
         // as NotConnected, which the loop classifies as fatal and exits on,
         // leaving the connection with no idle ping and no dead-socket watchdog.
         let keepalive = self.clone();
+        // Both captured here, in the caller, not inside the task: the spawn only
+        // promises the loop will run, not when its first poll happens, and by
+        // then a teardown may already have reset the notifier and bumped the
+        // generation for the next connection. See `keepalive_loop`.
+        let keepalive_shutdown = self.connection_shutdown_signal();
+        let keepalive_generation = self.connection_generation.load(Ordering::Acquire);
         self.runtime
-            .spawn(Box::pin(async move { keepalive.keepalive_loop().await }))
+            .spawn(Box::pin(async move {
+                keepalive
+                    .keepalive_loop(keepalive_shutdown, keepalive_generation)
+                    .await
+            }))
             .detach();
 
         let loop_result = self.read_messages_loop().await;
@@ -1332,7 +1387,7 @@ impl Client {
         // socket write) would park `connect_internal`, which installs through this mutex.
         let transport = self.transport.lock().await.clone();
         if let Some(transport) = transport {
-            transport.disconnect().await;
+            self.close_transport_bounded(&transport).await;
         }
         self.cleanup_connection_state().await;
 
@@ -1406,7 +1461,7 @@ impl Client {
 
         let transport = self.transport.lock().await.clone();
         if let Some(transport) = transport {
-            transport.disconnect().await;
+            self.close_transport_bounded(&transport).await;
         }
     }
 
@@ -1442,7 +1497,7 @@ impl Client {
 
         let transport = self.transport.lock().await.clone();
         if let Some(transport) = transport {
-            transport.disconnect().await;
+            self.close_transport_bounded(&transport).await;
         }
     }
 
@@ -1585,7 +1640,7 @@ impl Client {
         }
 
         if let Some(transport) = &torn_down {
-            transport.disconnect().await;
+            self.close_transport_bounded(transport).await;
         }
 
         // A connection nobody is reading has no `drive_connection` to run the
@@ -1796,9 +1851,23 @@ impl Client {
         // afterwards would strip the replacement connection instead of the one being torn down.
         let transport = self.transport.lock().await.take();
         *self.transport_events.lock().await = None;
-        *self.noise_socket.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let noise_socket = self
+            .noise_socket
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        // Stop the noise sender explicitly rather than leaving it to the last
+        // `Arc` clone. Its callers hold the socket across their awaits, so a
+        // send parked on a dead transport keeps the task — and the transport's
+        // sink — alive well past this teardown, and the close below would then
+        // queue behind a write the kernel is still retrying. Done before the
+        // close for that reason, and after the caller's bounded outbound flush,
+        // so nothing that was still allowed to go out is cancelled here.
+        if let Some(noise_socket) = noise_socket {
+            noise_socket.abort_sender();
+        }
         if let Some(transport) = transport {
-            transport.disconnect().await;
+            self.close_transport_bounded(&transport).await;
         }
         // Authoritative point for the gauge: every disconnect (intentional or a
         // run-loop drop/reconnect) funnels through here, so disconnect()'s early
@@ -2332,6 +2401,88 @@ impl Drop for Connection<'_> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Install a socket over `transport` on `client` as a published connection,
+    /// the way `connect_internal` would.
+    async fn publish_transport_for_test(
+        client: &Arc<Client>,
+        transport: Arc<crate::transport::mock::StallingMockTransport>,
+    ) -> Arc<NoiseSocket> {
+        use wacore::handshake::NoiseCipher;
+
+        let noise_socket = Arc::new(NoiseSocket::new(
+            client.runtime.clone(),
+            transport.clone() as Arc<dyn crate::transport::Transport>,
+            NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
+            NoiseCipher::new(&[0u8; 32]).expect("32-byte key"),
+        ));
+        *client.transport.lock().await = Some(transport as Arc<dyn crate::transport::Transport>);
+        *client
+            .noise_socket
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&noise_socket));
+        client.set_connected_for_test(true);
+        noise_socket
+    }
+
+    /// A teardown may not park on a socket that never closes.
+    ///
+    /// This is the shape a long-lived session hits: the peer disappears without
+    /// a FIN, the write the noise sender is parked in is retried by the kernel
+    /// for another quarter of an hour, and the close queues behind it because
+    /// both share the transport's sink. Untimed, `disconnect()` — and every
+    /// reconnect, which tears down the same way — inherits that wait, so the
+    /// run loop stops driving anything for as long as the OS takes to give up.
+    #[tokio::test(start_paused = true)]
+    async fn teardown_is_bounded_when_the_socket_never_closes() {
+        let client = crate::test_utils::create_test_client().await;
+        let transport = Arc::new(crate::transport::mock::StallingMockTransport::new());
+        let noise_socket = publish_transport_for_test(&client, Arc::clone(&transport)).await;
+
+        // A send parked inside the transport, holding the sink the close needs.
+        // Spawned with its own clone of the socket, which is what makes the
+        // refcount alone unable to stop the sender task.
+        let parked_send = tokio::spawn({
+            let noise_socket = Arc::clone(&noise_socket);
+            async move {
+                noise_socket
+                    .encrypt_and_send(bytes::Bytes::from_static(b"parked"))
+                    .await
+            }
+        });
+        crate::test_utils::poll_until("the noise sender to park in the transport", || {
+            transport.sends_started() >= 1
+        })
+        .await;
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(600), client.disconnect())
+            .await
+            .expect("disconnect() must not wait on a socket that never closes");
+        assert!(
+            transport.disconnects_started() >= 1,
+            "the teardown must still have asked the transport to close"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "teardown took {:?}; it is supposed to be bounded by a handful of \
+             {:?} windows",
+            started.elapsed(),
+            Client::TRANSPORT_CLOSE_TIMEOUT,
+        );
+
+        // The other half: the sender task is stopped outright, so the caller
+        // parked on it is failed rather than left waiting on a socket nobody
+        // will ever read again.
+        let sent = tokio::time::timeout(Duration::from_secs(30), parked_send)
+            .await
+            .expect("the parked send must be released by the teardown")
+            .expect("the sending task must not panic");
+        assert!(
+            sent.is_err(),
+            "a send the teardown cancelled must report failure, not success"
+        );
+    }
 
     /// What one `Client` costs before it has connected, cached or received
     /// anything: pure structure, shared `PersistenceManager` and backend

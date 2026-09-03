@@ -328,15 +328,16 @@ impl Client {
     /// byte figures.
     ///
     /// On-demand only: walks the in-process caches under their locks when
-    /// called, costs nothing otherwise. Counts are approximate (caches may
-    /// have pending evictions); call `run_pending_tasks()` on individual
-    /// caches first if you need exact counts.
+    /// called, costs nothing otherwise. Counts include entries that have
+    /// expired but not yet been swept; the sweep runs with the keepalive's
+    /// periodic maintenance ([`Self::run_cache_maintenance`]), so between
+    /// sweeps a count can exceed what a fresh lookup would find.
     pub async fn memory_report(&self) -> MemoryReport {
         use wacore::stats::{CollectionStats, HeapSize};
 
         let (signal_sessions, signal_identities, signal_sender_keys) =
             self.signal_cache.memory_stats().await;
-        let (lid_pn_lid_entries, lid_pn_pn_entries) = self.lid_pn_cache.memory_stats().await;
+        let lid_pn = self.lid_pn_cache.memory_stats().await;
         let pending_retries_count = self
             .pending_retries
             .lock()
@@ -374,6 +375,17 @@ impl Client {
             .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
             .await;
         let group_distribution_locks = self.group_distribution_locks.capacity_stats().await;
+        // One awaited walk: a lane's queue length is a channel counter, so this
+        // reads each lane once and allocates nothing.
+        let (chat_lanes, chat_lane_backlog) = self
+            .chat_lanes
+            .fold_entries((0u64, 0u64), |(lanes, backlog), _, lane| {
+                (
+                    lanes + 1,
+                    backlog.saturating_add(u64::try_from(lane.queue_tx.len()).unwrap_or(u64::MAX)),
+                )
+            })
+            .await;
 
         // Each count read into a local so no two guards are ever held at once.
         let response_waiters = self.response_waiters_guard().len();
@@ -466,17 +478,19 @@ impl Client {
         MemoryReport {
             group_cache,
             device_registry_cache: self.device_registry_cache.memory_stats().await,
-            lid_pn_lid_entries,
-            lid_pn_pn_entries,
+            lid_pn_lid_entries: lid_pn.lid,
+            lid_pn_pn_entries: lid_pn.pn,
+            lid_pn_contact_hash_entries: lid_pn.contact_hash,
+            lid_pn_persisted_entries: lid_pn.persisted,
             recent_messages,
             sender_key_device_cache: self.sender_key_device_cache.memory_stats().await,
             group_devices_memo,
             dm_devices_memo,
-            message_retry_counts: self.message_retry_counts.entry_count(),
-            undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
-            dispatched_messages: self.dispatched_messages.entry_count(),
-            pdo_pending_requests: self.pdo_pending_requests.entry_count(),
-            pdo_requested: self.pdo_requested.entry_count(),
+            message_retry_counts: self.message_retry_counts.entry_count_async().await,
+            undecryptable_dispatched: self.undecryptable_dispatched.entry_count_async().await,
+            dispatched_messages: self.dispatched_messages.entry_count_async().await,
+            pdo_pending_requests: self.pdo_pending_requests.entry_count_async().await,
+            pdo_requested: self.pdo_requested.entry_count_async().await,
             history_sync_tasks,
             history_sync_tasks_peak: history_sync_activity.tasks_peak as u64,
             history_sync_payload_bytes_peak: history_sync_activity.payload_bytes_peak as u64,
@@ -484,16 +498,17 @@ impl Client {
             offline_receipt_buffer,
             msg_secret_buffer,
             pending_device_sync,
-            session_locks: self.session_locks.entry_count(),
+            session_locks: self.session_locks.entry_count_async().await,
             ensure_inflight: self.ensure_inflight.len() as u64,
             group_metadata_inflight: self.group_metadata_inflight.len() as u64,
-            chat_lanes: self.chat_lanes.entry_count(),
+            chat_lanes,
+            chat_lane_backlog,
             group_distribution_locks: group_distribution_locks.entries,
             group_distribution_lock_evictions: group_distribution_locks.evictions,
             group_distribution_lock_eviction_blocks: group_distribution_locks.eviction_blocks,
-            resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
-            session_recreate_history: self.session_recreate_history.entry_count(),
-            skdm_warm_memo: self.skdm_warm_memo.entry_count(),
+            resend_rate_limiter_chats: self.resend_rate_limiter.entry_count_async().await,
+            session_recreate_history: self.session_recreate_history.entry_count_async().await,
+            skdm_warm_memo: self.skdm_warm_memo.entry_count_async().await,
             transport_ack_queue: self.transport_ack_queue.get().map_or(0, |tx| tx.len()),
             delivery_receipt_queue: self.delivery_receipt_queue.get().map_or(0, |tx| tx.len()),
             response_waiters,

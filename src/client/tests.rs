@@ -3205,6 +3205,50 @@ fn test_fibonacci_backoff_max_900s() {
     );
 }
 
+/// The sequence stops changing at the cap, so the work of computing it must
+/// stop there too. The counter feeding this is only reset by a connection that
+/// stays up 30 s, so on a link that flaps for weeks it is the one input here
+/// with no natural bound.
+#[test]
+fn fibonacci_backoff_stops_at_the_cap_instead_of_counting_out_the_attempt() {
+    let capped = fibonacci_backoff(20);
+    let far_past_the_cap = fibonacci_backoff(u32::MAX);
+    for (label, delay) in [
+        ("attempt 20", capped),
+        ("attempt u32::MAX", far_past_the_cap),
+    ] {
+        let ms = delay.as_millis() as u64;
+        assert!(
+            (810_000..=990_000).contains(&ms),
+            "{label} should be the 900s cap (±10% jitter), got {ms}ms"
+        );
+    }
+}
+
+/// The counter itself saturates, so a month of flapping cannot run it up (or,
+/// with the 429 handler adding five at a time, wrap it). The delay is pinned at
+/// the cap long before the ceiling, so nothing about the schedule moves.
+#[test]
+fn reconnect_attempts_saturate_at_the_ceiling() {
+    assert_eq!(next_backoff_attempt(0), 1);
+    assert_eq!(
+        next_backoff_attempt(MAX_BACKOFF_ATTEMPTS - 1),
+        MAX_BACKOFF_ATTEMPTS
+    );
+    assert_eq!(
+        next_backoff_attempt(MAX_BACKOFF_ATTEMPTS),
+        MAX_BACKOFF_ATTEMPTS
+    );
+    assert_eq!(next_backoff_attempt(u32::MAX), MAX_BACKOFF_ATTEMPTS);
+    const {
+        assert!(
+            MAX_BACKOFF_ATTEMPTS > 17,
+            "the ceiling must sit past the attempt at which the delay reaches \
+             its cap, so saturating never changes a wait"
+        )
+    };
+}
+
 #[test]
 fn test_fibonacci_backoff_first_attempt_is_1s() {
     let delay = fibonacci_backoff(0);
@@ -4921,8 +4965,10 @@ async fn memory_report_display_sections_stay_aligned() {
     let ttl_start = rendered
         .find("--- TTL-bounded caches ---")
         .expect("ttl section");
+    let lid_pn_start = rendered.find("--- LID/PN maps").expect("lid/pn section");
     let signal_start = rendered.find("--- Signal store").expect("signal section");
-    let ttl_block = &rendered[ttl_start..signal_start];
+    let ttl_block = &rendered[ttl_start..lid_pn_start];
+    let lid_pn_block = &rendered[lid_pn_start..signal_start];
 
     for name in [
         "group_cache:",
@@ -4936,6 +4982,23 @@ async fn memory_report_display_sections_stay_aligned() {
             "{name} must render under the TTL-bounded heading, got:\n{rendered}"
         );
     }
+    // No TTL bounds these; a contact-list-sized map rendered as a TTL-bounded
+    // cache would make sustained growth read as normal cache activity.
+    for name in [
+        "lid_pn (lid):",
+        "lid_pn (pn):",
+        "lid_pn (hash):",
+        "lid_pn (persisted):",
+    ] {
+        assert!(
+            lid_pn_block.contains(name),
+            "{name} must render under the LID/PN heading, got:\n{rendered}"
+        );
+        assert!(
+            !ttl_block.contains(name),
+            "{name} must not render as a TTL-bounded cache, got:\n{rendered}"
+        );
+    }
     for name in [
         "signal_sessions:",
         "signal_identities:",
@@ -4946,6 +5009,23 @@ async fn memory_report_display_sections_stay_aligned() {
             "{name} must render under the Signal heading, got:\n{rendered}"
         );
     }
+
+    // The lanes are capped; their queues are not, so the backlog belongs with
+    // the drain-bounded collections, not beside the lane count.
+    let capacity_start = rendered
+        .find("--- Capacity-only caches ---")
+        .expect("capacity section");
+    let unbounded_start = rendered
+        .find("--- Unbounded collections ---")
+        .expect("unbounded section");
+    assert!(
+        !rendered[capacity_start..unbounded_start].contains("chat_lane_backlog:"),
+        "chat_lane_backlog must not render as capacity-bounded, got:\n{rendered}"
+    );
+    assert!(
+        rendered[unbounded_start..signal_start].contains("chat_lane_backlog:"),
+        "chat_lane_backlog must render under the unbounded heading, got:\n{rendered}"
+    );
 
     // The last two `collections()` entries are transient retention, one section
     // each. Their order is what the two boundary constants encode, so a cache
@@ -5002,6 +5082,182 @@ async fn memory_report_counts_the_offline_device_sync_queue() {
 
     client.pending_device_sync.take_all();
     assert_eq!(client.memory_report().await.pending_device_sync, 0);
+}
+
+/// The LID/PN cache's side maps grow with the contact list for the process
+/// lifetime, one entry per identifier and one per persisted pair, and were
+/// invisible to the report; the counts must surface and the bytes must be the
+/// table alone, since both maps hold the entry's own strings.
+#[tokio::test]
+async fn memory_report_counts_lid_pn_side_maps() {
+    let client = crate::test_utils::create_test_client_with_name("lid_pn_side_maps").await;
+    let before = client.memory_report().await;
+    assert_eq!(before.lid_pn_contact_hash_entries.entries, 0);
+    assert_eq!(before.lid_pn_persisted_entries.entries, 0);
+
+    let entry = crate::lid_pn_cache::LidPnEntry::new(
+        "100000000000002".to_string(),
+        "19045550180".to_string(),
+        LearningSource::Usync,
+    );
+    client.lid_pn_cache.add(&entry).await;
+    client
+        .lid_pn_cache
+        .mark_persisted(&entry.phone_number, &entry.lid)
+        .await;
+
+    let report = client.memory_report().await;
+    assert_eq!(
+        report.lid_pn_contact_hash_entries.entries, 2,
+        "both sides of a pair are hash-indexed"
+    );
+    assert_eq!(report.lid_pn_persisted_entries.entries, 1);
+    assert!(
+        report.lid_pn_contact_hash_entries.bytes > 0 && report.lid_pn_persisted_entries.bytes > 0,
+        "table structure is charged even though the strings are the entry's"
+    );
+    assert!(
+        report.lid_pn_contact_hash_entries.bytes < report.lid_pn_lid_entries.bytes,
+        "a side map must not re-charge the payload the entry map already counts"
+    );
+    let names: Vec<&str> = report
+        .unbounded_counts()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(names.contains(&"lid_pn_contact_hash_entries"));
+    assert!(names.contains(&"lid_pn_persisted_entries"));
+}
+
+/// A lane's queue is unbounded and each queued message retains its frame, so
+/// a stuck worker is a backlog the report has to show; the lane count alone
+/// reads the same whether the queues are empty or a million deep.
+#[tokio::test]
+async fn memory_report_sums_chat_lane_backlog() {
+    let client = crate::test_utils::create_test_client_with_name("chat_lane_backlog").await;
+    assert_eq!(client.memory_report().await.chat_lane_backlog, 0);
+
+    // A lane with no worker: nothing drains what is enqueued.
+    let chat: Jid = "120363000000000042@g.us".parse().unwrap();
+    let (queue_tx, _queue_rx) = async_channel::unbounded();
+    let lane = ChatLane {
+        enqueue_lock: Arc::new(Mutex::new(())),
+        queue_tx,
+        worker_running: Arc::new(Mutex::new(())),
+    };
+    client.chat_lanes.insert(chat.clone(), lane.clone()).await;
+    for id in ["A", "B", "C"] {
+        let node = NodeBuilder::new("message")
+            .attr("from", chat.clone())
+            .attr("id", id)
+            .build();
+        lane.try_enqueue(node_to_owned_ref(node))
+            .expect("an unbounded lane queue accepts every message");
+    }
+
+    let report = client.memory_report().await;
+    assert_eq!(report.chat_lanes, 1);
+    assert_eq!(report.chat_lane_backlog, 3);
+    assert!(
+        report
+            .unbounded_counts()
+            .contains(&("chat_lane_backlog", 3)),
+        "the backlog is a drain-bounded collection, so the soak compares it"
+    );
+}
+
+/// An online device refresh releases its dedup entry when it finishes. Left
+/// in place, the entry outlived the refresh by the whole connection: the user
+/// was retained until teardown, and a later unknown device from them never
+/// triggered another refresh.
+#[tokio::test]
+async fn online_device_sync_releases_its_dedup_entry() {
+    let client = crate::test_utils::create_test_client_with_name("online_device_sync").await;
+    let jid: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+
+    // Not connected, so the refresh fails; the release must not depend on it
+    // succeeding.
+    client
+        .schedule_unknown_device_sync(jid.clone(), false)
+        .await;
+    for _ in 0..1_000 {
+        if client.pending_device_sync.len() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        client.pending_device_sync.len(),
+        0,
+        "the dedup entry must leave with the refresh that took it"
+    );
+    assert!(
+        client.pending_device_sync.add(&jid),
+        "a later unknown device from the same user triggers a refresh again"
+    );
+}
+
+/// A runtime may drop a spawned future before its first poll. The release
+/// guard is built before the spawn and moved into the task, so even then the
+/// dedup entry leaves with the work it was deduplicating.
+#[tokio::test]
+async fn online_device_sync_releases_its_dedup_entry_when_never_polled() {
+    let pm = Arc::new(
+        PersistenceManager::new(crate::test_utils::create_test_backend().await)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let (client, _rx) = Client::new_with_cache_config(
+        Arc::new(DropSpawnRuntime),
+        pm,
+        Arc::new(crate::transport::mock::MockTransportFactory::new()),
+        Arc::new(MockHttpClient),
+        None,
+        CacheConfig::default(),
+    )
+    .await;
+    let jid: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+
+    client
+        .schedule_unknown_device_sync(jid.clone(), false)
+        .await;
+    assert_eq!(
+        client.pending_device_sync.len(),
+        0,
+        "a task dropped before its first poll must still release its entry"
+    );
+    assert!(client.pending_device_sync.add(&jid));
+}
+
+/// Expired entries leave a quiet cache only when something sweeps: nothing
+/// accesses them and nothing inserts, so without the maintenance tick the
+/// dedup gates hold five-minute-old keys for weeks.
+#[tokio::test]
+async fn cache_maintenance_sweeps_expired_entries() {
+    let mut cache_config = CacheConfig::default();
+    cache_config.dispatched_messages =
+        crate::cache_config::CacheEntryConfig::new(Some(Duration::from_millis(20)), 64);
+    let client = crate::test_utils::create_test_client_with_config(
+        "cache_maintenance",
+        Arc::new(MockHttpClient),
+        cache_config,
+    )
+    .await;
+
+    let chat: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+    let key =
+        wacore::types::message::SenderMessageId::new(chat.clone(), "3EB0EXPIRING".into(), chat);
+    client.dispatched_messages.insert(key, ()).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        client.dispatched_messages.entry_count_async().await,
+        1,
+        "a quiet cache keeps its expired entry until swept"
+    );
+
+    client.run_cache_maintenance().await;
+    assert_eq!(client.dispatched_messages.entry_count_async().await, 0);
+    assert_eq!(client.memory_report().await.dispatched_messages, 0);
 }
 
 #[tokio::test]
@@ -7300,6 +7556,18 @@ async fn arm_offline_drain(client: &Arc<Client>, total: usize, delivered: usize)
     offline_resume::send_first_batch(Arc::clone(client), total).await;
 }
 
+/// Stand in for the next connection opening, after a fixture has torn the
+/// previous one down by hand.
+///
+/// `connect_internal` resets the per-connection shutdown notifier before it
+/// publishes a socket, and that notifier is sticky: without this step the
+/// teardown's fired signal still stands on the "new" connection, and everything
+/// that watches it — the offline-delivery wait, the inactivity watchdog —
+/// correctly stands down on sight.
+fn open_next_connection_for_test(client: &Arc<Client>) {
+    client.reset_connection_shutdown();
+}
+
 fn drain_offline_sync_events(
     rx: &async_channel::Receiver<Arc<Event>>,
 ) -> (Vec<(i32, i32)>, Vec<i32>) {
@@ -7468,6 +7736,7 @@ async fn a_later_drain_still_reports_its_own_outcome() {
 
     arm_offline_drain(&client, 711, 700).await;
     client.cleanup_connection_state().await;
+    open_next_connection_for_test(&client);
 
     // The real path: an `<ib><offline_preview count>` on the next connection,
     // processed inline like any other stanza.
@@ -7512,6 +7781,7 @@ async fn a_finisher_left_behind_by_two_connections_reports_nothing() {
     client.cleanup_connection_state().await;
 
     // A whole new connection and a new drain, which reports its own outcome.
+    open_next_connection_for_test(&client);
     let live_generation = client.connection_generation.load(Ordering::Acquire);
     arm_offline_drain(&client, 25, 25).await;
     client
@@ -7554,6 +7824,7 @@ async fn a_stale_completion_does_not_consume_the_next_connection_finisher() {
         .await;
 
     // The next connection's drain still gets its own finisher and its own event.
+    open_next_connection_for_test(&client);
     let live_generation = client.connection_generation.load(Ordering::Acquire);
     arm_offline_drain(&client, 25, 25).await;
     client
@@ -7564,6 +7835,73 @@ async fn a_stale_completion_does_not_consume_the_next_connection_finisher() {
     let (interrupted, completed) = drain_offline_sync_events(&rx);
     assert_eq!(interrupted.len(), 1, "the first drain's interruption");
     assert_eq!(completed, vec![25], "the second drain still completes");
+}
+
+/// The wait belongs to a connection, so it must end when that connection does
+/// — and it must not mark the sync complete on the way out.
+///
+/// Every caller of this helper (the post-login task, the prekey-low top-up, the
+/// dirty-bits handler, the send path's session pre-flight) was otherwise parked
+/// here for the full timeout after the socket was already gone. Over a month of
+/// reconnects that is one such task per reconnect, each holding the client and
+/// each waiting on a connection that no longer exists.
+#[tokio::test(start_paused = true)]
+async fn wait_for_offline_delivery_end_returns_when_its_connection_ends() {
+    let client = offline_resume_test_client().await;
+    arm_offline_drain(&client, 711, 5).await;
+
+    let started = tokio::time::Instant::now();
+    let waiter = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .wait_for_offline_delivery_end_with_timeout(Duration::from_secs(60))
+                .await;
+        })
+    };
+
+    // Sticky, so this cannot lose the race against the waiter's subscription:
+    // a signal fired first is still observed by a later subscriber.
+    client.notify_connection_shutdown();
+
+    tokio::time::timeout(Duration::from_secs(600), waiter)
+        .await
+        .expect("the wait must end with its connection")
+        .expect("the waiting task must not panic");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the wait ran for {:?}; a teardown must release it rather than let it \
+         serve out the timeout",
+        started.elapsed()
+    );
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Relaxed),
+        "a sync belonging to a connection that ended must not be marked complete"
+    );
+}
+
+/// The inactivity watchdog waits a minute at a time, and its whole job is to
+/// complete a drain the *server* stopped feeding. A drain the *connection*
+/// stopped feeding is the other case — the backlog was never acked and the
+/// server redelivers it — so a teardown has to stop the watchdog rather than
+/// let it wake a minute later and declare the resume finished.
+#[tokio::test(start_paused = true)]
+async fn the_inactivity_watchdog_stops_with_its_connection() {
+    let client = offline_resume_test_client().await;
+    // Arms the coordinator and spawns the production watchdog.
+    arm_offline_drain(&client, 711, 5).await;
+
+    client.notify_connection_shutdown();
+
+    // Well past the window the watchdog would otherwise have completed in.
+    tokio::time::sleep(Duration::from_secs(600)).await;
+
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "a resume whose connection ended is reported as interrupted, not \
+         completed by a watchdog that outlived it"
+    );
 }
 
 /// The startup waiter reports a teardown as soon as it happens.

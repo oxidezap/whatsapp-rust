@@ -1378,7 +1378,15 @@ impl Client {
     /// snapshot silently never happens.
     fn schedule_app_state_task_retry(self: &Arc<Self>, name: WAPatchName, full_sync: bool) {
         let mut scope = self.sync_scope(None);
-        let client = self.clone();
+        // Weak across the sleep: the backoff doubles to an hour, and holding a
+        // strong reference through it keeps the entire client graph — caches,
+        // stores, subsystems — alive for that long after the application has
+        // dropped its handle, and defers the `Drop` that signals shutdown. The
+        // runtime handle is kept separately so the sleep needs nothing from the
+        // client, and the loop re-acquires a strong reference for the round it
+        // is about to run and releases it again at the end of the iteration.
+        let weak_client = Arc::downgrade(self);
+        let runtime = self.runtime.clone();
         self.runtime.spawn_detached(Box::pin(async move {
             // Attempts and rounds are counted separately: a wait that ran out
             // never reached the server, so spending an attempt on it would let a
@@ -1389,7 +1397,11 @@ impl Client {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
+                runtime.sleep(app_state_retry_backoff(attempts)).await;
+                let Some(client) = weak_client.upgrade() else {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: client is gone");
+                    return;
+                };
                 if client.is_terminal() {
                     debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
                     return;
@@ -1495,7 +1507,11 @@ impl Client {
         if collections.is_empty() {
             return;
         }
-        let client = self.clone();
+        // Weak across the sleep, for the same reason as
+        // `schedule_app_state_task_retry`: an hour-long backoff must not keep
+        // the client graph alive after the application lets go of it.
+        let weak_client = Arc::downgrade(self);
+        let runtime = self.runtime.clone();
         self.runtime.spawn_detached(Box::pin(async move {
             let mut scope = scope;
             let mut settles = settles;
@@ -1517,7 +1533,11 @@ impl Client {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
+                runtime.sleep(app_state_retry_backoff(attempts)).await;
+                let Some(client) = weak_client.upgrade() else {
+                    debug!(target: "Client/AppState", "App state retry cancelled: client is gone");
+                    return;
+                };
                 // Waited for, not charged for. Without this the loop spends an
                 // attempt on every offline round, and the whole budget is gone
                 // long before a reconnect that backs off in minutes returns —
@@ -1607,6 +1627,12 @@ impl Client {
             // producing any — would otherwise finish in silence, with the
             // collections still stale. `retryable` is exactly what these are:
             // not synced, and a later trigger can still fix them.
+            //
+            // Nobody to report to if the client is gone; the strong reference
+            // the rounds held was released with the last of them.
+            let Some(client) = weak_client.upgrade() else {
+                return;
+            };
             if client.admits(scope).is_ok() {
                 let exhausted = BatchedSyncOutcome {
                     retryable: pending,
@@ -3695,6 +3721,48 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Neither retry scheduler may keep the client alive while it sleeps.
+    ///
+    /// The backoff doubles to an hour, so a strong reference held across it
+    /// pins the whole graph — caches, stores, the persistence manager — and
+    /// defers the `Drop` that signals shutdown, for as long after the
+    /// application let go of the client. Both loops re-acquire a strong
+    /// reference for the round they are about to run and release it again.
+    #[tokio::test]
+    async fn a_sleeping_app_state_retry_does_not_hold_the_client() {
+        let client = crate::test_utils::create_test_client_with_name("appstate_retry_weak").await;
+        let scope = client.sync_scope(None);
+        // Let construction settle before the count is taken: a startup task
+        // still holding its own clone would otherwise release it during the
+        // yields below and read as this scheduler letting one go.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let before = Arc::strong_count(&client);
+
+        client.schedule_app_state_task_retry(WAPatchName::RegularLow, false);
+        client.schedule_app_state_retry(
+            vec![WAPatchName::RegularHigh],
+            scope,
+            SyncSettles::JustTheCollections,
+            false,
+        );
+
+        // Time is not advanced here on purpose: both tasks park in their first
+        // backoff sleep, which is exactly the state being asserted about. Polled
+        // rather than counted in yields, because under a loaded test host the
+        // spawned tasks may not have reached their sleep after any fixed number
+        // of yields; a task that held the client across its backoff would keep
+        // the count above `before` for the whole (minutes-long) sleep, which the
+        // poll's deadline turns into a failure. `<=` tolerates a startup task
+        // releasing its own clone in the meantime.
+        crate::test_utils::poll_until(
+            "both retry schedulers to park in their backoff holding the client weakly",
+            || Arc::strong_count(&client) <= before,
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn key_arrival_finishes_before_a_slow_fanout() {

@@ -6,8 +6,8 @@ use wacore::net::DisconnectReason;
 use wacore::stanza::wire_tags::StanzaTag;
 
 /// Non-error exits of [`Client::read_messages_loop`] — `ServerRecycle` keeps the
-/// routine reconnect path out of `Err`, so severity consumers (logs, the span's
-/// `err(...)` capture, error trackers) only fire for genuine failures.
+/// routine reconnect path out of `Err`, so severity consumers (logs, error
+/// trackers) only fire for genuine failures.
 pub(crate) enum ReadLoopExit {
     /// Shutdown signal or an expected disconnect.
     Expected,
@@ -171,28 +171,37 @@ impl Client {
         }
     }
 
-    // err(...) stays at the default ERROR on purpose: with the routine server
-    // recycle moved to Ok(ServerRecycle), an Err from this loop now always means
-    // something genuinely wrong — so the automatic capture only ever reports
-    // real failures, not WhatsApp's periodic stream recycling.
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            name = "wa.conn.read_loop",
-            level = "debug",
-            skip_all,
-            fields(lid = tracing::field::Empty, pn = tracing::field::Empty),
-            err(Debug)
-        )
-    )]
+    /// Read until the connection ends, reporting how it ended.
+    ///
+    /// Deliberately NOT instrumented, on the same grounds as `keepalive_loop`
+    /// and `run`: a span opened here lives for the whole connection — days on a
+    /// long-lived session — so nothing exports until the disconnect, every
+    /// per-frame span hangs off a parent that never closes, and any duration
+    /// histogram over it measures uptime rather than work. The loop's entry and
+    /// exit are events instead, and the per-frame spans (`wa.conn.node`,
+    /// `wa.conn.decrypt_frame`) keep their own timing.
     pub(crate) async fn read_messages_loop(
         self: &Arc<Self>,
     ) -> Result<ReadLoopExit, ReadLoopError> {
-        #[cfg(feature = "tracing")]
-        self.record_identity_on_span(&tracing::Span::current());
-
         debug!("Starting message processing loop...");
+        let outcome = self.read_messages_loop_inner().await;
+        // The exit reason at the same level as the entry: with the span gone,
+        // this is what pairs a loop that started with the connection that ended
+        // it. Severity stays with the callers — `drive_connection` decides
+        // which of these is worth an event and which is routine.
+        match &outcome {
+            Ok(ReadLoopExit::Expected) => {
+                debug!("Message processing loop exited: expected disconnect.")
+            }
+            Ok(ReadLoopExit::ServerRecycle(reason)) => {
+                debug!("Message processing loop exited: stream recycled ({reason:?}).")
+            }
+            Err(e) => debug!("Message processing loop exited with an error: {e}"),
+        }
+        outcome
+    }
 
+    async fn read_messages_loop_inner(self: &Arc<Self>) -> Result<ReadLoopExit, ReadLoopError> {
         let mut rx_guard = self.transport_events.lock().await;
         let transport_events = rx_guard
             .take()

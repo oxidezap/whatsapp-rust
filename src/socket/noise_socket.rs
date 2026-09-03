@@ -204,8 +204,10 @@ pub struct NoiseSocket {
     /// await the result without holding a lock.
     send_job_tx: async_channel::Sender<SendJob>,
     /// Handle to the sender task. Aborted on drop to prevent resource leaks
-    /// if the task is stuck on a slow/hanging network operation.
-    _sender_task_handle: AbortHandle,
+    /// if the task is stuck on a slow/hanging network operation, and
+    /// explicitly by [`NoiseSocket::abort_sender`] when teardown cannot wait
+    /// for the last `Arc` to go.
+    sender_task_handle: AbortHandle,
 }
 
 impl NoiseSocket {
@@ -258,7 +260,7 @@ impl NoiseSocket {
             read_key,
             read_counter: Arc::new(AtomicU32::new(0)),
             send_job_tx,
-            _sender_task_handle: sender_task_handle,
+            sender_task_handle,
         }
     }
 
@@ -629,6 +631,26 @@ impl NoiseSocket {
         Self::await_send(receiver).await
     }
 
+    /// Stop the sender task now, without waiting for the last `Arc` to drop.
+    ///
+    /// Drop alone is not enough on a teardown path. The socket is handed out as
+    /// an `Arc`, and a send held across an await (`send_raw_bytes`) keeps a
+    /// clone alive for as long as that send is parked — which, on a black-holed
+    /// TCP connection, is however long the kernel takes to give up on the write
+    /// (`tcp_retries2`, ~15 minutes on Linux). Until then the task stays parked
+    /// inside `transport.send`, holding the transport's sink, so the close that
+    /// teardown is waiting on cannot even start. Cancelling the task drops that
+    /// send, releases the sink, and hands every queued and in-flight caller a
+    /// closed channel instead of a wait with no deadline.
+    ///
+    /// Closing the job channel first is what makes the failure prompt rather
+    /// than merely eventual: an enqueue racing the abort fails immediately
+    /// instead of landing in a queue nothing will drain.
+    pub(crate) fn abort_sender(&self) {
+        self.send_job_tx.close();
+        self.sender_task_handle.abort();
+    }
+
     pub fn decrypt_frame(&self, mut ciphertext: BytesMut) -> Result<BytesMut> {
         // Checked increment: error instead of wrapping the read counter (AES-GCM
         // nonce reuse). fetch_update returns the pre-increment counter to use, or
@@ -646,6 +668,8 @@ impl NoiseSocket {
 
 // AbortHandle aborts the sender task on drop automatically, so no manual
 // Drop impl is needed — the `sender_task_handle` field's own Drop does the work.
+// `abort_sender` is the same stop, taken early by a teardown that cannot wait
+// for the last `Arc` clone to be released.
 
 #[cfg(test)]
 mod tests {

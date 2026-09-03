@@ -41,10 +41,21 @@ impl PendingDeviceSync {
         std::mem::take(&mut *self.lock()).into_iter().collect()
     }
 
-    /// Users queued for the next `doPendingDeviceSync`, plus the users an
-    /// online refresh already covered — [`Self::add`] is the dedup for both, and
-    /// only [`Self::take_all`] and [`Self::clear`] remove anything, so an entry
-    /// added by the online path stays until the next drain or teardown.
+    /// Release a user whose online refresh has finished, so the next unknown
+    /// device from them triggers a refresh again instead of hitting the dedup
+    /// for the rest of the connection. A no-op for an entry an offline drain
+    /// already took.
+    pub(crate) fn remove(&self, jid: &Jid) {
+        let mut pending = self.lock();
+        pending.remove(jid);
+        crate::client::release_after_burst(&mut pending);
+    }
+
+    /// Users queued for the next `doPendingDeviceSync`, plus the users with an
+    /// online refresh in flight — [`Self::add`] is the dedup for both. Offline
+    /// entries leave with [`Self::take_all`]; an online entry leaves when its
+    /// refresh finishes ([`Self::remove`]), so outside a drain this holds only
+    /// what is in flight.
     ///
     /// The set has no capacity cap, and a cap would be the wrong fix: dropping a
     /// user silently skips a device refresh and leaves the next send to them

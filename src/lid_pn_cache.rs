@@ -84,6 +84,19 @@ pub struct LidPnCache {
     persisted: TypedCache<Arc<str>, Arc<str>>,
 }
 
+/// What [`LidPnCache::memory_stats`] reports: one figure per internal map.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LidPnMemory {
+    /// LID → entry, charged with the entry payloads.
+    pub lid: wacore::stats::CollectionStats,
+    /// PN → entry; bytes cover only entries the LID map no longer shares.
+    pub pn: wacore::stats::CollectionStats,
+    /// Contact hash → LID, structural bytes only (the LID is the entry's).
+    pub contact_hash: wacore::stats::CollectionStats,
+    /// PN → persisted LID, structural bytes only (both strings are the entry's).
+    pub persisted: wacore::stats::CollectionStats,
+}
+
 /// Proof that LID/PN mapping mutations are serialized.
 pub(crate) struct LidPnMutationGuard<'a> {
     _guard: async_lock::MutexGuard<'a, ()>,
@@ -158,12 +171,7 @@ impl LidPnCache {
     /// the LID map no longer holds (transient eviction asymmetry), keeping
     /// every entry counted exactly once. `Arc<T>`'s `HeapSize` already
     /// includes `size_of::<LidPnEntry>()`.
-    pub async fn memory_stats(
-        &self,
-    ) -> (
-        wacore::stats::CollectionStats,
-        wacore::stats::CollectionStats,
-    ) {
+    pub async fn memory_stats(&self) -> LidPnMemory {
         use wacore::stats::HeapSize;
         // Dedup by heap address as `usize`, not `*const LidPnEntry`: a raw-pointer
         // set is `!Send`, and held across the two `.await`s below it would make
@@ -187,7 +195,32 @@ impl LidPnCache {
                 }
             })
             .await;
-        (lid, pn)
+        // Both side maps hold only `Arc<str>`s the entries above already own
+        // (`contact_hash_to_lid` clones the entry's LID; `persisted` takes the
+        // entry's own pair), so their payload is charged once, at the entry.
+        // What they add is table structure, which `memory_stats` charges
+        // itself — and that is the part that grows with the contact count for
+        // the whole process lifetime, which is why they are reported at all.
+        let contact_hash = self.contact_hash_to_lid.structural_stats().await;
+        let persisted = self.persisted.structural_stats().await;
+        LidPnMemory {
+            lid,
+            pn,
+            contact_hash,
+            persisted,
+        }
+    }
+
+    /// Sweep entries past the configured idle timeout (a no-op for the
+    /// default, unbounded configuration, and for store-backed maps). Driven by
+    /// [`Client::run_cache_maintenance`].
+    ///
+    /// [`Client::run_cache_maintenance`]: crate::client::Client::run_cache_maintenance
+    pub async fn run_pending_tasks(&self) {
+        self.lid_to_entry.run_pending_tasks().await;
+        self.pn_to_entry.run_pending_tasks().await;
+        self.contact_hash_to_lid.run_pending_tasks().await;
+        self.persisted.run_pending_tasks().await;
     }
 
     /// Get the current LID for a phone number.
