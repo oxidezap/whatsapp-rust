@@ -135,13 +135,19 @@ impl Client {
         // would let a racing reset_connection_shutdown swap the underlying
         // notifier mid-loop and strand this task on the next connection's signal.
         let shutdown_signal = self.connection_shutdown_signal();
+        // Seeded once, not per tick: a fresh `StdRng` costs OS entropy and a
+        // 320-byte state to draw one number, and this loop wakes every 15-30 s
+        // on every connected client (measured 14.8 us vs 808 ns for the draw
+        // alone, debug). The interval only needs to be unpredictable enough that
+        // clients do not synchronise their pings.
+        let mut interval_rng = rand::make_rng::<rand::rngs::StdRng>();
 
         loop {
             // Fresh listener each iteration (event_listener is edge-triggered);
             // the Weak underneath stays pinned to this connection's notifier.
             let shutdown = wacore::runtime::wait_for_shutdown(&shutdown_signal);
 
-            let interval_ms = rand::make_rng::<rand::rngs::StdRng>().random_range(
+            let interval_ms = interval_rng.random_range(
                 KEEP_ALIVE_INTERVAL_MIN.as_millis()..=KEEP_ALIVE_INTERVAL_MAX.as_millis(),
             );
             let interval = Duration::from_millis(interval_ms as u64);
