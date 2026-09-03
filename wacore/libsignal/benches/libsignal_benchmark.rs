@@ -799,7 +799,9 @@ fn setup_session_with_backlog() -> SessionRecord {
     futures::executor::block_on(async {
         let mut rng = bench_rng();
         let mut last = Vec::new();
-        for _ in 0..=SERIALIZE_BACKLOG {
+        // The setup's own in-order message is already undelivered, so it is
+        // one of the backlog.
+        for _ in 0..SERIALIZE_BACKLOG {
             let msg = message_encrypt(
                 b"skipped",
                 &bob.address,
@@ -811,7 +813,8 @@ fn setup_session_with_backlog() -> SessionRecord {
             last = msg.serialize().to_vec();
         }
         let last = CiphertextMessage::SignalMessage(
-            wacore_libsignal::protocol::SignalMessage::try_from(last.as_slice()).unwrap(),
+            wacore_libsignal::protocol::SignalMessage::try_from(last.as_slice())
+                .expect("parse the last message"),
         );
         message_decrypt(
             &last,

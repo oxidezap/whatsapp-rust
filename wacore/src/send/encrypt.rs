@@ -1129,8 +1129,6 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
     // device order: WA Web's `phash` (computed both client and server side)
     // sorts before hashing, as does our `participant_list_hash`.
     if devices.len() <= INLINE_ENCRYPT_DEVICES {
-        // Rationale on the constant: no parallelism worth its spawn cost at
-        // this size, so encrypt sequentially on the caller's task.
         for (idx, device) in devices.iter().enumerate() {
             let addr = encryption_override_at(&encryption_overrides, idx)
                 .unwrap_or(device)
