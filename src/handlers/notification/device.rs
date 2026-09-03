@@ -1,6 +1,6 @@
 use crate::client::Client;
 use crate::lid_pn_cache::LearningSource;
-use crate::types::events::Event;
+use crate::types::events::{Event, EventKind};
 use log::{debug, info, warn};
 use std::sync::Arc;
 use wacore::stanza::devices::DeviceNotification;
@@ -354,13 +354,18 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     }
 
     // = addSecurityCodeChangedNotifications, which WA Web fires inside the gate.
-    client.core.event_bus.dispatch(Event::IdentityChange(
-        crate::types::events::IdentityChange::builder()
-            .user(from_jid.clone())
-            .maybe_lid_user(stanza_lid)
-            .implicit(false)
-            .build(),
-    ));
+    client
+        .core
+        .event_bus
+        .dispatch_with(EventKind::IdentityChange, || {
+            Event::IdentityChange(
+                crate::types::events::IdentityChange::builder()
+                    .user(from_jid.clone())
+                    .maybe_lid_user(stanza_lid)
+                    .implicit(false)
+                    .build(),
+            )
+        });
 
     // Re-establish the session eagerly so the next send is fast (WA Web does this
     // inside the gate too). Skip only while the offline backlog is still draining,
@@ -450,13 +455,18 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
         client.reissue_tc_token_after_identity_change(&sender).await;
     }
 
-    client.core.event_bus.dispatch(Event::IdentityChange(
-        crate::types::events::IdentityChange::builder()
-            .user(sender)
-            .maybe_lid_user(None)
-            .implicit(true)
-            .build(),
-    ));
+    client
+        .core
+        .event_bus
+        .dispatch_with(EventKind::IdentityChange, || {
+            Event::IdentityChange(
+                crate::types::events::IdentityChange::builder()
+                    .user(sender)
+                    .maybe_lid_user(None)
+                    .implicit(true)
+                    .build(),
+            )
+        });
 }
 
 /// Refresh the device list of the contact a hash-only `<update>` names.
@@ -562,27 +572,31 @@ pub(crate) async fn handle_devices_notification(client: &Arc<Client>, node: &Nod
     }
 
     // Dispatch event to notify application layer
-    let event = Event::DeviceListUpdate(
-        DeviceListUpdate::builder()
-            .user(notification.from.clone())
-            .maybe_lid_user(notification.lid_user.clone())
-            .update_type(op.operation_type.into())
-            .devices(
-                op.devices
-                    .iter()
-                    .map(|d| {
-                        DeviceNotificationInfo::builder()
-                            .device_id(d.device_id())
-                            .maybe_key_index(d.key_index)
-                            .build()
-                    })
-                    .collect(),
+    client
+        .core
+        .event_bus
+        .dispatch_with(EventKind::DeviceListUpdate, || {
+            Event::DeviceListUpdate(
+                DeviceListUpdate::builder()
+                    .user(notification.from.clone())
+                    .maybe_lid_user(notification.lid_user.clone())
+                    .update_type(op.operation_type.into())
+                    .devices(
+                        op.devices
+                            .iter()
+                            .map(|d| {
+                                DeviceNotificationInfo::builder()
+                                    .device_id(d.device_id())
+                                    .maybe_key_index(d.key_index)
+                                    .build()
+                            })
+                            .collect(),
+                    )
+                    .maybe_key_index(op.key_index.clone())
+                    .maybe_contact_hash(op.contact_hash.clone())
+                    .build(),
             )
-            .maybe_key_index(op.key_index.clone())
-            .maybe_contact_hash(op.contact_hash.clone())
-            .build(),
-    );
-    client.core.event_bus.dispatch(event);
+        });
 }
 
 /// Parsed device info from account_sync notification

@@ -752,6 +752,42 @@ impl wacore::types::events::EventHandler for MessageCounter {
     }
 }
 
+/// Counts the non-message stanza events the inbound benchmarks produce, so a
+/// "with a subscriber" row can prove the event actually reached a handler
+/// rather than being dropped by the interest bitmask.
+///
+/// Kept unsubscribed by the fixture: the same benchmarks also measure the
+/// no-subscriber shape, which is what a bot that only wants `Messages` runs,
+/// and that shape only exists while nothing is interested in these kinds.
+struct StanzaEventCounter {
+    delivered: portable_atomic::AtomicU64,
+}
+
+/// The kinds [`ReceiveHarness`]'s non-message stanzas turn into: a `<receipt>`,
+/// a `<presence>`, a `<notification type="picture">` and an `<ack>`.
+const STANZA_EVENT_KINDS: &[wacore::types::events::EventKind] = &[
+    wacore::types::events::EventKind::Receipt,
+    wacore::types::events::EventKind::Presence,
+    wacore::types::events::EventKind::PictureUpdate,
+    wacore::types::events::EventKind::ServerAck,
+];
+
+impl wacore::types::events::EventHandler for StanzaEventCounter {
+    fn handle_event(&self, event: Arc<wacore::types::events::Event>) {
+        use wacore::types::events::Event;
+        if matches!(
+            &*event,
+            Event::Receipt(_) | Event::Presence(_) | Event::PictureUpdate(_) | Event::ServerAck(_)
+        ) {
+            self.delivered.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn interest(&self) -> wacore::types::events::EventInterest {
+        wacore::types::events::EventInterest::of(STANZA_EVENT_KINDS)
+    }
+}
+
 /// A logged-in client receiving from one peer it already shares a session and
 /// a sender key with: the steady state every message after the first arrives
 /// in.
@@ -775,6 +811,7 @@ pub struct ReceiveHarness {
     group: Jid,
     group_sender_key: wacore::libsignal::protocol::SenderKeyName,
     counter: Arc<MessageCounter>,
+    stanza_counter: Arc<StanzaEventCounter>,
     /// Dropping it would unsubscribe the counter.
     _subscription: wacore::types::events::Subscription,
     next_id: portable_atomic::AtomicU64,
@@ -799,6 +836,7 @@ impl ReceiveHarness {
             group: fixture.group,
             group_sender_key: fixture.group_sender_key,
             counter: fixture.counter,
+            stanza_counter: fixture.stanza_counter,
             _subscription: fixture.subscription,
             next_id: portable_atomic::AtomicU64::new(0),
         }
@@ -902,6 +940,119 @@ impl ReceiveHarness {
         self.counter.delivered.load(Ordering::Relaxed)
     }
 
+    /// Subscribe the non-message stanza counter for as long as the returned
+    /// [`Subscription`](wacore::types::events::Subscription) is held.
+    ///
+    /// The inbound benchmarks run each stanza both ways, because the
+    /// subscriber is what decides how much of the pipeline runs at all:
+    /// `has_handler_for` gates the receipt parse and steers `processes_inline`,
+    /// and without one an event is never materialised. Neither shape is the
+    /// "real" one — a bot that only consumes `Messages` runs the first, a
+    /// client that mirrors presence and receipts runs the second.
+    pub fn subscribe_stanza_events(&self) -> wacore::types::events::Subscription {
+        self.client.subscribe_handler(
+            Arc::clone(&self.stanza_counter) as Arc<dyn wacore::types::events::EventHandler>
+        )
+    }
+
+    /// How many of the four non-message stanza events reached the subscriber.
+    pub fn stanza_events(&self) -> u64 {
+        self.stanza_counter.delivered.load(Ordering::Relaxed)
+    }
+
+    /// A `<receipt>` from the peer: the delivery acknowledgement one of our
+    /// outgoing DMs draws back, in the simple (non-aggregated) shape.
+    pub fn receipt_stanza(&self) -> Arc<wacore_binary::OwnedNodeRef> {
+        let node = wacore_binary::builder::NodeBuilder::new("receipt")
+            .attr("from", self.peer_jid.to_string())
+            .attr("id", self.next_message_id())
+            .attr("t", wacore::time::now_secs().to_string())
+            .build();
+        decoded(&node)
+    }
+
+    /// A `<presence>` from the peer. The one inbound stanza the server does
+    /// not expect an `<ack>` for, which is what makes it the control against
+    /// the acked kinds.
+    pub fn presence_stanza(&self) -> Arc<wacore_binary::OwnedNodeRef> {
+        let node = wacore_binary::builder::NodeBuilder::new("presence")
+            .attr("from", self.peer_jid.to_string())
+            .attr("type", "available")
+            .build();
+        decoded(&node)
+    }
+
+    /// A `<notification type="picture">`, the cheapest notification the client
+    /// models: one synchronous arm and a single-`String` payload. Anything the
+    /// row reports beyond that belongs to the dispatch machinery around the
+    /// arm, not to the arm.
+    pub fn notification_stanza(&self) -> Arc<wacore_binary::OwnedNodeRef> {
+        let jid = self.peer_jid.to_string();
+        let set = wacore_binary::builder::NodeBuilder::new("set")
+            .attr("jid", jid.clone())
+            .attr("id", "1700000000")
+            .build();
+        let node = wacore_binary::builder::NodeBuilder::new("notification")
+            .attr("from", jid)
+            .attr("type", "picture")
+            .attr("id", self.next_message_id())
+            .attr("t", wacore::time::now_secs().to_string())
+            .children([set])
+            .build();
+        decoded(&node)
+    }
+
+    /// A server `<ack>` for an outgoing stanza no waiter is parked on — the
+    /// shape every fire-and-forget send (receipts, acks, presence) draws back.
+    pub fn ack_stanza(&self) -> Arc<wacore_binary::OwnedNodeRef> {
+        let node = wacore_binary::builder::NodeBuilder::new("ack")
+            .attr("from", self.peer_jid.to_string())
+            .attr("class", "message")
+            .attr("id", self.next_message_id())
+            .attr("t", wacore::time::now_secs().to_string())
+            .build();
+        decoded(&node)
+    }
+
+    /// Run one stanza through the real `Client::process_node` — classification,
+    /// the handler, the event — and stop there.
+    ///
+    /// Unlike [`Self::receive`] this does *not* flush the outbound scope. The
+    /// transport `<ack>` a `<receipt>` or `<notification>` owes is handed to a
+    /// persistent worker that only runs while something else awaits, so
+    /// flushing it per stanza would fold a socket write into a measurement of
+    /// the inbound path. [`Self::flush`] settles it between benchmarks
+    /// instead.
+    pub fn process_nowait(&self, node: Arc<wacore_binary::OwnedNodeRef>) {
+        self.runtime
+            .block_on(Arc::clone(&self.client).process_node(node));
+    }
+
+    /// Run a whole batch of stanzas under one `block_on`, as an offline drain
+    /// does: the read loop hands the queue over without yielding to anything
+    /// else between items, so the per-item cost includes whatever the ack
+    /// worker gets to do in the gaps.
+    pub fn process_burst(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
+        self.runtime.block_on(async {
+            for node in nodes {
+                Arc::clone(&self.client)
+                    .process_node(Arc::clone(node))
+                    .await;
+            }
+        });
+    }
+
+    /// Let the outbound work the processed stanzas queued (their transport
+    /// `<ack>`s) finish, so it cannot leak into the next benchmark.
+    pub fn flush(&self) {
+        self.runtime.block_on(async {
+            self.client
+                .outbound_flush
+                .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
+                .await;
+        });
+    }
+
     /// A fresh stanza id per built message, so dedup never sees a repeat.
     fn next_message_id(&self) -> String {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -935,6 +1086,7 @@ struct ReceiveFixture {
     group: Jid,
     group_sender_key: wacore::libsignal::protocol::SenderKeyName,
     counter: Arc<MessageCounter>,
+    stanza_counter: Arc<StanzaEventCounter>,
     subscription: wacore::types::events::Subscription,
 }
 
@@ -1015,6 +1167,9 @@ async fn build_receive_fixture() -> ReceiveFixture {
         group,
         group_sender_key,
         counter,
+        stanza_counter: Arc::new(StanzaEventCounter {
+            delivered: portable_atomic::AtomicU64::new(0),
+        }),
         subscription,
     }
 }

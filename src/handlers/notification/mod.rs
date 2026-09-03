@@ -36,8 +36,19 @@ impl StanzaHandler for NotificationHandler {
     }
 }
 
-/// Dispatch notification by type. Each arm calls a separate async fn so the
-/// compiler doesn't size this future for all arms simultaneously.
+/// Dispatch notification by type.
+///
+/// Every asynchronous arm is `Box::pin`ned. Awaiting a plain async fn inlines
+/// its state machine into this one, and `async_trait` boxes *this* future on
+/// every inbound `<notification>` — so without the indirection that one
+/// allocation is sized for the union of all the arms, and a
+/// `<notification type="picture">` pays for `handle_devices_notification`'s
+/// locals. Measured on `benches/inbound_stanza`, a `<notification
+/// type="picture">` allocated 2306 bytes before — of which a single 2272-byte
+/// block was this future — and 146 bytes after. The box the arm that actually
+/// runs pays instead is a small block from a hot malloc bin, and only the arm
+/// that runs pays it. Synchronous arms need none of this: a plain call
+/// contributes no state to the caller's future.
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(name = "wa.notif.dispatch", level = "debug", skip_all)
@@ -51,22 +62,32 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
         .and_then(|t| NotificationType::try_from(t).ok());
 
     match parsed {
-        Some(NotificationType::Encrypt) => handle_encrypt_notification(client, nr).await,
+        Some(NotificationType::Encrypt) => Box::pin(handle_encrypt_notification(client, nr)).await,
         Some(NotificationType::ServerSync) => handle_server_sync_notification(client, nr),
-        Some(NotificationType::AccountSync) => handle_account_sync_notification(client, nr).await,
-        Some(NotificationType::Devices) => handle_devices_notification(client, nr).await,
+        Some(NotificationType::AccountSync) => {
+            Box::pin(handle_account_sync_notification(client, nr)).await
+        }
+        Some(NotificationType::Devices) => Box::pin(handle_devices_notification(client, nr)).await,
         Some(NotificationType::LinkCodeCompanionReg) => {
-            crate::pair_code::handle_pair_code_notification(client, nr).await;
+            Box::pin(crate::pair_code::handle_pair_code_notification(client, nr)).await;
         }
         Some(NotificationType::CompanionRegRefresh) => {
-            handle_companion_reg_refresh(client, nr).await
+            Box::pin(handle_companion_reg_refresh(client, nr)).await
         }
-        Some(NotificationType::Business) => handle_business_notification(client, nr).await,
+        Some(NotificationType::Business) => {
+            Box::pin(handle_business_notification(client, nr)).await
+        }
         Some(NotificationType::Picture) => handle_picture_notification(client, nr),
-        Some(NotificationType::PrivacyToken) => handle_privacy_token_notification(client, nr).await,
+        Some(NotificationType::PrivacyToken) => {
+            Box::pin(handle_privacy_token_notification(client, nr)).await
+        }
         Some(NotificationType::Status) => handle_status_notification(client, nr),
-        Some(NotificationType::Contacts) => handle_contacts_notification(client, nr).await,
-        Some(NotificationType::WGp2) => handle_group_notification(client, Arc::clone(&node)).await,
+        Some(NotificationType::Contacts) => {
+            Box::pin(handle_contacts_notification(client, nr)).await
+        }
+        Some(NotificationType::WGp2) => {
+            Box::pin(handle_group_notification(client, Arc::clone(&node))).await
+        }
         Some(NotificationType::DisappearingMode) => {
             handle_disappearing_mode_notification(client, nr)
         }
@@ -85,7 +106,10 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
         // not model at all, and both reach the consumer as a raw event.
         _ => {
             if let Some(parsed) = parsed
-                && crate::client::subsystem::dispatch_notification(client, parsed, &node).await
+                && Box::pin(crate::client::subsystem::dispatch_notification(
+                    client, parsed, &node,
+                ))
+                .await
             {
                 return;
             }
@@ -1834,6 +1858,50 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the stale stanza-LID identity must be deleted by the reset"
+        );
+    }
+    /// The one heap block `async_trait` allocates per inbound `<notification>`
+    /// must stay small.
+    ///
+    /// Awaiting an unboxed async fn inlines its state machine into the caller's
+    /// future, so a single `.await` on an unboxed arm re-sizes this allocation
+    /// for the union of every arm: 2272 bytes when it was measured that way,
+    /// against 146 bytes for the whole notification once they are boxed.
+    /// Nothing else observes that — the
+    /// allocation *count* does not move, the handler's behaviour does not
+    /// change, and `benches/inbound_stanza` reports it but does not run in
+    /// nextest. Hence a unit test, and hence a ceiling (1 KiB) rather than an
+    /// exact size: the point is the order of magnitude, not the byte.
+    #[test]
+    fn notification_future_is_not_sized_for_every_arm() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let client = runtime.block_on(create_test_client());
+        let peer = "19045550180@s.whatsapp.net";
+        let node = node_to_arc(
+            NodeBuilder::new("notification")
+                .attr("from", peer)
+                .attr("type", "picture")
+                .attr("id", "N1")
+                .attr("t", "1700000000")
+                .children([NodeBuilder::new("delete").attr("jid", peer).build()])
+                .build(),
+        );
+
+        // Through `StanzaHandler::handle`, because `async_trait`'s box around
+        // it is the allocation under test; calling `handle_notification_impl`
+        // directly would leave the future on the stack.
+        let handler = NotificationHandler;
+        let largest = crate::test_alloc::min_max_block(1024, || {
+            let mut cancelled = false;
+            runtime.block_on(handler.handle(Arc::clone(&client), Arc::clone(&node), &mut cancelled))
+        });
+        assert!(
+            largest < 1024,
+            "a notification allocated {largest} bytes in one block; an `.await` on an \
+             unboxed arm of handle_notification_impl re-inflates the boxed future"
         );
     }
 }

@@ -181,6 +181,50 @@ mod tests {
     use super::*;
     use crate::types::message::{MessageCategory, MessageInfo, MessageSource};
 
+    /// The receipt handler gates on the raw parsed type *before* running this
+    /// downgrade, so the gate is only behaviour-preserving while no input can
+    /// come out the other side as a `Retry` (the one type it must not drop
+    /// without a subscriber). The scoping to `Delivered` is what guarantees
+    /// that; this pins it, so widening the downgrade fails here rather than
+    /// silently dropping retries on the receive path.
+    #[test]
+    fn downgrade_never_turns_a_type_into_a_retry() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt")
+            .children([NodeBuilder::new("error")
+                .attr("reason", "lid")
+                .attr("type", "feature-incapable")
+                .build()])
+            .build();
+        let node = node.as_node_ref();
+
+        // Every variant; a new one belongs in this list.
+        for parsed in [
+            ReceiptType::Delivered,
+            ReceiptType::Sent,
+            ReceiptType::Sender,
+            ReceiptType::Retry,
+            ReceiptType::EncRekeyRetry,
+            ReceiptType::Read,
+            ReceiptType::ReadSelf,
+            ReceiptType::Played,
+            ReceiptType::PlayedSelf,
+            ReceiptType::ServerError,
+            ReceiptType::Inactive,
+            ReceiptType::PeerMsg,
+            ReceiptType::HistorySync,
+            ReceiptType::Other("something-new".to_string()),
+        ] {
+            let downgraded = downgrade_for_feature_incapable(&node, parsed.clone());
+            assert_eq!(
+                downgraded == ReceiptType::Retry,
+                parsed == ReceiptType::Retry,
+                "downgrading {parsed:?} changed whether it is a Retry"
+            );
+        }
+    }
+
     #[test]
     fn feature_incapable_error_downgrades_delivery_to_sent() {
         use wacore_binary::builder::NodeBuilder;
