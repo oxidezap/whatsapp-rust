@@ -1104,8 +1104,13 @@ impl Client {
         Ok(success_count)
     }
 
-    /// Log primary phone (device 0) session state at login.
-    /// Migration is lazy via try_pn_to_lid_migration_decrypt on first message.
+    /// Log which session (if any) exists with our own primary phone, device 0.
+    ///
+    /// Diagnostics, not a step: it establishes nothing. A LID session with the
+    /// primary is created lazily, by `try_pn_to_lid_migration_decrypt` on the
+    /// first message, and PDO's own `ensure_e2e_sessions` fallback covers the
+    /// case where none exists yet. Two DB reads for a `debug!`, so it belongs
+    /// off the login critical path — see the call site in `handle_success`.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -1115,7 +1120,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub(crate) async fn establish_primary_phone_session_immediate(&self) -> Result<()> {
+    pub(crate) async fn log_primary_phone_session_state(&self) -> Result<()> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         let own_pn = device_snapshot

@@ -1039,10 +1039,10 @@ async fn test_offline_sync_lifecycle() {
     info!("✅ test_offline_sync_lifecycle passed");
 }
 
-/// Test that establish_primary_phone_session_immediate returns error when no PN is set.
+/// Test that log_primary_phone_session_state returns error when no PN is set.
 /// This verifies the "not logged in" guard works.
 #[tokio::test]
-async fn test_establish_primary_phone_session_fails_without_pn() {
+async fn test_primary_phone_session_probe_fails_without_pn() {
     let backend = Arc::new(
         crate::store::SqliteStore::new("file:memdb_no_pn?mode=memory&cache=shared")
             .await
@@ -1063,11 +1063,11 @@ async fn test_establish_primary_phone_session_fails_without_pn() {
     .await;
 
     // No PN set, so this should fail
-    let result = client.establish_primary_phone_session_immediate().await;
+    let result = client.log_primary_phone_session_state().await;
 
     assert!(
         result.is_err(),
-        "establish_primary_phone_session_immediate should fail when no PN is set"
+        "log_primary_phone_session_state should fail when no PN is set"
     );
 
     let err = result.unwrap_err();
@@ -1078,12 +1078,12 @@ async fn test_establish_primary_phone_session_fails_without_pn() {
         err
     );
 
-    info!("✅ test_establish_primary_phone_session_fails_without_pn passed");
+    info!("✅ test_primary_phone_session_probe_fails_without_pn passed");
 }
 
 /// Test that ensure_e2e_sessions waits for offline sync to complete.
 /// This is the CRITICAL difference between ensure_e2e_sessions and
-/// establish_primary_phone_session_immediate.
+/// log_primary_phone_session_state.
 #[tokio::test]
 async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
     use std::sync::atomic::Ordering;
@@ -1197,16 +1197,11 @@ async fn ensure_sessions_warm_cache_short_circuits() {
         .expect("cached session must satisfy ensure without network");
 }
 
-/// Integration test: Verify that the immediate session establishment does NOT
-/// wait for offline sync. This is critical for PDO to work during offline sync.
-///
-/// The flow is:
-/// 1. Login -> establish_primary_phone_session_immediate() is called
-/// 2. This should NOT wait for offline sync (flag is false at this point)
-/// 3. After session is established, offline messages arrive
-/// 4. When decryption fails, PDO can immediately send to device 0
+/// Integration test: the primary-phone probe answers from local state alone —
+/// it never blocks on the offline drain, which is what would make it unsafe to
+/// run at login at all.
 #[tokio::test]
-async fn test_immediate_session_does_not_wait_for_offline_sync() {
+async fn test_primary_phone_session_probe_does_not_wait_for_offline_sync() {
     use std::sync::atomic::Ordering;
     use wacore_binary::Jid;
 
@@ -1221,7 +1216,7 @@ async fn test_immediate_session_does_not_wait_for_offline_sync() {
             .expect("persistence manager should initialize"),
     );
 
-    // Set a PN so establish_primary_phone_session_immediate doesn't fail early
+    // Set a PN so log_primary_phone_session_state doesn't fail early
     pm.modify_device(|device| {
         device.pn = Some(Jid::pn("559999999999"));
     })
@@ -1239,7 +1234,7 @@ async fn test_immediate_session_does_not_wait_for_offline_sync() {
     // Flag is false (offline sync not complete - simulating login state)
     assert!(!client.offline_sync_completed.load(Ordering::Relaxed));
 
-    // Call establish_primary_phone_session_immediate
+    // Call log_primary_phone_session_state
     // It should NOT wait for offline sync - it should proceed immediately
     let start = wacore::time::Instant::now();
 
@@ -1247,7 +1242,7 @@ async fn test_immediate_session_does_not_wait_for_offline_sync() {
     // but the important thing is that it doesn't WAIT for offline sync
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        client.establish_primary_phone_session_immediate(),
+        client.log_primary_phone_session_state(),
     )
     .await;
 
@@ -1256,36 +1251,34 @@ async fn test_immediate_session_does_not_wait_for_offline_sync() {
     // The call should complete (or fail) quickly, NOT wait for 10 second timeout
     assert!(
         result.is_ok(),
-        "establish_primary_phone_session_immediate should not wait for offline sync, timed out"
+        "log_primary_phone_session_state should not wait for offline sync, timed out"
     );
 
     // It should complete in < 500ms (not 10 second wait)
     assert!(
         elapsed.as_millis() < 500,
-        "establish_primary_phone_session_immediate should not wait, took {:?}",
+        "log_primary_phone_session_state should not wait, took {:?}",
         elapsed
     );
 
     // The actual result might be an error (no network), but that's fine
     // The important thing is it didn't wait for offline sync
     info!(
-        "establish_primary_phone_session_immediate completed in {:?} (result: {:?})",
+        "log_primary_phone_session_state completed in {:?} (result: {:?})",
         elapsed,
         result.unwrap().is_ok()
     );
 
-    info!("✅ test_immediate_session_does_not_wait_for_offline_sync passed");
+    info!("✅ test_primary_phone_session_probe_does_not_wait_for_offline_sync passed");
 }
 
-/// Integration test: Verify that establish_primary_phone_session_immediate
-/// skips establishment when a session already exists.
+/// Integration test: the probe reports an existing session and touches nothing.
 ///
-/// This is the CRITICAL fix for MAC verification failures:
-/// - BUG (before fix): Called process_prekey_bundle() unconditionally,
-///   replacing the existing session with a new one
-/// - RESULT: Remote device still uses old session state, causing MAC failures
+/// It once called `process_prekey_bundle()` unconditionally, replacing a live
+/// session with a fresh one while the remote device kept using the old state —
+/// which is how MAC verification started failing. It must stay read-only.
 #[tokio::test]
-async fn test_establish_session_skips_when_exists() {
+async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
     use wacore::libsignal::protocol::SessionRecord;
     use wacore::libsignal::store::SessionStore;
     use wacore::types::jid::JidExt;
@@ -1340,13 +1333,13 @@ async fn test_establish_session_skips_when_exists() {
     )
     .await;
 
-    // Call establish_primary_phone_session_immediate
+    // Call log_primary_phone_session_state
     // It should return Ok(()) immediately without fetching prekeys
-    let result = client.establish_primary_phone_session_immediate().await;
+    let result = client.log_primary_phone_session_state().await;
 
     assert!(
         result.is_ok(),
-        "establish_primary_phone_session_immediate should succeed when session exists"
+        "log_primary_phone_session_state should succeed when session exists"
     );
 
     // Verify the session was NOT replaced (still has the same record)
@@ -1361,7 +1354,7 @@ async fn test_establish_session_skips_when_exists() {
         assert!(exists, "Session should still exist after the call");
     }
 
-    info!("✅ test_establish_session_skips_when_exists passed");
+    info!("✅ test_primary_phone_session_probe_leaves_an_existing_session_alone passed");
 }
 
 /// Integration test: Verify that the session check prevents MAC failures

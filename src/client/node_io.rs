@@ -1156,19 +1156,6 @@ impl Client {
             check_generation!();
             client_clone.send_unified_session().await;
 
-            // === Establish session with primary phone for PDO ===
-            // This must happen BEFORE we exit passive mode (before offline messages arrive).
-            // PDO needs a session with device 0 to request decrypted content from our phone.
-            // Matches WhatsApp Web's bootstrapDeviceCapabilities() pattern.
-            check_generation!();
-            if let Err(e) = client_clone
-                .establish_primary_phone_session_immediate()
-                .await
-            {
-                warn!(target: "Client/PDO", "Failed to establish session with primary phone on login: {:?}", e);
-                // Don't fail login - PDO will retry via ensure_e2e_sessions fallback
-            }
-
             check_generation!();
             if !client_clone.is_connected() {
                 debug!("Skipping passive tasks: connection closed");
@@ -1198,6 +1185,18 @@ impl Client {
                     if key_client.connection_generation.load(Ordering::SeqCst) != key_generation {
                         return;
                     }
+
+                    // Diagnostics only — it reads two session rows and logs what it
+                    // found, establishing nothing (the PN→LID migration is lazy, on
+                    // the first message). It used to sit between `<success>` and the
+                    // `set_passive(false)` that gates offline delivery, where its two
+                    // serial DB reads delayed the backlog for a log line.
+                    if let Err(e) = key_client.log_primary_phone_session_state().await
+                        && !key_client.is_shutting_down()
+                    {
+                        warn!(target: "Client/PDO", "Failed to check the primary-phone session on login: {e:?}");
+                    }
+
                     if let Err(e) = key_client.upload_pre_keys_at_login().await
                         && !key_client.is_shutting_down()
                     {
