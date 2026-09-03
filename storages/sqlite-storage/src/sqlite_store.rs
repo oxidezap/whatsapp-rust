@@ -306,6 +306,30 @@ pub type ConnectionInitHook = Arc<
 ///
 /// Sessions that share one database file can go further and share the connection
 /// itself: see [`SqliteStore::share_for_device`].
+///
+/// **The other profile: one long-lived session, one large database.** A process
+/// that pairs once and stays connected for weeks — a bot — is the opposite
+/// shape from the default's assumption. There is one store, not fifty, and its
+/// database reaches a few hundred MB (`msg_secrets` dominates it; its
+/// `CacheConfig::msg_secret_retention` horizon is what sets the size). Against
+/// that file a 512 KiB page cache is a fraction of a percent, so nearly every
+/// b-tree descent is an OS read, and one reader connection means the decrypt
+/// path queues behind whatever write is in flight. The default is not raised
+/// for everyone because the density case is real and pays for both in memory;
+/// name the profile instead:
+///
+/// ```
+/// # use whatsapp_rust_sqlite_storage::SqliteStoreConfig;
+/// let config = SqliteStoreConfig {
+///     // A warm cache for a database far larger than the default assumes.
+///     cache_size_kib: 16 * 1024,
+///     // Two readers, so a session lookup never waits out a write-behind flush.
+///     read_pool_size: 2,
+///     ..Default::default()
+/// }
+/// // Optional: moves reads onto reclaimable file-backed pages.
+/// .with_mmap_size(256 * 1024 * 1024);
+/// ```
 #[derive(Clone)]
 pub struct SqliteStoreConfig {
     /// Max concurrent operations: r2d2 `max_size` AND the internal semaphore permits,

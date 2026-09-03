@@ -253,6 +253,17 @@ pub struct CacheConfig {
     /// [`original_message_resolver`]: CacheConfig::original_message_resolver
     pub msg_secret_policy: MsgSecretPolicy,
     /// Per-add-on-kind retention horizons applied under `Managed`/`BotOnly`.
+    ///
+    /// This is the sizing knob for what is, by row count, the largest table the
+    /// store holds: one row per inbound message that carries a `messageSecret`,
+    /// plus one per outbound message that mints one, each kept until its horizon
+    /// passes. The steady state is therefore the horizon's worth of traffic, and
+    /// nothing else bounds it. For a busy bot — ~15k inbound and ~1.5k outbound
+    /// messages a day — the default 30-day `text` horizon settles at ~500k rows;
+    /// at roughly 270 B a row once the primary key and the expiry index are
+    /// counted, that is ~130 MB, and materially more where poll traffic (a
+    /// 90-day horizon) is heavy. Shortening `text` trades addon decryption of
+    /// older messages for disk, and is the one lever that moves the figure.
     pub msg_secret_retention: MsgSecretRetention,
     /// Whether to seed `messageSecret`s from history-sync blobs. Default `true`.
     ///

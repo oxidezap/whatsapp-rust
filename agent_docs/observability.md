@@ -445,7 +445,10 @@ what a component can introspect — absent means "not reported", not zero):
   client holds. A default on an already-implemented sub-trait gives both —
   composable *and* non-breaking. SQLite reports `min(cache cap, db size)` (an
   upper bound on the page cache; Diesel doesn't expose the raw handle needed for
-  `sqlite3_db_status`), plus the DB page count. Remote backends report
+  `sqlite3_db_status`), plus the DB page count, how much of it is on the free
+  list (`freelist_count` — space the retention sweeps emptied that only a
+  `VACUUM` returns to the filesystem), and the `-wal` sidecar's size on disk.
+  Remote backends report
   `memory_bytes: Some(0)`. `InMemoryBackend` sums its own maps (table
   allocations plus the heap its keys and values own), which is exact rather
   than a cap, because every byte it holds is this process's heap.
@@ -540,6 +543,30 @@ instrumented polls/tasks are counted (the run loop is covered since #963; work
 spawned raw on the runtime — some voip/media paths — is not). Deallocations are
 charged to whichever meter is active at free time, so `allocated` (churn) is the
 reliable signal and `freed`/`net` drift for buffers that outlive their poll.
+
+### Periodic storage maintenance — what the keepalive tick runs
+
+Three cadences hang off the keepalive tick, all driven by the tick itself rather
+than by a successful ping, so a connection with steady inbound traffic (which
+takes the idle-ping early return) still reaches them:
+
+| pass | cadence | what it does |
+| --- | --- | --- |
+| retention sweeps | every 12 ticks (~4.5 min) | `sent_messages`, `pending_inbound_messages`, `base_keys` and `msg_secrets` expiry, sequentially in one task, each through the store's write permit |
+| engine maintenance | ~1 h of ticks | `DeviceStore::maintenance()` — for SQLite, `analysis_limit` + `PRAGMA optimize` and an opportunistic `wal_checkpoint(TRUNCATE)` |
+| session maintenance | ~6 h of ticks | signed pre-key rotation check and the tcToken prune, both of which used to run only at connect |
+
+The last two exist because a process that holds one connection for weeks never
+reruns connect-time work: before them a session outliving the 27-day rotation
+cadence never rotated its signed pre-key, pruned tcTokens exactly once, and let
+the WAL keep whatever size its largest transaction gave it. Failures are logged
+at `warn!` — a sweep that fails every time is how a bounded table quietly stops
+being bounded.
+
+`maintenance()` is a defaulted method on `DeviceStore`, for the same reason
+`resource_report` is. What it must never do is take an exclusive lock on the
+whole database: `VACUUM` (the only thing that returns free-list pages to the
+filesystem) stays an explicit embedder call.
 
 ### `SqliteStoreConfig::mmap_size` — page-cache tuning knob
 

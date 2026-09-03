@@ -797,6 +797,13 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// The backend is wrapped in an `Arc` internally; use
     /// [`BotBuilder::with_backend_arc`] to pass an already-shared backend.
     ///
+    /// A bot that pairs once and stays connected for weeks is the
+    /// single-long-lived-session profile, and `SqliteStore`'s defaults are tuned
+    /// for the opposite one (many small per-session stores in a process). See
+    /// the `SqliteStoreConfig` docs for the cache size, reader count and mmap
+    /// setting that profile wants, and pass them with
+    /// `SqliteStore::with_config`.
+    ///
     /// # Example
     /// ```rust,ignore
     /// let bot = Bot::builder()
