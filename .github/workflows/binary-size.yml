@@ -49,6 +49,9 @@ jobs:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-binstall
 
       - name: Install cargo-bloat and cargo-llvm-lines
+        env:
+          # binstall can fall back to compilation before sccache is installed.
+          RUSTC_WRAPPER: ""
         run: >
           cargo binstall --no-confirm
           cargo-bloat@${{ env.CARGO_BLOAT_VERSION }}
@@ -187,6 +190,9 @@ jobs:
           tool: protoc@${{ env.PROTOC_VERSION }},cargo-binstall
 
       - name: Install cargo-bloat and cargo-llvm-lines
+        env:
+          # binstall can fall back to compilation before sccache is installed.
+          RUSTC_WRAPPER: ""
         run: >
           cargo binstall --no-confirm
           cargo-bloat@${{ env.CARGO_BLOAT_VERSION }}
