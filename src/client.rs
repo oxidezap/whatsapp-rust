@@ -36,7 +36,7 @@ use extension_lifecycle::LifecycleRegistration;
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
-pub use lifecycle::{Connection, Reachability, RunCompletionReason};
+pub use lifecycle::{Connection, ProtocolTerminalReason, Reachability, RunCompletionReason};
 pub use voip::{CallError, Voip};
 
 use crate::cache::Cache;
@@ -1475,6 +1475,9 @@ pub struct Client {
     /// error / connect_failure / disconnect. Per-connection subscribers
     /// (keepalive, request waiters, read loop, offline flush) observe this.
     pub(crate) connection_shutdown: std::sync::Mutex<wacore::runtime::ShutdownNotifier>,
+    /// Protocol-level terminal cause captured by the reader before its
+    /// expected-disconnect flag suppresses the transport outcome.
+    pub(crate) protocol_terminal_reason: std::sync::Mutex<Option<ProtocolTerminalReason>>,
     /// Allocated only when an extension host installs lifecycle callbacks.
     #[cfg(feature = "client-lifecycle")]
     lifecycle: Option<Arc<LifecycleRegistration>>,

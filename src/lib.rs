@@ -231,7 +231,8 @@ pub use client::{
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
 pub use client::{
-    ConnectError, ConnectStage, Reachability, RunCompletionReason, SignalMaintenanceError,
+    ConnectError, ConnectStage, ProtocolTerminalReason, Reachability, RunCompletionReason,
+    SignalMaintenanceError,
 };
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
@@ -361,7 +362,9 @@ pub mod prelude {
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     pub use crate::client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
-    pub use crate::client::{ConnectError, ConnectStage};
+    pub use crate::client::{
+        ConnectError, ConnectStage, ProtocolTerminalReason, RunCompletionReason,
+    };
     #[cfg(feature = "plugins")]
     #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]
     pub use crate::plugins::{

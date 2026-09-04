@@ -1,5 +1,6 @@
 //! Inbound node I/O: read loop, frame decryption, node routing, acks and stream errors.
 
+use super::lifecycle::ProtocolTerminalReason;
 use super::*;
 use crate::client::{PhashWaiter, ResponseWaiter, StreamedResponse};
 use wacore::net::DisconnectReason;
@@ -17,7 +18,7 @@ pub(crate) enum ReadLoopExit {
 
 /// Genuine failures of [`Client::read_messages_loop`] — everything here is worth
 /// reporting loudly, unlike [`ReadLoopExit`].
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum ReadLoopError {
     #[error("cannot start message loop: {0}")]
     NotStarted(&'static str),
@@ -1947,6 +1948,7 @@ impl Client {
         let mut should_disconnect = false;
 
         if !conflict_type.is_empty() {
+            self.record_protocol_terminal_reason(ProtocolTerminalReason::Conflict);
             info!(
                 "Got stream error indicating client was removed or replaced (conflict={}). Logging out.",
                 conflict_type
@@ -1978,6 +1980,11 @@ impl Client {
                 }
                 "516" => {
                     info!("Got 516 stream error (device removed). Logging out.");
+                    if let Ok(code) = code.parse() {
+                        self.record_protocol_terminal_reason(
+                            ProtocolTerminalReason::StreamErrorCode(code),
+                        );
+                    }
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
@@ -1991,6 +1998,11 @@ impl Client {
                 }
                 "401" => {
                     info!("Got 401 stream error (unauthorized). Logging out.");
+                    if let Ok(code) = code.parse() {
+                        self.record_protocol_terminal_reason(
+                            ProtocolTerminalReason::StreamErrorCode(code),
+                        );
+                    }
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
@@ -2004,6 +2016,11 @@ impl Client {
                 }
                 "409" => {
                     info!("Got 409 stream error (conflict). Another session replaced this one.");
+                    if let Ok(code) = code.parse() {
+                        self.record_protocol_terminal_reason(
+                            ProtocolTerminalReason::StreamErrorCode(code),
+                        );
+                    }
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
                     self.core.event_bus.dispatch(Event::StreamReplaced(
@@ -2120,6 +2137,7 @@ impl Client {
         // against a server that just refused us. (WA Web drops the stanza
         // outright; it has a UI to fall back on, an embedder does not.)
         let reason = failure.reason.unwrap_or(ConnectFailureReason::Unknown(0));
+        self.record_protocol_terminal_reason(ProtocolTerminalReason::ConnectFailure(reason));
 
         if reason.should_reconnect() {
             self.expected_disconnect.store(false, Ordering::Relaxed);

@@ -3327,6 +3327,14 @@ async fn test_stream_error_401_disables_reconnect() {
         !client.enable_auto_reconnect.load(Ordering::Relaxed),
         "401 should disable auto-reconnect"
     );
+    assert_eq!(
+        client
+            .protocol_terminal_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref(),
+        Some(&ProtocolTerminalReason::StreamErrorCode(401))
+    );
 }
 
 #[tokio::test]
