@@ -2979,7 +2979,7 @@ mod tests {
         let (client, entered, release) = client_parked_in_connect().await;
 
         let runner = Arc::clone(&client);
-        let run = tokio::spawn(async move { runner.run().await });
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
         next_connect_attempt(&entered).await;
 
         // Parked, so this is guaranteed to land before the loop reaches the
@@ -2987,10 +2987,11 @@ mod tests {
         client.disconnect().await;
         drop(release);
 
-        tokio::time::timeout(Duration::from_secs(10), run)
+        let reason = tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .expect("run() must return once the client has been disconnected")
             .expect("the run task must not panic");
+        assert!(matches!(reason, RunCompletionReason::ShutdownRequested));
 
         let said = logs.records_for(RUN_LOOP_LOG);
         assert!(
