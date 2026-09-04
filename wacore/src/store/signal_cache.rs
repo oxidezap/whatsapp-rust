@@ -6358,5 +6358,432 @@ mod cold_read_race_tests {
 }
 
 #[cfg(test)]
+mod flush_contention_reproduction_tests {
+    use super::*;
+    use crate::libsignal::protocol::{
+        ChainKey, IdentityKey, KeyPair, ProtocolAddress, RootKey, SessionRecord, SessionState,
+    };
+    use crate::store::in_memory::InMemoryBackend;
+    use crate::store::traits::SignalStore;
+    use core::time::Duration;
+    use std::future::poll_fn;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    fn session_at_index(index: u32) -> SessionRecord {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let remote = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let base_key = KeyPair::generate(&mut rng).public_key;
+        let mut state = SessionState::new(3, &local, &remote, &RootKey::new([4u8; 32]), &base_key);
+        state.set_sender_chain(
+            &KeyPair::generate(&mut rng),
+            &ChainKey::new([7u8; 32], index),
+        );
+        SessionRecord::new(state)
+    }
+
+    fn chain_index_of(record: &SessionRecord) -> u32 {
+        record
+            .session_state()
+            .expect("session state")
+            .get_sender_chain_key()
+            .expect("sender chain")
+            .index()
+    }
+
+    fn signal_address(user: &str) -> ProtocolAddress {
+        ProtocolAddress::new(&format!("{user}@s.whatsapp.net"), 0.into())
+    }
+
+    struct ContentionGatedBackend {
+        inner: InMemoryBackend,
+        gating_enabled: AtomicBool,
+        entered_tx: async_channel::Sender<()>,
+        release_rx: async_channel::Receiver<()>,
+    }
+
+    impl ContentionGatedBackend {
+        fn new(
+            entered_tx: async_channel::Sender<()>,
+            release_rx: async_channel::Receiver<()>,
+        ) -> Self {
+            Self {
+                inner: InMemoryBackend::new(),
+                gating_enabled: AtomicBool::new(false),
+                entered_tx,
+                release_rx,
+            }
+        }
+
+        fn enable_gating(&self) {
+            self.gating_enabled.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl SignalStore for ContentionGatedBackend {
+        async fn put_sessions_batch(
+            &self,
+            sessions: &[(Arc<str>, bytes::Bytes)],
+        ) -> crate::store::error::Result<()> {
+            if self.gating_enabled.load(Ordering::Acquire) {
+                let _ = self.entered_tx.send(()).await;
+                let _ = self.release_rx.recv().await;
+            }
+            self.inner.put_sessions_batch(sessions).await
+        }
+
+        async fn get_session(
+            &self,
+            address: &str,
+        ) -> crate::store::error::Result<Option<bytes::Bytes>> {
+            self.inner.get_session(address).await
+        }
+
+        async fn put_session(
+            &self,
+            address: &str,
+            session: &[u8],
+        ) -> crate::store::error::Result<()> {
+            self.inner.put_session(address, session).await
+        }
+
+        async fn delete_session(&self, address: &str) -> crate::store::error::Result<()> {
+            self.inner.delete_session(address).await
+        }
+
+        async fn delete_sessions_batch(
+            &self,
+            addresses: &[Arc<str>],
+        ) -> crate::store::error::Result<()> {
+            self.inner.delete_sessions_batch(addresses).await
+        }
+
+        async fn get_sessions_batch(
+            &self,
+            addresses: &[Arc<str>],
+        ) -> crate::store::error::Result<Vec<(Arc<str>, bytes::Bytes)>> {
+            self.inner.get_sessions_batch(addresses).await
+        }
+
+        async fn load_identity(
+            &self,
+            address: &str,
+        ) -> crate::store::error::Result<Option<[u8; 32]>> {
+            self.inner.load_identity(address).await
+        }
+
+        async fn put_identity(
+            &self,
+            address: &str,
+            key: [u8; 32],
+        ) -> crate::store::error::Result<()> {
+            self.inner.put_identity(address, key).await
+        }
+
+        async fn delete_identity(&self, address: &str) -> crate::store::error::Result<()> {
+            self.inner.delete_identity(address).await
+        }
+
+        async fn store_prekey(
+            &self,
+            id: u32,
+            record: &[u8],
+            uploaded: bool,
+        ) -> crate::store::error::Result<()> {
+            self.inner.store_prekey(id, record, uploaded).await
+        }
+
+        async fn load_prekey(&self, id: u32) -> crate::store::error::Result<Option<bytes::Bytes>> {
+            self.inner.load_prekey(id).await
+        }
+
+        async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+            self.inner.mark_prekeys_uploaded(ids).await
+        }
+
+        async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
+            self.inner.remove_prekey(id).await
+        }
+
+        async fn remove_prekeys_batch(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+            self.inner.remove_prekeys_batch(ids).await
+        }
+
+        async fn get_max_prekey_id(&self) -> crate::store::error::Result<u32> {
+            self.inner.get_max_prekey_id().await
+        }
+
+        async fn store_signed_prekey(
+            &self,
+            id: u32,
+            record: &[u8],
+        ) -> crate::store::error::Result<()> {
+            self.inner.store_signed_prekey(id, record).await
+        }
+
+        async fn load_signed_prekey(
+            &self,
+            id: u32,
+        ) -> crate::store::error::Result<Option<Vec<u8>>> {
+            self.inner.load_signed_prekey(id).await
+        }
+
+        async fn load_all_signed_prekeys(
+            &self,
+        ) -> crate::store::error::Result<Vec<(u32, Vec<u8>)>> {
+            self.inner.load_all_signed_prekeys().await
+        }
+
+        async fn remove_signed_prekey(&self, id: u32) -> crate::store::error::Result<()> {
+            self.inner.remove_signed_prekey(id).await
+        }
+
+        async fn put_sender_key(
+            &self,
+            address: &str,
+            record: &[u8],
+        ) -> crate::store::error::Result<()> {
+            self.inner.put_sender_key(address, record).await
+        }
+
+        async fn get_sender_key(
+            &self,
+            address: &str,
+        ) -> crate::store::error::Result<Option<Vec<u8>>> {
+            self.inner.get_sender_key(address).await
+        }
+
+        async fn delete_sender_key(&self, address: &str) -> crate::store::error::Result<()> {
+            self.inner.delete_sender_key(address).await
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_flush_of_a_blocks_checkout_and_put_of_independent_session_b() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = Arc::new(ContentionGatedBackend::new(entered_tx, release_rx));
+        let cache = Arc::new(SignalStoreCache::new());
+
+        let addr_a = signal_address("19995551001");
+        let addr_b = signal_address("19995551002");
+
+        // Warm up B and flush it so it is Present and clean in cache.
+        cache.put_session(&addr_b, session_at_index(10)).await;
+        cache.flush(backend.as_ref()).await.expect("warmup flush");
+
+        // Dirty session A.
+        cache.put_session(&addr_a, session_at_index(20)).await;
+
+        // Enable gating so backend.put_sessions_batch will pause.
+        backend.enable_gating();
+
+        // Spawn flush of A.
+        let flush_task = tokio::spawn({
+            let (cache, backend) = (cache.clone(), backend.clone());
+            async move { cache.flush(backend.as_ref()).await }
+        });
+
+        // Wait for flush to enter put_sessions_batch while holding lock_sessions().
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("timeout waiting for flush to enter put_sessions_batch")
+            .expect("channel alive");
+
+        // --- At this point, flush of A holds the sessions lock mid-I/O ---
+
+        // 1. Non-blocking checkout of independent warm session B must return None.
+        assert!(
+            cache.try_checkout_session(&addr_b).is_none(),
+            "try_checkout_session on warm independent session B must fail while flush holds sessions lock"
+        );
+
+        // 2. Async checkout of B must be Pending (blocked on sessions lock).
+        let mut checkout_b = pin!(cache.checkout_session(&addr_b, backend.as_ref()));
+        let pending_checkout =
+            poll_fn(|cx| Poll::Ready(checkout_b.as_mut().poll(cx).is_pending())).await;
+        assert!(
+            pending_checkout,
+            "checkout_session of warm independent session B must be Pending during flush"
+        );
+
+        // 3. Non-blocking put of independent session B must fail with Err(record).
+        let put_res = cache.try_put_session(&addr_b, session_at_index(11));
+        assert!(
+            put_res.is_err(),
+            "try_put_session on session B must fail while flush holds sessions lock"
+        );
+        let record_b_put = put_res.unwrap_err();
+
+        // 4. Async put of B must be Pending (blocked on sessions lock).
+        let mut put_b = pin!(cache.put_session(&addr_b, record_b_put));
+        let pending_put = poll_fn(|cx| Poll::Ready(put_b.as_mut().poll(cx).is_pending())).await;
+        assert!(
+            pending_put,
+            "put_session of independent session B must be Pending during flush"
+        );
+
+        // Release backend I/O to complete flush.
+        release_tx.send(()).await.expect("release backend");
+        tokio::time::timeout(Duration::from_secs(5), flush_task)
+            .await
+            .expect("flush timeout")
+            .unwrap()
+            .expect("flush must succeed");
+
+        // Both checkout and put of B can now complete without deadlock.
+        let (record_b, checkout_key_b) = checkout_b
+            .await
+            .expect("checkout B must succeed after flush releases lock");
+        assert_eq!(chain_index_of(&record_b.expect("record B present")), 10);
+        cache.cancel_session_checkout(&addr_b, checkout_key_b);
+
+        put_b.await;
+        let (updated_b, _) = cache
+            .checkout_session(&addr_b, backend.as_ref())
+            .await
+            .expect("checkout updated B");
+        assert_eq!(chain_index_of(&updated_b.expect("updated B present")), 11);
+    }
+
+    #[tokio::test]
+    async fn control_without_flush_independent_session_progresses_without_pending() {
+        let (entered_tx, _entered_rx) = async_channel::bounded(1);
+        let (_release_tx, release_rx) = async_channel::bounded(1);
+        let backend = Arc::new(ContentionGatedBackend::new(entered_tx, release_rx));
+        let cache = Arc::new(SignalStoreCache::new());
+
+        let addr_b = signal_address("19995551003");
+
+        // Warm up B.
+        cache.put_session(&addr_b, session_at_index(10)).await;
+        cache.flush(backend.as_ref()).await.expect("warmup flush");
+
+        // Without flush running, try_checkout_session succeeds immediately.
+        let checkout_opt = cache.try_checkout_session(&addr_b);
+        assert!(
+            checkout_opt.is_some(),
+            "try_checkout must succeed without flush"
+        );
+        let (record, checkout_key) = checkout_opt.unwrap().expect("checkout ok");
+        assert_eq!(chain_index_of(&record.expect("record present")), 10);
+        cache.cancel_session_checkout(&addr_b, checkout_key);
+
+        // try_put_session succeeds immediately.
+        let put_res = cache.try_put_session(&addr_b, session_at_index(11));
+        assert!(put_res.is_ok(), "try_put must succeed without flush");
+
+        // Async checkout is Ready on first poll.
+        let mut checkout_fut = pin!(cache.checkout_session(&addr_b, backend.as_ref()));
+        let is_ready = poll_fn(|cx| Poll::Ready(checkout_fut.as_mut().poll(cx).is_ready())).await;
+        assert!(
+            is_ready,
+            "checkout must be ready on first poll when warm and uncontented"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_cold_read_blocked_at_cache_lock_during_flush_before_backend_io() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = Arc::new(ContentionGatedBackend::new(entered_tx, release_rx));
+        let cache = Arc::new(SignalStoreCache::new());
+
+        let addr_a = signal_address("19995551004");
+        let addr_c = signal_address("19995551005");
+
+        // Seed C directly into backend, NOT into cache (C is cold).
+        let mut raw = Vec::new();
+        session_at_index(50).serialize_into_for_store(&mut raw, &[0xAA; 16]);
+        backend
+            .inner
+            .put_session(addr_c.as_str(), &raw)
+            .await
+            .expect("seed C");
+
+        // Dirty session A in cache.
+        cache.put_session(&addr_a, session_at_index(20)).await;
+        backend.enable_gating();
+
+        // Spawn flush of A.
+        let flush_task = tokio::spawn({
+            let (cache, backend) = (cache.clone(), backend.clone());
+            async move { cache.flush(backend.as_ref()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("flush entry timeout")
+            .expect("flush in progress");
+
+        // Cold checkout of C must probe cache first before issuing backend get_session.
+        // Because flush holds lock_sessions(), cold checkout is blocked at the initial cache probe.
+        let mut cold_checkout = pin!(cache.checkout_session(&addr_c, backend.as_ref()));
+        let pending = poll_fn(|cx| Poll::Ready(cold_checkout.as_mut().poll(cx).is_pending())).await;
+        assert!(
+            pending,
+            "cold checkout of C must be Pending at the cache lock before even reaching the backend"
+        );
+
+        release_tx.send(()).await.expect("release flush");
+        tokio::time::timeout(Duration::from_secs(5), flush_task)
+            .await
+            .expect("flush completion timeout")
+            .expect("join")
+            .expect("flush ok");
+
+        // After flush releases lock, cold read proceeds to backend and completes.
+        let (record_c, key_c) = cold_checkout.await.expect("cold checkout ok");
+        assert_eq!(chain_index_of(&record_c.expect("record C present")), 50);
+        cache.cancel_session_checkout(&addr_c, key_c);
+    }
+
+    #[tokio::test]
+    async fn control_same_session_remains_serialized_during_flush() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = Arc::new(ContentionGatedBackend::new(entered_tx, release_rx));
+        let cache = Arc::new(SignalStoreCache::new());
+
+        let addr_a = signal_address("19995551006");
+        cache.put_session(&addr_a, session_at_index(30)).await;
+        backend.enable_gating();
+
+        let flush_task = tokio::spawn({
+            let (cache, backend) = (cache.clone(), backend.clone());
+            async move { cache.flush(backend.as_ref()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("flush entry timeout")
+            .expect("flush in progress");
+
+        // Operations on the SAME session A must remain blocked / pending during flush.
+        assert!(cache.try_checkout_session(&addr_a).is_none());
+        let mut checkout_a = pin!(cache.checkout_session(&addr_a, backend.as_ref()));
+        let pending = poll_fn(|cx| Poll::Ready(checkout_a.as_mut().poll(cx).is_pending())).await;
+        assert!(
+            pending,
+            "session A must be serialized while its flush is in flight"
+        );
+
+        release_tx.send(()).await.expect("release flush");
+        tokio::time::timeout(Duration::from_secs(5), flush_task)
+            .await
+            .expect("flush completion timeout")
+            .expect("join")
+            .expect("flush ok");
+
+        let (rec_a, key_a) = checkout_a.await.expect("checkout ok");
+        assert_eq!(chain_index_of(&rec_a.expect("record present")), 30);
+        cache.cancel_session_checkout(&addr_a, key_a);
+    }
+}
+
+#[cfg(test)]
 #[path = "signal_cache_durability_chaos.rs"]
 mod durability_chaos_tests;

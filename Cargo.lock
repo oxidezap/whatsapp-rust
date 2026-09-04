@@ -4297,6 +4297,7 @@ dependencies = [
  "libsqlite3-sys",
  "log",
  "portable-atomic",
+ "rand 0.10.2",
  "scheduled-thread-pool",
  "serde_json",
  "sha2",

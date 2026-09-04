@@ -39,6 +39,8 @@ sha2 = { workspace = true }
 [dev-dependencies]
 divan = { workspace = true }
 portable-atomic = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [[bench]]
 name = "signal_flush"
@@ -50,6 +52,10 @@ harness = false
 
 [[bench]]
 name = "store_contention"
+harness = false
+
+[[bench]]
+name = "signal_cache_contention"
 harness = false
 
 [lints]
