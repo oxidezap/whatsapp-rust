@@ -5750,6 +5750,23 @@ mod tests {
             .await
             .expect("store batch");
 
+        // The flag lands with the record: stored with `false`, it reads back
+        // `false` until an upsert flips it.
+        for id in 1..=4u32 {
+            let uploaded = store
+                .read_query(move |conn| {
+                    prekeys::table
+                        .select(prekeys::uploaded)
+                        .filter(prekeys::id.eq(id as i32))
+                        .filter(prekeys::device_id.eq(store.device_id))
+                        .first::<bool>(conn)
+                        .map_err(|e| StoreError::Database(Box::new(e)))
+                })
+                .await
+                .expect("read uploaded flag");
+            assert!(!uploaded, "stored with false must read back false");
+        }
+
         let mut loaded = store
             .load_prekeys_batch(&[1, 2, 3, 4])
             .await
@@ -5780,6 +5797,18 @@ mod tests {
                 [0xAA; 16].as_slice(),
                 "re-batch must replace the record"
             );
+            let uploaded = store
+                .read_query(move |conn| {
+                    prekeys::table
+                        .select(prekeys::uploaded)
+                        .filter(prekeys::id.eq(id as i32))
+                        .filter(prekeys::device_id.eq(store.device_id))
+                        .first::<bool>(conn)
+                        .map_err(|e| StoreError::Database(Box::new(e)))
+                })
+                .await
+                .expect("read uploaded flag");
+            assert!(uploaded, "re-batch with true must flip the flag");
         }
 
         store
