@@ -1705,7 +1705,9 @@ impl SignalStoreCache {
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
             let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
 
-            let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::new();
+            // At most one push per dirty key, so this is the exact upper
+            // bound: one allocation instead of the 0-4-8-16-32 growth chain.
+            let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::with_capacity(dirty_keys.len());
             for address in &dirty_keys {
                 // A dirty key is Present (promoted) or CheckedOut (taken by a
                 // concurrent reader). Only the Present ones can be persisted now;
@@ -1764,7 +1766,7 @@ impl SignalStoreCache {
             {
                 let mut removed = self.removed_prekeys.lock().await;
                 if !removed.is_empty() {
-                    let mut deletable: Vec<u32> = Vec::new();
+                    let mut deletable: Vec<u32> = Vec::with_capacity(removed.len());
                     for (id, addr) in removed.iter() {
                         // Resolve to an owned decision before any await so no cache
                         // borrow is held across the backend roundtrip.
@@ -1816,7 +1818,7 @@ impl SignalStoreCache {
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
             let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
 
-            let mut batch: Vec<(Arc<str>, [u8; 32])> = Vec::new();
+            let mut batch: Vec<(Arc<str>, [u8; 32])> = Vec::with_capacity(dirty_keys.len());
             for address in &dirty_keys {
                 if let Some(Some(data)) = state.cache.get(address.as_ref()) {
                     let key: [u8; 32] = data.as_ref().try_into().map_err(|_| {
@@ -1850,8 +1852,8 @@ impl SignalStoreCache {
             let incarnation = state.incarnation;
             let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
 
-            let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::new();
-            let mut deleted: Vec<Arc<str>> = Vec::new();
+            let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::with_capacity(dirty_keys.len());
+            let mut deleted: Vec<Arc<str>> = Vec::with_capacity(dirty_keys.len());
             for name in &dirty_keys {
                 match state.cache.get(name.as_ref()) {
                     Some(Some(record)) => {
