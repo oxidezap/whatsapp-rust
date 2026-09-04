@@ -176,7 +176,7 @@ pub enum IqError {
     /// closure when a newer protocol or storage classification is introduced
     /// in `wacore` before this facade learns its dedicated variant.
     #[error("unclassified IQ error: {0}")]
-    Unclassified(#[source] Box<wacore::request::IqError>),
+    Unclassified(#[source] wacore::request::IqError),
     #[error("IQ request ID is already in flight: {0}")]
     DuplicateRequestId(String),
     #[error("failed to encode IQ request")]
@@ -249,7 +249,7 @@ impl IqError {
             wacore::request::IqError::InternalChannelClosed => Self::InternalChannelClosed,
             // wacore::IqError is #[non_exhaustive]. Preserve a newer variant's
             // source until this facade can assign it a dedicated meaning.
-            other => Self::Unclassified(Box::new(other)),
+            other => Self::Unclassified(other),
         }
     }
 }
@@ -801,18 +801,13 @@ mod tests {
         let source = wacore::request::IqError::UnexpectedResponseType {
             got: Some("future".to_string()),
         };
-        let error = IqError::Unclassified(Box::new(source));
+        let error = IqError::Unclassified(source);
 
         assert!(!error.is_transport_unavailable());
         assert!(!error.is_timeout());
         let source = std::error::Error::source(&error).expect("source is retained");
         let source = source
             .downcast_ref::<wacore::request::IqError>()
-            .or_else(|| {
-                source
-                    .downcast_ref::<Box<wacore::request::IqError>>()
-                    .map(Box::as_ref)
-            })
             .expect("the core error remains downcastable");
         assert!(matches!(
             source,

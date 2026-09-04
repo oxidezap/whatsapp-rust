@@ -327,23 +327,32 @@ fn iq_conversion_fallback_preserves_the_core_error_source() {
             _ => None,
         })
         .expect("find IqError::from_response");
-    let method_start = source
-        .find("pub fn from_response(")
-        .expect("locate parsed from_response");
-    let method_tail = &source[method_start..];
-    let method_end = method_tail
-        .find("\n    }\n}")
-        .expect("locate end of parsed from_response")
-        + "\n    }".len();
-    let body = &method_tail[..method_end];
-    assert!(
-        body.contains("Unclassified") && body.contains("Box") && body.contains("other"),
-        "future core IQ errors must be boxed as their original typed error"
+    let body = &_method.block;
+    let match_expr = body.stmts.iter().find_map(|statement| match statement {
+        syn::Stmt::Expr(syn::Expr::Match(expr), _) => Some(expr),
+        _ => None,
+    });
+    let match_expr = match_expr.expect("from_response must match the core error");
+    let fallback = match_expr
+        .arms
+        .iter()
+        .find(|arm| matches!(&arm.pat, syn::Pat::Ident(pattern) if pattern.ident == "other"))
+        .expect("from_response must retain a fallback arm for the non-exhaustive core enum");
+    let syn::Expr::Call(outer) = fallback.body.as_ref() else {
+        panic!("fallback must construct the facade error");
+    };
+    let syn::Expr::Path(outer_path) = outer.func.as_ref() else {
+        panic!("fallback must call a named facade variant");
+    };
+    assert_eq!(
+        outer_path.path.segments.last().unwrap().ident,
+        "Unclassified"
     );
-    assert!(
-        !body.contains("_ => Self::InternalChannelClosed"),
-        "future core IQ errors must not be classified as channel closure"
-    );
+    assert_eq!(outer.args.len(), 1);
+    let syn::Expr::Path(source_path) = &outer.args[0] else {
+        panic!("fallback must pass the captured core error directly");
+    };
+    assert_eq!(source_path.path.segments.last().unwrap().ident, "other");
 }
 
 // ── The reported symptom ────────────────────────────────────────────────────
