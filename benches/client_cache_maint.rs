@@ -76,18 +76,40 @@ fn warm(n: usize) -> &'static Cache<Jid, Arc<()>> {
     &built[idx]
 }
 
-/// Plain insert throughput into a warm cache that never evicts.
+/// Plain insert throughput into a warm cache that never evicts: capacity is
+/// `n + BATCH`, so the batch fits beside the resident set and every
+/// iteration starts and ends with the same `n` entries.
 #[divan::bench(args = CACHE_SIZES)]
 fn cache_insert(bencher: divan::Bencher, n: usize) {
-    let cache = warm(n);
+    static ROOMY: OnceLock<Vec<Cache<Jid, Arc<()>>>> = OnceLock::new();
+    let built = ROOMY.get_or_init(|| {
+        CACHE_SIZES
+            .iter()
+            .map(|&m| {
+                let cache: Cache<Jid, Arc<()>> =
+                    Cache::builder().max_capacity((m + BATCH) as u64).build();
+                block_on(async {
+                    for i in 0..m {
+                        cache.insert(key(i), Arc::new(())).await;
+                    }
+                });
+                cache
+            })
+            .collect()
+    });
+    let idx = CACHE_SIZES
+        .iter()
+        .position(|&m| m == n)
+        .expect("known size");
+    let cache = &built[idx];
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
         block_on(async {
             for i in 0..BATCH {
                 cache.insert(black_box(key(n + i)), Arc::new(())).await;
             }
         });
-        // Keep the cache at its size so every iteration measures the same
-        // steady state instead of growing the fixture without bound.
+        // Back to the steady state so every iteration measures the same work
+        // instead of growing the fixture without bound.
         block_on(async {
             for i in 0..BATCH {
                 cache.invalidate(black_box(&key(n + i))).await;
