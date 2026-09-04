@@ -183,9 +183,12 @@ fn report() {
         "The no-overlap control persists once at the end; the overlap case persists each round plus final drain."
     );
     println!(
-        "| Round | Chats | Overlap | Cache cycles/s | Checkout p50 us | Checkout p99 us | Restore p99 us | Flush-call p99 us |"
+        "Early flushes completed before sibling operations were issued and did not overlap them."
     );
-    println!("|---|---|---|---|---|---|---|---|");
+    println!(
+        "| Round | Chats | Overlap attempted | Early flushes | Cache cycles/s | Checkout p50 us | Checkout p99 us | Restore p99 us | Flush-call p99 us |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|");
     for repetition in 0..3 {
         for chats in [1, 8, 32] {
             for overlap in [false, true] {
@@ -194,20 +197,27 @@ fn report() {
                 let mut checkouts = Vec::with_capacity(chats * rounds);
                 let mut restores = Vec::with_capacity(chats * rounds);
                 let mut flushes = Vec::with_capacity(rounds + 1);
+                let mut early_flushes = 0;
                 let start = Instant::now();
                 h.runtime.block_on(async {
                     tokio::time::timeout(DEADLINE, async {
                         for _ in 0..rounds {
                             let mut flush = pin!(h.cache.flush(&h.store));
                             let flush_start = Instant::now();
-                            if overlap {
-                                // The first poll acquires the cache lock and submits the SQLite job.
-                                // Hold that future pending until the sibling operations are issued.
-                                assert!(
-                                    poll_fn(|cx| Poll::Ready(flush.as_mut().poll(cx).is_pending()))
-                                        .await
-                                );
-                            }
+                            // A native blocking job can finish before its join handle is polled.
+                            // Count that case instead of assuming every flush yields.
+                            let early_duration = if overlap {
+                                match poll_fn(|cx| Poll::Ready(flush.as_mut().poll(cx))).await {
+                                    Poll::Ready(result) => {
+                                        result.expect("early flush");
+                                        early_flushes += 1;
+                                        Some(flush_start.elapsed())
+                                    }
+                                    Poll::Pending => None,
+                                }
+                            } else {
+                                None
+                            };
                             let tasks: Vec<_> = h
                                 .addresses
                                 .iter()
@@ -219,8 +229,13 @@ fn report() {
                                 })
                                 .collect();
                             if overlap {
-                                flush.await.expect("round flush");
-                                flushes.push(flush_start.elapsed());
+                                match early_duration {
+                                    Some(duration) => flushes.push(duration),
+                                    None => {
+                                        flush.await.expect("round flush");
+                                        flushes.push(flush_start.elapsed());
+                                    }
+                                }
                             }
                             for task in tasks {
                                 let (checkout, restore) = task.await.expect("task");
@@ -238,7 +253,7 @@ fn report() {
                 let elapsed = start.elapsed();
                 h.verify_persisted(u32::try_from(rounds + 1).expect("counter"));
                 println!(
-                    "| {} | {chats} | {overlap} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} |",
+                    "| {} | {chats} | {overlap} | {early_flushes} | {:.0} | {:.2} | {:.2} | {:.2} | {:.2} |",
                     repetition + 1,
                     (chats * rounds) as f64 / elapsed.as_secs_f64(),
                     percentile(&mut checkouts, 50),
