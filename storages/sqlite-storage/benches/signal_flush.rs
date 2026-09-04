@@ -366,17 +366,16 @@ fn update_sessions_first_prepare(bencher: divan::Bencher, n: usize) {
             let alt = true;
             let batch = db.fixed_sessions(n, alt);
             ColdUpdateInput {
-                db,
+                db: Some(db),
                 alt,
                 batch,
                 written: false,
             }
         })
         .bench_local_refs(|input| {
-            input
-                .db
-                .runtime
-                .block_on(input.db.store.put_sessions_batch(black_box(&input.batch)))
+            let db = input.db.as_ref().expect("live cold input");
+            db.runtime
+                .block_on(db.store.put_sessions_batch(black_box(&input.batch)))
                 .expect("cold update batch");
             input.written = true;
         });
@@ -384,7 +383,7 @@ fn update_sessions_first_prepare(bencher: divan::Bencher, n: usize) {
 
 // Input destruction happens outside bench_local_refs' measured region.
 struct ColdUpdateInput {
-    db: Db,
+    db: Option<Db>,
     alt: bool,
     batch: Vec<(Arc<str>, Bytes)>,
     written: bool,
@@ -392,9 +391,12 @@ struct ColdUpdateInput {
 
 impl Drop for ColdUpdateInput {
     fn drop(&mut self) {
+        let Some(db) = self.db.take() else { return };
         if self.written && !std::thread::panicking() {
-            self.db.verify_fixed_sessions(self.batch.len(), self.alt);
+            db.verify_fixed_sessions(self.batch.len(), self.alt);
         }
-        self.db.remove_files();
+        let path = db.path.clone();
+        drop(db);
+        remove_db_files(&path);
     }
 }
