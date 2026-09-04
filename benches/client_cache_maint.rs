@@ -144,11 +144,13 @@ fn cache_insert(bencher: divan::Bencher, n: usize) {
 /// Insertion at capacity: every insert evicts one entry, so the FIFO scan is
 /// on the bill. The per-iteration cost must not grow with what is retained.
 ///
-/// Samples alternate between two prebuilt batches: each one inserts the same
-/// keys and evicts the other batch whole, so every sample is the same 512
-/// inserts plus 512 evictions. A monotonic key counter (never-before-seen
-/// keys per sample) made the peak-memory instrument read allocator-state
-/// drift as signal here.
+/// Samples rotate through prebuilt batches whose distinct keys outnumber the
+/// largest capacity, so the incoming batch is always fully absent and every
+/// sample is the same 512 misses plus 512 evictions. Two alternating batches
+/// were not enough: past 1024 residents both stay cached and later samples
+/// degrade into hit-overwrites with no eviction. A monotonic key counter
+/// (never-before-seen keys per sample) was worse still — it made the
+/// peak-memory instrument read allocator-state drift as signal here.
 #[divan::bench(args = CACHE_SIZES)]
 fn cache_insert_at_capacity(bencher: divan::Bencher, n: usize) {
     static FULL: OnceLock<Vec<Cache<Jid, Arc<()>>>> = OnceLock::new();
@@ -171,13 +173,23 @@ fn cache_insert_at_capacity(bencher: divan::Bencher, n: usize) {
         .position(|&m| m == n)
         .expect("known size");
     let cache = &built[idx];
-    // One shared pair: the batches outlive every size's row and never collide
-    // with any resident range, so all three widths rotate the same keys.
-    static ROTATING: OnceLock<[Vec<Jid>; 2]> = OnceLock::new();
-    let batches = ROTATING.get_or_init(|| [batch_keys(200_000, BATCH), batch_keys(300_000, BATCH)]);
+    // Rotation depth is sized off the largest capacity, not this row's: the
+    // batches are shared across widths, and every width needs the incoming
+    // batch absent. Depth * BATCH distinct keys must exceed the largest
+    // capacity (4096): 4096 / 512 + 2 = 10 batches = 5120 keys, so the cache
+    // can never hold the whole rotation and round-robin insertion always
+    // lands on 512 misses. None of the ranges collide with the resident
+    // `key(0..m)` keys, and all stay below 1_000_000 so `{i:06}` never widens.
+    static ROTATING: OnceLock<Vec<Vec<Jid>>> = OnceLock::new();
+    let batches = ROTATING.get_or_init(|| {
+        let depth = CACHE_SIZES.iter().max().expect("sizes") / BATCH + 2;
+        (0..depth)
+            .map(|b| batch_keys(200_000 + b * BATCH, BATCH))
+            .collect()
+    });
     let round = AtomicUsize::new(0);
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
-        let batch = &batches[round.fetch_add(1, Ordering::Relaxed) % 2];
+        let batch = &batches[round.fetch_add(1, Ordering::Relaxed) % batches.len()];
         block_on(async {
             for k in batch {
                 cache.insert(black_box(k.clone()), Arc::new(())).await;
