@@ -456,12 +456,19 @@ mod tests {
     }
 
     /// Small reads keep the shared handoff: the decoder copies them into its
-    /// chunk buffer either way, so this only pins that they arrive intact.
+    /// chunk buffer either way. Pinned both ways: intact bytes, and still
+    /// shared — a regression to a per-read copy would pass the first assert
+    /// while breaking the zero-copy handoff this documents.
     #[test]
     fn small_reads_hand_over_shared_bytes_intact() {
-        let expected = vec![0x5Au8; ADOPT_THRESHOLD / 4];
-        let bytes = handoff_bytes(tokio_websockets::Payload::from(expected.clone()));
-        assert_eq!(&bytes[..], &expected[..]);
+        let backing = Bytes::from(vec![0x5Au8; ADOPT_THRESHOLD / 4]);
+        // `clone` keeps a second owner alive, as the codec's read buffer does.
+        let bytes = handoff_bytes(tokio_websockets::Payload::from(backing.clone()));
+        assert_eq!(&bytes[..], &backing[..]);
+        assert!(
+            bytes.try_into_mut().is_err(),
+            "small reads must preserve the shared handoff"
+        );
     }
 
     /// Workstream C: the transport's reported footprint is the sum of its
