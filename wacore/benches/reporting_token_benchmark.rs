@@ -2,6 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use buffa::Message;
+use buffa::MessageView;
 use divan::black_box;
 use wacore::reporting_token::{
     MESSAGE_SECRET_SIZE, REPORTING_TOKEN_KEY_SIZE, calculate_reporting_token,
@@ -50,6 +51,20 @@ fn create_extended_message() -> wa::Message {
 
 fn create_test_jid(user: &str) -> Jid {
     Jid::pn(user)
+}
+
+/// Message with an inline-stored submessage (`reaction_message` is acyclic,
+/// so its view slot is `InlineMessageFieldView` under the experiment).
+/// EXPERIMENT (jlucaso1/buffa#2).
+fn create_inline_message() -> wa::Message {
+    wa::Message {
+        reaction_message: buffa::MessageField::some(wa::message::ReactionMessage {
+            text: Some("👍".to_string()),
+            grouping_key: Some("g".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 // Setup functions
@@ -152,6 +167,28 @@ fn bench_full_token_generation_extended(bencher: divan::Bencher) {
                 Some(&data.secret),
             ))
         });
+}
+
+// View-decode benchmarks: ExtendedTextMessage nests two singular message
+// levels (extended_text_message -> context_info), both inline under the
+// experiment's view_inline_fields(true); the simple message is the
+// no-submessage control. EXPERIMENT (jlucaso1/buffa#2).
+#[divan::bench(sample_count = MICRO_SAMPLE_COUNT, sample_size = MICRO_SAMPLE_SIZE)]
+fn bench_view_decode_simple(bencher: divan::Bencher) {
+    let bytes = create_simple_message().encode_to_vec();
+    bencher.bench(|| black_box(wa::MessageView::decode_view(black_box(bytes.as_slice())).unwrap()));
+}
+
+#[divan::bench(sample_count = MICRO_SAMPLE_COUNT, sample_size = MICRO_SAMPLE_SIZE)]
+fn bench_view_decode_extended(bencher: divan::Bencher) {
+    let bytes = create_extended_message().encode_to_vec();
+    bencher.bench(|| black_box(wa::MessageView::decode_view(black_box(bytes.as_slice())).unwrap()));
+}
+
+#[divan::bench(sample_count = MICRO_SAMPLE_COUNT, sample_size = MICRO_SAMPLE_SIZE)]
+fn bench_view_decode_inline(bencher: divan::Bencher) {
+    let bytes = create_inline_message().encode_to_vec();
+    bencher.bench(|| black_box(wa::MessageView::decode_view(black_box(bytes.as_slice())).unwrap()));
 }
 
 // Message encoding benchmarks

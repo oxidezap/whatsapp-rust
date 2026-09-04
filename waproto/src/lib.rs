@@ -165,14 +165,19 @@ pub mod codec {
     }
 
     /// Append the encoded message to `out`. Infallible into a `Vec`.
+    ///
+    /// EXPERIMENT (jlucaso1/buffa#2): single-pass append — no `compute_size`
+    /// pre-pass. Revert to `msg.encode(out)` with the experiment.
     #[inline(never)]
     pub fn message_encode_into(msg: &whatsapp::Message, out: &mut Vec<u8>) {
-        msg.encode(out);
+        msg.encode_single_pass(out);
     }
 
+    /// EXPERIMENT (jlucaso1/buffa#2): single-pass encode, no `compute_size`
+    /// pre-pass. Revert to `encode_to_vec` with the experiment.
     #[inline(never)]
     pub fn message_to_vec(msg: &whatsapp::Message) -> Vec<u8> {
-        msg.encode_to_vec()
+        msg.encode_to_vec_single_pass()
     }
 
     /// Two-pass encode with a caller-owned `SizeCache`: `compute_size` fills the
@@ -535,9 +540,10 @@ pub mod codec {
         whatsapp::HandshakeMessage::decode_from_slice(bytes)
     }
 
+    /// EXPERIMENT (jlucaso1/buffa#2): single-pass encode. Revert with the experiment.
     #[inline(never)]
     pub fn handshake_message_to_vec(msg: &whatsapp::HandshakeMessage) -> Vec<u8> {
-        msg.encode_to_vec()
+        msg.encode_to_vec_single_pass()
     }
 
     #[inline(never)]
@@ -617,9 +623,10 @@ pub mod codec {
     /// Secret-addon payloads (enc reactions, event responses, bot msmsg
     /// replies) and per-message sidecars; small trees, but wacore and the
     /// main crate each stamped private copies.
+    /// EXPERIMENT (jlucaso1/buffa#2): single-pass encode. Revert with the experiment.
     #[inline(never)]
     pub fn reaction_message_to_vec(msg: &whatsapp::message::ReactionMessage) -> Vec<u8> {
-        msg.encode_to_vec()
+        msg.encode_to_vec_single_pass()
     }
 
     #[inline(never)]
@@ -629,9 +636,10 @@ pub mod codec {
         whatsapp::message::ReactionMessage::decode_from_slice(bytes)
     }
 
+    /// EXPERIMENT (jlucaso1/buffa#2): single-pass encode. Revert with the experiment.
     #[inline(never)]
     pub fn event_response_message_to_vec(msg: &whatsapp::message::EventResponseMessage) -> Vec<u8> {
-        msg.encode_to_vec()
+        msg.encode_to_vec_single_pass()
     }
 
     #[inline(never)]
