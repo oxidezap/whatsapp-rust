@@ -225,6 +225,7 @@ impl InMemoryBackend {
             sender_key_batch_writes: AtomicU32::new(0),
             #[cfg(any(test, feature = "test-util"))]
             fail_session_writes: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
             fail_session_after: AtomicUsize::new(usize::MAX),
             #[cfg(any(test, feature = "test-util"))]
             fail_sender_key_writes: AtomicBool::new(false),
@@ -359,17 +360,25 @@ impl SignalStore for InMemoryBackend {
         }
         let mut state = self.state.lock().await;
         state.sessions.reserve(sessions.len());
-        for (index, (address, session)) in sessions.iter().enumerate() {
+        #[cfg(any(test, feature = "test-util"))]
+        let mut written = 0;
+        for (address, session) in sessions {
             #[cfg(any(test, feature = "test-util"))]
-            if index >= self.fail_session_after.load(Ordering::Relaxed) {
-                return Err(crate::store::error::StoreError::Io(std::io::Error::other(
-                    "put_sessions_batch failed after partial progress (test hook)",
-                )));
+            {
+                if written >= self.fail_session_after.load(Ordering::Relaxed) {
+                    return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                        "put_sessions_batch failed after partial progress (test hook)",
+                    )));
+                }
             }
             if let Some(stored) = state.sessions.get_mut(address.as_ref()) {
                 *stored = session.clone();
             } else {
                 state.sessions.insert(address.to_string(), session.clone());
+            }
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                written += 1;
             }
         }
         Ok(())
