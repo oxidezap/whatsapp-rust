@@ -14,6 +14,18 @@ fn main() {
     divan::main();
 }
 
+/// Sampling for the sub-50µs benches below (15-byte `conversation` encode,
+/// whitelist extraction over a handful of bytes).
+///
+/// A single op per sample leaves the measurement dominated by timer and
+/// allocator granularity — the ±10% swing seen on the buffa fork experiment.
+/// `sample_size` batches N ops per sample while divan still reports per-op
+/// time, so the measured quantity is unchanged; `sample_count` keeps total
+/// work modest under CodSpeed's Valgrind instrumentation
+/// (~25µs × 50 × 100 ≈ 0.1s per bench).
+const MICRO_SAMPLE_COUNT: u32 = 100;
+const MICRO_SAMPLE_SIZE: u32 = 50;
+
 fn create_simple_message() -> wa::Message {
     wa::Message {
         conversation: Some("Hello, World!".to_string()),
@@ -50,14 +62,14 @@ fn setup_extended_message() -> wa::Message {
 }
 
 // Content extraction benchmarks
-#[divan::bench]
+#[divan::bench(sample_count = MICRO_SAMPLE_COUNT, sample_size = MICRO_SAMPLE_SIZE)]
 fn bench_content_extraction_simple(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_simple_message)
         .bench_refs(|msg| black_box(generate_reporting_token_content(msg)));
 }
 
-#[divan::bench]
+#[divan::bench(sample_count = MICRO_SAMPLE_COUNT, sample_size = MICRO_SAMPLE_SIZE)]
 fn bench_content_extraction_extended(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_extended_message)
@@ -143,14 +155,14 @@ fn bench_full_token_generation_extended(bencher: divan::Bencher) {
 }
 
 // Message encoding benchmarks
-#[divan::bench]
+#[divan::bench(sample_count = MICRO_SAMPLE_COUNT, sample_size = MICRO_SAMPLE_SIZE)]
 fn bench_message_encoding_simple(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_simple_message)
         .bench_refs(|msg| black_box(msg.encode_to_vec()));
 }
 
-#[divan::bench]
+#[divan::bench(sample_count = MICRO_SAMPLE_COUNT, sample_size = MICRO_SAMPLE_SIZE)]
 fn bench_message_encoding_extended(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_extended_message)
