@@ -799,10 +799,9 @@ impl wacore::types::events::EventHandler for StanzaEventCounter {
 /// measured is everything from the decoded stanza to the dispatched event:
 /// classification, the session or sender-key decrypt through the signal
 /// cache, plaintext handling, dispatch, and the delivery receipt written to
-/// the sink socket. The chat lane is not on the bill: a stanza enters at
-/// `Client::handle_incoming_message`, which is what the lane worker awaits
-/// per message, so the queue hop is excluded by construction and the
-/// per-message work is not.
+/// the sink socket. [`Self::receive`] and [`Self::receive_burst`] enter at
+/// `Client::handle_incoming_message` and exclude the queue hop.
+/// [`Self::enqueue_and_drain`] also measures the chat-lane queue and worker.
 pub struct ReceiveHarness {
     runtime: tokio::runtime::Runtime,
     client: Arc<Client>,
