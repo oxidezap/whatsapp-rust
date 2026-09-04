@@ -395,7 +395,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn queued_chat_message_keeps_two_handles() {
+        assert_eq!(size_of::<QueuedChatMessage>(), 2 * size_of::<usize>());
+    }
+
     #[tokio::test]
+    #[ignore = "layout diagnostic: run explicitly with --ignored --nocapture"]
     async fn audit_receive_future_and_struct_layouts() {
         let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sizing_runtime = SizingRuntime {

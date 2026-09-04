@@ -8,11 +8,11 @@
 //! event bus, the delivery receipt — lives in the `whatsapp-rust` crate, and
 //! this target is what puts a number on it.
 //!
-//! What it does not cover, stated once so no number here is over-read:
+//! The direct receive and `_burst` cases enter at `handle_incoming_message`
+//! and exclude the queue hop. The `worker_*` cases include enqueue and the
+//! production chat-lane worker; `worker_lanes` also includes lane shutdown.
 //!
-//! - **The chat lane.** A stanza enters at `handle_incoming_message`, which
-//!   is what the lane worker awaits per message; the queue hop itself is not
-//!   measured.
+//! These fixtures exclude:
 //! - **The SQLite backend.** The fixture stores through `InMemoryBackend`.
 //! - **First contact.** Session and sender key are established in setup.
 //! - **The socket write.** The delivery receipt is marshalled, noise-encrypted
