@@ -16,6 +16,9 @@ pub enum RunCompletionReason {
         /// The final connect failure, when no connection was established.
         connect_error: Option<ConnectError>,
     },
+    /// The supervision flag was cleared without a terminal shutdown verdict.
+    /// This is an internal stop and carries no claim about the protocol cause.
+    Stopped,
     /// Another task already owns the supervision loop.
     AlreadyRunning,
 }
@@ -739,10 +742,7 @@ impl Client {
         let mut first_connect = true;
         let mut last_connect_error: Option<ConnectError>;
         let mut last_disconnect_reason: Option<DisconnectReason>;
-        let mut completion = RunCompletionReason::AutoReconnectDisabled {
-            connection: None,
-            connect_error: None,
-        };
+        let mut completion = RunCompletionReason::Stopped;
         while self.is_running.load(Ordering::Relaxed) {
             // The one place a pause is honoured, and it is before the attempt
             // rather than after one fails: a `pause()` can land during a
