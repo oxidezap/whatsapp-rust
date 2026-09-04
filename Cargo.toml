@@ -366,6 +366,22 @@ required-features = ["bench-harness"]
 name = "jid_keyed_cache"
 harness = false
 
+# USync normalization + spec build: pure `wacore`/`wacore-binary` calls, no
+# runtime, no `bench-harness`. Same plain-`cargo bench` reasoning as above.
+[[bench]]
+name = "client_usync"
+harness = false
+
+# Warm `LidPnCache` hit/miss through the public cache only. Same reasoning.
+[[bench]]
+name = "client_identity_cache"
+harness = false
+
+# `Cache` write/evict/sweep terms around the read path. Same reasoning.
+[[bench]]
+name = "client_cache_maint"
+harness = false
+
 [profile.release]
 opt-level = 3
 debug = false

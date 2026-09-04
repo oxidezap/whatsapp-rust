@@ -173,3 +173,29 @@ fn media_decrypt_in_place_10mb(bencher: Bencher) {
 fn media_decrypt_in_place_1mb(bencher: Bencher) {
     bench_decrypt_in_place(bencher, MB, MediaType::Image);
 }
+
+/// The copying decrypt: allocates the plaintext beside the ciphertext, so one
+/// full-file memcpy plus a 2x peak. The delta against the in-place rows above
+/// is what routing a buffered HTTP response through
+/// `verify_and_decrypt_in_place` saves.
+fn bench_decrypt_copy(bencher: Bencher, len: usize, media_type: MediaType) {
+    let ciphertext = encrypted(len, media_type);
+    bencher
+        .counter(BytesCount::new(len))
+        .with_inputs(|| ciphertext.clone())
+        .bench_refs(|buf| {
+            black_box(
+                DownloadUtils::verify_and_decrypt(black_box(buf), &MEDIA_KEY, media_type).unwrap(),
+            );
+        });
+}
+
+#[divan::bench]
+fn media_decrypt_copy_10mb(bencher: Bencher) {
+    bench_decrypt_copy(bencher, 10 * MB, MediaType::Video);
+}
+
+#[divan::bench]
+fn media_decrypt_copy_1mb(bencher: Bencher) {
+    bench_decrypt_copy(bencher, MB, MediaType::Image);
+}

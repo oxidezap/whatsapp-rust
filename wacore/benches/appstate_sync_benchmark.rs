@@ -45,3 +45,18 @@ fn bench_collect_unique_index_macs(bencher: divan::Bencher, n: usize) {
         .with_inputs(|| setup_mutations(n))
         .bench_refs(|mutations| black_box(collect_unique_index_macs(black_box(mutations))));
 }
+
+/// Same scan over a patch that repeats one index: the dedup early-out shape.
+/// The delta against the distinct-index row above is the best-vs-worst spread
+/// a swap (HashSet, sort) must beat on both ends before it lands.
+fn setup_duplicate_mutations(n: usize) -> Vec<wa::SyncdMutation> {
+    let one = setup_mutations(1).pop().expect("one mutation");
+    vec![one; n]
+}
+
+#[divan::bench(args = [10, 1000])]
+fn bench_collect_unique_index_macs_duplicates(bencher: divan::Bencher, n: usize) {
+    bencher
+        .with_inputs(|| setup_duplicate_mutations(n))
+        .bench_refs(|mutations| black_box(collect_unique_index_macs(black_box(mutations))));
+}

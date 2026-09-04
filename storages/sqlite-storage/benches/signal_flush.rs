@@ -131,7 +131,7 @@ fn remove_db_files(path: &std::path::Path) {
     }
 }
 
-const DB_SLOTS: usize = 5;
+const DB_SLOTS: usize = 7;
 static DBS: [OnceLock<Db>; DB_SLOTS] = [const { OnceLock::new() }; DB_SLOTS];
 
 fn db(slot: usize, tag: &str) -> &'static Db {
@@ -211,5 +211,47 @@ fn remove_prekeys_batch(bencher: divan::Bencher, n: usize) {
             db.runtime
                 .block_on(db.store.remove_prekeys_batch(black_box(&ids)))
                 .expect("remove batch");
+        });
+}
+
+/// One `get_session` per device: the N+1 a group send pays on its session
+/// checkout, with no batch API to fold it into. The number a future
+/// `load_sessions_batch` has to beat.
+#[divan::bench(args = BATCH_SIZES)]
+fn get_session_hit(bencher: divan::Bencher, n: usize) {
+    let db = db(5, "get-hit");
+    bencher
+        .with_inputs(|| db.inserted_sessions(n))
+        .bench_values(|addresses| {
+            db.runtime.block_on(async {
+                for address in &addresses {
+                    black_box(
+                        db.store
+                            .get_session(black_box(address))
+                            .await
+                            .expect("load session"),
+                    );
+                }
+            });
+        });
+}
+
+/// Same, for addresses never written: the miss a first-contact send pays.
+#[divan::bench(args = BATCH_SIZES)]
+fn get_session_miss(bencher: divan::Bencher, n: usize) {
+    let db = db(6, "get-miss");
+    bencher
+        .with_inputs(|| db.fresh_sessions(n))
+        .bench_values(|batch| {
+            db.runtime.block_on(async {
+                for (address, _) in &batch {
+                    black_box(
+                        db.store
+                            .get_session(black_box(address))
+                            .await
+                            .expect("load miss"),
+                    );
+                }
+            });
         });
 }
