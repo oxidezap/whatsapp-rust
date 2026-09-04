@@ -3004,7 +3004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expected_disconnect_with_reconnect_disabled_has_no_connection_cause() {
+    async fn expected_disconnect_during_failed_connect_has_no_connection_cause() {
         let (client, entered, release) = client_parked_in_connect().await;
         client.enable_auto_reconnect.store(false, Ordering::Relaxed);
         let runner = Arc::clone(&client);
@@ -3014,13 +3014,13 @@ mod tests {
         release.send(()).await.unwrap();
 
         let reason = run.await.unwrap();
-        assert!(matches!(
-            reason,
+        match reason {
             RunCompletionReason::AutoReconnectDisabled {
                 connection: None,
-                connect_error: Some(_),
-            }
-        ));
+                connect_error: Some(ConnectError::Version(error)),
+            } => assert!(error.to_string().contains("client_revision")),
+            other => panic!("unexpected completion: {other:?}"),
+        }
     }
 
     /// The misreport this branch's guard exists for. `disconnect()` is
