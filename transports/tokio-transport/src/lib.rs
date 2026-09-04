@@ -208,6 +208,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for WsTranspo
     }
 }
 
+/// Reads at or above this size are moved out of the WebSocket codec's buffer
+/// into their own allocation before handoff.
+///
+/// tokio-websockets cuts each message out of its long-lived read buffer
+/// (`BytesMut::split_to`, which always promotes the buffer to shared), so the
+/// `Bytes` inside a message is a shared view into it: `FrameDecoder::feed_owned`
+/// could never adopt such a read (`Bytes::try_into_mut` fails while the codec
+/// holds the other reference) and would copy every large frame anyway, while
+/// the view kept the codec's whole read buffer — and any frames coalesced into
+/// it — alive until the read loop got around to that copy. Moving a large read
+/// into its own `Vec` hands the decoder a uniquely-owned buffer it adopts with
+/// no further copy, and drops the shared view here so the codec reuses its
+/// buffer for the next read.
+///
+/// Reads below this size keep the zero-copy shared handoff: the decoder copies
+/// those into its amortized chunk buffer regardless, so a `Vec` here would add
+/// an allocation and a copy per small stanza.
+///
+/// Must match `CHUNK_SIZE` in `wacore-noise`'s framing module, the size at and
+/// above which `feed_owned` adopts. Drift in either direction stays correct (a
+/// fallback copy), only less optimal.
+const ADOPT_THRESHOLD: usize = 1024;
+
+/// Moves a received message's payload into the `Bytes` handed to the read loop.
+///
+/// Large reads get their own allocation (adoptable by `feed_owned`); small
+/// reads keep the zero-copy shared view (copied into the decoder's chunk
+/// buffer regardless). Rationale on [`ADOPT_THRESHOLD`].
+fn handoff_bytes(payload: tokio_websockets::Payload) -> Bytes {
+    if payload.len() >= ADOPT_THRESHOLD {
+        Bytes::from(payload.to_vec())
+    } else {
+        Bytes::from(payload)
+    }
+}
+
 async fn read_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: SplitStream<WebSocketStream<S>>,
     tx: async_channel::Sender<TransportEvent>,
@@ -226,10 +262,11 @@ async fn read_pump<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 Some(Ok(msg)) if msg.is_binary() => {
                     let payload = msg.into_payload();
                     debug!("<-- Received WebSocket data: {} bytes", payload.len());
+                    let bytes = handoff_bytes(payload);
                     tokio::select! {
                         biased;
                         _ = shutdown.changed() => break,
-                        r = tx.send(TransportEvent::DataReceived(Bytes::from(payload))) => {
+                        r = tx.send(TransportEvent::DataReceived(bytes)) => {
                             if r.is_err() {
                                 warn!("Event receiver dropped");
                                 break;
@@ -393,6 +430,39 @@ impl TransportFactory for TokioWebSocketTransportFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A large read must reach the frame decoder as a uniquely-owned `Bytes`
+    /// or `feed_owned` cannot adopt it. The production input is always shared
+    /// (the codec cuts messages out of its read buffer via `split_to`), so
+    /// this feeds the handoff a clone-held payload — the shape that must still
+    /// come out unique — and asserts adoption-ability by pointer semantics:
+    /// `try_into_mut` succeeds only for a single owner.
+    #[test]
+    fn large_reads_hand_over_uniquely_owned_bytes() {
+        let backing = Bytes::from(vec![0xA5u8; ADOPT_THRESHOLD * 4]);
+        // `clone` keeps a second owner alive, as the codec's read buffer does.
+        let shared = tokio_websockets::Payload::from(backing.clone());
+        assert!(
+            backing.clone().try_into_mut().is_err(),
+            "test setup must be shared to mean anything"
+        );
+
+        let bytes = handoff_bytes(shared);
+        assert_eq!(&bytes[..], &backing[..]);
+        assert!(
+            bytes.try_into_mut().is_ok(),
+            "a large read must be adoptable by feed_owned"
+        );
+    }
+
+    /// Small reads keep the shared handoff: the decoder copies them into its
+    /// chunk buffer either way, so this only pins that they arrive intact.
+    #[test]
+    fn small_reads_hand_over_shared_bytes_intact() {
+        let expected = vec![0x5Au8; ADOPT_THRESHOLD / 4];
+        let bytes = handoff_bytes(tokio_websockets::Payload::from(expected.clone()));
+        assert_eq!(&bytes[..], &expected[..]);
+    }
 
     /// Workstream C: the transport's reported footprint is the sum of its
     /// read/write framing buffers and the TLS state estimate.

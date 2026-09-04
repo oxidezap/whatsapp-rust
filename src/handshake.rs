@@ -420,7 +420,10 @@ async fn recv_frame(
         .await
         {
             Ok(Ok(TransportEvent::DataReceived(data))) => {
-                frame_decoder.feed(&data);
+                // `data` is the transport's own read buffer handed over outright;
+                // `feed_owned` adopts it without a copy when it can (a large or
+                // coalesced read) and copies small/shared reads as `feed` would.
+                frame_decoder.feed_owned(data);
                 if let Some(frame) = frame_decoder.decode_frame() {
                     return Ok(frame);
                 }
