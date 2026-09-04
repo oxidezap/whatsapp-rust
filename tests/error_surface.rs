@@ -305,6 +305,47 @@ fn wrapping_variants_preserve_their_typed_source() {
     );
 }
 
+/// The core error is non-exhaustive, so the facade's fallback cannot be
+/// reached with a currently constructible unknown variant. Guard the real
+/// conversion arm structurally until a future core variant makes it runnable.
+#[test]
+fn iq_conversion_fallback_preserves_the_core_error_source() {
+    let source =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/request.rs"))
+            .expect("read request conversion");
+    let file = syn::parse_file(&source).expect("parse request conversion");
+    let _method = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Impl(item) => Some(item),
+            _ => None,
+        })
+        .flat_map(|item| item.items.iter())
+        .find_map(|item| match item {
+            syn::ImplItem::Fn(method) if method.sig.ident == "from_response" => Some(method),
+            _ => None,
+        })
+        .expect("find IqError::from_response");
+    let method_start = source
+        .find("pub fn from_response(")
+        .expect("locate parsed from_response");
+    let method_tail = &source[method_start..];
+    let method_end = method_tail
+        .find("\n    }\n}")
+        .expect("locate end of parsed from_response")
+        + "\n    }".len();
+    let body = &method_tail[..method_end];
+    assert!(
+        body.contains("Unclassified") && body.contains("Box") && body.contains("other"),
+        "future core IQ errors must be boxed as their original typed error"
+    );
+    assert!(
+        !body.contains("_ => Self::InternalChannelClosed"),
+        "future core IQ errors must not be classified as channel closure"
+    );
+}
+
 // ── The reported symptom ────────────────────────────────────────────────────
 
 /// Regression for the original report: a `403` from a group operation was
