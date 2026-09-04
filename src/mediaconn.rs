@@ -112,8 +112,24 @@ impl Client {
         // Nothing started after this fetch: its answer is still the newest.
         // Otherwise a newer fetch owns the cache (or will, when it lands)
         // and this result is only good for its own callers.
+        //
+        // The check runs under the publication lock, not before it: a fetch
+        // that passed the check and then waited on the lock could otherwise
+        // land after a newer fetch that started and published in between.
+        let mut write_guard = self.media_conn.write().await;
+        #[cfg(test)]
+        {
+            // Deterministic TOCTOU reproduction: while set, a fetch parks
+            // here holding the lock, so a test can start a newer fetch past
+            // it and prove the parked answer cannot publish.
+            if self.media_conn_test_block_store.load(Ordering::Acquire) {
+                self.media_conn_test_in_store.fetch_add(1, Ordering::AcqRel);
+                while self.media_conn_test_block_store.load(Ordering::Acquire) {
+                    self.runtime.sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }
         if seq + 1 == self.media_conn_seq.load(Ordering::Acquire) {
-            let mut write_guard = self.media_conn.write().await;
             *write_guard = Some(new_conn.clone());
         }
 
@@ -383,9 +399,10 @@ impl Drop for MediaConnLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+    use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq, poll_until};
     use crate::transport::mock::CapturingMockTransport;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering as AtomicOrdering;
     use std::time::Duration;
     use wacore_binary::builder::NodeBuilder;
     use wacore_binary::node::Node;
@@ -691,6 +708,80 @@ mod tests {
                 .auth,
             "forced-auth",
             "an older flight completing last must not overwrite the forced refresh"
+        );
+    }
+
+    /// An older fetch parked between lock acquisition and publication must
+    /// not publish once a newer fetch began: the sequence re-check runs
+    /// under the same lock, so the parked answer cannot slip in after the
+    /// forced one even when the scheduler deschedules it mid-publication.
+    #[tokio::test]
+    async fn an_older_fetch_parked_at_publication_cannot_overwrite_a_newer_one() {
+        use AtomicOrdering as Ordering;
+
+        let (client, transport) = create_iq_test_client().await;
+        client
+            .media_conn_test_block_store
+            .store(true, Ordering::Release);
+
+        // Older fetch: answered, then parked inside publication holding the
+        // lock (its sequence check has not run yet).
+        let older = tokio::spawn({
+            let client = client.clone();
+            async move { client.refresh_media_conn(false).await }
+        });
+        answer_frame(&client, &transport, 0, "older-auth", 3600).await;
+        poll_until("the older fetch parks at publication", || {
+            client.media_conn_test_in_store.load(Ordering::Acquire) > 0
+        })
+        .await;
+
+        // A newer forced fetch starts (bumping the sequence) while the older
+        // one is parked, but cannot publish yet: the older fetch holds the lock.
+        let newer = tokio::spawn({
+            let client = client.clone();
+            async move { client.refresh_media_conn(true).await }
+        });
+        let sent = decode_sent_iq(&transport, 1).await;
+        let newer_id = request_id(&sent);
+
+        // Release the older fetch with the newer one started but unpublished:
+        // it must observe the newer sequence and skip its publication, while
+        // still answering its own caller with what it fetched.
+        client
+            .media_conn_test_block_store
+            .store(false, Ordering::Release);
+        let older_conn = tokio::time::timeout(Duration::from_secs(5), older)
+            .await
+            .expect("the older fetch must finish once released")
+            .expect("the older task stays alive")
+            .expect("the older fetch answers its own caller");
+        assert_eq!(older_conn.auth, "older-auth");
+        assert!(
+            client.cached_media_conn().await.is_none(),
+            "the parked older fetch must publish nothing once a newer fetch began"
+        );
+
+        // The newer fetch then publishes normally.
+        answer_iq(
+            &client,
+            &newer_id,
+            &media_conn_result(&newer_id, "forced-auth", 3600),
+        )
+        .await;
+        let newer_conn = tokio::time::timeout(Duration::from_secs(5), newer)
+            .await
+            .expect("the newer fetch must complete")
+            .expect("the newer task stays alive")
+            .expect("the newer fetch succeeds");
+        assert_eq!(newer_conn.auth, "forced-auth");
+        assert_eq!(
+            client
+                .cached_media_conn()
+                .await
+                .expect("the newer fetch publishes")
+                .auth,
+            "forced-auth"
         );
     }
 }

@@ -1435,6 +1435,14 @@ pub struct Client {
     /// Fetch sequence for `media_conn`: tagged at fetch start so a response
     /// that lost its race only publishes when nothing newer began after it.
     pub(crate) media_conn_seq: AtomicU64,
+    /// Test gate: parks a fetch after it takes the `media_conn` publication
+    /// lock but before it re-checks the sequence, so a test can drive a newer
+    /// fetch past it and prove the older answer cannot publish.
+    #[cfg(test)]
+    pub(crate) media_conn_test_block_store: AtomicBool,
+    /// Counts entries into the parked publication above.
+    #[cfg(test)]
+    pub(crate) media_conn_test_in_store: AtomicU32,
 
     pub(crate) is_logged_in: AtomicBool,
     #[cfg(feature = "client-lifecycle")]
