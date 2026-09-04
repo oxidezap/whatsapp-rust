@@ -939,7 +939,7 @@ impl Client {
         #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
         info!("Client run loop has shut down.");
-        if shutdown.is_fired() {
+        if matches!(completion, RunCompletionReason::Stopped) && shutdown.is_fired() {
             RunCompletionReason::ShutdownRequested
         } else {
             completion
@@ -2963,6 +2963,66 @@ mod tests {
             .expect("the observer channel must stay open");
     }
 
+    #[tokio::test]
+    async fn a_second_run_reports_already_running_without_stopping_the_first() {
+        let (client, entered, release) = client_parked_in_connect().await;
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.run_with_reason().await });
+        next_connect_attempt(&entered).await;
+
+        assert!(matches!(
+            client.run_with_reason().await,
+            RunCompletionReason::AlreadyRunning
+        ));
+        assert!(!first.is_finished());
+
+        client.disconnect().await;
+        drop(release);
+        assert!(matches!(
+            first.await.unwrap(),
+            RunCompletionReason::ShutdownRequested
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabling_reconnect_after_a_connect_failure_preserves_the_error() {
+        let (client, entered, release) = client_parked_in_connect().await;
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
+        next_connect_attempt(&entered).await;
+        release.send(()).await.unwrap();
+
+        let reason = run.await.unwrap();
+        match reason {
+            RunCompletionReason::AutoReconnectDisabled {
+                connection: None,
+                connect_error: Some(error),
+            } => assert!(!error.to_string().is_empty()),
+            other => panic!("unexpected completion: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expected_disconnect_with_reconnect_disabled_has_no_connection_cause() {
+        let (client, entered, release) = client_parked_in_connect().await;
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
+        next_connect_attempt(&entered).await;
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        release.send(()).await.unwrap();
+
+        let reason = run.await.unwrap();
+        assert!(matches!(
+            reason,
+            RunCompletionReason::AutoReconnectDisabled {
+                connection: None,
+                connect_error: Some(_),
+            }
+        ));
+    }
+
     /// The misreport this branch's guard exists for. `disconnect()` is
     /// terminal: it clears `is_running`, which is the loop's own stop
     /// condition. Landing it while a connect attempt is in flight used to make
@@ -3235,7 +3295,7 @@ mod tests {
         let (client, entered, release) = client_parked_in_connect().await;
 
         let runner = Arc::clone(&client);
-        let run = tokio::spawn(async move { runner.run().await });
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
         next_connect_attempt(&entered).await;
 
         client.pause().await;
@@ -3243,10 +3303,11 @@ mod tests {
         crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
 
         client.disconnect().await;
-        tokio::time::timeout(Duration::from_secs(10), run)
+        let reason = tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .expect("a paused run loop must still return when the client is disconnected")
             .expect("the run task must not panic");
+        assert!(matches!(reason, RunCompletionReason::ShutdownRequested));
         assert!(client.is_terminal(), "and the client is finished for good");
     }
 
