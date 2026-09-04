@@ -1548,11 +1548,11 @@ mod encryption_override_tests {
         );
         assert_ne!(
             device_list_fingerprint(&list),
-            device_list_fingerprint(&vec![lid("100000000000001", 5), lid("100000000000003", 0)])
+            device_list_fingerprint(&[lid("100000000000001", 5), lid("100000000000003", 0)])
         );
         assert_ne!(
             device_list_fingerprint(&list),
-            device_list_fingerprint(&vec![lid("100000000000001", 5)])
+            device_list_fingerprint(&[lid("100000000000001", 5)])
         );
     }
 }
