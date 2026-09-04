@@ -5342,6 +5342,13 @@ mod pre_wire_gate_tests {
 
         assert!(cache.flush(&backend).await.is_err());
         assert!(cache.needs_pre_wire_flush().await);
+        {
+            let state = cache.lock_sessions().await;
+            assert!(state.dirty.contains(first.as_str()));
+            assert!(state.dirty.contains(second.as_str()));
+            assert!(state.reservation_pending.contains(first.as_str()));
+            assert!(state.reservation_pending.contains(second.as_str()));
+        }
         let first_written = backend.get_session(first.as_str()).await.unwrap().is_some();
         let second_written = backend
             .get_session(second.as_str())
