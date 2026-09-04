@@ -3086,7 +3086,7 @@ mod tests {
         let (client, entered, release) = client_parked_in_connect().await;
 
         let runner = Arc::clone(&client);
-        let run = tokio::spawn(async move { runner.run().await });
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
         next_connect_attempt(&entered).await;
 
         // What a 515 leaves behind: the end was planned, and nobody asked the
@@ -3141,10 +3141,11 @@ mod tests {
         client.expected_disconnect.store(false, Ordering::Relaxed);
         drop(release);
 
-        tokio::time::timeout(Duration::from_secs(10), run)
+        let reason = tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .expect("run() must return even with its verdict flag erased")
             .expect("the run task must not panic");
+        assert!(matches!(reason, RunCompletionReason::ShutdownRequested));
 
         let said = logs.records_for(RUN_LOOP_LOG);
         assert!(
