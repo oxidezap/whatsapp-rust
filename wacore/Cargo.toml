@@ -7,6 +7,14 @@ authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
 repository = "https://github.com/jlucaso1/whatsapp-rust"
 description = "Core WhatsApp protocol implementation without runtime dependencies"
+# Keep codec test vectors and generator provenance out of the published crate. The three
+# compressed seeds remain included because production MLow expands them at runtime.
+exclude = [
+    "src/voip/mlow/testdata/*.json",
+    "src/voip/mlow/testdata/*.raw",
+    "src/voip/mlow/testdata/README.md",
+    "src/voip/mlow/testdata/PROVENANCE.md",
+]
 # Only the explicit [[bench]] targets below are built; never auto-discover benches/*.rs, so a stray
 # untracked file on a reused CI runner can't get compiled as a phantom bench.
 autobenches = false
