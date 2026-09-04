@@ -133,3 +133,7 @@ unknown-git = "deny"
 # crates.io only. Nothing in this workspace is vendored from a git remote, and
 # a new git source should be an explicit decision rather than a silent one.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    "https://github.com/jlucaso1/buffa",
+    "https://github.com/jlucaso1/buffa.git",
+]
