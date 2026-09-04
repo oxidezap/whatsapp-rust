@@ -423,7 +423,7 @@ impl EventHandler for CallbackBusAdapter {
 #[must_use = "dropping the handle aborts the bot; bind it and await it, or call .shutdown()"]
 pub struct BotHandle {
     client: Arc<Client>,
-    done_rx: futures::channel::oneshot::Receiver<crate::RunCompletionReason>,
+    done_rx: futures::channel::oneshot::Receiver<()>,
     abort_handle: wacore::runtime::AbortHandle,
 }
 
@@ -436,15 +436,9 @@ impl BotHandle {
     /// buffered receipts and message secrets) and waits for the run loop to
     /// exit.
     pub async fn shutdown(self) {
-        let _ = self.shutdown_with_reason().await;
-    }
-
-    /// Gracefully stop and report why the supervised client finished.
-    pub async fn shutdown_with_reason(mut self) -> crate::RunCompletionReason {
         self.client.disconnect().await;
-        (&mut self.done_rx)
-            .await
-            .unwrap_or(crate::RunCompletionReason::ShutdownRequested)
+        let mut done_rx = self.done_rx;
+        let _ = (&mut done_rx).await;
     }
 
     /// Abort the bot task immediately. Skips the flush work
@@ -599,9 +593,10 @@ impl Bot {
         let client = self.start_background();
 
         let run_client = client.clone();
-        let (done_tx, done_rx) = futures::channel::oneshot::channel::<crate::RunCompletionReason>();
+        let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
         let abort_handle = client.runtime.spawn(Box::pin(async move {
-            let _ = done_tx.send(run_client.run_with_reason().await);
+            run_client.run_with_reason().await;
+            let _ = done_tx.send(());
         }));
 
         BotHandle {

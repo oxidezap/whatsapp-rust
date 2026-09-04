@@ -4,7 +4,7 @@ use super::*;
 use wacore::net::DisconnectReason;
 
 /// Why [`Client::run`] stopped supervising the session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum RunCompletionReason {
     /// A terminal shutdown was requested through `disconnect`, `logout`, or drop.
@@ -14,7 +14,7 @@ pub enum RunCompletionReason {
         /// The final reader outcome, when a connection was established.
         connection: Option<DisconnectReason>,
         /// The final connect failure, when no connection was established.
-        connect_error: Option<String>,
+        connect_error: Option<ConnectError>,
     },
     /// Another task already owns the supervision loop.
     AlreadyRunning,
@@ -737,7 +737,7 @@ impl Client {
         // below would also count a final pass that never reconnects (a user
         // disconnect() flips is_running while the branch runs).
         let mut first_connect = true;
-        let mut last_connect_error: Option<String>;
+        let mut last_connect_error: Option<ConnectError>;
         let mut last_disconnect_reason: Option<DisconnectReason>;
         let mut completion = RunCompletionReason::AutoReconnectDisabled {
             connection: None,
@@ -766,7 +766,6 @@ impl Client {
 
             match self.connect().await {
                 Err(connect_err) => {
-                    last_connect_error = Some(connect_err.to_string());
                     wacore::telemetry::connect("fail");
                     match &connect_err {
                         // The loop is about to exit on the same shutdown, so this
@@ -789,6 +788,7 @@ impl Client {
                         }
                         _ => error!("Failed to connect: {connect_err:#}. Will retry..."),
                     }
+                    last_connect_error = Some(connect_err);
                 }
                 Ok(connection) => {
                     wacore::telemetry::connect("ok");
@@ -838,8 +838,8 @@ impl Client {
                 info!("Auto-reconnect disabled, shutting down.");
                 self.stop_supervision_loop();
                 completion = RunCompletionReason::AutoReconnectDisabled {
-                    connection: last_disconnect_reason.clone(),
-                    connect_error: last_connect_error.clone(),
+                    connection: last_disconnect_reason,
+                    connect_error: last_connect_error,
                 };
                 break;
             }
