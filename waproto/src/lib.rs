@@ -165,19 +165,14 @@ pub mod codec {
     }
 
     /// Append the encoded message to `out`. Infallible into a `Vec`.
-    ///
-    /// EXPERIMENT (jlucaso1/buffa#2): single-pass append — no `compute_size`
-    /// pre-pass. Revert to `msg.encode(out)` with the experiment.
     #[inline(never)]
     pub fn message_encode_into(msg: &whatsapp::Message, out: &mut Vec<u8>) {
-        msg.encode_single_pass(out);
+        msg.encode(out);
     }
 
-    /// EXPERIMENT (jlucaso1/buffa#2): single-pass encode, no `compute_size`
-    /// pre-pass. Revert to `encode_to_vec` with the experiment.
     #[inline(never)]
     pub fn message_to_vec(msg: &whatsapp::Message) -> Vec<u8> {
-        msg.encode_to_vec_single_pass()
+        msg.encode_to_vec()
     }
 
     /// Two-pass encode with a caller-owned `SizeCache`: `compute_size` fills the
