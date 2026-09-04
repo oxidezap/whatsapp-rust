@@ -50,7 +50,7 @@ pub use facade::{
     AcceptCall, CallHandle, CallLinkCall, CallTermination, GroupBoundCall, OutgoingCall,
     OutgoingGroupCall,
 };
-pub use video::{VideoFrame, VideoSink, VideoSource};
+pub use video::{TimedVideoFrame, VideoFrame, VideoSink, VideoSource};
 // Surface core types carried by the facade next to the builders and handle that expose them.
 pub use wacore::voip::{
     AudioCodec, AudioConfig, AudioFormat, AudioIo, AudioRtpProfile, EncodedAudioFrame,

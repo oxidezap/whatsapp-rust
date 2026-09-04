@@ -1883,6 +1883,7 @@ mod udp_relay_e2e {
                     events: ev_tx,
                     rekey: None,
                     video_in: async_channel::bounded(1).1,
+                    timed_video_in: None,
                     video_out: async_channel::bounded(1).0,
                     video_ctl: video_control_channel().1,
                     group_ctl: None,

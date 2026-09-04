@@ -7,12 +7,29 @@
 
 pub use wacore::voip::VideoFrame;
 
+/// One captured access unit with its 90 kHz RTP capture timestamp. The driver adds a private
+/// source generation when this crosses the facade boundary, so callers cannot forge generation
+/// ownership while replacing a source.
+#[derive(Debug, Clone)]
+pub struct TimedVideoFrame {
+    pub data: Vec<u8>,
+    pub timestamp: u32,
+}
+
 /// A video source for a call: one complete H.264 Annex-B access unit per item. Channel-factory
 /// shaped for the same reasons as [`AudioSource`](crate::voip::audio::AudioSource); a closed
 /// channel (encoder gone) does NOT end the call — audio keeps running.
 pub trait VideoSource: Send + Sync + 'static {
     /// The channel the facade reads encoded AUs from. Called once when video starts.
     fn frames(&self) -> async_channel::Receiver<Vec<u8>>;
+
+    /// An optional capture-timestamped channel. Sources that do not provide capture timestamps use
+    /// the legacy cadence path, which preserves the existing API and its fixed-stride semantics.
+    /// Implementations should return either this channel or the legacy channel for one attachment,
+    /// not both. The timestamp is the source's capture/presentation timeline, not dequeue time.
+    fn timed_frames(&self) -> Option<async_channel::Receiver<TimedVideoFrame>> {
+        None
+    }
 
     /// RTP clock increment between access units. It must match the source's pacing
     /// (`90_000 / frames_per_second`) and remain non-zero.
