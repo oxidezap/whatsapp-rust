@@ -5327,6 +5327,45 @@ mod pre_wire_gate_tests {
         assert!(!cache.needs_pre_wire_flush().await);
     }
 
+    /// A backend can commit a prefix of a default per-key batch and then
+    /// report an error. The cache must retain every gate until a later retry
+    /// confirms all current values, including the row after the prefix.
+    #[tokio::test]
+    async fn partial_session_batch_failure_keeps_all_gates_for_retry() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let first = addr("15550001021");
+        let second = addr("15550001022");
+        cache.put_session(&first, leased_record()).await;
+        cache.put_session(&second, leased_record()).await;
+        backend.set_fail_session_after_prefix(Some(1));
+
+        assert!(cache.flush(&backend).await.is_err());
+        assert!(cache.needs_pre_wire_flush().await);
+        let first_written = backend.get_session(first.as_str()).await.unwrap().is_some();
+        let second_written = backend
+            .get_session(second.as_str())
+            .await
+            .unwrap()
+            .is_some();
+        assert_ne!(
+            first_written, second_written,
+            "the injected backend must commit exactly one prefix row"
+        );
+
+        backend.set_fail_session_after_prefix(None);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert!(backend.get_session(first.as_str()).await.unwrap().is_some());
+        assert!(
+            backend
+                .get_session(second.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     /// The sender-key counterpart of `failed_flush_keeps_the_gate_closed`: a
     /// flush that fails writing the chain advance must keep the wire gated.
     #[tokio::test]
