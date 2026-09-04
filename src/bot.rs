@@ -423,7 +423,7 @@ impl EventHandler for CallbackBusAdapter {
 #[must_use = "dropping the handle aborts the bot; bind it and await it, or call .shutdown()"]
 pub struct BotHandle {
     client: Arc<Client>,
-    done_rx: futures::channel::oneshot::Receiver<()>,
+    done_rx: futures::channel::oneshot::Receiver<crate::RunCompletionReason>,
     abort_handle: wacore::runtime::AbortHandle,
 }
 
@@ -435,9 +435,16 @@ impl BotHandle {
     /// Gracefully stop the bot: disconnects (flushing the device snapshot,
     /// buffered receipts and message secrets) and waits for the run loop to
     /// exit.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_with_reason().await;
+    }
+
+    /// Gracefully stop and report why the supervised client finished.
+    pub async fn shutdown_with_reason(mut self) -> crate::RunCompletionReason {
         self.client.disconnect().await;
-        let _ = (&mut self.done_rx).await;
+        (&mut self.done_rx)
+            .await
+            .unwrap_or(crate::RunCompletionReason::ShutdownRequested)
     }
 
     /// Abort the bot task immediately. Skips the flush work
@@ -466,10 +473,10 @@ impl std::future::Future for BotHandle {
 /// CPU-relevant work of a session would be missing from the hook on the
 /// common `bot.run().await` launch path. `Bot::spawn` needs no equivalent:
 /// it routes the same loop through `Runtime::spawn`.
-async fn run_metered<F: std::future::Future<Output = ()>>(
+async fn run_metered<F: std::future::Future>(
     fut: F,
     instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
-) {
+) -> F::Output {
     match instrument {
         // Stack-pinned, not boxed: `MeteredFuture` only needs an `Unpin` inner,
         // and `Pin<&mut F>` is one without an allocation.
@@ -562,11 +569,17 @@ impl Bot {
     /// (linker-shared) function, so callers poll through a vtable and the
     /// graph is compiled once, here. One allocation per process.
     pub async fn run(self) {
+        let _ = self.run_with_reason().await;
+    }
+
+    /// Run the bot and report why its client supervision ended. Existing
+    /// callers can continue using [`Self::run`], which returns `()`.
+    pub async fn run_with_reason(self) -> crate::RunCompletionReason {
         self.run_boxed().await
     }
 
     #[inline(never)]
-    fn run_boxed(self) -> wacore::runtime::BoxFuture<'static, ()> {
+    fn run_boxed(self) -> wacore::runtime::BoxFuture<'static, crate::RunCompletionReason> {
         Box::pin(self.run_graph())
     }
 
@@ -574,10 +587,10 @@ impl Bot {
         feature = "tracing",
         tracing::instrument(name = "wa.bot.run", level = "debug", skip_all)
     )]
-    async fn run_graph(self) {
+    async fn run_graph(self) -> crate::RunCompletionReason {
         let instrument = self.task_instrument.clone();
         let client = self.start_background();
-        run_metered(client.run(), instrument).await;
+        run_metered(client.run_with_reason(), instrument).await
     }
 
     /// Start the bot on its runtime and return a [`BotHandle`] to await,
@@ -586,10 +599,9 @@ impl Bot {
         let client = self.start_background();
 
         let run_client = client.clone();
-        let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
+        let (done_tx, done_rx) = futures::channel::oneshot::channel::<crate::RunCompletionReason>();
         let abort_handle = client.runtime.spawn(Box::pin(async move {
-            run_client.run().await;
-            let _ = done_tx.send(());
+            let _ = done_tx.send(run_client.run_with_reason().await);
         }));
 
         BotHandle {

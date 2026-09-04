@@ -27,7 +27,7 @@ pub const WHATSAPP_WEB_ORIGIN: &str = "https://web.whatsapp.com";
 /// Serialize: carried by `events::Disconnected`, whose payload consumers forward
 /// as JSON (webhooks, dashboards) — snake_case so the wire shape doesn't leak
 /// Rust variant naming.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisconnectReason {
     /// The peer sent a WebSocket Close frame. `code` is the RFC 6455 close

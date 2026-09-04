@@ -3,6 +3,23 @@
 use super::*;
 use wacore::net::DisconnectReason;
 
+/// Why [`Client::run`] stopped supervising the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RunCompletionReason {
+    /// A terminal shutdown was requested through `disconnect`, `logout`, or drop.
+    ShutdownRequested,
+    /// The current connection ended while automatic reconnection was disabled.
+    AutoReconnectDisabled {
+        /// The final reader outcome, when a connection was established.
+        connection: Option<DisconnectReason>,
+        /// The final connect failure, when no connection was established.
+        connect_error: Option<String>,
+    },
+    /// Another task already owns the supervision loop.
+    AlreadyRunning,
+}
+
 /// `authenticated_generation` when no connection has published one.
 ///
 /// Not zero: that is a real generation, the one a freshly built client is on,
@@ -688,31 +705,44 @@ impl Client {
     // keepalive-loop span. Identity (lid/pn) attribution comes from the
     // per-operation spans (send/request), which record it themselves.
     pub async fn run(self: &Arc<Self>) {
+        let _ = self.run_with_reason().await;
+    }
+
+    /// Drive the session until supervision ends and report the terminal cause.
+    /// This additive companion preserves the unit-returning [`Self::run`]
+    /// contract for existing callers.
+    pub async fn run_with_reason(self: &Arc<Self>) -> RunCompletionReason {
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle
             && !lifecycle.wait_until_active().await
         {
             warn!("Client `run` rejected before construction completed.");
-            return;
+            return RunCompletionReason::ShutdownRequested;
         }
         let shutdown = self.shutdown_signal();
         if shutdown.is_fired() {
             warn!("Client `run` called after shutdown.");
-            return;
+            return RunCompletionReason::ShutdownRequested;
         }
         if self.is_running.swap(true, Ordering::SeqCst) {
             warn!("Client `run` method called while already running.");
-            return;
+            return RunCompletionReason::AlreadyRunning;
         }
         if shutdown.is_fired() {
             self.is_running.store(false, Ordering::SeqCst);
-            return;
+            return RunCompletionReason::ShutdownRequested;
         }
         // Reconnects are counted at iteration start: every pass after the
         // first is an attempt actually being made. Counting at the branches
         // below would also count a final pass that never reconnects (a user
         // disconnect() flips is_running while the branch runs).
         let mut first_connect = true;
+        let mut last_connect_error: Option<String>;
+        let mut last_disconnect_reason: Option<DisconnectReason>;
+        let mut completion = RunCompletionReason::AutoReconnectDisabled {
+            connection: None,
+            connect_error: None,
+        };
         while self.is_running.load(Ordering::Relaxed) {
             // The one place a pause is honoured, and it is before the attempt
             // rather than after one fails: a `pause()` can land during a
@@ -730,10 +760,13 @@ impl Client {
                 self.stats.record_reconnect();
             }
             first_connect = false;
+            last_connect_error = None;
+            last_disconnect_reason = None;
             self.expected_disconnect.store(false, Ordering::Relaxed);
 
             match self.connect().await {
                 Err(connect_err) => {
+                    last_connect_error = Some(connect_err.to_string());
                     wacore::telemetry::connect("fail");
                     match &connect_err {
                         // The loop is about to exit on the same shutdown, so this
@@ -759,7 +792,7 @@ impl Client {
                 }
                 Ok(connection) => {
                     wacore::telemetry::connect("ok");
-                    let _ = connection.read_until_disconnected().await;
+                    last_disconnect_reason = connection.read_until_disconnected().await;
                 }
             }
 
@@ -797,12 +830,17 @@ impl Client {
             {
                 self.clear_connection_backoff_state();
                 info!("Disconnect requested, shutting down without reconnecting.");
+                completion = RunCompletionReason::ShutdownRequested;
                 break;
             }
 
             if !self.enable_auto_reconnect.load(Ordering::Relaxed) {
                 info!("Auto-reconnect disabled, shutting down.");
                 self.stop_supervision_loop();
+                completion = RunCompletionReason::AutoReconnectDisabled {
+                    connection: last_disconnect_reason.clone(),
+                    connect_error: last_connect_error.clone(),
+                };
                 break;
             }
 
@@ -901,6 +939,11 @@ impl Client {
         #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
         info!("Client run loop has shut down.");
+        if shutdown.is_fired() {
+            RunCompletionReason::ShutdownRequested
+        } else {
+            completion
+        }
     }
 
     /// Open one connection and hand it back for the caller to read.
