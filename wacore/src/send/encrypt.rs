@@ -581,6 +581,12 @@ pub struct SessionPlan {
     /// the memo ([`SessionPlan::assume_ready`]); consumers fall back to
     /// rendering per device when the lengths disagree.
     effective_addresses: Vec<ProtocolAddress>,
+    /// Fingerprint of the exact device identities the memo was rendered from.
+    /// Length alone cannot prove the memo belongs to this list — same length,
+    /// different devices would silently encrypt to stale sessions — so the
+    /// consume points verify it. Zero for [`SessionPlan::assume_ready`], whose
+    /// memo is always empty and never consulted.
+    device_fingerprint: u64,
     pub had_unregistered_device: bool,
     /// Devices the server rejected *by name*. Empty when the whole batch
     /// failed, since a batch-wide answer names nobody.
@@ -615,6 +621,7 @@ impl SessionPlan {
             device_count,
             encryption_overrides: Vec::new(),
             effective_addresses: Vec::new(),
+            device_fingerprint: 0,
             had_unregistered_device: false,
             rejected_devices: Vec::new(),
             first_error: None,
@@ -651,6 +658,28 @@ async fn has_session_or_report(
 /// is what a warm send carries.
 fn encryption_override_at(overrides: &[Option<Jid>], index: usize) -> Option<&Jid> {
     overrides.get(index).and_then(Option::as_ref)
+}
+
+/// Identity fingerprint of the device list a [`SessionPlan`] memo was rendered
+/// from: FNV-1a over each device's user, server and device id. Compared at the
+/// consume points so a plan can never serve a same-length, different-identity
+/// list its renders do not belong to. No dependency and no allocation; the
+/// release build never calls it (see the `debug_assert` at the consume site).
+fn device_list_fingerprint(devices: &[Jid]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for device in devices {
+        for byte in device.user.as_str().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= device.server as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        hash ^= u64::from(device.device);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// Effective encryption address for `devices[index]`: the render
@@ -1078,6 +1107,7 @@ pub async fn ensure_sessions_for_devices_resolved(
         device_count: devices.len(),
         encryption_overrides,
         effective_addresses,
+        device_fingerprint: device_list_fingerprint(devices),
         had_unregistered_device: had_406,
         rejected_devices,
         first_error,
@@ -1212,10 +1242,23 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
         devices.len(),
         "SessionPlan built for a different device list"
     );
+    // Same length is not same list: the memo is parallel to the exact
+    // identities it was rendered from, and serving it to different devices
+    // would encrypt to stale sessions. Unreachable by construction — the memo
+    // field is private, `assume_ready` (the only cross-crate constructor)
+    // leaves it empty, and every in-tree flow consumes the plan over the slice
+    // it was built from — so this stays a debug check and release pays nothing.
+    // An empty memo (`assume_ready`) always falls back to per-device rendering.
+    debug_assert!(
+        plan.effective_addresses.is_empty()
+            || plan.device_fingerprint == device_list_fingerprint(devices),
+        "SessionPlan consumed with different device identities than built from"
+    );
     let SessionPlan {
         device_count: _,
         encryption_overrides,
         effective_addresses,
+        device_fingerprint: _,
         had_unregistered_device,
         rejected_devices,
         mut first_error,
@@ -1390,7 +1433,8 @@ mod participant_node_tests {
 #[cfg(test)]
 mod encryption_override_tests {
     use super::{
-        SessionPlan, encrypt_address_at, encryption_override_at, record_encryption_override,
+        SessionPlan, device_list_fingerprint, encrypt_address_at, encryption_override_at,
+        record_encryption_override,
     };
     use crate::types::jid::JidExt;
     use wacore_binary::Jid;
@@ -1490,5 +1534,25 @@ mod encryption_override_tests {
         let no_overrides: Vec<Option<Jid>> = Vec::new();
         let addr = encrypt_address_at(&empty, &no_overrides, &devices, 0);
         assert_eq!(addr.as_str(), device.to_protocol_address().as_str());
+    }
+
+    /// The fingerprint behind the consume-site guard: stable for the same
+    /// list, different for a same-length list with different identities, so a
+    /// memo can never serve devices it was not rendered from.
+    #[test]
+    fn device_list_fingerprint_separates_same_length_lists() {
+        let list = vec![lid("100000000000001", 5), lid("100000000000002", 0)];
+        assert_eq!(
+            device_list_fingerprint(&list),
+            device_list_fingerprint(&list.clone())
+        );
+        assert_ne!(
+            device_list_fingerprint(&list),
+            device_list_fingerprint(&vec![lid("100000000000001", 5), lid("100000000000003", 0)])
+        );
+        assert_ne!(
+            device_list_fingerprint(&list),
+            device_list_fingerprint(&vec![lid("100000000000001", 5)])
+        );
     }
 }
