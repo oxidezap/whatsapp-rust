@@ -12,6 +12,12 @@
 //! `jid_keyed_cache`'s header gives: uncontended `async_lock` futures complete
 //! on the first poll, and a runtime would bill its scheduling to the lookup.
 //!
+//! Every measured loop inserts the same prebuilt keys: a monotonic key counter
+//! made each sample insert never-before-seen keys, and the peak-memory
+//! instrument read that allocator-state drift as signal (a false regression on
+//! an unchanged file). Bit-identical work per sample keeps both instruments
+//! honest.
+//!
 //! What it does not cover: the `TypedCache` custom-store path
 //! (`src/cache_store.rs:96` `to_string` per op), which needs a backend and
 //! belongs in `store_shapes`/`store_contention`, and the offline receipt
@@ -22,6 +28,7 @@
 use divan::{black_box, counter::ItemsCount};
 use std::future::Future;
 use std::pin::pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -49,6 +56,14 @@ const BATCH: usize = 512;
 
 fn key(i: usize) -> Jid {
     Jid::pn(format!("5511999{i:06}"))
+}
+
+/// Prebuilt keys outside any measurement: building a key formats a `String`,
+/// which is allocator traffic the cache rows must not bill to the cache.
+/// Bases sit far above every resident range (`key(0..m)`) so no batch key is
+/// ever a hit, and below 1_000_000 so `{i:06}` never widens mid-run.
+fn batch_keys(base: usize, len: usize) -> Vec<Jid> {
+    (0..len).map(|i| key(base + i)).collect()
 }
 
 /// Warm caches per size, built once; values are cheap so the clock keeps the
@@ -102,17 +117,24 @@ fn cache_insert(bencher: divan::Bencher, n: usize) {
         .position(|&m| m == n)
         .expect("known size");
     let cache = &built[idx];
+    // One batch, reused every sample: insert it, then invalidate it back out,
+    // so every iteration starts and ends with the same `n` resident entries
+    // and inserts the same keys. The `Jid` clone is a memcpy (the 13-char user
+    // rides inline in `CompactString`), so the loop bills the cache
+    // bookkeeping, not key formatting.
+    static BATCH_ONE: OnceLock<Vec<Jid>> = OnceLock::new();
+    let batch = BATCH_ONE.get_or_init(|| batch_keys(100_000, BATCH));
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
         block_on(async {
-            for i in 0..BATCH {
-                cache.insert(black_box(key(n + i)), Arc::new(())).await;
+            for k in batch {
+                cache.insert(black_box(k.clone()), Arc::new(())).await;
             }
         });
         // Back to the steady state so every iteration measures the same work
         // instead of growing the fixture without bound.
         block_on(async {
-            for i in 0..BATCH {
-                cache.invalidate(black_box(&key(n + i))).await;
+            for k in batch {
+                cache.invalidate(black_box(k)).await;
             }
         });
         black_box(cache.entry_count())
@@ -121,6 +143,12 @@ fn cache_insert(bencher: divan::Bencher, n: usize) {
 
 /// Insertion at capacity: every insert evicts one entry, so the FIFO scan is
 /// on the bill. The per-iteration cost must not grow with what is retained.
+///
+/// Samples alternate between two prebuilt batches: each one inserts the same
+/// keys and evicts the other batch whole, so every sample is the same 512
+/// inserts plus 512 evictions. A monotonic key counter (never-before-seen
+/// keys per sample) made the peak-memory instrument read allocator-state
+/// drift as signal here.
 #[divan::bench(args = CACHE_SIZES)]
 fn cache_insert_at_capacity(bencher: divan::Bencher, n: usize) {
     static FULL: OnceLock<Vec<Cache<Jid, Arc<()>>>> = OnceLock::new();
@@ -143,12 +171,16 @@ fn cache_insert_at_capacity(bencher: divan::Bencher, n: usize) {
         .position(|&m| m == n)
         .expect("known size");
     let cache = &built[idx];
-    let next = std::sync::atomic::AtomicUsize::new(n);
+    // One shared pair: the batches outlive every size's row and never collide
+    // with any resident range, so all three widths rotate the same keys.
+    static ROTATING: OnceLock<[Vec<Jid>; 2]> = OnceLock::new();
+    let batches = ROTATING.get_or_init(|| [batch_keys(200_000, BATCH), batch_keys(300_000, BATCH)]);
+    let round = AtomicUsize::new(0);
     bencher.counter(ItemsCount::new(BATCH)).bench(|| {
+        let batch = &batches[round.fetch_add(1, Ordering::Relaxed) % 2];
         block_on(async {
-            for _ in 0..BATCH {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                cache.insert(black_box(key(i)), Arc::new(())).await;
+            for k in batch {
+                cache.insert(black_box(k.clone()), Arc::new(())).await;
             }
         });
         black_box(cache.entry_count())
@@ -195,10 +227,21 @@ fn sweep_with_expired(bencher: divan::Bencher, n: usize) {
         .position(|&m| m == n)
         .expect("known size");
     let cache = &built[idx];
+    // Reinsert the same prebuilt keys every sample: the sweep reclaims them
+    // all (asserted below), so the next sample starts from the same empty
+    // cache with the same keys.
+    static SWEEP_KEYS: OnceLock<Vec<Vec<Jid>>> = OnceLock::new();
+    let keys = SWEEP_KEYS.get_or_init(|| {
+        [64usize, 512usize]
+            .iter()
+            .map(|&m| batch_keys(400_000, m))
+            .collect()
+    });
+    let batch = &keys[idx];
     bencher.counter(ItemsCount::new(n)).bench(|| {
         block_on(async {
-            for i in 0..n {
-                cache.insert(black_box(key(i)), Arc::new(())).await;
+            for k in batch {
+                cache.insert(black_box(k.clone()), Arc::new(())).await;
             }
         });
         std::thread::sleep(Duration::from_millis(20));
