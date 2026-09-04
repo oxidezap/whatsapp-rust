@@ -130,7 +130,16 @@ impl Client {
         )
     )]
     pub async fn refresh_media_conn(&self, force: bool) -> Result<MediaConn, IqError> {
-        if !force && let Some(conn) = self.cached_media_conn().await {
+        // A forced refresh carries out-of-band knowledge that the cache is
+        // bad (a 401/403 on the token it holds), so it never joins a flight:
+        // that flight's request may have been issued before the rejection,
+        // and reusing its answer would risk the rejected generation again.
+        // This keeps the old contract exactly: force always sends.
+        if force {
+            return self.fetch_media_conn().await;
+        }
+
+        if let Some(conn) = self.cached_media_conn().await {
             return Ok(conn);
         }
 
@@ -138,14 +147,11 @@ impl Client {
             match self.claim_media_conn_flight() {
                 MediaConnClaim::Joined(flight) => {
                     match flight.wait().await {
-                        // The leader stored before releasing, so this usually
-                        // hits. An invalidate that landed in between only
-                        // misses again and takes its own turn below.
-                        Some(MediaFlightOutcome::Refreshed) => {
-                            if let Some(conn) = self.cached_media_conn().await {
-                                return Ok(conn);
-                            }
-                        }
+                        // The flight's answer, no cache round trip: a waiter
+                        // re-read could miss on an invalidate racing the
+                        // release and serialize the whole burst into fresh
+                        // fetches, one leader at a time.
+                        Some(MediaFlightOutcome::Refreshed(conn)) => return Ok(conn),
                         Some(MediaFlightOutcome::Failed(class)) => {
                             return Err(class.into_error());
                         }
@@ -157,15 +163,14 @@ impl Client {
                 MediaConnClaim::Leader(lease) => {
                     // A flight that finished between the miss above and this
                     // claim already refreshed the cache; fetching again would
-                    // be the duplicate this flight exists to prevent. A forced
-                    // refresh skips this: it promises a new request.
-                    if !force && let Some(conn) = self.cached_media_conn().await {
+                    // be the duplicate this flight exists to prevent.
+                    if let Some(conn) = self.cached_media_conn().await {
                         drop(lease);
                         return Ok(conn);
                     }
                     match self.fetch_media_conn().await {
                         Ok(conn) => {
-                            lease.finish(|| MediaFlightOutcome::Refreshed);
+                            lease.finish(|| MediaFlightOutcome::Refreshed(conn.clone()));
                             return Ok(conn);
                         }
                         Err(error) => {
@@ -181,13 +186,13 @@ impl Client {
 
 /// What one shared refresh flight produced, for the callers that joined it.
 ///
-/// Success carries no payload: the cache is the shared result and each waiter
-/// re-reads it, so the uncontended flight allocates nothing to report. Only a
-/// failure is published, and only when someone is waiting (see
-/// [`MediaConnLease::finish`]).
+/// Success carries the fetched connection, so a waiter needs no cache round
+/// trip to learn the answer. Only built when someone is waiting (see
+/// [`MediaConnLease::finish`]); the uncontended flight still allocates
+/// nothing to report.
 #[derive(Debug, Clone)]
 enum MediaFlightOutcome {
-    Refreshed,
+    Refreshed(MediaConn),
     Failed(FailureClass),
 }
 
@@ -602,5 +607,65 @@ mod tests {
             .expect("the retry task stays alive")
             .expect("the retry succeeds after the refusal clears");
         assert_eq!(recovered.auth, "recovered-auth");
+    }
+
+    /// A forced refresh never joins a running flight: it carries out-of-band
+    /// knowledge that the cache is bad (a 401/403 on the token it holds), so
+    /// it always sends its own request, exactly as before single-flight.
+    #[tokio::test]
+    async fn a_forced_refresh_bypasses_a_running_flight() {
+        let (client, transport) = create_iq_test_client().await;
+
+        // Park a non-force refresh mid-flight: one IQ on the wire, unanswered.
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.refresh_media_conn(false).await }
+        });
+        quiesce(&transport).await;
+
+        // The forced refresh must send its own IQ, not join frame 0.
+        let forced = tokio::spawn({
+            let client = client.clone();
+            async move { client.refresh_media_conn(true).await }
+        });
+        let sent = decode_sent_iq(&transport, 1).await;
+        let forced_id = request_id(&sent);
+        answer_iq(
+            &client,
+            &forced_id,
+            &media_conn_result(&forced_id, "forced-auth", 3600),
+        )
+        .await;
+
+        let sent_first = decode_sent_iq(&transport, 0).await;
+        let first_id = request_id(&sent_first);
+        answer_iq(
+            &client,
+            &first_id,
+            &media_conn_result(&first_id, "flight-auth", 3600),
+        )
+        .await;
+
+        let (first_conn, forced_conn) = tokio::time::timeout(Duration::from_secs(5), async {
+            (
+                first.await.expect("the first task stays alive"),
+                forced.await.expect("the forced task stays alive"),
+            )
+        })
+        .await
+        .expect("both refreshes complete");
+        assert!(
+            matches!(first_conn, Ok(ref c) if c.auth == "flight-auth"),
+            "the parked flight answers with its own fetch"
+        );
+        assert!(
+            matches!(forced_conn, Ok(ref c) if c.auth == "forced-auth"),
+            "the forced refresh answers with its own request"
+        );
+        assert_eq!(
+            transport.sent().len(),
+            2,
+            "force sends its own request instead of joining"
+        );
     }
 }
