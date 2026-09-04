@@ -591,6 +591,9 @@ pub struct MemoryReport {
     /// here costs a walk on every stanza — which the count is what makes
     /// visible.
     pub stanza_interceptors: usize,
+    /// Registered core-event handler table slots. Closure captures and retired snapshots are not
+    /// estimated because dispatch may hold them outside the current bus snapshot.
+    pub core_event_handlers: CollectionStats,
 }
 
 /// Names one collection an attached subsystem reports.
@@ -632,7 +635,7 @@ pub struct SubsystemMemory {
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
-    fn collections(&self) -> [(&'static str, &CollectionStats); 16] {
+    fn collections(&self) -> [(&'static str, &CollectionStats); 17] {
         [
             ("group_cache:", &self.group_cache),
             ("device_registry_cache:", &self.device_registry_cache),
@@ -650,6 +653,7 @@ impl MemoryReport {
             ("history_sync_tasks:", &self.history_sync_tasks),
             ("inbound_commit_batch:", &self.inbound_commit_batch),
             ("offline_receipts:", &self.offline_receipt_buffer),
+            ("core_event_handlers:", &self.core_event_handlers),
         ]
     }
 
@@ -724,6 +728,7 @@ impl MemoryReport {
             ("chatstate_handlers", n(self.chatstate_handlers)),
             ("custom_enc_handlers", n(self.custom_enc_handlers)),
             ("stanza_interceptors", n(self.stanza_interceptors)),
+            ("core_event_handlers", self.core_event_handlers.entries),
         ]
     }
 }
@@ -895,6 +900,7 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "  chatstate_handlers:     {}", self.chatstate_handlers)?;
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
         writeln!(f, "  stanza_interceptors:    {}", self.stanza_interceptors)?;
+        line(f, "core_event_handlers:", &self.core_event_handlers)?;
         writeln!(
             f,
             "  total estimated:        {} B",

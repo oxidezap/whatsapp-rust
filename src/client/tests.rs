@@ -5304,6 +5304,23 @@ async fn memory_report_on_fresh_client() {
     let _ = report.to_string();
 }
 
+#[tokio::test]
+async fn memory_report_tracks_core_event_handler_table() {
+    let client = crate::test_utils::create_test_client_with_name("memory_event_handlers").await;
+    assert_eq!(client.memory_report().await.core_event_handlers.entries, 0);
+
+    let (handler, _events) = wacore::types::events::ChannelEventHandler::new();
+    let subscription = client.subscribe_handler(handler);
+    let retained = client.memory_report().await.core_event_handlers;
+    assert_eq!(retained.entries, 1);
+    assert!(retained.bytes > 0);
+
+    assert!(subscription.unsubscribe());
+    let released = client.memory_report().await.core_event_handlers;
+    assert_eq!(released.entries, 0);
+    assert_eq!(released.bytes, 0);
+}
+
 /// resource_report (workstream F) composes the client's own memory_report with
 /// the out-of-client components, folds in an AllocMeter snapshot when installed,
 /// and is Display-able.

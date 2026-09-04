@@ -8,6 +8,7 @@ use portable_atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::fmt;
+use std::mem::size_of;
 use std::sync::{Arc, OnceLock, RwLock};
 use wacore_binary::Node;
 use wacore_binary::OwnedNodeRef;
@@ -612,6 +613,16 @@ impl CoreEventBus {
     /// Useful for skipping expensive work when no one is listening.
     pub fn has_handlers(&self) -> bool {
         !self.snapshot().handlers.is_empty()
+    }
+
+    /// Retained handler-table slots. Closure captures and retired snapshots held by an in-flight
+    /// dispatch are intentionally outside this estimate.
+    pub fn memory_stats(&self) -> crate::stats::CollectionStats {
+        let snapshot = self.snapshot();
+        crate::stats::CollectionStats::new(
+            snapshot.handlers.len() as u64,
+            (snapshot.handlers.capacity() * size_of::<HandlerEntry>()) as u64,
+        )
     }
 
     /// Whether any registered handler is interested in `kind`. Lets callers
