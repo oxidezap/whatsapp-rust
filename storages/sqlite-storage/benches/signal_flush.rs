@@ -14,8 +14,9 @@
 //!   per backend call, each a `spawn_blocking`, a pool checkout and a WAL
 //!   commit; the batched form is one transaction.
 //!
-//! One database per benchmark, opened once for the process and grown by every
-//! iteration: rows are never reused, so an insert is always an insert.
+//! Insert/delete fixtures reuse a database and generate fresh row keys.
+//! Warm updates reuse fixed keys; first-preparation updates use a fresh store
+//! per input with the target rows seeded through a separate connection.
 
 use bytes::Bytes;
 use divan::black_box;
@@ -356,13 +357,14 @@ fn update_sessions_first_prepare(bencher: divan::Bencher, n: usize) {
                         )
                         .bind::<diesel::sql_types::Text, _>(address.as_ref())
                         .bind::<diesel::sql_types::Binary, _>(record.as_ref())
-                        .bind::<diesel::sql_types::Integer, _>(0)
+                        .bind::<diesel::sql_types::Integer, _>(db.store.device_id())
                         .execute(conn)?;
                     }
                     Ok::<_, diesel::result::Error>(())
                 })
                 .expect("seed initial rows");
             }
+            db.verify_fixed_sessions(n, false);
             let alt = true;
             let batch = db.fixed_sessions(n, alt);
             ColdUpdateInput {
