@@ -62,8 +62,9 @@ def parse_divan_output(output: str) -> Dict[str, Dict[str, Any]]:
         first_col_raw = parts[0]
         cols = [c.strip() for c in parts]
 
-        if "fastest" in first_col_raw:
-            root_name = first_col_raw.replace("fastest", "").strip()
+        if (cols[1:6] == ["slowest", "median", "mean", "samples", "iters"]
+                and re.search(r"\sfastest\s*$", first_col_raw)):
+            root_name = re.sub(r"\s+fastest\s*$", "", first_col_raw).strip()
             path_stack = [(0, root_name)]
             continue
 
@@ -72,7 +73,10 @@ def parse_divan_output(output: str) -> Dict[str, Dict[str, Any]]:
             if ch in ("├", "╰"):
                 pos = i
                 break
-        depth = (pos // 3 + 1) if pos >= 0 else 0
+        if pos < 0:
+            # Counter/throughput rows have columns but are not nodes in the tree.
+            continue
+        depth = pos // 3 + 1
 
         m = NUM_RE.search(first_col_raw.rstrip())
         if m and len(cols) >= 6:
@@ -186,18 +190,19 @@ def main():
         parser.error("--rounds must be positive")
 
     measured_hash = binary_digest(args.bin)
+    metadata = {"command": [args.bin, "--bench", *args.filter, *args.bench_args],
+                "cpus": args.cpus, "requested_rounds": args.rounds,
+                "platform": platform.platform(), "cwd": os.getcwd(),
+                "binary_sha256": measured_hash}
+    revision = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+    metadata["revision"] = revision.stdout.strip() if revision.returncode == 0 else None
+    metadata["git_status"] = subprocess.run(
+        ["git", "status", "--short"], capture_output=True, text=True).stdout
+
     runs = run_benchmark_rounds(args.bin, args.filter + args.bench_args, args.cpus, args.rounds, args.raw_dir, measured_hash)
     agg = aggregate_runs(runs)
 
     if args.json:
-        metadata = {"command": [args.bin, "--bench", *args.filter, *args.bench_args],
-                    "cpus": args.cpus, "requested_rounds": args.rounds,
-                    "platform": platform.platform(), "cwd": os.getcwd(),
-                    "binary_sha256": measured_hash}
-        revision = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
-        metadata["revision"] = revision.stdout.strip() if revision.returncode == 0 else None
-        metadata["git_status"] = subprocess.run(
-            ["git", "status", "--short"], capture_output=True, text=True).stdout
         print(json.dumps({"metadata": metadata, "benchmarks": agg}, indent=2))
     else:
         print(f"| Benchmark | Rounds | Median (of medians) | Min Median | Max Median | Spread | Best Fastest |")
