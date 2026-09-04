@@ -7,6 +7,7 @@ mod pool;
 mod schema;
 mod shared;
 mod sqlite_store;
+pub(crate) mod upsert_queries;
 mod wire;
 
 pub use shared::SharedSqlite;

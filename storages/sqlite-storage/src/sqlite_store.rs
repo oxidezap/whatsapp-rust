@@ -1464,17 +1464,13 @@ impl SqliteStore {
                     let mut conn = pool_clone
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
-                    diesel::insert_into(identities::table)
-                        .values((
-                            identities::address.eq(address_clone.as_ref()),
-                            identities::key.eq(&key[..]),
-                            identities::device_id.eq(device_id),
-                        ))
-                        .on_conflict((identities::address, identities::device_id))
-                        .do_update()
-                        .set(identities::key.eq(&key[..]))
-                        .execute(&mut *conn)
-                        .map_err(DieselOrStore::Diesel)?;
+                    crate::upsert_queries::UpsertIdentity {
+                        address: address_clone.as_ref(),
+                        key: &key[..],
+                        device_id,
+                    }
+                    .execute(&mut *conn)
+                    .map_err(DieselOrStore::Diesel)?;
                     Ok(())
                 })
                 .await;
@@ -1599,17 +1595,13 @@ impl SqliteStore {
                     let mut conn = pool_clone
                         .get()
                         .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
-                    diesel::insert_into(sessions::table)
-                        .values((
-                            sessions::address.eq(address_clone.as_ref()),
-                            sessions::record.eq(session_clone.as_ref()),
-                            sessions::device_id.eq(device_id),
-                        ))
-                        .on_conflict((sessions::address, sessions::device_id))
-                        .do_update()
-                        .set(sessions::record.eq(session_clone.as_ref()))
-                        .execute(&mut *conn)
-                        .map_err(DieselOrStore::Diesel)?;
+                    crate::upsert_queries::UpsertSession {
+                        address: address_clone.as_ref(),
+                        record: session_clone.as_ref(),
+                        device_id,
+                    }
+                    .execute(&mut *conn)
+                    .map_err(DieselOrStore::Diesel)?;
                     Ok(())
                 })
                 .await;
@@ -1676,17 +1668,13 @@ impl SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
-            diesel::insert_into(sender_keys::table)
-                .values((
-                    sender_keys::address.eq(address),
-                    sender_keys::record.eq(&record_vec),
-                    sender_keys::device_id.eq(device_id),
-                ))
-                .on_conflict((sender_keys::address, sender_keys::device_id))
-                .do_update()
-                .set(sender_keys::record.eq(&record_vec))
-                .execute(&mut *conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            crate::upsert_queries::UpsertSenderKey {
+                address: &address,
+                record: &record_vec,
+                device_id,
+            }
+            .execute(&mut *conn)
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
@@ -2102,16 +2090,12 @@ impl SignalStore for SqliteStore {
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction(|conn| {
                     for (address, key) in batch.iter() {
-                        diesel::insert_into(identities::table)
-                            .values((
-                                identities::address.eq(address.as_ref()),
-                                identities::key.eq(&key[..]),
-                                identities::device_id.eq(device_id),
-                            ))
-                            .on_conflict((identities::address, identities::device_id))
-                            .do_update()
-                            .set(identities::key.eq(&key[..]))
-                            .execute(conn)?;
+                        crate::upsert_queries::UpsertIdentity {
+                            address: address.as_ref(),
+                            key: &key[..],
+                            device_id,
+                        }
+                        .execute(conn)?;
                     }
                     Ok(())
                 })
@@ -2289,16 +2273,12 @@ impl SignalStore for SqliteStore {
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction(|conn| {
                     for (address, record) in batch.iter() {
-                        diesel::insert_into(sessions::table)
-                            .values((
-                                sessions::address.eq(address.as_ref()),
-                                sessions::record.eq(record.as_ref()),
-                                sessions::device_id.eq(device_id),
-                            ))
-                            .on_conflict((sessions::address, sessions::device_id))
-                            .do_update()
-                            .set(sessions::record.eq(record.as_ref()))
-                            .execute(conn)?;
+                        crate::upsert_queries::UpsertSession {
+                            address: address.as_ref(),
+                            record: record.as_ref(),
+                            device_id,
+                        }
+                        .execute(conn)?;
                     }
                     Ok(())
                 })
@@ -2758,16 +2738,12 @@ impl SignalStore for SqliteStore {
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction(|conn| {
                     for (address, record) in batch.iter() {
-                        diesel::insert_into(sender_keys::table)
-                            .values((
-                                sender_keys::address.eq(address.as_ref()),
-                                sender_keys::record.eq(record.as_ref()),
-                                sender_keys::device_id.eq(device_id),
-                            ))
-                            .on_conflict((sender_keys::address, sender_keys::device_id))
-                            .do_update()
-                            .set(sender_keys::record.eq(record.as_ref()))
-                            .execute(conn)?;
+                        crate::upsert_queries::UpsertSenderKey {
+                            address: address.as_ref(),
+                            record: record.as_ref(),
+                            device_id,
+                        }
+                        .execute(conn)?;
                     }
                     Ok(())
                 })
@@ -3362,27 +3338,17 @@ impl ProtocolStore for SqliteStore {
                 .get()
                 .map_err(|e| StoreError::Connection(Box::new(e)))?;
             let raw_id_i32 = record.raw_id.map(|r| r as i32);
-            diesel::insert_into(device_registry::table)
-                .values((
-                    device_registry::user_id.eq(record.user.as_ref()),
-                    device_registry::devices_json.eq(&devices_json),
-                    device_registry::timestamp.eq(record.timestamp as i32),
-                    device_registry::phash.eq(record.phash.as_deref()),
-                    device_registry::device_id.eq(device_id),
-                    device_registry::updated_at.eq(now),
-                    device_registry::raw_id.eq(raw_id_i32),
-                ))
-                .on_conflict((device_registry::user_id, device_registry::device_id))
-                .do_update()
-                .set((
-                    device_registry::devices_json.eq(&devices_json),
-                    device_registry::timestamp.eq(record.timestamp as i32),
-                    device_registry::phash.eq(record.phash.as_deref()),
-                    device_registry::updated_at.eq(now),
-                    device_registry::raw_id.eq(raw_id_i32),
-                ))
-                .execute(&mut *conn)
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
+            crate::upsert_queries::UpsertDeviceRegistry {
+                user_id: record.user.as_ref(),
+                devices_json: &devices_json,
+                timestamp: record.timestamp as i32,
+                phash: record.phash.as_deref(),
+                device_id,
+                updated_at: now,
+                raw_id: raw_id_i32,
+            }
+            .execute(&mut *conn)
+            .map_err(|e| StoreError::Database(Box::new(e)))?;
             Ok(())
         })
         .await
@@ -3429,26 +3395,16 @@ impl ProtocolStore for SqliteStore {
             Box::new(move |conn: &mut SqliteConnection| {
                 conn.transaction::<_, DieselError, _>(|conn| {
                     for row in prepared.iter() {
-                        diesel::insert_into(device_registry::table)
-                            .values((
-                                device_registry::user_id.eq(&row.user),
-                                device_registry::devices_json.eq(&row.devices_json),
-                                device_registry::timestamp.eq(row.timestamp),
-                                device_registry::phash.eq(&row.phash),
-                                device_registry::device_id.eq(device_id),
-                                device_registry::updated_at.eq(now),
-                                device_registry::raw_id.eq(row.raw_id),
-                            ))
-                            .on_conflict((device_registry::user_id, device_registry::device_id))
-                            .do_update()
-                            .set((
-                                device_registry::devices_json.eq(&row.devices_json),
-                                device_registry::timestamp.eq(row.timestamp),
-                                device_registry::phash.eq(&row.phash),
-                                device_registry::updated_at.eq(now),
-                                device_registry::raw_id.eq(row.raw_id),
-                            ))
-                            .execute(conn)?;
+                        crate::upsert_queries::UpsertDeviceRegistry {
+                            user_id: &row.user,
+                            devices_json: &row.devices_json,
+                            timestamp: row.timestamp,
+                            phash: row.phash.as_deref(),
+                            device_id,
+                            updated_at: now,
+                            raw_id: row.raw_id,
+                        }
+                        .execute(conn)?;
                     }
                     Ok(())
                 })
@@ -5344,6 +5300,72 @@ mod tests {
 
         assert_eq!(loaded.devices.len(), 2);
         assert_eq!(loaded.phash.as_deref(), Some("2:new"));
+    }
+
+    #[tokio::test]
+    async fn test_device_registry_batch_update_transitions() {
+        let store = create_test_store().await;
+
+        let batch1 = vec![
+            DeviceListRecord {
+                user: "user_a".into(),
+                devices: [DeviceInfo::new(0, None)].into(),
+                timestamp: 1000,
+                phash: Some("phash_a1".into()),
+                raw_id: Some(10),
+            },
+            DeviceListRecord {
+                user: "user_b".into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(1, Some(2))].into(),
+                timestamp: 1000,
+                phash: None,
+                raw_id: None,
+            },
+        ];
+        store
+            .update_device_lists(batch1)
+            .await
+            .expect("batch1 failed");
+
+        let loaded_a = store.get_devices("user_a").await.unwrap().unwrap();
+        assert_eq!(loaded_a.phash.as_deref(), Some("phash_a1"));
+        assert_eq!(loaded_a.raw_id, Some(10));
+
+        let loaded_b = store.get_devices("user_b").await.unwrap().unwrap();
+        assert_eq!(loaded_b.phash, None);
+        assert_eq!(loaded_b.raw_id, None);
+
+        // Transition: user_a becomes None, user_b becomes Some
+        let batch2 = vec![
+            DeviceListRecord {
+                user: "user_a".into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(2, None)].into(),
+                timestamp: 2000,
+                phash: None,
+                raw_id: None,
+            },
+            DeviceListRecord {
+                user: "user_b".into(),
+                devices: [DeviceInfo::new(0, None)].into(),
+                timestamp: 2000,
+                phash: Some("phash_b2".into()),
+                raw_id: Some(20),
+            },
+        ];
+        store
+            .update_device_lists(batch2)
+            .await
+            .expect("batch2 failed");
+
+        let loaded_a2 = store.get_devices("user_a").await.unwrap().unwrap();
+        assert_eq!(loaded_a2.phash, None);
+        assert_eq!(loaded_a2.raw_id, None);
+        assert_eq!(loaded_a2.devices.len(), 2);
+
+        let loaded_b2 = store.get_devices("user_b").await.unwrap().unwrap();
+        assert_eq!(loaded_b2.phash.as_deref(), Some("phash_b2"));
+        assert_eq!(loaded_b2.raw_id, Some(20));
+        assert_eq!(loaded_b2.devices.len(), 1);
     }
 
     #[tokio::test]
