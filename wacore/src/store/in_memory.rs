@@ -360,12 +360,10 @@ impl SignalStore for InMemoryBackend {
         }
         let mut state = self.state.lock().await;
         state.sessions.reserve(sessions.len());
-        #[cfg(any(test, feature = "test-util"))]
-        let mut written = 0;
-        for (address, session) in sessions {
+        for (index, (address, session)) in sessions.iter().enumerate() {
             #[cfg(any(test, feature = "test-util"))]
             {
-                if written >= self.fail_session_after.load(Ordering::Relaxed) {
+                if index >= self.fail_session_after.load(Ordering::Relaxed) {
                     return Err(crate::store::error::StoreError::Io(std::io::Error::other(
                         "put_sessions_batch failed after partial progress (test hook)",
                     )));
@@ -376,10 +374,7 @@ impl SignalStore for InMemoryBackend {
             } else {
                 state.sessions.insert(address.to_string(), session.clone());
             }
-            #[cfg(any(test, feature = "test-util"))]
-            {
-                written += 1;
-            }
+            let _ = index;
         }
         Ok(())
     }
