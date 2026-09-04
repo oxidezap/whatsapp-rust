@@ -4,7 +4,9 @@
 
 use crate::client::Client;
 use crate::http::{HTTP_STATUS_FORBIDDEN, HTTP_STATUS_UNAUTHORIZED};
-use crate::request::IqError;
+use crate::request::{IqError, RejectionStanza};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use wacore::iq::mediaconn::MediaConnSpec;
 use wacore::time::Instant;
@@ -54,27 +56,42 @@ impl Client {
         *self.media_conn.write().await = None;
     }
 
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            name = "wa.media.refresh_conn",
-            level = "debug",
-            skip_all,
-            fields(force),
-            err(Debug)
-        )
-    )]
-    pub async fn refresh_media_conn(&self, force: bool) -> Result<MediaConn, IqError> {
-        {
-            let guard = self.media_conn.read().await;
-            if !force
-                && let Some(conn) = &*guard
-                && !conn.is_expired()
-            {
-                return Ok(conn.clone());
+    /// Claim the in-flight refresh, or become its leader.
+    ///
+    /// Synchronous and taken under one short lock, so two callers racing on
+    /// an empty cache cannot both come away as leader. The lock is never held
+    /// across an await.
+    fn claim_media_conn_flight(&self) -> MediaConnClaim {
+        let mut slot = self
+            .media_conn_flight
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match &*slot {
+            Some(flight) => {
+                flight.waiters.fetch_add(1, Ordering::AcqRel);
+                MediaConnClaim::Joined(flight.clone())
+            }
+            None => {
+                let (release, released) = async_channel::bounded(1);
+                let flight = Arc::new(MediaConnFlight {
+                    waiters: AtomicUsize::new(0),
+                    result: std::sync::Mutex::new(None),
+                    released,
+                });
+                *slot = Some(flight.clone());
+                MediaConnClaim::Leader(MediaConnLease {
+                    slot: self.media_conn_flight.clone(),
+                    flight,
+                    _release: release,
+                })
             }
         }
+    }
 
+    /// The one round trip a flight performs, shared by every caller that
+    /// joined it. The store is unconditional: whatever is written here was
+    /// issued by the server seconds ago, so last writer still wins fresh.
+    async fn fetch_media_conn(&self) -> Result<MediaConn, IqError> {
         let response = self.execute(MediaConnSpec::new()).await?;
 
         let new_conn = MediaConn {
@@ -89,5 +106,501 @@ impl Client {
         *write_guard = Some(new_conn.clone());
 
         Ok(new_conn)
+    }
+
+    /// Read the cache without touching any flight. The happy path stays on
+    /// this alone: one read lock, no channel, no allocation beyond the clone
+    /// the caller was always owed.
+    async fn cached_media_conn(&self) -> Option<MediaConn> {
+        let guard = self.media_conn.read().await;
+        match &*guard {
+            Some(conn) if !conn.is_expired() => Some(conn.clone()),
+            _ => None,
+        }
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(
+            name = "wa.media.refresh_conn",
+            level = "debug",
+            skip_all,
+            fields(force),
+            err(Debug)
+        )
+    )]
+    pub async fn refresh_media_conn(&self, force: bool) -> Result<MediaConn, IqError> {
+        if !force && let Some(conn) = self.cached_media_conn().await {
+            return Ok(conn);
+        }
+
+        loop {
+            match self.claim_media_conn_flight() {
+                MediaConnClaim::Joined(flight) => {
+                    match flight.wait().await {
+                        // The leader stored before releasing, so this usually
+                        // hits. An invalidate that landed in between only
+                        // misses again and takes its own turn below.
+                        Some(MediaFlightOutcome::Refreshed) => {
+                            if let Some(conn) = self.cached_media_conn().await {
+                                return Ok(conn);
+                            }
+                        }
+                        Some(MediaFlightOutcome::Failed(class)) => {
+                            return Err(class.into_error());
+                        }
+                        // The leader died before deciding: nothing was asked,
+                        // so this caller asks for itself.
+                        None => {}
+                    }
+                }
+                MediaConnClaim::Leader(lease) => {
+                    // A flight that finished between the miss above and this
+                    // claim already refreshed the cache; fetching again would
+                    // be the duplicate this flight exists to prevent. A forced
+                    // refresh skips this: it promises a new request.
+                    if !force && let Some(conn) = self.cached_media_conn().await {
+                        drop(lease);
+                        return Ok(conn);
+                    }
+                    match self.fetch_media_conn().await {
+                        Ok(conn) => {
+                            lease.finish(|| MediaFlightOutcome::Refreshed);
+                            return Ok(conn);
+                        }
+                        Err(error) => {
+                            lease.finish(|| MediaFlightOutcome::Failed(FailureClass::of(&error)));
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What one shared refresh flight produced, for the callers that joined it.
+///
+/// Success carries no payload: the cache is the shared result and each waiter
+/// re-reads it, so the uncontended flight allocates nothing to report. Only a
+/// failure is published, and only when someone is waiting (see
+/// [`MediaConnLease::finish`]).
+#[derive(Debug, Clone)]
+enum MediaFlightOutcome {
+    Refreshed,
+    Failed(FailureClass),
+}
+
+/// The failure classes a waiter rebuilds faithfully. `IqError` is not `Clone`,
+/// and what callers act on through `ErrorChainExt` is timeout vs. transport
+/// gone vs. server refusal, so those three rebuild canonically and everything
+/// else keeps its message under a shared-attempt wrapper.
+#[derive(Debug, Clone)]
+enum FailureClass {
+    TimedOut,
+    TransportGone,
+    Refused {
+        code: u16,
+        text: String,
+        error_type: Option<String>,
+        backoff: Option<u32>,
+        response: RejectionStanza,
+    },
+    Other(String),
+}
+
+impl FailureClass {
+    fn of(error: &IqError) -> Self {
+        if error.is_timeout() {
+            Self::TimedOut
+        } else if error.is_transport_unavailable() {
+            Self::TransportGone
+        } else if let IqError::ServerError {
+            code,
+            text,
+            error_type,
+            backoff,
+            response,
+        } = error
+        {
+            Self::Refused {
+                code: *code,
+                text: text.clone(),
+                error_type: error_type.clone(),
+                backoff: *backoff,
+                response: response.clone(),
+            }
+        } else {
+            Self::Other(error.to_string())
+        }
+    }
+
+    fn into_error(self) -> IqError {
+        match self {
+            Self::TimedOut => IqError::Timeout,
+            Self::TransportGone => IqError::NotConnected,
+            Self::Refused {
+                code,
+                text,
+                error_type,
+                backoff,
+                response,
+            } => IqError::ServerError {
+                code,
+                text,
+                error_type,
+                backoff,
+                response,
+            },
+            // The predicates all answer false for these, leader or waiter
+            // alike; the message keeps the cause readable.
+            Self::Other(message) => IqError::ParseError(anyhow::anyhow!(
+                "media_conn refresh failed on a shared attempt: {message}"
+            )),
+        }
+    }
+}
+
+/// The shared side of the one in-flight refresh. One slot, not a registry:
+/// every caller wants the same connection, so there is nothing to key by.
+pub(crate) struct MediaConnFlight {
+    /// Callers admitted while the leader runs, counted under the slot lock.
+    /// A waiter cancelled before the leader finishes stays counted, so the
+    /// leader can publish an answer nobody reads. That costs one small enum,
+    /// where the alternative is another ordering-sensitive path in a
+    /// structure whose bugs would all be ordering bugs.
+    waiters: AtomicUsize,
+    /// Set by the leader before it releases. Absent means the leader produced
+    /// nothing a waiter can act on, so a waiter takes its own turn.
+    result: std::sync::Mutex<Option<MediaFlightOutcome>>,
+    /// Closes when the leader's lease drops: on success, on failure, and on a
+    /// cancelled or panicking leader alike, so no waiter can be stranded by an
+    /// outcome the leader never got to report.
+    released: async_channel::Receiver<std::convert::Infallible>,
+}
+
+impl MediaConnFlight {
+    /// Wait for the leader to release, and read what it produced.
+    async fn wait(&self) -> Option<MediaFlightOutcome> {
+        let _ = self.released.recv().await;
+        self.result
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+}
+
+/// What a caller got from claiming the flight slot.
+enum MediaConnClaim {
+    /// This caller runs the one round trip.
+    Leader(MediaConnLease),
+    /// Someone else is running it; wait on their flight.
+    Joined(Arc<MediaConnFlight>),
+}
+
+/// The leader's side. Dropping it releases every waiter.
+pub(crate) struct MediaConnLease {
+    slot: Arc<std::sync::Mutex<Option<Arc<MediaConnFlight>>>>,
+    flight: Arc<MediaConnFlight>,
+    _release: async_channel::Sender<std::convert::Infallible>,
+}
+
+impl MediaConnLease {
+    /// Close this flight to new joiners and, if anyone is waiting, publish
+    /// what the round trip produced.
+    ///
+    /// Closing and deciding are atomic: a caller admitted after the leader
+    /// decided nobody was waiting would find the flight closed and empty, and
+    /// fetch again on the strength of a round trip that had just succeeded.
+    ///
+    /// `outcome` only runs when someone is actually waiting, so the
+    /// uncontended call, which is most of them, never formats a failure
+    /// message just to drop it.
+    fn finish(self, outcome: impl FnOnce() -> MediaFlightOutcome) {
+        let publish = {
+            let mut slot = self
+                .slot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            // Retired first, so nobody else can join; the count read after
+            // it, still under the lock, therefore covers everyone who could.
+            Self::retire(&mut slot, &self.flight);
+            self.flight.waiters.load(Ordering::Acquire) > 0
+        };
+
+        // Built after the lock is released: a waiter reads only once the
+        // flight is released, which is this lease being dropped after this
+        // returns.
+        if publish {
+            *self
+                .flight
+                .result
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(outcome());
+        }
+    }
+
+    /// Remove this flight, but only where the registered one is still ours:
+    /// the slot may already belong to a later caller's flight.
+    fn retire(slot: &mut Option<Arc<MediaConnFlight>>, flight: &Arc<MediaConnFlight>) {
+        if let Some(registered) = slot
+            && Arc::ptr_eq(registered, flight)
+        {
+            *slot = None;
+        }
+    }
+}
+
+impl Drop for MediaConnLease {
+    fn drop(&mut self) {
+        // Idempotent: a leader that reached `finish` is already gone from the
+        // slot, and one that died never got there.
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Self::retire(&mut slot, &self.flight);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{answer_iq, create_iq_test_client, decode_sent_iq};
+    use crate::transport::mock::CapturingMockTransport;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use wacore_binary::builder::NodeBuilder;
+    use wacore_binary::node::Node;
+
+    /// Callers in one burst: parallel AppState collections plus simultaneous
+    /// media downloads all ask for the connection at once on a cold cache.
+    const BURST: usize = 8;
+
+    fn media_conn_result(id: &str, auth: &str, ttl: u64) -> Node {
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("id", id)
+            .attr("from", "s.whatsapp.net")
+            .children([NodeBuilder::new("media_conn")
+                .attr("auth", auth)
+                .attr("ttl", ttl)
+                .children([NodeBuilder::new("host")
+                    .attr("hostname", "mmg.whatsapp.net")
+                    .build()])
+                .build()])
+            .build()
+    }
+
+    fn media_conn_error(id: &str, code: u16) -> Node {
+        NodeBuilder::new("iq")
+            .attr("type", "error")
+            .attr("id", id)
+            .attr("from", "s.whatsapp.net")
+            .children([NodeBuilder::new("error")
+                .attr("code", code.to_string())
+                .attr("text", "internal server error")
+                .build()])
+            .build()
+    }
+
+    fn request_id(sent: &Arc<wacore_binary::OwnedNodeRef>) -> String {
+        sent.get()
+            .to_owned()
+            .attrs()
+            .optional_string("id")
+            .expect("every IQ carries an id")
+            .into_owned()
+    }
+
+    /// The burst reaches the wire and then goes quiet: every caller that is
+    /// going to fetch has fetched, and the rest are parked on responses.
+    /// Returns the frame count at quiescence, which is the measurement this
+    /// suite pins down.
+    async fn quiesce(transport: &Arc<CapturingMockTransport>) -> usize {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut last = usize::MAX;
+            loop {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let now = transport.sent().len();
+                if now == last && now > 0 {
+                    return now;
+                }
+                last = now;
+            }
+        })
+        .await
+        .expect("the burst must reach the wire")
+    }
+
+    async fn answer_frame(
+        client: &Arc<Client>,
+        transport: &Arc<CapturingMockTransport>,
+        index: usize,
+        auth: &str,
+        ttl: u64,
+    ) {
+        let sent = decode_sent_iq(transport, index).await;
+        assert!(
+            sent.get().get_optional_child("media_conn").is_some(),
+            "frame {index} must be the media_conn query"
+        );
+        let id = request_id(&sent);
+        answer_iq(client, &id, &media_conn_result(&id, auth, ttl)).await;
+    }
+
+    fn spawn_burst(
+        client: &Arc<Client>,
+    ) -> tokio::task::JoinHandle<Vec<Result<MediaConn, IqError>>> {
+        let client = client.clone();
+        tokio::spawn(async move {
+            futures::future::join_all((0..BURST).map(|_| client.refresh_media_conn(false))).await
+        })
+    }
+
+    /// Eight callers on an empty cache must send one `<media_conn/>` IQ
+    /// between them and all come home with the same connection.
+    #[tokio::test]
+    async fn concurrent_refreshes_share_a_single_wire_request() {
+        let (client, transport) = create_iq_test_client().await;
+        let mut pending = spawn_burst(&client);
+
+        let dispatched = quiesce(&transport).await;
+        answer_frame(&client, &transport, 0, "shared-auth", 3600).await;
+
+        match tokio::time::timeout(Duration::from_secs(5), &mut pending).await {
+            Ok(done) => {
+                let results = done.expect("the burst task stays alive");
+                assert!(
+                    results
+                        .iter()
+                        .all(|r| matches!(r, Ok(conn) if conn.auth == "shared-auth")),
+                    "every caller shares the one flight's connection"
+                );
+                assert_eq!(
+                    transport.sent().len(),
+                    1,
+                    "concurrent refreshes on an empty cache must share one flight"
+                );
+            }
+            Err(_) => {
+                pending.abort();
+                panic!(
+                    "no single-flight: {dispatched} media_conn IQs reached the wire \
+                     for {BURST} concurrent refreshes (expected 1)"
+                );
+            }
+        }
+    }
+
+    /// An expired cache is a miss, but still one miss: the burst after a
+    /// `ttl: 0` seed sends exactly one more IQ.
+    #[tokio::test]
+    async fn an_expired_cache_still_flies_single() {
+        let (client, transport) = create_iq_test_client().await;
+
+        let seed = tokio::spawn({
+            let client = client.clone();
+            async move { client.refresh_media_conn(false).await }
+        });
+        answer_frame(&client, &transport, 0, "stale-auth", 0).await;
+        let seeded = tokio::time::timeout(Duration::from_secs(5), seed)
+            .await
+            .expect("the seed refresh must complete")
+            .expect("the seed task stays alive")
+            .expect("the seed refresh succeeds");
+        assert!(seeded.is_expired(), "ttl 0 is expired on arrival");
+
+        let mut pending = spawn_burst(&client);
+        quiesce(&transport).await;
+        answer_frame(&client, &transport, 1, "fresh-auth", 3600).await;
+
+        match tokio::time::timeout(Duration::from_secs(5), &mut pending).await {
+            Ok(done) => {
+                let results = done.expect("the burst task stays alive");
+                assert!(
+                    results
+                        .iter()
+                        .all(|r| matches!(r, Ok(conn) if conn.auth == "fresh-auth")),
+                    "every caller shares the one refetch"
+                );
+                assert_eq!(
+                    transport.sent().len(),
+                    2,
+                    "seed plus one shared refetch, nothing more"
+                );
+            }
+            Err(_) => {
+                pending.abort();
+                panic!(
+                    "no single-flight: {} media_conn IQs reached the wire \
+                     for the seed plus {BURST} concurrent refreshes (expected 2)",
+                    transport.sent().len(),
+                );
+            }
+        }
+    }
+
+    /// One failed flight fails everyone with the same error: the refusal is
+    /// answered once, every caller reports it, and a later call retries on a
+    /// cleared slot.
+    ///
+    /// Answered with a server refusal rather than an injected transport
+    /// failure: a failed write poisons the noise sender, which would leave no
+    /// healthy socket for the retry round to prove the slot cleared.
+    #[tokio::test]
+    async fn a_failed_flight_fails_everyone_once_and_retries_after() {
+        let (client, transport) = create_iq_test_client().await;
+        let mut pending = spawn_burst(&client);
+
+        let dispatched = quiesce(&transport).await;
+        let sent = decode_sent_iq(&transport, 0).await;
+        let id = request_id(&sent);
+        answer_iq(&client, &id, &media_conn_error(&id, 500)).await;
+
+        match tokio::time::timeout(Duration::from_secs(5), &mut pending).await {
+            Ok(done) => {
+                let results = done.expect("the burst task stays alive");
+                assert!(
+                    results.iter().all(|r| r.is_err()),
+                    "a failed flight reports its error to every caller"
+                );
+                let first = results[0].as_ref().expect_err("checked above").to_string();
+                assert!(
+                    first.contains("500"),
+                    "the shared error carries the refusal, got: {first}"
+                );
+                assert!(
+                    results
+                        .iter()
+                        .all(|r| r.as_ref().expect_err("checked above").to_string() == first),
+                    "waiters share the flight's error, they do not mint their own"
+                );
+                assert_eq!(
+                    transport.sent().len(),
+                    1,
+                    "one shared flight sends one query even when refused"
+                );
+            }
+            Err(_) => {
+                pending.abort();
+                panic!(
+                    "no single-flight: {dispatched} media_conn IQs reached the wire \
+                     for {BURST} concurrent refreshes (expected 1)"
+                );
+            }
+        }
+
+        let retry = tokio::spawn({
+            let client = client.clone();
+            async move { client.refresh_media_conn(false).await }
+        });
+        answer_frame(&client, &transport, 1, "recovered-auth", 3600).await;
+        let recovered = tokio::time::timeout(Duration::from_secs(5), retry)
+            .await
+            .expect("the retry must complete")
+            .expect("the retry task stays alive")
+            .expect("the retry succeeds after the refusal clears");
+        assert_eq!(recovered.auth, "recovered-auth");
     }
 }

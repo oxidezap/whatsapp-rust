@@ -432,6 +432,7 @@ impl Client {
             ),
             persistence_manager: persistence_manager.clone(),
             media_conn: Arc::new(RwLock::new(None)),
+            media_conn_flight: Arc::new(std::sync::Mutex::new(None)),
             is_logged_in: AtomicBool::new(false),
             #[cfg(feature = "client-lifecycle")]
             login_transition: std::sync::Mutex::new(()),

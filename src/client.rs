@@ -1428,6 +1428,10 @@ pub struct Client {
     /// commit (WA Web MessageProcessorCache parity).
     pub(crate) inbound_commit_batch: crate::message::commit_batch::InboundCommitBatcher,
     pub(crate) media_conn: Arc<RwLock<Option<crate::mediaconn::MediaConn>>>,
+    /// The one in-flight `refresh_media_conn` fetch, shared by concurrent
+    /// callers; `None` when no fetch is running. See `crate::mediaconn`.
+    pub(crate) media_conn_flight:
+        Arc<std::sync::Mutex<Option<Arc<crate::mediaconn::MediaConnFlight>>>>,
 
     pub(crate) is_logged_in: AtomicBool,
     #[cfg(feature = "client-lifecycle")]
