@@ -3018,7 +3018,11 @@ mod tests {
             RunCompletionReason::AutoReconnectDisabled {
                 connection: None,
                 connect_error: Some(ConnectError::Version(error)),
-            } => assert!(error.to_string().contains("client_revision")),
+            } => assert!(
+                error
+                    .to_string()
+                    .contains("Failed to fetch latest WhatsApp version")
+            ),
             other => panic!("unexpected completion: {other:?}"),
         }
     }
