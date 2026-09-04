@@ -1310,12 +1310,12 @@ impl Client {
             warn!("Failed to send logout IQ: {e}");
         }
 
-        self.core.event_bus.dispatch(Event::LoggedOut(
+        self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
             crate::types::events::LoggedOut::builder()
                 .on_connect(false)
                 .reason(ConnectFailureReason::LoggedOut)
                 .build(),
-        ));
+        )));
 
         self.disconnect().await;
     }

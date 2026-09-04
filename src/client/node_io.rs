@@ -1957,13 +1957,13 @@ impl Client {
             let event = if conflict_type == "replaced" {
                 Event::StreamReplaced(crate::types::events::StreamReplaced::builder().build())
             } else {
-                Event::LoggedOut(
+                Event::LoggedOut(Box::new(
                     crate::types::events::LoggedOut::builder()
                         .on_connect(false)
                         .reason(ConnectFailureReason::LoggedOut)
                         .raw(node.to_owned())
                         .build(),
-                )
+                ))
             };
             self.core.event_bus.dispatch(event);
             should_disconnect = true;
@@ -1980,26 +1980,26 @@ impl Client {
                     info!("Got 516 stream error (device removed). Logging out.");
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
-                    self.core.event_bus.dispatch(Event::LoggedOut(
+                    self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
                         crate::types::events::LoggedOut::builder()
                             .on_connect(false)
                             .reason(ConnectFailureReason::LoggedOut)
                             .raw(node.to_owned())
                             .build(),
-                    ));
+                    )));
                     should_disconnect = true;
                 }
                 "401" => {
                     info!("Got 401 stream error (unauthorized). Logging out.");
                     self.expected_disconnect.store(true, Ordering::Relaxed);
                     self.enable_auto_reconnect.store(false, Ordering::Relaxed);
-                    self.core.event_bus.dispatch(Event::LoggedOut(
+                    self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
                         crate::types::events::LoggedOut::builder()
                             .on_connect(false)
                             .reason(ConnectFailureReason::LoggedOut)
                             .raw(node.to_owned())
                             .build(),
-                    ));
+                    )));
                     should_disconnect = true;
                 }
                 "409" => {
@@ -2143,14 +2143,14 @@ impl Client {
                 "Got {reason:?} connect failure, logging out: {}",
                 DisplayableNodeRef(node)
             );
-            self.core.event_bus.dispatch(Event::LoggedOut(
+            self.core.event_bus.dispatch(Event::LoggedOut(Box::new(
                 crate::types::events::LoggedOut::builder()
                     .on_connect(true)
                     .reason(reason)
                     .maybe_logout_message(failure.logout_message())
                     .raw(node.to_owned())
                     .build(),
-            ));
+            )));
         } else if let ConnectFailureReason::TempBanned = reason
             && let Some(expire_secs) = failure.expire
             && let Some(ban_code) = failure.code
@@ -2161,7 +2161,7 @@ impl Client {
                 "Temporary ban connect failure: {}",
                 DisplayableNodeRef(node)
             );
-            self.core.event_bus.dispatch(Event::TemporaryBan(
+            self.core.event_bus.dispatch(Event::TemporaryBan(Box::new(
                 crate::types::events::TemporaryBan::builder()
                     .code(crate::types::events::TempBanReason::from(ban_code))
                     .expire(expire_duration)
@@ -2169,7 +2169,7 @@ impl Client {
                     .maybe_url(failure.url.as_deref().map(str::to_owned))
                     .raw(node.to_owned())
                     .build(),
-            ));
+            )));
         } else if let ConnectFailureReason::ClientOutdated = reason {
             error!("Client is outdated and was rejected by server.");
             self.core.event_bus.dispatch(Event::ClientOutdated(

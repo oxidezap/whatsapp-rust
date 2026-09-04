@@ -1214,7 +1214,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     {
         self.on_event_for(&[EventKind::LoggedOut], move |event, _client| {
             let fut = match &*event {
-                Event::LoggedOut(info) => Some(handler(info.clone())),
+                Event::LoggedOut(info) => Some(handler(info.as_ref().clone())),
                 _ => None,
             };
             async move {

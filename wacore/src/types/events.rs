@@ -901,7 +901,14 @@ pub enum Event {
     Disconnected(Disconnected),
     PairSuccess(PairSuccess),
     PairError(PairError),
-    LoggedOut(LoggedOut),
+    /// The device was logged out: unlinked, locked, or refused at connect.
+    /// Terminal for the session, so it fires at most once per connection.
+    ///
+    /// Boxed for the same reason as [`Event::IncomingCall`]: at 328 bytes it
+    /// was the variant setting the size of every `Event`, and every
+    /// dispatched event is one `Arc` allocation of that size whatever its
+    /// payload. A `<presence>` is not obliged to pay for a logout stanza.
+    LoggedOut(Box<LoggedOut>),
     PairingQrCode(PairingQrCode),
     PairingCode(PairingCode),
     PairingCodeRefresh(PairingCodeRefresh),
@@ -1018,7 +1025,10 @@ pub enum Event {
     BusinessStatusUpdate(BusinessStatusUpdate),
 
     StreamReplaced(StreamReplaced),
-    TemporaryBan(TemporaryBan),
+    /// The server temporarily banned the account. Like [`Event::LoggedOut`]
+    /// it fires at most once per connection, and carries the whole
+    /// `<failure>` stanza, so it is boxed for the same reason.
+    TemporaryBan(Box<TemporaryBan>),
     ConnectFailure(ConnectFailure),
     StreamError(StreamError),
 
@@ -2686,15 +2696,16 @@ mod tests {
     }
 
     /// `size_of::<Event>()` sizes every dispatched event (see the boxed
-    /// variants' docs for why). The ceiling is set by `LoggedOut` (328), with
-    /// `TemporaryBan` (312) behind it.
+    /// variants' docs for why). The ceiling is set by `ConnectFailure` (272);
+    /// `LoggedOut` and `TemporaryBan` used to set it at 328 before their
+    /// payloads were boxed.
     ///
     /// The number is not sacred; the order of magnitude is. Raising it means a
     /// new variant just made every event bigger, and the fix is almost always
     /// to box that variant's payload rather than to edit this line.
     #[test]
     fn event_stays_under_its_size_ceiling() {
-        const CEILING: usize = 328;
+        const CEILING: usize = 272;
         let size = size_of::<Event>();
         assert!(
             size <= CEILING,
