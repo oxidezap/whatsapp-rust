@@ -89,9 +89,16 @@ impl Client {
     }
 
     /// The one round trip a flight performs, shared by every caller that
-    /// joined it. The store is unconditional: whatever is written here was
-    /// issued by the server seconds ago, so last writer still wins fresh.
+    /// joined it.
+    ///
+    /// The store is generation-gated, not last-writer-wins: a fetch that
+    /// started earlier may complete later (a forced refresh bypasses the
+    /// flight and runs alongside it), and publishing its answer then would
+    /// clobber credentials a newer fetch already replaced. The fetch's own
+    /// callers still get its result; only the shared cache keeps the newest
+    /// starter's.
     async fn fetch_media_conn(&self) -> Result<MediaConn, IqError> {
+        let seq = self.media_conn_seq.fetch_add(1, Ordering::AcqRel);
         let response = self.execute(MediaConnSpec::new()).await?;
 
         let new_conn = MediaConn {
@@ -102,8 +109,13 @@ impl Client {
             fetched_at: Instant::now(),
         };
 
-        let mut write_guard = self.media_conn.write().await;
-        *write_guard = Some(new_conn.clone());
+        // Nothing started after this fetch: its answer is still the newest.
+        // Otherwise a newer fetch owns the cache (or will, when it lands)
+        // and this result is only good for its own callers.
+        if seq + 1 == self.media_conn_seq.load(Ordering::Acquire) {
+            let mut write_guard = self.media_conn.write().await;
+            *write_guard = Some(new_conn.clone());
+        }
 
         Ok(new_conn)
     }
@@ -666,6 +678,19 @@ mod tests {
             transport.sent().len(),
             2,
             "force sends its own request instead of joining"
+        );
+        // The older flight completes last (its frame is answered second) and
+        // must not clobber the forced credentials: the cache keeps the newest
+        // starter's answer, while the older flight's own caller still gets
+        // what it fetched.
+        assert_eq!(
+            client
+                .cached_media_conn()
+                .await
+                .expect("the forced fetch publishes")
+                .auth,
+            "forced-auth",
+            "an older flight completing last must not overwrite the forced refresh"
         );
     }
 }

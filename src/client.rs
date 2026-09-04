@@ -1432,6 +1432,9 @@ pub struct Client {
     /// callers; `None` when no fetch is running. See `crate::mediaconn`.
     pub(crate) media_conn_flight:
         Arc<std::sync::Mutex<Option<Arc<crate::mediaconn::MediaConnFlight>>>>,
+    /// Fetch sequence for `media_conn`: tagged at fetch start so a response
+    /// that lost its race only publishes when nothing newer began after it.
+    pub(crate) media_conn_seq: AtomicU64,
 
     pub(crate) is_logged_in: AtomicBool,
     #[cfg(feature = "client-lifecycle")]
