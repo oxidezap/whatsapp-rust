@@ -397,7 +397,7 @@ dependencies = [
 [[package]]
 name = "buffa"
 version = "0.9.2"
-source = "git+https://github.com/jlucaso1/buffa.git?branch=claude%2Fbuffa-binary-size-optimization-358bh7#54964cd5a09d3832b783a0b7b603527f6af2d9fc"
+source = "git+https://github.com/jlucaso1/buffa.git?branch=claude%2Fbuffa-inline-views-single-pass-encode#6a7d26b5905f742f74d157c53e5c897cfada53c0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -414,7 +414,7 @@ dependencies = [
 [[package]]
 name = "buffa-build"
 version = "0.9.2"
-source = "git+https://github.com/jlucaso1/buffa.git?branch=claude%2Fbuffa-binary-size-optimization-358bh7#54964cd5a09d3832b783a0b7b603527f6af2d9fc"
+source = "git+https://github.com/jlucaso1/buffa.git?branch=claude%2Fbuffa-inline-views-single-pass-encode#6a7d26b5905f742f74d157c53e5c897cfada53c0"
 dependencies = [
  "buffa",
  "buffa-codegen",
@@ -424,7 +424,7 @@ dependencies = [
 [[package]]
 name = "buffa-codegen"
 version = "0.9.2"
-source = "git+https://github.com/jlucaso1/buffa.git?branch=claude%2Fbuffa-binary-size-optimization-358bh7#54964cd5a09d3832b783a0b7b603527f6af2d9fc"
+source = "git+https://github.com/jlucaso1/buffa.git?branch=claude%2Fbuffa-inline-views-single-pass-encode#6a7d26b5905f742f74d157c53e5c897cfada53c0"
 dependencies = [
  "buffa",
  "buffa-descriptor",
@@ -438,7 +438,7 @@ dependencies = [
 [[package]]
 name = "buffa-descriptor"
 version = "0.9.2"
-source = "git+https://github.com/jlucaso1/buffa.git?branch=claude%2Fbuffa-binary-size-optimization-358bh7#54964cd5a09d3832b783a0b7b603527f6af2d9fc"
+source = "git+https://github.com/jlucaso1/buffa.git?branch=claude%2Fbuffa-inline-views-single-pass-encode#6a7d26b5905f742f74d157c53e5c897cfada53c0"
 dependencies = [
  "buffa",
  "rustversion",
