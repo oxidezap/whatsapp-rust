@@ -53,45 +53,13 @@ fn is_retriable_sqlite_error(error: &DieselError) -> bool {
 /// Native uses Tokio's timer, while the browser target uses its JavaScript
 /// `setTimeout` future because no Tokio time driver is installed there.
 #[cfg(not(target_family = "wasm"))]
-async fn retry_backoff(delay_ms: u64) {
+pub(crate) async fn retry_backoff(delay_ms: u64) {
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 }
 
 #[cfg(target_family = "wasm")]
-async fn retry_backoff(delay_ms: u64) {
+pub(crate) async fn retry_backoff(delay_ms: u64) {
     gloo_timers::future::TimeoutFuture::new(delay_ms as u32).await;
-}
-
-#[cfg(test)]
-mod retry_tests {
-    use super::*;
-
-    #[test]
-    fn only_busy_and_locked_database_errors_are_retriable() {
-        let busy = DieselError::DatabaseError(
-            DatabaseErrorKind::Unknown,
-            Box::new("database is busy".to_string()),
-        );
-        let locked = DieselError::DatabaseError(
-            DatabaseErrorKind::Unknown,
-            Box::new("database table is locked".to_string()),
-        );
-        let syntax = DieselError::DatabaseError(
-            DatabaseErrorKind::Unknown,
-            Box::new("near SELECT: syntax error".to_string()),
-        );
-        assert!(is_retriable_sqlite_error(&busy));
-        assert!(is_retriable_sqlite_error(&locked));
-        assert!(!is_retriable_sqlite_error(&syntax));
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[tokio::test]
-    async fn native_retry_backoff_waits_on_the_runtime_timer() {
-        let started = wacore::time::Instant::now();
-        retry_backoff(5).await;
-        assert!(started.elapsed() >= Duration::from_millis(4));
-    }
 }
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
@@ -4563,6 +4531,38 @@ fn pragma_i64(conn: &mut SqliteConnection, pragma: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn only_busy_and_locked_database_errors_are_retriable() {
+        let busy = DieselError::DatabaseError(
+            DatabaseErrorKind::Unknown,
+            Box::new("database is busy".to_string()),
+        );
+        let locked = DieselError::DatabaseError(
+            DatabaseErrorKind::Unknown,
+            Box::new("database table is locked".to_string()),
+        );
+        let syntax = DieselError::DatabaseError(
+            DatabaseErrorKind::Unknown,
+            Box::new("near SELECT: syntax error".to_string()),
+        );
+        assert!(is_retriable_sqlite_error(&busy));
+        assert!(is_retriable_sqlite_error(&locked));
+        assert!(!is_retriable_sqlite_error(&syntax));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[tokio::test]
+    async fn native_retry_backoff_waits_on_the_runtime_timer() {
+        let started = wacore::time::Instant::now();
+        retry_backoff(5).await;
+        assert!(started.elapsed() >= Duration::from_millis(4));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -7568,7 +7568,7 @@ mod read_routing_tests {
     /// matching nothing.
     fn misrouted_reads(source: &str) -> (Vec<String>, Vec<String>, usize) {
         let source = source
-            .split_once("\n#[cfg(test)]\nmod tests")
+            .split_once("\n#[cfg(test)]")
             .map(|(before, _)| before)
             .unwrap_or(source);
 

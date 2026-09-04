@@ -11,3 +11,9 @@ mod wire;
 
 pub use shared::SharedSqlite;
 pub use sqlite_store::{ConnectionInitHook, SqliteStore, SqliteStoreConfig, Synchronous};
+
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub async fn test_retry_backoff(delay_ms: u64) {
+    sqlite_store::retry_backoff(delay_ms).await;
+}
