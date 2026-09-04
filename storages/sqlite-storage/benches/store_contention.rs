@@ -5,6 +5,10 @@
 //! burst, holding the permit before the read is issued, and one read, both
 //! awaited, so the work per sample is fixed; see `read_under_write` for why a
 //! background writer is not measurable here and how the two are ordered.
+//!
+//! The runtime is built and fully populated in `harness`, before anything is
+//! measured, so the one iteration CodSpeed times cannot contain a thread the
+//! store happened to need; see [`BLOCKING_THREADS`].
 
 use divan::black_box;
 use std::future::{Future, poll_fn};
@@ -13,6 +17,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
+use std::time::Duration;
 use wacore::appstate::processor::AppStateMutationMAC;
 use wacore::store::traits::{AppSyncStore, DeviceInfo, DeviceListRecord, ProtocolStore};
 use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
@@ -57,13 +62,60 @@ fn macs(n: usize, seed: u8) -> Vec<AppStateMutationMAC> {
 const USER: &str = "190455501800";
 const GROUP: &str = "120363000000000001@g.us";
 
+/// The blocking threads the pool may have, and the number it is given before
+/// anything is measured.
+///
+/// A sample overlaps at most two database jobs: the burst holding the write
+/// permit, and the read beside it on a reader connection. Everything else the
+/// store does is one `spawn_blocking` at a time, and the async side is a
+/// permit acquire and a dispatch, so a current-thread runtime is the whole
+/// runtime this needs.
+///
+/// The cap and [`warm_blocking_pool`] exist because tokio creates a blocking
+/// thread on demand and reaps it after ten seconds idle, while CodSpeed
+/// measures **one** iteration per benchmark: a `pthread_create` — stack
+/// `mmap`, `mprotect`, TLS allocation — landing in that iteration is charged
+/// to the store and reads as a regression of several percent that no change
+/// to the code caused. Two threads, created up front and never reaped, keep
+/// every iteration measuring the same work.
+const BLOCKING_THREADS: usize = 2;
+
+/// How long an idle blocking thread is kept: longer than any benchmark run,
+/// so the pool warmed below is the pool every measurement sees.
+const THREAD_KEEP_ALIVE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Bring every blocking thread into existence before the first measurement.
+///
+/// The barrier is what forces distinct threads: tokio spawns one only when a
+/// job arrives and no thread is idle, so the jobs have to overlap. Each job
+/// here is dispatched while the previous one is parked on the barrier, so the
+/// pool ends up with exactly [`BLOCKING_THREADS`] threads.
+fn warm_blocking_pool(runtime: &tokio::runtime::Runtime) {
+    let barrier = Arc::new(std::sync::Barrier::new(BLOCKING_THREADS));
+    runtime.block_on(async {
+        let jobs: Vec<_> = (0..BLOCKING_THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                tokio::task::spawn_blocking(move || {
+                    barrier.wait();
+                })
+            })
+            .collect();
+        for job in jobs {
+            job.await.expect("warm a blocking thread");
+        }
+    });
+}
+
 fn harness() -> &'static Harness {
     HARNESS.get_or_init(|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(BLOCKING_THREADS)
+            .thread_keep_alive(THREAD_KEEP_ALIVE)
             .enable_all()
             .build()
-            .expect("runtime");
+            .expect("current-thread runtime");
+        warm_blocking_pool(&runtime);
         let path =
             std::env::temp_dir().join(format!("wa-store-contention-{}.db", std::process::id()));
         remove_db_files(&path);

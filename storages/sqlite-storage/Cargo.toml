@@ -39,8 +39,6 @@ sha2 = { workspace = true }
 [dev-dependencies]
 divan = { workspace = true }
 portable-atomic = { workspace = true }
-# `store_contention` drives readers and a writer on a multi-thread runtime.
-tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [[bench]]
 name = "signal_flush"
