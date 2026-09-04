@@ -145,7 +145,15 @@ fn sweep_idle_no_ttl(bencher: divan::Bencher, n: usize) {
 }
 
 /// The sweep with expired entries present: scales with the expired set.
-#[divan::bench(args = [64, 512])]
+///
+/// Entries carry a 10 ms TTL and each iteration sleeps past it before
+/// sweeping, so the sweep always reclaims `n` expired entries — the assert
+/// proves it, and a sweep that stopped expiring would fail instead of
+/// silently measuring the live-entry walk. The sleep is a syscall, ~zero
+/// instructions, so CodSpeed's instruction counts stay a clean signal; wall
+/// time includes it, which is why this row runs few samples. Same 10/20 ms
+/// pairing the `portable_cache` expiry tests use.
+#[divan::bench(args = [64, 512], sample_count = 5, sample_size = 3)]
 fn sweep_with_expired(bencher: divan::Bencher, n: usize) {
     static BUILT: OnceLock<Vec<Cache<Jid, Arc<()>>>> = OnceLock::new();
     let built = BUILT.get_or_init(|| {
@@ -154,7 +162,7 @@ fn sweep_with_expired(bencher: divan::Bencher, n: usize) {
             .map(|&m| {
                 let cache: Cache<Jid, Arc<()>> = Cache::builder()
                     .max_capacity((m * 2) as u64)
-                    .time_to_live(Duration::from_secs(3600))
+                    .time_to_live(Duration::from_millis(10))
                     .build();
                 cache
             })
@@ -170,8 +178,11 @@ fn sweep_with_expired(bencher: divan::Bencher, n: usize) {
             for i in 0..n {
                 cache.insert(black_box(key(i)), Arc::new(())).await;
             }
-            cache.run_pending_tasks().await;
         });
-        black_box(cache.entry_count())
+        std::thread::sleep(Duration::from_millis(20));
+        block_on(cache.run_pending_tasks());
+        let remaining = cache.entry_count();
+        assert_eq!(remaining, 0, "the sweep must reclaim every expired entry");
+        black_box(remaining)
     });
 }

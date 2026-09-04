@@ -68,7 +68,7 @@ fn users(n: usize) -> &'static Vec<Jid> {
 #[divan::bench(args = USER_COUNTS)]
 fn normalize_borrow(bencher: divan::Bencher, n: usize) {
     let input = users(n);
-    bencher.counter(ItemsCount::new(BATCH)).bench(|| {
+    bencher.counter(ItemsCount::new(BATCH * n)).bench(|| {
         let mut done = 0usize;
         for _ in 0..BATCH {
             for jid in input.iter() {
@@ -84,7 +84,7 @@ fn normalize_borrow(bencher: divan::Bencher, n: usize) {
 /// functional no-op that still walks and branches per user.
 #[divan::bench(args = USER_COUNTS)]
 fn normalize_owned_second_pass(bencher: divan::Bencher, n: usize) {
-    bencher.counter(ItemsCount::new(BATCH)).bench(|| {
+    bencher.counter(ItemsCount::new(BATCH * n)).bench(|| {
         let mut done = 0usize;
         for _ in 0..BATCH {
             // Cloned outside the timed region in spirit: `with_inputs` would
@@ -105,7 +105,7 @@ fn normalize_owned_second_pass(bencher: divan::Bencher, n: usize) {
 #[divan::bench(args = USER_COUNTS)]
 fn protocol_address_per_device(bencher: divan::Bencher, n: usize) {
     let input = users(n);
-    bencher.counter(ItemsCount::new(BATCH)).bench(|| {
+    bencher.counter(ItemsCount::new(BATCH * n)).bench(|| {
         let mut done = 0usize;
         for _ in 0..BATCH {
             for jid in input.iter() {

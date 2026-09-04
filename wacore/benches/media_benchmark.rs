@@ -185,7 +185,8 @@ fn bench_decrypt_copy(bencher: Bencher, len: usize, media_type: MediaType) {
         .with_inputs(|| ciphertext.clone())
         .bench_refs(|buf| {
             black_box(
-                DownloadUtils::verify_and_decrypt(black_box(buf), &MEDIA_KEY, media_type).unwrap(),
+                DownloadUtils::verify_and_decrypt(black_box(buf), &MEDIA_KEY, media_type)
+                    .expect("fixture decrypt"),
             );
         });
 }
