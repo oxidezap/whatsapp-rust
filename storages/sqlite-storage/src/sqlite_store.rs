@@ -2376,70 +2376,35 @@ impl SignalStore for SqliteStore {
             return Ok(());
         }
 
-        let pool = self.pool.clone();
-        let db_semaphore = self.db_semaphore.clone();
         let device_id = self.device_id;
-        let keys: Vec<(u32, Bytes)> = keys.to_vec();
-
-        const MAX_RETRIES: u32 = 5;
-
-        for attempt in 0..=MAX_RETRIES {
-            let permit = db_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| StoreError::Database(Box::new(e)))?;
-
-            let pool_clone = pool.clone();
-            let keys_clone = keys.clone();
-
-            let result =
-                crate::pool::spawn_blocking(move || -> std::result::Result<(), DieselOrStore> {
-                    let mut conn = pool_clone
-                        .get()
-                        .map_err(|e| DieselOrStore::Store(StoreError::Connection(Box::new(e))))?;
-
-                    conn.transaction(|conn| {
-                        for (id, record) in &keys_clone {
-                            diesel::insert_into(prekeys::table)
-                                .values((
-                                    prekeys::id.eq(*id as i32),
-                                    prekeys::key.eq(record.as_ref()),
-                                    prekeys::uploaded.eq(uploaded),
-                                    prekeys::device_id.eq(device_id),
-                                ))
-                                .on_conflict((prekeys::id, prekeys::device_id))
-                                .do_update()
-                                .set((
-                                    prekeys::key.eq(record.as_ref()),
-                                    prekeys::uploaded.eq(uploaded),
-                                ))
-                                .execute(conn)?;
-                        }
-                        Ok::<(), diesel::result::Error>(())
-                    })
-                    .map_err(DieselOrStore::Diesel)
+        // `Arc<Vec>` so each retry attempt bumps a refcount instead of re-cloning
+        // the whole batch (see put_sessions_batch).
+        let batch = Arc::new(keys.to_vec());
+        self.with_retry("store_prekeys_batch", || {
+            let batch = batch.clone();
+            Box::new(move |conn: &mut SqliteConnection| {
+                conn.transaction(|conn| {
+                    for (id, record) in batch.iter() {
+                        diesel::insert_into(prekeys::table)
+                            .values((
+                                prekeys::id.eq(*id as i32),
+                                prekeys::key.eq(record.as_ref()),
+                                prekeys::uploaded.eq(uploaded),
+                                prekeys::device_id.eq(device_id),
+                            ))
+                            .on_conflict((prekeys::id, prekeys::device_id))
+                            .do_update()
+                            .set((
+                                prekeys::key.eq(record.as_ref()),
+                                prekeys::uploaded.eq(uploaded),
+                            ))
+                            .execute(conn)?;
+                    }
+                    Ok(())
                 })
-                .await;
-
-            drop(permit);
-
-            match result {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(DieselOrStore::Diesel(ref e)))
-                    if is_retriable_sqlite_error(e) && attempt < MAX_RETRIES =>
-                {
-                    let delay_ms = 10u64 * (1u64 << attempt.min(4));
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                Ok(Err(e)) => return Err(e.into()),
-                Err(e) => return Err(StoreError::Database(Box::new(e))),
-            }
-        }
-
-        Err(StoreError::RetriesExhausted {
-            op: "store_prekeys_batch".to_string(),
+            })
         })
+        .await
     }
 
     async fn load_prekey(&self, id: u32) -> Result<Option<Bytes>> {
@@ -5767,6 +5732,71 @@ mod tests {
         assert!(gone.is_none(), "consumed key must not be resurrected");
         let live = store.load_prekey(2).await.expect("load");
         assert!(live.is_some(), "live key still present");
+    }
+
+    /// The prekey reserve path stores the whole generated window in one call:
+    /// every key lands, re-storing the same ids upserts (record and uploaded
+    /// flag), and the flush-time consume path removes them together. Empty
+    /// batches short-circuit without touching the database.
+    #[tokio::test]
+    async fn store_and_remove_prekeys_batch_round_trip() {
+        let store = create_test_store().await;
+
+        let batch: Vec<(u32, Bytes)> = (1..=4u32)
+            .map(|id| (id, Bytes::from(vec![id as u8; 16])))
+            .collect();
+        store
+            .store_prekeys_batch(&batch, false)
+            .await
+            .expect("store batch");
+
+        let mut loaded = store
+            .load_prekeys_batch(&[1, 2, 3, 4])
+            .await
+            .expect("load batch");
+        loaded.sort_unstable_by_key(|(id, _)| *id);
+        assert_eq!(loaded.len(), batch.len(), "every batched key must land");
+        for ((id, record), (expected_id, expected)) in loaded.iter().zip(batch.iter()) {
+            assert_eq!(id, expected_id);
+            assert_eq!(record.as_ref(), expected.as_ref());
+        }
+
+        // Re-storing the same ids upserts instead of conflicting.
+        let updated: Vec<(u32, Bytes)> = (1..=4u32)
+            .map(|id| (id, Bytes::from(vec![0xAA; 16])))
+            .collect();
+        store
+            .store_prekeys_batch(&updated, true)
+            .await
+            .expect("upsert batch");
+        for id in 1..=4u32 {
+            let record = store
+                .load_prekey(id)
+                .await
+                .expect("load")
+                .expect("upserted key must still exist");
+            assert_eq!(
+                record.as_ref(),
+                [0xAA; 16].as_slice(),
+                "re-batch must replace the record"
+            );
+        }
+
+        store
+            .remove_prekeys_batch(&[1, 2, 3, 4])
+            .await
+            .expect("remove batch");
+        let remaining = store
+            .load_prekeys_batch(&[1, 2, 3, 4])
+            .await
+            .expect("load after remove");
+        assert!(remaining.is_empty(), "batched remove must delete every key");
+
+        store
+            .store_prekeys_batch(&[], false)
+            .await
+            .expect("empty ok");
+        store.remove_prekeys_batch(&[]).await.expect("empty ok");
     }
 
     /// Round-trips the prekey watermarks through the SQLite schema: save with
