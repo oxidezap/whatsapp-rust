@@ -30,6 +30,10 @@ def parse_time_to_ns(time_str: str) -> float:
     raise ValueError(f"Unknown time unit: {unit!r}")
 
 
+def binary_digest(bin_path: str) -> str:
+    return hashlib.sha256(Path(bin_path).read_bytes()).hexdigest()
+
+
 def format_ns(ns: float) -> str:
     if ns < 1_000:
         return f"{ns:.2f} ns"
@@ -105,14 +109,24 @@ def run_benchmark_rounds(
     cpu_cores: str,
     rounds: int,
     raw_dir: Path | None = None,
+    expected_hash: str | None = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
+    if rounds < 1:
+        raise ValueError("rounds must be positive")
+    if raw_dir is not None:
+        raw_dir.mkdir(parents=True, exist_ok=False)
+    expected_hash = expected_hash or binary_digest(bin_path)
     all_runs: Dict[str, List[Dict[str, Any]]] = {}
     for r in range(rounds):
+        if binary_digest(bin_path) != expected_hash:
+            raise ValueError(f"Round {r + 1}: benchmark executable changed")
         cmd = ["taskset", "-c", cpu_cores, bin_path, "--bench"] + filter_args
         out = run_command(cmd)
         if raw_dir is not None:
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            (raw_dir / f"round-{r + 1}.txt").write_text(out)
+            with (raw_dir / f"round-{r + 1}.txt").open("x") as raw_file:
+                raw_file.write(out)
+        if binary_digest(bin_path) != expected_hash:
+            raise ValueError(f"Round {r + 1}: benchmark executable changed")
         parsed = parse_divan_output(out)
         if not parsed:
             raise ValueError(f"Round {r + 1}: no benchmark results; check filters and output format")
@@ -164,21 +178,22 @@ def main():
     parser.add_argument("--filter", nargs="*", default=[], help="Filter expressions")
     parser.add_argument("--cpus", required=True, help="Allowed CPUs verified against this host topology")
     parser.add_argument("--rounds", type=int, default=3, help="Number of benchmark rounds (default: 3)")
-    parser.add_argument("--raw-dir", type=Path, help="Save raw Divan stdout for each round")
+    parser.add_argument("--raw-dir", type=Path, help="Save raw Divan stdout in a new directory (must not exist)")
     parser.add_argument("--bench-args", nargs=argparse.REMAINDER, default=[], help="Additional Divan flags; put this option last")
     parser.add_argument("--json", action="store_true", help="Output JSON format")
     args = parser.parse_args()
     if args.rounds < 1:
         parser.error("--rounds must be positive")
 
-    runs = run_benchmark_rounds(args.bin, args.filter + args.bench_args, args.cpus, args.rounds, args.raw_dir)
+    measured_hash = binary_digest(args.bin)
+    runs = run_benchmark_rounds(args.bin, args.filter + args.bench_args, args.cpus, args.rounds, args.raw_dir, measured_hash)
     agg = aggregate_runs(runs)
 
     if args.json:
         metadata = {"command": [args.bin, "--bench", *args.filter, *args.bench_args],
                     "cpus": args.cpus, "requested_rounds": args.rounds,
                     "platform": platform.platform(), "cwd": os.getcwd(),
-                    "binary_sha256": hashlib.sha256(Path(args.bin).read_bytes()).hexdigest()}
+                    "binary_sha256": measured_hash}
         revision = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
         metadata["revision"] = revision.stdout.strip() if revision.returncode == 0 else None
         metadata["git_status"] = subprocess.run(
