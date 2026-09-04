@@ -215,8 +215,8 @@ fn remove_prekeys_batch(bencher: divan::Bencher, n: usize) {
 }
 
 /// One `get_session` per device: the N+1 a group send pays on its session
-/// checkout, with no batch API to fold it into. The number a future
-/// `load_sessions_batch` has to beat.
+/// checkout when the cache is cold. The number `get_sessions_batch` has to
+/// beat: same rows through one query.
 #[divan::bench(args = BATCH_SIZES)]
 fn get_session_hit(bencher: divan::Bencher, n: usize) {
     let db = db(5, "get-hit");

@@ -574,6 +574,13 @@ pub struct SessionPlan {
     /// Empty means "no device is overridden"; otherwise one slot per device.
     /// See [`record_encryption_override`].
     encryption_overrides: Vec<Option<Jid>>,
+    /// Effective encryption address per device, parallel to the `devices` slice
+    /// the plan was built from: rendered once by
+    /// [`ensure_sessions_for_devices`] so the encrypt fan-out reuses it instead
+    /// of formatting every device a second time. Empty for plans that predate
+    /// the memo ([`SessionPlan::assume_ready`]); consumers fall back to
+    /// rendering per device when the lengths disagree.
+    effective_addresses: Vec<ProtocolAddress>,
     pub had_unregistered_device: bool,
     /// Devices the server rejected *by name*. Empty when the whole batch
     /// failed, since a batch-wide answer names nobody.
@@ -607,6 +614,7 @@ impl SessionPlan {
         Self {
             device_count,
             encryption_overrides: Vec::new(),
+            effective_addresses: Vec::new(),
             had_unregistered_device: false,
             rejected_devices: Vec::new(),
             first_error: None,
@@ -643,6 +651,26 @@ async fn has_session_or_report(
 /// is what a warm send carries.
 fn encryption_override_at(overrides: &[Option<Jid>], index: usize) -> Option<&Jid> {
     overrides.get(index).and_then(Option::as_ref)
+}
+
+/// Effective encryption address for `devices[index]`: the render
+/// [`ensure_sessions_for_devices`] memoized in the plan, cloned out (an inline
+/// value, so the clone is a memcpy, not an allocation). A plan without a memo
+/// for this device — [`SessionPlan::assume_ready`], or a length mismatch that
+/// means the plan was built for a different slice — renders on the spot, which
+/// is what every path did before the memo existed.
+fn encrypt_address_at(
+    effective_addresses: &[ProtocolAddress],
+    overrides: &[Option<Jid>],
+    devices: &[Jid],
+    index: usize,
+) -> ProtocolAddress {
+    if let Some(addr) = effective_addresses.get(index) {
+        return addr.clone();
+    }
+    encryption_override_at(overrides, index)
+        .unwrap_or(&devices[index])
+        .to_protocol_address()
 }
 
 /// Record a per-index LID override, materializing the map on its first entry.
@@ -708,14 +736,14 @@ pub async fn ensure_sessions_for_devices_resolved(
     let mut unkeyed_devices: Vec<Jid> = Vec::new();
     let mut first_error = None;
 
-    let mut reusable_addr = crate::types::jid::make_reusable_protocol_address();
-
+    // Resolve every device's LID upgrade up front: the prefetch below and the
+    // probe loop both index by device, and resolving twice would pay the
+    // mapping lookup (a boxed `async_trait` call into an async-locked cache) N
+    // extra times. A caller-resolved address that equals the device is "no
+    // upgrade", the same answer the lookup gives.
+    let mut lid_upgrades: Vec<Option<Cow<'_, Jid>>> = Vec::with_capacity(devices.len());
     for (idx, device_jid) in devices.iter().enumerate() {
-        // Resolved once per device: both the session probe and the prekey
-        // branch below want it, and the lookup is a boxed `async_trait` call
-        // into an async-locked cache. A caller-resolved address that equals
-        // the device is "no upgrade", the same answer the lookup gives.
-        let lid_jid: Option<Cow<'_, Jid>> = match signal_addresses {
+        lid_upgrades.push(match signal_addresses {
             Some(addrs) => {
                 let addr = &addrs[idx];
                 (addr != device_jid).then_some(Cow::Borrowed(addr))
@@ -725,42 +753,57 @@ pub async fn ensure_sessions_for_devices_resolved(
                 .await
                 .map(|lid_user| Cow::Owned(Jid::lid_device(lid_user, device_jid.device))),
             None => None,
-        };
+        });
+    }
+
+    // Render every candidate address once: `candidates[i]` is what `devices[i]`
+    // probes under, with the LID upgrades appended after (their positions in
+    // `lid_addr_of`). The probe loop and the encrypt fan-out both consume these
+    // renders, so no device formats its address twice per send anymore.
+    let mut candidates: Vec<ProtocolAddress> =
+        Vec::with_capacity(devices.len() + lid_upgrades.iter().filter(|u| u.is_some()).count());
+    for device_jid in devices.iter() {
+        candidates.push(device_jid.to_protocol_address());
+    }
+    let mut lid_addr_of: Vec<Option<usize>> = Vec::with_capacity(devices.len());
+    for upgrade in &lid_upgrades {
+        match upgrade {
+            Some(lid_jid) => {
+                lid_addr_of.push(Some(candidates.len()));
+                candidates.push(lid_jid.to_protocol_address());
+            }
+            None => lid_addr_of.push(None),
+        }
+    }
+
+    // One backend round-trip for the whole fan-out instead of one per cold
+    // device: the probes below (and the encrypt checkouts after them) then hit
+    // cache. Best-effort — a failure falls through to the per-device paths,
+    // which report it with its address attached.
+    if let Err(error) = stores.session_store.prefetch_sessions(&candidates).await {
+        log::debug!("session prefetch failed, falling back to per-device loads: {error}");
+    }
+
+    // The effective encryption address per device, parallel to `devices`: the
+    // single render the encrypt fan-out reuses.
+    let mut effective_addresses: Vec<ProtocolAddress> = Vec::with_capacity(devices.len());
+
+    for (idx, device_jid) in devices.iter().enumerate() {
         // WhatsApp Web's SignalAddress.toString() normalizes PN → LID before
         // creating signal addresses. We do the same: check LID session FIRST.
         // This prevents using stale PN sessions when a newer LID session exists.
-        if let Some(lid_jid) = &lid_jid {
-            lid_jid.reset_protocol_address(&mut reusable_addr);
-
-            if has_session_or_report(stores.session_store, &reusable_addr, resolver, devices)
-                .await?
-            {
-                log::debug!(
-                    "Using LID session {} for PN {} (LID-first lookup)",
-                    lid_jid.observe(),
-                    device_jid.observe()
-                );
-                record_encryption_override(
-                    &mut encryption_overrides,
-                    devices.len(),
-                    idx,
-                    lid_jid.clone().into_owned(),
-                );
-                continue;
-            }
-        }
-
-        device_jid.reset_protocol_address(&mut reusable_addr);
-        if has_session_or_report(stores.session_store, &reusable_addr, resolver, devices).await? {
-            continue;
-        }
-
-        // No session found - need to fetch prekeys and create session.
-        // Keep device_jid for prekey fetch (server returns bundles keyed by this),
-        // but normalize to LID for the actual session creation.
-        if let Some(lid_jid) = lid_jid {
+        if let (Some(lid_jid), Some(lid_addr_idx)) =
+            (lid_upgrades[idx].as_deref(), lid_addr_of[idx])
+            && has_session_or_report(
+                stores.session_store,
+                &candidates[lid_addr_idx],
+                resolver,
+                devices,
+            )
+            .await?
+        {
             log::debug!(
-                "Will create LID session {} for PN {} (no existing session)",
+                "Using LID session {} for PN {} (LID-first lookup)",
                 lid_jid.observe(),
                 device_jid.observe()
             );
@@ -768,8 +811,33 @@ pub async fn ensure_sessions_for_devices_resolved(
                 &mut encryption_overrides,
                 devices.len(),
                 idx,
-                lid_jid.into_owned(),
+                lid_jid.clone(),
             );
+            effective_addresses.push(candidates[lid_addr_idx].clone());
+            continue;
+        }
+
+        if has_session_or_report(stores.session_store, &candidates[idx], resolver, devices).await? {
+            effective_addresses.push(candidates[idx].clone());
+            continue;
+        }
+
+        // No session found - need to fetch prekeys and create session.
+        // Keep device_jid for prekey fetch (server returns bundles keyed by this),
+        // but normalize to LID for the actual session creation.
+        if let (Some(lid_jid), Some(lid_addr_idx)) = (
+            lid_upgrades[idx].clone().map(Cow::into_owned),
+            lid_addr_of[idx],
+        ) {
+            log::debug!(
+                "Will create LID session {} for PN {} (no existing session)",
+                lid_jid.observe(),
+                device_jid.observe()
+            );
+            effective_addresses.push(candidates[lid_addr_idx].clone());
+            record_encryption_override(&mut encryption_overrides, devices.len(), idx, lid_jid);
+        } else {
+            effective_addresses.push(candidates[idx].clone());
         }
         indices_needing_prekeys.push(idx);
     }
@@ -1009,6 +1077,7 @@ pub async fn ensure_sessions_for_devices_resolved(
     Ok(SessionPlan {
         device_count: devices.len(),
         encryption_overrides,
+        effective_addresses,
         had_unregistered_device: had_406,
         rejected_devices,
         first_error,
@@ -1146,6 +1215,7 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
     let SessionPlan {
         device_count: _,
         encryption_overrides,
+        effective_addresses,
         had_unregistered_device,
         rejected_devices,
         mut first_error,
@@ -1161,9 +1231,8 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
     // sorts before hashing, as does our `participant_list_hash`.
     if devices.len() <= INLINE_ENCRYPT_DEVICES {
         for (idx, device) in devices.iter().enumerate() {
-            let addr = encryption_override_at(&encryption_overrides, idx)
-                .unwrap_or(device)
-                .to_protocol_address();
+            let addr =
+                encrypt_address_at(&effective_addresses, &encryption_overrides, devices, idx);
             let res = encrypt_one_device(
                 plaintext_to_encrypt,
                 &addr,
@@ -1200,10 +1269,15 @@ async fn encrypt_for_devices_with_sessions_raw_detailed(
             // The 'static task can't borrow devices/encryption_overrides.
             let jobs: Vec<(ProtocolAddress, Jid)> = (chunk_start..chunk_end)
                 .map(|idx| {
-                    let addr = encryption_override_at(&encryption_overrides, idx)
-                        .unwrap_or(&devices[idx])
-                        .to_protocol_address();
-                    (addr, devices[idx].clone())
+                    (
+                        encrypt_address_at(
+                            &effective_addresses,
+                            &encryption_overrides,
+                            devices,
+                            idx,
+                        ),
+                        devices[idx].clone(),
+                    )
                 })
                 .collect();
             let plaintext = plaintext_arc.clone();
@@ -1315,7 +1389,10 @@ mod participant_node_tests {
 
 #[cfg(test)]
 mod encryption_override_tests {
-    use super::{SessionPlan, encryption_override_at, record_encryption_override};
+    use super::{
+        SessionPlan, encrypt_address_at, encryption_override_at, record_encryption_override,
+    };
+    use crate::types::jid::JidExt;
     use wacore_binary::Jid;
 
     fn lid(user: &str, device: u16) -> Jid {
@@ -1387,5 +1464,31 @@ mod encryption_override_tests {
             Some(&lid("100000000000009", 33))
         );
         assert!(encryption_override_at(&overrides, 1).is_none());
+    }
+
+    /// The memo hit serves the exact render `ensure` stored, so the fan-out
+    /// formats nothing; without a memo entry the address renders on the spot,
+    /// byte-identical to the pre-memo path.
+    #[test]
+    fn encrypt_address_prefers_the_memoized_render() {
+        let device = lid("100000000000001", 5);
+        let upgraded = lid("100000000000002", 5);
+        let devices = vec![device.clone()];
+        let memo = vec![upgraded.to_protocol_address()];
+        let overrides = vec![Some(upgraded.clone())];
+
+        let addr = encrypt_address_at(&memo, &overrides, &devices, 0);
+        assert_eq!(addr.as_str(), upgraded.to_protocol_address().as_str());
+        assert_ne!(addr.as_str(), device.to_protocol_address().as_str());
+
+        // No memo (e.g. `assume_ready`): the override still decides the render.
+        let empty: Vec<crate::libsignal::protocol::ProtocolAddress> = Vec::new();
+        let addr = encrypt_address_at(&empty, &overrides, &devices, 0);
+        assert_eq!(addr.as_str(), upgraded.to_protocol_address().as_str());
+
+        // Neither memo nor override: the device's own address.
+        let no_overrides: Vec<Option<Jid>> = Vec::new();
+        let addr = encrypt_address_at(&empty, &no_overrides, &devices, 0);
+        assert_eq!(addr.as_str(), device.to_protocol_address().as_str());
     }
 }

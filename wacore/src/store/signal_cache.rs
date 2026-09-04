@@ -1367,6 +1367,70 @@ impl SignalStoreCache {
             .is_some())
     }
 
+    /// Fault a send's candidate session addresses into the cache in one backend
+    /// round-trip instead of one per cold device.
+    ///
+    /// Only addresses the cache does not already know are read; a warm send
+    /// therefore pays a lock scan and no backend call at all. Each row installs
+    /// exactly as a cold [`Self::checkout_session`] would have left it —
+    /// positively, or negatively when the backend has no row (or this build
+    /// cannot decode it) — so a later checkout or probe answers from cache.
+    /// An entry that appeared while the batch was in flight is never clobbered:
+    /// it is newer than anything the batch could have read.
+    pub async fn prefetch_sessions(
+        &self,
+        addresses: &[ProtocolAddress],
+        backend: &dyn SignalStore,
+    ) -> Result<()> {
+        let (missing, since) = {
+            let state = self.lock_sessions().await;
+            let mut missing = Vec::new();
+            for address in addresses {
+                let key = address.as_str();
+                if state.cache.get(key).is_none() {
+                    missing.push(state.key_for(key));
+                }
+            }
+            (missing, state.cache.removal_seq())
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // Backend I/O outside the lock, like every other cold path.
+        let loaded = backend.get_sessions_batch(&missing).await?;
+        let mut state = self.lock_sessions().await;
+        let mut found: HashMap<&str, &[u8]> = HashMap::with_capacity(loaded.len());
+        for (address, record) in &loaded {
+            found.insert(address.as_ref(), record.as_ref());
+        }
+        for key in &missing {
+            // Raced with a concurrent install, checkout or eviction: keep the
+            // newer entry, or skip a key whose newer write was dropped behind
+            // us, rather than rewinding it with the batch's older read. This is
+            // the multi-key form of the stamp `checkout_session` re-checks.
+            if state.cache.get(key.as_ref()).is_some()
+                || state.cache.removed_since(key.as_ref(), since)
+            {
+                continue;
+            }
+            // Decoded against the current incarnation, which may have bumped
+            // while the batch was in flight; the rows are still the backend's
+            // truth either way.
+            let record = found
+                .get(key.as_ref())
+                .copied()
+                .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
+                .map(Arc::new);
+            let entry = match &record {
+                Some(record) => SessionEntry::Present(record.clone()),
+                None => SessionEntry::Absent,
+            };
+            state.cache.insert(key.clone(), entry);
+        }
+        state.evict_if_needed(self.max_entries);
+        Ok(())
+    }
+
     // === Identities ===
 
     pub async fn get_identity(
@@ -3525,6 +3589,66 @@ mod sender_key_lock_tests {
             Some(false),
             "negative-cached entry must answer synchronously"
         );
+    }
+
+    /// A send faults its whole fan-out with one backend read: hits install as
+    /// present, misses as absent, and afterwards every probe and checkout is
+    /// served synchronously with no backend consult left to make.
+    #[tokio::test]
+    async fn prefetch_faults_a_whole_fanout_in_one_backend_read() {
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let writer = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let present: Vec<ProtocolAddress> = (0..4u8)
+            .map(|i| ProtocolAddress::new(&format!("199955510{i}@c.us"), 0.into()))
+            .collect();
+        for addr in &present {
+            writer.put_session(addr, SessionRecord::new_fresh()).await;
+        }
+        writer.flush(&backend).await.expect("seed flush");
+
+        let cache = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let missing = ProtocolAddress::new("19995551999@c.us", 0.into());
+        let fanout: Vec<ProtocolAddress> = present
+            .iter()
+            .cloned()
+            .chain(std::iter::once(missing.clone()))
+            .collect();
+        cache
+            .prefetch_sessions(&fanout, &backend)
+            .await
+            .expect("prefetch");
+
+        for addr in &present {
+            assert_eq!(
+                cache.try_has_session(addr),
+                Some(true),
+                "a prefetched hit must answer synchronously"
+            );
+            let (record, checkout) = cache
+                .try_checkout_session(addr)
+                .expect("lock free")
+                .expect("cached hit checks out");
+            assert!(record.is_some(), "the prefetched row must decode");
+            cache.cancel_session_checkout(addr, checkout);
+        }
+        assert_eq!(
+            cache.try_has_session(&missing),
+            Some(false),
+            "a prefetched miss must answer negatively without a backend read"
+        );
+
+        // A warm prefetch is only the lock scan: everything is already known.
+        cache
+            .prefetch_sessions(&fanout, &backend)
+            .await
+            .expect("warm prefetch");
+        assert_eq!(cache.try_has_session(&missing), Some(false));
     }
 
     #[tokio::test]

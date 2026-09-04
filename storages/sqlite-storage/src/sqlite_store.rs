@@ -2178,6 +2178,36 @@ impl SignalStore for SqliteStore {
             .map(Bytes::from))
     }
 
+    /// One read query for the whole fan-out: the per-address `get_session` is a
+    /// pool checkout plus query each, and a group send faults one per device on
+    /// a cold cache. Chunked like `delete_sessions_batch`: a large group
+    /// carries more addresses than SQLite's host-parameter limit. Returns only
+    /// the addresses that exist, in backend order.
+    async fn get_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<Vec<(Arc<str>, Bytes)>> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let device_id = self.device_id;
+        let items = Arc::new(addresses.to_vec());
+        self.read_query(move |conn| {
+            let mut out = Vec::with_capacity(items.len());
+            for chunk in items.chunks(ID_PARAM_CHUNK) {
+                let rows: Vec<(String, Vec<u8>)> = sessions::table
+                    .select((sessions::address, sessions::record))
+                    .filter(sessions::address.eq_any(chunk.iter().map(|a| a.as_ref())))
+                    .filter(sessions::device_id.eq(device_id))
+                    .load(conn)
+                    .map_err(|e| StoreError::Database(Box::new(e)))?;
+                out.extend(
+                    rows.into_iter()
+                        .map(|(address, record)| (Arc::from(address), Bytes::from(record))),
+                );
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn has_session(&self, address: &str) -> Result<bool> {
         // Not the cache's has_session, which reads get_session instead. This one
         // is only reached through Device::contains_session, whose single caller
@@ -5195,6 +5225,46 @@ mod tests {
         store.put_sessions_batch(&[]).await.unwrap();
         store.put_identities_batch(&[]).await.unwrap();
         store.put_sender_keys_batch(&[]).await.unwrap();
+    }
+
+    /// The batch read is one query for the whole fan-out: hits come back keyed
+    /// as requested, misses are omitted (never returned empty), and an empty
+    /// request short-circuits without touching the database.
+    #[tokio::test]
+    async fn get_sessions_batch_reads_hits_in_one_query() {
+        use std::sync::Arc;
+        let store = create_test_store().await;
+
+        let sessions: Vec<(Arc<str>, Bytes)> = (0..5u8)
+            .map(|i| {
+                (
+                    Arc::from(format!("batchuser{i}@s.whatsapp.net").as_str()),
+                    Bytes::from(vec![i; 8]),
+                )
+            })
+            .collect();
+        store.put_sessions_batch(&sessions).await.unwrap();
+
+        let missing: Arc<str> = Arc::from("nobody@s.whatsapp.net");
+        let mut requested: Vec<Arc<str>> = sessions.iter().map(|(addr, _)| addr.clone()).collect();
+        requested.insert(2, missing.clone());
+        let loaded = store.get_sessions_batch(&requested).await.unwrap();
+        assert_eq!(loaded.len(), sessions.len(), "misses are omitted");
+        for (addr, bytes) in &sessions {
+            assert!(
+                loaded.iter().any(|(a, b)| a == addr && b == bytes),
+                "hit for {addr} must come back with its record"
+            );
+        }
+
+        assert!(
+            store
+                .get_sessions_batch(&[missing])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.get_sessions_batch(&[]).await.unwrap().is_empty());
     }
 
     #[test]

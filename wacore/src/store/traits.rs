@@ -591,6 +591,21 @@ pub trait SignalStore: Send + Sync {
         Ok(())
     }
 
+    /// Load multiple encrypted sessions in a single backend operation.
+    /// Returns only the addresses that exist, like [`Self::load_prekeys_batch`].
+    /// Default implementation falls back to individual `get_session` calls.
+    /// Addresses are `Arc<str>` so a caller holding the cache's keys passes
+    /// shared refs without allocating a `String` per entry.
+    async fn get_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<Vec<(Arc<str>, Bytes)>> {
+        let mut result = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            if let Some(session) = self.get_session(address).await? {
+                result.push((address.clone(), session));
+            }
+        }
+        Ok(result)
+    }
+
     /// Delete a session.
     async fn delete_session(&self, address: &str) -> Result<()>;
 

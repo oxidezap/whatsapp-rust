@@ -312,6 +312,19 @@ impl SignalStore for InMemoryBackend {
         Ok(self.state.lock().await.sessions.get(address).cloned())
     }
 
+    /// One lock acquisition for the whole fan-out instead of one per device.
+    /// Returns only the addresses that exist, like the default.
+    async fn get_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<Vec<(Arc<str>, Bytes)>> {
+        let state = self.state.lock().await;
+        let mut result = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            if let Some(session) = state.sessions.get(address.as_ref()) {
+                result.push((address.clone(), session.clone()));
+            }
+        }
+        Ok(result)
+    }
+
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()> {
         self.state
             .lock()
@@ -1510,6 +1523,40 @@ mod tests {
     #[test]
     fn in_memory_backend_implements_backend() {
         is_backend::<InMemoryBackend>();
+    }
+
+    /// The batch read returns only what exists, keyed as requested: a send's
+    /// prefetch tells hits from misses by set difference.
+    #[tokio::test]
+    async fn get_sessions_batch_returns_only_hits() {
+        let backend = InMemoryBackend::new();
+        let first: Arc<str> = "15550000001:1@s.whatsapp.net".into();
+        let second: Arc<str> = "15550000002:2@s.whatsapp.net".into();
+        let missing: Arc<str> = "15550000003:3@s.whatsapp.net".into();
+        backend
+            .put_sessions_batch(&[
+                (first.clone(), Bytes::from_static(b"first")),
+                (second.clone(), Bytes::from_static(b"second")),
+            ])
+            .await
+            .unwrap();
+
+        let loaded = backend
+            .get_sessions_batch(&[first.clone(), missing.clone(), second.clone()])
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 2, "misses are omitted, not returned empty");
+        assert_eq!(loaded[0], (first, Bytes::from_static(b"first")));
+        assert_eq!(loaded[1], (second, Bytes::from_static(b"second")));
+
+        assert!(
+            backend
+                .get_sessions_batch(&[missing])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(backend.get_sessions_batch(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]

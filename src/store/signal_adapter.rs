@@ -139,6 +139,22 @@ impl SessionStore for SessionAdapter {
             .map_err(signal_err("backend"))
     }
 
+    /// Collapse the send's N+1 session loads into one backend batch by faulting
+    /// the fan-out's candidate addresses into the cache before it probes them
+    /// one by one. Best-effort by contract: the per-device paths still serve
+    /// anything this misses.
+    async fn prefetch_sessions(
+        &self,
+        addresses: &[ProtocolAddress],
+    ) -> Result<(), SignalProtocolError> {
+        let device = self.0.device();
+        self.0
+            .cache
+            .prefetch_sessions(addresses, &*device.backend)
+            .await
+            .map_err(signal_err("backend"))
+    }
+
     async fn load_session_for_update(
         &self,
         address: &ProtocolAddress,
