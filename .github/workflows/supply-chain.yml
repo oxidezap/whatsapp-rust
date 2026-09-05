@@ -42,6 +42,8 @@ jobs:
       # needs neither protoc nor ALSA nor a warm target dir.
       - name: Run cargo-deny
         run: cargo deny --all-features check
+      - name: Audit host tooling dependencies
+        run: cargo deny --manifest-path tools/xtask/Cargo.toml --all-features check
 
   semver-checks:
     name: Semver Checks (informational)

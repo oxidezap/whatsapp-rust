@@ -1,11 +1,11 @@
-//! Oracle coordination and lossless fixtures. The guest implementation stays in unwasm.
+//! MLOW oracle derivation, lossless fixtures and independent C comparison.
 use anyhow::{Context, Result, ensure};
 use clap::Subcommand;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use xtask_support::{capture, cbor, read_json, run as execute, sha256, write, write_json};
+use xtask_support::{capture, cbor, run as execute, sha256, write, write_json};
 const DATA: &str = "wacore/src/voip/mlow/testdata";
 const SOURCE: &str = "0aa87c64ffd07fb288a7db8df5c46c30e92ff7fa";
 #[derive(Subcommand)]
@@ -17,18 +17,58 @@ pub enum Task {
         #[arg(long)]
         check: bool,
     },
+    /// Fetch the J/S wasm captures required by the MLOW derivation.
+    Fetch,
+    /// Execute and verify all locked MLOW derivations.
+    Verify {
+        #[arg(long, default_value = "all", value_parser = ["all", "JgwtTQVeWPm", "S_ivh1PriOA"])]
+        capture: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        from_derived: bool,
+        #[arg(long, conflicts_with = "refresh_spec_hashes")]
+        update_lock: bool,
+        #[arg(long)]
+        refresh_spec_hashes: bool,
+    },
+    /// Generate every derived spec or check it against its recipe.
+    Specs {
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        check: bool,
+    },
+    /// Generate one leaf trace specification.
+    Spec {
+        kind: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 330)]
+        lsf_count: usize,
+        #[arg(long, default_value_t = 1099)]
+        end: usize,
+    },
+    /// Assemble captured snapshots into fixture JSON.
+    Assemble {
+        kind: Option<String>,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        run: Option<PathBuf>,
+        #[arg(long, alias = "lsf-output", alias = "harm-output")]
+        secondary: Option<PathBuf>,
+        #[arg(long, default_value_t = 330)]
+        lsf_count: usize,
+    },
     /// Re-derive and verify every primary fixture with the pinned Rust oracle task.
     Regenerate {
-        #[arg(long)]
-        oracle_repo: PathBuf,
         #[arg(long)]
         out: Option<PathBuf>,
         #[arg(long)]
         from_derived: Option<PathBuf>,
         #[arg(long)]
         check: bool,
-        #[arg(long)]
-        allow_tool_worktree: bool,
     },
     /// Build the independent C reference harness and regenerate its packet/PCM pairs.
     CReference {
@@ -195,68 +235,15 @@ fn pack_legacy(root: &Path, check: bool) -> Result<()> {
     println!("C audit corpus verified");
     Ok(())
 }
-fn regenerate(
-    root: &Path,
-    tool: &Path,
-    out: &Path,
-    cached: bool,
-    check: bool,
-    allow_dirty: bool,
-) -> Result<()> {
-    let tool = tool.canonicalize()?;
-    let pin = read_json(&root.join("scripts/mlow-vectors/oracle.lock.json"))?;
-    let revision = String::from_utf8(
-        capture(
-            Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&tool),
-        )?
-        .stdout,
-    )?
-    .trim()
-    .to_owned();
-    if !allow_dirty {
-        ensure!(
-            pin["revision"].as_str() == Some(&revision),
-            "oracle revision differs: {revision}"
-        );
-        execute(
-            Command::new("git")
-                .args([
-                    "diff",
-                    "--quiet",
-                    "HEAD",
-                    "--",
-                    "crates",
-                    "tools",
-                    "specs",
-                    "Cargo.lock",
-                    "Cargo.toml",
-                    ".cargo/config.toml",
-                    "wasm.lock.json",
-                ])
-                .current_dir(&tool),
-        )?;
-    }
+fn regenerate(root: &Path, out: &Path, cached: bool, check: bool) -> Result<()> {
+    let specs = root.join("tools/oracle-core/specs");
+    let lock_sha256 = sha256(&std::fs::read(specs.join("mlow.lock.json"))?);
     ensure!(
-        sha256(&std::fs::read(tool.join("specs/mlow.lock.json"))?)
-            == pin["derivation_lock_sha256"].as_str().context("lock pin")?,
-        "derivation lock drift"
-    );
-    ensure!(
-        std::fs::read(tool.join("specs/synth_mic.raw"))?
+        std::fs::read(specs.join("synth_mic.raw"))?
             == std::fs::read(root.join(DATA).join("synth_mic.raw"))?,
         "synthetic input mismatch"
     );
-    let mut cmd = Command::new("cargo");
-    cmd.args(["+stable", "xt", "mlow", "verify", "--out"])
-        .arg(out)
-        .current_dir(&tool)
-        .env("CARGO_ENCODED_RUSTFLAGS", "");
-    if cached {
-        cmd.arg("--from-derived");
-    }
-    execute(&mut cmd)?;
+    super::derive_mlow::verify(root, out, "all", cached, false, false)?;
     let mut metadata = json!({});
     let data = root.join(DATA);
     for leaf in [
@@ -301,11 +288,14 @@ fn regenerate(
         }
         metadata[name] = json!({"sha256":sha256(&payload),"bytes":payload.len()});
     }
-    if !check {
-        write_json(
-            &data.join("wasm-fixtures.json"),
-            &json!({"derivation_lock_sha256":pin["derivation_lock_sha256"],"files":metadata}),
-        )?;
+    let manifest = json!({"derivation_lock_sha256":lock_sha256,"files":metadata});
+    if check {
+        ensure!(
+            xtask_support::read_json(&data.join("wasm-fixtures.json"))? == manifest,
+            "wasm fixture manifest drift"
+        );
+    } else {
+        write_json(&data.join("wasm-fixtures.json"), &manifest)?;
     }
     println!("Wasm fixtures verified");
     Ok(())
@@ -448,12 +438,49 @@ pub fn run(root: &Path, task: Task) -> Result<()> {
             Ok(())
         }
         Task::PackLegacy { check } => pack_legacy(root, check),
+        Task::Fetch => super::derive_mlow::fetch(root, Some(&["JgwtTQVeWPm", "S_ivh1PriOA"])),
+        Task::Verify {
+            capture,
+            out,
+            from_derived,
+            update_lock,
+            refresh_spec_hashes,
+        } => super::derive_mlow::verify(
+            root,
+            &std::path::absolute(out.unwrap_or(root.join(".derive-mlow/wasm")))?,
+            &capture,
+            from_derived,
+            update_lock,
+            refresh_spec_hashes,
+        ),
+        Task::Specs { out, check } => super::derive_mlow::specs(
+            root,
+            &out.unwrap_or(root.join("tools/oracle-core/specs")),
+            check,
+        ),
+        Task::Spec {
+            kind,
+            out,
+            lsf_count,
+            end,
+        } => super::derive_mlow::spec(root, &kind, &out, lsf_count, end),
+        Task::Assemble {
+            kind,
+            out,
+            run,
+            secondary,
+            lsf_count,
+        } => super::derive_mlow::assemble(
+            kind.as_deref(),
+            run.as_deref(),
+            &out,
+            secondary.as_deref(),
+            lsf_count,
+        ),
         Task::Regenerate {
-            oracle_repo,
             out,
             from_derived,
             check,
-            allow_tool_worktree,
         } => {
             let cached = from_derived.is_some();
             let out = std::path::absolute(
@@ -461,7 +488,7 @@ pub fn run(root: &Path, task: Task) -> Result<()> {
                     .or(out)
                     .unwrap_or(root.join(".derive-mlow/wasm")),
             )?;
-            regenerate(root, &oracle_repo, &out, cached, check, allow_tool_worktree)
+            regenerate(root, &out, cached, check)
         }
         Task::CReference { check } => c_reference(root, check),
     }

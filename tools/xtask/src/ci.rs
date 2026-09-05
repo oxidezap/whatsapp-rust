@@ -53,8 +53,6 @@ pub enum Task {
         #[arg(long, default_value = ".")]
         out_dir: PathBuf,
     },
-    /// Validate and publish the pinned oracle revision as a GitHub Actions output.
-    OracleRevision,
 }
 fn metadata(root: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(
@@ -269,19 +267,6 @@ pub fn run(root: &Path, task: Task) -> Result<u8> {
             .as_deref(),
             &out_dir,
         )?,
-        Task::OracleRevision => {
-            let pin =
-                xtask_support::read_json(&root.join("scripts/mlow-vectors/oracle.lock.json"))?;
-            let revision = pin["revision"].as_str().context("oracle revision")?;
-            ensure!(
-                revision.len() == 40
-                    && revision
-                        .bytes()
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-                "invalid revision"
-            );
-            github_output("revision", revision)?;
-        }
     }
     Ok(0)
 }

@@ -6,7 +6,11 @@ runtime libraries do not depend on this crate.
 | Command | Purpose |
 |---|---|
 | `cargo xt proto-desc` / `tables-desc` / `wire-desc` | Regenerate protobuf descriptors and hash sidecars |
-| `cargo xt mlow regenerate --oracle-repo PATH --check` | Run the pinned unwasm Rust tasks and verify the primary corpus |
+| `cargo xt mlow regenerate --check` | Run the local WhatsApp wasm oracle and verify the primary corpus |
+| `cargo xt mlow verify` | Re-derive all locked J/S outputs |
+| `cargo xt mlow specs --check` | Check generated specs against their recipes |
+| `cargo xt oracle fetch` | Restore every hash-pinned WhatsApp wasm capture |
+| `cargo xt oracle --help` | Capture-specific diagnostic patches |
 | `cargo xt mlow pack SOURCE OUTPUT` | Lossless canonical CBOR + zstd |
 | `cargo xt mlow pack-legacy --check` | Verify independent historical C auditors |
 | `cargo xt mlow c-reference --check` | Build/run the C auditor harness and compare packet/PCM pairs |
@@ -26,11 +30,11 @@ The C reference remains an independent external oracle, selected through
 Cargo, Git and deployment tools remain external programs; task logic does not
 invoke Python or maintained shell scripts.
 
-`xtask-support` is pinned to the unwasm repository. It shares descriptors,
-checked I/O, hashes, binary readers and CBOR/zstd without linking the wasm engine
-into these tasks. The unwasm command validates cached runs itself, so neither
-repository imports another language's implementation or duplicates manifest
-validation. Stable oracle builds clear inherited nightly-only rustflags.
+`xtask-support` is local and contains descriptors, checked I/O, binary readers
+and canonical CBOR/zstd. Capture transport comes from whatspec's commit-pinned
+`wa-store`; static wasm analysis comes from commit-pinned `unwasm-core`.
+`oracle-core`, both dependencies and all recipes remain host-only workspace
+tools outside `default-members`.
 
 Metadata commands write only machine-readable results to stdout. Timed tests
 require `NEXTEST_PROFILE` and `TEST_TIMINGS_DIR`. GitHub workflow tasks use the

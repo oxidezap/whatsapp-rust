@@ -1,7 +1,9 @@
 //! Rust repository automation: `cargo xt`.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 mod ci;
+mod derive_mlow;
 mod mlow;
+mod oracle_patch;
 mod size;
 mod workflow;
 use anyhow::Result;
@@ -37,6 +39,11 @@ enum Task {
         #[command(subcommand)]
         task: mlow::Task,
     },
+    /// WhatsApp wasm capture acquisition and diagnostic patching.
+    Oracle {
+        #[command(subcommand)]
+        task: oracle_patch::Task,
+    },
     /// CI metadata, timed tests, image pins, binary measurements and reporting.
     Ci {
         #[command(subcommand)]
@@ -66,6 +73,10 @@ fn main() -> Result<std::process::ExitCode> {
         }
         Task::Mlow { task } => {
             mlow::run(&root, task)?;
+            0
+        }
+        Task::Oracle { task } => {
+            oracle_patch::run(&root, task)?;
             0
         }
         Task::Ci { task } => ci::run(&root, task)?,

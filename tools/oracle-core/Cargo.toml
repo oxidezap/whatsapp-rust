@@ -1,0 +1,50 @@
+[package]
+name = "oracle-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version = "1.95"
+license.workspace = true
+publish.workspace = true
+description = "Loads and inspects WhatsApp Web's WebAssembly modules as an executable oracle"
+
+[dependencies]
+anyhow = { workspace = true }
+unwasm-core = { workspace = true }
+wasmparser = { workspace = true }
+wasm-encoder = { workspace = true }
+wasmtime = { workspace = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+hex = "0.4.3"
+
+# Not `workspace = true`: `unsafe_code` is `deny` here rather than the
+# workspace's `forbid`, because reading wasmtime's shared memory requires it and
+# every site carries a SAFETY note. Lints are per-package, so the decompiler
+# half keeps `forbid` without this crate being relaxed and without it being
+# forced to lie. Everything else follows the workspace.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# This package runs only on native Wasmtime hosts. The workspace bans these in
+# portable runtime crates because ESP32 lacks native 64-bit atomics and its
+# clock is abstracted; neither constraint applies to this tooling process.
+disallowed_methods = "allow"
+disallowed_types = "allow"
+
+[dev-dependencies]
+base64 = "0.23.0"
+# Used only to build wire-format stanzas for the signaling tests: the oracle is
+# fed the same bytes whatsapp-rust would emit. `simd` needs nightly, and this is
+# not a hot path.
+#
+# From crates.io rather than a path to a sibling whatsapp-rust checkout: as a
+# path it was a dev-dependency that a fresh clone could not resolve, so nothing
+# built at all — not the tests, not the `oracle` binary, not `cargo metadata`.
+wacore-binary = { workspace = true }
+wasmtime.workspace = true
+wasm-encoder = { workspace = true }
+wacore = { workspace = true }

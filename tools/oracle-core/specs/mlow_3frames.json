@@ -1,0 +1,956 @@
+{
+  "comment": [
+    "Derive MLOW vectors from the shipped VoIP engine (JgwtTQVeWPm).",
+    "Pipeline: ctors -> TLS -> pj-log mutex -> pj_init -> smpl global init (slot 7242 trampoline) -> forged pjmedia structs + minimal pool -> opus_codec_open -> opus_codec_encode/decode.",
+    "Every index is a hint settled by must_hold_string; module pinned by hash. Same bytes + same spec = same outputs.",
+    "Opens the codec (rc 0).",
+    "3-frame vector: open once, then per frame k: encode synth frame k -> exact packet (read_reg on pktlen) -> decode back. Encoder state evolves across calls in one instance.",
+    "Inputs: tools/oracle-core/specs/frames3.raw = synth_mic.raw frames 0-2 concatenated (3x1920 s16le @16kHz).",
+    "Locked 2026-09-04: packet+pcm hashes below are the vector. Any byte drift fails here, not downstream."
+  ],
+  "module": {
+    "id": "JgwtTQVeWPm",
+    "sha256": "97259423aea19cc30c1771478e035105cb0d0e64ab4b0297741b62d01deac8db",
+    "size": 10650934
+  },
+  "functions": {
+    "pj_init": {
+      "index_hint": 9981,
+      "must_hold_string": "pj_init"
+    },
+    "log_mutex_init": {
+      "index_hint": 9848
+    },
+    "smpl_init": {
+      "index_hint": 10566
+    },
+    "opus_open": {
+      "index_hint": 6658,
+      "must_hold_string": "opus_codec_open"
+    },
+    "opus_encode": {
+      "index_hint": 6666,
+      "must_hold_string": "opus_codec_encode"
+    },
+    "opus_decode": {
+      "index_hint": 6670,
+      "must_hold_string": "opus_codec_decode"
+    }
+  },
+  "steps": [
+    {
+      "op": "instantiate"
+    },
+    {
+      "op": "run_ctors"
+    },
+    {
+      "op": "log_ring",
+      "len": 1048576
+    },
+    {
+      "op": "call",
+      "func": "_emscripten_tls_init",
+      "results": [
+        "tls"
+      ]
+    },
+    {
+      "op": "call_table",
+      "func": "log_mutex_init",
+      "results": [
+        "lrc"
+      ]
+    },
+    {
+      "op": "call_table",
+      "func": "pj_init",
+      "results": [
+        "pjrc"
+      ]
+    },
+    {
+      "op": "assert_reg",
+      "reg": "$pjrc",
+      "equals": 0
+    },
+    {
+      "op": "call_table",
+      "func": "smpl_init"
+    },
+    {
+      "op": "read_u32",
+      "ptr": 1719408,
+      "as": "smpl_flag"
+    },
+    {
+      "op": "assert_reg",
+      "reg": "$smpl_flag",
+      "equals": 1
+    },
+    {
+      "op": "malloc",
+      "as": "codec",
+      "len": 64
+    },
+    {
+      "op": "fill",
+      "ptr": "$codec",
+      "len": 64,
+      "byte": 0
+    },
+    {
+      "op": "malloc",
+      "as": "state",
+      "len": 1024
+    },
+    {
+      "op": "fill",
+      "ptr": "$state",
+      "len": 1024,
+      "byte": 0
+    },
+    {
+      "op": "malloc",
+      "as": "attr",
+      "len": 1184
+    },
+    {
+      "op": "fill",
+      "ptr": "$attr",
+      "len": 1184,
+      "byte": 0
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 8,
+      "hex": "bd130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 12,
+      "hex": "bc130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 16,
+      "hex": "bb130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 20,
+      "hex": "ba130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 24,
+      "hex": "b9130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 28,
+      "hex": "b8130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 32,
+      "hex": "b7130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 36,
+      "hex": "b6130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 40,
+      "hex": "b5130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 44,
+      "hex": "b4130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 48,
+      "hex": "b3130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 52,
+      "hex": "b2130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 56,
+      "hex": "b1130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 60,
+      "hex": "b0130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 64,
+      "hex": "af130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 68,
+      "hex": "ae130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 72,
+      "hex": "ad130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 76,
+      "hex": "ac130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 80,
+      "hex": "ab130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 84,
+      "hex": "aa130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 88,
+      "hex": "a9130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 92,
+      "hex": "a8130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 96,
+      "hex": "a7130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 100,
+      "hex": "a6130000"
+    },
+    {
+      "op": "write",
+      "ptr": "$state",
+      "at": 816,
+      "hex": "01000000"
+    },
+    {
+      "op": "store",
+      "ptr": "$codec",
+      "at": 8,
+      "reg": "$state"
+    },
+    {
+      "op": "write",
+      "ptr": "$codec",
+      "at": 12,
+      "hex": "8c031500"
+    },
+    {
+      "op": "write",
+      "ptr": "$codec",
+      "at": 20,
+      "hex": "c0071400"
+    },
+    {
+      "op": "write",
+      "ptr": "$attr",
+      "at": 0,
+      "hex": "803e0000"
+    },
+    {
+      "op": "write",
+      "ptr": "$attr",
+      "at": 4,
+      "hex": "01000000"
+    },
+    {
+      "op": "write",
+      "ptr": "$attr",
+      "at": 26,
+      "hex": "3c00"
+    },
+    {
+      "op": "write",
+      "ptr": "$attr",
+      "at": 36,
+      "hex": "01"
+    },
+    {
+      "op": "write",
+      "ptr": "$attr",
+      "at": 1116,
+      "hex": "03000000"
+    },
+    {
+      "op": "malloc",
+      "as": "encbuf",
+      "len": 1000000
+    },
+    {
+      "op": "malloc",
+      "as": "blk",
+      "len": 32
+    },
+    {
+      "op": "fill",
+      "ptr": "$blk",
+      "len": 32,
+      "byte": 0
+    },
+    {
+      "op": "malloc",
+      "as": "pool",
+      "len": 128
+    },
+    {
+      "op": "fill",
+      "ptr": "$pool",
+      "len": 128,
+      "byte": 0
+    },
+    {
+      "op": "store",
+      "ptr": "$blk",
+      "at": 12,
+      "reg": "$encbuf"
+    },
+    {
+      "op": "add",
+      "reg": "$encbuf",
+      "by": 1000000,
+      "as": "bufend"
+    },
+    {
+      "op": "store",
+      "ptr": "$blk",
+      "at": 16,
+      "reg": "$bufend"
+    },
+    {
+      "op": "add",
+      "reg": "$pool",
+      "by": 48,
+      "as": "anchor"
+    },
+    {
+      "op": "store",
+      "ptr": "$blk",
+      "at": 4,
+      "reg": "$anchor"
+    },
+    {
+      "op": "store",
+      "ptr": "$pool",
+      "at": 52,
+      "reg": "$blk"
+    },
+    {
+      "op": "store",
+      "ptr": "$state",
+      "at": 0,
+      "reg": "$pool"
+    },
+    {
+      "op": "call_table",
+      "func": "opus_open",
+      "args": [
+        "$codec",
+        "$attr"
+      ],
+      "results": [
+        "rc"
+      ]
+    },
+    {
+      "op": "assert_reg",
+      "reg": "$rc",
+      "equals": 0
+    },
+    {
+      "op": "malloc",
+      "as": "synth",
+      "len": 5760
+    },
+    {
+      "op": "write_file",
+      "ptr": "$synth",
+      "file": "tools/oracle-core/specs/frames3.raw"
+    },
+    {
+      "op": "malloc",
+      "as": "obuf",
+      "len": 1024
+    },
+    {
+      "op": "fill",
+      "ptr": "$obuf",
+      "len": 1024,
+      "byte": 0
+    },
+    {
+      "op": "malloc",
+      "as": "pout",
+      "len": 1920
+    },
+    {
+      "op": "fill",
+      "ptr": "$pout",
+      "len": 1920,
+      "byte": 0
+    },
+    {
+      "op": "add",
+      "reg": "$synth",
+      "by": 0,
+      "as": "pk0"
+    },
+    {
+      "op": "malloc",
+      "as": "in0",
+      "len": 32
+    },
+    {
+      "op": "fill",
+      "ptr": "$in0",
+      "len": 32,
+      "byte": 0
+    },
+    {
+      "op": "store",
+      "ptr": "$in0",
+      "at": 4,
+      "reg": "$pk0"
+    },
+    {
+      "op": "store",
+      "ptr": "$in0",
+      "at": 8,
+      "reg": "$pk0"
+    },
+    {
+      "op": "write",
+      "ptr": "$in0",
+      "at": 16,
+      "hex": "80070000"
+    },
+    {
+      "op": "malloc",
+      "as": "of0",
+      "len": 64
+    },
+    {
+      "op": "fill",
+      "ptr": "$of0",
+      "len": 64,
+      "byte": 0
+    },
+    {
+      "op": "store",
+      "ptr": "$of0",
+      "at": 4,
+      "reg": "$obuf"
+    },
+    {
+      "op": "store",
+      "ptr": "$of0",
+      "at": 8,
+      "reg": "$obuf"
+    },
+    {
+      "op": "write",
+      "ptr": "$of0",
+      "at": 16,
+      "hex": "00040000"
+    },
+    {
+      "op": "call_table",
+      "func": "opus_encode",
+      "args": [
+        "$codec",
+        "$in0",
+        400,
+        "$of0"
+      ],
+      "results": [
+        "erc0"
+      ]
+    },
+    {
+      "op": "read_u32",
+      "ptr": "$of0",
+      "at": 16,
+      "as": "pl0"
+    },
+    {
+      "op": "read",
+      "ptr": "$obuf",
+      "len": "$pl0",
+      "out": "packet0.bin"
+    },
+    {
+      "op": "malloc",
+      "as": "df0",
+      "len": 64
+    },
+    {
+      "op": "fill",
+      "ptr": "$df0",
+      "len": 64,
+      "byte": 0
+    },
+    {
+      "op": "malloc",
+      "as": "of20",
+      "len": 64
+    },
+    {
+      "op": "fill",
+      "ptr": "$of20",
+      "len": 64,
+      "byte": 0
+    },
+    {
+      "op": "store",
+      "ptr": "$df0",
+      "at": 8,
+      "reg": "$obuf"
+    },
+    {
+      "op": "store",
+      "ptr": "$df0",
+      "at": 16,
+      "reg": "$pl0"
+    },
+    {
+      "op": "store",
+      "ptr": "$of20",
+      "at": 8,
+      "reg": "$pout"
+    },
+    {
+      "op": "write",
+      "ptr": "$of20",
+      "at": 16,
+      "hex": "80070000"
+    },
+    {
+      "op": "call_table",
+      "func": "opus_decode",
+      "args": [
+        "$codec",
+        "$df0",
+        1920,
+        "$of20"
+      ],
+      "results": [
+        "drc0"
+      ]
+    },
+    {
+      "op": "read",
+      "ptr": "$pout",
+      "len": 1920,
+      "out": "decoded0.raw"
+    },
+    {
+      "op": "print",
+      "regs": [
+        "$erc0",
+        "$pl0",
+        "$drc0"
+      ]
+    },
+    {
+      "op": "add",
+      "reg": "$synth",
+      "by": 1920,
+      "as": "pk1"
+    },
+    {
+      "op": "malloc",
+      "as": "in1",
+      "len": 32
+    },
+    {
+      "op": "fill",
+      "ptr": "$in1",
+      "len": 32,
+      "byte": 0
+    },
+    {
+      "op": "store",
+      "ptr": "$in1",
+      "at": 4,
+      "reg": "$pk1"
+    },
+    {
+      "op": "store",
+      "ptr": "$in1",
+      "at": 8,
+      "reg": "$pk1"
+    },
+    {
+      "op": "write",
+      "ptr": "$in1",
+      "at": 16,
+      "hex": "80070000"
+    },
+    {
+      "op": "malloc",
+      "as": "of1",
+      "len": 64
+    },
+    {
+      "op": "fill",
+      "ptr": "$of1",
+      "len": 64,
+      "byte": 0
+    },
+    {
+      "op": "store",
+      "ptr": "$of1",
+      "at": 4,
+      "reg": "$obuf"
+    },
+    {
+      "op": "store",
+      "ptr": "$of1",
+      "at": 8,
+      "reg": "$obuf"
+    },
+    {
+      "op": "write",
+      "ptr": "$of1",
+      "at": 16,
+      "hex": "00040000"
+    },
+    {
+      "op": "call_table",
+      "func": "opus_encode",
+      "args": [
+        "$codec",
+        "$in1",
+        400,
+        "$of1"
+      ],
+      "results": [
+        "erc1"
+      ]
+    },
+    {
+      "op": "read_u32",
+      "ptr": "$of1",
+      "at": 16,
+      "as": "pl1"
+    },
+    {
+      "op": "read",
+      "ptr": "$obuf",
+      "len": "$pl1",
+      "out": "packet1.bin"
+    },
+    {
+      "op": "malloc",
+      "as": "df1",
+      "len": 64
+    },
+    {
+      "op": "fill",
+      "ptr": "$df1",
+      "len": 64,
+      "byte": 0
+    },
+    {
+      "op": "malloc",
+      "as": "of21",
+      "len": 64
+    },
+    {
+      "op": "fill",
+      "ptr": "$of21",
+      "len": 64,
+      "byte": 0
+    },
+    {
+      "op": "store",
+      "ptr": "$df1",
+      "at": 8,
+      "reg": "$obuf"
+    },
+    {
+      "op": "store",
+      "ptr": "$df1",
+      "at": 16,
+      "reg": "$pl1"
+    },
+    {
+      "op": "store",
+      "ptr": "$of21",
+      "at": 8,
+      "reg": "$pout"
+    },
+    {
+      "op": "write",
+      "ptr": "$of21",
+      "at": 16,
+      "hex": "80070000"
+    },
+    {
+      "op": "call_table",
+      "func": "opus_decode",
+      "args": [
+        "$codec",
+        "$df1",
+        1920,
+        "$of21"
+      ],
+      "results": [
+        "drc1"
+      ]
+    },
+    {
+      "op": "read",
+      "ptr": "$pout",
+      "len": 1920,
+      "out": "decoded1.raw"
+    },
+    {
+      "op": "print",
+      "regs": [
+        "$erc1",
+        "$pl1",
+        "$drc1"
+      ]
+    },
+    {
+      "op": "add",
+      "reg": "$synth",
+      "by": 3840,
+      "as": "pk2"
+    },
+    {
+      "op": "malloc",
+      "as": "in2",
+      "len": 32
+    },
+    {
+      "op": "fill",
+      "ptr": "$in2",
+      "len": 32,
+      "byte": 0
+    },
+    {
+      "op": "store",
+      "ptr": "$in2",
+      "at": 4,
+      "reg": "$pk2"
+    },
+    {
+      "op": "store",
+      "ptr": "$in2",
+      "at": 8,
+      "reg": "$pk2"
+    },
+    {
+      "op": "write",
+      "ptr": "$in2",
+      "at": 16,
+      "hex": "80070000"
+    },
+    {
+      "op": "malloc",
+      "as": "of2",
+      "len": 64
+    },
+    {
+      "op": "fill",
+      "ptr": "$of2",
+      "len": 64,
+      "byte": 0
+    },
+    {
+      "op": "store",
+      "ptr": "$of2",
+      "at": 4,
+      "reg": "$obuf"
+    },
+    {
+      "op": "store",
+      "ptr": "$of2",
+      "at": 8,
+      "reg": "$obuf"
+    },
+    {
+      "op": "write",
+      "ptr": "$of2",
+      "at": 16,
+      "hex": "00040000"
+    },
+    {
+      "op": "call_table",
+      "func": "opus_encode",
+      "args": [
+        "$codec",
+        "$in2",
+        400,
+        "$of2"
+      ],
+      "results": [
+        "erc2"
+      ]
+    },
+    {
+      "op": "read_u32",
+      "ptr": "$of2",
+      "at": 16,
+      "as": "pl2"
+    },
+    {
+      "op": "read",
+      "ptr": "$obuf",
+      "len": "$pl2",
+      "out": "packet2.bin"
+    },
+    {
+      "op": "malloc",
+      "as": "df2",
+      "len": 64
+    },
+    {
+      "op": "fill",
+      "ptr": "$df2",
+      "len": 64,
+      "byte": 0
+    },
+    {
+      "op": "malloc",
+      "as": "of22",
+      "len": 64
+    },
+    {
+      "op": "fill",
+      "ptr": "$of22",
+      "len": 64,
+      "byte": 0
+    },
+    {
+      "op": "store",
+      "ptr": "$df2",
+      "at": 8,
+      "reg": "$obuf"
+    },
+    {
+      "op": "store",
+      "ptr": "$df2",
+      "at": 16,
+      "reg": "$pl2"
+    },
+    {
+      "op": "store",
+      "ptr": "$of22",
+      "at": 8,
+      "reg": "$pout"
+    },
+    {
+      "op": "write",
+      "ptr": "$of22",
+      "at": 16,
+      "hex": "80070000"
+    },
+    {
+      "op": "call_table",
+      "func": "opus_decode",
+      "args": [
+        "$codec",
+        "$df2",
+        1920,
+        "$of22"
+      ],
+      "results": [
+        "drc2"
+      ]
+    },
+    {
+      "op": "read",
+      "ptr": "$pout",
+      "len": 1920,
+      "out": "decoded2.raw"
+    },
+    {
+      "op": "print",
+      "regs": [
+        "$erc2",
+        "$pl2",
+        "$drc2"
+      ]
+    },
+    {
+      "op": "assert_sha256",
+      "file": "packet0.bin",
+      "sha256": "e4b19307ccaaf076c8a68c872ec3990e46bd2c08a0bc7e10eee37889effd3f62"
+    },
+    {
+      "op": "assert_sha256",
+      "file": "decoded0.raw",
+      "sha256": "7b3552b8bc09658e710552393428fb862d314c863c79f92efff23c7660bf2db0"
+    },
+    {
+      "op": "assert_sha256",
+      "file": "packet1.bin",
+      "sha256": "ca7c72433aadfa70ee11f36be9e1b2d3fb2e6a5d12cea68f6bdba3e21124f8cb"
+    },
+    {
+      "op": "assert_sha256",
+      "file": "decoded1.raw",
+      "sha256": "eb63e7ffe2cbe2af84db34d1861c7e37b2c55abafd825149aa1586f4c4e371a4"
+    },
+    {
+      "op": "assert_sha256",
+      "file": "packet2.bin",
+      "sha256": "eb38048cdcea4f1b66890fc17b37149520446cd9f429047a7a6a64e66fa4e0f1"
+    },
+    {
+      "op": "assert_sha256",
+      "file": "decoded2.raw",
+      "sha256": "7d6be179923f6aef3fbfbf2af093262ad9cdcd2e50fdf05e914d046bc8c5ef7c"
+    }
+  ]
+}

@@ -30,7 +30,10 @@ members = [
     "tests/bench-integration",
     "tests/e2e",
     "tools/whatspec-codegen",
+    "tools/oracle-cli",
+    "tools/oracle-core",
     "tools/xtask",
+    "tools/xtask-support",
     "transports/tokio-transport",
     "wacore",
     "wacore/appstate",
@@ -58,6 +61,9 @@ default-members = [
 # "Test Stable (MSRV)" job pins; raise both together (that job's
 # `toolchain:` and this value) when a dependency or language feature needs it.
 [workspace.package]
+edition = "2024"
+license = "MIT"
+publish = false
 rust-version = "1.94"
 
 [workspace.lints.clippy]
@@ -81,10 +87,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
 unused_qualifications = "warn"
 
 [workspace.dependencies]
-xtask-support = { git = "https://github.com/oxidezap/unwasm.git", rev = "6043ff49a2e37667a9a7d65ff2bcc5ea9d140c00" }
+oracle-core = { path = "tools/oracle-core" }
+unwasm-core = { git = "https://github.com/oxidezap/unwasm.git", rev = "e00274cbd4bb228cddaf0f164fafd1f2a194ffee" }
+wa-store = { git = "https://github.com/oxidezap/whatspec.git", rev = "62c9b59e1910e50870d195373e636b4ddcf25ca3" }
+xtask-support = { path = "tools/xtask-support" }
 aes = "0.9.2"
 aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc"] }
 anyhow = { version = "1.0", default-features = false }
+clap = { version = "4", features = ["derive"] }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
 async-lock = { version = "3", default-features = false }
 async-trait = "0.1.91"
@@ -121,6 +131,20 @@ serde-big-array = "0.5"
 serde_json = { version = "1.0", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }
+wasm-encoder = "0.254"
+wasmparser = { version = "0.254", default-features = false, features = ["std", "validate"] }
+wasmtime = { version = "48.0.1", default-features = false, features = [
+    "runtime",
+    "anyhow",
+    "cranelift",
+    "std",
+    "threads",
+    "parallel-compilation",
+    "cache",
+    "addr2line",
+    "demangle",
+    "call-hook",
+] }
 # Shared dependencies
 smallvec = "1.15"
 smoothutf8 = { version = "0.2.3", default-features = false }

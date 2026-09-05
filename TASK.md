@@ -25,10 +25,11 @@ all remaining derivation, packaging, CI and retirement work.
 - [x] Complete the consumer commits and publish the CI branch.
 - [x] Confirm remote tool/consumer CI executions and record their results.
 
-The detailed investigation is in the sibling `unwasm/MLOW_DERIVE.md`.
+The detailed investigation is in `agent_docs/mlow_derivation.md`.
 Canonical corpus contracts, counts and commands are in
-`wacore/src/voip/mlow/testdata/PROVENANCE.md`. Tool revision and derivation
-lock are pinned by `scripts/mlow-vectors/oracle.lock.json`.
+`wacore/src/voip/mlow/testdata/PROVENANCE.md`. The derivation lock is local at
+`tools/oracle-core/specs/mlow.lock.json`; Git dependencies are pinned by
+`Cargo.lock`.
 
 The tool review also closed two migration hazards: it now checks the old
 capture's pin and removes unresolved selectors, which derive rejects before
@@ -76,8 +77,8 @@ valores esperados dos fixtures.
 - Auditores C e todos os artefatos wasm passaram nas verificações nativas.
 - A guarda de biblioteca C desatualizada foi preservada; a referência foi
   reconstruída para validar também o caminho de geração.
-- `xtask-support` e o oráculo usam o commit Git
-  `6043ff49a2e37667a9a7d65ff2bcc5ea9d140c00`; nenhuma dependência local resta.
+- A primeira versão usou o pin `6043ff49a2e37667a9a7d65ff2bcc5ea9d140c00`;
+  a separação de responsabilidades abaixo substitui esse arranjo.
 - 131/131 testes MLOW passaram; cargo-deny e actionlint passaram.
 - Os cinco testes das tarefas e clippy do workspace inteiro com warnings
   negados passaram. A verificação dos fixtures passou novamente com o pin final.
@@ -89,3 +90,46 @@ valores esperados dos fixtures.
 Migração encerrada nos commits `249c0250472e4431a203b9a8ad76a3331d8d56bf`
 (consumidor) e `6043ff49a2e37667a9a7d65ff2bcc5ea9d140c00`
 (pin compartilhado/produtor). Nenhum trabalho desta migração permanece aberto.
+
+## Desacoplamento dos oráculos — 2026-09-05
+
+Responsabilidades finais:
+
+- `unwasm`: decompilador, análise e runtime gerado independentes de WhatsApp.
+- `whatspec`: descoberta, transporte, locks e restauração verificável de JS/WASM.
+- `whatsapp-rust`: host Wasmtime do WhatsApp, diagnósticos, specs, receitas,
+  montagem MLOW e fixtures.
+
+O oráculo completo, seus testes/exemplos, as specs e os documentos MLOW foram
+movidos para `tools/` e `agent_docs/` deste repositório. O executor usa
+`unwasm-core` (`e00274cbd4bb228cddaf0f164fafd1f2a194ffee`) como dependência
+Git somente no tooling; ele permanece fora de `default-members`. O `whatspec`
+ganhou a crate `wa-store`, aprovada com o workspace, para expor
+locks/restauração sem puxar os extratores.
+
+O audit ampliado ao tooling encontrou quatro advisories no Wasmtime 41 que o
+gate anterior, limitado ao pacote runtime, não enxergava. `wa-store` também foi
+repinado em `62c9b59e1910e50870d195373e636b4ddcf25ca3`, com ureq 3.4,
+rustls 0.23.43 e a provider OxiTLS/RustCrypto 0.3.0. O oráculo passa a
+usar Wasmtime 48.0.1, a versão estável atual, e o workflow audita explicitamente
+o grafo de `tools/xtask` além do grafo de produção.
+
+### Verificação final do desacoplamento
+
+- `cargo tree` confirma que os grafos normais de `whatsapp-rust` e `wacore`
+  não contêm Wasmtime, oracle, unwasm, wa-store ou wa-fetch.
+- Oito capturas foram restauradas por `wa-store` com nome, tamanho, magic e
+  SHA-256 verificados; J/S foram rederivadas do zero nas 11 execuções.
+- A lock antiga e a movida são estruturalmente idênticas, exceto pelos hashes
+  das specs cujos caminhos mudaram. Todos os oito CBOR descompactados e todos
+  os streams permaneceram byte-idênticos; só o envelope zstd foi reemitido.
+- Wasmtime 48 passou 117 testes do oráculo; 27 casos lentos continuam
+  explicitamente ignorados. As tarefas passaram 6 testes, os utilitários 3 e
+  o codec passou 131/131 testes MLOW.
+- Clippy do workspace com warnings negados, actionlint e os gates cargo-deny
+  separados para runtime/tooling passaram.
+- CIs remotos: [unwasm desacoplado](https://github.com/oxidezap/unwasm/actions/runs/33982898581)
+  e [whatspec/wa-store + TLS atualizado](https://github.com/oxidezap/whatspec/actions/runs/33983145320).
+
+Nenhum trabalho desta separação permanece aberto; falta apenas o recibo do CI
+desta branch após publicar o commit do consumidor.

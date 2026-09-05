@@ -24,5 +24,6 @@ memdb_*.snapshot-*
 file:memdb_*.snapshot-*
 
 /.derive-mlow*/
+/.cache/
 /scripts/mlow-vectors/__pycache__/
 /.oracle-tool/

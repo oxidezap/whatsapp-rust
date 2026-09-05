@@ -2,9 +2,9 @@ name: MLOW oracle fixtures
 
 on:
   push:
-    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', 'tools/xtask/**', 'Cargo.lock', '.cargo/config.toml', '.github/workflows/mlow-derive.yml']
+    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', 'tools/oracle-*/**', 'tools/xtask*/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', '.github/workflows/mlow-derive.yml']
   pull_request:
-    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', 'tools/xtask/**', 'Cargo.lock', '.cargo/config.toml', '.github/workflows/mlow-derive.yml']
+    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', 'tools/oracle-*/**', 'tools/xtask*/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', '.github/workflows/mlow-derive.yml']
   workflow_dispatch:
   schedule:
     - cron: '19 6 * * 1'
@@ -18,30 +18,21 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
-      - name: Read the oracle commit pin
-        id: oracle
-        run: cargo xt ci oracle-revision
-      - uses: actions/checkout@v4
-        with:
-          repository: oxidezap/unwasm
-          ref: ${{ steps.oracle.outputs.revision }}
-          path: .oracle-tool
       - uses: taiki-e/install-action@v2
         with:
           tool: protoc@3.25.3,cargo-nextest
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            . -> target
-            .oracle-tool -> target
+          workspaces: . -> target
+      - name: Test the WhatsApp wasm oracle
+        run: cargo test --release --locked -p oracle-core --lib
       - name: Test native task utilities
-        run: cargo test --locked -p whatsapp-xtask
+        run: cargo test --locked -p whatsapp-xtask -p xtask-support
       - name: Re-derive J/S and compare every committed wasm fixture
-        run: cargo xt mlow regenerate --oracle-repo .oracle-tool --check
+        run: cargo xt mlow regenerate --check
       - name: Test the runtime against the regenerated corpus
         run: cargo nextest run --profile ci --locked -p wacore --features voip-mlow --lib -E 'test(voip::mlow::)'
       - uses: actions/upload-artifact@v4
