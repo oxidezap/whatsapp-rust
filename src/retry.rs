@@ -1433,6 +1433,7 @@ impl Client {
                 device_identity,
                 &fetched_identity,
                 account_identity.as_ref(),
+                requester_jid,
             ) {
                 wacore::adv::AdvValidation::Valid => {}
                 wacore::adv::AdvValidation::Invalid => {
@@ -4158,6 +4159,156 @@ mod tests {
             .ensure_e2e_sessions_resolved(std::slice::from_ref(&resolved_jid))
             .await
             .expect("no-op when session exists");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn retry_key_bundle_validates_hosted_adv_before_installing_session() {
+        use buffa::Message;
+        use wacore_binary::Server;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let signed_prekey = KeyPair::generate(&mut rng);
+        let one_time_prekey = KeyPair::generate(&mut rng);
+        let identity = device.public_key.public_key_bytes();
+        let account_key = account.public_key.public_key_bytes();
+        let prekey_signature = device
+            .private_key
+            .calculate_signature(&signed_prekey.public_key.serialize(), &mut rng)
+            .unwrap();
+        let jids = [
+            Jid::pn_device("15550000001", 1),
+            Jid::lid_device("100000000000001", 1),
+            Jid::pn_device("15550000001", 99),
+            Jid::lid_device("100000000000001", 99),
+            Jid::new("15550000001", Server::Hosted).with_device(99),
+            Jid::new("100000000000001", Server::HostedLid).with_device(99),
+        ];
+        for jid in jids {
+            for hosted_signer in [false, true] {
+                let details = wa::ADVDeviceIdentity {
+                    key_index: Some(0),
+                    device_type: Some(if hosted_signer {
+                        wa::ADVEncryptionType::HOSTED
+                    } else {
+                        wa::ADVEncryptionType::E2EE
+                    }),
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let acct_prefix: &[u8] = if hosted_signer { &[6, 5] } else { &[6, 0] };
+                for include_account_key in [false, true] {
+                    let client =
+                        crate::test_utils::create_test_client_with_failing_http("retry_hosted_adv")
+                            .await;
+                    client
+                        .signal_cache
+                        .put_identity(&jid.with_device(0).to_protocol_address(), account_key)
+                        .await;
+                    for valid in [false, true] {
+                        let dev_prefix: &[u8] = if jid.is_hosted() == valid {
+                            &[6, 6]
+                        } else {
+                            &[6, 1]
+                        };
+                        let signed = wa::ADVSignedDeviceIdentity {
+                            details: Some(details.clone()),
+                            account_signature_key: include_account_key
+                                .then(|| account_key.to_vec()),
+                            account_signature: Some(
+                                account
+                                    .private_key
+                                    .calculate_signature(
+                                        &[acct_prefix, &details, identity].concat(),
+                                        &mut rng,
+                                    )
+                                    .unwrap()
+                                    .to_vec(),
+                            ),
+                            device_signature: Some(
+                                device
+                                    .private_key
+                                    .calculate_signature(
+                                        &[dev_prefix, &details, identity, account_key].concat(),
+                                        &mut rng,
+                                    )
+                                    .unwrap()
+                                    .to_vec(),
+                            ),
+                        };
+                        let keys = NodeBuilder::new("keys")
+                            .children([
+                                NodeBuilder::new("type").bytes(vec![5]).build(),
+                                NodeBuilder::new("identity")
+                                    .bytes(identity.to_vec())
+                                    .build(),
+                                OneTimePreKeyNode::new(
+                                    1,
+                                    one_time_prekey.public_key.public_key_bytes().to_vec(),
+                                )
+                                .into_node(),
+                                SignedPreKeyNode::new(
+                                    2,
+                                    signed_prekey.public_key.public_key_bytes().to_vec(),
+                                    prekey_signature.to_vec(),
+                                )
+                                .into_node(),
+                                NodeBuilder::new("device-identity")
+                                    .bytes(waproto::codec::adv_signed_device_identity_to_vec(
+                                        &signed,
+                                    ))
+                                    .build(),
+                            ])
+                            .build();
+                        let receipt = NodeBuilder::new("receipt")
+                            .children([
+                                NodeBuilder::new("registration")
+                                    .bytes(12345u32.to_be_bytes().to_vec())
+                                    .build(),
+                                keys,
+                            ])
+                            .build();
+                        let addr = jid.to_protocol_address();
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            client.process_retry_key_bundle(
+                                &receipt.as_node_ref(),
+                                &jid,
+                                false,
+                                false,
+                            ),
+                        )
+                        .await
+                        .expect("retry bundle processing must complete");
+                        if valid {
+                            result.unwrap_or_else(|e| panic!("jid={jid} hosted_signer={hosted_signer} in_blob={include_account_key}: {e}"));
+                        } else {
+                            assert!(
+                                result
+                                    .unwrap_err()
+                                    .to_string()
+                                    .contains("device-identity ADV validation failed")
+                            );
+                        }
+                        let snapshot = client.persistence_manager.get_device_snapshot();
+                        let session = client
+                            .signal_cache
+                            .peek_session(&addr, &*snapshot.backend)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            session.is_some(),
+                            valid,
+                            "jid={jid} hosted_signer={hosted_signer} in_blob={include_account_key}"
+                        );
+                        if let Some(session) = session {
+                            assert_eq!(session.remote_registration_id().unwrap(), 12345);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

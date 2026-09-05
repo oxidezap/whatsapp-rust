@@ -7,20 +7,30 @@
 
 use buffa::view::MessageView as _;
 use smallvec::SmallVec;
+use wacore_binary::{Jid, JidExt};
+use waproto::whatsapp::ADVEncryptionType;
 
 use crate::libsignal::protocol::PublicKey;
 use crate::store::traits::DeviceInfo;
 
-/// Every ADV prefix is a two-byte domain separator, which is what lets the
-/// signed messages be built once and re-prefixed per family below.
 const ADV_PREFIX_LEN: usize = 2;
 
-// ADV signature prefixes (WAWebAdvSignatureConstants). The hosted ([6,5]/[6,6])
-// variants apply to business-hosted companion devices.
-const ADV_PREFIX_ACCOUNT_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 0];
-const ADV_PREFIX_DEVICE_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 1];
-const ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 5];
+// WAWebAdvSignatureConstants.
+pub(crate) const ADV_PREFIX_ACCOUNT_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 0];
+pub(crate) const ADV_PREFIX_DEVICE_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 1];
+pub(crate) const ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 5];
 const ADV_HOSTED_PREFIX_DEVICE_SIGNATURE: [u8; ADV_PREFIX_LEN] = [6, 6];
+
+pub(crate) fn account_signature_prefix(
+    device_type: Option<ADVEncryptionType>,
+) -> &'static [u8; ADV_PREFIX_LEN] {
+    // WAWebAdvSignatureApi uses the signed deviceType, independently of accountType.
+    if device_type == Some(ADVEncryptionType::HOSTED) {
+        &ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE
+    } else {
+        &ADV_PREFIX_ACCOUNT_SIGNATURE
+    }
+}
 
 /// Stack-backed buffer for a signed ADV message.
 ///
@@ -49,29 +59,17 @@ pub enum AdvValidation {
 /// fetched identity key to the account's ADV chain, mirroring WA Web
 /// `WAWebAdvSignatureApi.validateADVwithIdentityKey`.
 ///
-/// Two checks must both hold under one prefix family: the account signature over
-/// `prefix || details || identity`, and the device signature (made with the
-/// fetched identity key) over `prefix || details || identity || accountKey`. The
-/// device signature is what binds the fetched identity to the account, so a relay
-/// that substitutes a fabricated identity key is rejected. We try the E2EE then
-/// the hosted prefix set rather than replicating WA Web's `bizHostedDevicesEnabled`
-/// gating: the prefix is only a domain separator, so accepting whichever the
-/// signer used stays sound (an attacker still can't forge the account signature).
-///
-/// The account key is `blob.account_signature_key || account_identity_fallback`,
-/// exactly as WA Web's `P`/`w` helpers (`e.accountSignatureKey || t`): the server
-/// legitimately omits `account_signature_key` for a contact's companion device
-/// because it's the contact's primary (device 0) identity the client already
-/// holds, so the caller passes that stored identity as the fallback. When neither
-/// source has a key the chain is unverifiable and we return `NoAccountKey` rather
-/// than rejecting a bundle we simply lack the material to check.
+/// The account prefix follows the signed `ADVDeviceIdentity.device_type`; the
+/// device prefix follows `device_jid.is_hosted()`. Both signatures must verify
+/// with those exact prefixes, including mixed hosted-account/regular-device chains.
+/// An in-blob account key takes precedence over `account_identity_fallback`.
+/// Callers must supply the fetched device's JID, preserving its hosting identity.
 pub fn validate_adv_with_identity_key(
     device_identity_bytes: &[u8],
     fetched_identity_key: &[u8; 32],
     account_identity_fallback: Option<&[u8; 32]>,
+    device_jid: &Jid,
 ) -> AdvValidation {
-    // Decoded as a view: every field here is read once and compared, so the
-    // owned decode's four `Vec<u8>` copies bought nothing.
     let Ok(signed) =
         waproto::whatsapp::ADVSignedDeviceIdentityView::decode_view(device_identity_bytes)
     else {
@@ -82,6 +80,10 @@ pub fn validate_adv_with_identity_key(
         signed.account_signature,
         signed.device_signature,
     ) else {
+        return AdvValidation::Invalid;
+    };
+    let Ok(identity_details) = waproto::whatsapp::ADVDeviceIdentityView::decode_view(details)
+    else {
         return AdvValidation::Invalid;
     };
     // WA Web `e.accountSignatureKey || t`: prefer the in-blob key, else the
@@ -100,34 +102,24 @@ pub fn validate_adv_with_identity_key(
         return AdvValidation::Invalid;
     };
 
-    // Both signed messages differ between the two prefix families only in their
-    // leading `ADV_PREFIX_LEN` bytes, so they are assembled once and the prefix
-    // is overwritten per attempt. The zeroed placeholder is always replaced
-    // before either message is verified.
     let mut account_msg =
         AdvSigBuffer::with_capacity(ADV_PREFIX_LEN + details.len() + fetched_identity_key.len());
-    account_msg.extend_from_slice(&[0u8; ADV_PREFIX_LEN]);
+    account_msg.extend_from_slice(account_signature_prefix(identity_details.device_type));
     account_msg.extend_from_slice(details);
     account_msg.extend_from_slice(fetched_identity_key);
+    if !account_pub.verify_signature(&account_msg, account_sig) {
+        return AdvValidation::Invalid;
+    }
 
     let mut device_msg = AdvSigBuffer::with_capacity(account_msg.len() + account_key.len());
     device_msg.extend_from_slice(&account_msg);
-    device_msg.extend_from_slice(account_key);
-
-    let verified = [
-        (ADV_PREFIX_ACCOUNT_SIGNATURE, ADV_PREFIX_DEVICE_SIGNATURE),
-        (
-            ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE,
-            ADV_HOSTED_PREFIX_DEVICE_SIGNATURE,
-        ),
-    ]
-    .into_iter()
-    .any(|(account_prefix, device_prefix)| {
-        account_msg[..ADV_PREFIX_LEN].copy_from_slice(&account_prefix);
-        device_msg[..ADV_PREFIX_LEN].copy_from_slice(&device_prefix);
-        account_pub.verify_signature(&account_msg, account_sig)
-            && device_pub.verify_signature(&device_msg, device_sig)
+    device_msg[..ADV_PREFIX_LEN].copy_from_slice(if device_jid.is_hosted() {
+        &ADV_HOSTED_PREFIX_DEVICE_SIGNATURE
+    } else {
+        &ADV_PREFIX_DEVICE_SIGNATURE
     });
+    device_msg.extend_from_slice(account_key);
+    let verified = device_pub.verify_signature(&device_msg, device_sig);
 
     if verified {
         AdvValidation::Valid
@@ -362,17 +354,27 @@ mod tests {
         hosted: bool,
         include_account_key: bool,
     ) -> Vec<u8> {
+        signed_identity_with_prefixes(
+            account,
+            device,
+            details,
+            if hosted { &[6, 5] } else { &[6, 0] },
+            if hosted { &[6, 6] } else { &[6, 1] },
+            include_account_key,
+        )
+    }
+
+    fn signed_identity_with_prefixes(
+        account: &KeyPair,
+        device: &KeyPair,
+        details: &[u8],
+        acct_prefix: &[u8],
+        dev_prefix: &[u8],
+        include_account_key: bool,
+    ) -> Vec<u8> {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let identity = device.public_key.public_key_bytes();
         let account_key = account.public_key.public_key_bytes();
-        let (acct_prefix, dev_prefix): (&[u8], &[u8]) = if hosted {
-            (
-                &ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE,
-                &ADV_HOSTED_PREFIX_DEVICE_SIGNATURE,
-            )
-        } else {
-            (&ADV_PREFIX_ACCOUNT_SIGNATURE, &ADV_PREFIX_DEVICE_SIGNATURE)
-        };
         let account_sig = account
             .private_key
             .calculate_signature(&[acct_prefix, details, identity].concat(), &mut rng)
@@ -409,13 +411,211 @@ mod tests {
     }
 
     #[test]
+    fn adv_chain_hosted_account_signature_with_regular_device_signature() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let details = &[0x28, 0x01];
+        let bytes = signed_identity(&account, &device, details, true);
+        let mut signed = waproto::codec::adv_signed_device_identity_decode(&bytes).unwrap();
+        signed.device_signature = Some(
+            device
+                .private_key
+                .calculate_signature(
+                    &[
+                        &[6, 1],
+                        details.as_slice(),
+                        device.public_key.public_key_bytes(),
+                        account.public_key.public_key_bytes(),
+                    ]
+                    .concat(),
+                    &mut rng,
+                )
+                .unwrap()
+                .to_vec(),
+        );
+        assert_eq!(
+            validate_adv_with_identity_key(
+                &signed.encode_to_vec(),
+                &id32(&device),
+                None,
+                &Jid::pn_device("15550000001", 1)
+            ),
+            AdvValidation::Valid
+        );
+    }
+
+    #[test]
+    fn adv_prefixes_follow_signed_device_type_and_address_independently() {
+        use wacore_binary::Server;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let types = [
+            None,
+            Some(ADVEncryptionType::E2EE),
+            Some(ADVEncryptionType::HOSTED),
+            Some(ADVEncryptionType::NON_E2EE),
+        ];
+        let addresses = [
+            (Jid::pn_device("15550000001", 1), false),
+            (Jid::lid_device("100000000000001", 1), false),
+            (Jid::pn_device("15550000001", 99), true),
+            (Jid::lid_device("100000000000001", 99), true),
+            (
+                Jid::new("15550000001", Server::Hosted).with_device(99),
+                true,
+            ),
+            (
+                Jid::new("100000000000001", Server::HostedLid).with_device(99),
+                true,
+            ),
+        ];
+        for account_type in types {
+            for device_type in types {
+                let details = waproto::whatsapp::ADVDeviceIdentity {
+                    key_index: Some(0),
+                    account_type,
+                    device_type,
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let account_prefix = if device_type == Some(ADVEncryptionType::HOSTED) {
+                    &[6, 5]
+                } else {
+                    &[6, 0]
+                };
+                let wrong_account_prefix = if device_type == Some(ADVEncryptionType::HOSTED) {
+                    &[6, 0]
+                } else {
+                    &[6, 5]
+                };
+                for (jid, hosted) in &addresses {
+                    let device_prefix = if *hosted { &[6, 6] } else { &[6, 1] };
+                    let wrong_device_prefix = if *hosted { &[6, 1] } else { &[6, 6] };
+                    for include_account_key in [false, true] {
+                        let fallback = (!include_account_key).then(|| id32(&account));
+                        for (acct, dev, expected) in [
+                            (account_prefix, device_prefix, AdvValidation::Valid),
+                            (wrong_account_prefix, device_prefix, AdvValidation::Invalid),
+                            (account_prefix, wrong_device_prefix, AdvValidation::Invalid),
+                        ] {
+                            let bytes = signed_identity_with_prefixes(
+                                &account,
+                                &device,
+                                &details,
+                                acct,
+                                dev,
+                                include_account_key,
+                            );
+                            assert_eq!(
+                                validate_adv_with_identity_key(
+                                    &bytes,
+                                    &id32(&device),
+                                    fallback.as_ref(),
+                                    jid
+                                ),
+                                expected,
+                                "account={account_type:?} device={device_type:?} jid={jid} in_blob={include_account_key} prefixes={acct:?}/{dev:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adv_rejects_signed_malformed_details_even_without_account_key() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        for include_key in [false, true] {
+            let bytes = signed_identity_with_prefixes(
+                &account,
+                &device,
+                &[0xff],
+                &[6, 0],
+                &[6, 1],
+                include_key,
+            );
+            assert_eq!(
+                validate_adv_with_identity_key(
+                    &bytes,
+                    &id32(&device),
+                    None,
+                    &Jid::pn_device("15550000001", 1)
+                ),
+                AdvValidation::Invalid
+            );
+        }
+    }
+
+    #[test]
+    fn adv_empty_account_key_uses_fallback_and_rejects_tampering() {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        for hosted in [false, true] {
+            let jid = Jid::pn_device("15550000001", if hosted { 99 } else { 1 });
+            let device_prefix = if hosted { &[6, 6] } else { &[6, 1] };
+            let bytes = signed_identity_with_prefixes(
+                &account,
+                &device,
+                &[0x28, 1],
+                &[6, 5],
+                device_prefix,
+                false,
+            );
+            let mut signed = waproto::codec::adv_signed_device_identity_decode(&bytes).unwrap();
+            signed.account_signature_key = Some(vec![]);
+            assert_eq!(
+                validate_adv_with_identity_key(
+                    &signed.encode_to_vec(),
+                    &id32(&device),
+                    Some(&id32(&account)),
+                    &jid
+                ),
+                AdvValidation::Valid
+            );
+            assert_eq!(
+                validate_adv_with_identity_key(&signed.encode_to_vec(), &id32(&device), None, &jid),
+                AdvValidation::NoAccountKey
+            );
+            for field in 0..3 {
+                let mut corrupt = signed.clone();
+                match field {
+                    0 => corrupt.account_signature.as_mut().unwrap()[0] ^= 1,
+                    1 => corrupt.device_signature.as_mut().unwrap()[0] ^= 1,
+                    2 => corrupt.details = Some(vec![0x28, 0]),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    validate_adv_with_identity_key(
+                        &corrupt.encode_to_vec(),
+                        &id32(&device),
+                        Some(&id32(&account)),
+                        &jid
+                    ),
+                    AdvValidation::Invalid
+                );
+            }
+        }
+    }
+
+    #[test]
     fn adv_chain_valid_accepted() {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
-        let bytes = signed_identity(&account, &device, b"details", false);
+        let bytes = signed_identity(&account, &device, b"\x18\x01", false);
         assert_eq!(
-            validate_adv_with_identity_key(&bytes, &id32(&device), None),
+            validate_adv_with_identity_key(
+                &bytes,
+                &id32(&device),
+                None,
+                &Jid::pn_device("15550000001", 1)
+            ),
             AdvValidation::Valid
         );
     }
@@ -425,9 +625,14 @@ mod tests {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
-        let bytes = signed_identity(&account, &device, b"hosted-details", true);
+        let bytes = signed_identity(&account, &device, b"\x28\x01", true);
         assert_eq!(
-            validate_adv_with_identity_key(&bytes, &id32(&device), None),
+            validate_adv_with_identity_key(
+                &bytes,
+                &id32(&device),
+                None,
+                &Jid::pn_device("15550000001", 99)
+            ),
             AdvValidation::Valid
         );
     }
@@ -440,9 +645,14 @@ mod tests {
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
         let attacker = KeyPair::generate(&mut rng);
-        let bytes = signed_identity(&account, &device, b"details", false);
+        let bytes = signed_identity(&account, &device, b"\x18\x01", false);
         assert_eq!(
-            validate_adv_with_identity_key(&bytes, &id32(&attacker), None),
+            validate_adv_with_identity_key(
+                &bytes,
+                &id32(&attacker),
+                None,
+                &Jid::pn_device("15550000001", 1)
+            ),
             AdvValidation::Invalid
         );
     }
@@ -453,14 +663,19 @@ mod tests {
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
         let no_dev_sig = waproto::whatsapp::ADVSignedDeviceIdentity {
-            details: Some(b"details".to_vec()),
+            details: Some(b"\x18\x01".to_vec()),
             account_signature_key: Some(account.public_key.public_key_bytes().to_vec()),
             account_signature: Some(vec![0u8; 64]),
             device_signature: None,
         }
         .encode_to_vec();
         assert_eq!(
-            validate_adv_with_identity_key(&no_dev_sig, &id32(&device), None),
+            validate_adv_with_identity_key(
+                &no_dev_sig,
+                &id32(&device),
+                None,
+                &Jid::pn_device("15550000001", 1)
+            ),
             AdvValidation::Invalid
         );
     }
@@ -470,7 +685,12 @@ mod tests {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let device = KeyPair::generate(&mut rng);
         assert_eq!(
-            validate_adv_with_identity_key(&[1, 2, 3, 4], &id32(&device), None),
+            validate_adv_with_identity_key(
+                &[1, 2, 3, 4],
+                &id32(&device),
+                None,
+                &Jid::pn_device("15550000001", 1)
+            ),
             AdvValidation::Invalid
         );
     }
@@ -483,9 +703,14 @@ mod tests {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
-        let bytes = signed_identity_opts(&account, &device, b"details", false, false);
+        let bytes = signed_identity_opts(&account, &device, b"\x18\x01", false, false);
         assert_eq!(
-            validate_adv_with_identity_key(&bytes, &id32(&device), Some(&id32(&account))),
+            validate_adv_with_identity_key(
+                &bytes,
+                &id32(&device),
+                Some(&id32(&account)),
+                &Jid::pn_device("15550000001", 1)
+            ),
             AdvValidation::Valid
         );
     }
@@ -497,9 +722,14 @@ mod tests {
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
-        let bytes = signed_identity_opts(&account, &device, b"details", false, false);
+        let bytes = signed_identity_opts(&account, &device, b"\x18\x01", false, false);
         assert_eq!(
-            validate_adv_with_identity_key(&bytes, &id32(&device), None),
+            validate_adv_with_identity_key(
+                &bytes,
+                &id32(&device),
+                None,
+                &Jid::pn_device("15550000001", 1)
+            ),
             AdvValidation::NoAccountKey
         );
     }
@@ -513,9 +743,14 @@ mod tests {
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
         let attacker = KeyPair::generate(&mut rng);
-        let bytes = signed_identity_opts(&account, &device, b"details", false, false);
+        let bytes = signed_identity_opts(&account, &device, b"\x18\x01", false, false);
         assert_eq!(
-            validate_adv_with_identity_key(&bytes, &id32(&device), Some(&id32(&attacker))),
+            validate_adv_with_identity_key(
+                &bytes,
+                &id32(&device),
+                Some(&id32(&attacker)),
+                &Jid::pn_device("15550000001", 1)
+            ),
             AdvValidation::Invalid
         );
     }
@@ -528,9 +763,14 @@ mod tests {
         let account = KeyPair::generate(&mut rng);
         let device = KeyPair::generate(&mut rng);
         let unrelated = KeyPair::generate(&mut rng);
-        let bytes = signed_identity(&account, &device, b"details", false);
+        let bytes = signed_identity(&account, &device, b"\x18\x01", false);
         assert_eq!(
-            validate_adv_with_identity_key(&bytes, &id32(&device), Some(&id32(&unrelated))),
+            validate_adv_with_identity_key(
+                &bytes,
+                &id32(&device),
+                Some(&id32(&unrelated)),
+                &Jid::pn_device("15550000001", 1)
+            ),
             AdvValidation::Valid
         );
     }
