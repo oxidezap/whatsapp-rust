@@ -76,3 +76,5 @@ not in Git.
 The initial implementation is covered by `tools/oracle-core/tests/media_probe.rs`:
 it proves callback payload capture, sequence/timestamp capture, resource-limit
 failure, exact comparison, content-addressed persistence and stale-file cleanup.
+The cross-layer gate that combines these traces with signaling, IQ and the
+pure-Rust protocol tests is [`voip_conformance.md`](voip_conformance.md).

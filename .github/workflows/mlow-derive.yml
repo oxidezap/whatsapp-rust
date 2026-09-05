@@ -1,4 +1,4 @@
-name: MLOW oracle fixtures
+name: VoIP conformance
 
 on:
   push:
@@ -23,24 +23,22 @@ jobs:
           toolchain: nightly-2026-06-16
       - uses: taiki-e/install-action@v2
         with:
-          tool: protoc@3.25.3,cargo-nextest
+          tool: protoc@3.25.3
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: . -> target
       - name: Test native task utilities
         run: cargo test --locked -p whatsapp-xtask -p xtask-support
-      - name: Fetch every pinned oracle capture
-        run: cargo xt oracle fetch
-      - name: Test the WhatsApp wasm oracle against its captures
-        run: cargo test --release --locked -p oracle-core -- --nocapture
-      - name: Re-derive J/S and compare every committed wasm fixture
-        run: cargo xt mlow regenerate --check
-      - name: Test the runtime against the regenerated corpus
-        run: cargo nextest run --profile ci --locked -p wacore --features voip-mlow --lib -E 'test(voip::mlow::)'
+      - name: Run complete VoIP conformance gate
+        if: github.event_name != 'schedule'
+        run: cargo xt oracle conformance
+      - name: Run complete VoIP conformance gate with slow signaling
+        if: github.event_name == 'schedule'
+        run: cargo xt oracle conformance --slow
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: mlow-oracle-evidence
+          name: voip-conformance-evidence
           path: |
             .derive-mlow/wasm/*.log
             .derive-mlow/wasm/*/manifest.json

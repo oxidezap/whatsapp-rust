@@ -163,6 +163,10 @@ A rodada de revisão reforçou as fronteiras que tornam a derivação reproduzí
 - O host recusa `EM_ASM` desconhecido, descreve corretamente o preopen WASI e
   preserva largura/sinal dos inteiros registrados pelo embind. A inspeção
   estática também recusa exports com índices fora do espaço de funções.
+- Iovecs, seeks, truncamento, PRNG, probes de overflow, paths de outputs e
+  locals instrumentados passaram a falhar em entradas inválidas; retornos por
+  fall-through também recebem markers. A captura de mídia reserva a ordem na
+  entrada do callback e exige configuração explícita.
 
 Os pins finais usados pelo tooling são `unwasm`
 `8f798470e9f8c22a9ef40780eee302894fe7bdce` e `whatspec`
@@ -183,3 +187,14 @@ A infraestrutura está pronta para receber specs derivadas dos callbacks dos
 módulos pinados. Os fixtures E2E de chamadas completas serão adicionados quando
 os ABIs de callback de áudio e vídeo forem identificados por seletor e prova de
 execução; nenhum índice ou layout foi presumido nesta etapa.
+
+## Gate de conformidade VoIP completo — 2026-09-05
+
+- [x] Um único `cargo xt oracle conformance` verifica IR JS/WhatSpec, oráculo
+  wasm, rederivação MLOW e superfícies `voip::`/`iq::` do Rust puro.
+- [x] A execução agendada acrescenta os cenários lentos de signaling com
+  threads reais e serialização entre binários.
+- [x] A matriz documenta a fonte de verdade e o gate de cada camada, sem
+  atribuir ao wasm comportamentos de IQ que pertencem ao bundle JS.
+- [x] Captura ausente/corrompida e probes inconclusivos agora falham em todos os
+  testes do oráculo em vez de virarem skips silenciosos.
