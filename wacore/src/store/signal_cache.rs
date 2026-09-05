@@ -2,7 +2,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, OnceLock};
+use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, OnceLock, Weak};
 
 use anyhow::Result;
 use async_lock::Mutex;
@@ -17,19 +17,75 @@ use crate::store::traits::SignalStore;
 
 type StoreIncarnation = [u8; 16];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrekeyProbe {
+    Needed,
+    Durable,
+    Deferred,
+}
+
+// A weak version prevents allocation-address reuse without making ordinary
+// checkouts clone their records while the serialized snapshot is in I/O.
+fn same_flush_version<T: ?Sized>(record: &Arc<T>, version: &Weak<T>) -> bool {
+    std::ptr::eq(Arc::as_ptr(record), version.as_ptr())
+}
+
 fn new_store_incarnation() -> StoreIncarnation {
     let mut incarnation = [0; 16];
     rand::make_rng::<rand::rngs::StdRng>().fill(&mut incarnation);
     incarnation
 }
 
+struct EvictionCandidates {
+    keys: Vec<Arc<str>>,
+    negatives: usize,
+    limit: usize,
+}
+
+impl EvictionCandidates {
+    fn new(limit: usize) -> Self {
+        Self {
+            keys: Vec::new(),
+            negatives: 0,
+            limit,
+        }
+    }
+
+    fn consider(&mut self, key: &Arc<str>, negative: bool) -> bool {
+        if self.negatives == self.limit {
+            return true;
+        }
+        if self.keys.len() == self.limit {
+            if !negative {
+                return false;
+            }
+            // The prefix contains only negatives; replacing the first positive
+            // preserves priority without retaining every clean resident key.
+            self.keys[self.negatives] = key.clone();
+        } else {
+            if self.keys.is_empty() {
+                self.keys.reserve_exact(self.limit);
+            }
+            self.keys.push(key.clone());
+            if negative {
+                let last = self.keys.len() - 1;
+                self.keys.swap(self.negatives, last);
+            }
+        }
+        if negative {
+            self.negatives += 1;
+        }
+        self.negatives == self.limit
+    }
+}
+
 /// Evict clean (non-dirty, non-deleted) entries from a cache HashMap.
 /// Negative entries (None values) are evicted first.
 ///
 /// Amortized: the O(n) scan only runs once the map crosses the high watermark
-/// (`max_entries + slack`), then it trims back down to `max_entries`. Steady
-/// state over capacity therefore costs O(1) per call because a fresh scan needs
-/// `slack` more growth inserts before it can fire again. Call it from every path
+/// (`max_entries + slack`), then it trims to `max_entries` when enough entries
+/// are clean. Successful trimming amortizes the scan over `slack` more growth
+/// inserts. Call it from every path
 /// that grows the map, including read-populate (cache-miss) inserts, so the cache
 /// stays bounded even under unique-key read floods; the early-out keeps it cheap.
 fn evict_clean_entries<V>(
@@ -39,12 +95,19 @@ fn evict_clean_entries<V>(
     max_entries: usize,
 ) {
     compact_users_if_needed(cache, max_entries);
-    if cache.len() <= high_watermark(max_entries) {
+    // Dirty and deleted keys are disjoint subsets of the cache. A stalled
+    // backend can pin the whole map above the watermark; scanning it again
+    // on every write would be quadratic work that cannot reclaim anything.
+    if cache.len() <= high_watermark(max_entries)
+        || dirty.len().saturating_add(deleted.map_or(0, HashSet::len)) >= cache.len()
+    {
         return;
     }
     let overflow = cache.len().saturating_sub(max_entries);
-    let mut negative = Vec::with_capacity(overflow);
-    let mut positive = Vec::with_capacity(overflow);
+    let available = cache
+        .len()
+        .saturating_sub(dirty.len().saturating_add(deleted.map_or(0, HashSet::len)));
+    let mut candidates = EvictionCandidates::new(overflow.min(available));
     for (k, v) in cache.iter() {
         if dirty.contains(k.as_ref()) {
             continue;
@@ -54,13 +117,11 @@ fn evict_clean_entries<V>(
         {
             continue;
         }
-        if v.is_none() {
-            negative.push(k.clone());
-        } else {
-            positive.push(k.clone());
+        if candidates.consider(k, v.is_none()) {
+            break;
         }
     }
-    for key in negative.into_iter().chain(positive).take(overflow) {
+    for key in candidates.keys {
         cache.remove(&key);
     }
 }
@@ -157,7 +218,6 @@ impl PendingWireGate {
         self.addresses.is_empty()
     }
 
-    #[cfg(test)]
     fn contains(&self, address: &str) -> bool {
         self.addresses.contains(address)
     }
@@ -418,10 +478,12 @@ impl<V> UserIndexedCache<V> {
 /// misses) evicts non-dirty entries once the high watermark is crossed, trimming
 /// back to `max_entries` (amortized O(1) thanks to the slack early-out).
 pub struct SignalStoreCache {
+    /// Orders persistence and teardown. Cache get/put methods do not acquire it.
+    flush_lock: Mutex<()>,
     sessions: Mutex<SessionStoreState>,
     /// The gates' own flags (see `PendingWireGate`), so a send answers
-    /// `needs_pre_wire_flush` without queueing behind a flush that holds either
-    /// store lock across its backend I/O.
+    /// `needs_pre_wire_flush` without queueing behind cache mutations or snapshot
+    /// capture.
     session_wire_gate: Arc<AtomicBool>,
     session_recovery_generation: AtomicU64,
     has_pending_session_restores: AtomicBool,
@@ -456,10 +518,22 @@ enum SessionEntry {
     CheckedOut {
         had_session: bool,
         token: NonZeroU64,
+        /// A prior encrypt can still need this lease durably published while
+        /// the next operation owns the mutable record. Retained only until the
+        /// lease is persisted; ordinary covered checkouts remain move-only.
+        wire_snapshot: Option<Arc<SessionRecord>>,
     },
 }
 
 impl SessionEntry {
+    fn flushable_record(&self) -> Option<&Arc<SessionRecord>> {
+        match self {
+            Self::Present(record) => Some(record),
+            Self::CheckedOut { wire_snapshot, .. } => wire_snapshot.as_ref(),
+            Self::Absent => None,
+        }
+    }
+
     fn exists(&self) -> bool {
         matches!(
             self,
@@ -521,6 +595,27 @@ impl SessionStoreState {
         }
     }
 
+    fn prekey_probe(
+        &self,
+        removed: &HashMap<u32, Arc<str>>,
+        id: u32,
+        address: &Arc<str>,
+    ) -> PrekeyProbe {
+        if !removed
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, address))
+            || self.dirty.contains(address.as_ref())
+            || self.deleted.contains(address.as_ref())
+        {
+            return PrekeyProbe::Deferred;
+        }
+        match self.cache.get(address.as_ref()) {
+            Some(SessionEntry::Present(_)) => PrekeyProbe::Durable,
+            Some(SessionEntry::CheckedOut { .. }) => PrekeyProbe::Deferred,
+            Some(SessionEntry::Absent) | None => PrekeyProbe::Needed,
+        }
+    }
+
     fn put(&mut self, address: &str, record: SessionRecord) {
         let addr = self.key_for(address);
         self.put_with_key(addr, record);
@@ -553,12 +648,16 @@ impl SessionStoreState {
             return CachedSessionCheckout::Missing(checkout);
         };
         match entry {
-            SessionEntry::Present(_) => {
+            SessionEntry::Present(record) => {
+                let wire_snapshot = (!self.reservation_pending.is_empty()
+                    && self.reservation_pending.contains(address))
+                .then(|| Arc::clone(record));
                 let SessionEntry::Present(record) = std::mem::replace(
                     entry,
                     SessionEntry::CheckedOut {
                         had_session: true,
                         token,
+                        wire_snapshot,
                     },
                 ) else {
                     unreachable!()
@@ -572,6 +671,7 @@ impl SessionStoreState {
                 *entry = SessionEntry::CheckedOut {
                     had_session: false,
                     token,
+                    wire_snapshot: None,
                 };
                 CachedSessionCheckout::Absent(checkout)
             }
@@ -612,23 +712,31 @@ impl SessionStoreState {
 
     fn evict_if_needed(&mut self, max_entries: usize) {
         compact_users_if_needed(&mut self.cache, max_entries);
-        if self.cache.len() <= high_watermark(max_entries) {
+        if self.cache.len() <= high_watermark(max_entries)
+            || self.dirty.len().saturating_add(self.deleted.len()) >= self.cache.len()
+        {
             return;
         }
         let overflow = self.cache.len().saturating_sub(max_entries);
-        let mut negative = Vec::with_capacity(overflow);
-        let mut positive = Vec::with_capacity(overflow);
+        let available = self
+            .cache
+            .len()
+            .saturating_sub(self.dirty.len().saturating_add(self.deleted.len()));
+        let mut candidates = EvictionCandidates::new(overflow.min(available));
         for (k, v) in self.cache.iter() {
             if self.dirty.contains(k.as_ref()) || self.deleted.contains(k.as_ref()) {
                 continue;
             }
-            match v {
-                SessionEntry::CheckedOut { .. } => continue, // never evict checked-out
-                SessionEntry::Absent => negative.push(k.clone()),
-                SessionEntry::Present(_) => positive.push(k.clone()),
+            let negative = match v {
+                SessionEntry::CheckedOut { .. } => continue,
+                SessionEntry::Absent => true,
+                SessionEntry::Present(_) => false,
+            };
+            if candidates.consider(k, negative) {
+                break;
             }
         }
-        for key in negative.into_iter().chain(positive).take(overflow) {
+        for key in candidates.keys {
             self.cache.remove(&key);
         }
     }
@@ -813,6 +921,7 @@ impl SignalStoreCache {
         let sessions = SessionStoreState::new(incarnation);
         let sender_keys = SenderKeyStoreState::new(incarnation);
         Self {
+            flush_lock: Mutex::new(()),
             session_wire_gate: sessions.reservation_pending.flag(),
             sender_key_wire_gate: sender_keys.wire_gate_pending.flag(),
             sessions: Mutex::new(sessions),
@@ -853,6 +962,7 @@ impl SignalStoreCache {
                     SessionEntry::CheckedOut {
                         had_session: was_present,
                         token,
+                        ..
                     },
                 )) = state.cache.get_key_value(address.as_ref())
                 && *was_present == had_session
@@ -914,6 +1024,7 @@ impl SignalStoreCache {
                 SessionEntry::CheckedOut {
                     had_session: was_present,
                     token,
+                    ..
                 },
             )) = state.cache.get_key_value(address.as_str())
             else {
@@ -974,6 +1085,7 @@ impl SignalStoreCache {
                 SessionEntry::CheckedOut {
                     had_session: false,
                     token,
+                    ..
                 },
             )) = state.cache.get_key_value(address.as_str())
             && *token == checkout.token()
@@ -1184,6 +1296,7 @@ impl SignalStoreCache {
             SessionEntry::CheckedOut {
                 had_session: record.is_some(),
                 token: checkout.token(),
+                wire_snapshot: None,
             },
         );
         state.evict_if_needed(self.max_entries);
@@ -1703,6 +1816,7 @@ impl SignalStoreCache {
     ) -> Result<()> {
         let lock = self.sender_key_lock(name).await;
         let _guard = lock.lock().await;
+        let _flush_guard = self.flush_lock.lock().await;
         let cache_key = name.cache_key();
         {
             let mut state = self.sender_keys.lock().await;
@@ -1750,140 +1864,148 @@ impl SignalStoreCache {
 
     // === Flush ===
 
-    /// Flush all dirty state to the backend.
-    ///
-    /// Identities and sender keys are flushed independently under their own lock,
-    /// so each is locked only during its own I/O while the others stay free for
-    /// concurrent encrypt/decrypt. Sessions and consumed pre-keys are committed
-    /// together under the single sessions lock: the prekey delete must be atomic
-    /// with the session put against concurrent buffering, so they cannot use
-    /// separate lock scopes. Within each scope the lock is held across snapshot,
-    /// I/O, and clear, so there is no race between snapshot and clear and dirty
-    /// sets are cleared only after successful writes.
+    /// Flush the current dirty snapshots, in backend order. The cache mutexes
+    /// cover capture and confirmation of record writes. Consumed-prekey removal
+    /// additionally excludes session mutations through its destructive I/O.
+    /// A concurrent mutation stays dirty unless that exact record was persisted.
     pub async fn flush(&self, backend: &dyn SignalStore) -> Result<()> {
-        // Flush sessions: one batched write for all dirty puts instead of one
-        // backend call (and one SQLite transaction) per session.
-        {
+        let _flush_guard = self.flush_lock.lock().await;
+        self.flush_sessions(backend).await?;
+        self.flush_identities(backend).await?;
+        self.flush_sender_keys(backend).await
+    }
+
+    async fn flush_sessions(&self, backend: &dyn SignalStore) -> Result<()> {
+        let (batch, versions, deleted, mut prekeys) = {
+            let state = self.lock_sessions().await;
+            let mut batch = Vec::with_capacity(state.dirty.len());
+            let mut versions = Vec::with_capacity(state.dirty.len());
+            for address in &state.dirty {
+                if let Some(record) = state
+                    .cache
+                    .get(address.as_ref())
+                    .and_then(SessionEntry::flushable_record)
+                {
+                    let mut bytes = Vec::new();
+                    record.serialize_into_for_store(&mut bytes, &state.incarnation);
+                    batch.push((address.clone(), bytes::Bytes::from(bytes)));
+                    versions.push((address.clone(), Arc::downgrade(record)));
+                }
+            }
+            // Capture consumption together with its session snapshot: a prekey
+            // buffered during the I/O must wait for the next snapshot, even if
+            // this flush persisted an older session at the same address.
+            let removed = self.removed_prekeys.lock().await;
+            let prekeys = removed
+                .iter()
+                .map(|(&id, address)| (id, address.clone(), PrekeyProbe::Needed))
+                .collect::<Vec<_>>();
+            (
+                batch,
+                versions,
+                state.deleted.iter().cloned().collect::<Vec<_>>(),
+                prekeys,
+            )
+        };
+
+        if !batch.is_empty() {
+            backend.put_sessions_batch(&batch).await?;
             let mut state = self.lock_sessions().await;
-            let incarnation = state.incarnation;
-            let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
-            let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
-
-            // At most one push per dirty key, so this is the exact upper
-            // bound: one allocation instead of the 0-4-8-16-32 growth chain.
-            let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::with_capacity(dirty_keys.len());
-            for address in &dirty_keys {
-                // A dirty key is Present (promoted) or CheckedOut (taken by a
-                // concurrent reader). Only the Present ones can be persisted now;
-                // a CheckedOut one stays volatile and its consumed prekey is
-                // deferred below until a later flush sees it durable.
-                if let Some(SessionEntry::Present(record)) = state.cache.get(address.as_ref()) {
-                    let mut buf = Vec::new();
-                    record.serialize_into_for_store(&mut buf, &incarnation);
-                    batch.push((address.clone(), bytes::Bytes::from(buf)));
-                }
-            }
-            if !batch.is_empty() {
-                backend.put_sessions_batch(&batch).await?;
-                // These leases are durable now; only the written addresses
-                // leave the pending set (a CheckedOut session stays gated).
-                for (address, _) in &batch {
+            for (address, version) in &versions {
+                if state
+                    .cache
+                    .get(address.as_ref())
+                    .and_then(SessionEntry::flushable_record)
+                    .is_some_and(|record| same_flush_version(record, version))
+                {
+                    state.dirty.remove(address);
                     state.reservation_pending.remove(address);
+                    if let Some(SessionEntry::CheckedOut { wire_snapshot, .. }) =
+                        state.cache.get_mut(address.as_ref())
+                    {
+                        *wire_snapshot = None;
+                    }
                 }
-            }
-            if !deleted_keys.is_empty() {
-                backend.delete_sessions_batch(&deleted_keys).await?;
-                for address in &deleted_keys {
-                    state.reservation_pending.remove(address);
-                }
-            }
-
-            for key in &dirty_keys {
-                if !matches!(
-                    state.cache.get(key.as_ref()),
-                    Some(SessionEntry::CheckedOut { .. })
-                ) {
-                    state.dirty.remove(key);
-                }
-            }
-            for key in &deleted_keys {
-                state.deleted.remove(key);
             }
             state.evict_if_needed(self.max_entries);
-
-            // Delete a consumed one-time prekey only once its session is durable.
-            // Durability is decided per session, not from a single flush's batch:
-            // a Present (clean at drain) entry is persisted (by this flush or an
-            // earlier one); a CheckedOut entry is the still-volatile promoted copy,
-            // so defer; an absent/deleted/evicted/cleared entry is ambiguous, so
-            // ask the backend. This covers a prekey buffered just after a
-            // concurrent flush already persisted its session (it would never
-            // re-enter a batch) and never deletes a prekey whose session was
-            // dropped before reaching the backend (which would make a redelivered
-            // pkmsg permanently undecryptable). Staying under the sessions lock
-            // keeps the session commit and the prekey delete atomic against a
-            // decrypt buffering its own prekey (it must take this same lock to
-            // store its session first), matching WAWebSignalProtocolStoreUnifiedApi
-            // (bulkPutSession + bulkRemovePreKey under one lock). The buffer is
-            // mutated only after each delete succeeds, so a failed flush leaves the
-            // IDs for the next attempt.
-            {
-                let mut removed = self.removed_prekeys.lock().await;
-                if !removed.is_empty() {
-                    let mut deletable: Vec<u32> = Vec::with_capacity(removed.len());
-                    for (id, addr) in removed.iter() {
-                        // Resolve to an owned decision before any await so no cache
-                        // borrow is held across the backend roundtrip.
-                        let durable = match state.cache.get(addr.as_ref()) {
-                            Some(SessionEntry::Present(_)) => Some(true),
-                            Some(SessionEntry::CheckedOut { .. }) => Some(false),
-                            Some(SessionEntry::Absent) | None => None,
-                        };
-                        let durable = match durable {
-                            Some(d) => d,
-                            // Row existence is not enough: a row that does not
-                            // decode is no session at all, and deleting the
-                            // prekey against it is the very outcome this block
-                            // exists to prevent -- a redelivered pkmsg would
-                            // have neither a usable session nor the prekey to
-                            // rebuild one. Decoded under the sessions lock we
-                            // already hold, so the decision stays atomic
-                            // against a decrypt storing its own session.
-                            None => backend
-                                .get_session(addr.as_ref())
-                                .await?
-                                .as_deref()
-                                .and_then(|bytes| {
-                                    Self::decode_stored_session(
-                                        addr.as_ref(),
-                                        bytes,
-                                        &state.incarnation,
-                                    )
-                                })
-                                .is_some(),
-                        };
-                        if durable {
-                            deletable.push(*id);
-                        }
-                    }
-                    if !deletable.is_empty() {
-                        backend.remove_prekeys_batch(&deletable).await?;
-                        for id in &deletable {
-                            removed.remove(id);
-                        }
-                    }
+        }
+        if !deleted.is_empty() {
+            backend.delete_sessions_batch(&deleted).await?;
+            let mut state = self.lock_sessions().await;
+            for address in &deleted {
+                if matches!(
+                    state.cache.get(address.as_ref()),
+                    Some(SessionEntry::Absent)
+                ) {
+                    state.deleted.remove(address);
+                    state.reservation_pending.remove(address);
                 }
             }
+            state.evict_if_needed(self.max_entries);
         }
 
-        // Flush identities
-        {
-            let mut state = self.identities.lock().await;
-            let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
-            let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
+        if prekeys.is_empty() {
+            return Ok(());
+        }
+        let incarnation = {
+            let state = self.lock_sessions().await;
+            let removed = self.removed_prekeys.lock().await;
+            for (id, address, probe) in &mut prekeys {
+                *probe = state.prekey_probe(&removed, *id, address);
+            }
+            state.incarnation
+        };
+        // Read-only probes can release both locks. The outer flush gate keeps
+        // backend writes ordered; the destructive phase rechecks live cache
+        // state and consumption identity before trusting a probe result.
+        for (_, address, probe) in &mut prekeys {
+            if *probe == PrekeyProbe::Needed {
+                let durable = backend
+                    .get_session(address.as_ref())
+                    .await?
+                    .as_deref()
+                    .and_then(|bytes| Self::decode_stored_session(address, bytes, &incarnation))
+                    .is_some();
+                *probe = if durable {
+                    PrekeyProbe::Durable
+                } else {
+                    PrekeyProbe::Deferred
+                };
+            }
+        }
+        // Private-key deletion is irreversible: a new checkout could consume
+        // the same key before its newer session becomes durable. Exclude that
+        // window, including the gap between session return and consumption
+        // buffering, rather than merely retaining a newer buffer entry after
+        // its private key has already been destroyed.
+        let state = self.lock_sessions().await;
+        let mut removed = self.removed_prekeys.lock().await;
+        let mut deletable = Vec::new();
+        for (id, address, probe) in prekeys {
+            let durable = match state.prekey_probe(&removed, id, &address) {
+                PrekeyProbe::Durable => true,
+                PrekeyProbe::Deferred => false,
+                PrekeyProbe::Needed => probe == PrekeyProbe::Durable,
+            };
+            if durable {
+                deletable.push(id);
+            }
+        }
+        if !deletable.is_empty() {
+            backend.remove_prekeys_batch(&deletable).await?;
+            for id in deletable {
+                removed.remove(&id);
+            }
+        }
+        Ok(())
+    }
 
-            let mut batch: Vec<(Arc<str>, [u8; 32])> = Vec::with_capacity(dirty_keys.len());
-            for address in &dirty_keys {
+    async fn flush_identities(&self, backend: &dyn SignalStore) -> Result<()> {
+        let (batch, versions, deleted) = {
+            let state = self.identities.lock().await;
+            let mut batch = Vec::with_capacity(state.dirty.len());
+            let mut versions = Vec::with_capacity(state.dirty.len());
+            for address in &state.dirty {
                 if let Some(Some(data)) = state.cache.get(address.as_ref()) {
                     let key: [u8; 32] = data.as_ref().try_into().map_err(|_| {
                         anyhow::anyhow!(
@@ -1892,63 +2014,86 @@ impl SignalStoreCache {
                         )
                     })?;
                     batch.push((address.clone(), key));
+                    versions.push((address.clone(), Arc::downgrade(data)));
                 }
             }
-            if !batch.is_empty() {
-                backend.put_identities_batch(&batch).await?;
-            }
-            if !deleted_keys.is_empty() {
-                backend.delete_identities_batch(&deleted_keys).await?;
-            }
-
-            for key in &dirty_keys {
-                state.dirty.remove(key);
-            }
-            for key in &deleted_keys {
-                state.deleted.remove(key);
+            (
+                batch,
+                versions,
+                state.deleted.iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+        if !batch.is_empty() {
+            backend.put_identities_batch(&batch).await?;
+            let mut state = self.identities.lock().await;
+            for (address, version) in versions {
+                if matches!(state.cache.get(address.as_ref()), Some(Some(record)) if same_flush_version(record, &version))
+                {
+                    state.dirty.remove(&address);
+                }
             }
             state.evict_if_needed(self.max_entries);
         }
+        if !deleted.is_empty() {
+            backend.delete_identities_batch(&deleted).await?;
+            let mut state = self.identities.lock().await;
+            for address in deleted {
+                if matches!(state.cache.get(address.as_ref()), Some(None)) {
+                    state.deleted.remove(&address);
+                }
+            }
+            state.evict_if_needed(self.max_entries);
+        }
+        Ok(())
+    }
 
-        // Flush sender keys
-        {
-            let mut state = self.sender_keys.lock().await;
-            let incarnation = state.incarnation;
-            let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
-
-            let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::with_capacity(dirty_keys.len());
-            let mut deleted: Vec<Arc<str>> = Vec::with_capacity(dirty_keys.len());
-            for name in &dirty_keys {
-                match state.cache.get(name.as_ref()) {
+    async fn flush_sender_keys(&self, backend: &dyn SignalStore) -> Result<()> {
+        let (batch, versions, deleted) = {
+            let state = self.sender_keys.lock().await;
+            let mut batch = Vec::with_capacity(state.dirty.len());
+            let mut versions = Vec::with_capacity(state.dirty.len());
+            let mut deleted = Vec::new();
+            for address in &state.dirty {
+                match state.cache.get(address.as_ref()) {
                     Some(Some(record)) => {
-                        let bytes = record
-                            .serialize_for_store(&incarnation)
-                            .map_err(|e| anyhow::anyhow!("sender key serialize for {name}: {e}"))?;
-                        batch.push((name.clone(), bytes::Bytes::from(bytes)));
+                        let bytes =
+                            record
+                                .serialize_for_store(&state.incarnation)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("sender key serialize for {address}: {e}")
+                                })?;
+                        batch.push((address.clone(), bytes::Bytes::from(bytes)));
+                        versions.push((address.clone(), Arc::downgrade(record)));
                     }
-                    Some(None) => deleted.push(name.clone()),
+                    Some(None) => deleted.push(address.clone()),
                     None => {}
                 }
             }
-            if !deleted.is_empty() {
-                backend.delete_sender_keys_batch(&deleted).await?;
-                for name in &deleted {
-                    state.wire_gate_pending.remove(name);
+            (batch, versions, deleted)
+        };
+        if !deleted.is_empty() {
+            backend.delete_sender_keys_batch(&deleted).await?;
+            let mut state = self.sender_keys.lock().await;
+            for address in deleted {
+                if matches!(state.cache.get(address.as_ref()), Some(None)) {
+                    state.dirty.remove(&address);
+                    state.wire_gate_pending.remove(&address);
                 }
-            }
-            if !batch.is_empty() {
-                backend.put_sender_keys_batch(&batch).await?;
-                for (name, _) in &batch {
-                    state.wire_gate_pending.remove(name);
-                }
-            }
-
-            for key in &dirty_keys {
-                state.dirty.remove(key);
             }
             state.evict_if_needed(self.max_entries);
         }
-
+        if !batch.is_empty() {
+            backend.put_sender_keys_batch(&batch).await?;
+            let mut state = self.sender_keys.lock().await;
+            for (address, version) in versions {
+                if matches!(state.cache.get(address.as_ref()), Some(Some(record)) if same_flush_version(record, &version))
+                {
+                    state.dirty.remove(&address);
+                    state.wire_gate_pending.remove(&address);
+                }
+            }
+            state.evict_if_needed(self.max_entries);
+        }
         Ok(())
     }
 
@@ -1960,7 +2105,7 @@ impl SignalStoreCache {
     /// coalesced write-behind.
     ///
     /// Answered from the gates' flags so the common (open) case does not take
-    /// either store lock, which a flush holds across its backend I/O.
+    /// either store lock.
     pub async fn needs_pre_wire_flush(&self) -> bool {
         if self.wire_gates_raised() {
             return true;
@@ -1992,7 +2137,8 @@ impl SignalStoreCache {
     ///
     /// Session entry counts include negative (`Absent`) and checked-out slots
     /// — they occupy the map. Byte totals include the key length for every
-    /// slot, but the estimated record payload only for `Present` entries.
+    /// slot; record payloads cover `Present` entries and retained immutable
+    /// lease snapshots in checked-out slots.
     ///
     /// Structural allocations are charged too, through
     /// [`crate::stats::hash_table_bytes`]: each cache's own tables (see
@@ -2035,10 +2181,7 @@ impl SignalStoreCache {
                 .iter()
                 .filter_map(|(k, v)| {
                     keys_len += k.len();
-                    match v {
-                        SessionEntry::Present(rec) => Some(rec.clone()),
-                        SessionEntry::Absent | SessionEntry::CheckedOut { .. } => None,
-                    }
+                    v.flushable_record().cloned()
                 })
                 .collect();
             keys_len += s.cache.overhead_bytes()
@@ -2121,6 +2264,7 @@ impl SignalStoreCache {
     async fn clear_with_incarnation(&self, incarnation: StoreIncarnation) {
         self.session_recovery_generation
             .fetch_add(1, Ordering::AcqRel);
+        let _flush_guard = self.flush_lock.lock().await;
         {
             let mut sessions = self.sessions.lock().await;
             let mut pending = self.pending_session_restores();
@@ -2143,6 +2287,7 @@ impl SignalStoreCache {
     /// Only a discard can make a post-flush write's stale snapshot reloadable.
     #[doc(hidden)]
     pub async fn clear_after_flush(&self) {
+        let _flush_guard = self.flush_lock.lock().await;
         let mut sessions = self.lock_sessions().await;
         if sessions.dirty.is_empty()
             && sessions.deleted.is_empty()
@@ -4124,18 +4269,7 @@ mod consumed_prekey_atomicity_tests {
         );
     }
 
-    /// A decrypt racing a flush must never lose the session<->prekey atomicity.
-    ///
-    /// Sender A's flush holds the sessions lock across both the session commit AND
-    /// the consumed-prekey drain. While it is mid-flush, sender B's decrypt tries to
-    /// promote B's session and buffer B's consumed prekey. Because the prekey buffer
-    /// is drained under that same sessions lock, B cannot reach the buffer until A's
-    /// flush has fully committed and released the lock, so A's flush can never delete
-    /// B's prekey while B's session is still volatile. The buggy form (prekey drain
-    /// in a separate lock scope) releases the sessions lock first, leaving a window
-    /// where B buffers its prekey and A then durably deletes it with B's session
-    /// unflushed. The backend asserts the sessions lock is held at the moment the
-    /// prekey is deleted, which directly distinguishes the fixed and buggy forms.
+    /// A prekey buffered during I/O belongs to the next session snapshot.
     #[tokio::test]
     async fn concurrent_decrypt_does_not_lose_prekey_during_flush() {
         use std::sync::Arc as StdArc;
@@ -4144,22 +4278,13 @@ mod consumed_prekey_atomicity_tests {
         const PREKEY_A: u32 = 1001;
         const PREKEY_B: u32 = 1002;
 
-        /// Wraps an InMemoryBackend. `put_sessions_batch` yields the executor many
-        /// times before doing the real write, so a concurrently spawned decrypt has
-        /// every chance to reach (and block on) the sessions lock while A's flush
-        /// holds it. `remove_prekey` records whether the sessions lock was actually
-        /// held (the core invariant the fix establishes) and flags any prekey delete
-        /// whose owning session is not yet durable.
         struct GatedBackend {
             inner: InMemoryBackend,
-            // The cache under flush, so the backend can probe the sessions lock.
-            cache: StdArc<SignalStoreCache>,
-            // Set if a prekey was deleted while the sessions lock was NOT held: that
-            // is the regression (prekey drain outside the sessions lock scope).
-            drained_without_sessions_lock: StdArc<AtomicBool>,
-            // Set if a prekey delete ever ran while its session was still volatile.
             violation: StdArc<AtomicBool>,
             addr_b: String,
+            gate: AtomicBool,
+            entered: async_channel::Sender<()>,
+            release: async_channel::Receiver<()>,
         }
 
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -4169,11 +4294,9 @@ mod consumed_prekey_atomicity_tests {
                 &self,
                 sessions: &[(Arc<str>, bytes::Bytes)],
             ) -> crate::store::error::Result<()> {
-                // A's flush holds the sessions lock here; yield repeatedly so B's
-                // spawned decrypt gets scheduled and blocks on that lock before the
-                // session commit (and the prekey drain) completes.
-                for _ in 0..64 {
-                    tokio::task::yield_now().await;
+                if self.gate.swap(false, Ordering::SeqCst) {
+                    self.entered.send(()).await.unwrap();
+                    self.release.recv().await.unwrap();
                 }
                 self.inner.put_sessions_batch(sessions).await
             }
@@ -4181,13 +4304,6 @@ mod consumed_prekey_atomicity_tests {
                 self.inner.mark_prekeys_uploaded(ids).await
             }
             async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
-                // The fix drains prekeys under the sessions lock, so a try_lock here
-                // must fail while a flush is deleting. If it succeeds, the drain ran
-                // outside the sessions lock: the exact regression.
-                if self.cache.sessions.try_lock().is_some() {
-                    self.drained_without_sessions_lock
-                        .store(true, Ordering::SeqCst);
-                }
                 // B's prekey may only be deleted once B's session is durable.
                 if id == PREKEY_B
                     && self
@@ -4305,12 +4421,14 @@ mod consumed_prekey_atomicity_tests {
 
         let cache = StdArc::new(SignalStoreCache::new());
         let violation = StdArc::new(AtomicBool::new(false));
-        let drained_without_sessions_lock = StdArc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
 
         let backend = StdArc::new(GatedBackend {
             inner,
-            cache: cache.clone(),
-            drained_without_sessions_lock: drained_without_sessions_lock.clone(),
+            gate: AtomicBool::new(true),
+            entered: entered_tx,
+            release: release_rx,
             violation: violation.clone(),
             addr_b: addr_b.as_str().to_string(),
         });
@@ -4319,32 +4437,25 @@ mod consumed_prekey_atomicity_tests {
         cache.put_session(&addr_a, SessionRecord::new_fresh()).await;
         cache.remove_prekey(PREKEY_A, addr_a.as_str()).await;
 
-        // Sender B's decrypt races A's flush: it promotes B's session and buffers
-        // B's consumed prekey. put_session must take the sessions lock, so while A's
-        // flush holds it (yielding inside put_sessions_batch) B blocks here and can
-        // only buffer once A's flush has committed and released the lock.
-        let b_cache = cache.clone();
-        let addr_b_task = addr_b.clone();
-        let b_task = tokio::spawn(async move {
-            b_cache
-                .put_session(&addr_b_task, SessionRecord::new_fresh())
-                .await;
-            b_cache.remove_prekey(PREKEY_B, addr_b_task.as_str()).await;
-        });
-
-        // A's flush runs concurrently with B's spawned decrypt. It holds the
-        // sessions lock across its yielding I/O and the prekey drain, so B cannot
-        // insert into removed_prekeys until A is done: A can never delete B's prekey.
-        cache.flush(backend.as_ref()).await.unwrap();
-        b_task.await.unwrap();
-
-        // The core invariant: every prekey delete during the flush ran while the
-        // sessions lock was held, so no concurrent decrypt could have buffered a
-        // prekey into the same drain. This is what makes session+prekey atomic.
+        let mut flush = Box::pin(cache.flush(backend.as_ref()));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
         assert!(
-            !drained_without_sessions_lock.load(Ordering::SeqCst),
-            "prekey was drained without holding the sessions lock (regression)"
+            cache
+                .try_put_session(&addr_b, SessionRecord::new_fresh())
+                .is_ok()
         );
+        cache.remove_prekey(PREKEY_B, addr_b.as_str()).await;
+        assert!(
+            backend
+                .inner
+                .get_session(addr_b.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
 
         // The flush must never have deleted B's prekey while B's session was
         // volatile.
@@ -4367,8 +4478,7 @@ mod consumed_prekey_atomicity_tests {
             "sender A's consumed prekey must be deleted with its session"
         );
 
-        // B buffered its prekey only after A's flush completed, so B's prekey is
-        // still durable and still buffered for B's own next flush.
+        // B was absent from the snapshot, so its prekey must survive this flush.
         assert!(
             backend.load_prekey(PREKEY_B).await.unwrap().is_some(),
             "B's prekey must survive a concurrent flush that did not persist B's session"
@@ -4402,6 +4512,33 @@ mod consumed_prekey_atomicity_tests {
 #[cfg(test)]
 mod eviction_tests {
     use super::*;
+
+    #[test]
+    fn bounded_candidates_keep_negative_priority_without_retaining_every_key() {
+        let positives: Vec<Arc<str>> = (0..64)
+            .map(|i| Arc::from(format!("positive-{i}")))
+            .collect();
+        let mut candidates = EvictionCandidates::new(4);
+        for key in &positives {
+            assert!(!candidates.consider(key, false));
+            assert!(candidates.keys.len() <= 4);
+        }
+        assert_eq!(Arc::strong_count(&positives[63]), 1);
+        for i in 0..4 {
+            let key = Arc::from(format!("negative-{i}"));
+            assert_eq!(candidates.consider(&key, true), i == 3);
+            assert_eq!(candidates.keys.len(), 4);
+        }
+        assert!(
+            candidates
+                .keys
+                .iter()
+                .all(|key| key.starts_with("negative-"))
+        );
+        assert!(candidates.consider(&Arc::from("extra"), false));
+        assert_eq!(candidates.keys.len(), 4);
+        assert!(EvictionCandidates::new(0).consider(&Arc::from("unused"), true));
+    }
     use crate::libsignal::protocol::{DeviceId, ProtocolAddress};
     use crate::store::in_memory::InMemoryBackend;
 
@@ -5041,6 +5178,53 @@ mod pre_wire_gate_tests {
         record
     }
 
+    #[tokio::test]
+    async fn leased_checkout_preserves_a_flushable_snapshot_and_gates_its_next_lease() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let address = addr("19995551020");
+        cache.put_session(&address, leased_record()).await;
+        let mut taken = cache
+            .get_session(&address, &backend)
+            .await
+            .unwrap()
+            .unwrap();
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            !cache.needs_pre_wire_flush().await,
+            "a checkout must not hide the lease needed by an already completed encrypt"
+        );
+        taken.reserve_sender_chain_counters(64);
+        cache.put_session(&address, taken).await;
+        assert!(cache.needs_pre_wire_flush().await);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    #[tokio::test]
+    async fn a_checkout_snapshot_settles_its_lease_but_keeps_its_prekey() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let address = addr("19995551032");
+        backend.store_prekey(9202, b"key", false).await.unwrap();
+        cache.put_session(&address, leased_record()).await;
+        cache.remove_prekey(9202, address.as_str()).await;
+        let taken = cache
+            .get_session(&address, &backend)
+            .await
+            .unwrap()
+            .unwrap();
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert!(
+            backend.load_prekey(9202).await.unwrap().is_some(),
+            "the mutable owner can still consume this key"
+        );
+        cache.put_session(&address, taken).await;
+        cache.flush(&backend).await.unwrap();
+        assert!(backend.load_prekey(9202).await.unwrap().is_none());
+    }
+
     /// The lock-free flags only exist to answer `needs_pre_wire_flush`, so
     /// every mutation of either pending set has to leave them agreeing with it.
     async fn assert_gate_agrees(cache: &SignalStoreCache, after: &str) {
@@ -5278,11 +5462,8 @@ mod pre_wire_gate_tests {
         assert!(!cache.needs_pre_wire_flush().await);
     }
 
-    /// A checked-out session cannot be persisted by a flush, so its pending
-    /// lease must survive that flush and release only once the returned
-    /// record is actually written.
     #[tokio::test]
-    async fn checked_out_session_keeps_its_lease_pending_across_a_flush() {
+    async fn a_checked_out_lease_stays_gated_when_its_snapshot_write_fails() {
         let backend = InMemoryBackend::new();
         let cache = SignalStoreCache::new();
         let a = addr("15550000004");
@@ -5290,12 +5471,15 @@ mod pre_wire_gate_tests {
         cache.put_session(&a, leased_record()).await;
         let taken = cache.get_session(&a, &backend).await.unwrap().unwrap();
 
-        cache.flush(&backend).await.unwrap();
+        backend.set_fail_session_writes(true);
+        assert!(cache.flush(&backend).await.is_err());
         assert!(
             cache.needs_pre_wire_flush().await,
-            "a checked-out lease was not persisted and must keep the gate closed"
+            "a failed snapshot write must keep the checked-out lease gated"
         );
-
+        backend.set_fail_session_writes(false);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
         cache.put_session(&a, taken).await;
         cache.flush(&backend).await.unwrap();
         assert!(!cache.needs_pre_wire_flush().await);
@@ -6411,7 +6595,6 @@ mod flush_contention_reproduction_tests {
     };
     use crate::store::in_memory::InMemoryBackend;
     use crate::store::traits::SignalStore;
-    use core::time::Duration;
     use std::future::poll_fn;
     use std::pin::pin;
     use std::sync::Arc;
@@ -6444,9 +6627,21 @@ mod flush_contention_reproduction_tests {
         ProtocolAddress::new(&format!("{user}@s.whatsapp.net"), 0.into())
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FlushTarget {
+        Sessions,
+        SessionReads,
+        Identities,
+        SenderKeys,
+        SessionDeletes,
+        SenderKeyDeletes,
+        Prekeys,
+    }
+
     struct ContentionGatedBackend {
         inner: InMemoryBackend,
         gating_enabled: AtomicBool,
+        target: FlushTarget,
         entered_tx: async_channel::Sender<()>,
         release_rx: async_channel::Receiver<()>,
     }
@@ -6459,6 +6654,7 @@ mod flush_contention_reproduction_tests {
             Self {
                 inner: InMemoryBackend::new(),
                 gating_enabled: AtomicBool::new(false),
+                target: FlushTarget::Sessions,
                 entered_tx,
                 release_rx,
             }
@@ -6466,6 +6662,13 @@ mod flush_contention_reproduction_tests {
 
         fn enable_gating(&self) {
             self.gating_enabled.store(true, Ordering::Release);
+        }
+
+        async fn gate(&self, target: FlushTarget) {
+            if self.gating_enabled.load(Ordering::Acquire) && self.target == target {
+                self.entered_tx.send(()).await.unwrap();
+                self.release_rx.recv().await.unwrap();
+            }
         }
     }
 
@@ -6476,17 +6679,39 @@ mod flush_contention_reproduction_tests {
             &self,
             sessions: &[(Arc<str>, bytes::Bytes)],
         ) -> crate::store::error::Result<()> {
-            if self.gating_enabled.load(Ordering::Acquire) {
-                let _ = self.entered_tx.send(()).await;
-                let _ = self.release_rx.recv().await;
-            }
+            self.gate(FlushTarget::Sessions).await;
             self.inner.put_sessions_batch(sessions).await
+        }
+
+        async fn put_identities_batch(
+            &self,
+            rows: &[(Arc<str>, [u8; 32])],
+        ) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::Identities).await;
+            self.inner.put_identities_batch(rows).await
+        }
+
+        async fn put_sender_keys_batch(
+            &self,
+            rows: &[(Arc<str>, bytes::Bytes)],
+        ) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::SenderKeys).await;
+            self.inner.put_sender_keys_batch(rows).await
+        }
+
+        async fn delete_sender_keys_batch(
+            &self,
+            rows: &[Arc<str>],
+        ) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::SenderKeyDeletes).await;
+            self.inner.delete_sender_keys_batch(rows).await
         }
 
         async fn get_session(
             &self,
             address: &str,
         ) -> crate::store::error::Result<Option<bytes::Bytes>> {
+            self.gate(FlushTarget::SessionReads).await;
             self.inner.get_session(address).await
         }
 
@@ -6506,6 +6731,7 @@ mod flush_contention_reproduction_tests {
             &self,
             addresses: &[Arc<str>],
         ) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::SessionDeletes).await;
             self.inner.delete_sessions_batch(addresses).await
         }
 
@@ -6557,6 +6783,7 @@ mod flush_contention_reproduction_tests {
         }
 
         async fn remove_prekeys_batch(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::Prekeys).await;
             self.inner.remove_prekeys_batch(ids).await
         }
 
@@ -6610,91 +6837,547 @@ mod flush_contention_reproduction_tests {
     }
 
     #[tokio::test]
-    async fn deterministic_flush_of_a_blocks_checkout_and_put_of_independent_session_b() {
+    async fn cold_prekey_probes_allow_progress_and_revalidate_before_deletion() {
+        #[derive(Clone, Copy, Debug)]
+        enum Race {
+            None,
+            Checkout,
+            Write,
+            Delete,
+            Reconsume,
+        }
+
+        for race in [
+            Race::None,
+            Race::Checkout,
+            Race::Write,
+            Race::Delete,
+            Race::Reconsume,
+        ] {
+            let (entered_tx, entered_rx) = async_channel::bounded(1);
+            let (release_tx, release_rx) = async_channel::bounded(1);
+            let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+            backend.target = FlushTarget::SessionReads;
+            let cache = SignalStoreCache::new();
+            let address = signal_address("cold-probe-owner");
+            let incarnation = cache.lock_sessions().await.incarnation;
+            let mut raw = Vec::new();
+            session_at_index(20).serialize_into_for_store(&mut raw, &incarnation);
+            backend
+                .inner
+                .put_session(address.as_str(), &raw)
+                .await
+                .unwrap();
+            backend
+                .inner
+                .store_prekey(9301, b"key", false)
+                .await
+                .unwrap();
+            cache.remove_prekey(9301, address.as_str()).await;
+            backend.enable_gating();
+            let mut flush = Box::pin(cache.flush(&backend));
+            assert!(futures::poll!(flush.as_mut()).is_pending());
+            entered_rx.try_recv().unwrap();
+            backend.gating_enabled.store(false, Ordering::Release);
+            let mut owner = None;
+            match race {
+                Race::None => {}
+                Race::Checkout => {
+                    let mut checkout = Box::pin(cache.checkout_session(&address, &backend));
+                    let Poll::Ready(Ok((record, token))) = futures::poll!(checkout.as_mut()) else {
+                        panic!("readonly durability probe blocked session checkout");
+                    };
+                    owner = Some((record.unwrap(), token));
+                }
+                Race::Write => assert!(
+                    cache
+                        .try_put_session(&address, session_at_index(21))
+                        .is_ok()
+                ),
+                Race::Delete => {
+                    let mut delete = Box::pin(cache.delete_session(&address));
+                    assert!(futures::poll!(delete.as_mut()).is_ready());
+                }
+                Race::Reconsume => {
+                    let mut reconsume = Box::pin(cache.remove_prekey(9301, address.as_str()));
+                    assert!(futures::poll!(reconsume.as_mut()).is_ready());
+                }
+            }
+            release_tx.try_send(()).unwrap();
+            flush.await.unwrap();
+            assert_eq!(
+                backend.inner.load_prekey(9301).await.unwrap().is_none(),
+                matches!(race, Race::None),
+                "{race:?}"
+            );
+            if let Some((record, token)) = owner {
+                cache.restore_session_from_checkout(&address, record, token, true);
+            }
+            cache.flush(&backend).await.unwrap();
+            assert_eq!(
+                backend.inner.load_prekey(9301).await.unwrap().is_some(),
+                matches!(race, Race::Delete),
+                "{race:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_and_sender_key_mutations_survive_an_older_flush() {
+        for target in [FlushTarget::Identities, FlushTarget::SenderKeys] {
+            let (entered_tx, entered_rx) = async_channel::bounded(1);
+            let (release_tx, release_rx) = async_channel::bounded(1);
+            let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+            backend.target = target;
+            let cache = SignalStoreCache::new();
+            let address = signal_address("19995551025");
+            let name = SenderKeyName::from_parts("120363000000000025@g.us", address.as_str());
+            if target == FlushTarget::Identities {
+                cache.put_identity(&address, &[1; 32]).await;
+            } else {
+                let mut record = SenderKeyRecord::new_empty();
+                record.mark_wire_gated();
+                cache.put_sender_key(&name, record).await;
+            }
+            backend.enable_gating();
+            let mut flush = Box::pin(cache.flush(&backend));
+            assert!(futures::poll!(flush.as_mut()).is_pending());
+            entered_rx.try_recv().unwrap();
+            if target == FlushTarget::Identities {
+                assert!(cache.try_put_identity(&address, &[2; 32]));
+            } else {
+                let mut record = SenderKeyRecord::new_empty();
+                record.mark_wire_gated();
+                let mut put = Box::pin(cache.put_sender_key(&name, record));
+                assert!(futures::poll!(put.as_mut()).is_ready());
+            }
+            release_tx.try_send(()).unwrap();
+            flush.await.unwrap();
+            if target == FlushTarget::Identities {
+                assert!(
+                    cache
+                        .identities
+                        .lock()
+                        .await
+                        .dirty
+                        .contains(address.as_str())
+                );
+                assert_eq!(
+                    backend.inner.load_identity(address.as_str()).await.unwrap(),
+                    Some([1; 32])
+                );
+            } else {
+                assert!(
+                    cache
+                        .sender_keys
+                        .lock()
+                        .await
+                        .dirty
+                        .contains(name.cache_key())
+                );
+                assert!(cache.needs_pre_wire_flush().await);
+            }
+            backend.gating_enabled.store(false, Ordering::Release);
+            cache.flush(&backend).await.unwrap();
+            assert!(!cache.needs_pre_wire_flush().await);
+            if target == FlushTarget::Identities {
+                assert_eq!(
+                    backend.inner.load_identity(address.as_str()).await.unwrap(),
+                    Some([2; 32])
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replacements_during_tombstone_io_remain_dirty_and_gated() {
+        for target in [FlushTarget::SessionDeletes, FlushTarget::SenderKeyDeletes] {
+            let (entered_tx, entered_rx) = async_channel::bounded(1);
+            let (release_tx, release_rx) = async_channel::bounded(1);
+            let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+            backend.target = target;
+            let cache = SignalStoreCache::new();
+            let address = signal_address("19995551026");
+            let name = SenderKeyName::from_parts("120363000000000026@g.us", address.as_str());
+            if target == FlushTarget::SessionDeletes {
+                cache.delete_session(&address).await;
+            } else {
+                cache.delete_sender_key(name.cache_key()).await;
+            }
+            backend.enable_gating();
+            let mut flush = Box::pin(cache.flush(&backend));
+            assert!(futures::poll!(flush.as_mut()).is_pending());
+            entered_rx.try_recv().unwrap();
+            if target == FlushTarget::SessionDeletes {
+                let mut record = session_at_index(64);
+                record.reserve_sender_chain_counters(64);
+                assert!(cache.try_put_session(&address, record).is_ok());
+            } else {
+                let mut record = SenderKeyRecord::new_empty();
+                record.mark_wire_gated();
+                let mut put = Box::pin(cache.put_sender_key(&name, record));
+                assert!(futures::poll!(put.as_mut()).is_ready());
+            }
+            release_tx.try_send(()).unwrap();
+            flush.await.unwrap();
+            assert!(cache.needs_pre_wire_flush().await);
+            backend.gating_enabled.store(false, Ordering::Release);
+            cache.flush(&backend).await.unwrap();
+            assert!(!cache.needs_pre_wire_flush().await);
+            if target == FlushTarget::SessionDeletes {
+                assert!(
+                    backend
+                        .inner
+                        .get_session(address.as_str())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            } else {
+                assert!(
+                    backend
+                        .inner
+                        .get_sender_key(name.cache_key())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_tombstone_created_during_put_io_is_not_lost() {
         let (entered_tx, entered_rx) = async_channel::bounded(1);
         let (release_tx, release_rx) = async_channel::bounded(1);
-        let backend = Arc::new(ContentionGatedBackend::new(entered_tx, release_rx));
-        let cache = Arc::new(SignalStoreCache::new());
-
-        let addr_a = signal_address("19995551001");
-        let addr_b = signal_address("19995551002");
-
-        // Warm up B and flush it so it is Present and clean in cache.
-        cache.put_session(&addr_b, session_at_index(10)).await;
-        cache.flush(backend.as_ref()).await.expect("warmup flush");
-
-        // Dirty session A.
-        cache.put_session(&addr_a, session_at_index(20)).await;
-
-        // Enable gating so backend.put_sessions_batch will pause.
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551027");
+        let mut record = session_at_index(20);
+        record.reserve_sender_chain_counters(20);
+        cache.put_session(&address, record).await;
         backend.enable_gating();
-
-        // Spawn flush of A.
-        let flush_task = tokio::spawn({
-            let (cache, backend) = (cache.clone(), backend.clone());
-            async move { cache.flush(backend.as_ref()).await }
-        });
-
-        // Wait for flush to enter put_sessions_batch while holding lock_sessions().
-        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
-            .await
-            .expect("timeout waiting for flush to enter put_sessions_batch")
-            .expect("channel alive");
-
-        // --- At this point, flush of A holds the sessions lock mid-I/O ---
-
-        // 1. Non-blocking checkout of independent warm session B must return None.
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let mut delete = Box::pin(cache.delete_session(&address));
+        assert!(futures::poll!(delete.as_mut()).is_ready());
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
         assert!(
-            cache.try_checkout_session(&addr_b).is_none(),
-            "try_checkout_session on warm independent session B must fail while flush holds sessions lock"
+            cache
+                .lock_sessions()
+                .await
+                .deleted
+                .contains(address.as_str())
         );
-
-        // 2. Async checkout of B must be Pending (blocked on sessions lock).
-        let mut checkout_b = pin!(cache.checkout_session(&addr_b, backend.as_ref()));
-        let pending_checkout =
-            poll_fn(|cx| Poll::Ready(checkout_b.as_mut().poll(cx).is_pending())).await;
+        assert!(cache.needs_pre_wire_flush().await);
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
         assert!(
-            pending_checkout,
-            "checkout_session of warm independent session B must be Pending during flush"
+            backend
+                .inner
+                .get_session(address.as_str())
+                .await
+                .unwrap()
+                .is_none()
         );
+    }
 
-        // 3. Non-blocking put of independent session B must fail with Err(record).
-        let put_res = cache.try_put_session(&addr_b, session_at_index(11));
+    #[tokio::test]
+    async fn a_later_prekey_on_the_same_address_waits_for_its_own_snapshot() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551028");
+        backend
+            .inner
+            .store_prekey(9101, b"first", false)
+            .await
+            .unwrap();
+        backend
+            .inner
+            .store_prekey(9102, b"second", false)
+            .await
+            .unwrap();
+        cache.put_session(&address, session_at_index(20)).await;
+        cache.remove_prekey(9101, address.as_str()).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
         assert!(
-            put_res.is_err(),
-            "try_put_session on session B must fail while flush holds sessions lock"
+            cache
+                .try_put_session(&address, session_at_index(21))
+                .is_ok()
         );
-        let record_b_put = put_res.unwrap_err();
+        cache.remove_prekey(9102, address.as_str()).await;
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(backend.inner.load_prekey(9101).await.unwrap().is_some());
+        assert!(backend.inner.load_prekey(9102).await.unwrap().is_some());
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        assert!(backend.inner.load_prekey(9101).await.unwrap().is_none());
+        assert!(backend.inner.load_prekey(9102).await.unwrap().is_none());
+    }
 
-        // 4. Async put of B must be Pending (blocked on sessions lock).
-        let mut put_b = pin!(cache.put_session(&addr_b, record_b_put));
-        let pending_put = poll_fn(|cx| Poll::Ready(put_b.as_mut().poll(cx).is_pending())).await;
+    #[tokio::test]
+    async fn a_reconsumed_prekey_survives_until_the_new_session_is_durable() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551033");
+        backend
+            .inner
+            .store_prekey(9201, b"key", false)
+            .await
+            .unwrap();
+        cache.put_session(&address, session_at_index(20)).await;
+        cache.remove_prekey(9201, address.as_str()).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
         assert!(
-            pending_put,
-            "put_session of independent session B must be Pending during flush"
+            cache
+                .try_put_session(&address, session_at_index(21))
+                .is_ok()
         );
+        cache.remove_prekey(9201, address.as_str()).await;
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(
+            backend.inner.load_prekey(9201).await.unwrap().is_some(),
+            "old flush destroyed a reconsumed private key"
+        );
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        assert!(backend.inner.load_prekey(9201).await.unwrap().is_none());
+    }
 
-        // Release backend I/O to complete flush.
-        release_tx.send(()).await.expect("release backend");
-        tokio::time::timeout(Duration::from_secs(5), flush_task)
+    #[tokio::test]
+    async fn private_prekey_deletion_excludes_new_session_checkouts() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        backend.target = FlushTarget::Prekeys;
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551034");
+        backend
+            .inner
+            .store_prekey(9203, b"key", false)
             .await
-            .expect("flush timeout")
-            .unwrap()
-            .expect("flush must succeed");
+            .unwrap();
+        cache.put_session(&address, session_at_index(20)).await;
+        cache.remove_prekey(9203, address.as_str()).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        assert!(
+            cache.try_checkout_session(&address).is_none(),
+            "checkout raced irreversible private-key deletion"
+        );
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        let (record, token) = cache.try_checkout_session(&address).unwrap().unwrap();
+        cache.restore_session_from_checkout(&address, record.unwrap(), token, true);
+    }
 
-        // Both checkout and put of B can now complete without deadlock.
-        let (record_b, checkout_key_b) = checkout_b
-            .await
-            .expect("checkout B must succeed after flush releases lock");
-        assert_eq!(chain_index_of(&record_b.expect("record B present")), 10);
-        cache.cancel_session_checkout(&addr_b, checkout_key_b);
+    #[tokio::test]
+    async fn concurrent_flushes_cannot_overtake_each_other() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551029");
+        cache.put_session(&address, session_at_index(20)).await;
+        backend.enable_gating();
+        let mut first = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        assert!(
+            cache
+                .try_put_session(&address, session_at_index(21))
+                .is_ok()
+        );
+        let mut second = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert!(entered_rx.try_recv().is_err());
+        backend.gating_enabled.store(false, Ordering::Release);
+        release_tx.try_send(()).unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
+        cache.clear_after_flush().await;
+        let (record, token) = cache.checkout_session(&address, &backend).await.unwrap();
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), 21);
+        cache.restore_session_from_checkout(&address, record.unwrap(), token, true);
+    }
 
-        put_b.await;
-        let (updated_b, _) = cache
-            .checkout_session(&addr_b, backend.as_ref())
-            .await
-            .expect("checkout updated B");
-        assert_eq!(chain_index_of(&updated_b.expect("updated B present")), 11);
+    #[tokio::test]
+    async fn a_durable_sender_key_delete_waits_out_an_older_put_snapshot() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        backend.target = FlushTarget::SenderKeys;
+        let cache = SignalStoreCache::new();
+        let name =
+            SenderKeyName::from_parts("120363000000000030@g.us", "19995551030@s.whatsapp.net:0");
+        cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let mut delete = Box::pin(cache.delete_sender_key_durable(&name, &backend));
+        assert!(futures::poll!(delete.as_mut()).is_pending());
+        backend.gating_enabled.store(false, Ordering::Release);
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        delete.await.unwrap();
+        assert!(
+            backend
+                .inner
+                .get_sender_key(name.cache_key())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    #[tokio::test]
+    async fn a_lossy_clear_waits_for_snapshot_io_and_preserves_recovery_burn() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551031");
+        let mut record = session_at_index(20);
+        record.reserve_sender_chain_counters(20);
+        let ceiling = record.reserved_sender_chain_index();
+        cache.put_session(&address, record).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let mut clear = Box::pin(cache.clear());
+        assert!(futures::poll!(clear.as_mut()).is_pending());
+        assert_eq!(cache.session_recovery_generation.load(Ordering::Acquire), 1);
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        clear.await;
+        let (record, token) = cache.checkout_session(&address, &backend).await.unwrap();
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), ceiling);
+        cache.restore_session_from_checkout(&address, record.unwrap(), token, true);
+    }
+
+    #[tokio::test]
+    async fn independent_session_progresses_while_another_flush_is_in_io() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let a = signal_address("19995551021");
+        let b = signal_address("19995551022");
+        cache.put_session(&b, session_at_index(10)).await;
+        cache.flush(&backend).await.unwrap();
+        cache.put_session(&a, session_at_index(20)).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+
+        let (record, token) = cache
+            .try_checkout_session(&b)
+            .expect("independent checkout blocked")
+            .unwrap();
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), 10);
+        assert!(matches!(
+            cache.restore_session_from_checkout(&b, record.unwrap(), token, true),
+            SessionCheckoutStoreResult::Stored
+        ));
+        assert!(cache.try_put_session(&b, session_at_index(11)).is_ok());
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(cache.lock_sessions().await.dirty.contains(b.as_str()));
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        cache.clear_after_flush().await;
+        let (record, token) = cache.checkout_session(&b, &backend).await.unwrap();
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), 11);
+        cache.restore_session_from_checkout(&b, record.unwrap(), token, true);
+    }
+
+    #[tokio::test]
+    async fn an_older_session_flush_cannot_clear_a_newer_write_or_lease() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let a = signal_address("19995551023");
+        cache.put_session(&a, session_at_index(20)).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let mut newer = session_at_index(64);
+        newer.reserve_sender_chain_counters(64);
+        assert!(
+            cache.try_put_session(&a, newer).is_ok(),
+            "update blocked by backend I/O"
+        );
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(cache.needs_pre_wire_flush().await);
+        assert!(cache.lock_sessions().await.dirty.contains(a.as_str()));
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_backend_commit_preserves_dirty_state_for_retry() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551024");
+        let mut record = session_at_index(20);
+        record.reserve_sender_chain_counters(20);
+        cache.put_session(&address, record).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let state = cache.sessions.lock().await;
+        release_tx.try_send(()).unwrap();
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        assert!(
+            backend
+                .inner
+                .get_session(address.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(flush);
+        assert!(state.dirty.contains(address.as_str()));
+        assert!(state.reservation_pending.contains(address.as_str()));
+        drop(state);
+        cache.put_session(&address, session_at_index(21)).await;
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        cache.clear_after_flush().await;
+        let (record, token) = cache.checkout_session(&address, &backend).await.unwrap();
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), 21);
+        cache.restore_session_from_checkout(&address, record.unwrap(), token, true);
     }
 
     #[tokio::test]
@@ -6734,99 +7417,61 @@ mod flush_contention_reproduction_tests {
     }
 
     #[tokio::test]
-    async fn control_cold_read_blocked_at_cache_lock_during_flush_before_backend_io() {
+    async fn a_cold_read_reaches_the_backend_while_an_independent_flush_is_in_io() {
         let (entered_tx, entered_rx) = async_channel::bounded(1);
         let (release_tx, release_rx) = async_channel::bounded(1);
-        let backend = Arc::new(ContentionGatedBackend::new(entered_tx, release_rx));
-        let cache = Arc::new(SignalStoreCache::new());
-
-        let addr_a = signal_address("19995551004");
-        let addr_c = signal_address("19995551005");
-
-        // Seed C directly into backend, NOT into cache (C is cold).
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let a = signal_address("19995551004");
+        let c = signal_address("19995551005");
         let mut raw = Vec::new();
         session_at_index(50).serialize_into_for_store(&mut raw, &[0xAA; 16]);
-        backend
-            .inner
-            .put_session(addr_c.as_str(), &raw)
-            .await
-            .expect("seed C");
-
-        // Dirty session A in cache.
-        cache.put_session(&addr_a, session_at_index(20)).await;
+        backend.inner.put_session(c.as_str(), &raw).await.unwrap();
+        cache.put_session(&a, session_at_index(20)).await;
         backend.enable_gating();
-
-        // Spawn flush of A.
-        let flush_task = tokio::spawn({
-            let (cache, backend) = (cache.clone(), backend.clone());
-            async move { cache.flush(backend.as_ref()).await }
-        });
-        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
-            .await
-            .expect("flush entry timeout")
-            .expect("flush in progress");
-
-        // Cold checkout of C must probe cache first before issuing backend get_session.
-        // Because flush holds lock_sessions(), cold checkout is blocked at the initial cache probe.
-        let mut cold_checkout = pin!(cache.checkout_session(&addr_c, backend.as_ref()));
-        let pending = poll_fn(|cx| Poll::Ready(cold_checkout.as_mut().poll(cx).is_pending())).await;
-        assert!(
-            pending,
-            "cold checkout of C must be Pending at the cache lock before even reaching the backend"
-        );
-
-        release_tx.send(()).await.expect("release flush");
-        tokio::time::timeout(Duration::from_secs(5), flush_task)
-            .await
-            .expect("flush completion timeout")
-            .expect("join")
-            .expect("flush ok");
-
-        // After flush releases lock, cold read proceeds to backend and completes.
-        let (record_c, key_c) = cold_checkout.await.expect("cold checkout ok");
-        assert_eq!(chain_index_of(&record_c.expect("record C present")), 50);
-        cache.cancel_session_checkout(&addr_c, key_c);
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let mut cold = Box::pin(cache.checkout_session(&c, &backend));
+        let Poll::Ready(Ok((record, token))) = futures::poll!(cold.as_mut()) else {
+            panic!("cold read blocked before reaching an independent backend read");
+        };
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), 50);
+        cache.restore_session_from_checkout(&c, record.unwrap(), token, true);
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
     }
 
     #[tokio::test]
-    async fn control_same_session_remains_serialized_during_flush() {
+    async fn concurrent_checkouts_remain_exclusive_during_a_flush() {
         let (entered_tx, entered_rx) = async_channel::bounded(1);
         let (release_tx, release_rx) = async_channel::bounded(1);
-        let backend = Arc::new(ContentionGatedBackend::new(entered_tx, release_rx));
-        let cache = Arc::new(SignalStoreCache::new());
-
-        let addr_a = signal_address("19995551006");
-        cache.put_session(&addr_a, session_at_index(30)).await;
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let a = signal_address("19995551006");
+        cache.put_session(&a, session_at_index(30)).await;
         backend.enable_gating();
-
-        let flush_task = tokio::spawn({
-            let (cache, backend) = (cache.clone(), backend.clone());
-            async move { cache.flush(backend.as_ref()).await }
-        });
-        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
-            .await
-            .expect("flush entry timeout")
-            .expect("flush in progress");
-
-        // Operations on the SAME session A must remain blocked / pending during flush.
-        assert!(cache.try_checkout_session(&addr_a).is_none());
-        let mut checkout_a = pin!(cache.checkout_session(&addr_a, backend.as_ref()));
-        let pending = poll_fn(|cx| Poll::Ready(checkout_a.as_mut().poll(cx).is_pending())).await;
-        assert!(
-            pending,
-            "session A must be serialized while its flush is in flight"
-        );
-
-        release_tx.send(()).await.expect("release flush");
-        tokio::time::timeout(Duration::from_secs(5), flush_task)
-            .await
-            .expect("flush completion timeout")
-            .expect("join")
-            .expect("flush ok");
-
-        let (rec_a, key_a) = checkout_a.await.expect("checkout ok");
-        assert_eq!(chain_index_of(&rec_a.expect("record present")), 30);
-        cache.cancel_session_checkout(&addr_a, key_a);
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        {
+            let state = cache.sessions.lock().await;
+            let SessionEntry::Present(record) = state.cache.get(a.as_str()).unwrap() else {
+                panic!("session is not present");
+            };
+            assert_eq!(
+                Arc::strong_count(record),
+                1,
+                "flush must not force ordinary checkouts to clone"
+            );
+            assert!(Arc::weak_count(record) > 0);
+        }
+        let (record, token) = cache.try_checkout_session(&a).unwrap().unwrap();
+        assert!(cache.try_checkout_session(&a).unwrap().is_err());
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(cache.try_checkout_session(&a).unwrap().is_err());
+        cache.restore_session_from_checkout(&a, record.unwrap(), token, true);
     }
 }
 

@@ -306,11 +306,18 @@ whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, features = ["wasm_js"] }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+send_wrapper = { version = "0.6", features = ["futures"] }
+
 [dev-dependencies]
 aes = { workspace = true }
 cbc = { workspace = true, features = ["block-padding"] }
 divan = { workspace = true }
 env_logger = { workspace = true }
+# URL parser for the benchmark example's mock admin endpoint derivation.
+# Dev-only so production builds carry no new dependency; already in the tree
+# via the Tokio transport, so this adds no new crate to compile.
+http = "1"
 # `total_listeners()` (how tests observe that a waiter parked) is std-gated.
 event-listener = { workspace = true, features = ["std"] }
 flate2 = { workspace = true }
@@ -337,9 +344,17 @@ workspace = true
 [[example]]
 name = "demo"
 
+# The mock-capable benchmark client. `test = true` makes its `#[cfg(test)]`
+# config tests a nextest target, so the default CI run executes them instead of
+# only compiling the example. `required-features` names what the example
+# actually needs to link (runtime, transport, HTTP client — all in `default`),
+# so `--no-default-features` builds still skip it. `danger-skip-tls-verify`
+# stays an opt-in Cargo feature for talking to the mock's own-root TLS chain,
+# never a build requirement.
 [[example]]
 name = "benchmark"
-required-features = ["danger-skip-tls-verify"]
+test = true
+required-features = ["tokio-runtime", "tokio-transport", "ureq-client"]
 
 [[example]]
 name = "observability"

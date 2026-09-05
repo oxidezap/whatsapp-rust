@@ -35,7 +35,12 @@ fn create_session(rng: &mut rand::rngs::StdRng) -> SessionRecord {
     let base_key = KeyPair::generate(rng).public_key;
     let mut state = SessionState::new(3, &local, &remote, &RootKey::new([7; 32]), &base_key);
     state.set_sender_chain(&KeyPair::generate(rng), &ChainKey::new([11; 32], 0));
-    SessionRecord::new(state)
+    let mut record = SessionRecord::new(state);
+    // Cover the report's 101 advances before timing: otherwise its no-overlap
+    // control leaves a lease unpersisted for the entire run, forcing checkout
+    // snapshots that a real pre-wire send would have settled immediately.
+    record.reserve_sender_chain_counters(64);
+    record
 }
 
 fn chain_index(record: &SessionRecord) -> u32 {
@@ -176,6 +181,31 @@ fn percentile(samples: &mut [Duration], percent: usize) -> f64 {
 
 #[allow(clippy::print_stdout)]
 fn report() {
+    let probe = Harness::new(1);
+    let cache_access = probe.runtime.block_on(async {
+        let mut flush = pin!(probe.cache.flush(&probe.store));
+        match poll_fn(|cx| Poll::Ready(flush.as_mut().poll(cx))).await {
+            Poll::Ready(result) => {
+                result.expect("probe flush");
+                None
+            }
+            Poll::Pending => {
+                let accessible = probe.cache.try_has_session(&probe.addresses[0]).is_some();
+                flush.await.expect("probe flush");
+                Some(accessible)
+            }
+        }
+    });
+    if std::env::var_os("SIGNAL_CACHE_EXPECT_UNLOCKED").is_some()
+        && let Some(accessible) = cache_access
+    {
+        assert!(
+            accessible,
+            "benchmark linked a cache that holds its mutex across I/O"
+        );
+    }
+    println!("Cache readable during pending native flush: {cache_access:?}");
+    probe.close();
     println!(
         "Cache operations only; timings include scheduling. Flush duration is not mutex hold time."
     );

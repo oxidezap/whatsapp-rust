@@ -54,6 +54,26 @@ fn block_on<F: Future>(future: F) -> F::Output {
 const CACHE_SIZES: [usize; 3] = [64, 512, 4096];
 const BATCH: usize = 512;
 
+/// A cold burst can pin every coordination entry beyond capacity. Eviction
+/// must not repeatedly scan the whole growing map when none can be reclaimed.
+#[divan::bench(args = [256, 4096])]
+fn held_coordination_entries(bencher: divan::Bencher, count: usize) {
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        let cache = Cache::builder()
+            .max_capacity(2)
+            .evict_guard(|value: &Arc<()>| Arc::strong_count(value) <= 1)
+            .build();
+        let mut held = Vec::with_capacity(count);
+        for key in 0..count {
+            let value = Arc::new(());
+            held.push(value.clone());
+            block_on(cache.insert(key, value));
+        }
+        assert_eq!(cache.entry_count(), count as u64);
+        black_box(held);
+    });
+}
+
 fn key(i: usize) -> Jid {
     Jid::pn(format!("5511999{i:06}"))
 }

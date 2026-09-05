@@ -1,7 +1,7 @@
 use super::error::StoreError;
 use crate::store::Device;
 use crate::store::traits::Backend;
-use async_lock::RwLock;
+use async_lock::{Mutex, RwLock};
 use event_listener::Event;
 use futures::FutureExt;
 use log::{debug, error};
@@ -9,6 +9,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use wacore::runtime::{AbortHandle, Runtime, ShutdownSignal, wait_for_shutdown};
+
+#[cfg(not(target_arch = "wasm32"))]
+type PendingDeviceSave = wacore::runtime::BoxFuture<'static, Result<(), StoreError>>;
+#[cfg(target_arch = "wasm32")]
+type PendingDeviceSave =
+    send_wrapper::SendWrapper<wacore::runtime::BoxFuture<'static, Result<(), StoreError>>>;
+
+fn pending_device_save(
+    future: wacore::runtime::BoxFuture<'static, Result<(), StoreError>>,
+) -> PendingDeviceSave {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Browser stores return local futures; access stays on their origin
+        // thread even though the store adapters require Send + Sync handles.
+        send_wrapper::SendWrapper::new(future)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        future
+    }
+}
 
 pub struct PersistenceManager {
     device: Arc<RwLock<Device>>,
@@ -19,6 +40,10 @@ pub struct PersistenceManager {
     device_snapshot: std::sync::RwLock<Arc<Device>>,
     backend: Arc<dyn Backend>,
     dirty: Arc<AtomicBool>,
+    /// The manager, not a flush caller, owns an initiated save. Cancellation
+    /// releases the driver lock but retains the future, including a backend's
+    /// spawned I/O, so the next caller resumes it before writing a newer snapshot.
+    pending_save: Mutex<Option<PendingDeviceSave>>,
     save_notify: Arc<Event>,
     /// Set to true when the background saver halts due to repeated flush failures.
     saver_halted: Arc<AtomicBool>,
@@ -62,6 +87,7 @@ impl PersistenceManager {
             device_snapshot: std::sync::RwLock::new(snapshot),
             backend,
             dirty: Arc::new(AtomicBool::new(false)),
+            pending_save: Mutex::new(None),
             save_notify: Arc::new(Event::new()),
             saver_halted: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -122,25 +148,48 @@ impl PersistenceManager {
     }
 
     /// Flush any dirty device state to the backend immediately.
+    ///
+    /// Cancelling the caller retains an initiated save in the manager. The next
+    /// flush or background-saver tick resumes it before persisting newer state.
     pub async fn flush(&self) -> Result<(), StoreError> {
         self.save_to_disk().await
     }
 
     async fn save_to_disk(&self) -> Result<(), StoreError> {
-        if self.dirty.swap(false, Ordering::AcqRel) {
-            debug!("Device state is dirty, saving to disk.");
-            let device_guard = self.device.read().await;
-            let serializable_device = device_guard.to_serializable();
-            drop(device_guard);
-
-            if let Err(e) = self.backend.save(&serializable_device).await {
-                // Restore dirty flag so the next tick retries the save
-                self.dirty.store(true, Ordering::Release);
-                return Err(e);
-            }
-            debug!("Device state saved successfully.");
+        let mut pending = self.pending_save.lock().await;
+        self.finish_device_save(&mut pending).await?;
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok(());
         }
-        Ok(())
+
+        // Synchronize with publication before consuming dirty: a modifier sets
+        // it while still rebuilding the snapshot under the device write guard.
+        let device_guard = self.device.read().await;
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let snapshot = self.get_device_snapshot();
+        drop(device_guard);
+        let backend = self.backend.clone();
+        *pending = Some(pending_device_save(Box::pin(async move {
+            backend.save(&snapshot.core).await
+        })));
+        self.finish_device_save(&mut pending).await
+    }
+
+    async fn finish_device_save(
+        &self,
+        pending: &mut Option<PendingDeviceSave>,
+    ) -> Result<(), StoreError> {
+        let Some(save) = pending.as_mut() else {
+            return Ok(());
+        };
+        let result = save.await;
+        *pending = None;
+        if result.is_err() {
+            self.dirty.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Triggers a snapshot of the underlying storage backend.
@@ -327,7 +376,110 @@ impl PersistenceManager {
 mod tests {
     use super::*;
     use crate::runtime_impl::TokioRuntime;
+    use wacore::store::traits::DeviceStore;
     use wacore::time::Instant;
+
+    #[tokio::test]
+    async fn audit_cancelled_flush_must_preserve_dirty_device() {
+        let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        let pm = PersistenceManager::new(backend.clone()).await.unwrap();
+        pm.process_command(DeviceCommand::SetPushName("before".into()))
+            .await;
+        pm.flush().await.unwrap();
+        pm.process_command(DeviceCommand::SetPushName("after".into()))
+            .await;
+
+        // Block snapshot acquisition without mutating Device; cancellation
+        // must not consume the dirty state while waiting for this guard.
+        let guard = pm.device.write().await;
+        let mut flush = Box::pin(pm.flush());
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        drop(flush);
+        drop(guard);
+
+        pm.flush().await.unwrap();
+        assert_eq!(backend.load().await.unwrap().unwrap().push_name, "after");
+    }
+
+    #[tokio::test]
+    async fn audit_overlapping_flush_must_wait_for_durable_device() {
+        let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        let pm = PersistenceManager::new(backend.clone()).await.unwrap();
+        pm.process_command(DeviceCommand::SetPushName("before".into()))
+            .await;
+        pm.flush().await.unwrap();
+        pm.process_command(DeviceCommand::SetPushName("after".into()))
+            .await;
+
+        let guard = pm.device.write().await;
+        let mut first = Box::pin(pm.flush());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert_eq!(backend.load().await.unwrap().unwrap().push_name, "before");
+        let mut second = Box::pin(pm.flush());
+        assert!(
+            futures::poll!(second.as_mut()).is_pending(),
+            "flush returned success while the newer device snapshot was not durable"
+        );
+        drop(guard);
+        first.await.unwrap();
+        second.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_driver_resumes_pending_save_before_newer_snapshot() {
+        let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        let pm = PersistenceManager::new(backend.clone()).await.unwrap();
+        pm.process_command(DeviceCommand::SetPushName("before".into()))
+            .await;
+        pm.flush().await.unwrap();
+
+        let snapshot = pm.get_device_snapshot();
+        let saved = backend.clone();
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        *pm.pending_save.lock().await = Some(pending_device_save(Box::pin(async move {
+            entered_tx.send(()).await.unwrap();
+            release_rx.recv().await.unwrap();
+            saved.save(&snapshot.core).await
+        })));
+        pm.process_command(DeviceCommand::SetPushName("after".into()))
+            .await;
+
+        let mut first = Box::pin(pm.flush());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        drop(first);
+        assert!(
+            !release_tx.is_closed(),
+            "cancellation dropped the save future"
+        );
+
+        let mut next = Box::pin(pm.flush());
+        assert!(futures::poll!(next.as_mut()).is_pending());
+        release_tx.try_send(()).unwrap();
+        next.await.unwrap();
+        assert_eq!(backend.load().await.unwrap().unwrap().push_name, "after");
+        assert!(pm.pending_save.lock().await.is_none());
+        assert!(!pm.dirty.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn failed_pending_save_retries_latest_snapshot() {
+        let backend = Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        let pm = PersistenceManager::new(backend.clone()).await.unwrap();
+        pm.process_command(DeviceCommand::SetPushName("after".into()))
+            .await;
+        *pm.pending_save.lock().await = Some(pending_device_save(Box::pin(async {
+            Err(StoreError::Io(std::io::Error::other(
+                "injected save failure",
+            )))
+        })));
+        assert!(pm.flush().await.is_err());
+        assert!(pm.dirty.load(Ordering::Acquire));
+        assert!(pm.pending_save.lock().await.is_none());
+        pm.flush().await.unwrap();
+        assert_eq!(backend.load().await.unwrap().unwrap().push_name, "after");
+    }
 
     // Saver must observe shutdown.notify, run a final flush, and exit so the
     // AbortHandle-backed task doesn't outlive the Bot.
