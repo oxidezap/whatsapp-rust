@@ -47,12 +47,11 @@ one process can disagree and no reconnect can observe a change. The explicit
 code against zero-signed fixtures — it skips only the two XEdDSA steps, and a
 chain accepted under it is typed as nothing to persist (`XxHandshakeOutcome`
 carries `None`) and never authorizes IK (`select_pattern` stays at XX), so it
-is neither read from nor written to the trusted cache. The legacy
-`danger-skip-cert-chain-verify` feature only changes what the *default*
-policy is; an explicit `Strict` verifies regardless of it, and the public
+is neither read from nor written to the trusted cache. There is no Cargo
+feature for this: migration is deleting the feature flag and choosing the
+explicit per-client policy only where a mock server needs it. The public
 `HandshakeUtils::verify_server_cert` helper always verifies strictly — it
-never consults the default, so with the feature its integration test still
-runs and still rejects the zero-signed fixture. `tests/e2e` passes the
+never consults the default. `tests/e2e` passes the
 bypass per client at construction because the mock server does not sign its
 chain. **Default builds verify; only an explicit per-client bypass skips
 the signature checks.** The `wacore/noise` integration tests in

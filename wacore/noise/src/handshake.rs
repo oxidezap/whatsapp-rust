@@ -19,9 +19,10 @@ pub const WA_CERT_PUB_KEY: [u8; 32] = [
 /// two clients in one process can hold different policies and no in-flight
 /// reconnect can observe a change. Consulted only while setting up or
 /// verifying a handshake, never on the per-message path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NoiseCertPolicy {
     /// Verify both XEdDSA signatures and reuse the trusted IK cache.
+    #[default]
     Strict,
     /// Testing-only opt-in for mock servers that cannot produce a
     /// WhatsApp-rooted chain.
@@ -30,20 +31,6 @@ pub enum NoiseCertPolicy {
     /// run, and a chain accepted here is never read from or written to the
     /// trusted IK cache.
     DangerSkipCertChainVerify,
-}
-
-impl Default for NoiseCertPolicy {
-    fn default() -> Self {
-        // Sole place where the legacy feature still matters: legacy
-        // entrypoints (which predate the policy) select the default, so a
-        // build with the feature keeps its old behavior without any verifier
-        // consulting the feature behind an explicit Strict's back.
-        if cfg!(feature = "danger-skip-cert-chain-verify") {
-            NoiseCertPolicy::DangerSkipCertChainVerify
-        } else {
-            NoiseCertPolicy::Strict
-        }
-    }
 }
 
 impl NoiseCertPolicy {
@@ -225,12 +212,10 @@ impl HandshakeUtils {
         ))
     }
 
-    /// Verifies the server's certificate chain, always strictly. The legacy
-    /// `danger-skip-cert-chain-verify` feature changes only what the
-    /// *default* policy is for the handshake-state constructors; it never
-    /// weakens this helper. Bypass remains available through the
-    /// `*_with_cert_policy` constructors, whose outcomes carry no trusted
-    /// chain instead of a differently-typed one.
+    /// Verifies the server's certificate chain, always strictly. Bypass
+    /// remains available only through the `*_with_cert_policy`
+    /// constructors, whose outcomes carry no trusted chain instead of a
+    /// differently-typed one.
     pub fn verify_server_cert(
         cert_decrypted: &[u8],
         static_decrypted: &[u8; 32],
@@ -1145,9 +1130,8 @@ mod tests {
         let client_static = KeyPair::generate(&mut rand::rng());
         let payload = b"login-payload".to_vec();
 
-        // Explicit Strict: must reject even though this test compiles under
-        // cfg(test), and even with the legacy feature unified in. No build
-        // flag bypasses an explicit Strict.
+        // Explicit Strict: must reject. No build flag bypasses an explicit
+        // Strict.
         let mut state = XxHandshakeState::new_with_cert_policy(
             client_static.clone(),
             payload.clone(),

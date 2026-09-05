@@ -1409,8 +1409,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     }
 
     /// Select the Noise server-cert verification policy for handshakes made
-    /// by the built client. Defaults to strict without the legacy
-    /// `danger-skip-cert-chain-verify` feature (explicit `Strict` always
+    /// by the built client. Defaults to strict (explicit `Strict` always
     /// verifies); pass
     /// [`NoiseCertPolicy::DangerSkipCertChainVerify`] only for testing
     /// against a mock server that cannot produce a WhatsApp-rooted chain.
@@ -1739,8 +1738,8 @@ mod tests {
         );
         bypass_bot.client().disconnect().await;
 
-        // Explicit Strict survives even when the legacy feature moves the
-        // default: the setter, not the build flag, decides.
+        // Explicit Strict is distinct from the default only when the
+        // default changes: the setter, not a build flag, decides.
         let strict_bot = Bot::builder()
             .with_backend_arc(create_test_sqlite_backend().await)
             .with_transport_factory(TokioWebSocketTransportFactory::new())

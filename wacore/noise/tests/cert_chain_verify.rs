@@ -1,8 +1,8 @@
 //! Integration tests for the `HandshakeUtils::verify_server_cert` path.
-//! These load `wacore-noise` as a regular dependency, so the legacy
-//! `cfg(test)` bypass (removed) could never apply here; what runs is the
-//! real verify. The strict test below is additionally run with the legacy
-//! feature enabled to prove an explicit Strict rejects regardless.
+//! These load `wacore-noise` as a regular dependency and exercise the real
+//! verify: the public helper always verifies strictly, and the default
+//! policy is strict while the explicit per-handshake bypass still drives
+//! zero-signed fixtures.
 
 #![allow(clippy::disallowed_methods)]
 
@@ -50,10 +50,10 @@ fn build_chain_with_issuer_serial(server_static_pub: &[u8; 32], issuer_serial: u
     chain.encode_to_vec()
 }
 
-// The public helper always verifies strictly, even with the legacy feature
-// enabled: the zero-signed fixture must fail XEdDSA verify in every build.
-// Bypass remains available only through the explicit-policy handshake
-// constructors, whose outcomes carry no trusted chain.
+// The public helper always verifies strictly: the zero-signed fixture
+// must fail XEdDSA verify in every build. Bypass remains available only
+// through the explicit-policy handshake constructors, whose outcomes
+// carry no trusted chain.
 #[test]
 fn verify_server_cert_rejects_fixture_with_zero_signed_certs() {
     // The chain is structurally valid (right shape, leaf.key matches the
@@ -72,23 +72,19 @@ fn verify_server_cert_rejects_fixture_with_zero_signed_certs() {
     );
 }
 
-// Pins the reported bug: with the legacy feature the default policy selects
-// the bypass, yet the public helper must still reject the zero-signed chain
-// — it never consults the default, so no `VerifiedServerCertChain` exists
-// here that `From` could mark `signature_verified`.
-#[cfg(feature = "danger-skip-cert-chain-verify")]
+// The default policy is strict, yet the public helper must still reject
+// the zero-signed chain — it never consults the default, so no
+// `VerifiedServerCertChain` exists here that `From` could mark
+// `signature_verified`.
 #[test]
-fn verify_server_cert_ignores_legacy_default_policy() {
+fn verify_server_cert_default_is_strict_and_helper_stays_strict() {
     use wacore_noise::NoiseCertPolicy;
 
-    assert_eq!(
-        NoiseCertPolicy::default(),
-        NoiseCertPolicy::DangerSkipCertChainVerify
-    );
+    assert_eq!(NoiseCertPolicy::default(), NoiseCertPolicy::Strict);
     let server_static_pub = [0xAAu8; 32];
     let chain_bytes = build_zero_signed_chain(&server_static_pub);
     let err = HandshakeUtils::verify_server_cert(&chain_bytes, &server_static_pub)
-        .expect_err("public helper must stay strict under the legacy feature");
+        .expect_err("public helper must stay strict");
     assert!(
         err.to_string()
             .contains("intermediate signature failed XEdDSA verify"),
@@ -112,8 +108,7 @@ fn verify_server_cert_rejects_when_leaf_key_does_not_match_static() {
 
 #[test]
 fn verify_server_cert_rejects_unexpected_issuer_serial() {
-    // The issuer pin is structural and runs under every policy, so this
-    // holds with or without the legacy feature.
+    // The issuer pin is structural and runs under every policy.
     let server_static_pub = [0xAAu8; 32];
     let chain_bytes = build_chain_with_issuer_serial(&server_static_pub, 7);
     let err = HandshakeUtils::verify_server_cert(&chain_bytes, &server_static_pub)

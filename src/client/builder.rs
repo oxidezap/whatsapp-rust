@@ -309,8 +309,7 @@ impl ClientBuilder {
     }
 
     /// Select the Noise server-cert verification policy for handshakes made
-    /// by the built client. Defaults to strict without the legacy
-    /// `danger-skip-cert-chain-verify` feature (explicit `Strict` always
+    /// by the built client. Defaults to strict (explicit `Strict` always
     /// verifies); pass
     /// [`NoiseCertPolicy::DangerSkipCertChainVerify`] only for testing
     /// against a mock server that cannot produce a WhatsApp-rooted chain.
@@ -983,7 +982,6 @@ mod tests {
         assert_eq!(strict.noise_cert_policy, NoiseCertPolicy::default());
     }
 
-    #[cfg(not(feature = "danger-skip-cert-chain-verify"))]
     #[test]
     fn noise_cert_policy_default_is_strict() {
         assert_eq!(NoiseCertPolicy::default(), NoiseCertPolicy::Strict);

@@ -687,10 +687,7 @@ mod tests {
         assert!(NoiseCertPolicy::DangerSkipCertChainVerify.skip_signature_check());
     }
 
-    // Without the legacy feature the default policy is strict. (With the
-    // feature it selects the bypass, which is the documented legacy
-    // behavior for pre-policy entrypoints.)
-    #[cfg(not(feature = "danger-skip-cert-chain-verify"))]
+    // The default policy is strict.
     #[test]
     fn cert_policy_default_is_strict() {
         assert_eq!(NoiseCertPolicy::default(), NoiseCertPolicy::Strict);
