@@ -50,7 +50,7 @@ jobs:
       - name: Re-derive J/S and compare every committed wasm fixture
         run: python3 scripts/mlow-vectors/regenerate-wasm.py --oracle-repo .oracle-tool --check
       - name: Test the runtime against the regenerated corpus
-        run: cargo nextest run --locked -p wacore --features voip-mlow --lib -E 'test(voip::mlow::)'
+        run: cargo nextest run --profile ci --locked -p wacore --features voip-mlow --lib -E 'test(voip::mlow::)'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -59,3 +59,4 @@ jobs:
             .derive-mlow/wasm/*.log
             .derive-mlow/wasm/*/manifest.json
           if-no-files-found: error
+          include-hidden-files: true

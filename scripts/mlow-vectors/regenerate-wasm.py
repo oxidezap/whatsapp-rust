@@ -5,7 +5,7 @@
 choices across versions. --from-derived verifies a previous run's complete
 output hashes before reusing it; it never trusts unverified cached artifacts.
 """
-import argparse,hashlib,importlib.util,json,subprocess,sys
+import argparse,hashlib,importlib.util,json,subprocess,sys,os
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 DATA=ROOT/'wacore/src/voip/mlow/testdata'
@@ -30,7 +30,10 @@ def main():
  import verify
  out=(a.from_derived or a.out).resolve()
  if a.from_derived is None:
-  subprocess.run(['cargo','+stable','build','--release','--locked','-p','oracle-cli'],cwd=tool,check=True)
+  # A checkout nested under this repo otherwise inherits its nightly-only
+  # .cargo/config rustflags. Keep the oracle's stable build independent.
+  build_env={**os.environ,'CARGO_ENCODED_RUSTFLAGS':''}
+  subprocess.run(['cargo','+stable','build','--release','--locked','-p','oracle-cli'],cwd=tool,env=build_env,check=True)
   subprocess.run(['python3',str(tool/'scripts/mlow/verify.py'),'--out',str(out)],cwd=tool,check=True)
  lock=json.loads((tool/'specs/mlow.lock.json').read_text())
  for name,expected in lock['runs'].items():

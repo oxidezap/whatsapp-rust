@@ -22,7 +22,7 @@ all remaining derivation, packaging, CI and retirement work.
 
 ## Final integration in progress
 
-- [ ] Complete the consumer commits and publish the CI branch.
+- [x] Complete the consumer commits and publish the CI branch.
 - [ ] Confirm the first remote CI executions and record their results.
 
 The detailed investigation is in the sibling `unwasm/MLOW_DERIVE.md`.
@@ -37,3 +37,10 @@ instantiation. No capture depends on an ephemeral `/tmp` artifact.
 TOC retains its small auditor/writer tests by the recorded design decision;
 spact is no longer parked. There are no remaining DSP derivation or S-decode
 items hidden behind the earlier parked labels.
+
+First remote runs found workflow integration issues, not codec drift:
+tool J/S tests and derivations passed, but artifact upload excluded the
+hidden evidence directory; the consumer's nested tool checkout inherited
+nightly-only rustflags. Both configurations were corrected. A fresh nested local checkout now builds
+with stable and re-derives/verifies every artifact successfully. Remote reruns
+are queued.
