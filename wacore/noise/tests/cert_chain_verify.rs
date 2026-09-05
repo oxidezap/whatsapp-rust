@@ -1,12 +1,9 @@
-//! Integration test for the production `HandshakeUtils::verify_server_cert`
-//! path. Lives here (not under `#[cfg(test)] mod tests` inside the lib)
-//! because the in-crate cfg(test) gate inside `verify_cert_step` short-circuits
-//! the XEdDSA verification so other unit tests can use the zero-signed
-//! `build_cert_chain_bytes` fixture. Integration tests load `wacore-noise` as
-//! a regular dep without `cfg(test)`, so the real verify actually runs here.
+//! Integration tests for the `HandshakeUtils::verify_server_cert` path.
+//! These load `wacore-noise` as a regular dependency, so the legacy
+//! `cfg(test)` bypass (removed) could never apply here; what runs is the
+//! real verify. The strict test below is additionally run with the legacy
+//! feature enabled to prove an explicit Strict rejects regardless.
 
-#![cfg(not(feature = "danger-skip-cert-chain-verify"))]
-// Tests/benches exercise the raw buffa API.
 #![allow(clippy::disallowed_methods)]
 
 use buffa::Message;
@@ -16,16 +13,18 @@ use wacore_noise::HandshakeUtils;
 
 /// Build a structurally valid `CertChain` blob with zero-filled signatures.
 /// Copy of the fixture in `wacore_noise::test_util` so this integration test
-/// doesn't need to enable the `test-util` feature (Cargo can't enable a lib
-/// feature from the lib's own dev-deps).
+/// doesn't need the `test-util` feature.
 fn build_zero_signed_chain(server_static_pub: &[u8; 32]) -> Vec<u8> {
+    build_chain_with_issuer_serial(server_static_pub, 0)
+}
+
+fn build_chain_with_issuer_serial(server_static_pub: &[u8; 32], issuer_serial: u32) -> Vec<u8> {
     let intermediate_details = noise_certificate::Details {
         serial: Some(1),
-        issuer_serial: Some(0),
+        issuer_serial: Some(issuer_serial),
         key: Some(vec![0xCC; 32]),
         not_before: Some(1_700_000_000),
         not_after: Some(1_900_000_000),
-        ..Default::default()
     };
     let intermediate_details_bytes = intermediate_details.encode_to_vec();
 
@@ -35,7 +34,6 @@ fn build_zero_signed_chain(server_static_pub: &[u8; 32]) -> Vec<u8> {
         key: Some(server_static_pub.to_vec()),
         not_before: Some(1_700_000_500),
         not_after: Some(1_899_999_500),
-        ..Default::default()
     };
     let leaf_details_bytes = leaf_details.encode_to_vec();
 
@@ -43,18 +41,22 @@ fn build_zero_signed_chain(server_static_pub: &[u8; 32]) -> Vec<u8> {
         leaf: buffa::MessageField::some(wa::cert_chain::NoiseCertificate {
             details: Some(leaf_details_bytes),
             signature: Some(vec![0u8; 64]),
-            ..Default::default()
         }),
         intermediate: buffa::MessageField::some(wa::cert_chain::NoiseCertificate {
             details: Some(intermediate_details_bytes),
             signature: Some(vec![0u8; 64]),
-            ..Default::default()
         }),
-        ..Default::default()
     };
     chain.encode_to_vec()
 }
 
+// The legacy entrypoint selects the default policy, which is strict without
+// the legacy feature: the zero-signed chain must fail XEdDSA verify. (With
+// the feature the default selects the documented legacy bypass, so this
+// stays gated; explicit-Strict rejection under the feature is covered by
+// the `xx_handshake_with_strict_policy_rejects_zero_signed_chain` unit
+// test, run with the feature enabled.)
+#[cfg(not(feature = "danger-skip-cert-chain-verify"))]
 #[test]
 fn verify_server_cert_rejects_fixture_with_zero_signed_certs() {
     // The chain is structurally valid (right shape, leaf.key matches the
@@ -84,5 +86,20 @@ fn verify_server_cert_rejects_when_leaf_key_does_not_match_static() {
     assert!(
         err.to_string()
             .contains("Server certificate verification failed")
+    );
+}
+
+#[test]
+fn verify_server_cert_rejects_unexpected_issuer_serial() {
+    // The issuer pin is structural and runs under every policy, so this
+    // holds with or without the legacy feature.
+    let server_static_pub = [0xAAu8; 32];
+    let chain_bytes = build_chain_with_issuer_serial(&server_static_pub, 7);
+    let err = HandshakeUtils::verify_server_cert(&chain_bytes, &server_static_pub)
+        .expect_err("wrong issuer serial must be a CertVerification error");
+    assert!(
+        err.to_string()
+            .contains("Unexpected intermediate issuer serial"),
+        "unexpected error: {err}"
     );
 }

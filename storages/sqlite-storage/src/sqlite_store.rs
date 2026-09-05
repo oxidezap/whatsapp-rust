@@ -6054,6 +6054,7 @@ mod tests {
                 not_before: 1_700_000_500,
                 not_after: 1_899_999_500,
             },
+            signature_verified: true,
         };
 
         // First store: create + populate. Keep it alive until after the
@@ -6093,6 +6094,30 @@ mod tests {
             loaded.server_cert_chain.as_ref(),
             Some(&chain),
             "server_cert_chain must survive a save/load roundtrip"
+        );
+
+        // proto3 omits false booleans on the wire, so a chain stored
+        // without provenance is byte-identical to a legacy row: it must
+        // reload as untrusted.
+        let mut device = loaded.clone();
+        device.server_cert_chain = Some(CachedServerCertChain {
+            signature_verified: false,
+            ..chain.clone()
+        });
+        store
+            .save_device_data_for_device(device_id, &device)
+            .await
+            .expect("save with unmarked cert chain");
+
+        let reloaded = store
+            .load_device_data_for_device(device_id)
+            .await
+            .expect("reload")
+            .expect("device should exist");
+        let reloaded_chain = reloaded.server_cert_chain.as_ref().expect("chain present");
+        assert!(
+            !reloaded_chain.signature_verified,
+            "field-less rows must decode as untrusted"
         );
 
         // Sanity: clearing the chain and saving leaves the column as NULL,

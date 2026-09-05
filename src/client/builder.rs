@@ -21,6 +21,7 @@ use crate::sync_task::MajorSyncTask;
 use crate::transport::TransportFactory;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
+use wacore::handshake::NoiseCertPolicy;
 use wacore::runtime::Runtime;
 
 /// Result of constructing a [`Client`].
@@ -117,6 +118,7 @@ pub struct ClientBuilder {
     skip_history_sync: bool,
     ab_props_fetch: bool,
     presence_policy: PresencePolicy,
+    noise_cert_policy: NoiseCertPolicy,
     wanted_pre_key_count: Option<usize>,
     resend_rate_limit: Option<(u32, u32)>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
@@ -151,6 +153,7 @@ impl ClientBuilder {
             skip_history_sync: false,
             ab_props_fetch: true,
             presence_policy: PresencePolicy::default(),
+            noise_cert_policy: NoiseCertPolicy::default(),
             wanted_pre_key_count: None,
             resend_rate_limit: None,
             task_instrument: None,
@@ -302,6 +305,16 @@ impl ClientBuilder {
     /// [`PresencePolicy`].
     pub fn with_presence_policy(mut self, policy: PresencePolicy) -> Self {
         self.presence_policy = policy;
+        self
+    }
+
+    /// Select the Noise server-cert verification policy for handshakes made
+    /// by the built client. Defaults to strict; pass
+    /// [`NoiseCertPolicy::DangerSkipCertChainVerify`] only for testing
+    /// against a mock server that cannot sign its chain. Fixed at build
+    /// time and applied to every connect, including reconnects.
+    pub fn with_noise_cert_policy(mut self, policy: NoiseCertPolicy) -> Self {
+        self.noise_cert_policy = policy;
         self
     }
 
@@ -540,6 +553,7 @@ impl ClientBuilder {
                 lifecycle,
                 #[cfg(feature = "plugins")]
                 plugin_host,
+                noise_cert_policy: self.noise_cert_policy,
             },
         );
         let client = assembly.client();
@@ -697,6 +711,7 @@ pub(super) struct ClientExtensions {
     pub(super) lifecycle: Option<Arc<LifecycleRegistration>>,
     #[cfg(feature = "plugins")]
     pub(super) plugin_host: Option<Arc<PluginHost>>,
+    pub(super) noise_cert_policy: NoiseCertPolicy,
 }
 
 impl ClientAssembly {
@@ -946,6 +961,55 @@ mod tests {
                 .await,
             Err(ClientBuilderError::MissingHttpClient)
         ));
+    }
+
+    #[test]
+    fn noise_cert_policy_setter_stores_per_builder_value() {
+        let strict = ClientBuilder::new();
+        assert_eq!(
+            strict.noise_cert_policy,
+            NoiseCertPolicy::default(),
+            "fresh builder carries the default policy"
+        );
+        let bypass =
+            ClientBuilder::new().with_noise_cert_policy(NoiseCertPolicy::DangerSkipCertChainVerify);
+        assert_eq!(
+            bypass.noise_cert_policy,
+            NoiseCertPolicy::DangerSkipCertChainVerify
+        );
+        // No shared state: opting one builder in leaves the other alone.
+        assert_eq!(strict.noise_cert_policy, NoiseCertPolicy::default());
+    }
+
+    #[cfg(not(feature = "danger-skip-cert-chain-verify"))]
+    #[test]
+    fn noise_cert_policy_default_is_strict() {
+        assert_eq!(NoiseCertPolicy::default(), NoiseCertPolicy::Strict);
+    }
+
+    #[tokio::test]
+    async fn noise_cert_policy_reaches_the_built_client() {
+        let strict = complete_builder()
+            .await
+            .build()
+            .await
+            .expect("build")
+            .into_client();
+        assert_eq!(strict.noise_cert_policy, NoiseCertPolicy::default());
+        strict.signal_shutdown_sync();
+
+        let bypass = complete_builder()
+            .await
+            .with_noise_cert_policy(NoiseCertPolicy::DangerSkipCertChainVerify)
+            .build()
+            .await
+            .expect("build")
+            .into_client();
+        assert_eq!(
+            bypass.noise_cert_policy,
+            NoiseCertPolicy::DangerSkipCertChainVerify
+        );
+        bypass.signal_shutdown_sync();
     }
 
     #[tokio::test]

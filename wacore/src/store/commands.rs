@@ -216,6 +216,7 @@ mod tests {
                 not_before: 1_700_000_100,
                 not_after: 1_899_999_900,
             },
+            signature_verified: false,
         }
     }
 

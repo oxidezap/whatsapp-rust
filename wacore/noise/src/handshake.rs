@@ -14,17 +14,69 @@ pub const WA_CERT_PUB_KEY: [u8; 32] = [
     0xc4, 0xa2, 0x8b, 0x73, 0xe3, 0x69, 0x5c, 0x6c, 0xe1, 0xf7, 0xf9, 0x54, 0x5d, 0xa8, 0xee, 0x6b,
 ];
 
+/// Per-client policy for Noise server-cert-chain verification. A value, not a
+/// flag: it travels from client construction into the handshake states, so
+/// two clients in one process can hold different policies and no in-flight
+/// reconnect can observe a change. Consulted only while setting up or
+/// verifying a handshake, never on the per-message path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoiseCertPolicy {
+    /// Verify both XEdDSA signatures and reuse the trusted IK cache.
+    Strict,
+    /// Testing-only opt-in for mock servers that cannot sign their chain.
+    /// Skips the two XEdDSA signature checks and nothing else: framing,
+    /// Noise crypto, structural checks and the leaf-to-static binding still
+    /// run, and a chain accepted here is never read from or written to the
+    /// trusted IK cache.
+    DangerSkipCertChainVerify,
+}
+
+impl Default for NoiseCertPolicy {
+    fn default() -> Self {
+        // Sole place where the legacy feature still matters: legacy
+        // entrypoints (which predate the policy) select the default, so a
+        // build with the feature keeps its old behavior without any verifier
+        // consulting the feature behind an explicit Strict's back.
+        if cfg!(feature = "danger-skip-cert-chain-verify") {
+            NoiseCertPolicy::DangerSkipCertChainVerify
+        } else {
+            NoiseCertPolicy::Strict
+        }
+    }
+}
+
+impl NoiseCertPolicy {
+    /// Whether the XEdDSA signature steps may be skipped.
+    pub fn skip_signature_check(self) -> bool {
+        match self {
+            NoiseCertPolicy::Strict => false,
+            NoiseCertPolicy::DangerSkipCertChainVerify => true,
+        }
+    }
+
+    /// Whether a cached chain may select IK. A bypassed chain was never
+    /// verified, so it must never authorize a resume.
+    pub fn reuse_cached_chain(self) -> bool {
+        match self {
+            NoiseCertPolicy::Strict => true,
+            NoiseCertPolicy::DangerSkipCertChainVerify => false,
+        }
+    }
+}
+
 /// XEdDSA-verifies one step of the Noise cert chain (`signature` over
-/// `details` with `issuer_key`). Skipped under `cfg(test)` and the
-/// `danger-skip-cert-chain-verify` feature, both of which exist so callers
-/// can drive the surrounding code against zero-signed fixtures.
+/// `details` with `issuer_key`). Skipped only under an explicit
+/// `NoiseCertPolicy::DangerSkipCertChainVerify`, which exists so callers can
+/// drive the surrounding code against zero-signed fixtures. An explicit
+/// `Strict` always verifies, regardless of build features.
 fn verify_cert_step(
     issuer_key: &[u8; 32],
     details: &[u8],
     signature: Option<&Vec<u8>>,
     label: &'static str,
+    cert_policy: NoiseCertPolicy,
 ) -> Result<()> {
-    if cfg!(test) || cfg!(feature = "danger-skip-cert-chain-verify") {
+    if cert_policy.skip_signature_check() {
         return Ok(());
     }
     let signature = signature
@@ -84,6 +136,14 @@ pub struct VerifiedServerCertChain {
 
 /// Handshake utilities for WhatsApp protocol operations
 pub struct HandshakeUtils;
+
+/// What chain verification established. Only `Trusted` may flow into the
+/// handshake outcome that populates the IK cache; `Untrusted` still binds
+/// the leaf to the decrypted static, but its signatures were never checked.
+enum ChainAcceptance {
+    Trusted(VerifiedServerCertChain),
+    Untrusted(VerifiedServerCertChain),
+}
 
 impl HandshakeUtils {
     /// Creates a ClientHello message with the given ephemeral key only (XX).
@@ -163,13 +223,34 @@ impl HandshakeUtils {
         ))
     }
 
-    /// Verifies the server's certificate chain and returns a stripped form
-    /// suitable for caching across reconnects (signatures and the global
-    /// issuer serial are dropped — they were just checked).
+    /// Verifies the server's certificate chain. Legacy entrypoint: selects
+    /// `NoiseCertPolicy::default()`, so a build with the legacy
+    /// `danger-skip-cert-chain-verify` feature keeps its old behavior while
+    /// normal builds verify strictly. Prefer the `*_with_cert_policy`
+    /// constructors on the handshake states, which never promote a
+    /// bypass-accepted chain into the trusted outcome type.
     pub fn verify_server_cert(
         cert_decrypted: &[u8],
         static_decrypted: &[u8; 32],
     ) -> Result<VerifiedServerCertChain> {
+        match Self::verify_chain(cert_decrypted, static_decrypted, NoiseCertPolicy::default()) {
+            Ok(ChainAcceptance::Trusted(chain)) => Ok(chain),
+            // Legacy behavior under the legacy feature's default: the chain
+            // is structurally sound and bound to the static, but its
+            // signatures were not checked.
+            Ok(ChainAcceptance::Untrusted(chain)) => Ok(chain),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Structural checks always run; the two XEdDSA steps run per policy.
+    /// The verdict tells the caller whether the parsed chain may populate
+    /// trusted state.
+    fn verify_chain(
+        cert_decrypted: &[u8],
+        static_decrypted: &[u8; 32],
+        cert_policy: NoiseCertPolicy,
+    ) -> Result<ChainAcceptance> {
         let cert_chain = waproto::codec::cert_chain_decode(cert_decrypted)?;
 
         let intermediate = cert_chain
@@ -210,6 +291,7 @@ impl HandshakeUtils {
             intermediate_details_bytes,
             intermediate.signature.as_ref(),
             "intermediate",
+            cert_policy,
         )?;
 
         let leaf_details_bytes = leaf
@@ -237,16 +319,23 @@ impl HandshakeUtils {
             leaf_details_bytes,
             leaf.signature.as_ref(),
             "leaf",
+            cert_policy,
         )?;
 
-        Ok(VerifiedServerCertChain {
+        let chain = VerifiedServerCertChain {
             intermediate_key,
             intermediate_not_before: intermediate_details.not_before.unwrap_or(0) as i64,
             intermediate_not_after: intermediate_details.not_after.unwrap_or(0) as i64,
             leaf_key: *static_decrypted,
             leaf_not_before: leaf_details.not_before.unwrap_or(0) as i64,
             leaf_not_after: leaf_details.not_after.unwrap_or(0) as i64,
-        })
+        };
+        // Only a policy that checked the signatures may hand out trust.
+        if cert_policy.skip_signature_check() {
+            Ok(ChainAcceptance::Untrusted(chain))
+        } else {
+            Ok(ChainAcceptance::Trusted(chain))
+        }
     }
 
     pub fn build_client_finish(
@@ -351,7 +440,10 @@ impl NoiseHandshake {
 pub struct XxHandshakeOutcome {
     pub write_cipher: NoiseCipher,
     pub read_cipher: NoiseCipher,
-    pub server_cert_chain: VerifiedServerCertChain,
+    /// `Some` only when the chain's signatures were actually checked; a
+    /// bypass-accepted chain authenticates the session but must never be
+    /// persisted as trusted IK state.
+    pub server_cert_chain: Option<VerifiedServerCertChain>,
 }
 
 /// Outcome of a successful IK handshake — only the cipher keys, since the
@@ -391,9 +483,12 @@ pub struct XxHandshakeState {
     ephemeral_kp: KeyPair,
     static_kp: KeyPair,
     payload: Vec<u8>,
+    cert_policy: NoiseCertPolicy,
     /// Captured during `read_server_hello_and_build_client_finish` so that
-    /// `finish()` can ship it back without a second decrypt.
-    cert_chain: Option<VerifiedServerCertChain>,
+    /// `finish()` can ship it back without a second decrypt. `None` means
+    /// the handshake never completed, which is distinct from a bypassed
+    /// completion carrying no trusted chain.
+    cert_chain: Option<ChainAcceptance>,
 }
 
 impl XxHandshakeState {
@@ -402,6 +497,23 @@ impl XxHandshakeState {
     /// * `client_payload` - The encoded client payload bytes
     /// * `prologue` - The prologue/header bytes (e.g., WA_CONN_HEADER)
     pub fn new(static_kp: KeyPair, client_payload: Vec<u8>, prologue: &[u8]) -> Result<Self> {
+        Self::new_with_cert_policy(
+            static_kp,
+            client_payload,
+            prologue,
+            NoiseCertPolicy::default(),
+        )
+    }
+
+    /// Explicit-policy variant of `new`. The policy is fixed for the life of
+    /// the handshake; a bypass-accepted chain never reaches the trusted
+    /// outcome type.
+    pub fn new_with_cert_policy(
+        static_kp: KeyPair,
+        client_payload: Vec<u8>,
+        prologue: &[u8],
+        cert_policy: NoiseCertPolicy,
+    ) -> Result<Self> {
         let ephemeral_kp = KeyPair::generate(&mut rand::rng());
         let mut noise = NoiseHandshake::new(wacore_binary::consts::NOISE_PATTERN_XX, prologue)?;
         noise.authenticate(ephemeral_kp.public_key.public_key_bytes());
@@ -411,6 +523,7 @@ impl XxHandshakeState {
             ephemeral_kp,
             static_kp,
             payload: client_payload,
+            cert_policy,
             cert_chain: None,
         })
     }
@@ -442,19 +555,36 @@ impl XxHandshakeState {
             server_ephemeral,
             &server_static_ciphertext,
             &certificate_ciphertext,
+            self.cert_policy,
             &mut self.cert_chain,
         )
     }
 
     pub fn finish(self) -> Result<XxHandshakeOutcome> {
-        let cert_chain = self.cert_chain.ok_or(HandshakeError::IncompleteResponse)?;
-        let (write_cipher, read_cipher) = self.noise.finish()?;
-        Ok(XxHandshakeOutcome {
-            write_cipher,
-            read_cipher,
-            server_cert_chain: cert_chain,
-        })
+        finish_xx_outcome(self.noise, self.cert_chain)
     }
+}
+
+/// Shared completion for the XX and XX-fallback states. Completion and
+/// trust stay separate: `None` means no ServerHello was ever processed and
+/// fails, `Some(Untrusted)` succeeds with nothing to persist, and
+/// `Some(Trusted)` succeeds with a chain the orchestrator may cache. One
+/// function so the two states cannot diverge on this.
+fn finish_xx_outcome(
+    noise: NoiseHandshake,
+    cert_chain: Option<ChainAcceptance>,
+) -> Result<XxHandshakeOutcome> {
+    let server_cert_chain = match cert_chain {
+        Some(ChainAcceptance::Trusted(chain)) => Some(chain),
+        Some(ChainAcceptance::Untrusted(_)) => None,
+        None => return Err(HandshakeError::IncompleteResponse),
+    };
+    let (write_cipher, read_cipher) = noise.finish()?;
+    Ok(XxHandshakeOutcome {
+        write_cipher,
+        read_cipher,
+        server_cert_chain,
+    })
 }
 
 /// Shared XX serverHello -> clientFinish core. Used by both the cold-start
@@ -469,7 +599,8 @@ fn process_xx_server_hello_into(
     server_ephemeral: [u8; 32],
     server_static_ciphertext: &[u8],
     certificate_ciphertext: &[u8],
-    cert_chain_out: &mut Option<VerifiedServerCertChain>,
+    cert_policy: NoiseCertPolicy,
+    cert_chain_out: &mut Option<ChainAcceptance>,
 ) -> Result<Vec<u8>> {
     noise.authenticate(&server_ephemeral);
     noise.mix_shared_secret(ephemeral_kp.private_key.serialize(), &server_ephemeral)?;
@@ -483,10 +614,14 @@ fn process_xx_server_hello_into(
 
     let cert_decrypted = noise.decrypt(certificate_ciphertext)?;
 
-    let chain = HandshakeUtils::verify_server_cert(&cert_decrypted, &static_decrypted_arr)
+    let chain = HandshakeUtils::verify_chain(&cert_decrypted, &static_decrypted_arr, cert_policy)
         .map_err(|e| {
-            HandshakeError::CertVerification(format!("Error verifying server cert: {e}"))
-        })?;
+        HandshakeError::CertVerification(format!("Error verifying server cert: {e}"))
+    })?;
+    // The verdict travels with the completion: only a chain whose
+    // signatures were actually checked may populate the outcome the
+    // orchestrator persists. A bypassed chain authenticates this session
+    // and nothing else.
     *cert_chain_out = Some(chain);
 
     let encrypted_pubkey = noise.encrypt(static_kp.public_key.public_key_bytes())?;
@@ -644,11 +779,22 @@ pub struct XxFallbackHandshakeState {
     static_kp: KeyPair,
     payload: Vec<u8>,
     server_hello_bytes: Vec<u8>,
-    cert_chain: Option<VerifiedServerCertChain>,
+    cert_policy: NoiseCertPolicy,
+    cert_chain: Option<ChainAcceptance>,
 }
 
 impl XxFallbackHandshakeState {
     pub fn from_ik_failure(inputs: IkFallbackInputs, prologue: &[u8]) -> Result<Self> {
+        Self::from_ik_failure_with_cert_policy(inputs, prologue, NoiseCertPolicy::default())
+    }
+
+    /// Explicit-policy variant of `from_ik_failure`, with the same
+    /// no-promotion guarantee as `new_with_cert_policy`.
+    pub fn from_ik_failure_with_cert_policy(
+        inputs: IkFallbackInputs,
+        prologue: &[u8],
+        cert_policy: NoiseCertPolicy,
+    ) -> Result<Self> {
         let mut noise =
             NoiseHandshake::new(wacore_binary::consts::NOISE_PATTERN_XXFALLBACK, prologue)?;
         // Reuse the ephemeral that was already sent in the IK ClientHello —
@@ -661,6 +807,7 @@ impl XxFallbackHandshakeState {
             static_kp: inputs.static_kp,
             payload: inputs.client_payload,
             server_hello_bytes: inputs.server_hello_bytes,
+            cert_policy,
             cert_chain: None,
         })
     }
@@ -683,18 +830,13 @@ impl XxFallbackHandshakeState {
             server_ephemeral,
             &server_static_ciphertext,
             &certificate_ciphertext,
+            self.cert_policy,
             &mut self.cert_chain,
         )
     }
 
     pub fn finish(self) -> Result<XxHandshakeOutcome> {
-        let cert_chain = self.cert_chain.ok_or(HandshakeError::IncompleteResponse)?;
-        let (write_cipher, read_cipher) = self.noise.finish()?;
-        Ok(XxHandshakeOutcome {
-            write_cipher,
-            read_cipher,
-            server_cert_chain: cert_chain,
-        })
+        finish_xx_outcome(self.noise, self.cert_chain)
     }
 }
 
@@ -939,8 +1081,15 @@ mod tests {
         let client_static = KeyPair::generate(&mut rand::rng());
         let payload = b"login-payload".to_vec();
 
-        let mut state =
-            XxHandshakeState::new(client_static.clone(), payload.clone(), &prologue).unwrap();
+        let mut state = XxHandshakeState::new_with_cert_policy(
+            client_static.clone(),
+            payload.clone(),
+            &prologue,
+            // Zero-signed responder fixture: the bypass under test here is
+            // explicit per-handshake policy, not a build flag.
+            NoiseCertPolicy::DangerSkipCertChainVerify,
+        )
+        .unwrap();
         let client_hello = state.build_client_hello().unwrap();
 
         let (server_hello, server_noise, server_eph, _client_eph_pub) = xx_serve_ext(
@@ -977,11 +1126,103 @@ mod tests {
             .expect("decrypt with initiator read");
         assert_eq!(buf2, plaintext);
 
-        // Cert chain must be the one the responder served.
-        assert_eq!(
-            outcome.server_cert_chain.leaf_key,
-            responder.server_static_pub()
+        // A bypass-accepted chain authenticates the session but is typed as
+        // nothing to persist: the outcome carries no trusted chain.
+        assert!(
+            outcome.server_cert_chain.is_none(),
+            "bypass handshake must not produce a trusted chain"
         );
+    }
+
+    #[test]
+    fn xx_handshake_with_strict_policy_rejects_zero_signed_chain() {
+        let prologue = WA_CONN_HEADER;
+        let (responder, _) = TestResponder::new();
+
+        let client_static = KeyPair::generate(&mut rand::rng());
+        let payload = b"login-payload".to_vec();
+
+        // Explicit Strict: must reject even though this test compiles under
+        // cfg(test), and even with the legacy feature unified in. No build
+        // flag bypasses an explicit Strict.
+        let mut state = XxHandshakeState::new_with_cert_policy(
+            client_static.clone(),
+            payload.clone(),
+            &prologue,
+            NoiseCertPolicy::Strict,
+        )
+        .unwrap();
+        let client_hello = state.build_client_hello().unwrap();
+
+        let (server_hello, _server_noise, _server_eph, _client_eph_pub) = xx_serve_ext(
+            &responder,
+            &client_hello,
+            wacore_binary::consts::NOISE_PATTERN_XX,
+            &prologue,
+        );
+
+        let err = state
+            .read_server_hello_and_build_client_finish(&server_hello)
+            .expect_err("zero-signed chain must fail under Strict");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("intermediate signature failed XEdDSA verify"),
+            "expected an intermediate XEdDSA-verify failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn finish_without_server_hello_is_incomplete_for_both_policies() {
+        let prologue = WA_CONN_HEADER;
+        let client_static = KeyPair::generate(&mut rand::rng());
+        for policy in [
+            NoiseCertPolicy::Strict,
+            NoiseCertPolicy::DangerSkipCertChainVerify,
+        ] {
+            let state = XxHandshakeState::new_with_cert_policy(
+                client_static.clone(),
+                b"x".to_vec(),
+                &prologue,
+                policy,
+            )
+            .unwrap();
+            let err = match state.finish() {
+                Ok(_) => panic!("finish before ServerHello must fail"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, HandshakeError::IncompleteResponse),
+                "expected IncompleteResponse, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_finish_without_server_hello_is_incomplete_for_both_policies() {
+        let prologue = WA_CONN_HEADER;
+        for policy in [
+            NoiseCertPolicy::Strict,
+            NoiseCertPolicy::DangerSkipCertChainVerify,
+        ] {
+            let inputs = IkFallbackInputs {
+                ephemeral_kp: KeyPair::generate(&mut rand::rng()),
+                static_kp: KeyPair::generate(&mut rand::rng()),
+                client_payload: b"x".to_vec(),
+                server_hello_bytes: Vec::new(),
+            };
+            let state = XxFallbackHandshakeState::from_ik_failure_with_cert_policy(
+                inputs, &prologue, policy,
+            )
+            .unwrap();
+            let err = match state.finish() {
+                Ok(_) => panic!("fallback finish before ServerHello must fail"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, HandshakeError::IncompleteResponse),
+                "expected IncompleteResponse, got: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1039,7 +1280,14 @@ mod tests {
             IkServerHelloOutcome::Continue(_) => panic!("expected Fallback"),
         };
 
-        let mut fb = XxFallbackHandshakeState::from_ik_failure(inputs, &prologue).unwrap();
+        let mut fb = XxFallbackHandshakeState::from_ik_failure_with_cert_policy(
+            inputs,
+            &prologue,
+            // Zero-signed responder fixture: the bypass under test here is
+            // explicit per-handshake policy, not a build flag.
+            NoiseCertPolicy::DangerSkipCertChainVerify,
+        )
+        .unwrap();
         let client_finish = fb.build_client_finish().expect("fallback must succeed");
         let result = fb.finish().expect("finish");
 
@@ -1064,9 +1312,9 @@ mod tests {
             .expect("initiator reads what responder wrote");
         assert_eq!(buf2, plaintext);
 
-        assert_eq!(
-            result.server_cert_chain.leaf_key,
-            responder.server_static_pub()
+        assert!(
+            result.server_cert_chain.is_none(),
+            "bypass fallback must not produce a trusted chain"
         );
     }
 

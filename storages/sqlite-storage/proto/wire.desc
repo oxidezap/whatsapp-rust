@@ -1,15 +1,16 @@
 
-ø
+¨
 
 wire.protowire"Y
 	NoiseCert
 key (Rkey
 
 not_before (R	notBefore
-	not_after (RnotAfter"k
+	not_after (RnotAfter"š
 ServerCertChain3
 intermediate (2.wire.NoiseCertRintermediate#
-leaf (2.wire.NoiseCertRleaf"p
+leaf (2.wire.NoiseCertRleaf-
+signature_verified (RsignatureVerified"p
 AppStateSyncKeyWire
 key_data (RkeyData 
 fingerprint (Rfingerprint

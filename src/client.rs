@@ -1471,6 +1471,11 @@ pub struct Client {
     /// cached `serverStaticPublic` doesn't trap us in a loop. Reset to 0 on
     /// any successful handshake (XX, IK, or XXfallback).
     pub(crate) ik_handshake_failures: AtomicU32,
+    /// Server-cert verification policy for the Noise handshake. Fixed at
+    /// construction (builder-selected, default strict): every connect,
+    /// including reconnects, reads this same value, so the policy cannot
+    /// change under an in-flight handshake.
+    pub(crate) noise_cert_policy: wacore::handshake::NoiseCertPolicy,
     /// Terminal shutdown (process-wide). Fired ONLY by `disconnect()`.
     /// Long-lived subscribers that must outlive reconnect cycles (saver,
     /// device registry cleanup) subscribe here.

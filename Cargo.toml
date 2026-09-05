@@ -302,10 +302,7 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4"] }
 wacore = { workspace = true, features = ["test-util"] }
-wacore-noise = { path = "./wacore/noise", features = [
-    "test-util",
-    "danger-skip-cert-chain-verify",
-] }
+wacore-noise = { path = "./wacore/noise", features = ["test-util"] }
 
 [lints]
 workspace = true

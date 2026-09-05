@@ -10,6 +10,8 @@ use wacore::handshake::{
     HandshakeError as CoreHandshakeError, IkHandshakeState, IkServerHelloOutcome,
     VerifiedServerCertChain, XxFallbackHandshakeState, XxHandshakeState, build_handshake_header,
 };
+
+pub use wacore::handshake::NoiseCertPolicy;
 use wacore::noise::NoiseCipher;
 use wacore::runtime::{Runtime, timeout as rt_timeout};
 use wacore::store::DeviceCommand;
@@ -132,7 +134,13 @@ fn select_pattern(
     device: &wacore::store::Device,
     ik_failures: u32,
     now_secs: i64,
+    cert_policy: NoiseCertPolicy,
 ) -> HandshakePattern {
+    // A chain accepted under the bypass was never verified, so it must never
+    // authorize an IK resume, even when the cache is populated and fresh.
+    if !cert_policy.reuse_cached_chain() {
+        return HandshakePattern::Xx;
+    }
     // Unregistered + cached chain is a signal of a legacy DB written before
     // the registration gate; `do_handshake` no longer creates that state but
     // we still need to refuse IK against it.
@@ -145,6 +153,12 @@ fn select_pattern(
     let Some(chain) = device.server_cert_chain.as_ref() else {
         return HandshakePattern::Xx;
     };
+    // Records without verification provenance — including chains cached
+    // while a global bypass was enabled — cannot authorize IK. One XX
+    // re-verifies and stores a marked chain.
+    if !chain.signature_verified {
+        return HandshakePattern::Xx;
+    }
     // `not_before` covers backwards clock skew, `not_after` is normal expiry.
     if now_secs < chain.leaf.not_before
         || now_secs < chain.intermediate.not_before
@@ -156,8 +170,10 @@ fn select_pattern(
     HandshakePattern::Ik(chain.leaf.key)
 }
 
-/// `server_cert_chain` is `Some` for XX / XX-fallback (fresh chain to persist)
-/// and `None` for IK Continue (on-disk cache stays authoritative).
+/// `server_cert_chain` is `Some` for an XX / XX-fallback chain whose
+/// signatures were actually checked, and `None` for IK Continue (on-disk
+/// cache stays authoritative) or a bypass-accepted chain (nothing trusted
+/// to persist).
 struct HandshakeSuccess {
     write_cipher: NoiseCipher,
     read_cipher: NoiseCipher,
@@ -168,6 +184,9 @@ fn should_persist_cert_chain(device: &wacore::store::Device) -> bool {
     device.is_registered()
 }
 
+/// Runs the Noise handshake with the default cert policy (strict without
+/// the legacy feature). Only callers that explicitly opt a client into the
+/// testing bypass use `do_handshake_with_cert_policy`.
 pub async fn do_handshake(
     runtime: Arc<dyn Runtime>,
     persistence_manager: &PersistenceManager,
@@ -176,12 +195,37 @@ pub async fn do_handshake(
     transport_events: &mut async_channel::Receiver<TransportEvent>,
     observers: crate::socket::noise_socket::SendObservers,
 ) -> Result<Arc<NoiseSocket>> {
+    do_handshake_with_cert_policy(
+        runtime,
+        persistence_manager,
+        ik_handshake_failures,
+        transport,
+        transport_events,
+        observers,
+        NoiseCertPolicy::default(),
+    )
+    .await
+}
+
+/// Runs the Noise handshake with the client's cert policy. A chain accepted
+/// under the bypass is neither read from nor written to the trusted IK
+/// cache: every connect starts at XX and nothing it learns persists.
+pub async fn do_handshake_with_cert_policy(
+    runtime: Arc<dyn Runtime>,
+    persistence_manager: &PersistenceManager,
+    ik_handshake_failures: &AtomicU32,
+    transport: Arc<dyn Transport>,
+    transport_events: &mut async_channel::Receiver<TransportEvent>,
+    observers: crate::socket::noise_socket::SendObservers,
+    cert_policy: NoiseCertPolicy,
+) -> Result<Arc<NoiseSocket>> {
     let (write_cipher, read_cipher) = negotiate(
         &runtime,
         persistence_manager,
         ik_handshake_failures,
         &transport,
         transport_events,
+        cert_policy,
     )
     .await?;
 
@@ -210,6 +254,7 @@ async fn negotiate(
     ik_handshake_failures: &AtomicU32,
     transport: &Arc<dyn Transport>,
     transport_events: &mut async_channel::Receiver<TransportEvent>,
+    cert_policy: NoiseCertPolicy,
 ) -> Result<(NoiseCipher, NoiseCipher)> {
     let device_snapshot = persistence_manager.get_device_snapshot();
     let now_secs = wacore::time::now_secs();
@@ -217,6 +262,7 @@ async fn negotiate(
         &device_snapshot,
         ik_handshake_failures.load(Ordering::Acquire),
         now_secs,
+        cert_policy,
     );
 
     let mut fallback_taken = false;
@@ -229,6 +275,7 @@ async fn negotiate(
                 &device_snapshot,
                 transport.clone(),
                 transport_events,
+                cert_policy,
             )
             .await
         }
@@ -241,6 +288,7 @@ async fn negotiate(
                 transport.clone(),
                 transport_events,
                 &mut fallback_taken,
+                cert_policy,
             )
             .await
         }
@@ -248,6 +296,8 @@ async fn negotiate(
 
     match result {
         Ok(success) => {
+            // A bypass-accepted chain arrives as `None`, so it can never be
+            // persisted no matter which policy ran the handshake.
             if let Some(chain) = success.server_cert_chain
                 && should_persist_cert_chain(&device_snapshot)
             {
@@ -287,10 +337,15 @@ async fn run_xx_handshake(
     device: &wacore::store::Device,
     transport: Arc<dyn Transport>,
     transport_events: &mut async_channel::Receiver<TransportEvent>,
+    cert_policy: NoiseCertPolicy,
 ) -> Result<HandshakeSuccess> {
     let client_payload = waproto::codec::client_payload_to_vec(&device.get_client_payload());
-    let mut handshake_state =
-        XxHandshakeState::new(device.noise_key.clone(), client_payload, &WA_CONN_HEADER)?;
+    let mut handshake_state = XxHandshakeState::new_with_cert_policy(
+        device.noise_key.clone(),
+        client_payload,
+        &WA_CONN_HEADER,
+        cert_policy,
+    )?;
     let mut frame_decoder = wacore::framing::FrameDecoder::new();
 
     let client_hello_bytes = handshake_state.build_client_hello()?;
@@ -313,7 +368,7 @@ async fn run_xx_handshake(
     Ok(HandshakeSuccess {
         write_cipher: outcome.write_cipher,
         read_cipher: outcome.read_cipher,
-        server_cert_chain: Some(outcome.server_cert_chain),
+        server_cert_chain: outcome.server_cert_chain,
     })
 }
 
@@ -330,6 +385,7 @@ async fn run_ik_handshake(
     transport: Arc<dyn Transport>,
     transport_events: &mut async_channel::Receiver<TransportEvent>,
     fallback_taken: &mut bool,
+    cert_policy: NoiseCertPolicy,
 ) -> Result<HandshakeSuccess> {
     let client_payload = waproto::codec::client_payload_to_vec(&device.get_client_payload());
     let mut ik = IkHandshakeState::new(
@@ -370,7 +426,11 @@ async fn run_ik_handshake(
                 "[socket] resumeNoiseHandshake failed: serverStaticCiphertext not null — \
                  doFallbackHandshake continuing handshake with given server hello"
             );
-            let mut fb = XxFallbackHandshakeState::from_ik_failure(*inputs, &WA_CONN_HEADER)?;
+            let mut fb = XxFallbackHandshakeState::from_ik_failure_with_cert_policy(
+                *inputs,
+                &WA_CONN_HEADER,
+                cert_policy,
+            )?;
             let client_finish_bytes = fb.build_client_finish()?;
             debug!(
                 "[socket] continueFullHandshakeCore client finish and deriving secrets (XXfallback)"
@@ -383,7 +443,7 @@ async fn run_ik_handshake(
             Ok(HandshakeSuccess {
                 write_cipher: outcome.write_cipher,
                 read_cipher: outcome.read_cipher,
-                server_cert_chain: Some(outcome.server_cert_chain),
+                server_cert_chain: outcome.server_cert_chain,
             })
         }
     }
@@ -460,6 +520,7 @@ mod tests {
                 not_before: 1_700_000_000,
                 not_after: leaf_not_after,
             },
+            signature_verified: true,
         }
     }
 
@@ -473,7 +534,7 @@ mod tests {
     fn select_pattern_no_cache_returns_xx() {
         let device = paired_device();
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
@@ -484,7 +545,7 @@ mod tests {
         let pub_key = [0xAA; 32];
         device.server_cert_chain = Some(cached_chain(pub_key, 1_900_000_000, 1_900_000_000));
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Ik(pub_key)
         );
     }
@@ -494,7 +555,12 @@ mod tests {
         let mut device = paired_device();
         device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
         assert_eq!(
-            select_pattern(&device, IK_FAILURE_THRESHOLD, 1_800_000_000),
+            select_pattern(
+                &device,
+                IK_FAILURE_THRESHOLD,
+                1_800_000_000,
+                NoiseCertPolicy::Strict
+            ),
             HandshakePattern::Xx
         );
     }
@@ -504,7 +570,7 @@ mod tests {
         let mut device = paired_device();
         device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_700_000_500, 1_900_000_000));
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
@@ -514,7 +580,7 @@ mod tests {
         let mut device = paired_device();
         device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_700_000_500));
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
@@ -524,7 +590,7 @@ mod tests {
         let mut device = paired_device();
         device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
         assert_eq!(
-            select_pattern(&device, 0, 1_699_999_999),
+            select_pattern(&device, 0, 1_699_999_999, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
@@ -536,7 +602,7 @@ mod tests {
         chain.intermediate.not_before = 1_800_000_001;
         device.server_cert_chain = Some(chain);
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
@@ -550,9 +616,56 @@ mod tests {
         );
         device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
+    }
+
+    #[test]
+    fn select_pattern_bypass_ignores_valid_cache() {
+        let mut device = paired_device();
+        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
+        assert_eq!(
+            select_pattern(
+                &device,
+                0,
+                1_800_000_000,
+                NoiseCertPolicy::DangerSkipCertChainVerify
+            ),
+            HandshakePattern::Xx
+        );
+    }
+
+    #[test]
+    fn select_pattern_unmarked_cache_returns_xx() {
+        // Records predating signature provenance (including chains cached
+        // while a global bypass was enabled) cannot authorize IK, even when
+        // fresh and otherwise valid.
+        let mut device = paired_device();
+        let mut chain = cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000);
+        chain.signature_verified = false;
+        device.server_cert_chain = Some(chain);
+        assert_eq!(
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
+            HandshakePattern::Xx
+        );
+    }
+
+    #[test]
+    fn cert_policy_cache_gates() {
+        assert!(NoiseCertPolicy::Strict.reuse_cached_chain());
+        assert!(!NoiseCertPolicy::DangerSkipCertChainVerify.reuse_cached_chain());
+        assert!(!NoiseCertPolicy::Strict.skip_signature_check());
+        assert!(NoiseCertPolicy::DangerSkipCertChainVerify.skip_signature_check());
+    }
+
+    // Without the legacy feature the default policy is strict. (With the
+    // feature it selects the bypass, which is the documented legacy
+    // behavior for pre-policy entrypoints.)
+    #[cfg(not(feature = "danger-skip-cert-chain-verify"))]
+    #[test]
+    fn cert_policy_default_is_strict() {
+        assert_eq!(NoiseCertPolicy::default(), NoiseCertPolicy::Strict);
     }
 
     #[test]

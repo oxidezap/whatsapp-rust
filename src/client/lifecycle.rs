@@ -462,6 +462,7 @@ impl Client {
             lifecycle,
             #[cfg(feature = "plugins")]
             plugin_host,
+            noise_cert_policy,
         } = extensions;
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
@@ -505,6 +506,7 @@ impl Client {
             is_connected: AtomicBool::new(false),
             send_active_receipts: AtomicU32::new(0),
             ik_handshake_failures: AtomicU32::new(0),
+            noise_cert_policy,
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
             protocol_terminal_reason: std::sync::Mutex::new(None),
@@ -1313,7 +1315,7 @@ impl Client {
             return Err(refusal);
         }
 
-        let noise_socket = match handshake::do_handshake(
+        let noise_socket = match handshake::do_handshake_with_cert_policy(
             self.runtime.clone(),
             &self.persistence_manager,
             &self.ik_handshake_failures,
@@ -1321,6 +1323,7 @@ impl Client {
             &mut transport_events,
             crate::socket::noise_socket::SendObservers::with_stats(self.stats.clone())
                 .with_sent_frames(self.sent_frame_tap.clone()),
+            self.noise_cert_policy,
         )
         .await
         {
@@ -2639,6 +2642,7 @@ mod tests {
                     lifecycle: None,
                     #[cfg(feature = "plugins")]
                     plugin_host: None,
+                    noise_cert_policy: wacore::handshake::NoiseCertPolicy::default(),
                 },
             )
         };
