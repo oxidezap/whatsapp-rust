@@ -20,6 +20,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use thiserror::Error;
+use wacore::handshake::NoiseCertPolicy;
 use wacore::proto_helpers::MessageBuilderExt;
 use wacore::runtime::Runtime;
 use wacore::store::DevicePropsOverride;
@@ -719,6 +720,7 @@ pub struct BotBuilder<
     skip_history_sync: bool,
     ab_props_fetch: bool,
     presence_policy: PresencePolicy,
+    noise_cert_policy: NoiseCertPolicy,
     initial_push_name: Option<String>,
     cache_config: CacheConfig,
     wanted_pre_key_count: Option<usize>,
@@ -750,6 +752,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             skip_history_sync: false,
             ab_props_fetch: true,
             presence_policy: PresencePolicy::default(),
+            noise_cert_policy: NoiseCertPolicy::default(),
             initial_push_name: None,
             cache_config: CacheConfig::default(),
             wanted_pre_key_count: None,
@@ -785,6 +788,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             skip_history_sync: self.skip_history_sync,
             ab_props_fetch: self.ab_props_fetch,
             presence_policy: self.presence_policy,
+            noise_cert_policy: self.noise_cert_policy,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
             wanted_pre_key_count: self.wanted_pre_key_count,
@@ -1404,6 +1408,16 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Select the Noise server-cert verification policy for handshakes made
+    /// by the built client. Defaults to strict; pass
+    /// [`NoiseCertPolicy::DangerSkipCertChainVerify`] only for testing
+    /// against a mock server that cannot sign its chain. Fixed at build
+    /// time and applied to every connect, including reconnects.
+    pub fn with_noise_cert_policy(mut self, policy: NoiseCertPolicy) -> Self {
+        self.noise_cert_policy = policy;
+        self
+    }
+
     /// Set how many one-time pre-keys are generated and uploaded per batch.
     ///
     /// Defaults to WA Web's UPLOAD_KEYS_COUNT (812). The value is clamped to the
@@ -1546,6 +1560,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             .with_transport_factory_arc(transport_factory)
             .with_http_client_arc(http_client)
             .with_cache_config(self.cache_config)
+            .with_noise_cert_policy(self.noise_cert_policy)
             .with_custom_enc_handlers(self.custom_enc_handlers)
             .with_skip_history_sync(self.skip_history_sync)
             .with_ab_props_fetch(self.ab_props_fetch)
@@ -1687,6 +1702,57 @@ mod tests {
             Some(&"installed")
         );
         bot.client().disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn bot_builder_noise_cert_policy_reaches_built_client() {
+        use wacore::handshake::NoiseCertPolicy;
+
+        let default_bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("default bot build");
+        assert_eq!(
+            default_bot.client().noise_cert_policy,
+            NoiseCertPolicy::default()
+        );
+        default_bot.client().disconnect().await;
+
+        let bypass_bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_noise_cert_policy(NoiseCertPolicy::DangerSkipCertChainVerify)
+            .build()
+            .await
+            .expect("bypass bot build");
+        assert_eq!(
+            bypass_bot.client().noise_cert_policy,
+            NoiseCertPolicy::DangerSkipCertChainVerify
+        );
+        bypass_bot.client().disconnect().await;
+
+        // Explicit Strict survives even when the legacy feature moves the
+        // default: the setter, not the build flag, decides.
+        let strict_bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_noise_cert_policy(NoiseCertPolicy::Strict)
+            .build()
+            .await
+            .expect("explicit strict bot build");
+        assert_eq!(
+            strict_bot.client().noise_cert_policy,
+            NoiseCertPolicy::Strict
+        );
+        strict_bot.client().disconnect().await;
     }
 
     fn pairing_code_event(code: &str) -> Arc<Event> {

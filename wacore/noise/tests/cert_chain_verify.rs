@@ -50,13 +50,10 @@ fn build_chain_with_issuer_serial(server_static_pub: &[u8; 32], issuer_serial: u
     chain.encode_to_vec()
 }
 
-// The legacy entrypoint selects the default policy, which is strict without
-// the legacy feature: the zero-signed chain must fail XEdDSA verify. (With
-// the feature the default selects the documented legacy bypass, so this
-// stays gated; explicit-Strict rejection under the feature is covered by
-// the `xx_handshake_with_strict_policy_rejects_zero_signed_chain` unit
-// test, run with the feature enabled.)
-#[cfg(not(feature = "danger-skip-cert-chain-verify"))]
+// The public helper always verifies strictly, even with the legacy feature
+// enabled: the zero-signed fixture must fail XEdDSA verify in every build.
+// Bypass remains available only through the explicit-policy handshake
+// constructors, whose outcomes carry no trusted chain.
 #[test]
 fn verify_server_cert_rejects_fixture_with_zero_signed_certs() {
     // The chain is structurally valid (right shape, leaf.key matches the
@@ -72,6 +69,30 @@ fn verify_server_cert_rejects_fixture_with_zero_signed_certs() {
     assert!(
         msg.contains("intermediate signature failed XEdDSA verify"),
         "expected an intermediate XEdDSA-verify failure, got: {msg}"
+    );
+}
+
+// Pins the reported bug: with the legacy feature the default policy selects
+// the bypass, yet the public helper must still reject the zero-signed chain
+// — it never consults the default, so no `VerifiedServerCertChain` exists
+// here that `From` could mark `signature_verified`.
+#[cfg(feature = "danger-skip-cert-chain-verify")]
+#[test]
+fn verify_server_cert_ignores_legacy_default_policy() {
+    use wacore_noise::NoiseCertPolicy;
+
+    assert_eq!(
+        NoiseCertPolicy::default(),
+        NoiseCertPolicy::DangerSkipCertChainVerify
+    );
+    let server_static_pub = [0xAAu8; 32];
+    let chain_bytes = build_zero_signed_chain(&server_static_pub);
+    let err = HandshakeUtils::verify_server_cert(&chain_bytes, &server_static_pub)
+        .expect_err("public helper must stay strict under the legacy feature");
+    assert!(
+        err.to_string()
+            .contains("intermediate signature failed XEdDSA verify"),
+        "expected an XEdDSA-verify failure, got: {err}"
     );
 }
 
