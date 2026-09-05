@@ -102,14 +102,14 @@ Responsabilidades finais:
 
 O oráculo completo, seus testes/exemplos, as specs e os documentos MLOW foram
 movidos para `tools/` e `agent_docs/` deste repositório. O executor usa
-`unwasm-core` (`db80811118806128167d045938ffbaf82b363afd`) como dependência
+`unwasm-core` (`8f798470e9f8c22a9ef40780eee302894fe7bdce`) como dependência
 Git somente no tooling; ele permanece fora de `default-members`. O `whatspec`
 ganhou a crate `wa-store`, aprovada com o workspace, para expor
 locks/restauração sem puxar os extratores.
 
 O audit ampliado ao tooling encontrou quatro advisories no Wasmtime 41 que o
 gate anterior, limitado ao pacote runtime, não enxergava. `wa-store` também foi
-repinado em `963b21803b9f6541440b15b05e77291856fd0f0f`, com ureq 3.4,
+repinado em `10a66fdaab616c9ef6b3f5e6b197bdddfabc142a`, com ureq 3.4,
 rustls 0.23.43 e a provider OxiTLS/RustCrypto 0.3.0. O oráculo passa a
 usar Wasmtime 48.0.1, a versão estável atual, e o workflow audita explicitamente
 o grafo de `tools/xtask` além do grafo de produção.
@@ -138,3 +138,25 @@ também concluiu verde com o novo audit de tooling. O job semver informativo
 continuou reportando as sete quebras já presentes na API protobuf gerada; ele
 não envolve os membros de tooling e permanece deliberadamente não bloqueante.
 Nenhum trabalho desta separação permanece aberto.
+
+## Revisão das PRs — 2026-09-05
+
+A rodada de revisão reforçou as fronteiras que tornam a derivação reproduzível:
+
+- `whatspec` pagina todos os assets de release, valida URLs com parser, limita
+  tamanho de cada wasm e memória de dicionário XZ e preserva erros de escrita.
+- `unwasm` mantém o decompilador utilizável offline; o xtask de captura fica em
+  workspace separado e aponta para `wa-store` em
+  `10a66fdaab616c9ef6b3f5e6b197bdddfabc142a`.
+- `whatsapp-rust` verifica tamanho e SHA das capturas conhecidas antes da
+  instanciação, serializa o teste VoIP, exige a inicialização dos workers e
+  libera temporários embind também quando a codificação falha.
+- O host passou a rejeitar strings C inválidas e descritores já fechados; as
+  leituras amostradas da memória compartilhada usam a mesma carga atômica das
+  demais leituras do host.
+- O job MSRV testa as crates publicadas diretamente no Rust 1.94, e o job MLOW
+  baixa as capturas antes de executar também os testes de integração do oráculo.
+
+Os pins finais usados pelo tooling são `unwasm`
+`8f798470e9f8c22a9ef40780eee302894fe7bdce` e `whatspec`
+`10a66fdaab616c9ef6b3f5e6b197bdddfabc142a`.

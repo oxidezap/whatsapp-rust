@@ -127,6 +127,11 @@ skip = [
     # those four migrate.
     { name = "base64", version = "=0.22.1" },
 
+    # rtc-dtls still parses its own keys with pem 3 while its current rcgen
+    # dependency has moved to pem 4. Both paths are inside the same upstream
+    # crate, so the workspace cannot select one version for both.
+    { name = "pem", version = "=3.0.6" },
+
     # Assorted transitive lag: no workspace crate depends on any of these
     # directly, so the version is whatever our deps agreed on.
     { name = "bitflags", version = "=1.3.2" },

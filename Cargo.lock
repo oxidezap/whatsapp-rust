@@ -1164,21 +1164,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7431dd8c9def94aca43b27915dee0d42103d9b13922cfb044febcd975547d68"
 
 [[package]]
-name = "crc"
-version = "3.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
-dependencies = [
- "crc-catalog",
-]
-
-[[package]]
-name = "crc-catalog"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
-
-[[package]]
 name = "crc32c"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2662,13 +2647,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "lzma-rs"
-version = "0.3.0"
+name = "lzma-rust2"
+version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
 dependencies = [
- "byteorder",
- "crc",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -4600,7 +4584,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4994,7 +4978,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "unwasm-core"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/unwasm.git?rev=db80811118806128167d045938ffbaf82b363afd#db80811118806128167d045938ffbaf82b363afd"
+source = "git+https://github.com/oxidezap/unwasm.git?rev=8f798470e9f8c22a9ef40780eee302894fe7bdce#8f798470e9f8c22a9ef40780eee302894fe7bdce"
 dependencies = [
  "wasmparser",
 ]
@@ -5089,7 +5073,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "wa-fetch"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=963b21803b9f6541440b15b05e77291856fd0f0f#963b21803b9f6541440b15b05e77291856fd0f0f"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=10a66fdaab616c9ef6b3f5e6b197bdddfabc142a#10a66fdaab616c9ef6b3f5e6b197bdddfabc142a"
 dependencies = [
  "anyhow",
  "oxitls-rustcrypto-provider",
@@ -5102,15 +5086,16 @@ dependencies = [
 [[package]]
 name = "wa-store"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=963b21803b9f6541440b15b05e77291856fd0f0f#963b21803b9f6541440b15b05e77291856fd0f0f"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=10a66fdaab616c9ef6b3f5e6b197bdddfabc142a#10a66fdaab616c9ef6b3f5e6b197bdddfabc142a"
 dependencies = [
  "anyhow",
  "flate2",
- "lzma-rs",
+ "lzma-rust2",
  "serde",
  "serde_json",
  "tar",
  "tempfile",
+ "url",
  "wa-fetch",
  "wa-text",
 ]
@@ -5118,7 +5103,7 @@ dependencies = [
 [[package]]
 name = "wa-text"
 version = "0.1.0"
-source = "git+https://github.com/oxidezap/whatspec.git?rev=963b21803b9f6541440b15b05e77291856fd0f0f#963b21803b9f6541440b15b05e77291856fd0f0f"
+source = "git+https://github.com/oxidezap/whatspec.git?rev=10a66fdaab616c9ef6b3f5e6b197bdddfabc142a#10a66fdaab616c9ef6b3f5e6b197bdddfabc142a"
 dependencies = [
  "sha2 0.10.9",
 ]

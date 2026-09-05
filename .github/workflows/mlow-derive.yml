@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-16
@@ -27,15 +27,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: . -> target
-      - name: Test the WhatsApp wasm oracle
-        run: cargo test --release --locked -p oracle-core --lib
       - name: Test native task utilities
         run: cargo test --locked -p whatsapp-xtask -p xtask-support
+      - name: Fetch every pinned oracle capture
+        run: cargo xt oracle fetch
+      - name: Test the WhatsApp wasm oracle against its captures
+        run: cargo test --release --locked -p oracle-core -- --nocapture
       - name: Re-derive J/S and compare every committed wasm fixture
         run: cargo xt mlow regenerate --check
       - name: Test the runtime against the regenerated corpus
         run: cargo nextest run --profile ci --locked -p wacore --features voip-mlow --lib -E 'test(voip::mlow::)'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: mlow-oracle-evidence

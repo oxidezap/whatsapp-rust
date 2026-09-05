@@ -88,8 +88,8 @@ unused_qualifications = "warn"
 
 [workspace.dependencies]
 oracle-core = { path = "tools/oracle-core" }
-unwasm-core = { git = "https://github.com/oxidezap/unwasm.git", rev = "db80811118806128167d045938ffbaf82b363afd" }
-wa-store = { git = "https://github.com/oxidezap/whatspec.git", rev = "963b21803b9f6541440b15b05e77291856fd0f0f" }
+unwasm-core = { git = "https://github.com/oxidezap/unwasm.git", rev = "8f798470e9f8c22a9ef40780eee302894fe7bdce" }
+wa-store = { git = "https://github.com/oxidezap/whatspec.git", rev = "10a66fdaab616c9ef6b3f5e6b197bdddfabc142a" }
 xtask-support = { path = "tools/xtask-support" }
 aes = "0.9.2"
 aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc"] }
