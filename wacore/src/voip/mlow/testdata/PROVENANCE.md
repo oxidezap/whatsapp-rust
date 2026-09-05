@@ -91,7 +91,10 @@ cargo xt mlow pack-legacy --check
 
 That recipe reads the immutable historical fixture commit pinned in the Rust task (a full-history
 checkout, or fetching that commit, is required). `packed-fixtures.json` records original source
-hashes, selected record counts, canonical CBOR hashes and sizes. The C fork behind those historical
+hashes, selected record counts, canonical CBOR hashes and sizes. Check mode compares all stable
+manifest fields and verifies the hashes and sizes of the committed compressed files. The JSON byte
+hash and size describe an intermediate serializer rendering and are excluded from that comparison;
+the canonical CBOR bytes remain the representation-independent contract. The C fork behind those historical
 outputs is `edgardmessias/opus_mlow@84b076e0809412df22e8a0d26f944610c4a3e40f`; some original dump
 harnesses/configurations were lost, so replaying the archived bytes is deliberately distinguished
 from rebuilding that C oracle. The primary wasm corpus has no such dependency.

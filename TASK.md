@@ -156,6 +156,10 @@ A rodada de revisão reforçou as fronteiras que tornam a derivação reproduzí
   demais leituras do host.
 - O job MSRV testa as crates publicadas diretamente no Rust 1.94, e o job MLOW
   baixa as capturas antes de executar também os testes de integração do oráculo.
+- Falhas ao carregar uma captura deixam de virar skips; workers recusam limites
+  de stack incompletos, patches sobrepostos são erros e todos os sinks de marker
+  registram seus hits. O check dos auditores C também compara o manifesto de
+  proveniência inteiro com os arquivos empacotados.
 
 Os pins finais usados pelo tooling são `unwasm`
 `8f798470e9f8c22a9ef40780eee302894fe7bdce` e `whatspec`

@@ -151,6 +151,23 @@ fn select(root: &Path, name: &str, records: Value) -> Result<Value> {
     }
     Ok(records)
 }
+
+fn stable_manifest(mut manifest: Value) -> Result<Value> {
+    for (name, metadata) in manifest
+        .as_object_mut()
+        .context("C audit manifest is not an object")?
+    {
+        if name.ends_with(".cbor.zst") {
+            let metadata = metadata
+                .as_object_mut()
+                .with_context(|| format!("C audit manifest entry {name} is not an object"))?;
+            metadata.remove("json_sha256");
+            metadata.remove("json_bytes");
+        }
+    }
+    Ok(manifest)
+}
+
 fn pack_legacy(root: &Path, check: bool) -> Result<()> {
     let data = root.join(DATA);
     let mut manifest = json!({});
@@ -184,10 +201,13 @@ fn pack_legacy(root: &Path, check: bool) -> Result<()> {
         let (packed, mut meta) = cbor::pack(&json)?;
         let name = format!("{name}.cbor.zst");
         if check {
+            let committed = std::fs::read(data.join(&name))?;
             ensure!(
-                cbor::decompress(&std::fs::read(data.join(&name))?)? == cbor::encode(&selected),
+                cbor::decompress(&committed)? == cbor::encode(&selected),
                 "C audit drift: {name}"
             );
+            meta["zstd_sha256"] = json!(sha256(&committed));
+            meta["packed_bytes"] = json!(committed.len());
         } else {
             write(&data.join(&name), &packed)?;
         }
@@ -219,17 +239,24 @@ fn pack_legacy(root: &Path, check: bool) -> Result<()> {
         }
         let packed = cbor::compress(&raw)?;
         let target = format!("{name}.zst");
-        if check {
-            ensure!(
-                cbor::decompress(&std::fs::read(data.join(&target))?)? == raw,
-                "C raw drift: {name}"
-            );
+        let packed_bytes = if check {
+            let committed = std::fs::read(data.join(&target))?;
+            ensure!(cbor::decompress(&committed)? == raw, "C raw drift: {name}");
+            committed.len()
         } else {
             write(&data.join(&target), &packed)?;
-        }
-        manifest[target] = json!({"oracle":"C audit","source_revision":revision,"source_file":name,"source_sha256":sha256(&original),"raw_sha256":sha256(&raw),"raw_bytes":raw.len(),"packed_bytes":packed.len()});
+            packed.len()
+        };
+        manifest[target] = json!({"oracle":"C audit","source_revision":revision,"source_file":name,"source_sha256":sha256(&original),"raw_sha256":sha256(&raw),"raw_bytes":raw.len(),"packed_bytes":packed_bytes});
     }
-    if !check {
+    if check {
+        let committed: Value =
+            serde_json::from_slice(&std::fs::read(data.join("packed-fixtures.json"))?)?;
+        ensure!(
+            stable_manifest(committed)? == stable_manifest(manifest)?,
+            "C audit manifest drift"
+        );
+    } else {
         write_json(&data.join("packed-fixtures.json"), &manifest)?;
     }
     println!("C audit corpus verified");
@@ -491,5 +518,27 @@ pub fn run(root: &Path, task: Task) -> Result<()> {
             regenerate(root, &out, cached, check)
         }
         Task::CReference { check } => c_reference(root, check),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_comparison_ignores_only_intermediate_json_rendering() {
+        let left = json!({"fixture.cbor.zst":{"json_sha256":"a","json_bytes":1,"cbor_sha256":"stable","records":2}});
+        let right = json!({"fixture.cbor.zst":{"json_sha256":"b","json_bytes":9,"cbor_sha256":"stable","records":2}});
+        assert_eq!(
+            stable_manifest(left).unwrap(),
+            stable_manifest(right).unwrap()
+        );
+
+        let changed = json!({"fixture.cbor.zst":{"cbor_sha256":"changed","records":2}});
+        assert_ne!(
+            stable_manifest(json!({"fixture.cbor.zst":{"cbor_sha256":"stable","records":2}}))
+                .unwrap(),
+            stable_manifest(changed).unwrap()
+        );
     }
 }
