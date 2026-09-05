@@ -242,6 +242,30 @@ impl Runtime {
         self.store.data()
     }
 
+    /// Capture payloads passed to a fixed set of guest-to-host audio/video callbacks.
+    pub fn watch_media(
+        &self,
+        watches: impl IntoIterator<Item = crate::media_probe::MediaWatch>,
+    ) -> Result<()> {
+        let probe = crate::media_probe::MediaProbe::new(watches.into_iter().collect())?;
+        self.store
+            .data()
+            .shared
+            .media_probe
+            .set(probe)
+            .map_err(|_| anyhow!("media probe is already installed"))
+    }
+
+    /// Drain the captured media records, or report a malformed/budget-breaking callback.
+    pub fn take_media_observations(&self) -> Result<Vec<crate::media_probe::MediaObservation>> {
+        self.store
+            .data()
+            .shared
+            .media_probe
+            .get()
+            .map_or_else(|| Ok(Vec::new()), crate::media_probe::MediaProbe::take)
+    }
+
     /// Grows the guest's memory by `pages`, returning the new size in pages.
     ///
     /// A WASI command whose libc grows the heap on demand can find its own

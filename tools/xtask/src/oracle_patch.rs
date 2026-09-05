@@ -30,6 +30,8 @@ pub enum Task {
         source: PathBuf,
         destination: PathBuf,
     },
+    /// Verify two persisted audio/video oracle traces byte for byte.
+    CompareMedia { expected: PathBuf, actual: PathBuf },
 }
 
 pub fn run(root: &Path, task: Task) -> Result<()> {
@@ -52,6 +54,13 @@ pub fn run(root: &Path, task: Task) -> Result<()> {
             source,
             destination,
         } => offer_errors(&source, &destination),
+        Task::CompareMedia { expected, actual } => {
+            let expected = oracle_core::read_media_trace(&expected)?;
+            let actual = oracle_core::read_media_trace(&actual)?;
+            oracle_core::compare_media(&expected, &actual)?;
+            println!("{} media record(s) match", expected.len());
+            Ok(())
+        }
     }
 }
 
@@ -218,5 +227,33 @@ mod tests {
         let result = std::fs::read(&out).unwrap();
         assert_eq!(&result[..2], &[0x41, 1]);
         assert_eq!(&result[2..], &pattern[2..]);
+    }
+
+    #[test]
+    fn media_compare_checks_persisted_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join("expected");
+        let actual = dir.path().join("actual");
+        let observation = oracle_core::MediaObservation {
+            stream: oracle_core::MediaStream::Audio,
+            symbol: "env::audio".to_owned(),
+            ordinal: 0,
+            sequence: Some(1),
+            timestamp: Some(960),
+            payload: vec![1, 2, 3],
+        };
+        oracle_core::write_media_trace(&expected, std::slice::from_ref(&observation)).unwrap();
+        oracle_core::write_media_trace(&actual, &[observation]).unwrap();
+        run(
+            dir.path(),
+            Task::CompareMedia {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            },
+        )
+        .unwrap();
+
+        std::fs::write(actual.join("record-0000.bin"), [1, 2, 4]).unwrap();
+        assert!(run(dir.path(), Task::CompareMedia { expected, actual }).is_err());
     }
 }

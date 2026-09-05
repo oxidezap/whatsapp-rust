@@ -273,6 +273,9 @@ impl HostState {
         if let Some(recorder) = self.shared.snapshots.get() {
             recorder.record(self, module, name, &args);
         }
+        if let Some(probe) = self.shared.media_probe.get() {
+            probe.record(self, module, name, &args);
+        }
         self.shared.record(module, name, args);
     }
 }

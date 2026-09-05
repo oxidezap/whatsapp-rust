@@ -72,6 +72,7 @@ Read the one that covers what you are touching:
 | `agent_docs/observability.md` | Adding a cache, counter, or anything reported by `memory_report()` / `stats()` |
 | `agent_docs/plugin_architecture.md` | Touching the `plugins` / `client-lifecycle` feature surface |
 | `agent_docs/voip_audio_codecs.md` | VoIP media: codec profiles, negotiation, encoded audio API |
+| `agent_docs/voip_media_oracle.md` | Building differential audio/video traces against captured WhatsApp wasm |
 | `agent_docs/mlow_derivation.md` | Re-deriving MLOW fixtures from pinned J/S wasm captures |
 | `agent_docs/voip_oracle_status.md` | Running or extending the WhatsApp Wasmtime oracle |
 | `agent_docs/wam_telemetry.md` | WAM: the generated event catalog, the buffer codec, and what a client may honestly report |

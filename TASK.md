@@ -167,3 +167,19 @@ A rodada de revisão reforçou as fronteiras que tornam a derivação reproduzí
 Os pins finais usados pelo tooling são `unwasm`
 `8f798470e9f8c22a9ef40780eee302894fe7bdce` e `whatspec`
 `10a66fdaab616c9ef6b3f5e6b197bdddfabc142a`.
+
+## Fundação do oráculo E2E de mídia — 2026-09-05
+
+- [x] Captura declarativa e limitada de callbacks de áudio/vídeo, incluindo
+  payload, ordem, sequência e timestamp.
+- [x] Persistência verificável em manifesto + payloads binários, com tamanho e
+  SHA-256 conferidos na leitura e limpeza de records obsoletos.
+- [x] Comparador exato disponível em `cargo xt oracle compare-media`.
+- [x] Testes de captura real pelo host wasm, limites, tamper, comparação e
+  persistência.
+- [x] Documento com as etapas para codec, RTP, SRTP/WARP, H.264/FU-A e receive.
+
+A infraestrutura está pronta para receber specs derivadas dos callbacks dos
+módulos pinados. Os fixtures E2E de chamadas completas serão adicionados quando
+os ABIs de callback de áudio e vídeo forem identificados por seletor e prova de
+execução; nenhum índice ou layout foi presumido nesta etapa.

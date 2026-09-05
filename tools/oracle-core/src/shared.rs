@@ -156,6 +156,7 @@ pub struct SharedHost {
     /// conventional `__indirect_function_table`.
     pub table_export: std::sync::OnceLock<String>,
     pub(crate) module_data_sha256: std::sync::OnceLock<String>,
+    pub(crate) media_probe: std::sync::OnceLock<crate::media_probe::MediaProbe>,
     /// Threads that have been told to check their mailbox and have not yet.
     ///
     /// Emscripten wakes a thread by posting it a `checkMailbox` message; there
@@ -258,6 +259,7 @@ impl Default for SharedHost {
             invoke_imports: std::sync::OnceLock::new(),
             table_export: std::sync::OnceLock::new(),
             module_data_sha256: std::sync::OnceLock::new(),
+            media_probe: std::sync::OnceLock::new(),
             exports: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
             last_size: AtomicUsize::new(0),

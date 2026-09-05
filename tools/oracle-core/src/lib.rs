@@ -18,6 +18,7 @@ pub mod emval;
 pub mod exports;
 pub mod host;
 pub mod inspect;
+pub mod media_probe;
 pub mod migrate;
 pub mod patch;
 pub mod runtime;
@@ -47,3 +48,6 @@ impl<T> IntoWasmtime<T> for anyhow::Result<T> {
 pub use catalog::{CapturedModule, Catalog};
 pub use data::{DataReport, DataSegment, DataString};
 pub use inspect::{ExportEntry, ImportEntry, Inspection, Requirement, SectionEntry, Toolchain};
+pub use media_probe::{
+    MediaObservation, MediaStream, MediaWatch, compare_media, read_media_trace, write_media_trace,
+};
