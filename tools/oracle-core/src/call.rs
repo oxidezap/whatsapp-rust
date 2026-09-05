@@ -148,27 +148,21 @@ impl Runtime {
             ));
         }
 
-        // The invoker's first parameter is the function pointer itself.
-        let mut call_args = vec![Val::I32(target as i32)];
-        let mut owned = Owned::default();
-        for (arg, type_id) in args.iter().zip(&param_types) {
-            let wire = self.wire_for(*type_id).with_context(|| {
-                format!("argument of `{name}` (type `{}`)", self.type_name(*type_id))
-            })?;
-            let value = self.encode(arg, wire, &mut owned)?;
-            call_args.push(value);
-        }
+        let outcome = self.with_owned(|this, owned| {
+            // The invoker's first parameter is the function pointer itself.
+            let mut call_args = vec![Val::I32(target as i32)];
+            for (arg, type_id) in args.iter().zip(&param_types) {
+                let wire = this.wire_for(*type_id).with_context(|| {
+                    format!("argument of `{name}` (type `{}`)", this.type_name(*type_id))
+                })?;
+                call_args.push(this.encode(arg, wire, owned)?);
+            }
 
-        let result_wire = self
-            .wire_for(result_type)
-            .with_context(|| format!("return type of `{name}`"))?;
-
-        let outcome = self.invoke(invoker, &call_args, result_wire);
-
-        // Release temporaries whether or not the call succeeded. An embind
-        // function takes its vector arguments by value, so the instance built
-        // for the call is ours to destroy once it returns.
-        self.release_owned(owned);
+            let result_wire = this
+                .wire_for(result_type)
+                .with_context(|| format!("return type of `{name}`"))?;
+            this.invoke(invoker, &call_args, result_wire)
+        });
 
         outcome.with_context(|| format!("calling embind function `{name}`"))
     }
@@ -244,6 +238,16 @@ impl Runtime {
         for ptr in owned.allocations {
             let _ = self.free(ptr);
         }
+    }
+
+    fn with_owned<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self, &mut Owned) -> Result<T>,
+    ) -> Result<T> {
+        let mut owned = Owned::default();
+        let result = operation(self, &mut owned);
+        self.release_owned(owned);
+        result
     }
 
     /// Looks the invoker up in the function table and calls it.
@@ -449,22 +453,19 @@ impl Runtime {
         };
 
         for value in &values {
-            let mut owned = Owned::default();
-            let encoded = self.encode(value, element_wire, &mut owned)?;
+            self.with_owned(|this, owned| {
+                let encoded = this.encode(value, element_wire, owned)?;
 
-            // A method invoker takes (context, this, args...).
-            let invoker = self.table_function(push_back.invoker)?;
-            let args = [
-                Val::I32(push_back.context as i32),
-                Val::I32(handle.ptr as i32),
-                encoded,
-            ];
-            let outcome = self
-                .call_func(invoker, &args, &mut [])
-                .with_context(|| format!("`{class_name}::push_back`"));
-
-            self.release_owned(owned);
-            outcome?;
+                // A method invoker takes (context, this, args...).
+                let invoker = this.table_function(push_back.invoker)?;
+                let args = [
+                    Val::I32(push_back.context as i32),
+                    Val::I32(handle.ptr as i32),
+                    encoded,
+                ];
+                this.call_func(invoker, &args, &mut [])
+                    .with_context(|| format!("`{class_name}::push_back`"))
+            })?;
         }
 
         Ok(())
@@ -558,26 +559,26 @@ impl Runtime {
             ));
         }
 
-        let mut call_args = vec![
-            Val::I32(declared.context as i32),
-            Val::I32(handle.ptr as i32),
-        ];
-        let mut owned = Owned::default();
-        for (arg, type_id) in args.iter().zip(&param_types) {
-            let wire = self.wire_for(*type_id).with_context(|| {
-                format!(
-                    "argument of `{class_name}::{method}` (type `{}`)",
-                    self.type_name(*type_id)
-                )
-            })?;
-            call_args.push(self.encode(arg, wire, &mut owned)?);
-        }
+        let outcome = self.with_owned(|this, owned| {
+            let mut call_args = vec![
+                Val::I32(declared.context as i32),
+                Val::I32(handle.ptr as i32),
+            ];
+            for (arg, type_id) in args.iter().zip(&param_types) {
+                let wire = this.wire_for(*type_id).with_context(|| {
+                    format!(
+                        "argument of `{class_name}::{method}` (type `{}`)",
+                        this.type_name(*type_id)
+                    )
+                })?;
+                call_args.push(this.encode(arg, wire, owned)?);
+            }
 
-        let result_wire = self
-            .wire_for(*result_type)
-            .with_context(|| format!("return type of `{class_name}::{method}`"))?;
-        let outcome = self.invoke(declared.invoker, &call_args, result_wire);
-        self.release_owned(owned);
+            let result_wire = this
+                .wire_for(*result_type)
+                .with_context(|| format!("return type of `{class_name}::{method}`"))?;
+            this.invoke(declared.invoker, &call_args, result_wire)
+        });
 
         outcome.with_context(|| format!("calling `{class_name}::{method}`"))
     }

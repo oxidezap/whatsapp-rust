@@ -28,7 +28,7 @@ use crate::shared::SharedHost;
 /// Relaxed because there is nothing to order against. The host is sampling
 /// bytes the guest owns; no other host state is published through them.
 #[allow(unsafe_code)]
-fn load_shared(cell: &UnsafeCell<u8>) -> u8 {
+pub(crate) fn load_shared(cell: &UnsafeCell<u8>) -> u8 {
     // SAFETY: the pointer comes from a live `UnsafeCell<u8>` inside wasmtime's
     // shared-memory mapping, so it is non-null, aligned (`u8` always is) and
     // valid for the lifetime of the borrow. Every host access to that mapping
@@ -284,7 +284,7 @@ impl HostState {
     /// narrows the window — a guest thread holds its turn across the host call
     /// this read happens inside — but that is bounded, not absolute, and
     /// `threads.rs` deliberately watches a word another thread is writing. So
-    /// every byte goes through [`load_shared`]: the answer can still mix old
+    /// every byte goes through `load_shared`: the answer can still mix old
     /// and new bytes, and now that is a defined outcome instead of a race.
     #[allow(unsafe_code)]
     pub fn read(&self, ptr: u32, len: u32) -> Result<Vec<u8>> {
@@ -364,8 +364,12 @@ impl HostState {
             // Near the end of memory a full-length read fails; retry smaller.
             self.read(ptr, 256)
         })?;
-        let end = bytes.iter().position(|&byte| byte == 0).unwrap_or(0);
-        Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+        let end = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .ok_or_else(|| anyhow!("C string at {ptr} has no terminator within the read limit"))?;
+        String::from_utf8(bytes[..end].to_vec())
+            .map_err(|error| anyhow!("C string at {ptr} is not UTF-8: {error}"))
     }
 
     /// Writes `bytes` into linear memory at `ptr`.

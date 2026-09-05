@@ -467,7 +467,7 @@ fn marker_bytes_local(id: i32, local: u32, sink: u32) -> Vec<u8> {
 ///
 /// Returns an error when the module declares no import that can serve as a
 /// marker sink — including when it declares one whose host implementation is
-/// not known to be recording-only, see [`choose_sink`] — when it has no code
+/// not known to be recording-only, see `choose_sink` — when it has no code
 /// section, or when a named function does not exist.
 pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
     let layout = read_layout(bytes)?;

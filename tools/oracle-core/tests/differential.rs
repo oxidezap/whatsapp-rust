@@ -7,6 +7,15 @@
 use oracle_core::{Catalog, Runtime, Value};
 use wasmtime::Val;
 
+mod common;
+
+static THREADED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn threaded_guard() -> (std::sync::MutexGuard<'static, ()>, common::EngineLock) {
+    let local = THREADED.lock().unwrap_or_else(|error| error.into_inner());
+    (local, common::engine_lock())
+}
+
 /// The capture these comparisons treat as ground truth. Named once: see the
 /// note on the same constant in `abi_inference.rs`.
 const VOIP: &str = "JgwtTQVeWPm";
@@ -236,6 +245,7 @@ fn signaling_offer_is_accepted() {
 
 #[test]
 fn voip_stack_initialises() {
+    let _serial = threaded_guard();
     let mut runtime = module_or_skip!(VOIP);
     runtime.run_ctors().expect("ctors");
 

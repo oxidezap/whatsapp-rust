@@ -421,7 +421,7 @@ impl SharedHost {
         *self.marker_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(symbol.to_owned());
     }
 
-    /// The markers seen, oldest first, up to the last [`MAX_MARKERS`].
+    /// The markers seen, oldest first, up to the last `MAX_MARKERS`.
     pub fn markers(&self) -> Vec<(i32, i64)> {
         self.markers
             .lock()

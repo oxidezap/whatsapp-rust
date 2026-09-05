@@ -542,8 +542,17 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
             arg(params, 3),
         ),
         "fd_close" => {
-            caller.data_mut().wasi.open.remove(&arg(params, 0));
-            ESUCCESS
+            if caller
+                .data_mut()
+                .wasi
+                .open
+                .remove(&arg(params, 0))
+                .is_some()
+            {
+                ESUCCESS
+            } else {
+                EBADF
+            }
         }
         "fd_fdstat_get" => fd_fdstat_get(caller, arg(params, 0), arg(params, 1)),
         "fd_filestat_get" => fd_filestat_get(caller, arg(params, 0), arg(params, 1)),

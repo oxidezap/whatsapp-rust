@@ -257,29 +257,35 @@ fn run_thread(ctx: Context_, thread_ptr: u32, start_routine: u32, arg: u32) -> R
     // and the first thing that checks — `emscripten_proxy_execute_queue`, the
     // drain for proxied work — asserts and kills the thread. Every engine
     // worker was dying that way. See `exports.rs`.
-    let thread_init = ["__emscripten_thread_init", "_emscripten_thread_init"]
+    let init_names = ["__emscripten_thread_init", "_emscripten_thread_init"];
+    let init = init_names
         .into_iter()
-        .find_map(|name| instance.get_func(&mut store, name));
+        .find_map(|name| instance.get_func(&mut store, name))
+        .ok_or_else(|| {
+            crate::exports::missing_from(
+                ctx.shared.exports.get(),
+                "worker initializer",
+                &init_names,
+            )
+        })?;
 
-    if let Some(init) = thread_init {
-        // (pthread_ptr, is_main, is_runtime, can_block, is_default_stack, ...)
-        //
-        // `can_block = 1`: a worker may block, unlike the main thread. Setting
-        // it to 0 here was measured and is much worse — seven of twelve
-        // threading tests fail — because the busy-wait costs more than the
-        // occasional held turn.
-        let args = [
-            Val::I32(thread_ptr as i32),
-            Val::I32(0),
-            Val::I32(0),
-            Val::I32(1),
-            Val::I32(0),
-            Val::I32(0),
-        ];
-        let arity = init.ty(&store).params().len().min(args.len());
-        init.call(&mut store, &args[..arity], &mut [])
-            .context("__emscripten_thread_init")?;
-    }
+    // (pthread_ptr, is_main, is_runtime, can_block, is_default_stack, ...)
+    //
+    // `can_block = 1`: a worker may block, unlike the main thread. Setting
+    // it to 0 here was measured and is much worse — seven of twelve
+    // threading tests fail — because the busy-wait costs more than the
+    // occasional held turn.
+    let args = [
+        Val::I32(thread_ptr as i32),
+        Val::I32(0),
+        Val::I32(0),
+        Val::I32(1),
+        Val::I32(0),
+        Val::I32(0),
+    ];
+    let arity = init.ty(&store).params().len().min(args.len());
+    init.call(&mut store, &args[..arity], &mut [])
+        .context("__emscripten_thread_init")?;
 
     // No stack of its own for this thread, and that is now a measurement rather
     // than an oversight — but read the measurement, because it says the

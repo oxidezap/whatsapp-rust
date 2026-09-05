@@ -364,6 +364,7 @@ mod wasi_fixture {
             ("clock_time_get", 1),
             ("path_open", 2),
             ("fd_read", 3),
+            ("fd_close", 5),
         ] {
             imports.import("wasi_snapshot_preview1", name, EntityType::Function(ty));
         }
@@ -378,7 +379,7 @@ mod wasi_fixture {
         });
 
         let mut functions = FunctionSection::new();
-        for ty in [4, 5, 6, 5] {
+        for ty in [4, 5, 6, 5, 5] {
             functions.function(ty);
         }
 
@@ -450,13 +451,17 @@ mod wasi_fixture {
         }
         code.function(&read);
 
+        let mut close = Function::new([]);
+        close.instructions().local_get(0).call(4).end();
+        code.function(&close);
+
         let mut exports = ExportSection::new();
         exports.export("memory", ExportKind::Memory, 0);
-        for (index, name) in ["do_pread", "do_clock", "do_open", "do_read"]
+        for (index, name) in ["do_pread", "do_clock", "do_open", "do_read", "do_close"]
             .into_iter()
             .enumerate()
         {
-            exports.export(name, ExportKind::Func, 4 + index as u32);
+            exports.export(name, ExportKind::Func, 5 + index as u32);
         }
 
         let mut module = Module::new();
@@ -553,6 +558,72 @@ fn fd_pread_reads_from_its_offset_and_leaves_the_cursor_alone() {
         "01234567",
         "fd_pread must not have advanced the descriptor"
     );
+}
+
+#[test]
+fn fd_close_rejects_reserved_unknown_and_already_closed_descriptors() {
+    let mut runtime = Runtime::instantiate(&wasi_fixture::module()).expect("instantiate");
+    runtime.add_file("data.bin", vec![1, 2, 3]);
+    runtime
+        .write_bytes_at(wasi_fixture::PATH, b"data.bin")
+        .expect("path");
+    let opened = runtime
+        .call(
+            "do_open",
+            &[
+                wasmtime::Val::I32(wasi_fixture::PATH as i32),
+                wasmtime::Val::I32(8),
+            ],
+        )
+        .expect("open");
+    assert_eq!(errno_of(&opened), 0);
+    let fd = runtime.read_u32_at(wasi_fixture::OPENED_FD).expect("fd");
+
+    let close = |runtime: &mut Runtime, fd: u32| {
+        errno_of(
+            &runtime
+                .call("do_close", &[wasmtime::Val::I32(fd as i32)])
+                .expect("close"),
+        )
+    };
+    assert_eq!(close(&mut runtime, fd), 0);
+    assert_eq!(close(&mut runtime, fd), 8);
+    for reserved in [0, 1, 2, 3] {
+        assert_eq!(close(&mut runtime, reserved), 8);
+    }
+}
+
+#[test]
+fn c_strings_require_a_terminator_and_valid_utf8() {
+    use wasm_encoder::{ExportKind, ExportSection, MemorySection, MemoryType, Module};
+
+    let mut memories = MemorySection::new();
+    memories.memory(MemoryType {
+        minimum: 1,
+        maximum: None,
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
+    let mut exports = ExportSection::new();
+    exports.export("memory", ExportKind::Memory, 0);
+    let mut module = Module::new();
+    module.section(&memories);
+    module.section(&exports);
+
+    let mut runtime = Runtime::instantiate(&module.finish()).expect("instantiate");
+    runtime
+        .write_bytes_at(32, b"valid\0")
+        .expect("valid string");
+    assert_eq!(runtime.read_cstr(32).unwrap(), "valid");
+    runtime
+        .write_bytes_at(64, b"\xff\0")
+        .expect("invalid UTF-8");
+    assert!(runtime.read_cstr(64).is_err());
+    runtime
+        .write_bytes_at(65_536 - 256, &vec![b'x'; 256])
+        .expect("unterminated string");
+    assert!(runtime.read_cstr(65_536 - 256).is_err());
 }
 
 /// The clock id is the question, and answering all of them with the monotonic

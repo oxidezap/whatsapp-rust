@@ -599,9 +599,12 @@ impl Runtime {
         args: &[Val],
         results: &mut [Val],
     ) -> Result<()> {
+        let shared = Arc::clone(&self.store.data().shared);
+        shared.scheduler.acquire(0);
         let outcome = func
             .call(&mut self.store, args, results)
             .map_err(|error| anyhow!("{error}"));
+        shared.scheduler.release(0);
         // Same reason as `call` and `call_table`: an embind constructor,
         // method or invoker can grow an ordinary exported memory, and a stale
         // window makes every pointer allocated in the new pages look out of
@@ -847,7 +850,7 @@ impl Runtime {
     ///
     /// Unlike [`Self::all_calls_to`] this is complete and its bytes are real:
     /// the host function copies them while the guest's buffer is still alive,
-    /// which is the only moment it is. See [`SignalingCall`].
+    /// which is the only moment it is. See `SignalingCall`.
     #[must_use]
     pub fn signaling(&self) -> Vec<crate::shared::SignalingCall> {
         self.store.data().shared.signaling()

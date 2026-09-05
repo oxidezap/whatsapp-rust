@@ -282,7 +282,6 @@ fn report_broken_watch(
 /// Strided rather than exhaustive because this runs while the guest is stopped
 /// mid-call: reading seventeen megabytes here would change what is being
 /// measured. Every 64th byte is plenty to tell 83% from 3%.
-#[allow(unsafe_code)]
 fn sampled_zeroes(state: &HostState) -> (usize, u32) {
     const STRIDE: usize = 64;
 
@@ -294,9 +293,7 @@ fn sampled_zeroes(state: &HostState) -> (usize, u32) {
     let mut zero = 0u64;
     let mut at = 0;
     while at < data.len() {
-        // SAFETY: as in `HostState::read` — one byte read through the cell, no
-        // reference into shared memory formed, index bounded by the loop.
-        if unsafe { *data[at].get() } == 0 {
+        if crate::state::load_shared(&data[at]) == 0 {
             zero += 1;
         }
         seen += 1;
