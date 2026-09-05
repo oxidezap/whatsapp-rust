@@ -31,6 +31,10 @@ use wacore::time::Instant;
 /// behind a writer.
 const TTI_RENEWAL_DIVISOR: u32 = 16;
 
+/// Coordination entries may all be pinned. Bound each insertion's scan work
+/// rather than repeatedly walking the growing map without finding a victim.
+const GUARDED_EVICTION_PROBES: usize = 64;
+
 struct CacheEntry<V> {
     value: V,
     // Monotonic instants (not wall-clock) so TTL/TTI are immune to clock jumps,
@@ -126,7 +130,7 @@ enum ClockWalk {
     /// No victim, but at least one entry spent its second chance; the next
     /// pass over the same entries finds them unreferenced.
     Requeued,
-    /// Nothing evictable at all.
+    /// No victim found within this pass's probe budget.
     Blocked,
 }
 
@@ -152,11 +156,45 @@ fn expiry_walk(
     expired
 }
 
-/// One pass of the second-chance walk over `order`, oldest first: the first
+/// One resumable pass of the second-chance walk over `order`: the first
 /// unreferenced, unheld entry is the victim; entries hit since the last pass
 /// have their bit cleared (by `probe`) and re-queue behind everything
 /// inserted so far, so each can earn at most one more pass per hit and the
-/// scan cannot cycle.
+/// scan cannot cycle. Coordination caches resume at the cursor when the
+/// insertion exhausts its budget; ordinary caches start at the oldest entry.
+fn guarded_clock_walk(
+    order: &mut BTreeMap<u64, u64>,
+    next_seq: &mut u64,
+    cursor: &mut u64,
+    remaining: &mut usize,
+    probe: &mut dyn FnMut(ClockOp) -> ClockVerdict,
+) -> ClockWalk {
+    let mut victim = None;
+    let mut second_chance = Vec::new();
+    let start = *cursor;
+    for (&seq, &hash) in order.range(start..) {
+        if *remaining == 0 {
+            break;
+        }
+        *remaining -= 1;
+        *cursor = seq.saturating_add(1);
+        match probe(ClockOp::Classify { seq, hash }) {
+            ClockVerdict::Skip => continue,
+            ClockVerdict::SecondChance => second_chance.push((seq, hash)),
+            ClockVerdict::Victim => {
+                victim = Some((seq, hash));
+                break;
+            }
+        }
+    }
+    if victim.is_none() && *remaining != 0 {
+        *cursor = 0;
+    }
+    finish_clock_walk(order, next_seq, probe, victim, second_chance)
+}
+
+// Ordinary data caches keep the linear iterator: seeking a resumable range
+// on every eviction penalizes the common single-victim case.
 fn clock_walk(
     order: &mut BTreeMap<u64, u64>,
     next_seq: &mut u64,
@@ -174,6 +212,16 @@ fn clock_walk(
             }
         }
     }
+    finish_clock_walk(order, next_seq, probe, victim, second_chance)
+}
+
+fn finish_clock_walk(
+    order: &mut BTreeMap<u64, u64>,
+    next_seq: &mut u64,
+    probe: &mut dyn FnMut(ClockOp) -> ClockVerdict,
+    victim: Option<(u64, u64)>,
+    second_chance: Vec<(u64, u64)>,
+) -> ClockWalk {
     let requeued = !second_chance.is_empty();
     for (seq, hash) in second_chance {
         let fresh = *next_seq;
@@ -213,6 +261,7 @@ struct CacheInner<K, V> {
     track_order: bool,
     /// Next FIFO sequence to assign.
     next_seq: u64,
+    eviction_cursor: u64,
     capacity_evictions: u64,
     capacity_eviction_blocks: u64,
 }
@@ -228,6 +277,7 @@ where
             order: BTreeMap::new(),
             track_order,
             next_seq: 0,
+            eviction_cursor: 0,
             capacity_evictions: 0,
             capacity_eviction_blocks: 0,
         }
@@ -326,9 +376,19 @@ where
     /// for a while rather than dropping a live one (see
     /// [`PortableCacheBuilder::evict_guard`]).
     fn evict_to_capacity(&mut self, cap: u64, evict_guard: Option<fn(&V) -> bool>) {
-        while self.table.len() as u64 >= cap {
+        let mut remaining = if evict_guard.is_some() {
+            GUARDED_EVICTION_PROBES
+        } else {
+            usize::MAX
+        };
+        let mut cursor = if evict_guard.is_some() {
+            self.eviction_cursor
+        } else {
+            0
+        };
+        while self.table.len() as u64 >= cap && remaining != 0 {
             let table = &mut self.table;
-            let walk = clock_walk(&mut self.order, &mut self.next_seq, &mut |op| match op {
+            let mut probe = |op| match op {
                 ClockOp::Classify { seq, hash } => {
                     match table.find(hash, |slot| slot.entry.seq == seq) {
                         None => ClockVerdict::Skip,
@@ -358,7 +418,18 @@ where
                         None => ClockVerdict::Skip,
                     }
                 }
-            });
+            };
+            let walk = if evict_guard.is_some() {
+                guarded_clock_walk(
+                    &mut self.order,
+                    &mut self.next_seq,
+                    &mut cursor,
+                    &mut remaining,
+                    &mut probe,
+                )
+            } else {
+                clock_walk(&mut self.order, &mut self.next_seq, &mut probe)
+            };
             match walk {
                 ClockWalk::Victim { seq, hash } => {
                     self.order.remove(&seq);
@@ -369,12 +440,13 @@ where
                 // Every candidate had a chance to spend; the next pass over
                 // the same entries finds them unreferenced.
                 ClockWalk::Requeued => continue,
-                ClockWalk::Blocked => {
-                    self.capacity_eviction_blocks = self.capacity_eviction_blocks.saturating_add(1);
-                    break;
-                }
+                ClockWalk::Blocked => break,
             }
         }
+        if self.table.len() as u64 >= cap {
+            self.capacity_eviction_blocks = self.capacity_eviction_blocks.saturating_add(1);
+        }
+        self.eviction_cursor = cursor;
     }
 
     /// Insert a brand-new entry (the caller has already confirmed the key is
@@ -556,6 +628,10 @@ where
     /// returns `true` when a value is safe to evict. For an `Arc<Mutex>` lock cache,
     /// pass `|v| Arc::strong_count(v) <= 1`, so an entry held elsewhere is never
     /// FIFO-evicted and re-minted (which would let two writers race the resource).
+    ///
+    /// Capacity is soft for these entries: insertion scans a bounded number of
+    /// candidates, resuming on the next insertion. After holders release their
+    /// entries, subsequent inserts reclaim the overflow incrementally.
     pub fn evict_guard(mut self, guard: fn(&V) -> bool) -> Self {
         self.evict_guard = Some(guard);
         self
@@ -1088,6 +1164,68 @@ impl<K, V> Clone for PortableCache<K, V> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn pinned_eviction_has_bounded_probe_work() {
+        for count in [64usize, 128, 256, 4096] {
+            let probes = Arc::new(AtomicUsize::new(0));
+            let cache = PortableCache::builder()
+                .max_capacity(2)
+                .evict_guard(|value: &Arc<AtomicUsize>| {
+                    value.fetch_add(1, Ordering::Relaxed);
+                    Arc::strong_count(value) <= 1
+                })
+                .build();
+            for key in 0..count {
+                cache.insert(key, Arc::clone(&probes)).await;
+            }
+            let visits = probes.load(Ordering::Relaxed);
+            assert_eq!(cache.entry_count(), count as u64);
+            assert!(visits <= count * 64, "unbounded scan work: {visits}");
+            eprintln!("audit: {count} pinned entries, {visits} eviction probes");
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_eviction_eventually_reclaims_released_locks() {
+        let cache = PortableCache::builder()
+            .max_capacity(2)
+            .evict_guard(|value: &Arc<()>| Arc::strong_count(value) <= 1)
+            .build();
+        let mut held = Vec::new();
+        for key in 0..256usize {
+            let value = Arc::new(());
+            held.push(value.clone());
+            cache.insert(key, value).await;
+        }
+        for (key, value) in held.iter().enumerate() {
+            assert!(Arc::ptr_eq(&cache.get(&key).await.unwrap(), value));
+        }
+        drop(held);
+        for key in 256..288 {
+            cache.insert(key, Arc::new(())).await;
+        }
+        assert_eq!(cache.entry_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_second_chances_report_and_reclaim_deferred_capacity() {
+        let cache = PortableCache::builder()
+            .max_capacity(128)
+            .evict_guard(|_: &()| true)
+            .build();
+        for key in 0..128usize {
+            cache.insert(key, ()).await;
+            cache.get(&key).await.unwrap();
+        }
+        cache.insert(128, ()).await;
+        assert_eq!(cache.entry_count(), 129);
+        assert_eq!(cache.capacity_stats().await.eviction_blocks, 1);
+        for key in 129..133 {
+            cache.insert(key, ()).await;
+        }
+        assert_eq!(cache.entry_count(), 128);
+    }
 
     fn build_cache<K, V>() -> PortableCache<K, V>
     where

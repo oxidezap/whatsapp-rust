@@ -517,7 +517,7 @@ pub struct MemoryReport {
     pub group_distribution_locks: u64,
     /// Cumulative capacity evictions; poll successive reports to derive a rate.
     pub group_distribution_lock_evictions: u64,
-    /// Cumulative attempts that kept a live lane and temporarily exceeded capacity.
+    /// Cumulative attempts that could not make room within the eviction scan budget.
     pub group_distribution_lock_eviction_blocks: u64,
     pub resend_rate_limiter_chats: u64,
     /// Peers whose session was recently recreated, keyed to rate-limit the next

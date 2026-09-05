@@ -209,15 +209,15 @@ pub struct CacheConfig {
 
     // --- Coordination caches (capacity-only, no TTL) ---
     /// Per-device Signal session lock capacity. Default: 10000. Soft cap: a lock a
-    /// task is actively holding is never evicted, so the map can briefly exceed this
-    /// under heavy concurrent fan-out (bounded by the concurrently-held count) rather
-    /// than evicting a live lock and letting two writers race the same session.
+    /// task is actively holding is never evicted. Reclamation scans a bounded number
+    /// of candidates per insertion, so subsequent inserts retire excess idle entries
+    /// incrementally after a concurrent burst.
     pub session_locks_capacity: u64,
     /// Per-chat lane capacity (combined lock + queue). Default: 5000.
+    /// Uses the soft-cap reclamation policy of [`Self::session_locks_capacity`].
     pub chat_lanes_capacity: u64,
     /// Per-group cold sender-key distribution lock capacity. Default: 512.
-    /// Soft cap: a live lane is never evicted, so the map may briefly exceed
-    /// this under concurrent fan-out instead of breaking tracker ordering.
+    /// Uses the soft-cap reclamation policy of [`Self::session_locks_capacity`].
     pub group_distribution_locks_capacity: u64,
     /// Per-group resolved-device memo capacity: the device list a group send
     /// fans out to plus its member index, ~10 KiB at 256 members. Also bounds
