@@ -835,9 +835,8 @@ mod tests {
     /// engine (`oracle derive --spec specs/mlow_110frames.json` in unwasm;
     /// see PROVENANCE.md): the `0x10` frames it encoded over the silent
     /// stretches must decode (here) to audio matching what it decoded
-    /// itself — a coded-inactive frame carries a decodable body, and the
-    /// lengths differ per side (DTX routes short), so this compares per-frame
-    /// RMS instead of concatenated spans.
+    /// itself. The per-frame RMS check also covers near-silent intervals,
+    /// where a correlation coefficient alone is not meaningful.
     #[test]
     fn wasm_derived_dtx_frames_decode_to_audio() {
         let frames: Vec<String> =

@@ -851,11 +851,11 @@ fn wasm_derived_frames_decode_to_wasm_reference() {
     for (k, hex_frame) in frames.iter().enumerate() {
         let frame = hex::decode(hex_frame).unwrap();
         let out = dec.decode(&frame);
-        assert!(!out.is_empty(), "frame {k}: decoder returned nothing");
-        // DTX/CN frames route short; only active frames carry 960 comparable samples.
-        if out.len() != 960 {
-            continue;
-        }
+        assert_eq!(
+            out.len(),
+            960,
+            "frame {k}: the complete coded packet must decode"
+        );
         let expected = &refp[k * 960..(k + 1) * 960];
         let (e_out, e_ref) = (rms(&out), rms(expected));
         if e_ref < 0.005 {

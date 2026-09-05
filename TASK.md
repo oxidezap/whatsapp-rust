@@ -20,10 +20,10 @@ all remaining derivation, packaging, CI and retirement work.
       and 17 oracle library tests plus tool workspace clippy.
 - [x] Review and commit the tool in two parts; publish `feat/mlow-derived-oracles`.
 
-## Final integration in progress
+## Final integration completed
 
 - [x] Complete the consumer commits and publish the CI branch.
-- [ ] Confirm the first remote CI executions and record their results.
+- [x] Confirm remote tool/consumer CI executions and record their results.
 
 The detailed investigation is in the sibling `unwasm/MLOW_DERIVE.md`.
 Canonical corpus contracts, counts and commands are in
@@ -42,5 +42,19 @@ First remote runs found workflow integration issues, not codec drift:
 tool J/S tests and derivations passed, but artifact upload excluded the
 hidden evidence directory; the consumer's nested tool checkout inherited
 nightly-only rustflags. Both configurations were corrected. A fresh nested local checkout now builds
-with stable and re-derives/verifies every artifact successfully. Remote reruns
-are queued.
+with stable and re-derives/verifies every artifact successfully. Remote reruns passed, including evidence upload.
+
+## Completion evidence
+
+- Tool CI: https://github.com/oxidezap/unwasm/actions/runs/33938645892
+- Consumer CI: https://github.com/oxidezap/whatsapp-rust/actions/runs/33938854330
+- All 131 MLOW tests passed together after compacting the C auditors.
+- The final PCM length assertion requires 960 samples for all 110 packets;
+  its targeted test passed. No false DTX-short exception remains.
+- Final testdata: approximately 9.1 MB vs 15.8 MB originally.
+- Tool and consumer work are committed and published in their task branches.
+
+No implementation, derivation, packaging or first-CI item from the requested
+scope remains open. The linked runs validate the implementation; subsequent
+documentation receipts and the stronger PCM length assertion are kept in the
+same branch and checked by its workflow.
