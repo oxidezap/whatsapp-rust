@@ -524,36 +524,61 @@ mod tests {
         }
     }
 
-    fn paired_device() -> wacore::store::Device {
-        let mut device = wacore::store::Device::new();
-        device.pn = Some("12345@s.whatsapp.net".parse().unwrap());
-        device
+    async fn paired_pm() -> Arc<PersistenceManager> {
+        let pm = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        pm.process_command(DeviceCommand::SetId(Some(
+            "12345@s.whatsapp.net".parse().unwrap(),
+        )))
+        .await;
+        pm
     }
 
-    #[test]
-    fn select_pattern_no_cache_returns_xx() {
-        let device = paired_device();
+    async fn snapshot_with_chain(
+        pm: &PersistenceManager,
+        chain: CachedServerCertChain,
+    ) -> Arc<crate::store::Device> {
+        pm.process_command(DeviceCommand::SetServerCertChain(chain.clone()))
+            .await;
+        let snapshot = pm.get_device_snapshot();
+        assert_eq!(
+            snapshot.server_cert_chain.as_ref(),
+            Some(&chain),
+            "command-applied chain must be visible through the cached snapshot"
+        );
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn select_pattern_no_cache_returns_xx() {
+        let pm = paired_pm().await;
+        let device = pm.get_device_snapshot();
         assert_eq!(
             select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_with_valid_cache_returns_ik() {
-        let mut device = paired_device();
+    #[tokio::test]
+    async fn select_pattern_with_valid_cache_returns_ik() {
+        let pm = paired_pm().await;
         let pub_key = [0xAA; 32];
-        device.server_cert_chain = Some(cached_chain(pub_key, 1_900_000_000, 1_900_000_000));
+        let device =
+            snapshot_with_chain(&pm, cached_chain(pub_key, 1_900_000_000, 1_900_000_000)).await;
         assert_eq!(
             select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Ik(pub_key)
         );
     }
 
-    #[test]
-    fn select_pattern_after_one_failure_returns_xx() {
-        let mut device = paired_device();
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
+    #[tokio::test]
+    async fn select_pattern_after_one_failure_returns_xx() {
+        let pm = paired_pm().await;
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000)).await;
         assert_eq!(
             select_pattern(
                 &device,
@@ -565,66 +590,72 @@ mod tests {
         );
     }
 
-    #[test]
-    fn select_pattern_with_expired_leaf_returns_xx() {
-        let mut device = paired_device();
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_700_000_500, 1_900_000_000));
+    #[tokio::test]
+    async fn select_pattern_with_expired_leaf_returns_xx() {
+        let pm = paired_pm().await;
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_700_000_500, 1_900_000_000)).await;
         assert_eq!(
             select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_with_expired_intermediate_returns_xx() {
-        let mut device = paired_device();
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_700_000_500));
+    #[tokio::test]
+    async fn select_pattern_with_expired_intermediate_returns_xx() {
+        let pm = paired_pm().await;
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_900_000_000, 1_700_000_500)).await;
         assert_eq!(
             select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_with_clock_before_leaf_not_before_returns_xx() {
-        let mut device = paired_device();
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
+    #[tokio::test]
+    async fn select_pattern_with_clock_before_leaf_not_before_returns_xx() {
+        let pm = paired_pm().await;
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000)).await;
         assert_eq!(
             select_pattern(&device, 0, 1_699_999_999, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_with_clock_before_intermediate_not_before_returns_xx() {
-        let mut device = paired_device();
+    #[tokio::test]
+    async fn select_pattern_with_clock_before_intermediate_not_before_returns_xx() {
+        let pm = paired_pm().await;
         let mut chain = cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000);
         chain.intermediate.not_before = 1_800_000_001;
-        device.server_cert_chain = Some(chain);
+        let device = snapshot_with_chain(&pm, chain).await;
         assert_eq!(
             select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_unregistered_device_returns_xx_even_with_valid_cache() {
-        let mut device = wacore::store::Device::new();
-        assert!(
-            !device.is_registered(),
-            "fresh Device::new() must be unpaired"
+    #[tokio::test]
+    async fn select_pattern_unregistered_device_returns_xx_even_with_valid_cache() {
+        let pm = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
         );
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000)).await;
+        assert!(!device.is_registered(), "fresh backend must be unpaired");
         assert_eq!(
             select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_bypass_ignores_valid_cache() {
-        let mut device = paired_device();
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
+    #[tokio::test]
+    async fn select_pattern_bypass_ignores_valid_cache() {
+        let pm = paired_pm().await;
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000)).await;
         assert_eq!(
             select_pattern(
                 &device,
@@ -636,15 +667,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn select_pattern_unmarked_cache_returns_xx() {
+    #[tokio::test]
+    async fn select_pattern_unmarked_cache_returns_xx() {
         // Records predating signature provenance (including chains cached
         // while a global bypass was enabled) cannot authorize IK, even when
         // fresh and otherwise valid.
-        let mut device = paired_device();
+        let pm = paired_pm().await;
         let mut chain = cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000);
         chain.signature_verified = false;
-        device.server_cert_chain = Some(chain);
+        let device = snapshot_with_chain(&pm, chain).await;
         assert_eq!(
             select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
@@ -675,9 +706,10 @@ mod tests {
         assert!(!should_persist_cert_chain(&device));
     }
 
-    #[test]
-    fn should_persist_cert_chain_registered_returns_true() {
-        let device = paired_device();
+    #[tokio::test]
+    async fn should_persist_cert_chain_registered_returns_true() {
+        let pm = paired_pm().await;
+        let device = pm.get_device_snapshot();
         assert!(device.is_registered());
         assert!(should_persist_cert_chain(&device));
     }

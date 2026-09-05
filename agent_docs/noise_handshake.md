@@ -49,9 +49,13 @@ chain accepted under it is typed as nothing to persist (`XxHandshakeOutcome`
 carries `None`) and never authorizes IK (`select_pattern` stays at XX), so it
 is neither read from nor written to the trusted cache. The legacy
 `danger-skip-cert-chain-verify` feature only changes what the *default*
-policy is; an explicit `Strict` verifies regardless of it. `tests/e2e`
-enables the feature because the mock server does not sign its chain.
-**Production builds verify.** The `wacore/noise` integration tests in
+policy is; an explicit `Strict` verifies regardless of it, and the public
+`HandshakeUtils::verify_server_cert` helper always verifies strictly — it
+never consults the default, so with the feature its integration test still
+runs and still rejects the zero-signed fixture. `tests/e2e` passes the
+bypass per client at construction because the mock server does not sign its
+chain. **Default builds verify; only an explicit per-client bypass skips
+the signature checks.** The `wacore/noise` integration tests in
 `tests/cert_chain_verify.rs` load the crate as a regular dependency, so no
 in-crate test bypass can mask them.
 
@@ -72,8 +76,10 @@ Breaking note: `XxHandshakeOutcome.server_cert_chain` is now
 `Option<VerifiedServerCertChain>` (`None` for bypass-accepted chains), and
 `CachedServerCertChain` has the new `signature_verified` field (struct
 literals and the SQLite `ServerCertChain` wire message gain it; old rows
-decode as untrusted). Low-level constructors keep their signatures and take
-the default policy; `*_with_cert_policy` variants select explicitly.
+decode as untrusted). The low-level handshake constructors keep their
+signatures and take the default policy; `*_with_cert_policy` variants select
+explicitly. `HandshakeUtils::verify_server_cert` keeps its two-argument
+shape but always verifies strictly instead of taking the default.
 
 ## Logs
 

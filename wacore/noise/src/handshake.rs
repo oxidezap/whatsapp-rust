@@ -137,12 +137,13 @@ pub struct VerifiedServerCertChain {
 /// Handshake utilities for WhatsApp protocol operations
 pub struct HandshakeUtils;
 
-/// What chain verification established. Only `Trusted` may flow into the
-/// handshake outcome that populates the IK cache; `Untrusted` still binds
-/// the leaf to the decrypted static, but its signatures were never checked.
+/// What chain verification established. Only `Trusted` carries a chain into
+/// the handshake outcome that populates the IK cache; `Untrusted` records
+/// that the leaf was structurally bound to the decrypted static without any
+/// signature check, with nothing to persist.
 enum ChainAcceptance {
     Trusted(VerifiedServerCertChain),
-    Untrusted(VerifiedServerCertChain),
+    Untrusted,
 }
 
 impl HandshakeUtils {
@@ -223,22 +224,21 @@ impl HandshakeUtils {
         ))
     }
 
-    /// Verifies the server's certificate chain. Legacy entrypoint: selects
-    /// `NoiseCertPolicy::default()`, so a build with the legacy
-    /// `danger-skip-cert-chain-verify` feature keeps its old behavior while
-    /// normal builds verify strictly. Prefer the `*_with_cert_policy`
-    /// constructors on the handshake states, which never promote a
-    /// bypass-accepted chain into the trusted outcome type.
+    /// Verifies the server's certificate chain, always strictly. The legacy
+    /// `danger-skip-cert-chain-verify` feature changes only what the
+    /// *default* policy is for the handshake-state constructors; it never
+    /// weakens this helper. Bypass remains available through the
+    /// `*_with_cert_policy` constructors, whose outcomes carry no trusted
+    /// chain instead of a differently-typed one.
     pub fn verify_server_cert(
         cert_decrypted: &[u8],
         static_decrypted: &[u8; 32],
     ) -> Result<VerifiedServerCertChain> {
-        match Self::verify_chain(cert_decrypted, static_decrypted, NoiseCertPolicy::default()) {
+        match Self::verify_chain(cert_decrypted, static_decrypted, NoiseCertPolicy::Strict) {
             Ok(ChainAcceptance::Trusted(chain)) => Ok(chain),
-            // Legacy behavior under the legacy feature's default: the chain
-            // is structurally sound and bound to the static, but its
-            // signatures were not checked.
-            Ok(ChainAcceptance::Untrusted(chain)) => Ok(chain),
+            Ok(ChainAcceptance::Untrusted) => Err(HandshakeError::CertVerification(
+                "chain accepted without signature checks cannot be verified".into(),
+            )),
             Err(err) => Err(err),
         }
     }
@@ -330,9 +330,11 @@ impl HandshakeUtils {
             leaf_not_before: leaf_details.not_before.unwrap_or(0) as i64,
             leaf_not_after: leaf_details.not_after.unwrap_or(0) as i64,
         };
-        // Only a policy that checked the signatures may hand out trust.
+        // Only a policy that checked the signatures may hand out trust; a
+        // bypassed chain authenticates this session and nothing else, so it
+        // carries no chain value at all.
         if cert_policy.skip_signature_check() {
-            Ok(ChainAcceptance::Untrusted(chain))
+            Ok(ChainAcceptance::Untrusted)
         } else {
             Ok(ChainAcceptance::Trusted(chain))
         }
@@ -576,7 +578,7 @@ fn finish_xx_outcome(
 ) -> Result<XxHandshakeOutcome> {
     let server_cert_chain = match cert_chain {
         Some(ChainAcceptance::Trusted(chain)) => Some(chain),
-        Some(ChainAcceptance::Untrusted(_)) => None,
+        Some(ChainAcceptance::Untrusted) => None,
         None => return Err(HandshakeError::IncompleteResponse),
     };
     let (write_cipher, read_cipher) = noise.finish()?;

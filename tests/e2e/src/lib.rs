@@ -202,6 +202,11 @@ impl TestClient {
             .with_transport_factory(transport_factory)
             .with_http_client(UreqHttpClient::new())
             .with_runtime(whatsapp_rust::TokioRuntime)
+            // The mock server cannot sign its chain; scope the bypass to
+            // these test clients instead of a global feature.
+            .with_noise_cert_policy(
+                whatsapp_rust::handshake::NoiseCertPolicy::DangerSkipCertChainVerify,
+            )
             .with_version((2, 3000, 0));
 
         let push_name_pre_seeded = push_name.is_some();
