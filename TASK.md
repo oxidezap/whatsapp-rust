@@ -133,4 +133,8 @@ o grafo de `tools/xtask` além do grafo de produção.
 
 CI remoto do consumidor concluído: [oráculo Wasmtime 48, tarefas, rederivação
 J/S, comparação dos fixtures e 131 testes MLOW](https://github.com/oxidezap/whatsapp-rust/actions/runs/33983916097).
+[Supply-chain](https://github.com/oxidezap/whatsapp-rust/actions/runs/33984858936)
+também concluiu verde com o novo audit de tooling. O job semver informativo
+continuou reportando as sete quebras já presentes na API protobuf gerada; ele
+não envolve os membros de tooling e permanece deliberadamente não bloqueante.
 Nenhum trabalho desta separação permanece aberto.
