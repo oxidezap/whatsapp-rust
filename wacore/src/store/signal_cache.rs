@@ -29,6 +29,49 @@ fn new_store_incarnation() -> StoreIncarnation {
     incarnation
 }
 
+struct EvictionCandidates {
+    keys: Vec<Arc<str>>,
+    negatives: usize,
+    limit: usize,
+}
+
+impl EvictionCandidates {
+    fn new(limit: usize) -> Self {
+        Self {
+            keys: Vec::new(),
+            negatives: 0,
+            limit,
+        }
+    }
+
+    fn consider(&mut self, key: &Arc<str>, negative: bool) -> bool {
+        if self.negatives == self.limit {
+            return true;
+        }
+        if self.keys.len() == self.limit {
+            if !negative {
+                return false;
+            }
+            // The prefix contains only negatives; replacing the first positive
+            // preserves priority without retaining every clean resident key.
+            self.keys[self.negatives] = key.clone();
+        } else {
+            if self.keys.is_empty() {
+                self.keys.reserve_exact(self.limit);
+            }
+            self.keys.push(key.clone());
+            if negative {
+                let last = self.keys.len() - 1;
+                self.keys.swap(self.negatives, last);
+            }
+        }
+        if negative {
+            self.negatives += 1;
+        }
+        self.negatives == self.limit
+    }
+}
+
 /// Evict clean (non-dirty, non-deleted) entries from a cache HashMap.
 /// Negative entries (None values) are evicted first.
 ///
@@ -54,8 +97,10 @@ fn evict_clean_entries<V>(
         return;
     }
     let overflow = cache.len().saturating_sub(max_entries);
-    let mut negative = Vec::with_capacity(overflow);
-    let mut positive = Vec::with_capacity(overflow);
+    let available = cache
+        .len()
+        .saturating_sub(dirty.len().saturating_add(deleted.map_or(0, HashSet::len)));
+    let mut candidates = EvictionCandidates::new(overflow.min(available));
     for (k, v) in cache.iter() {
         if dirty.contains(k.as_ref()) {
             continue;
@@ -65,13 +110,11 @@ fn evict_clean_entries<V>(
         {
             continue;
         }
-        if v.is_none() {
-            negative.push(k.clone());
-        } else {
-            positive.push(k.clone());
+        if candidates.consider(k, v.is_none()) {
+            break;
         }
     }
-    for key in negative.into_iter().chain(positive).take(overflow) {
+    for key in candidates.keys {
         cache.remove(&key);
     }
 }
@@ -647,19 +690,25 @@ impl SessionStoreState {
             return;
         }
         let overflow = self.cache.len().saturating_sub(max_entries);
-        let mut negative = Vec::with_capacity(overflow);
-        let mut positive = Vec::with_capacity(overflow);
+        let available = self
+            .cache
+            .len()
+            .saturating_sub(self.dirty.len().saturating_add(self.deleted.len()));
+        let mut candidates = EvictionCandidates::new(overflow.min(available));
         for (k, v) in self.cache.iter() {
             if self.dirty.contains(k.as_ref()) || self.deleted.contains(k.as_ref()) {
                 continue;
             }
-            match v {
-                SessionEntry::CheckedOut { .. } => continue, // never evict checked-out
-                SessionEntry::Absent => negative.push(k.clone()),
-                SessionEntry::Present(_) => positive.push(k.clone()),
+            let negative = match v {
+                SessionEntry::CheckedOut { .. } => continue,
+                SessionEntry::Absent => true,
+                SessionEntry::Present(_) => false,
+            };
+            if candidates.consider(k, negative) {
+                break;
             }
         }
-        for key in negative.into_iter().chain(positive).take(overflow) {
+        for key in candidates.keys {
             self.cache.remove(&key);
         }
     }
@@ -4423,6 +4472,33 @@ mod consumed_prekey_atomicity_tests {
 #[cfg(test)]
 mod eviction_tests {
     use super::*;
+
+    #[test]
+    fn bounded_candidates_keep_negative_priority_without_retaining_every_key() {
+        let positives: Vec<Arc<str>> = (0..64)
+            .map(|i| Arc::from(format!("positive-{i}")))
+            .collect();
+        let mut candidates = EvictionCandidates::new(4);
+        for key in &positives {
+            assert!(!candidates.consider(key, false));
+            assert!(candidates.keys.len() <= 4);
+        }
+        assert_eq!(Arc::strong_count(&positives[63]), 1);
+        for i in 0..4 {
+            let key = Arc::from(format!("negative-{i}"));
+            assert_eq!(candidates.consider(&key, true), i == 3);
+            assert_eq!(candidates.keys.len(), 4);
+        }
+        assert!(
+            candidates
+                .keys
+                .iter()
+                .all(|key| key.starts_with("negative-"))
+        );
+        assert!(candidates.consider(&Arc::from("extra"), false));
+        assert_eq!(candidates.keys.len(), 4);
+        assert!(EvictionCandidates::new(0).consider(&Arc::from("unused"), true));
+    }
     use crate::libsignal::protocol::{DeviceId, ProtocolAddress};
     use crate::store::in_memory::InMemoryBackend;
 
