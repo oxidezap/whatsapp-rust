@@ -11497,7 +11497,12 @@ mod tests {
         let (_legacy_rx, timed_rx, ctl_rx) = shared.take_receivers();
         let (src_tx, src_rx) = async_channel::unbounded::<TimedVideoFrame>();
         let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
-        let source: Arc<dyn VideoSource> = Arc::new(TimedCaptureSource { frames: src_rx });
+        let source_impl = Arc::new(TimedCaptureSource { frames: src_rx });
+        assert!(
+            source_impl.frames().is_closed(),
+            "timed sources may leave legacy input closed"
+        );
+        let source: Arc<dyn VideoSource> = source_impl;
         let sink: Arc<dyn VideoSink> = Arc::new(vout_tx);
         shared.attach_endpoints(&client, &source, &sink, Arc::new(EndedFlag::default()));
         assert_eq!(
@@ -11518,6 +11523,7 @@ mod tests {
         let forwarded = timed_rx.recv().await.unwrap();
         assert_eq!(forwarded.data, vec![1, 2, 3]);
         assert_eq!(forwarded.timestamp, 12_000);
+        assert_eq!(forwarded.generation, 1);
     }
 
     #[tokio::test]

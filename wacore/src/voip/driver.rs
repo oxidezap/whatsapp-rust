@@ -1705,11 +1705,11 @@ async fn run_call_with_clock_and_wallclock(
                                 packets: dropped.packets,
                             });
                         }
-                        // Discard any AUs still queued from the (now-detached) source, so a quick
-                        // re-Enable can't transmit stale frames from the previous session under the
-                        // new negotiation. Drained after the select block (the futures borrow the
-                        // channel).
-                        drain_video_in = true;
+                        // Keep queued legacy AUs: this control is used only while replacing one
+                        // legacy source with another, and the replacement shares this queue. The
+                        // legacy API never carried source generations, so an old tail may precede
+                        // the replacement's first AU exactly as it did before timestamped input.
+                        drain_video_in = false;
                     }
                     Ok(VideoControl::RequireKeyframe) => eng.require_video_keyframe(),
                     Ok(VideoControl::RequestPeerKeyframe(urgency)) => {
@@ -1806,10 +1806,9 @@ async fn run_call_with_clock_and_wallclock(
             },
             timed = timed_video_in_fut => match timed {
                 Ok(frame) => {
-                    if frame.generation != video_generation {
-                        continue;
+                    if frame.generation == video_generation {
+                        eng.handle_video_frame_at(now_ms(), &frame.data, frame.timestamp);
                     }
-                    eng.handle_video_frame_at(now_ms(), &frame.data, frame.timestamp);
                     let now = now_ms();
                     if let Some(at) = eng.poll_timeout()
                         && at != engine::NEVER
@@ -3537,6 +3536,7 @@ mod tests {
         let (vctl_tx, vctl_rx) = video_control_channel();
 
         // Control drains first (bias), so cadence, Enable, and orientation land before any AU.
+        assert!(vctl_tx.send(VideoControl::DisableKeepLegacy));
         assert!(vctl_tx.send(VideoControl::SetInputGeneration(7)));
         assert!(vctl_tx.send(VideoControl::SetTimestampStride(4500)));
         assert!(vctl_tx.send(VideoControl::Enable));
@@ -3558,13 +3558,15 @@ mod tests {
                 generation: 7,
             })
             .unwrap();
-        timed_tx
-            .try_send(VideoInput {
-                data: our_au,
-                timestamp: 9000,
-                generation: 6,
-            })
-            .unwrap();
+        for _ in 0..64 {
+            timed_tx
+                .try_send(VideoInput {
+                    data: our_au.clone(),
+                    timestamp: 9000,
+                    generation: 6,
+                })
+                .unwrap();
+        }
 
         let eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         futures::executor::block_on(run_call(

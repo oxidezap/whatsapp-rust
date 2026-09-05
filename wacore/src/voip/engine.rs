@@ -3896,10 +3896,9 @@ impl CallEngine {
         if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut())
             && video.active
             && !video.send_gated
+            && !video.pipe.set_video_timestamp(timestamp)
         {
-            if !video.pipe.set_video_timestamp(timestamp) {
-                return;
-            }
+            return;
         }
         self.on_video(au);
     }
