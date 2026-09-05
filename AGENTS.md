@@ -11,6 +11,16 @@ Ground truth for protocol behavior is WhatsApp Web itself: query the structured 
 - **whatsapp-rust** — Tokio runtime, SQLite persistence (Diesel), high-level API.
 - **whatspec-codegen** (`tools/`) — build tooling, never published and outside `default-members`. Regenerates every whatspec-derived file in one pass from a pinned IR commit. Nothing links it.
 
+## Repository tasks
+
+Use `cargo xt --help` for descriptors, MLOW oracles and CI maintenance.
+First-party task logic is Rust under `tools/xtask`, outside default-members;
+`xtask-support` is local and shared with whatspec-codegen. The WhatsApp wasm
+host/specs live under `tools/oracle-*`; they use commit-pinned `unwasm-core`
+for static analysis and whatspec `wa-store` for capture transport. These tool
+members are excluded from `default-members`.
+Do not add Python/Bash task implementations or runtime dependencies on these tools.
+
 ## Build & verify
 
 ```bash
@@ -62,6 +72,10 @@ Read the one that covers what you are touching:
 | `agent_docs/observability.md` | Adding a cache, counter, or anything reported by `memory_report()` / `stats()` |
 | `agent_docs/plugin_architecture.md` | Touching the `plugins` / `client-lifecycle` feature surface |
 | `agent_docs/voip_audio_codecs.md` | VoIP media: codec profiles, negotiation, encoded audio API |
+| `agent_docs/voip_media_oracle.md` | Building differential audio/video traces against captured WhatsApp wasm |
+| `agent_docs/voip_conformance.md` | Running or extending the full JS/wasm/Rust VoIP conformance gate |
+| `agent_docs/mlow_derivation.md` | Re-deriving MLOW fixtures from pinned J/S wasm captures |
+| `agent_docs/voip_oracle_status.md` | Running or extending the WhatsApp Wasmtime oracle |
 | `agent_docs/wam_telemetry.md` | WAM: the generated event catalog, the buffer codec, and what a client may honestly report |
 | `agent_docs/binary_size_ci.md` | A size gate failed, or a change adds dependencies or generic instantiations |
 | `agent_docs/build_flags.md` | Recommending codegen flags, or asked why a `target-feature` is not a default |

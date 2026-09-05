@@ -112,12 +112,14 @@ const GOLDEN_CLIP: f32 = 0.0;
 // one build: the encoder resolves ties on f32 comparisons, so the bitstream is a function of the
 // arithmetic the compiler emits, not only of the source. Changing `-C target-cpu` alone moves these
 // constants. They are a drift tripwire on the CI target, not a portable identity of the codec.
-const GOLDEN_RMS: f32 = 0.156401;
-const GOLDEN_PEAK: f32 = 0.524200;
-const GOLDEN_CHECKSUM: u64 = 0x4302_cced_6791_52b4;
+// Regenerated after the shipped LPC/VUV/pitch/harmonic tuning and the LPC
+// f64 regularization fix. Independent wasm kernel tests pin those changes.
+const GOLDEN_RMS: f32 = 0.155180;
+const GOLDEN_PEAK: f32 = 0.513214;
+const GOLDEN_CHECKSUM: u64 = 0x5f7a_a0e3_d0d9_5e7e;
 // Pins the ENCODER bitstream independently of the decoder: fnv1a over the concatenation of every
 // emitted packet's wire bytes. Drift here means the encoder changed even if decode output did not.
-const GOLDEN_FRAMES_CHECKSUM: u64 = 0x5583_7f25_b89a_0621;
+const GOLDEN_FRAMES_CHECKSUM: u64 = 0x83de_fbfb_b2b8_68b2;
 
 /// Encode then decode the whole corpus, returning the decoded i16 output and the concatenated
 /// packet bytes.

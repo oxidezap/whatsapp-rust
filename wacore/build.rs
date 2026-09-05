@@ -4,7 +4,7 @@
 //! `voip` feature consumes these tables, so codegen is skipped otherwise.
 //! Reading the descriptor means consumers never need `protoc`; editing the
 //! proto requires regenerating the descriptor via
-//! `scripts/regenerate-tables-desc.sh`.
+//! `cargo xt tables-desc`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=src/voip/mlow/tables.desc");
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "src/voip/mlow/tables.desc",
         "src/voip/mlow/tables.desc.sha256",
         "wacore (voip tables)",
-        "scripts/regenerate-tables-desc.sh",
+        "cargo xt tables-desc",
     )?;
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by cargo");

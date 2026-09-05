@@ -1,0 +1,761 @@
+{
+  "fe": {
+    "comment": [
+      "Trace window/LPC/BWE directly from all 330 frames of the shipped encoder.\n\nJ#10736: window call op1375, LPC call op1394, BWE loop ends before op1422.\nThe pre-BWE and post-BWE A are both captured, so no host implements the\noracle's bandwidth-expansion step. Baseline output hashes remain mandatory.\n"
+    ],
+    "functions": {
+      "core_encode": {
+        "index_hint": 10736
+      }
+    },
+    "captures": [
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 1375,
+        "local": 18,
+        "at": 0,
+        "len": 1792,
+        "count": 330,
+        "out": "fe_input"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 1394,
+        "local": 11,
+        "at": 1472,
+        "len": 1792,
+        "count": 330,
+        "out": "fe_window"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 1395,
+        "local": 9,
+        "at": 0,
+        "len": 68,
+        "count": 330,
+        "out": "fe_a_raw"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 1422,
+        "local": 9,
+        "at": 0,
+        "len": 68,
+        "count": 330,
+        "out": "fe_a"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 1395,
+        "local": 11,
+        "at": 1328,
+        "len": 136,
+        "count": 330,
+        "out": "fe_r"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 1395,
+        "local": 11,
+        "at": 288,
+        "len": 1028,
+        "count": 330,
+        "out": "fe_f2"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_encode",
+        "instruction": 1375,
+        "local": 17,
+        "count": 330,
+        "out": "fe_frame"
+      }
+    ]
+  },
+  "signal": {
+    "comment": [
+      "Capture the inlined signal-mode kernel from live J encoder execution.\n\nAt J#10736 instruction 4280, pitchcorr/average lag/harmonicity are in frame\n+12/+8/+4, and local 19+24 is speech activity. Locals 20/32/30 point to\nlags/F2/VUV state. Instruction 4584 follows the voiced decision. VUV layout\nis voicing_prev, last_lag_prev, nrg_lo_bgn, nrg_hi_bgn (four f32).\nAll 220 original packet/PCM hashes must pass while these read-only markers run.\n"
+    ],
+    "functions": {
+      "core_encode": {
+        "index_hint": 10736
+      }
+    },
+    "captures": [
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4280,
+        "local": 11,
+        "at": 4,
+        "len": 12,
+        "count": 330,
+        "out": "sig_input"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4280,
+        "local": 20,
+        "at": 0,
+        "len": 32,
+        "count": 330,
+        "out": "sig_lags"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4280,
+        "local": 32,
+        "at": 0,
+        "len": 1028,
+        "count": 330,
+        "out": "sig_f2"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4280,
+        "local": 30,
+        "at": 0,
+        "len": 16,
+        "count": 330,
+        "out": "sig_vuv_in"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4280,
+        "local": 19,
+        "at": 24,
+        "len": 4,
+        "count": 330,
+        "out": "sig_spact"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4280,
+        "local": 5,
+        "at": 52,
+        "len": 4,
+        "count": 330,
+        "out": "sig_cav"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4584,
+        "local": 30,
+        "at": 0,
+        "len": 16,
+        "count": 330,
+        "out": "sig_vuv_out"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4584,
+        "local": 56,
+        "at": 29136,
+        "len": 4,
+        "count": 330,
+        "out": "sig_result"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4584,
+        "local": 56,
+        "at": 29160,
+        "len": 4,
+        "count": 330,
+        "out": "sig_voiced"
+      }
+    ]
+  },
+  "kernel": {
+    "comment": [
+      "Read-only traces of pitch search and LSF quantization in the live encoder.\n\nPitch is inlined in J#10736. Entry at op1691 has the filtered 659-float LTP\nbuffer at local47 and PitchEstimator at local22; op4266 is after selection.\nLSF core J#10804 has the original 13-argument ABI. Params8..12 retain output\npointers until its implicit return. Conditional centroid state is p7 (nullable).\n"
+    ],
+    "functions": {
+      "core_encode": {
+        "index_hint": 10736
+      },
+      "lsf_core": {
+        "index_hint": 10804
+      }
+    },
+    "captures": [
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 1691,
+        "local": 47,
+        "at": 0,
+        "len": 2636,
+        "count": 330,
+        "out": "pitch_ltp"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 1691,
+        "local": 22,
+        "at": 4,
+        "len": 32,
+        "count": 330,
+        "out": "pitch_state"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 1691,
+        "local": 32,
+        "at": 0,
+        "len": 1028,
+        "count": 330,
+        "out": "pitch_f2"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 1691,
+        "local": 5,
+        "at": 52,
+        "len": 4,
+        "count": 330,
+        "out": "pitch_cav"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4266,
+        "local": 11,
+        "at": 4,
+        "len": 12,
+        "count": 330,
+        "out": "pitch_output"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4266,
+        "local": 20,
+        "at": 0,
+        "len": 32,
+        "count": 330,
+        "out": "pitch_lags"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4266,
+        "local": 68,
+        "at": 0,
+        "len": 32,
+        "count": 330,
+        "out": "pitch_indices"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_encode",
+        "instruction": 4266,
+        "local": 69,
+        "at": 0,
+        "len": 4,
+        "count": 330,
+        "out": "pitch_block"
+      },
+      {
+        "op": "capture_memory",
+        "func": "lsf_core",
+        "instruction": 0,
+        "local": 3,
+        "len": 68,
+        "count": 330,
+        "out": "lsf_a"
+      },
+      {
+        "op": "capture_memory",
+        "func": "lsf_core",
+        "instruction": 0,
+        "local": 7,
+        "len": 2176,
+        "count": 330,
+        "out": "lsf_cond"
+      },
+      {
+        "op": "capture_memory",
+        "func": "lsf_core",
+        "instruction": 1099,
+        "local": 8,
+        "len": 64,
+        "count": 330,
+        "out": "lsf_q"
+      },
+      {
+        "op": "capture_memory",
+        "func": "lsf_core",
+        "instruction": 1099,
+        "local": 9,
+        "len": 17,
+        "count": 330,
+        "out": "lsf_qi"
+      },
+      {
+        "op": "capture_memory",
+        "func": "lsf_core",
+        "instruction": 1099,
+        "local": 10,
+        "len": 4,
+        "count": 330,
+        "out": "lsf_bits"
+      },
+      {
+        "op": "capture_memory",
+        "func": "lsf_core",
+        "instruction": 1099,
+        "local": 11,
+        "len": 4,
+        "count": 330,
+        "out": "lsf_rd"
+      },
+      {
+        "op": "capture_memory",
+        "func": "lsf_core",
+        "instruction": 1099,
+        "local": 12,
+        "len": 64,
+        "count": 330,
+        "out": "lsf_weights"
+      },
+      {
+        "op": "capture_value",
+        "func": "lsf_core",
+        "instruction": 0,
+        "local": 2,
+        "float": false,
+        "count": 330,
+        "out": "lsf_surv"
+      },
+      {
+        "op": "capture_value",
+        "func": "lsf_core",
+        "instruction": 0,
+        "local": 4,
+        "float": true,
+        "count": 330,
+        "out": "lsf_rdw"
+      },
+      {
+        "op": "capture_value",
+        "func": "lsf_core",
+        "instruction": 0,
+        "local": 5,
+        "float": false,
+        "count": 330,
+        "out": "lsf_voiced"
+      },
+      {
+        "op": "capture_value",
+        "func": "lsf_core",
+        "instruction": 0,
+        "local": 6,
+        "float": false,
+        "count": 330,
+        "out": "lsf_lowrate"
+      },
+      {
+        "op": "capture_value",
+        "func": "lsf_core",
+        "instruction": 0,
+        "local": 7,
+        "float": false,
+        "count": 330,
+        "out": "lsf_cond_ptr"
+      }
+    ]
+  },
+  "postfilter": {
+    "comment": [
+      "Capture HP and harmonic postfilter I/O in J#10726, without guest writes.\n\nHP spans ops5550..5820: local33=HpPst (1332B), local19=320-sample audio.\nHarmonic spans ops7728..8368: local46=HarmPst (9260B), local44=960-sample\npacket, frame+4160 holds 24 lags. HarmPst is 16+17+2280 floats then two i32.\nThe original 220 packet/PCM hashes are retained as instrumentation guards.\n"
+    ],
+    "functions": {
+      "core_decode": {
+        "index_hint": 10726
+      }
+    },
+    "captures": [
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 5550,
+        "local": 33,
+        "at": 0,
+        "len": 1332,
+        "count": 330,
+        "out": "hp_state_in"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 5550,
+        "local": 19,
+        "at": 0,
+        "len": 1280,
+        "count": 330,
+        "out": "hp_pre"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 5820,
+        "local": 33,
+        "at": 0,
+        "len": 1332,
+        "count": 330,
+        "out": "hp_state_out"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 5820,
+        "local": 19,
+        "at": 0,
+        "len": 1280,
+        "count": 330,
+        "out": "hp_post"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 7728,
+        "local": 46,
+        "at": 0,
+        "len": 9260,
+        "count": 110,
+        "out": "harm_state_in"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 7728,
+        "local": 44,
+        "at": 0,
+        "len": 3840,
+        "count": 110,
+        "out": "harm_pre"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 7728,
+        "local": 11,
+        "at": 4160,
+        "len": 96,
+        "count": 110,
+        "out": "harm_lags"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 8368,
+        "local": 46,
+        "at": 0,
+        "len": 9260,
+        "count": 110,
+        "out": "harm_state_out"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 8368,
+        "local": 44,
+        "at": 0,
+        "len": 3840,
+        "count": 110,
+        "out": "harm_post"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_decode",
+        "instruction": 5820,
+        "local": 102,
+        "float": true,
+        "count": 330,
+        "out": "hp_lag"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_decode",
+        "instruction": 5550,
+        "local": 29,
+        "float": false,
+        "count": 330,
+        "out": "hp_len"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_decode",
+        "instruction": 7728,
+        "local": 41,
+        "float": false,
+        "count": 110,
+        "out": "harm_len"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_decode",
+        "instruction": 7728,
+        "local": 112,
+        "float": true,
+        "count": 110,
+        "out": "harm_nbr_sum"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_decode",
+        "instruction": 7728,
+        "local": 59,
+        "float": false,
+        "count": 110,
+        "out": "harm_nframes"
+      }
+    ]
+  },
+  "params": {
+    "comment": [
+      "Capture wire parameters and entropy context from J#10758.\n\nLbQuantParams is p9, 1416B. Offsets: voiced0, fcbg4 (4*i16), acbg12,\nLSF indices20 (17*i8), interpolation40, contour44, lags48 (8*i32),\nenergy symbols80/84, energy88 (4*f32), energyQ14=104 (4*i32),\nlegacy dense pulses120 (unused); sparse positions760/magnitudes1080\n(160*i16 each), nPositions1400, nPulses1404, sfPulses1408 (4*i16).\nThe context at p1 is ec_dec; skip its pointer and retain eleven words at +4.\n"
+    ],
+    "functions": {
+      "decode_params": {
+        "index_hint": 10758
+      }
+    },
+    "captures": [
+      {
+        "op": "capture_memory",
+        "func": "decode_params",
+        "instruction": 1466,
+        "local": 9,
+        "at": 0,
+        "len": 1416,
+        "count": 330,
+        "out": "params"
+      },
+      {
+        "op": "capture_memory",
+        "func": "decode_params",
+        "instruction": 1466,
+        "local": 1,
+        "at": 4,
+        "len": 44,
+        "count": 330,
+        "out": "range_after"
+      },
+      {
+        "op": "capture_value",
+        "func": "decode_params",
+        "instruction": 0,
+        "local": 2,
+        "count": 330,
+        "out": "params_len"
+      },
+      {
+        "op": "capture_value",
+        "func": "decode_params",
+        "instruction": 0,
+        "local": 3,
+        "count": 330,
+        "out": "params_subframes"
+      },
+      {
+        "op": "capture_value",
+        "func": "decode_params",
+        "instruction": 0,
+        "local": 4,
+        "count": 330,
+        "out": "params_cav"
+      },
+      {
+        "op": "capture_value",
+        "func": "decode_params",
+        "instruction": 0,
+        "local": 6,
+        "count": 330,
+        "out": "params_lowrate"
+      },
+      {
+        "op": "capture_value",
+        "func": "decode_params",
+        "instruction": 0,
+        "local": 7,
+        "count": 330,
+        "out": "params_frame"
+      },
+      {
+        "op": "capture_value",
+        "func": "decode_params",
+        "instruction": 0,
+        "local": 8,
+        "count": 330,
+        "out": "params_sid"
+      }
+    ]
+  },
+  "gennoise": {
+    "comment": [
+      "Derive live decoder excitation/noise cases from J#10726 op2631/2632.\n\nThese snapshots replace replay inputs with inputs computed by the shipped\nencoder and decoder from synth_mic.raw. Observation preserves all 220 hashes.\n"
+    ],
+    "functions": {
+      "core_decode": {
+        "index_hint": 10726
+      }
+    },
+    "captures": [
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 93,
+        "at": 0,
+        "len": 56,
+        "count": 1320,
+        "out": "noise_in"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 2632,
+        "local": 93,
+        "at": 0,
+        "len": 56,
+        "count": 1320,
+        "out": "noise_out"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 25,
+        "at": 0,
+        "len": 320,
+        "count": 1320,
+        "out": "noise_exc"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 2632,
+        "local": 11,
+        "at": 128,
+        "len": 320,
+        "count": 1320,
+        "out": "noise_audio"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 11,
+        "at": 2208,
+        "len": 256,
+        "count": 1320,
+        "out": "noise_lsfs"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 11,
+        "at": 4160,
+        "len": 96,
+        "count": 1320,
+        "out": "noise_lags"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 11,
+        "at": 2744,
+        "len": 4,
+        "count": 1320,
+        "out": "noise_voiced"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 8,
+        "at": 4,
+        "len": 2,
+        "count": 1320,
+        "out": "noise_fcbg"
+      },
+      {
+        "op": "capture_memory",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 9,
+        "at": 0,
+        "len": 2,
+        "count": 1320,
+        "out": "noise_pulses"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 101,
+        "float": true,
+        "count": 1320,
+        "out": "noise_nrg"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 109,
+        "float": true,
+        "count": 1320,
+        "out": "noise_nbr"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 10,
+        "float": false,
+        "count": 1320,
+        "out": "noise_sf"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 32,
+        "float": false,
+        "count": 1320,
+        "out": "noise_frame"
+      },
+      {
+        "op": "capture_value",
+        "func": "core_decode",
+        "instruction": 2631,
+        "local": 18,
+        "float": false,
+        "count": 1320,
+        "out": "noise_len"
+      }
+    ]
+  }
+}

@@ -9,7 +9,8 @@ use super::smpl_lpc::SMPL_F_LEN;
 /// Weights on corrs, vad, tilt, harmonicity, short lags. The reference declares 6 entries but only
 /// sums the first 5, so this holds 5.
 const SMPL_VUV_WEIGHTS: [f32; 5] = [1.0, 0.5, 0.5, 0.7, 0.3];
-const SMPL_VUV_BIAS: f32 = -0.1038;
+// J#10736 and the live 330-frame trace use f32 bits 0xbe051eb8.
+const SMPL_VUV_BIAS: f32 = -0.13;
 const SMPL_VUV_HYST: f32 = 0.05;
 /// `SMPL_F_LEN / 3` (the transition index between the low/high spectral-tilt bands).
 const TRANSITION_IX: usize = SMPL_F_LEN / 3;
@@ -173,6 +174,31 @@ pub(crate) fn smpl_get_signal_mode(
     sp_act_prob: f32,
     vuv: &mut VuvMode,
 ) -> f32 {
+    signal_mode_with_bias(
+        pitchcorr,
+        lags,
+        avg_lag,
+        harm_strength,
+        f2,
+        sp_act_prob,
+        vuv,
+        SMPL_VUV_BIAS,
+    )
+}
+
+// The C auditor is pinned to an older tuning (-0.1038). Keep the same kernel
+// testable under that tuning without carrying it into the shipped profile.
+#[allow(clippy::too_many_arguments)]
+fn signal_mode_with_bias(
+    pitchcorr: f32,
+    lags: &[f32],
+    avg_lag: f32,
+    harm_strength: f32,
+    f2: &[f32; SMPL_F_LEN],
+    sp_act_prob: f32,
+    vuv: &mut VuvMode,
+    bias: f32,
+) -> f32 {
     let corr_strength = smpl_inv_sigmoid(0.1 + 0.75 * pitchcorr.clamp(0.0, 1.0)); // -1.4 .. 1.4
     let vad_strength = 0.04 * (1.0 - 1.04 / (sp_act_prob + 0.04)); // -1 .. 0
 
@@ -203,7 +229,7 @@ pub(crate) fn smpl_get_signal_mode(
         + SMPL_VUV_WEIGHTS[3] * harm_strength
         + SMPL_VUV_WEIGHTS[4] * lag_strength)
         / smpl_sum_vec(&SMPL_VUV_WEIGHTS, 5)
-        + SMPL_VUV_BIAS;
+        + bias;
 
     // hysteresis
     if vuv.last_lag_prev > 0.0 {
@@ -230,8 +256,10 @@ mod tests {
     // the reference output. Isolates the classifier from the pitch estimator.
     #[test]
     fn signal_mode_matches_c_ground_truth() {
-        let recs: Value =
-            serde_json::from_str(include_str!("testdata/sigmode_ground_truth.json")).unwrap();
+        let recs: Value = crate::voip::mlow::fixture::decode(include_bytes!(
+            "testdata/sigmode_ground_truth.cbor.zst"
+        ))
+        .unwrap();
         let arr = recs.as_array().unwrap();
         assert!(arr.len() >= 12);
         let mut vuv = VuvMode::default();
@@ -269,7 +297,8 @@ mod tests {
                 max_harm_err = max_harm_err.max((harm_rs - harm).abs());
             }
 
-            let vstr_rs = smpl_get_signal_mode(pitchcorr, &lags, avg_lag, harm, &f2, sp, &mut vuv);
+            let vstr_rs =
+                signal_mode_with_bias(pitchcorr, &lags, avg_lag, harm, &f2, sp, &mut vuv, -0.1038);
             max_err = max_err.max((vstr_rs - vstr_c).abs());
             // Voiced decision (all dump frames are coded_as_active_voice).
             assert_eq!(
@@ -290,5 +319,63 @@ mod tests {
             max_harm_err < 0.05,
             "harm_strength diverges from reference beyond cache-aliasing tolerance: {max_harm_err}"
         );
+    }
+    #[test]
+    fn signal_mode_matches_shipped_wasm() {
+        let records: Value = crate::voip::mlow::fixture::decode(include_bytes!(
+            "testdata/wasm_signal_mode.cbor.zst"
+        ))
+        .expect("wasm signal mode");
+        let records = records.as_array().unwrap();
+        assert_eq!(records.len(), 330);
+        let vec = |v: &Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect::<Vec<_>>()
+        };
+        for (i, r) in records.iter().enumerate() {
+            let initial = vec(&r["vuv_in"]);
+            let mut state = VuvMode {
+                voicing_prev: initial[0],
+                last_lag_prev: initial[1],
+                nrg_lo_bgn: initial[2],
+                nrg_hi_bgn: initial[3],
+            };
+            let f2: [f32; SMPL_F_LEN] = vec(&r["F2"]).try_into().unwrap();
+            let lags = vec(&r["lags"]);
+            let value = smpl_get_signal_mode(
+                r["pitchcorr"].as_f64().unwrap() as f32,
+                &lags,
+                r["avg_lag"].as_f64().unwrap() as f32,
+                r["harm"].as_f64().unwrap() as f32,
+                &f2,
+                r["sp_act_prob"].as_f64().unwrap() as f32,
+                &mut state,
+            );
+            let expected = r["vstr"].as_f64().unwrap() as f32;
+            assert!(
+                (value - expected).abs() < 1e-5,
+                "frame {i}: strength {value} vs {expected}"
+            );
+            let actual = [
+                state.voicing_prev,
+                state.last_lag_prev,
+                state.nrg_lo_bgn,
+                state.nrg_hi_bgn,
+            ];
+            for (got, want) in actual.iter().zip(vec(&r["vuv_out"])) {
+                assert!(
+                    (got - want).abs() < 1e-5 * want.abs().max(1.0),
+                    "frame {i}: VUV state {got} vs {want}"
+                );
+            }
+            assert_eq!(
+                i32::from(value > 0.0 && r["cav"].as_i64().unwrap() != 0),
+                r["voiced"].as_i64().unwrap() as i32,
+                "frame {i}: voiced"
+            );
+        }
     }
 }

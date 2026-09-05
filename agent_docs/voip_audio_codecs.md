@@ -266,3 +266,7 @@ variant; `WA_AUDIO_PROFILE=mlow` selects the CELT escape.
 
 Video already accepts external H.264 Annex-B access units. It is not wire-codec-agnostic: signaling,
 packetization, and PT 97 currently target H.264.
+
+The host-tool-only foundation for comparing audio/video bytes and RTP metadata
+against pinned WhatsApp wasm is documented in
+[`voip_media_oracle.md`](voip_media_oracle.md).

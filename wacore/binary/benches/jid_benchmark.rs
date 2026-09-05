@@ -51,10 +51,15 @@ fn bench_jid_push_phash_form(bencher: divan::Bencher) {
             (jid, String::with_capacity(64))
         })
         .bench_refs(|(jid, buf)| {
-            jid.push_phash_form_to(buf);
-            // black-box the contents, not just the length: observing only
-            // `len` lets LLVM elide the actual formatting writes.
-            black_box(buf.as_bytes());
+            // The destination has to be opaque BEFORE the write. Observing the
+            // buffer afterwards -- even as `buf.as_bytes()` -- hands LLVM only
+            // the pointer and the length, never the bytes, so it proved the
+            // formatting stores dead and the row measured as nothing at all.
+            // Laundering `buf` through `black_box` first makes the pointer
+            // escape, which is what forces the stores to happen.
+            let buf = black_box(buf);
+            black_box(jid).push_phash_form_to(buf);
+            black_box(buf.len());
         });
 }
 

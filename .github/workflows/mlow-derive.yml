@@ -1,0 +1,46 @@
+name: VoIP conformance
+
+on:
+  push:
+    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', 'tools/oracle-*/**', 'tools/xtask*/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', '.github/workflows/mlow-derive.yml']
+  pull_request:
+    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', 'tools/oracle-*/**', 'tools/xtask*/**', 'Cargo.toml', 'Cargo.lock', '.cargo/config.toml', '.github/workflows/mlow-derive.yml']
+  workflow_dispatch:
+  schedule:
+    - cron: '19 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  rederive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Test native task utilities
+        run: cargo test --locked -p whatsapp-xtask -p xtask-support
+      - name: Run complete VoIP conformance gate
+        if: github.event_name != 'schedule'
+        run: cargo xt oracle conformance
+      - name: Run complete VoIP conformance gate with slow signaling
+        if: github.event_name == 'schedule'
+        run: cargo xt oracle conformance --slow
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: voip-conformance-evidence
+          path: |
+            .derive-mlow/wasm/*.log
+            .derive-mlow/wasm/*/manifest.json
+          if-no-files-found: error
+          include-hidden-files: true

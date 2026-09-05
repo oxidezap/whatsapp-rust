@@ -1,0 +1,97 @@
+{
+  "derivation_lock_sha256": "2bc945e2023c81834ef6d4d18c78f3f5e51eb973e4e71f79a5747e4768c7aa46",
+  "files": {
+    "wasm_derived_120ms_frames.json": {
+      "bytes": 4087,
+      "sha256": "0cf159be86830546b15687e0e61a088c10f7b940fb3806a008c9a3c07cd01304"
+    },
+    "wasm_derived_120ms_ref.raw": {
+      "bytes": 30720,
+      "sha256": "0bd296a4b4b12bf494c52b3733d5ede8df29ac336e01ac9eeb81385339cabdc3"
+    },
+    "wasm_derived_frames.json": {
+      "bytes": 23291,
+      "sha256": "c3b9c0b5140cd48401be07311ec547ec024e3e4c0841f5cdbf8178ede7d24bb3"
+    },
+    "wasm_derived_ref.raw": {
+      "bytes": 211200,
+      "sha256": "91c3970882daecc54428fa1d52428a2e3fa364ced10f674af38bf1a971e2a076"
+    },
+    "wasm_derived_vad.json": {
+      "bytes": 7664,
+      "sha256": "f797ed038a2dd2353362facfbc778a2f41338cfea1ac8349123e2a77f3955eff"
+    },
+    "wasm_fe.cbor.zst": {
+      "cbor_bytes": 2029537,
+      "cbor_sha256": "af0ce0ec313af750ee0c8e9bba03e57d67c7a543ad17435279afa2c4f6bdab51",
+      "json_bytes": 10916195,
+      "json_sha256": "2b4774ad1a584f6c49f2221d16a412857ff3057bfbd251831581379d2a74196a",
+      "packed_bytes": 1258015,
+      "records": 330,
+      "zstd_sha256": "f38d2f1ffd7cfd5b28bc7508c38ba1b5081772cf5a72848a8146869a86f89c4e"
+    },
+    "wasm_gennoise.cbor.zst": {
+      "cbor_bytes": 2326645,
+      "cbor_sha256": "a3d7d473a609406f32911c70eecb0c01b437ef110d9f17a05271daca6fc158bb",
+      "json_bytes": 11583460,
+      "json_sha256": "baaba6cb3b10699a46db0a9791275684ca9f030b6fc9e56acb0a94840e5d77f8",
+      "packed_bytes": 1039997,
+      "records": 1320,
+      "zstd_sha256": "498c2704df5c18a8fac9ec52b1957ded45a8c86b2a2271e3eea2f526c5e1c6f9"
+    },
+    "wasm_harm_postfilter.cbor.zst": {
+      "cbor_bytes": 3622499,
+      "cbor_sha256": "5b9bc947456dfb0216e81070be2d9b5a2059f47d7b95ff0931a0fada3152834f",
+      "json_bytes": 16539082,
+      "json_sha256": "80a738d8c851c004f444ced773ad43156a586088dc4566263bb4af9ad8e8ef19",
+      "packed_bytes": 659161,
+      "records": 110,
+      "zstd_sha256": "0c0275d8f34d697393e913520e69248a0aef2f193981d6e1a5b1d66823fbb8f0"
+    },
+    "wasm_hp_postfilter.cbor.zst": {
+      "cbor_bytes": 2175413,
+      "cbor_sha256": "a0a94807dd9efa1e0f02778aabb2976968bcb6c68055e72ec6f365c16bdc650a",
+      "json_bytes": 11873165,
+      "json_sha256": "5d23bb4bb230f58c4e4dcad2975ff08d585adca806b81b63a491a76cc08385e2",
+      "packed_bytes": 1252986,
+      "records": 330,
+      "zstd_sha256": "05d75526f603df3ae407ac7b9bc6c42077ca9bda382e417a72482f9e1cbcab01"
+    },
+    "wasm_lsf_quant.cbor.zst": {
+      "cbor_bytes": 711291,
+      "cbor_sha256": "fbd6a2989205c9a18c72c6cca970d0bde80b9c01163f649d8efa6f9cd09b8dac",
+      "json_bytes": 3807968,
+      "json_sha256": "365aa1381a91bade41a2e64fe4ea8198afacd1ef7e2a725ec7bdf7d149be8479",
+      "packed_bytes": 523628,
+      "records": 330,
+      "zstd_sha256": "4a668988d4513d5c9d4f6bfe3dde2ee8d1c71712e6b24ae3697ca96e197f8087"
+    },
+    "wasm_params.cbor.zst": {
+      "cbor_bytes": 176122,
+      "cbor_sha256": "3b2bf63bffe43a02753aa423d6f90ee5433ee48ac54fc9cfad4eff1ad1e50269",
+      "json_bytes": 1238268,
+      "json_sha256": "31d150e8f57c80b8b36b4aa0a2baaa728992fe07c0435a20d33832014a0b5663",
+      "packed_bytes": 23909,
+      "records": 330,
+      "zstd_sha256": "b35f65721608827455361b2a808e933d86e4f7aebff4f29594c6b7822347fb75"
+    },
+    "wasm_pitch.cbor.zst": {
+      "cbor_bytes": 1594979,
+      "cbor_sha256": "7bdfe32ed667778a0c4b8002ed50eb16596bd465b235f18abf649c5e1b2fa599",
+      "json_bytes": 8563224,
+      "json_sha256": "4501688fae63fdcd059592f0541a46fce59ac7a2e0c491639da285cd5bd697de",
+      "packed_bytes": 770095,
+      "records": 330,
+      "zstd_sha256": "d485cb83f47485bfcf90a3a92affd88bd42c5d2de322c84465e962a528ed856e"
+    },
+    "wasm_signal_mode.cbor.zst": {
+      "cbor_bytes": 488783,
+      "cbor_sha256": "21aac9ef93305a8ae2b9f12992c9ce442d888b04eb80ec846b0ff3e0060e9155",
+      "json_bytes": 2412142,
+      "json_sha256": "1d0c4e8ffd5051a060fc6d43a21d2b19d3cb4a2d032bace285ad2026cae0d449",
+      "packed_bytes": 331623,
+      "records": 330,
+      "zstd_sha256": "7d923d8ddd31a77244b125d716ecdf89d9d79d9b23b19e2d07bbe06e50ecb05f"
+    }
+  }
+}

@@ -36,7 +36,7 @@ jobs:
     services:
       mock-server:
         # Generated from .github/bartender-image.txt by
-        # scripts/ci/sync-bartender-image.sh.
+        # cargo xt ci sync-bartender-image.
         image: ghcr.io/whiskeysockets-devtools/bartender@sha256:9f3a49dd9f944414fbda50571bba5f66f2ab6fdc48001e6803d4c09a1042c78e
         credentials:
           username: ${{ github.actor }}
@@ -72,16 +72,7 @@ jobs:
         with:
           cache-targets: "true"
       - name: Wait for mock server
-        run: |
-          for i in $(seq 1 30); do
-            if curl -sk https://localhost:8080/ > /dev/null 2>&1; then
-              echo "Mock server is ready"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Mock server failed to become ready"
-          exit 1
+        run: cargo xt ci workflow wait-for-mock
       # The `e2e` nextest profile (.config/nextest.toml) carries the hang guard.
       # No `--nocapture`: nextest captures per test and replays the output of the
       # failures only, so a red run is readable instead of 25 interleaved logs.
@@ -91,7 +82,7 @@ jobs:
           RUST_LOG: info
           NEXTEST_PROFILE: e2e
           TEST_TIMINGS_DIR: ${{ runner.temp }}/test-timings
-        run: scripts/ci/nextest_timed.sh e2e -p e2e-tests
+        run: cargo xt ci nextest-timed e2e -- -p e2e-tests
       - name: Publish test timings
         if: always()
         uses: actions/upload-artifact@v7

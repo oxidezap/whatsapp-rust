@@ -17,7 +17,7 @@ Do NOT switch any metric to rlib size: rlibs carry un-monomorphized generics plu
 
 ## How regressions are caught
 
-- **PR gate** (`scripts/ci/binary_size_report.py`): absolute per-PR budget — stripped Δ ≤ 64 KiB, .text Δ ≤ 32 KiB. Absolute instead of percentage because sizes are deterministic for a pinned toolchain and 1% of a multi-MiB binary would hide real regressions. The sticky PR comment shows all deltas plus per-crate top movers.
+- **PR gate** (`cargo xt ci binary-size-report`): absolute per-PR budget — stripped Δ ≤ 64 KiB, .text Δ ≤ 32 KiB. Absolute instead of percentage because sizes are deterministic for a pinned toolchain and 1% of a multi-MiB binary would hide real regressions. The sticky PR comment shows all deltas plus per-crate top movers.
 - **Escape hatch**: the `size-increase-ok` label downgrades a failed gate to a warning. Use it for toolchain/dependency bumps and accepted feature costs; the increase still lands in the series.
 - **Post-merge safety net**: the push job stores the series at `dev/binary-size` on gh-pages via github-action-benchmark (`alert-threshold: 102%` comments on the offending commit). Graphs: <https://oxidezap.github.io/whatsapp-rust/dev/binary-size/>.
 
@@ -28,7 +28,7 @@ Do NOT switch any metric to rlib size: rlibs carry un-monomorphized generics plu
 - Sizes are only comparable under the same pinned toolchain. A `rust-toolchain.toml` bump legitimately moves every metric — expect a gate hit and use the label.
 - `cargo bloat` exits 0 even on analysis errors; the measure script validates its JSON instead of trusting the exit code.
 - Fork PRs run with a read-only token: they get the job summary and the gate, but no PR comment.
-- Local run: `python3 scripts/ci/measure_binary_size.py --out-dir size-out` (add `--skip-build` to reuse an existing release build).
+- Local run: `cargo xt ci measure-binary-size --out-dir size-out` (add `--skip-build` to reuse an existing release build).
 
 ## Per-crate opt-level
 
