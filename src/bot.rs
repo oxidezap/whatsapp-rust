@@ -20,6 +20,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use thiserror::Error;
+use wacore::handshake::NoiseCertPolicy;
 use wacore::proto_helpers::MessageBuilderExt;
 use wacore::runtime::Runtime;
 use wacore::store::DevicePropsOverride;
@@ -435,9 +436,10 @@ impl BotHandle {
     /// Gracefully stop the bot: disconnects (flushing the device snapshot,
     /// buffered receipts and message secrets) and waits for the run loop to
     /// exit.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(self) {
         self.client.disconnect().await;
-        let _ = (&mut self.done_rx).await;
+        let mut done_rx = self.done_rx;
+        let _ = (&mut done_rx).await;
     }
 
     /// Abort the bot task immediately. Skips the flush work
@@ -466,10 +468,10 @@ impl std::future::Future for BotHandle {
 /// CPU-relevant work of a session would be missing from the hook on the
 /// common `bot.run().await` launch path. `Bot::spawn` needs no equivalent:
 /// it routes the same loop through `Runtime::spawn`.
-async fn run_metered<F: std::future::Future<Output = ()>>(
+async fn run_metered<F: std::future::Future>(
     fut: F,
     instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
-) {
+) -> F::Output {
     match instrument {
         // Stack-pinned, not boxed: `MeteredFuture` only needs an `Unpin` inner,
         // and `Pin<&mut F>` is one without an allocation.
@@ -562,11 +564,17 @@ impl Bot {
     /// (linker-shared) function, so callers poll through a vtable and the
     /// graph is compiled once, here. One allocation per process.
     pub async fn run(self) {
+        let _ = self.run_with_reason().await;
+    }
+
+    /// Run the bot and report why its client supervision ended. Existing
+    /// callers can continue using [`Self::run`], which returns `()`.
+    pub async fn run_with_reason(self) -> crate::RunCompletionReason {
         self.run_boxed().await
     }
 
     #[inline(never)]
-    fn run_boxed(self) -> wacore::runtime::BoxFuture<'static, ()> {
+    fn run_boxed(self) -> wacore::runtime::BoxFuture<'static, crate::RunCompletionReason> {
         Box::pin(self.run_graph())
     }
 
@@ -574,10 +582,10 @@ impl Bot {
         feature = "tracing",
         tracing::instrument(name = "wa.bot.run", level = "debug", skip_all)
     )]
-    async fn run_graph(self) {
+    async fn run_graph(self) -> crate::RunCompletionReason {
         let instrument = self.task_instrument.clone();
         let client = self.start_background();
-        run_metered(client.run(), instrument).await;
+        run_metered(client.run_with_reason(), instrument).await
     }
 
     /// Start the bot on its runtime and return a [`BotHandle`] to await,
@@ -588,7 +596,7 @@ impl Bot {
         let run_client = client.clone();
         let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
         let abort_handle = client.runtime.spawn(Box::pin(async move {
-            run_client.run().await;
+            run_client.run_with_reason().await;
             let _ = done_tx.send(());
         }));
 
@@ -712,6 +720,7 @@ pub struct BotBuilder<
     skip_history_sync: bool,
     ab_props_fetch: bool,
     presence_policy: PresencePolicy,
+    noise_cert_policy: NoiseCertPolicy,
     initial_push_name: Option<String>,
     cache_config: CacheConfig,
     wanted_pre_key_count: Option<usize>,
@@ -743,6 +752,7 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             skip_history_sync: false,
             ab_props_fetch: true,
             presence_policy: PresencePolicy::default(),
+            noise_cert_policy: NoiseCertPolicy::default(),
             initial_push_name: None,
             cache_config: CacheConfig::default(),
             wanted_pre_key_count: None,
@@ -778,6 +788,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             skip_history_sync: self.skip_history_sync,
             ab_props_fetch: self.ab_props_fetch,
             presence_policy: self.presence_policy,
+            noise_cert_policy: self.noise_cert_policy,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
             wanted_pre_key_count: self.wanted_pre_key_count,
@@ -1397,6 +1408,17 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         self
     }
 
+    /// Select the Noise server-cert verification policy for handshakes made
+    /// by the built client. Defaults to strict (explicit `Strict` always
+    /// verifies); pass
+    /// [`NoiseCertPolicy::DangerSkipCertChainVerify`] only for testing
+    /// against a mock server that cannot produce a WhatsApp-rooted chain.
+    /// Fixed at build time and applied to every connect, including reconnects.
+    pub fn with_noise_cert_policy(mut self, policy: NoiseCertPolicy) -> Self {
+        self.noise_cert_policy = policy;
+        self
+    }
+
     /// Set how many one-time pre-keys are generated and uploaded per batch.
     ///
     /// Defaults to WA Web's UPLOAD_KEYS_COUNT (812). The value is clamped to the
@@ -1539,6 +1561,7 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             .with_transport_factory_arc(transport_factory)
             .with_http_client_arc(http_client)
             .with_cache_config(self.cache_config)
+            .with_noise_cert_policy(self.noise_cert_policy)
             .with_custom_enc_handlers(self.custom_enc_handlers)
             .with_skip_history_sync(self.skip_history_sync)
             .with_ab_props_fetch(self.ab_props_fetch)
@@ -1680,6 +1703,57 @@ mod tests {
             Some(&"installed")
         );
         bot.client().disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn bot_builder_noise_cert_policy_reaches_built_client() {
+        use wacore::handshake::NoiseCertPolicy;
+
+        let default_bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("default bot build");
+        assert_eq!(
+            default_bot.client().noise_cert_policy,
+            NoiseCertPolicy::default()
+        );
+        default_bot.client().disconnect().await;
+
+        let bypass_bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_noise_cert_policy(NoiseCertPolicy::DangerSkipCertChainVerify)
+            .build()
+            .await
+            .expect("bypass bot build");
+        assert_eq!(
+            bypass_bot.client().noise_cert_policy,
+            NoiseCertPolicy::DangerSkipCertChainVerify
+        );
+        bypass_bot.client().disconnect().await;
+
+        // Explicit Strict is distinct from the default only when the
+        // default changes: the setter, not a build flag, decides.
+        let strict_bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_noise_cert_policy(NoiseCertPolicy::Strict)
+            .build()
+            .await
+            .expect("explicit strict bot build");
+        assert_eq!(
+            strict_bot.client().noise_cert_policy,
+            NoiseCertPolicy::Strict
+        );
+        strict_bot.client().disconnect().await;
     }
 
     fn pairing_code_event(code: &str) -> Arc<Event> {

@@ -91,6 +91,51 @@ Do not replace the batch-safe flush with a raw cache flush. During offline
 drain, inbound rows must become durable before their ratchet advances; otherwise
 a crash can turn redelivery into an acknowledged duplicate and lose the event.
 
+## Contract matrix and recovery boundary
+
+The following matrix records the release point for each mutation. A backend may
+implement a batch operation as a transaction or as retryable per-key writes;
+the cache contract is the same in both cases. If an operation returns an error,
+the cache retains every affected dirty entry and gate, including entries that a
+backend may have written before reporting the error. A retry may repeat those
+bytes when the mutation is still current, or persist a newer mutation that has
+superseded them; in either case the cache must confirm the version being
+published before releasing its gate.
+
+| Operation | Required ordering | Gate release | Existing proof |
+| --- | --- | --- | --- |
+| Session put, including a raised reservation | `put_session` returns to the cache, then `flush` persists the serialized record | Only for addresses included in a successful `put_sessions_batch` | `failed_flush_keeps_the_gate_closed`, `session_lease_gates_until_a_successful_flush` |
+| Sender-key put, including a raised iteration lease | Encryption returns the record to the cache, then `flush` persists it; a pending distribution remains an in-memory retry buffer until the gated send succeeds | Only for names included in a successful `put_sender_keys_batch` | `failed_flush_keeps_the_sender_key_gate_closed`, `only_encrypt_marked_sender_keys_gate_the_wire` |
+| Session or sender-key delete | Cache installs a tombstone before backend deletion | Only after the corresponding delete operation succeeds | `session_tombstone_keeps_gate_until_delete_is_durable`, `sender_key_tombstone_keeps_gate_until_delete_is_durable`, `a_failed_durable_delete_keeps_the_gate_closed` |
+| Batch failure or partial progress | Retry the still-current serialized values and tombstones, or confirm a newer value superseded them | No entry is released by the failed call; entries already confirmed by an earlier successful call may be released individually | `partial_session_batch_failure_keeps_all_gates_for_retry`, `incomplete_session_flush_retains_newer_state_and_fails_closed_on_recovery` |
+| Consumed one-time prekey | Persist the promoted session before removing its prekey | Remove only after the session is known durable | `consumed_prekey_stays_durable_until_session_flush`, `checked_out_session_defers_prekey_delete_until_durable`, `failed_session_flush_does_not_delete_prekey` |
+| Outbound publication | Encrypt and return state, then call `persist_signal_state_pre_wire` | The transport is reached only after a successful flush when a gate is raised | `test_send_aborts_before_wire_when_lease_persist_fails` in `tests/e2e/tests/session_reuse.rs`; the chaos and SQLite tests cover state recovery separately |
+
+The recovery precondition is a current, confirmed backend snapshot and a cache
+incarnation that identifies whether the snapshot was written by this live
+cache. A clean reload in the same incarnation preserves the exact unused lease;
+a new incarnation advances to the persisted exclusive ceiling because a lower
+counter may already have reached the wire. This is a recovery rule for a
+confirmed current row, not an anti-rollback mechanism. If an operator restores
+an arbitrarily old snapshot, the bytes contain no independent monotonic source
+that can distinguish that restore from a legitimate older database. The API
+can demonstrate the distinction between clean reload and new-incarnation
+recovery, but cannot detect arbitrary snapshot rollback from the snapshot alone.
+The focused proofs are `dm_clean_reload_is_exact_but_new_cache_burns_the_lease`,
+`repeated_clean_reloads_keep_group_messages_within_forward_jump_limit`, and
+`an_unreadable_session_row_is_reported_absent_so_recovery_can_replace_it`.
+
+SQLite uses WAL with `Synchronous::Normal` by default. The durability boundary
+is the successful SQLite transaction observed by the cache, which gives the
+required process-crash ordering for committed rows and batched deletes. Normal
+does not promise that every commit survives sudden power loss before a WAL
+checkpoint; callers requiring that stronger storage claim can select
+`Synchronous::Full`. The cache contract does not silently promote all writes to
+Full because that would change the configured cost without improving the
+ordering proof. The effective default and the configurable Full mode are
+covered by the SQLite pragma tests and the ignored subprocess restart test;
+that process test is not a simulation of power loss.
+
 ## Cancellation, deletion, and teardown
 
 `SessionCheckout` owns the only mutable copy while a session operation is in

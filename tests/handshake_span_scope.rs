@@ -31,7 +31,7 @@ use wacore::libsignal::protocol::KeyPair;
 use wacore::runtime::{AbortHandle, Runtime};
 use wacore_binary::consts::{NOISE_PATTERN_XX, WA_CONN_HEADER};
 use wacore_noise::test_util::build_cert_chain_bytes;
-use whatsapp_rust::handshake::do_handshake;
+use whatsapp_rust::handshake::{NoiseCertPolicy, do_handshake_with_cert_policy};
 use whatsapp_rust::socket::noise_socket::SendObservers;
 use whatsapp_rust::transport::{Transport, TransportEvent};
 use whatsapp_rust::waproto::whatsapp as wa;
@@ -297,13 +297,15 @@ async fn observe_handshake(serve: bool) -> Observed {
         None
     };
 
-    let handshake_ok = do_handshake(
+    let handshake_ok = do_handshake_with_cert_policy(
         runtime as Arc<dyn Runtime>,
         pm.as_ref(),
         counter.as_ref(),
         transport as Arc<dyn Transport>,
         &mut events_rx,
         SendObservers::default(),
+        // Zero-signed fixture: explicit per-handshake bypass, not a flag.
+        NoiseCertPolicy::DangerSkipCertChainVerify,
     )
     .await
     .is_ok();

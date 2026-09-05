@@ -16,6 +16,8 @@ ignored = ["libsqlite3-sys"]
 [features]
 default = ["bundled-sqlite"]
 bundled-sqlite = ["libsqlite3-sys/bundled"]
+test-util = []
+wasm-test = ["wacore/js"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -39,6 +41,13 @@ sha2 = { workspace = true }
 [dev-dependencies]
 divan = { workspace = true }
 portable-atomic = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# Tokio's timer requires a runtime time driver, which the single-agent browser
+# target does not provide. This future wraps the platform's real setTimeout.
+gloo-timers = { version = "0.3", features = ["futures"] }
 
 [[bench]]
 name = "signal_flush"
@@ -50,6 +59,10 @@ harness = false
 
 [[bench]]
 name = "store_contention"
+harness = false
+
+[[bench]]
+name = "signal_cache_contention"
 harness = false
 
 [lints]

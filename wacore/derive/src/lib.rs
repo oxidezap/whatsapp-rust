@@ -33,6 +33,11 @@ use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
 /// Derive macro for implementing `ProtocolNode` on structs with attributes.
 ///
+/// Child fields are intentionally not accepted by this derive. Child
+/// cardinality and duplicate handling differ across protocol responses, so
+/// child-bearing nodes use an explicit implementation, optionally reusing the
+/// shared parsing helpers, instead of hiding those decisions in generated code.
+///
 /// # Attributes
 ///
 /// - `#[protocol(tag = "tagname")]` - Required. Specifies the XML tag name.

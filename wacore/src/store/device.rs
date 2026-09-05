@@ -326,8 +326,10 @@ pub struct Device {
     /// Server cert chain cached from the last successful XX (or XX-fallback)
     /// handshake. Enables Noise IK on the next connect by exposing
     /// `leaf.key` as the server's static public key, and lets us reject
-    /// stale entries via `not_after` before even attempting IK.
-    /// `None` forces XX on the next connect.
+    /// stale entries via `not_after` before even attempting IK. Only chains
+    /// whose signatures were checked (`signature_verified`) authorize IK;
+    /// `None` — or an unmarked legacy record — forces XX on the next
+    /// connect.
     #[serde(default)]
     pub server_cert_chain: Option<CachedServerCertChain>,
     /// Login counter sent as `ClientPayload.lc` on every login. WA Web's
@@ -467,13 +469,26 @@ impl ServerClientExpiration {
 /// Cached form of the server's two-cert chain. `leaf.key` is the server
 /// static public key consumed by Noise IK; the intermediate is kept solely
 /// to mirror WA Web's expiry checks.
+///
+/// `signature_verified` records that both XEdDSA signatures were actually
+/// checked when this chain was cached. Only such chains may authorize IK.
+/// Records written before this field existed deserialize it as `false` and
+/// fall back to one XX, which then stores a verified chain. This is upgrade
+/// hygiene, not tamper-proofing: the storage backend remains the trust
+/// boundary, and a backend that rewrites this flag can already rewrite the
+/// keys it guards.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedServerCertChain {
     pub intermediate: CachedNoiseCert,
     pub leaf: CachedNoiseCert,
+    #[serde(default)]
+    pub signature_verified: bool,
 }
 
 impl From<wacore_noise::VerifiedServerCertChain> for CachedServerCertChain {
+    /// Marks the chain verified. Only feed this chains that passed strict
+    /// verification: the orchestrator converts only `Some` outcomes, which
+    /// the handshake states produce solely for signature-checked chains.
     fn from(v: wacore_noise::VerifiedServerCertChain) -> Self {
         Self {
             intermediate: CachedNoiseCert {
@@ -486,6 +501,7 @@ impl From<wacore_noise::VerifiedServerCertChain> for CachedServerCertChain {
                 not_before: v.leaf_not_before,
                 not_after: v.leaf_not_after,
             },
+            signature_verified: true,
         }
     }
 }
@@ -721,11 +737,26 @@ mod tests {
                 not_before: 1_700_000_500,
                 not_after: 1_899_999_500,
             },
+            signature_verified: true,
         });
 
         let json = serde_json::to_string(&device).expect("serialize should succeed");
         let restored: Device = serde_json::from_str(&json).expect("deserialize should succeed");
         assert_eq!(device.server_cert_chain, restored.server_cert_chain);
+    }
+
+    #[test]
+    fn test_device_chain_without_provenance_deserializes_untrusted() {
+        // Records written before `signature_verified` existed — including
+        // chains cached while a global bypass was enabled — must load as
+        // untrusted so the next connect falls back to XX.
+        let legacy = r#"{"intermediate":{"key":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"not_before":1700000000,"not_after":1900000000},"leaf":{"key":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"not_before":1700000500,"not_after":1899999500}}"#;
+        let chain: CachedServerCertChain =
+            serde_json::from_str(legacy).expect("legacy record should deserialize");
+        assert!(
+            !chain.signature_verified,
+            "absent provenance must mean untrusted"
+        );
     }
 
     #[test]

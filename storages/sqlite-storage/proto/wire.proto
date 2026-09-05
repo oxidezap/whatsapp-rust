@@ -18,6 +18,11 @@ message NoiseCert {
 message ServerCertChain {
   NoiseCert intermediate = 1;
   NoiseCert leaf = 2;
+  // Set once both XEdDSA signatures were checked when this chain was
+  // cached. Absent in rows written before this field existed, which decode
+  // to false and so fall back to one XX -- the safe direction, since only a
+  // checked chain may authorize IK.
+  bool signature_verified = 3;
 }
 
 message AppStateSyncKeyWire {

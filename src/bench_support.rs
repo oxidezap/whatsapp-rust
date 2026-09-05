@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::Client;
+use crate::client::ChatLane;
 use crate::http::{HttpClient, HttpRequest, HttpResponse};
 use crate::runtime_impl::TokioRuntime;
 use crate::store::persistence_manager::PersistenceManager;
@@ -798,10 +799,9 @@ impl wacore::types::events::EventHandler for StanzaEventCounter {
 /// measured is everything from the decoded stanza to the dispatched event:
 /// classification, the session or sender-key decrypt through the signal
 /// cache, plaintext handling, dispatch, and the delivery receipt written to
-/// the sink socket. The chat lane is not on the bill: a stanza enters at
-/// `Client::handle_incoming_message`, which is what the lane worker awaits
-/// per message, so the queue hop is excluded by construction and the
-/// per-message work is not.
+/// the sink socket. [`Self::receive`] and [`Self::receive_burst`] enter at
+/// `Client::handle_incoming_message` and exclude the queue hop.
+/// [`Self::enqueue_and_drain`] also measures the chat-lane queue and worker.
 pub struct ReceiveHarness {
     runtime: tokio::runtime::Runtime,
     client: Arc<Client>,
@@ -932,6 +932,53 @@ impl ReceiveHarness {
         })
     }
 
+    /// Receive a burst of stanzas within a single runtime entry (`block_on`),
+    /// awaiting each `handle_incoming_message` inline and flushing outbound receipts,
+    /// matching the exact decrypt, event, and receipt work of [`Self::receive`]
+    /// while isolating the per-message processing cost from the `block_on` future passing artifact.
+    pub fn receive_burst(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
+        self.runtime.block_on(async {
+            for node in nodes {
+                Arc::clone(&self.client)
+                    .handle_incoming_message(Arc::clone(node))
+                    .await;
+                self.client
+                    .outbound_flush
+                    .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
+                    .await;
+            }
+        });
+    }
+
+    /// Enqueue stanzas through the real production `MessageHandler::handle_inline` into
+    /// chat lanes, driving the lane workers to process them, and flush outbound receipts.
+    pub fn enqueue_and_drain(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
+        self.runtime.block_on(async {
+            let target = self.messages_delivered() + nodes.len() as u64;
+            for node in nodes {
+                let mut cancelled = false;
+                let accepted = crate::handlers::message::MessageHandler::handle_inline(
+                    Arc::clone(&self.client),
+                    Arc::clone(node),
+                    &mut cancelled,
+                )
+                .await;
+                assert!(accepted && !cancelled, "message enqueue failed");
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while self.messages_delivered() < target {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("lane delivery timed out: a decrypt, commit, or worker failed");
+            self.client
+                .outbound_flush
+                .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
+                .await;
+        });
+    }
+
     /// How many `Event::Messages` batches reached the subscriber so far (one
     /// per received stanza in live mode). A benchmark
     /// asserts this against its iteration count, so a silent decrypt failure
@@ -1042,6 +1089,35 @@ impl ReceiveHarness {
         });
     }
 
+    /// Gracefully terminate all active chat lane workers by closing their channels,
+    /// awaiting their termination, and clearing the lane cache.
+    pub fn close_lanes(&self) {
+        self.runtime.block_on(async {
+            let lanes: Vec<ChatLane> = self
+                .client
+                .chat_lanes
+                .fold_entries(Vec::new(), |mut acc, _k, lane| {
+                    acc.push(lane.clone());
+                    acc
+                })
+                .await;
+
+            for lane in &lanes {
+                lane.queue_tx.close();
+            }
+
+            self.client.chat_lanes.clear().await;
+
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                for lane in &lanes {
+                    let _guard = lane.worker_running.lock().await;
+                }
+            })
+            .await
+            .expect("lane shutdown timed out");
+        });
+    }
+
     /// Let the outbound work the processed stanzas queued (their transport
     /// `<ack>`s) finish, so it cannot leak into the next benchmark.
     pub fn flush(&self) {
@@ -1064,6 +1140,302 @@ impl Default for ReceiveHarness {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A harness supporting multiple concurrent chat lanes (e.g. 1, 32, 256 lanes)
+/// with valid sender key ratchets per group, measuring production chat-lane
+/// enqueue, worker execution, and shutdown.
+pub struct MultiLaneReceiveHarness {
+    runtime: tokio::runtime::Runtime,
+    client: Arc<Client>,
+    peer: Arc<Client>,
+    peer_jid: Jid,
+    groups: Vec<Jid>,
+    group_sender_keys: Vec<wacore::libsignal::protocol::SenderKeyName>,
+    counter: Arc<MessageCounter>,
+    _subscription: wacore::types::events::Subscription,
+    next_id: portable_atomic::AtomicU64,
+}
+
+impl MultiLaneReceiveHarness {
+    /// Build a multi-lane harness with `num_lanes` pre-configured groups and installed
+    /// sender keys.
+    pub fn new(num_lanes: usize) -> Self {
+        assert!(num_lanes >= 1, "at least 1 lane is required");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let (client, peer, peer_jid, groups, group_sender_keys, counter, subscription) =
+            runtime.block_on(build_multilane_receive_fixture(num_lanes));
+        Self {
+            runtime,
+            client,
+            peer,
+            peer_jid,
+            groups,
+            group_sender_keys,
+            counter,
+            _subscription: subscription,
+            next_id: portable_atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Number of configured groups available in the harness.
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Generate a burst of valid encrypted stanzas distributed across `active_lanes` groups.
+    /// Each stanza advances the peer's sender key chain for that group.
+    pub fn generate_burst(
+        &self,
+        active_lanes: usize,
+        count: usize,
+    ) -> Vec<Arc<wacore_binary::OwnedNodeRef>> {
+        use wacore::libsignal::protocol::group_encrypt;
+
+        assert!(active_lanes >= 1 && active_lanes <= self.groups.len());
+        let plaintext = wacore::messages::MessageUtils::encode_and_pad(&wa::Message::text("bench"));
+
+        self.runtime.block_on(async {
+            let mut adapter = self.peer.signal_adapter();
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let mut stanzas = Vec::with_capacity(count);
+
+            for i in 0..count {
+                let lane_idx = i % active_lanes;
+                let group = &self.groups[lane_idx];
+                let sender_key = &self.group_sender_keys[lane_idx];
+
+                let ciphertext = group_encrypt(
+                    &mut adapter.sender_key_store,
+                    sender_key,
+                    &plaintext,
+                    &mut rng,
+                )
+                .await
+                .expect("peer encrypts to the group");
+
+                let enc = wacore_binary::builder::NodeBuilder::new("enc")
+                    .attr("type", "skmsg")
+                    .attr("v", "2")
+                    .bytes(ciphertext.serialized().to_vec())
+                    .build();
+                let node = wacore_binary::builder::NodeBuilder::new("message")
+                    .attr("from", group.to_string())
+                    .attr("participant", self.peer_jid.to_string())
+                    .attr("id", self.next_message_id())
+                    .attr("t", wacore::time::now_secs().to_string())
+                    .attr("type", "text")
+                    .attr("notify", "Bench Peer")
+                    .children([enc])
+                    .build();
+
+                stanzas.push(decoded(&node));
+            }
+            stanzas
+        })
+    }
+
+    /// Enqueue a batch of stanzas through production `MessageHandler::handle_inline` into
+    /// their respective chat lanes, await their processing, and flush outbound receipts.
+    pub fn enqueue_and_drain(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
+        self.runtime.block_on(async {
+            let target = self.messages_delivered() + nodes.len() as u64;
+            for node in nodes {
+                let mut cancelled = false;
+                let accepted = crate::handlers::message::MessageHandler::handle_inline(
+                    Arc::clone(&self.client),
+                    Arc::clone(node),
+                    &mut cancelled,
+                )
+                .await;
+                assert!(accepted && !cancelled, "message enqueue failed");
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while self.messages_delivered() < target {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("lane delivery timed out: a decrypt, commit, or worker failed");
+            self.client
+                .outbound_flush
+                .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
+                .await;
+        });
+    }
+
+    /// Receive a burst of stanzas within a single runtime entry (`block_on`),
+    /// calling `handle_incoming_message` inline, matching the exact decrypt,
+    /// event, and receipt work without chat lane hopping.
+    pub fn receive_burst(&self, nodes: &[Arc<wacore_binary::OwnedNodeRef>]) {
+        self.runtime.block_on(async {
+            for node in nodes {
+                Arc::clone(&self.client)
+                    .handle_incoming_message(Arc::clone(node))
+                    .await;
+                self.client
+                    .outbound_flush
+                    .flush(&*self.client.runtime, std::time::Duration::from_secs(5))
+                    .await;
+            }
+        });
+    }
+
+    /// Gracefully terminate all active chat lane workers by closing their channels,
+    /// awaiting their termination, and clearing the lane cache.
+    pub fn close_lanes(&self) {
+        self.runtime.block_on(async {
+            let lanes: Vec<ChatLane> = self
+                .client
+                .chat_lanes
+                .fold_entries(Vec::new(), |mut acc, _k, lane| {
+                    acc.push(lane.clone());
+                    acc
+                })
+                .await;
+
+            for lane in &lanes {
+                lane.queue_tx.close();
+            }
+
+            self.client.chat_lanes.clear().await;
+
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                for lane in &lanes {
+                    let _guard = lane.worker_running.lock().await;
+                }
+            })
+            .await
+            .expect("lane shutdown timed out");
+        });
+    }
+
+    /// How many `Event::Messages` batches reached the subscriber so far.
+    pub fn messages_delivered(&self) -> u64 {
+        self.counter.delivered.load(Ordering::Relaxed)
+    }
+
+    /// Number of active lanes currently present in `client.chat_lanes`.
+    pub fn active_lanes(&self) -> u64 {
+        self.runtime.block_on(async {
+            self.client
+                .chat_lanes
+                .fold_entries(0u64, |count, _k, _v| count + 1)
+                .await
+        })
+    }
+
+    /// Reference to the underlying client.
+    pub fn client(&self) -> &Arc<Client> {
+        &self.client
+    }
+
+    fn next_message_id(&self) -> String {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        format!("3EB0BENCH{n:011}")
+    }
+}
+
+async fn build_multilane_receive_fixture(
+    num_lanes: usize,
+) -> (
+    Arc<Client>,
+    Arc<Client>,
+    Jid,
+    Vec<Jid>,
+    Vec<wacore::libsignal::protocol::SenderKeyName>,
+    Arc<MessageCounter>,
+    wacore::types::events::Subscription,
+) {
+    use wacore::libsignal::protocol::create_sender_key_distribution_message;
+    use wacore::types::jid::{JidExt, make_sender_key_name};
+
+    let backend = Arc::new(InMemoryBackend::new());
+    let pm = Arc::new(
+        PersistenceManager::new(backend)
+            .await
+            .expect("persistence manager"),
+    );
+    let (client, _sync_rx) = Client::new(
+        Arc::new(TokioRuntime),
+        pm,
+        Arc::new(SinkTransportFactory),
+        Arc::new(NoopHttpClient),
+        None,
+    )
+    .await;
+
+    let own_pn = Jid::new(OWN_USER, Server::Pn);
+    let own_lid = Jid::new("100000000000001", Server::Lid);
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetId(Some(own_pn.clone())))
+        .await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(own_lid)))
+        .await;
+
+    seed_registry(&client, PEER_USER, &[0]).await;
+    seed_registry(&client, OWN_USER, &[0, 1]).await;
+
+    let peer_jid = Jid::new(PEER_USER, Server::Pn);
+    let peer = establish_acknowledged_session(&client, &peer_jid).await;
+
+    let mut groups = Vec::with_capacity(num_lanes);
+    let mut group_sender_keys = Vec::with_capacity(num_lanes);
+
+    let mut adapter = peer.signal_adapter();
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+
+    for i in 0..num_lanes {
+        let group: Jid = format!("12036300000{i:05}@g.us")
+            .parse()
+            .expect("valid group jid");
+        let group_sender_key = make_sender_key_name(&group, &peer_jid.to_protocol_address());
+        let skdm = create_sender_key_distribution_message(
+            &group_sender_key,
+            &mut adapter.sender_key_store,
+            &mut rng,
+        )
+        .await
+        .expect("peer sender key");
+
+        client
+            .handle_sender_key_distribution_message(
+                &group,
+                &peer_jid,
+                &format!("bench-skdm-{i}"),
+                skdm.serialized(),
+            )
+            .await;
+
+        groups.push(group);
+        group_sender_keys.push(group_sender_key);
+    }
+    drop(adapter);
+
+    let counter = Arc::new(MessageCounter {
+        delivered: portable_atomic::AtomicU64::new(0),
+    });
+    let subscription = client
+        .subscribe_handler(Arc::clone(&counter) as Arc<dyn wacore::types::events::EventHandler>);
+
+    install_offline_socket(&client).await;
+    settle_signal_flush_worker(&client).await;
+
+    (
+        client,
+        peer,
+        peer_jid,
+        groups,
+        group_sender_keys,
+        counter,
+        subscription,
+    )
 }
 
 /// The decoded form the read loop produces: marshalled and decoded back, so

@@ -476,6 +476,17 @@ impl VideoRtpStream {
         true
     }
 
+    /// Set the timestamp for the next access unit from a source-provided RTP capture clock.
+    pub(crate) fn set_timestamp(&mut self, timestamp: u32) -> bool {
+        if let Some(last) = self.last_sent_timestamp
+            && timestamp.wrapping_sub(last) > 0x8000_0000
+        {
+            return false;
+        }
+        self.timestamp = timestamp;
+        true
+    }
+
     /// Header for the next packet of the current AU; `last_in_au` sets the
     /// marker and moves the timestamp to the next AU. `media_frame_info` is an
     /// encoded-frame property and must be identical on every fragment of the AU.
@@ -666,6 +677,19 @@ mod tests {
         );
         assert!(!stream.set_timestamp_stride(0));
         assert!(VideoRtpStream::new(0x1122_3344, 0).is_none());
+    }
+
+    #[test]
+    fn video_source_timestamp_accepts_repeat_and_wrap_but_rejects_late() {
+        let mut stream = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS).unwrap();
+        let _ = stream.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_DELTA);
+        assert!(stream.set_timestamp(0));
+        assert!(stream.set_timestamp(50));
+        assert!(!stream.set_timestamp(u32::MAX - 50));
+        let mut wrapped = VideoRtpStream::new(0x1122_3344, VIDEO_TS_STRIDE_15FPS).unwrap();
+        assert!(wrapped.set_timestamp(u32::MAX - 100));
+        let _ = wrapped.next_video_packet(true, VIDEO_MEDIA_FRAME_INFO_DELTA);
+        assert!(wrapped.set_timestamp(50));
     }
 
     #[test]

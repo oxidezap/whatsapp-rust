@@ -102,14 +102,14 @@ Responsabilidades finais:
 
 O oráculo completo, seus testes/exemplos, as specs e os documentos MLOW foram
 movidos para `tools/` e `agent_docs/` deste repositório. O executor usa
-`unwasm-core` (`e00274cbd4bb228cddaf0f164fafd1f2a194ffee`) como dependência
+`unwasm-core` (`db80811118806128167d045938ffbaf82b363afd`) como dependência
 Git somente no tooling; ele permanece fora de `default-members`. O `whatspec`
 ganhou a crate `wa-store`, aprovada com o workspace, para expor
 locks/restauração sem puxar os extratores.
 
 O audit ampliado ao tooling encontrou quatro advisories no Wasmtime 41 que o
 gate anterior, limitado ao pacote runtime, não enxergava. `wa-store` também foi
-repinado em `62c9b59e1910e50870d195373e636b4ddcf25ca3`, com ureq 3.4,
+repinado em `963b21803b9f6541440b15b05e77291856fd0f0f`, com ureq 3.4,
 rustls 0.23.43 e a provider OxiTLS/RustCrypto 0.3.0. O oráculo passa a
 usar Wasmtime 48.0.1, a versão estável atual, e o workflow audita explicitamente
 o grafo de `tools/xtask` além do grafo de produção.

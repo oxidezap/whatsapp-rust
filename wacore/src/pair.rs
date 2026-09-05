@@ -1,3 +1,7 @@
+use crate::adv::{
+    ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE, ADV_PREFIX_ACCOUNT_SIGNATURE, AccountSignatureMessage,
+    DeviceSignatureKind,
+};
 use crate::companion_reg::CompanionWebClientType;
 use crate::libsignal::crypto::aes_256_gcm_encrypt;
 use crate::libsignal::protocol::{KeyPair, PublicKey};
@@ -11,12 +15,6 @@ use wacore_binary::{Jid, SERVER_JID};
 use wacore_binary::{Node, NodeRef};
 use waproto::whatsapp as wa;
 use waproto::whatsapp::ADVEncryptionType;
-
-// Prefixes from whatsmeow/pair.go, crucial for signature verification
-const ADV_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 0];
-const ADV_PREFIX_DEVICE_SIGNATURE_GENERATE: &[u8] = &[6, 1];
-const ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 5];
-const ADV_HOSTED_PREFIX_DEVICE_SIGNATURE_VERIFICATION: &[u8] = &[6, 6];
 
 // Aliases for HMAC-SHA256
 type HmacSha256 = Hmac<Sha256>;
@@ -176,7 +174,6 @@ impl PairUtils {
         device_state: &DeviceState,
         device_identity_bytes: &[u8],
     ) -> Result<(Vec<u8>, u32), PairCryptoError> {
-        // 1. Unmarshal HMAC container and verify HMAC
         let hmac_container = waproto::codec::adv_signed_device_identity_hmac_decode(
             device_identity_bytes,
         )
@@ -186,7 +183,6 @@ impl PairUtils {
             source: e.into(),
         })?;
 
-        // Determine if this is a hosted account
         let is_hosted_account = hmac_container.account_type == Some(ADVEncryptionType::HOSTED);
 
         let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(&device_state.adv_secret_key)
@@ -195,7 +191,6 @@ impl PairUtils {
             text: "internal-error",
             source: e.into(),
         })?;
-        // Get details and hmac as slices, handling potential None values
         let details_bytes = hmac_container
             .details
             .as_deref()
@@ -214,7 +209,7 @@ impl PairUtils {
             })?;
 
         if is_hosted_account {
-            mac.update(ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE);
+            mac.update(&ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE);
         }
         mac.update(details_bytes);
         // adv_secret is shared with the primary out-of-band (QR string or
@@ -227,7 +222,6 @@ impl PairUtils {
             source: anyhow::anyhow!("ADV signed-device-identity HMAC verification failed"),
         })?;
 
-        // 2. Unmarshal inner container and verify account signature
         let mut signed_identity = waproto::codec::adv_signed_device_identity_decode(details_bytes)
             .map_err(|e| PairCryptoError {
                 code: 500,
@@ -243,23 +237,27 @@ impl PairUtils {
             .account_signature
             .as_deref()
             .unwrap_or_default();
-        let inner_details_bytes = signed_identity
-            .details
-            .as_deref()
-            .unwrap_or_default()
-            .to_vec();
+        let inner_details_bytes =
+            signed_identity
+                .details
+                .as_deref()
+                .ok_or_else(|| PairCryptoError {
+                    code: 500,
+                    text: "internal-error",
+                    source: anyhow::anyhow!("ADVSignedDeviceIdentity missing details"),
+                })?;
+        let identity_details = waproto::codec::adv_device_identity_decode(inner_details_bytes)
+            .map_err(|e| PairCryptoError {
+                code: 500,
+                text: "internal-error",
+                source: e.into(),
+            })?;
 
-        let account_sig_prefix = if is_hosted_account {
-            ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE
-        } else {
-            ADV_PREFIX_ACCOUNT_SIGNATURE
-        };
-
-        let msg_to_verify = Self::concat_bytes(&[
-            account_sig_prefix,
-            &inner_details_bytes,
-            device_state.identity_key.public_key.public_key_bytes(),
-        ]);
+        let msg_to_verify = AccountSignatureMessage::new(
+            inner_details_bytes,
+            &device_state.identity_key.public_key,
+            identity_details.device_type,
+        );
 
         let account_public_key = PublicKey::from_djb_public_key_bytes(account_sig_key_bytes)
             .map_err(|e| PairCryptoError {
@@ -268,7 +266,7 @@ impl PairUtils {
                 source: e.into(),
             })?;
 
-        if !account_public_key.verify_signature(&msg_to_verify, account_sig_bytes) {
+        if !account_public_key.verify_signature(msg_to_verify.as_bytes(), account_sig_bytes) {
             return Err(PairCryptoError {
                 code: 401,
                 text: "signature-mismatch",
@@ -276,19 +274,15 @@ impl PairUtils {
             });
         }
 
-        // 3. Generate our device signature
-        let device_sig_prefix = if is_hosted_account {
-            ADV_HOSTED_PREFIX_DEVICE_SIGNATURE_VERIFICATION
-        } else {
-            ADV_PREFIX_DEVICE_SIGNATURE_GENERATE
-        };
+        let key_index = identity_details.key_index.ok_or_else(|| PairCryptoError {
+            code: 500,
+            text: "internal-error",
+            source: anyhow::anyhow!("ADVDeviceIdentity missing key_index"),
+        })?;
 
-        let msg_to_sign = Self::concat_bytes(&[
-            device_sig_prefix,
-            &inner_details_bytes,
-            device_state.identity_key.public_key.public_key_bytes(),
-            account_sig_key_bytes,
-        ]);
+        // WAWebAdvSignatureApi.generateDeviceSignature always signs a regular companion.
+        let msg_to_sign =
+            msg_to_verify.for_device(&account_public_key, DeviceSignatureKind::Companion);
         let device_signature = device_state
             .identity_key
             .private_key
@@ -300,20 +294,6 @@ impl PairUtils {
             })?;
         signed_identity.device_signature = Some(device_signature.to_vec());
 
-        // 4. Unmarshal final details to get key_index
-        let identity_details = waproto::codec::adv_device_identity_decode(&inner_details_bytes)
-            .map_err(|e| PairCryptoError {
-                code: 500,
-                text: "internal-error",
-                source: e.into(),
-            })?;
-        let key_index = identity_details.key_index.ok_or_else(|| PairCryptoError {
-            code: 500,
-            text: "internal-error",
-            source: anyhow::anyhow!("ADVDeviceIdentity missing key_index"),
-        })?;
-
-        // 5. Marshal the modified signed_identity to send back
         let self_signed_identity_bytes =
             waproto::codec::adv_signed_device_identity_to_vec(&signed_identity);
 
@@ -401,7 +381,7 @@ impl PairUtils {
 
         let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(adv_key)
             .map_err(|e| anyhow::anyhow!("Failed to init HMAC for master pairing: {e}"))?;
-        mac.update(ADV_PREFIX_ACCOUNT_SIGNATURE);
+        mac.update(&ADV_PREFIX_ACCOUNT_SIGNATURE);
         mac.update(dut_identity_pub);
         mac.update(master_ephemeral.public_key.public_key_bytes());
         let account_signature = mac.finalize().into_bytes();
@@ -454,17 +434,13 @@ impl PairUtils {
             .children([response_content])
             .build()
     }
-
-    /// Helper to concatenate multiple byte slices into a single Vec.
-    fn concat_bytes(slices: &[&[u8]]) -> Vec<u8> {
-        slices.iter().flat_map(|s| s.iter().cloned()).collect()
-    }
 }
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use crate::adv::test_util::{self, ENCRYPTION_TYPES, TEST_PN};
     use buffa::Message;
     use rand::RngExt;
 
@@ -683,9 +659,6 @@ mod tests {
         }
     }
 
-    /// Synthesize a signed pair-success payload whose HMAC is keyed by
-    /// `adv_secret_for_hmac`. Mirrors the verifier's hosted/E2EE branching
-    /// for both the account signature and the outer HMAC.
     fn build_pair_success_payload(
         state: &DeviceState,
         adv_secret_for_hmac: &[u8; 32],
@@ -700,56 +673,339 @@ mod tests {
         is_hosted: bool,
         key_index: Option<u32>,
     ) -> Vec<u8> {
-        use buffa::Message;
-        use waproto::whatsapp as wa;
-
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let account_kp = KeyPair::generate(&mut rng);
         let account_type = if is_hosted {
             ADVEncryptionType::HOSTED
         } else {
             ADVEncryptionType::E2EE
         };
-        let inner = wa::ADVDeviceIdentity {
-            raw_id: Some(1),
-            timestamp: Some(0),
-            key_index,
-            account_type: Some(account_type),
-            device_type: Some(account_type),
-        }
+        build_pair_success_payload_with_types(
+            state,
+            adv_secret_for_hmac,
+            Some(account_type),
+            wa::ADVDeviceIdentity {
+                raw_id: Some(1),
+                timestamp: Some(0),
+                key_index,
+                account_type: Some(account_type),
+                device_type: Some(account_type),
+            },
+        )
+    }
+
+    fn build_pair_success_payload_with_types(
+        state: &DeviceState,
+        adv_secret_for_hmac: &[u8; 32],
+        account_type: Option<ADVEncryptionType>,
+        details: wa::ADVDeviceIdentity,
+    ) -> Vec<u8> {
+        use buffa::Message;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account_kp = KeyPair::generate(&mut rng);
+        let mut inner = details.encode_to_vec();
+        // Preserve unknown signed fields byte-for-byte, including noncanonical field order.
+        inner.splice(0..0, [0xa0, 0x06, 0x01]);
+        let signed = test_util::signed_identity(
+            &account_kp,
+            &state.identity_key,
+            &inner,
+            test_util::account_prefix(details.device_type),
+            None,
+            true,
+        )
         .encode_to_vec();
-        let account_sig_prefix: &[u8] = if is_hosted {
-            ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE
-        } else {
-            ADV_PREFIX_ACCOUNT_SIGNATURE
-        };
-        let mut to_sign = Vec::new();
-        to_sign.extend_from_slice(account_sig_prefix);
-        to_sign.extend_from_slice(&inner);
-        to_sign.extend_from_slice(state.identity_key.public_key.public_key_bytes());
-        let sig = account_kp
-            .private_key
-            .calculate_signature(&to_sign, &mut rng)
-            .unwrap();
-        let signed = wa::ADVSignedDeviceIdentity {
-            details: Some(inner),
-            account_signature_key: Some(account_kp.public_key.public_key_bytes().to_vec()),
-            account_signature: Some(sig.to_vec()),
-            device_signature: None,
-        }
-        .encode_to_vec();
-        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(adv_secret_for_hmac).unwrap();
-        if is_hosted {
-            mac.update(ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE);
+        wrap_pair_success(adv_secret_for_hmac, account_type, signed)
+    }
+
+    fn wrap_pair_success(
+        secret: &[u8; 32],
+        account_type: Option<ADVEncryptionType>,
+        signed: Vec<u8>,
+    ) -> Vec<u8> {
+        use buffa::Message;
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(secret).unwrap();
+        if account_type == Some(ADVEncryptionType::HOSTED) {
+            mac.update(&[6, 5]);
         }
         mac.update(&signed);
-        let hmac_bytes = mac.finalize().into_bytes().to_vec();
         wa::ADVSignedDeviceIdentityHMAC {
             details: Some(signed),
-            hmac: Some(hmac_bytes),
-            account_type: Some(account_type),
+            hmac: Some(mac.finalize().into_bytes().to_vec()),
+            account_type,
         }
         .encode_to_vec()
+    }
+
+    #[test]
+    fn pairing_account_and_device_types_are_independent() {
+        use buffa::Message;
+        let state = dummy_device_state();
+        let types = ENCRYPTION_TYPES;
+        for outer in types {
+            for account_type in types {
+                for device_type in types {
+                    let payload = build_pair_success_payload_with_types(
+                        &state,
+                        &state.adv_secret_key,
+                        outer,
+                        wa::ADVDeviceIdentity {
+                            key_index: Some(42),
+                            account_type,
+                            device_type,
+                            ..Default::default()
+                        },
+                    );
+                    let (result, index) = PairUtils::do_pair_crypto(&state, &payload)
+                        .unwrap_or_else(|e| panic!("outer={outer:?} account={account_type:?} device={device_type:?}: {e}"));
+                    assert_eq!(index, 42);
+                    let container =
+                        waproto::codec::adv_signed_device_identity_hmac_decode(&payload).unwrap();
+                    let mut wrong_account_type = container.clone();
+                    wrong_account_type.account_type =
+                        Some(if outer == Some(ADVEncryptionType::HOSTED) {
+                            ADVEncryptionType::E2EE
+                        } else {
+                            ADVEncryptionType::HOSTED
+                        });
+                    let err =
+                        PairUtils::do_pair_crypto(&state, &wrong_account_type.encode_to_vec())
+                            .unwrap_err();
+                    assert_eq!((err.code, err.text), (401, "hmac-mismatch"));
+                    let original = waproto::codec::adv_signed_device_identity_decode(
+                        container.details.as_deref().unwrap(),
+                    )
+                    .unwrap();
+                    let signed =
+                        waproto::codec::adv_signed_device_identity_decode(&result).unwrap();
+                    assert_eq!(signed.details, original.details);
+                    assert_eq!(signed.account_signature, original.account_signature);
+                    assert_eq!(signed.account_signature_key, original.account_signature_key);
+                    assert_eq!(
+                        crate::adv::validate_adv_with_identity_key(
+                            &result,
+                            state
+                                .identity_key
+                                .public_key
+                                .public_key_bytes()
+                                .try_into()
+                                .unwrap(),
+                            None,
+                            &Jid::pn_device(TEST_PN, 1),
+                        ),
+                        crate::adv::AdvValidation::Valid
+                    );
+                    let details = signed.details.as_deref().unwrap();
+                    let account_key = signed.account_signature_key.as_deref().unwrap();
+                    let identity = state.identity_key.public_key.public_key_bytes();
+                    let signature = signed.device_signature.as_deref().unwrap();
+                    assert!(state.identity_key.public_key.verify_signature(
+                        &[&[6, 1], details, identity, account_key].concat(),
+                        signature,
+                    ));
+                    assert!(!state.identity_key.public_key.verify_signature(
+                        &[&[6, 6], details, identity, account_key].concat(),
+                        signature,
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pairing_preserves_signed_details_when_signature_buffers_spill() {
+        let state = dummy_device_state();
+        let account = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+        let mut details = wa::ADVDeviceIdentity {
+            key_index: Some(0),
+            device_type: Some(ADVEncryptionType::HOSTED),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        // Unknown field 100 with a 512-byte payload forces both signature buffers to spill.
+        details.extend_from_slice(&[0xa2, 0x06, 0x80, 0x04]);
+        details.extend_from_slice(&[0xab; 512]);
+        let original = test_util::signed_identity(
+            &account,
+            &state.identity_key,
+            &details,
+            &[6, 5],
+            None,
+            true,
+        );
+        let payload = wrap_pair_success(&state.adv_secret_key, None, original.encode_to_vec());
+        let (result, index) = PairUtils::do_pair_crypto(&state, &payload).unwrap();
+        assert_eq!(index, 0);
+        let signed = waproto::codec::adv_signed_device_identity_decode(&result).unwrap();
+        assert_eq!(signed.details.as_deref(), Some(details.as_slice()));
+        assert!(
+            state.identity_key.public_key.verify_signature(
+                &[
+                    &[6, 1],
+                    details.as_slice(),
+                    state.identity_key.public_key.public_key_bytes(),
+                    account.public_key.public_key_bytes()
+                ]
+                .concat(),
+                signed.device_signature.as_deref().unwrap(),
+            )
+        );
+        assert_eq!(
+            crate::adv::validate_adv_with_identity_key(
+                &result,
+                state
+                    .identity_key
+                    .public_key
+                    .public_key_bytes()
+                    .try_into()
+                    .unwrap(),
+                None,
+                &Jid::pn_device(TEST_PN, 1),
+            ),
+            crate::adv::AdvValidation::Valid
+        );
+    }
+
+    #[test]
+    fn pairing_rejects_authenticated_invalid_identity() {
+        use buffa::Message;
+        #[derive(Debug, Clone, Copy)]
+        enum Corruption {
+            Signature,
+            Details,
+            KeyLength,
+            MissingSignature,
+            MalformedDetails,
+            MissingDetails,
+            SubstitutedKey,
+        }
+        let state = dummy_device_state();
+        for hosted in [false, true] {
+            let payload = build_pair_success_payload(&state, &state.adv_secret_key, hosted);
+            let container =
+                waproto::codec::adv_signed_device_identity_hmac_decode(&payload).unwrap();
+            let original = waproto::codec::adv_signed_device_identity_decode(
+                container.details.as_deref().unwrap(),
+            )
+            .unwrap();
+            for case in [
+                Corruption::Signature,
+                Corruption::Details,
+                Corruption::KeyLength,
+                Corruption::MissingSignature,
+                Corruption::MalformedDetails,
+                Corruption::MissingDetails,
+                Corruption::SubstitutedKey,
+            ] {
+                let mut signed = original.clone();
+                let (code, text) = match case {
+                    Corruption::Signature => {
+                        signed.account_signature.as_mut().unwrap()[0] ^= 1;
+                        (401, "signature-mismatch")
+                    }
+                    Corruption::Details => {
+                        signed.details.as_mut().unwrap()[2] ^= 1;
+                        (401, "signature-mismatch")
+                    }
+                    Corruption::KeyLength => {
+                        signed.account_signature_key = Some(vec![0; 31]);
+                        (401, "invalid-key")
+                    }
+                    Corruption::MissingSignature => {
+                        signed.account_signature = None;
+                        (401, "signature-mismatch")
+                    }
+                    Corruption::MalformedDetails => {
+                        signed.details = Some(vec![0xff]);
+                        (500, "internal-error")
+                    }
+                    Corruption::MissingDetails => {
+                        signed.details = None;
+                        (500, "internal-error")
+                    }
+                    Corruption::SubstitutedKey => {
+                        let key = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
+                        signed.account_signature_key =
+                            Some(key.public_key.public_key_bytes().to_vec());
+                        (401, "signature-mismatch")
+                    }
+                };
+                let payload = wrap_pair_success(
+                    &state.adv_secret_key,
+                    container.account_type,
+                    signed.encode_to_vec(),
+                );
+                let err = PairUtils::do_pair_crypto(&state, &payload)
+                    .expect_err("authenticated invalid identity");
+                assert_eq!(
+                    (err.code, err.text),
+                    (code, text),
+                    "hosted={hosted} case={case:?}"
+                );
+            }
+            let other = dummy_device_state();
+            let other = DeviceState {
+                adv_secret_key: state.adv_secret_key,
+                ..other
+            };
+            let err =
+                PairUtils::do_pair_crypto(&other, &payload).expect_err("identity substitution");
+            assert_eq!(err.text, "signature-mismatch");
+        }
+    }
+
+    #[test]
+    fn pairing_does_not_try_an_alternate_account_signature_prefix() {
+        use buffa::Message;
+        let state = dummy_device_state();
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        for outer in [ADVEncryptionType::E2EE, ADVEncryptionType::HOSTED] {
+            for device_type in [ADVEncryptionType::E2EE, ADVEncryptionType::HOSTED] {
+                let details = wa::ADVDeviceIdentity {
+                    key_index: Some(0),
+                    device_type: Some(device_type),
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let wrong_prefix: &[u8; 2] = if device_type == ADVEncryptionType::HOSTED {
+                    &[6, 0]
+                } else {
+                    &[6, 5]
+                };
+                let signed = test_util::signed_identity(
+                    &account,
+                    &state.identity_key,
+                    &details,
+                    wrong_prefix,
+                    None,
+                    true,
+                );
+                let payload =
+                    wrap_pair_success(&state.adv_secret_key, Some(outer), signed.encode_to_vec());
+                let err = PairUtils::do_pair_crypto(&state, &payload).unwrap_err();
+                assert_eq!((err.code, err.text), (401, "signature-mismatch"));
+            }
+        }
+    }
+
+    #[test]
+    fn pairing_authenticates_container_before_decoding_inner_identity() {
+        use buffa::Message;
+        let state = dummy_device_state();
+        for account_type in [
+            None,
+            Some(ADVEncryptionType::E2EE),
+            Some(ADVEncryptionType::HOSTED),
+        ] {
+            let payload = wrap_pair_success(&state.adv_secret_key, account_type, vec![0xff]);
+            let err = PairUtils::do_pair_crypto(&state, &payload).unwrap_err();
+            assert_eq!((err.code, err.text), (500, "internal-error"));
+            let mut container =
+                waproto::codec::adv_signed_device_identity_hmac_decode(&payload).unwrap();
+            container.hmac.as_mut().unwrap()[0] ^= 1;
+            let err = PairUtils::do_pair_crypto(&state, &container.encode_to_vec()).unwrap_err();
+            assert_eq!((err.code, err.text), (401, "hmac-mismatch"));
+        }
     }
 
     #[test]

@@ -927,6 +927,10 @@ impl VideoPipeline {
         self.rtp.set_timestamp_stride(ts_stride)
     }
 
+    pub(crate) fn set_video_timestamp(&mut self, timestamp: u32) -> bool {
+        self.rtp.set_timestamp(timestamp)
+    }
+
     /// Same answering-device rekey as [`MediaPipeline::rekey_recv`]; the video
     /// recv keys are derived from the identical participant id, so they go
     /// stale together with the audio ones. The in-flight reassembly state is
@@ -2404,6 +2408,31 @@ mod tests {
         // Empty AU produces no packets rather than a marker-only ghost.
         let mut ok = VideoPipeline::new(&video_params(&call_key, lid, lid)).unwrap();
         assert!(ok.protect_video(&[]).is_empty());
+    }
+
+    #[test]
+    fn timed_video_input_preserves_a_capture_gap_in_rtp() {
+        let call_key: Vec<u8> = (0u8..32).collect();
+        let lid = "222222222222222:0@lid";
+        let stride = 6_000;
+        let mut pipe = VideoPipeline::new(&VideoPipelineParams {
+            call_key: &call_key,
+            self_lid: lid,
+            peer_lid: lid,
+            ssrc: 0x1234_5678,
+            ts_stride: stride,
+            warp_mi_tag_len: WARP_MI_TAG_LEN,
+        })
+        .unwrap();
+        let au = [0, 0, 0, 1, 0x65, 1, 2, 3];
+        let first = parse_rtp_header(&pipe.protect_video(&au).pop().unwrap()).unwrap();
+        assert_eq!(first.timestamp, 0);
+
+        // The source captured one AU at the missing timestamp. Supplying the next capture clock
+        // value keeps the RTP timeline at 3 * stride even though only two AUs reach this pipeline.
+        pipe.set_video_timestamp(stride * 3);
+        let after_gap = parse_rtp_header(&pipe.protect_video(&au).pop().unwrap()).unwrap();
+        assert_eq!(after_gap.timestamp, stride * 3);
     }
 
     // The esp32 control/crypto plane. An embedded consumer with no UDP, no codec, and no audio

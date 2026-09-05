@@ -76,6 +76,7 @@ pub(crate) fn encode_server_cert_chain(c: &CachedServerCertChain) -> Vec<u8> {
     ServerCertChain {
         intermediate: buffa::MessageField::some(NoiseCert::from(&c.intermediate)),
         leaf: buffa::MessageField::some(NoiseCert::from(&c.leaf)),
+        signature_verified: c.signature_verified,
     }
     .encode_to_vec()
 }
@@ -91,6 +92,9 @@ pub(crate) fn decode_server_cert_chain(bytes: &[u8]) -> Result<CachedServerCertC
     Ok(CachedServerCertChain {
         intermediate: noise_cert_from_wire(intermediate)?,
         leaf: noise_cert_from_wire(leaf)?,
+        // Absent in rows written before the field existed: untrusted, so
+        // the next connect falls back to one XX.
+        signature_verified: w.signature_verified,
     })
 }
 
@@ -165,20 +169,23 @@ mod tests {
 
     #[test]
     fn server_cert_chain_roundtrips() {
-        let chain = CachedServerCertChain {
-            intermediate: CachedNoiseCert {
-                key: [0xAB; 32],
-                not_before: 1_700_000_000,
-                not_after: 1_900_000_000,
-            },
-            leaf: CachedNoiseCert {
-                key: [0xCD; 32],
-                not_before: 1_700_000_500,
-                not_after: 1_899_999_500,
-            },
-        };
-        let decoded = decode_server_cert_chain(&encode_server_cert_chain(&chain)).unwrap();
-        assert_eq!(decoded, chain);
+        for signature_verified in [true, false] {
+            let chain = CachedServerCertChain {
+                intermediate: CachedNoiseCert {
+                    key: [0xAB; 32],
+                    not_before: 1_700_000_000,
+                    not_after: 1_900_000_000,
+                },
+                leaf: CachedNoiseCert {
+                    key: [0xCD; 32],
+                    not_before: 1_700_000_500,
+                    not_after: 1_899_999_500,
+                },
+                signature_verified,
+            };
+            let decoded = decode_server_cert_chain(&encode_server_cert_chain(&chain)).unwrap();
+            assert_eq!(decoded, chain);
+        }
     }
 
     #[test]
@@ -195,6 +202,7 @@ mod tests {
                 not_before: 1,
                 not_after: 2,
             }),
+            signature_verified: false,
         }
         .encode_to_vec();
         assert!(decode_server_cert_chain(&bytes).is_err());

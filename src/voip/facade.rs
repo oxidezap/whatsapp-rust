@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use log::warn;
+use portable_atomic::{AtomicU64, Ordering as PortableOrdering};
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 use wacore::stanza::call::{
@@ -37,7 +38,7 @@ use wacore::voip::{
     AudioCodec, AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection,
     CallEngine, CallEvent, CallPhase, CodecDecisionSource, EncodedAudioFrame, GroupEngineConfig,
     KeyframeUrgency, VideoControl, VideoControlReceiver, VideoControlSender, VideoFrame,
-    VideoUpgradeToken, run_call, video_control_channel,
+    VideoInput, VideoUpgradeToken, run_call, video_control_channel,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
@@ -48,7 +49,7 @@ use crate::voip::audio::{
     AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource, WA_FRAME_SAMPLES,
 };
 use crate::voip::driver::RandTxIds;
-use crate::voip::video::{VideoSink, VideoSource};
+use crate::voip::video::{TimedVideoFrame, VideoSink, VideoSource};
 
 enum AudioEndpoints {
     Pcm {
@@ -3180,7 +3181,7 @@ async fn attach_engine(
 
     // Video plumbing: the drive loop always gets the channels; the endpoints attach now (a
     // `.video()` call) or later (an upgrade via CallHandle::start_video/accept_video).
-    let (video_in_rx, video_ctl_rx) = video_shared.take_receivers();
+    let (video_in_rx, timed_video_in_rx, video_ctl_rx) = video_shared.take_receivers();
     let (video_out_tx, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
     // Forwarder from the drive loop to whatever sink is CURRENTLY attached (swappable mid-call).
     // Ends when the drive loop drops its video_out sender; moved into the media task like mic_feed.
@@ -3230,6 +3231,7 @@ async fn attach_engine(
         events: ev_tx,
         rekey: rekey_rx,
         video_in: video_in_rx,
+        timed_video_in: Some(timed_video_in_rx),
         video_out: video_out_tx,
         video_ctl: video_ctl_rx,
         group_ctl,
@@ -3292,28 +3294,39 @@ pub(crate) struct VideoShared {
     ctl_tx: VideoControlSender,
     /// Outbound AUs into the drive loop; a `VideoFeed` pumps the attached source into it.
     in_tx: async_channel::Sender<Vec<u8>>,
+    /// Optional capture-timestamped AUs, kept separate so the legacy source channel remains ABI
+    /// compatible for callers that only provide a fixed cadence.
+    timed_in_tx: async_channel::Sender<VideoInput>,
     /// The CURRENTLY attached sink (swappable: upgrade attaches, downgrade clears). The
     /// out-forwarder task reads it per frame.
     sink_slot: Arc<std::sync::Mutex<Option<async_channel::Sender<VideoFrame>>>>,
     /// The live source feed, aborted on downgrade/replacement.
     feed: std::sync::Mutex<Option<wacore::runtime::AbortHandle>>,
+    generation: AtomicU64,
     /// Receiver halves parked until `attach_engine` hands them to the drive loop.
     receivers: std::sync::Mutex<Option<VideoReceivers>>,
 }
 
 /// The drive-loop halves of the video channels: (outbound AUs, plane control).
-type VideoReceivers = (async_channel::Receiver<Vec<u8>>, VideoControlReceiver);
+type VideoReceivers = (
+    async_channel::Receiver<Vec<u8>>,
+    async_channel::Receiver<VideoInput>,
+    VideoControlReceiver,
+);
 
 impl VideoShared {
     fn new() -> Self {
         let (ctl_tx, ctl_rx) = video_control_channel();
         let (in_tx, in_rx) = async_channel::bounded::<Vec<u8>>(VIDEO_IN_CHANNEL_CAP);
+        let (timed_in_tx, timed_in_rx) = async_channel::bounded::<VideoInput>(VIDEO_IN_CHANNEL_CAP);
         Self {
             ctl_tx,
             in_tx,
+            timed_in_tx,
             sink_slot: Arc::new(std::sync::Mutex::new(None)),
             feed: std::sync::Mutex::new(None),
-            receivers: std::sync::Mutex::new(Some((in_rx, ctl_rx))),
+            generation: AtomicU64::new(0),
+            receivers: std::sync::Mutex::new(Some((in_rx, timed_in_rx, ctl_rx))),
         }
     }
 
@@ -3326,7 +3339,11 @@ impl VideoShared {
             .take()
             .unwrap_or_else(|| {
                 let (_ctl_tx, ctl_rx) = video_control_channel();
-                (async_channel::bounded(1).1, ctl_rx)
+                (
+                    async_channel::bounded(1).1,
+                    async_channel::bounded(1).1,
+                    ctl_rx,
+                )
             })
     }
 
@@ -3343,30 +3360,48 @@ impl VideoShared {
         sink: &Arc<dyn VideoSink>,
         ended: Arc<EndedFlag>,
     ) {
+        // Retire queued AUs before replacing the source. The driver drains legacy input and
+        // generation filtering retires timestamped frames that race with the control.
+        let timed_source = source.timed_frames();
+        let old = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(old) = old {
+            old.abort();
+            self.send_control(if timed_source.is_some() {
+                VideoControl::Disable
+            } else {
+                VideoControl::DisableKeepLegacy
+            });
+        }
+        let generation = self
+            .generation
+            .fetch_add(1, PortableOrdering::Relaxed)
+            .wrapping_add(1);
+        self.send_control(VideoControl::SetInputGeneration(generation));
         // Queue timing before the feed can make an AU ready. The driver's control arm is biased
         // ahead of media, so the first RTP timestamp already uses the source's cadence.
         self.send_control(VideoControl::SetTimestampStride(
             source.rtp_timestamp_stride(),
         ));
         *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.playout());
-        let feed = VideoFeed {
-            source: source.clone(),
-            src: source.frames(),
-            out: self.in_tx.clone(),
-            ended,
+        let handle = if let Some(src) = timed_source {
+            let feed = TimedVideoFeed {
+                source: source.clone(),
+                src,
+                out: self.timed_in_tx.clone(),
+                ended,
+                generation,
+            };
+            client.runtime.spawn(Box::pin(feed.run()))
+        } else {
+            let feed = VideoFeed {
+                source: source.clone(),
+                src: source.frames(),
+                out: self.in_tx.clone(),
+                ended,
+            };
+            client.runtime.spawn(Box::pin(feed.run()))
         };
-        let handle = client.runtime.spawn(Box::pin(feed.run()));
-        // Abort outside the guard: edition 2024 keeps an `if let` scrutinee temporary
-        // alive for the whole matching arm, and a `Runtime` that cancels synchronously
-        // would drop the task inline and re-enter this non-reentrant mutex.
-        let old = self
-            .feed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(handle);
-        if let Some(old) = old {
-            old.abort();
-        }
+        *self.feed.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
     /// Release the endpoints (downgrade / refused upgrade): the source feed is aborted, the sink is
@@ -3419,6 +3454,51 @@ struct VideoFeed {
     src: async_channel::Receiver<Vec<u8>>,
     out: async_channel::Sender<Vec<u8>>,
     ended: Arc<EndedFlag>,
+}
+
+struct TimedVideoFeed {
+    source: Arc<dyn VideoSource>,
+    src: async_channel::Receiver<TimedVideoFrame>,
+    out: async_channel::Sender<VideoInput>,
+    ended: Arc<EndedFlag>,
+    generation: u64,
+}
+
+impl TimedVideoFeed {
+    async fn run(self) {
+        use futures::FutureExt;
+        let _source = self.source;
+        loop {
+            let ended = self.ended.wait().fuse();
+            let recv = self.src.recv().fuse();
+            futures::pin_mut!(ended, recv);
+            let frame = futures::select_biased! {
+                _ = ended => break,
+                frame = recv => match frame {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                },
+            };
+            let ended = self.ended.wait().fuse();
+            let send = self
+                .out
+                .send(VideoInput {
+                    data: frame.data,
+                    timestamp: frame.timestamp,
+                    generation: self.generation,
+                })
+                .fuse();
+            futures::pin_mut!(ended, send);
+            futures::select_biased! {
+                _ = ended => break,
+                res = send => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl VideoFeed {
@@ -10532,6 +10612,20 @@ mod tests {
         timestamp_stride: u32,
     }
 
+    struct TimedCaptureSource {
+        frames: async_channel::Receiver<TimedVideoFrame>,
+    }
+
+    impl VideoSource for TimedCaptureSource {
+        fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
+            async_channel::bounded(1).1
+        }
+
+        fn timed_frames(&self) -> Option<async_channel::Receiver<TimedVideoFrame>> {
+            Some(self.frames.clone())
+        }
+    }
+
     impl VideoSource for TimedVideoSource {
         fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
             self.frames.clone()
@@ -11353,7 +11447,7 @@ mod tests {
     async fn video_feed_forwards_and_stops_on_ended() {
         let client = make_client().await;
         let shared = VideoShared::new();
-        let (in_rx, ctl_rx) = shared.take_receivers();
+        let (in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
         let (src_tx, src_rx) = async_channel::unbounded::<Vec<u8>>();
         let sink: Arc<dyn VideoSink> = {
             let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
@@ -11367,6 +11461,10 @@ mod tests {
         let ended = Arc::new(EndedFlag::default());
         shared.attach_endpoints(&client, &source, &sink, ended.clone());
 
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(1)
+        );
         assert_eq!(
             ctl_rx.recv().await.unwrap(),
             VideoControl::SetTimestampStride(4500)
@@ -11390,6 +11488,91 @@ mod tests {
             after.is_err(),
             "an AU sent after ended must not be forwarded (feed stopped)"
         );
+    }
+
+    #[tokio::test]
+    async fn timed_video_feed_forwards_capture_timestamp() {
+        let client = make_client().await;
+        let shared = VideoShared::new();
+        let (_legacy_rx, timed_rx, ctl_rx) = shared.take_receivers();
+        let (src_tx, src_rx) = async_channel::unbounded::<TimedVideoFrame>();
+        let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
+        let source_impl = Arc::new(TimedCaptureSource { frames: src_rx });
+        assert!(
+            source_impl.frames().is_closed(),
+            "timed sources may leave legacy input closed"
+        );
+        let source: Arc<dyn VideoSource> = source_impl;
+        let sink: Arc<dyn VideoSink> = Arc::new(vout_tx);
+        shared.attach_endpoints(&client, &source, &sink, Arc::new(EndedFlag::default()));
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(1)
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(6000)
+        );
+        src_tx
+            .send(TimedVideoFrame {
+                data: vec![1, 2, 3],
+                timestamp: 12_000,
+            })
+            .await
+            .unwrap();
+        let forwarded = timed_rx.recv().await.unwrap();
+        assert_eq!(forwarded.data, vec![1, 2, 3]);
+        assert_eq!(forwarded.timestamp, 12_000);
+        assert_eq!(forwarded.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_video_reattach_keeps_new_first_au_before_disable_is_consumed() {
+        let client = make_client().await;
+        let shared = VideoShared::new();
+        let (in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
+        let (old_tx, old_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (new_tx, new_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
+        let sink: Arc<dyn VideoSink> = Arc::new(vout_tx);
+        let old: Arc<dyn VideoSource> = Arc::new(TimedVideoSource {
+            frames: old_rx,
+            timestamp_stride: 6000,
+        });
+        let new: Arc<dyn VideoSource> = Arc::new(TimedVideoSource {
+            frames: new_rx,
+            timestamp_stride: 6000,
+        });
+        let ended = Arc::new(EndedFlag::default());
+        shared.attach_endpoints(&client, &old, &sink, ended.clone());
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(1)
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(6000)
+        );
+        shared.attach_endpoints(&client, &new, &sink, ended);
+        new_tx.send(vec![7, 7, 7]).await.unwrap();
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::DisableKeepLegacy
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(2)
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(6000)
+        );
+        let got = tokio::time::timeout(Duration::from_secs(2), in_rx.recv())
+            .await
+            .expect("new AU must not be drained")
+            .expect("channel open");
+        assert_eq!(got, vec![7, 7, 7]);
+        drop(old_tx);
     }
 
     /// Runs a caller-supplied hook inline on `abort()`, standing in for a `Runtime` that
@@ -11506,7 +11689,7 @@ mod tests {
     fn video_shared_second_take_yields_closed_channels() {
         let shared = VideoShared::new();
         let _live = shared.take_receivers();
-        let (in_rx, ctl_rx) = shared.take_receivers();
+        let (in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
         assert!(in_rx.is_closed());
         assert!(ctl_rx.is_closed());
     }
@@ -11514,7 +11697,7 @@ mod tests {
     #[test]
     fn video_control_queue_preserves_state_and_coalesces_orientation() {
         let shared = VideoShared::new();
-        let (_in_rx, ctl_rx) = shared.take_receivers();
+        let (_in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
         shared.send_control(VideoControl::Disable);
         for orientation in 0..100u8 {
             shared.send_control(VideoControl::SetOrientation(orientation % 4));

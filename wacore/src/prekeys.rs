@@ -370,6 +370,7 @@ impl PreKeyUtils {
                     di,
                     &identity_key_array,
                     account_identity,
+                    jid,
                 ) {
                     crate::adv::AdvValidation::Valid => {}
                     crate::adv::AdvValidation::Invalid => {
@@ -715,6 +716,77 @@ mod tests {
     }
 
     #[test]
+    fn prekey_fetch_validates_mixed_and_hosted_adv_chains() {
+        use crate::adv::test_util;
+        use buffa::Message;
+        use waproto::whatsapp as wa;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let account_key = account.public_key.public_key_bytes();
+        for (jid, hosted_device) in test_util::device_cases() {
+            let bundle = PreKeyBundle::new(
+                1,
+                u32::from(jid.device).into(),
+                Some((1u32.into(), device.public_key)),
+                2u32.into(),
+                device.public_key,
+                vec![0; 64],
+                IdentityKey::new(device.public_key),
+            )
+            .unwrap();
+            for device_type in test_util::ENCRYPTION_TYPES {
+                let details = wa::ADVDeviceIdentity {
+                    key_index: Some(0),
+                    device_type,
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let acct_prefix = test_util::account_prefix(device_type);
+                for include_account_key in [false, true] {
+                    for correct_device_prefix in [false, true] {
+                        let dev_prefix: &[u8; 2] = if hosted_device == correct_device_prefix {
+                            &[6, 6]
+                        } else {
+                            &[6, 1]
+                        };
+                        let signed = test_util::signed_identity(
+                            &account,
+                            &device,
+                            &details,
+                            acct_prefix,
+                            Some(dev_prefix),
+                            include_account_key,
+                        );
+                        let user = PreKeyBundleUserNode::from_bundle(
+                            jid.clone(),
+                            &bundle,
+                            Some(signed.encode_to_vec()),
+                        )
+                        .unwrap()
+                        .into_node();
+                        let response = NodeBuilder::new("iq")
+                            .children([NodeBuilder::new("list").children([user]).build()])
+                            .build();
+                        let fallbacks =
+                            HashMap::from([(jid.clone(), account_key.try_into().unwrap())]);
+                        let outcome = PreKeyUtils::parse_prekeys_response(
+                            &response.as_node_ref(),
+                            &fallbacks,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            outcome.bundles.contains_key(&jid),
+                            correct_device_prefix,
+                            "jid={jid} device_type={device_type:?} in_blob={include_account_key}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parse_skips_companion_bundle_with_invalid_device_identity() {
         let companion = Jid::lid_device("100000012345678", 33);
         let bundles = parse_one(companion.clone(), Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
@@ -738,7 +810,7 @@ mod tests {
         // device-identity without account_signature_key, signatures over the
         // bundle's identity key (create_mock_bundle's identity is unrelated, but
         // the NoAccountKey path short-circuits before signature checks anyway).
-        let di = trimmed_device_identity(&account, &device, b"details");
+        let di = trimmed_device_identity(&account, &device, b"\x18\x01");
         let bundles = parse_one(companion.clone(), Some(di));
         assert!(
             bundles.contains_key(&companion),

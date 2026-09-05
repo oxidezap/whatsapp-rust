@@ -305,6 +305,56 @@ fn wrapping_variants_preserve_their_typed_source() {
     );
 }
 
+/// The core error is non-exhaustive, so the facade's fallback cannot be
+/// reached with a currently constructible unknown variant. Guard the real
+/// conversion arm structurally until a future core variant makes it runnable.
+#[test]
+fn iq_conversion_fallback_preserves_the_core_error_source() {
+    let source =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/request.rs"))
+            .expect("read request conversion");
+    let file = syn::parse_file(&source).expect("parse request conversion");
+    let _method = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Impl(item) => Some(item),
+            _ => None,
+        })
+        .flat_map(|item| item.items.iter())
+        .find_map(|item| match item {
+            syn::ImplItem::Fn(method) if method.sig.ident == "from_response" => Some(method),
+            _ => None,
+        })
+        .expect("find IqError::from_response");
+    let body = &_method.block;
+    let match_expr = body.stmts.iter().find_map(|statement| match statement {
+        syn::Stmt::Expr(syn::Expr::Match(expr), _) => Some(expr),
+        _ => None,
+    });
+    let match_expr = match_expr.expect("from_response must match the core error");
+    let fallback = match_expr
+        .arms
+        .iter()
+        .find(|arm| matches!(&arm.pat, syn::Pat::Ident(pattern) if pattern.ident == "other"))
+        .expect("from_response must retain a fallback arm for the non-exhaustive core enum");
+    let syn::Expr::Call(outer) = fallback.body.as_ref() else {
+        panic!("fallback must construct the facade error");
+    };
+    let syn::Expr::Path(outer_path) = outer.func.as_ref() else {
+        panic!("fallback must call a named facade variant");
+    };
+    assert_eq!(
+        outer_path.path.segments.last().unwrap().ident,
+        "Unclassified"
+    );
+    assert_eq!(outer.args.len(), 1);
+    let syn::Expr::Path(source_path) = &outer.args[0] else {
+        panic!("fallback must pass the captured core error directly");
+    };
+    assert_eq!(source_path.path.segments.last().unwrap().ident, "other");
+}
+
 // ── The reported symptom ────────────────────────────────────────────────────
 
 /// Regression for the original report: a `403` from a group operation was

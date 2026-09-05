@@ -12,12 +12,9 @@
 //! growable and used to pass unseen, which is how the biggest per-client
 //! retention in the library — the inbound commit batch, which accumulates to
 //! 4 MiB of decoded protos — stayed out of the report. So the scan also resolves
-//! each field's crate-local types one level, aliases expanded, and looks at
-//! *their* fields.
-//!
-//! One level, not transitively: `self_weak: Weak<Client>` makes the graph
-//! reach every collection from every field, and a guard that flags everything
-//! flags nothing.
+//! each field's crate-local types transitively, aliases expanded, and looks at
+//! *their* fields. Weak edges are cut while parsing the type expression, so a
+//! `Weak<Client>` cannot make the graph reach every collection from every field.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +30,49 @@ const GROWABLE: &[&str] = &[
     "Vec",
     "VecDeque",
 ];
+
+const EXTERNAL_PATH_ROOTS: &[&str] = &[
+    "async_channel",
+    "bytes",
+    "event_listener",
+    "futures",
+    "std",
+    "tokio",
+];
+
+fn is_local_path_root(root: &str) -> bool {
+    static ROOTS: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            let mut roots = std::collections::HashSet::from(["wacore".to_owned()]);
+            let mut files = Vec::new();
+            crate_sources(&manifest_path("src"), &mut files);
+            crate_sources(&manifest_path("wacore/src"), &mut files);
+            for path in files {
+                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    roots.insert(stem.to_owned());
+                }
+                if let Ok(text) = std::fs::read_to_string(&path)
+                    && let Ok(file) = syn::parse_file(&text)
+                {
+                    fn modules(items: &[syn::Item], roots: &mut std::collections::HashSet<String>) {
+                        for item in items {
+                            if let syn::Item::Mod(module) = item {
+                                roots.insert(module.ident.to_string());
+                                if let Some((_, nested)) = &module.content {
+                                    modules(nested, roots);
+                                }
+                            }
+                        }
+                    }
+                    modules(&file.items, &mut roots);
+                }
+            }
+            roots
+        })
+        .contains(root)
+}
 
 /// Growable fields the report deliberately does not walk. Each entry states why
 /// it is not a per-session memory question; a new cache does NOT belong here.
@@ -77,6 +117,11 @@ const EXEMPT: &[(&str, &str)] = &[
          response, replaced wholesale on refresh",
     ),
     (
+        "media_conn_flight",
+        "at most one in-flight refresh result; a newer sequence replaces the older \
+         response before publication, so it cannot grow with workload",
+    ),
+    (
         "ab_props",
         "server props are filtered against the compile-time `WATCHED` interest \
          set at parse time, so the map is bounded by that list and not by what \
@@ -86,6 +131,17 @@ const EXEMPT: &[(&str, &str)] = &[
         "pair_code_state",
         "one in-flight pairing attempt; its `Vec` is the server's pairing ref, \
          a handful of bytes, not a collection of entries",
+    ),
+    (
+        "sent_frame_tap",
+        "the tap aliases the CoreEventBus handler table already counted as core_event_handlers; \
+         charging this Arc alias again would double-count the shared table",
+    ),
+    (
+        "persistence_manager",
+        "holds one live Device and one read snapshot of the fixed-shape persisted record; this \
+         guard does not estimate their Vec capacities (edge routing and NCT salt) or closure/lock \
+         overhead, and does not treat backend storage as process RAM",
     ),
 ];
 
@@ -103,8 +159,22 @@ fn read(relative: &str) -> String {
 fn type_idents(ty: &syn::Type, out: &mut Vec<String>) {
     match ty {
         syn::Type::Path(path) => {
+            if let Some(qself) = &path.qself {
+                // Visit the qualified receiver in `<Foo<Vec<_>> as Trait>::Output`; its generic
+                // arguments remain owned edges even though the projection itself has no local
+                // definition to traverse.
+                type_idents(&qself.ty, out);
+            }
+            let Some(segment) = path.path.segments.last() else {
+                return;
+            };
             for segment in &path.path.segments {
-                out.push(segment.ident.to_string());
+                // A generic carried by an intermediate path segment still owns its argument
+                // types, as in Foo<Vec<u8>>::Output. Preserve those edges even though only the
+                // final path segment is a named type candidate.
+                if segment.ident == "Weak" {
+                    continue;
+                }
                 if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                     for arg in &args.args {
                         if let syn::GenericArgument::Type(inner) = arg {
@@ -113,6 +183,24 @@ fn type_idents(ty: &syn::Type, out: &mut Vec<String>) {
                     }
                 }
             }
+            let final_name = segment.ident.to_string();
+            let local_path = path.path.segments.first().is_some_and(|first| {
+                first.ident == "crate" || first.ident == "self" || first.ident == "super"
+            });
+            let name = if path.path.segments.len() == 1
+                || local_path
+                || GROWABLE.contains(&final_name.as_str())
+            {
+                final_name
+            } else {
+                path.path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>()
+                    .join("::")
+            };
+            out.push(name);
         }
         syn::Type::Reference(r) => type_idents(&r.elem, out),
         syn::Type::Paren(p) => type_idents(&p.elem, out),
@@ -218,29 +306,26 @@ fn crate_type_fields() -> (HashMap<String, Vec<String>>, HashMap<String, Vec<Str
 fn resolve_aliases(idents: &[String], aliases: &HashMap<String, Vec<String>>) -> Vec<String> {
     idents
         .iter()
-        .flat_map(|ident| match aliases.get(ident) {
-            // A self-referential spelling (`type Cache = Cache<..>`) would
-            // otherwise expand forever without adding anything.
-            Some(target) if target != std::slice::from_ref(ident) => target.clone(),
-            _ => vec![ident.clone()],
+        .flat_map(|ident| {
+            let target = aliases.get(ident).or_else(|| {
+                let root = ident.split("::").next().unwrap_or(ident);
+                let short = ident.rsplit("::").next().unwrap_or(ident);
+                (is_local_path_root(root) && !EXTERNAL_PATH_ROOTS.contains(&root))
+                    .then(|| aliases.get(short))?
+            });
+            match target {
+                // A self-referential spelling (`type Cache = Cache<..>`) would
+                // otherwise expand forever without adding anything.
+                Some(target) if target != std::slice::from_ref(ident) => target.clone(),
+                _ => vec![ident.clone()],
+            }
         })
         .collect()
 }
 
-/// Collapse `A -> B -> … -> Vec` so every alias maps directly to what it
-/// bottoms out in.
-///
-/// Iterates to a fixed point rather than a fixed number of rounds: a chain
-/// longer than the loop would otherwise leave its tail unresolved, and the
-/// resulting miss looks exactly like "this field holds no collection".
-///
-/// Each round dedups, which is what makes the iteration terminate rather than
-/// blow up. Without it an alias naming another one twice (`type Pair = (Foo,
-/// Foo)`) doubles its ident list every round — with the whole of `wacore` in the
-/// map that is an OOM, not a slow test. Since the question asked of the result
-/// is only *which* idents are reachable, multiplicity carries no information,
-/// so dropping it costs nothing and bounds each list by the number of distinct
-/// idents in the tree.
+/// Collapse aliases with a memoized DFS. Each reachable alias is expanded once, so repeated DAG
+/// edges do not multiply work, while a cycle contributes its name as an opaque boundary and still
+/// allows sibling terminal collections to escape.
 fn flatten_alias_chains(aliases: &mut HashMap<String, Vec<String>>) {
     fn dedup(mut idents: Vec<String>) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
@@ -248,38 +333,102 @@ fn flatten_alias_chains(aliases: &mut HashMap<String, Vec<String>>) {
         idents
     }
 
-    for idents in aliases.values_mut() {
-        *idents = dedup(std::mem::take(idents));
+    fn target_for<'a>(
+        name: &str,
+        aliases: &'a HashMap<String, Vec<String>>,
+    ) -> Option<(&'a str, &'a Vec<String>)> {
+        aliases
+            .get_key_value(name)
+            .map(|(key, value)| (key.as_str(), value))
+            .or_else(|| {
+                let root = name.split("::").next().unwrap_or(name);
+                let short = name.rsplit("::").next().unwrap_or(name);
+                (is_local_path_root(root) && !EXTERNAL_PATH_ROOTS.contains(&root))
+                    .then(|| aliases.get_key_value(short))?
+                    .map(|(key, value)| (key.as_str(), value))
+            })
     }
-    loop {
-        let snapshot = aliases.clone();
-        let mut changed = false;
-        for idents in aliases.values_mut() {
-            let expanded = dedup(resolve_aliases(idents, &snapshot));
-            if *idents != expanded {
-                *idents = expanded;
-                changed = true;
+
+    let snapshot = aliases.clone();
+    for (name, targets) in aliases.iter_mut() {
+        let original = targets.clone();
+        let mut queue = original.into_iter().collect::<Vec<_>>();
+        let mut seen_aliases = std::collections::HashSet::new();
+        let mut terminals = Vec::new();
+        while let Some(target) = queue.pop() {
+            let Some((key, nested)) = target_for(&target, &snapshot) else {
+                terminals.push(target);
+                continue;
+            };
+            if !seen_aliases.insert(key.to_owned()) {
+                continue;
             }
+            queue.extend(nested.iter().cloned());
         }
-        if !changed {
-            return;
-        }
+        let terminals = dedup(terminals);
+        *targets = if terminals.is_empty() {
+            vec![name.clone()]
+        } else {
+            terminals
+        };
     }
 }
 
-/// How a field reaches a growable: directly in its own type, or through one
-/// crate-local type it names. Returned for the failure message, so a new
-/// candidate says which collection put it on the list.
+/// How a field reaches a growable: directly in its own type, or through crate-local types it
+/// names. The traversal is deliberately ownership-aware: `Weak` is a liveness edge rather than
+/// retained ownership, and qualified external definitions stop after their direct fields instead
+/// of merging an implementation graph into the Client scan. Other local wrappers, including
+/// `Arc`, are followed so shared state still gets attributed to the field that retains it.
 fn growable_path(idents: &[String], defs: &HashMap<String, Vec<String>>) -> Option<String> {
     if let Some(direct) = idents.iter().find(|i| GROWABLE.contains(&i.as_str())) {
         return Some(direct.clone());
     }
-    for ident in idents {
-        let Some(fields) = defs.get(ident) else {
-            continue;
-        };
+
+    fn visit(
+        ident: &str,
+        defs: &HashMap<String, Vec<String>>,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Option<String> {
+        // Weak<T> points at a live allocation without retaining its owned collections. Qualified
+        // paths remain distinct from crate-local names, so an external graph root is not merged
+        // into an unrelated local type with the same final segment.
+        let root = ident.split("::").next().unwrap_or(ident);
+        if (ident.contains("::") && !is_local_path_root(root))
+            || ident == "Weak"
+            || !seen.insert(ident.to_owned())
+        {
+            return None;
+        }
+        let short = ident.rsplit("::").next().unwrap_or(ident);
+        let fields = defs.get(ident).or_else(|| defs.get(short))?;
         if let Some(inner) = fields.iter().find(|i| GROWABLE.contains(&i.as_str())) {
             return Some(format!("{ident}::{inner}"));
+        }
+        fields
+            .iter()
+            .find_map(|inner| visit(inner, defs, seen).map(|path| format!("{ident}::{path}")))
+    }
+
+    fn local_candidate<'a>(ident: &'a str, defs: &HashMap<String, Vec<String>>) -> Option<&'a str> {
+        let root = ident.split("::").next().unwrap_or(ident);
+        let short = ident.rsplit("::").next().unwrap_or(ident);
+        if !ident.contains("::") {
+            return None;
+        }
+        if !is_local_path_root(root)
+            || EXTERNAL_PATH_ROOTS.contains(&root)
+            || !defs.contains_key(short)
+        {
+            return None;
+        }
+        Some(ident)
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for ident in idents {
+        let candidate = local_candidate(ident, defs).unwrap_or(ident);
+        if let Some(path) = visit(candidate, defs, &mut seen) {
+            return Some(path);
         }
     }
     None
@@ -532,8 +681,22 @@ fn a_newtype_or_alias_does_not_hide_its_collection() {
 
     // A type that holds no collection stays off the list, so the resolution is
     // selective rather than flagging every crate-local field type.
-    assert_eq!(path("SentFrameTap"), None);
+    assert!(
+        path("SentFrameTap").is_some(),
+        "SentFrameTap's shared handler snapshot must remain visible to the scanner"
+    );
     assert_eq!(path("NotAClientFieldTypeAnywhere"), None);
+}
+
+#[test]
+fn scanned_wacore_core_event_bus_reaches_nested_handlers() {
+    let (defs, _) = crate_type_fields();
+    let path = growable_path(&["wacore::types::events::CoreEventBus".to_owned()], &defs)
+        .expect("the scanned CoreEventBus must reach its handler snapshot Vec");
+    assert!(path.contains("Vec"), "unexpected CoreEventBus path: {path}");
+    let core = growable_path(&["wacore::client::CoreClient".to_owned()], &defs)
+        .expect("the scanned CoreClient must resolve its nested state graph");
+    assert!(core.contains("Vec"), "unexpected CoreClient path: {core}");
 }
 
 /// An alias chain longer than any fixed number of rounds still bottoms out.
@@ -564,13 +727,179 @@ fn alias_chains_resolve_to_a_fixed_point() {
 
     flatten_alias_chains(&mut aliases);
 
-    assert_eq!(aliases["A"], ["Arc", "Vec", "u8"]);
+    let mut expanded_a = aliases["A"].clone();
+    expanded_a.sort();
+    assert_eq!(expanded_a, ["Arc", "Vec", "u8"]);
     assert_eq!(aliases["Cache"], ["Cache"]);
+    let mut resolved = resolve_aliases(&["A".to_string()], &aliases);
+    resolved.sort();
     assert_eq!(
-        resolve_aliases(&["A".to_string()], &aliases),
+        resolved,
         ["Arc", "Vec", "u8"],
         "a field naming the head of the chain must reach the Vec at its end"
     );
+}
+
+#[test]
+fn alias_cycles_close_without_oscillation_and_keep_terminals() {
+    let mut aliases = HashMap::from([
+        ("A".to_owned(), vec!["B".to_owned()]),
+        ("B".to_owned(), vec!["C".to_owned(), "Vec".to_owned()]),
+        ("C".to_owned(), vec!["A".to_owned()]),
+    ]);
+    flatten_alias_chains(&mut aliases);
+    assert!(aliases.values().all(|targets| targets.len() <= 2));
+    assert!(
+        aliases
+            .values()
+            .all(|targets| targets.contains(&"Vec".to_owned()))
+    );
+    assert_eq!(resolve_aliases(&["A".to_owned()], &aliases), aliases["A"]);
+}
+
+#[test]
+fn alias_dag_and_qualified_chain_close_with_each_root_reaching_vec() {
+    let mut aliases = HashMap::new();
+    for index in 0..30 {
+        let next = if index == 29 {
+            "Vec".to_owned()
+        } else {
+            format!("A{}", index + 1)
+        };
+        aliases.insert(format!("A{index}"), vec![next.clone(), next.clone(), next]);
+    }
+    aliases.insert(
+        "QualifiedA".to_owned(),
+        vec!["sessions::QualifiedB".to_owned()],
+    );
+    aliases.insert("QualifiedB".to_owned(), vec!["QualifiedC".to_owned()]);
+    aliases.insert("QualifiedC".to_owned(), vec!["A0".to_owned()]);
+    flatten_alias_chains(&mut aliases);
+    assert!(
+        aliases
+            .values()
+            .all(|targets| targets.contains(&"Vec".to_owned()))
+    );
+}
+
+#[test]
+fn nested_types_follow_owned_edges_without_following_back_references() {
+    let defs = HashMap::from([
+        ("Direct".to_owned(), vec!["Vec".to_owned()]),
+        ("Wrapper".to_owned(), vec!["Direct".to_owned()]),
+        (
+            "Outer".to_owned(),
+            vec!["Arc".to_owned(), "Wrapper".to_owned()],
+        ),
+        ("CycleA".to_owned(), vec!["CycleB".to_owned()]),
+        ("CycleB".to_owned(), vec!["CycleA".to_owned()]),
+        ("Shared".to_owned(), vec!["HashMap".to_owned()]),
+    ]);
+
+    assert_eq!(
+        growable_path(&["Direct".to_owned()], &defs).as_deref(),
+        Some("Direct::Vec")
+    );
+    assert_eq!(
+        growable_path(&["Wrapper".to_owned()], &defs).as_deref(),
+        Some("Wrapper::Direct::Vec")
+    );
+    assert_eq!(
+        growable_path(&["Outer".to_owned()], &defs).as_deref(),
+        Some("Outer::Wrapper::Direct::Vec")
+    );
+    assert_eq!(growable_path(&["CycleA".to_owned()], &defs), None);
+    assert_eq!(
+        growable_path(
+            &["Weak".to_owned(), "Client".to_owned(), "Shared".to_owned()],
+            &defs
+        )
+        .as_deref(),
+        Some("Shared::HashMap")
+    );
+    assert_eq!(
+        growable_path(&["Shared".to_owned()], &defs).as_deref(),
+        Some("Shared::HashMap")
+    );
+}
+
+#[test]
+fn aliases_keep_owned_siblings_beside_weak_references() {
+    let defs = HashMap::from([("Shared".to_owned(), vec!["HashMap".to_owned()])]);
+    let aliases = HashMap::from([(
+        "WeakAndCache".to_owned(),
+        vec!["Weak".to_owned(), "Client".to_owned(), "Shared".to_owned()],
+    )]);
+    let idents = resolve_aliases(&["WeakAndCache".to_owned()], &aliases);
+    assert_eq!(
+        growable_path(&idents, &defs).as_deref(),
+        Some("Shared::HashMap")
+    );
+}
+
+#[test]
+fn parsed_weak_edges_do_not_hide_or_claim_siblings() {
+    let defs = HashMap::from([("Shared".to_owned(), vec!["HashMap".to_owned()])]);
+    let parse = |source: &str| syn::parse_str::<syn::Type>(source).expect("fixture type");
+    let idents = |source: &str| {
+        let mut out = Vec::new();
+        type_idents(&parse(source), &mut out);
+        out
+    };
+
+    assert_eq!(growable_path(&idents("Weak<Shared>"), &defs), None);
+    assert_eq!(
+        growable_path(&idents("(Weak<Shared>, Vec<u8>)"), &defs),
+        Some("Vec".to_owned())
+    );
+    assert_eq!(
+        growable_path(&idents("Arc<Shared>"), &defs).as_deref(),
+        Some("Shared::HashMap")
+    );
+}
+
+#[test]
+fn parsed_qualified_paths_keep_containers_and_local_types_visible() {
+    let defs = HashMap::from([
+        ("Wrapper".to_owned(), vec!["Vec".to_owned()]),
+        ("EnsureRegistry".to_owned(), vec!["HashMap".to_owned()]),
+        ("Event".to_owned(), vec!["Vec".to_owned()]),
+    ]);
+    let parse = |source: &str| syn::parse_str::<syn::Type>(source).expect("fixture type");
+    let idents = |source: &str| {
+        let mut out = Vec::new();
+        type_idents(&parse(source), &mut out);
+        out
+    };
+
+    assert_eq!(
+        growable_path(&idents("std::collections::HashMap<u8, u8>"), &defs),
+        Some("HashMap".to_owned())
+    );
+    assert_eq!(
+        growable_path(&idents("crate::nested::Wrapper"), &defs).as_deref(),
+        Some("Wrapper::Vec")
+    );
+    assert_eq!(
+        growable_path(&idents("sessions::EnsureRegistry"), &defs).as_deref(),
+        Some("sessions::EnsureRegistry::HashMap")
+    );
+    assert_eq!(
+        growable_path(&idents("foreign::Wrapper"), &defs),
+        None,
+        "an unlisted foreign namespace must not fall back to a local Wrapper definition"
+    );
+    assert_eq!(
+        growable_path(&idents("Foo<Vec<u8>>::Output"), &defs),
+        Some("Vec".to_owned())
+    );
+    assert_eq!(
+        growable_path(&idents("<Foo<Vec<u8>> as Trait>::Output"), &defs),
+        Some("Vec".to_owned())
+    );
+    let relative = idents("sessions::EnsureRegistry");
+    assert_eq!(relative, ["sessions::EnsureRegistry"]);
+    assert_eq!(growable_path(&idents("event_listener::Event"), &defs), None);
 }
 
 /// An exemption must name a field that still exists, so the list cannot rot

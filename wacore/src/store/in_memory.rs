@@ -11,7 +11,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::Hash;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-util"))]
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::appstate::hash::HashState;
@@ -197,6 +197,10 @@ pub struct InMemoryBackend {
     /// ratchet advance cannot be persisted.
     #[cfg(any(test, feature = "test-util"))]
     fail_session_writes: AtomicBool,
+    /// If set, write this many session rows then fail the batch. Test hook for
+    /// retrying a backend that reports an error after partial progress.
+    #[cfg(any(test, feature = "test-util"))]
+    fail_session_after: AtomicUsize,
     /// When set, `put_sender_keys_batch` fails. Test hook: the sender-key
     /// counterpart of `fail_session_writes` (wire gate must survive a failed
     /// flush).
@@ -222,6 +226,8 @@ impl InMemoryBackend {
             #[cfg(any(test, feature = "test-util"))]
             fail_session_writes: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
+            fail_session_after: AtomicUsize::new(usize::MAX),
+            #[cfg(any(test, feature = "test-util"))]
             fail_sender_key_writes: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
             signed_prekey_read_gate: std::sync::Mutex::new(None),
@@ -246,6 +252,14 @@ impl InMemoryBackend {
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_fail_session_writes(&self, fail: bool) {
         self.fail_session_writes.store(fail, Ordering::Relaxed);
+    }
+
+    /// Write `prefix` rows from the next session batch, then return an error.
+    /// Pass `None` to disable the partial-progress fault.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_fail_session_after_prefix(&self, prefix: Option<usize>) {
+        self.fail_session_after
+            .store(prefix.unwrap_or(usize::MAX), Ordering::Relaxed);
     }
 
     /// Make every subsequent `put_sender_keys_batch` fail (or stop failing).
@@ -346,12 +360,21 @@ impl SignalStore for InMemoryBackend {
         }
         let mut state = self.state.lock().await;
         state.sessions.reserve(sessions.len());
-        for (address, session) in sessions {
+        for (index, (address, session)) in sessions.iter().enumerate() {
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                if index >= self.fail_session_after.load(Ordering::Relaxed) {
+                    return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                        "put_sessions_batch failed after partial progress (test hook)",
+                    )));
+                }
+            }
             if let Some(stored) = state.sessions.get_mut(address.as_ref()) {
                 *stored = session.clone();
             } else {
                 state.sessions.insert(address.to_string(), session.clone());
             }
+            let _ = index;
         }
         Ok(())
     }

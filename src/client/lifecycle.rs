@@ -3,6 +3,45 @@
 use super::*;
 use wacore::net::DisconnectReason;
 
+/// Why [`Client::run`] stopped supervising the session.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RunCompletionReason {
+    /// A terminal shutdown was requested through `disconnect`, `logout`, or drop.
+    ShutdownRequested,
+    /// The current connection ended while automatic reconnection was disabled.
+    /// Logout may publish this observation while its best-effort deregistration
+    /// request is still in flight; the terminal shutdown latch follows that IQ.
+    AutoReconnectDisabled {
+        /// The final reader outcome, when a connection was established.
+        connection: Option<DisconnectReason>,
+        /// The final connect failure, when no connection was established.
+        connect_error: Option<ConnectError>,
+        /// Terminal stream or connect-failure code, when the reader captured one.
+        protocol_error: Option<ProtocolTerminalReason>,
+    },
+    /// The supervision flag was observed cleared without a classified terminal
+    /// verdict. The source may be a concurrent teardown or an internal stop,
+    /// so this carries no claim about the protocol cause.
+    Stopped,
+    /// Another task already owns the client's read loop, whether it is the
+    /// supervision loop or a directly driven connection.
+    AlreadyRunning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProtocolTerminalReason {
+    StreamErrorCode(u16),
+    ConnectFailure(ConnectFailureReason),
+    Conflict,
+}
+
+struct ConnectionEnd {
+    unexpected: Option<DisconnectReason>,
+    terminal_reason: Option<ProtocolTerminalReason>,
+}
+
 /// `authenticated_generation` when no connection has published one.
 ///
 /// Not zero: that is a real generation, the one a freshly built client is on,
@@ -17,6 +56,26 @@ impl Drop for Client {
 }
 
 impl Client {
+    fn clear_protocol_terminal_reason(&self) {
+        *self
+            .protocol_terminal_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    pub(crate) fn record_protocol_terminal_reason(&self, reason: ProtocolTerminalReason) {
+        *self
+            .protocol_terminal_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
+    }
+
+    fn take_protocol_terminal_reason(&self) -> Option<ProtocolTerminalReason> {
+        self.protocol_terminal_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
     /// WA Web `resetDelay: 30000` — only after a connection has stayed up this
     /// long is the reconnect backoff counter reset to its base.
     pub(crate) const STABLE_CONNECTION_RESET: Duration = Duration::from_secs(30);
@@ -403,6 +462,7 @@ impl Client {
             lifecycle,
             #[cfg(feature = "plugins")]
             plugin_host,
+            noise_cert_policy,
         } = extensions;
         let mut unique_id_bytes = [0u8; 2];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut unique_id_bytes);
@@ -446,8 +506,10 @@ impl Client {
             is_connected: AtomicBool::new(false),
             send_active_receipts: AtomicU32::new(0),
             ik_handshake_failures: AtomicU32::new(0),
+            noise_cert_policy,
             shutdown_notifier: wacore::runtime::ShutdownNotifier::new(),
             connection_shutdown: std::sync::Mutex::new(wacore::runtime::ShutdownNotifier::new()),
+            protocol_terminal_reason: std::sync::Mutex::new(None),
             #[cfg(feature = "client-lifecycle")]
             lifecycle,
             #[cfg(feature = "plugins")]
@@ -688,31 +750,45 @@ impl Client {
     // keepalive-loop span. Identity (lid/pn) attribution comes from the
     // per-operation spans (send/request), which record it themselves.
     pub async fn run(self: &Arc<Self>) {
+        let _ = self.run_with_reason().await;
+    }
+
+    /// Drive the session until supervision ends and report the observed
+    /// completion reason. A policy stop can race another teardown operation,
+    /// so this value describes the branch that ended this run, not a durable
+    /// account of every operation still in flight.
+    /// This additive companion preserves the unit-returning [`Self::run`]
+    /// contract for existing callers.
+    pub async fn run_with_reason(self: &Arc<Self>) -> RunCompletionReason {
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle
             && !lifecycle.wait_until_active().await
         {
             warn!("Client `run` rejected before construction completed.");
-            return;
+            return RunCompletionReason::ShutdownRequested;
         }
         let shutdown = self.shutdown_signal();
         if shutdown.is_fired() {
             warn!("Client `run` called after shutdown.");
-            return;
+            return RunCompletionReason::ShutdownRequested;
         }
         if self.is_running.swap(true, Ordering::SeqCst) {
             warn!("Client `run` method called while already running.");
-            return;
+            return RunCompletionReason::AlreadyRunning;
         }
         if shutdown.is_fired() {
             self.is_running.store(false, Ordering::SeqCst);
-            return;
+            return RunCompletionReason::ShutdownRequested;
         }
         // Reconnects are counted at iteration start: every pass after the
         // first is an attempt actually being made. Counting at the branches
         // below would also count a final pass that never reconnects (a user
         // disconnect() flips is_running while the branch runs).
         let mut first_connect = true;
+        let mut last_connect_error: Option<ConnectError>;
+        let mut last_disconnect_reason: Option<DisconnectReason>;
+        let mut last_protocol_reason: Option<ProtocolTerminalReason>;
+        let mut completion = RunCompletionReason::Stopped;
         while self.is_running.load(Ordering::Relaxed) {
             // The one place a pause is honoured, and it is before the attempt
             // rather than after one fails: a `pause()` can land during a
@@ -730,6 +806,12 @@ impl Client {
                 self.stats.record_reconnect();
             }
             first_connect = false;
+            last_connect_error = None;
+            last_disconnect_reason = None;
+            *self
+                .protocol_terminal_reason
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             self.expected_disconnect.store(false, Ordering::Relaxed);
 
             match self.connect().await {
@@ -756,10 +838,14 @@ impl Client {
                         }
                         _ => error!("Failed to connect: {connect_err:#}. Will retry..."),
                     }
+                    last_connect_error = Some(connect_err);
+                    last_protocol_reason = self.take_protocol_terminal_reason();
                 }
                 Ok(connection) => {
                     wacore::telemetry::connect("ok");
-                    let _ = connection.read_until_disconnected().await;
+                    let end = connection.read_until_disconnected_with_outcome().await;
+                    last_disconnect_reason = end.unexpected;
+                    last_protocol_reason = end.terminal_reason;
                 }
             }
 
@@ -797,12 +883,18 @@ impl Client {
             {
                 self.clear_connection_backoff_state();
                 info!("Disconnect requested, shutting down without reconnecting.");
+                completion = RunCompletionReason::ShutdownRequested;
                 break;
             }
 
             if !self.enable_auto_reconnect.load(Ordering::Relaxed) {
                 info!("Auto-reconnect disabled, shutting down.");
                 self.stop_supervision_loop();
+                completion = RunCompletionReason::AutoReconnectDisabled {
+                    connection: last_disconnect_reason,
+                    connect_error: last_connect_error,
+                    protocol_error: last_protocol_reason,
+                };
                 break;
             }
 
@@ -901,6 +993,11 @@ impl Client {
         #[cfg(feature = "client-lifecycle")]
         self.shutdown_lifecycle().await;
         info!("Client run loop has shut down.");
+        if matches!(completion, RunCompletionReason::Stopped) && shutdown.is_fired() {
+            RunCompletionReason::ShutdownRequested
+        } else {
+            completion
+        }
     }
 
     /// Open one connection and hand it back for the caller to read.
@@ -998,7 +1095,7 @@ impl Client {
     /// asked for. Shared by [`run`](Self::run)'s loop body and by the
     /// single-connection [`Connection::read_until_disconnected`], so the two
     /// cannot drift on what a connection ending means.
-    async fn drive_connection(self: &Arc<Self>) -> Option<DisconnectReason> {
+    async fn drive_connection_with_outcome(self: &Arc<Self>) -> ConnectionEnd {
         // Started here rather than at the end of connect: its ping goes through
         // `can_reach_server`, so a tick taken before anything reads is refused
         // as NotConnected, which the loop classifies as fatal and exits on,
@@ -1028,6 +1125,7 @@ impl Client {
         // Some(reason) = unexpected disconnect worth a `Disconnected` event; the
         // reason distinguishes a routine server recycle from a real failure so
         // consumers don't have to.
+        let terminal_reason = self.take_protocol_terminal_reason();
         let unexpected_disconnect = match loop_result {
             Ok(node_io::ReadLoopExit::Expected) => {
                 debug!("Message loop exited gracefully (expected disconnect).");
@@ -1066,7 +1164,10 @@ impl Client {
                     .build(),
             ));
         }
-        unexpected_disconnect
+        ConnectionEnd {
+            unexpected: unexpected_disconnect,
+            terminal_reason,
+        }
     }
 
     /// Hand a connection to a test without a server to handshake with.
@@ -1105,6 +1206,7 @@ impl Client {
         if self.is_connected() {
             return Err(ConnectError::AlreadyConnected);
         }
+        self.clear_protocol_terminal_reason();
         let _t = wacore::telemetry::timer(wacore::telemetry::CONNECT_DURATION);
         // Read once, compared at every checkpoint below: this is the attempt's
         // claim to belong to the current pause era.
@@ -1213,7 +1315,7 @@ impl Client {
             return Err(refusal);
         }
 
-        let noise_socket = match handshake::do_handshake(
+        let noise_socket = match handshake::do_handshake_with_cert_policy(
             self.runtime.clone(),
             &self.persistence_manager,
             &self.ik_handshake_failures,
@@ -1221,6 +1323,7 @@ impl Client {
             &mut transport_events,
             crate::socket::noise_socket::SendObservers::with_stats(self.stats.clone())
                 .with_sent_frames(self.sent_frame_tap.clone()),
+            self.noise_cert_policy,
         )
         .await
         {
@@ -2360,6 +2463,10 @@ impl Connection<'_> {
     /// it. Only the reader flag is given back, so a later `run` is not refused
     /// as already running.
     pub async fn read_until_disconnected(self) -> Option<DisconnectReason> {
+        self.read_until_disconnected_with_outcome().await.unexpected
+    }
+
+    async fn read_until_disconnected_with_outcome(self) -> ConnectionEnd {
         // Reading is what the Drop warning asks for, so the drop that ends this
         // call must not fire it.
         let this = std::mem::ManuallyDrop::new(self);
@@ -2385,7 +2492,7 @@ impl Connection<'_> {
                 this.client.stop_supervision_loop();
             })
         });
-        this.client.drive_connection().await
+        this.client.drive_connection_with_outcome().await
     }
 }
 
@@ -2535,6 +2642,7 @@ mod tests {
                     lifecycle: None,
                     #[cfg(feature = "plugins")]
                     plugin_host: None,
+                    noise_cert_policy: wacore::handshake::NoiseCertPolicy::default(),
                 },
             )
         };
@@ -2657,6 +2765,42 @@ mod tests {
         assert!(
             matches!(reason, Some(DisconnectReason::StreamEnded)),
             "an unannounced close must come back as the reason, got {reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_stream_error_reaches_connection_outcome_before_cleanup() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client
+            .send_node(NodeBuilder::new("stream:error").attr("code", "401").build())
+            .await
+            .expect("the terminal fixture frame must reach the mock transport");
+        crate::test_utils::poll_until("the terminal fixture frame to be written", || {
+            transport.sent_count() >= 1
+        })
+        .await;
+        let frame = transport.sent().remove(0);
+        let (events, receiver) = async_channel::bounded(2);
+        *client.transport_events.lock().await = Some(receiver);
+        events
+            .send(crate::transport::TransportEvent::DataReceived(frame))
+            .await
+            .expect("the fixture channel must accept the terminal frame");
+
+        let end = client
+            .connection_for_test()
+            .read_until_disconnected_with_outcome()
+            .await;
+        assert_eq!(
+            end.terminal_reason,
+            Some(ProtocolTerminalReason::StreamErrorCode(401))
+        );
+        assert!(!client.is_connected(), "cleanup retires the connection");
+
+        client.clear_protocol_terminal_reason();
+        assert_eq!(
+            client.protocol_terminal_reason.lock().unwrap().clone(),
+            None
         );
     }
 
@@ -2920,6 +3064,92 @@ mod tests {
             .expect("the observer channel must stay open");
     }
 
+    #[tokio::test]
+    async fn a_second_run_reports_already_running_without_stopping_the_first() {
+        let (client, entered, release) = client_parked_in_connect().await;
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.run_with_reason().await });
+        next_connect_attempt(&entered).await;
+
+        assert!(matches!(
+            client.run_with_reason().await,
+            RunCompletionReason::AlreadyRunning
+        ));
+        assert!(!first.is_finished());
+
+        client.disconnect().await;
+        drop(release);
+        assert!(matches!(
+            first.await.unwrap(),
+            RunCompletionReason::ShutdownRequested
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabling_reconnect_after_a_connect_failure_preserves_the_error() {
+        let (client, entered, release) = client_parked_in_connect().await;
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.record_protocol_terminal_reason(ProtocolTerminalReason::StreamErrorCode(401));
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
+        next_connect_attempt(&entered).await;
+        release.send(()).await.unwrap();
+
+        let reason = run.await.unwrap();
+        match reason {
+            RunCompletionReason::AutoReconnectDisabled {
+                connection: None,
+                connect_error: Some(error),
+                protocol_error: None,
+                ..
+            } => assert!(!error.to_string().is_empty()),
+            other => panic!("unexpected completion: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expected_stream_flag_during_failed_connect_preserves_no_transport_cause() {
+        let (client, entered, release) = client_parked_in_connect().await;
+        let node = NodeBuilder::new("stream:error").attr("code", "401").build();
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
+        next_connect_attempt(&entered).await;
+        client.handle_stream_error(&node.as_node_ref()).await;
+        release.send(()).await.unwrap();
+        match run.await.unwrap() {
+            RunCompletionReason::AutoReconnectDisabled {
+                protocol_error: Some(ProtocolTerminalReason::StreamErrorCode(401)),
+                ..
+            } => {}
+            other => panic!("unexpected completion: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expected_disconnect_during_failed_connect_has_no_connection_cause() {
+        let (client, entered, release) = client_parked_in_connect().await;
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        let runner = Arc::clone(&client);
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
+        next_connect_attempt(&entered).await;
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        release.send(()).await.unwrap();
+
+        let reason = run.await.unwrap();
+        match reason {
+            RunCompletionReason::AutoReconnectDisabled {
+                connection: None,
+                connect_error: Some(ConnectError::Version(error)),
+                ..
+            } => assert!(
+                error
+                    .to_string()
+                    .contains("Failed to fetch latest WhatsApp version")
+            ),
+            other => panic!("unexpected completion: {other:?}"),
+        }
+    }
+
     /// The misreport this branch's guard exists for. `disconnect()` is
     /// terminal: it clears `is_running`, which is the loop's own stop
     /// condition. Landing it while a connect attempt is in flight used to make
@@ -2936,7 +3166,7 @@ mod tests {
         let (client, entered, release) = client_parked_in_connect().await;
 
         let runner = Arc::clone(&client);
-        let run = tokio::spawn(async move { runner.run().await });
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
         next_connect_attempt(&entered).await;
 
         // Parked, so this is guaranteed to land before the loop reaches the
@@ -2944,10 +3174,11 @@ mod tests {
         client.disconnect().await;
         drop(release);
 
-        tokio::time::timeout(Duration::from_secs(10), run)
+        let reason = tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .expect("run() must return once the client has been disconnected")
             .expect("the run task must not panic");
+        assert!(matches!(reason, RunCompletionReason::ShutdownRequested));
 
         let said = logs.records_for(RUN_LOOP_LOG);
         assert!(
@@ -2978,7 +3209,7 @@ mod tests {
         let (client, entered, release) = client_parked_in_connect().await;
 
         let runner = Arc::clone(&client);
-        let run = tokio::spawn(async move { runner.run().await });
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
         next_connect_attempt(&entered).await;
 
         // What a 515 leaves behind: the end was planned, and nobody asked the
@@ -3026,17 +3257,18 @@ mod tests {
         let (client, entered, release) = client_parked_in_connect().await;
 
         let runner = Arc::clone(&client);
-        let run = tokio::spawn(async move { runner.run().await });
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
         next_connect_attempt(&entered).await;
 
         client.disconnect().await;
         client.expected_disconnect.store(false, Ordering::Relaxed);
         drop(release);
 
-        tokio::time::timeout(Duration::from_secs(10), run)
+        let reason = tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .expect("run() must return even with its verdict flag erased")
             .expect("the run task must not panic");
+        assert!(matches!(reason, RunCompletionReason::ShutdownRequested));
 
         let said = logs.records_for(RUN_LOOP_LOG);
         assert!(
@@ -3191,7 +3423,7 @@ mod tests {
         let (client, entered, release) = client_parked_in_connect().await;
 
         let runner = Arc::clone(&client);
-        let run = tokio::spawn(async move { runner.run().await });
+        let run = tokio::spawn(async move { runner.run_with_reason().await });
         next_connect_attempt(&entered).await;
 
         client.pause().await;
@@ -3199,10 +3431,11 @@ mod tests {
         crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
 
         client.disconnect().await;
-        tokio::time::timeout(Duration::from_secs(10), run)
+        let reason = tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .expect("a paused run loop must still return when the client is disconnected")
             .expect("the run task must not panic");
+        assert!(matches!(reason, RunCompletionReason::ShutdownRequested));
         assert!(client.is_terminal(), "and the client is finished for good");
     }
 

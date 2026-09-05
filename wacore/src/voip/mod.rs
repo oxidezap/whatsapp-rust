@@ -58,7 +58,7 @@ pub use demux::{
 };
 pub use driver::{
     CallChannels, GroupControl, GroupRawEpoch, VideoControl, VideoControlReceiver,
-    VideoControlSender, run_call, video_control_channel,
+    VideoControlSender, VideoInput, run_call, video_control_channel,
 };
 pub use engine::{
     CallConfig, CallEngine, CallEvent, CodecDecisionSource, CodecSwitchError, DirectPeer,

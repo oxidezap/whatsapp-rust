@@ -71,6 +71,13 @@ fn classify_keepalive_error(e: &IqError) -> KeepaliveResult {
         | IqError::ServerError { .. }
         | IqError::UnexpectedResponseType { .. }
         | IqError::ParseError(_) => KeepaliveResult::TransientFailure,
+        IqError::Unclassified(error) => {
+            if error.is_transport_unavailable() {
+                KeepaliveResult::FatalFailure
+            } else {
+                KeepaliveResult::TransientFailure
+            }
+        }
     }
 }
 

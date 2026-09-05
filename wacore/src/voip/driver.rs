@@ -138,6 +138,8 @@ impl Drop for GroupRawEpoch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VideoControl {
+    /// Select the source generation accepted by the timestamped input queue.
+    SetInputGeneration(u64),
     /// RTP clock increment for each access unit. Sent before attaching a source whose cadence is
     /// different from the 15 fps compatibility default.
     SetTimestampStride(u32),
@@ -149,6 +151,8 @@ pub enum VideoControl {
     EnableAwaitingAccept,
     /// Tear the video plane down (downgrade to audio).
     Disable,
+    /// Tear the video plane down while retaining queued legacy AUs for a legacy reattach.
+    DisableKeepLegacy,
     /// Require the next outbound access unit to be an IDR frame after changing its source role.
     RequireKeyframe,
     /// Ask the PEER for a keyframe, by RTCP PLI: the mirror of `RequireKeyframe`. See
@@ -542,6 +546,9 @@ pub struct CallChannels {
     pub rekey: Option<async_channel::Receiver<PeerAnswer>>,
     /// Outbound video: one pre-encoded H.264 Annex-B access unit per item.
     pub video_in: async_channel::Receiver<Vec<u8>>,
+    /// Optional capture-timestamped video input. The legacy `video_in` channel remains available
+    /// for sources whose only contract is a fixed cadence.
+    pub timed_video_in: Option<async_channel::Receiver<VideoInput>>,
     /// Inbound video: reassembled peer access units (dropped on sink overflow, like the speaker).
     pub video_out: async_channel::Sender<VideoFrame>,
     /// Mid-call video-plane control (lossless state, coalesced orientation).
@@ -550,6 +557,17 @@ pub struct CallChannels {
     pub group_ctl: Option<async_channel::Receiver<GroupControl>>,
     /// Where the drive loop publishes media counters for `CallHandle::media_stats`.
     pub media_stats: Arc<crate::voip::media_stats::MediaStatsCell>,
+}
+
+/// A pre-encoded video access unit with an RTP-clock capture timestamp.
+#[derive(Debug, Clone)]
+pub struct VideoInput {
+    /// Complete Annex-B H.264 access unit.
+    pub data: Vec<u8>,
+    /// Capture timestamp in the 90 kHz RTP clock, compared modulo `u32`.
+    pub timestamp: u32,
+    /// Source generation assigned by the facade. Stale generations are discarded at the driver.
+    pub generation: u64,
 }
 
 /// What the caller learned from the callee's `<accept>`, as one message.
@@ -1161,6 +1179,8 @@ async fn run_call_with_clock_and_wallclock(
     // Same closed-channel guards for the video arms: a call that never wires a video source/control
     // sender must not busy-spin on their always-ready `Err`.
     let mut video_in_open = true;
+    let mut timed_video_in_open = true;
+    let mut video_generation = 0u64;
     let mut video_ctl_open = true;
     // Set by a `Disable` to drain the video input queue after the select block (it can't be drained
     // inside, where the arm futures borrow the channel).
@@ -1453,6 +1473,21 @@ async fn run_call_with_clock_and_wallclock(
         .fuse();
         futures::pin_mut!(video_in_fut);
 
+        let timed_video_in = channels.timed_video_in.as_ref();
+        let timed_video_in_live = timed_video_in_open && timed_video_in.is_some();
+        let timed_video_in_fut = async move {
+            if timed_video_in_live {
+                timed_video_in
+                    .expect("timed_video_in_open implies Some")
+                    .recv()
+                    .await
+            } else {
+                std::future::pending().await
+            }
+        }
+        .fuse();
+        futures::pin_mut!(timed_video_in_fut);
+
         let video_ctl = &channels.video_ctl;
         let video_ctl_fut = async move {
             if video_ctl_open {
@@ -1630,6 +1665,9 @@ async fn run_call_with_clock_and_wallclock(
             // Enable can admit frames from the replacement source.
             ctl = video_ctl_fut => {
                 match ctl {
+                    Ok(VideoControl::SetInputGeneration(generation)) => {
+                        video_generation = generation;
+                    }
                     Ok(VideoControl::SetTimestampStride(ts_stride)) => {
                         let _ = eng.set_video_timestamp_stride(ts_stride);
                     }
@@ -1653,11 +1691,25 @@ async fn run_call_with_clock_and_wallclock(
                                 packets: dropped.packets,
                             });
                         }
-                        // Discard any AUs still queued from the (now-detached) source, so a quick
-                        // re-Enable can't transmit stale frames from the previous session under the
-                        // new negotiation. Drained after the select block (the futures borrow the
-                        // channel).
                         drain_video_in = true;
+                    }
+                    Ok(VideoControl::DisableKeepLegacy) => {
+                        eng.disable_video();
+                        let dropped = purge_unstarted_video(
+                            &mut send_queue,
+                            &mut awaiting_video_keyframe,
+                        );
+                        if dropped.packets != 0 {
+                            let _ = channels.events.try_send(CallEvent::OutboundMediaDropped {
+                                video_access_units: dropped.video_access_units,
+                                packets: dropped.packets,
+                            });
+                        }
+                        // Keep queued legacy AUs: this control is used only while replacing one
+                        // legacy source with another, and the replacement shares this queue. The
+                        // legacy API never carried source generations, so an old tail may precede
+                        // the replacement's first AU exactly as it did before timestamped input.
+                        drain_video_in = false;
                     }
                     Ok(VideoControl::RequireKeyframe) => eng.require_video_keyframe(),
                     Ok(VideoControl::RequestPeerKeyframe(urgency)) => {
@@ -1751,6 +1803,21 @@ async fn run_call_with_clock_and_wallclock(
                 // Video source gone (encoder EOF / downgrade released it): disable the arm but keep
                 // the call alive, exactly like the mic.
                 Err(_) => video_in_open = false,
+            },
+            timed = timed_video_in_fut => match timed {
+                Ok(frame) => {
+                    if frame.generation == video_generation {
+                        eng.handle_video_frame_at(now_ms(), &frame.data, frame.timestamp);
+                    }
+                    let now = now_ms();
+                    if let Some(at) = eng.poll_timeout()
+                        && at != engine::NEVER
+                        && now >= at
+                    {
+                        eng.handle_input(now, Input::Timeout);
+                    }
+                }
+                Err(_) => timed_video_in_open = false,
             },
             _ = &mut timer => eng.handle_input(now_ms(), Input::Timeout),
         }
@@ -2391,6 +2458,7 @@ mod tests {
             events,
             rekey: None,
             video_in: vin_rx,
+            timed_video_in: None,
             video_out: vout_tx,
             video_ctl: vctl_rx,
             group_ctl: None,
@@ -3463,16 +3531,42 @@ mod tests {
         let (spk_tx, _spk_rx) = async_channel::unbounded();
         let (ev_tx, _ev_rx) = async_channel::unbounded();
         let (vin_tx, vin_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (timed_tx, timed_rx) = async_channel::unbounded::<VideoInput>();
         let (vout_tx, vout_rx) = async_channel::unbounded::<VideoFrame>();
         let (vctl_tx, vctl_rx) = video_control_channel();
 
         // Control drains first (bias), so cadence, Enable, and orientation land before any AU.
+        assert!(vctl_tx.send(VideoControl::DisableKeepLegacy));
+        assert!(vctl_tx.send(VideoControl::SetInputGeneration(7)));
         assert!(vctl_tx.send(VideoControl::SetTimestampStride(4500)));
         assert!(vctl_tx.send(VideoControl::Enable));
         assert!(vctl_tx.send(VideoControl::SetOrientation(1)));
         let our_au = make_au(3000);
         vin_tx.try_send(our_au.clone()).unwrap();
-        vin_tx.try_send(our_au).unwrap();
+        vin_tx.try_send(our_au.clone()).unwrap();
+        timed_tx
+            .try_send(VideoInput {
+                data: our_au.clone(),
+                timestamp: 9000,
+                generation: 7,
+            })
+            .unwrap();
+        timed_tx
+            .try_send(VideoInput {
+                data: our_au.clone(),
+                timestamp: 18000,
+                generation: 7,
+            })
+            .unwrap();
+        for _ in 0..64 {
+            timed_tx
+                .try_send(VideoInput {
+                    data: our_au.clone(),
+                    timestamp: 9000,
+                    generation: 6,
+                })
+                .unwrap();
+        }
 
         let eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
         futures::executor::block_on(run_call(
@@ -3487,6 +3581,7 @@ mod tests {
                 events: ev_tx,
                 rekey: None,
                 video_in: vin_rx,
+                timed_video_in: Some(timed_rx),
                 video_out: vout_tx,
                 video_ctl: vctl_rx,
                 group_ctl: None,
@@ -3505,7 +3600,9 @@ mod tests {
             "SetOrientation must apply before the inbound AU reassembles"
         );
 
-        // Outbound: each 3KB AU fans out to four PT-97 packets and the 20 fps stride applies.
+        // Outbound: the two legacy AUs retain fixed-stride timestamps, while the two current timed AUs
+        // preserve their capture gap. The stale generation is ignored even though it was queued before
+        // the driver processed the replacement controls.
         let sent = transport.sent.lock().unwrap();
         let video_headers = sent
             .iter()
@@ -3513,15 +3610,14 @@ mod tests {
                 parse_rtp_header(packet).filter(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264)
             })
             .collect::<Vec<_>>();
-        assert_eq!(video_headers.len(), 8);
-        assert_eq!(
-            video_headers
-                .iter()
-                .filter(|header| header.marker)
-                .map(|header| header.timestamp)
-                .collect::<Vec<_>>(),
-            [0, 4500]
-        );
+        assert_eq!(video_headers.len(), 16);
+        let mut marker_timestamps = video_headers
+            .iter()
+            .filter(|header| header.marker)
+            .map(|header| header.timestamp)
+            .collect::<Vec<_>>();
+        marker_timestamps.sort_unstable();
+        assert_eq!(marker_timestamps, [0, 4500, 9000, 18000]);
     }
 
     // A relay stall backs the queue up past cap: the overflow policy must shed media, never the STUN

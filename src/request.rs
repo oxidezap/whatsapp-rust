@@ -170,6 +170,13 @@ pub enum IqError {
     UnexpectedResponseType { got: Option<String> },
     #[error("internal channel closed unexpectedly")]
     InternalChannelClosed,
+    /// A newer core IQ error that this facade does not classify yet.
+    ///
+    /// Keeping the original error as the source avoids reporting a transport
+    /// closure when a newer protocol or storage classification is introduced
+    /// in `wacore` before this facade learns its dedicated variant.
+    #[error("unclassified IQ error: {0}")]
+    Unclassified(#[source] wacore::request::IqError),
     #[error("IQ request ID is already in flight: {0}")]
     DuplicateRequestId(String),
     #[error("failed to encode IQ request")]
@@ -186,6 +193,7 @@ impl IqError {
             }
             IqError::EncryptSend(error) => error.is_transport_unavailable(),
             IqError::ClientState(client) => client.is_transport_unavailable(),
+            IqError::Unclassified(error) => error.is_transport_unavailable(),
             _ => false,
         }
     }
@@ -208,6 +216,7 @@ impl IqError {
             | IqError::DuplicateRequestId(_)
             | IqError::EncodeError(_)
             | IqError::ParseError(_) => false,
+            IqError::Unclassified(error) => error.is_timeout(),
         }
     }
 
@@ -238,9 +247,9 @@ impl IqError {
                 Self::UnexpectedResponseType { got }
             }
             wacore::request::IqError::InternalChannelClosed => Self::InternalChannelClosed,
-            // wacore::IqError is #[non_exhaustive]; a new upstream variant should
-            // get its own arm above. Until then treat it as an unexpected internal error.
-            _ => Self::InternalChannelClosed,
+            // wacore::IqError is #[non_exhaustive]. Preserve a newer variant's
+            // source until this facade can assign it a dedicated meaning.
+            other => Self::Unclassified(other),
         }
     }
 }
@@ -785,6 +794,26 @@ mod tests {
             IqError::UnexpectedResponseType { got } => assert_eq!(got.as_deref(), Some("get")),
             other => panic!("expected UnexpectedResponseType, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unclassified_iq_error_preserves_its_typed_source() {
+        let source = wacore::request::IqError::UnexpectedResponseType {
+            got: Some("future".to_string()),
+        };
+        let error = IqError::Unclassified(source);
+
+        assert!(!error.is_transport_unavailable());
+        assert!(!error.is_timeout());
+        let source = std::error::Error::source(&error).expect("source is retained");
+        let source = source
+            .downcast_ref::<wacore::request::IqError>()
+            .expect("the core error remains downcastable");
+        assert!(matches!(
+            source,
+            wacore::request::IqError::UnexpectedResponseType { got: Some(got) }
+                if got == "future"
+        ));
     }
 
     /// A rejection stanza carries more than the four attributes the parser reads: the

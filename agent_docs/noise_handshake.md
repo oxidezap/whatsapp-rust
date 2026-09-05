@@ -39,7 +39,46 @@ The split is `HandshakeError::is_transient()` vs `is_crypto_fatal()`. Misclassif
 
 `verify_server_cert` checks structural shape, the issuer-serial pin against `WA_CERT_ISSUER_SERIAL`, the chain link (the leaf's issuer serial must equal the intermediate's serial), that `leaf.key` equals the decrypted Noise static, and **both XEdDSA signatures**: the intermediate's over `WA_CERT_PUB_KEY`, then the leaf's over the intermediate's key.
 
-Signature verification is bypassed only under `cfg(test)` and the `danger-skip-cert-chain-verify` feature, which exist so callers can drive the surrounding code against zero-signed fixtures — `tests/e2e` enables the feature because the mock server does not sign its chain. **Production builds verify.** If you are changing this path, `wacore/noise/tests/cert_chain_verify.rs` is compiled with `#![cfg(not(feature = "danger-skip-cert-chain-verify"))]` precisely so the real path keeps coverage.
+Signature verification is strict by default. `NoiseCertPolicy` selects it
+per client at construction (`ClientBuilder::with_noise_cert_policy`, default
+`Strict`): the value travels into the XX/XXfallback states, so two clients in
+one process can disagree and no reconnect can observe a change. The explicit
+`DangerSkipCertChainVerify` bypass exists so callers can drive the surrounding
+code against zero-signed fixtures — it skips only the two XEdDSA steps, and a
+chain accepted under it is typed as nothing to persist (`XxHandshakeOutcome`
+carries `None`) and never authorizes IK (`select_pattern` stays at XX), so it
+is neither read from nor written to the trusted cache. There is no Cargo
+feature for this: migration is deleting the feature flag and choosing the
+explicit per-client policy only where a mock server needs it. The public
+`HandshakeUtils::verify_server_cert` helper always verifies strictly — it
+never consults the default. `tests/e2e` passes the
+bypass per client at construction because the mock server does not sign its
+chain. **Default builds verify; only an explicit per-client bypass skips
+the signature checks.** The `wacore/noise` integration tests in
+`tests/cert_chain_verify.rs` load the crate as a regular dependency, so no
+in-crate test bypass can mask them.
+
+Chains cached while the old global bypass was enabled are structurally
+identical to verified ones, so the cache now carries provenance:
+`CachedServerCertChain.signature_verified` (serde and SQLite-wire absent
+means untrusted) is minted only from a strictly verified chain and only a
+marked chain may authorize IK (
+`select_pattern`). After upgrading, the first connect does one XX and then
+resumes normally; the IK crypto itself still binds the cached static, so a
+mismatch fails closed regardless. This is upgrade hygiene, not
+tamper-proofing: the storage backend remains the trust boundary. Bypass mode
+can never mint provenance and ignores even marked caches, so mock traffic
+never pollutes trusted state. Cost of the upgrade: one XX per previously
+cached device, once.
+
+Breaking note: `XxHandshakeOutcome.server_cert_chain` is now
+`Option<VerifiedServerCertChain>` (`None` for bypass-accepted chains), and
+`CachedServerCertChain` has the new `signature_verified` field (struct
+literals and the SQLite `ServerCertChain` wire message gain it; old rows
+decode as untrusted). The low-level handshake constructors keep their
+signatures and take the default policy; `*_with_cert_policy` variants select
+explicitly. `HandshakeUtils::verify_server_cert` keeps its two-argument
+shape but always verifies strictly instead of taking the default.
 
 ## Logs
 

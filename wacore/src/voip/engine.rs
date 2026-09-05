@@ -2320,6 +2320,13 @@ impl CallEngine {
         }
     }
 
+    /// Apply a source-timestamped video access unit without changing the legacy `Input` enum.
+    pub fn handle_video_frame_at(&mut self, _now: Millis, au: &[u8], timestamp: u32) {
+        if !self.terminated {
+            self.on_video_at(au, timestamp);
+        }
+    }
+
     /// Drain one intent. Returns `Output::Timeout(deadline)` once the queue is empty; the shell
     /// stops draining there and arms a timer for `deadline` ([`NEVER`] = none).
     pub fn poll_output(&mut self) -> Output {
@@ -3883,6 +3890,17 @@ impl CallEngine {
         m.audio_tx_invalid_streak = 0;
         let packet = m.pipe.protect_audio(payload);
         self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
+    }
+
+    fn on_video_at(&mut self, au: &[u8], timestamp: u32) {
+        if let Some(video) = self.media.as_mut().and_then(|media| media.video.as_mut())
+            && video.active
+            && !video.send_gated
+            && !video.pipe.set_video_timestamp(timestamp)
+        {
+            return;
+        }
+        self.on_video(au);
     }
 
     fn on_video(&mut self, au: &[u8]) {
