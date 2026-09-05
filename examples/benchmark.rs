@@ -22,8 +22,6 @@ use whatsapp_rust_ureq_http_client::UreqHttpClient;
 /// `tests/e2e/src/lib.rs`. Returns `None` for URLs without a ws scheme or
 /// without an authority.
 fn mock_admin_scan_qr_url(ws_url: &str) -> Option<String> {
-    // Fragments are client-side only and never reach the wire; strip one up
-    // front so the parser below sees only what an HTTP request would carry.
     let ws_url = ws_url.split('#').next()?;
     let uri: http::Uri = ws_url.parse().ok()?;
     let http_scheme = match uri.scheme_str() {

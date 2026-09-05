@@ -319,9 +319,9 @@ name = "demo"
 # config tests a nextest target, so the default CI run executes them instead of
 # only compiling the example. `required-features` names what the example
 # actually needs to link (runtime, transport, HTTP client — all in `default`),
-# so `--no-default-features` builds still skip it. Compiling needs no insecure
-# TLS: `danger-skip-tls-verify` stays a runtime opt-in for talking to the
-# mock's own-root TLS chain, never a build requirement.
+# so `--no-default-features` builds still skip it. `danger-skip-tls-verify`
+# stays an opt-in Cargo feature for talking to the mock's own-root TLS chain,
+# never a build requirement.
 [[example]]
 name = "benchmark"
 test = true
