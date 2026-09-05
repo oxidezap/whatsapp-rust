@@ -1,0 +1,61 @@
+name: MLOW oracle fixtures
+
+on:
+  push:
+    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', '.github/workflows/mlow-derive.yml']
+  pull_request:
+    paths: ['wacore/src/voip/mlow/**', 'scripts/mlow-vectors/**', '.github/workflows/mlow-derive.yml']
+  workflow_dispatch:
+  schedule:
+    - cron: '19 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  rederive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the oracle commit pin
+        id: oracle
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          pin = json.load(open('scripts/mlow-vectors/oracle.lock.json'))
+          assert re.fullmatch('[0-9a-f]{40}', pin['revision'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('revision=' + pin['revision'] + '\n')
+          PY
+      - uses: actions/checkout@v4
+        with:
+          repository: oxidezap/unwasm
+          ref: ${{ steps.oracle.outputs.revision }}
+          path: .oracle-tool
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-16
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@3.25.3,cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            .oracle-tool -> target
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Re-derive J/S and compare every committed wasm fixture
+        run: python3 scripts/mlow-vectors/regenerate-wasm.py --oracle-repo .oracle-tool --check
+      - name: Test the runtime against the regenerated corpus
+        run: cargo nextest run --locked -p wacore --features voip-mlow --lib -E 'test(voip::mlow::)'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mlow-oracle-evidence
+          path: |
+            .derive-mlow/wasm/*.log
+            .derive-mlow/wasm/*/manifest.json
+          if-no-files-found: error

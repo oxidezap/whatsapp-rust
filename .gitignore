@@ -22,3 +22,7 @@ dhat-heap*.json
 # Two spellings: the plain name and the "file:" form the sqlite URI produces.
 memdb_*.snapshot-*
 file:memdb_*.snapshot-*
+
+/.derive-mlow*/
+/scripts/mlow-vectors/__pycache__/
+/.oracle-tool/
