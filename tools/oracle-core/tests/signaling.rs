@@ -65,7 +65,7 @@ mod common;
 use base64::Engine as _;
 use std::time::Duration;
 
-use oracle_core::{Catalog, Runtime, ThreadPolicy, Value};
+use oracle_core::{Runtime, ThreadPolicy, Value};
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::jid::Server;
 use wacore_binary::{Jid, Node, marshal};
@@ -104,6 +104,7 @@ fn engine() -> Option<Runtime> {
             Ok(runtime) => return Some(runtime),
             // No capture: nothing to retry.
             Err(EngineError::Unavailable) => return None,
+            Err(EngineError::Broken(why)) => panic!("loading VoIP capture: {why}"),
             Err(EngineError::InitFailed(why)) if attempt < ATTEMPTS => {
                 eprintln!("media stack did not come up (attempt {attempt}): {why}");
             }
@@ -118,15 +119,16 @@ fn engine() -> Option<Runtime> {
 enum EngineError {
     /// The capture directory or module is missing.
     Unavailable,
+    Broken(String),
     InitFailed(String),
 }
 
 fn engine_with(policy: ThreadPolicy) -> Result<Runtime, EngineError> {
-    let catalog = Catalog::discover().map_err(|_| EngineError::Unavailable)?;
-    let entry = catalog
-        .resolve(VOIP)
-        .map_err(|_| EngineError::Unavailable)?;
-    let bytes = std::fs::read(&entry.path).map_err(|_| EngineError::Unavailable)?;
+    let Some(bytes) =
+        common::capture(VOIP).map_err(|error| EngineError::Broken(error.to_string()))?
+    else {
+        return Err(EngineError::Unavailable);
+    };
 
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
     runtime.set_thread_policy(policy);
@@ -522,6 +524,7 @@ fn reached_call_stack(lines: &[String]) -> bool {
 #[test]
 #[ignore = "real threads; see the module docs"]
 fn engine_accepts_the_framed_encoding() {
+    let _serial = threaded_guard();
     let mut runtime = engine_or_skip!();
 
     let framed = {
@@ -558,6 +561,7 @@ fn engine_accepts_the_framed_encoding() {
 #[test]
 #[ignore = "real threads; see the module docs"]
 fn engine_survives_malformed_offers() {
+    let _serial = threaded_guard();
     /// Builds one malformed payload, given a live engine to size it against.
     type BuildPayload = Box<dyn Fn(&Runtime) -> String>;
 
@@ -851,14 +855,12 @@ fn an_incoherent_memory_view_withholds_the_log() {
 #[ignore = "real threads; see the module docs"]
 fn no_ring_means_no_log() {
     let _serial = threaded_guard();
-    let Some(catalog) = Catalog::discover().ok() else {
+    let Some(bytes) =
+        common::capture(VOIP).unwrap_or_else(|error| panic!("loading {VOIP}: {error:#}"))
+    else {
         eprintln!("skipping: no capture (set WA_WASM_DIR)");
         return;
     };
-    let Ok(entry) = catalog.resolve(VOIP) else {
-        return;
-    };
-    let bytes = std::fs::read(&entry.path).expect("read");
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
     runtime.run_ctors().expect("ctors");
 
@@ -879,7 +881,7 @@ fn overflow_is_observable() {
     // A ring this size does not wrap during startup, so this pins the
     // "no overflow" reading; the accessor existing is what lets a caller with a
     // smaller ring notice the opposite.
-    assert!(!runtime.engine_log_overflowed());
+    assert!(!runtime.engine_log_overflowed().expect("overflow probe"));
 }
 
 /// The offer reaches the call stack, rather than being rejected by the parser.
@@ -981,6 +983,7 @@ fn call_id_must_sit_on_the_call_element() {
 #[test]
 #[ignore = "real threads; see the module docs"]
 fn a_well_formed_offer_is_accepted() {
+    let _serial = threaded_guard();
     let mut runtime = engine_or_skip!();
     let payload = serialize(&offer_for(&runtime), true);
     let lines = deliver_without_a_lock_inversion(&mut runtime, &payload);
@@ -989,7 +992,7 @@ fn a_well_formed_offer_is_accepted() {
     // only return what is still in the buffer. Asserting through an overflow
     // reports "the engine refused" for a run in which it may well have
     // accepted, which is the kind of wrong answer an oracle must not give.
-    if runtime.engine_log_overflowed() {
+    if runtime.engine_log_overflowed().expect("overflow probe") {
         eprintln!("engine log overflowed; nothing can be concluded from absence");
         return;
     }
@@ -1074,7 +1077,7 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
     eprintln!(
         "after an incoming offer, an outgoing call yields {} lines, {structured} of them structured; overflowed={}",
         lines.len(),
-        runtime.engine_log_overflowed()
+        runtime.engine_log_overflowed().expect("overflow probe")
     );
     for line in lines.iter().take(6) {
         eprintln!("  SAMPLE {line:?}");
@@ -1117,6 +1120,7 @@ fn settings_from_an_incoming_offer_do_not_unblock_an_outgoing_call() {
 #[test]
 #[ignore = "real threads; see the module docs"]
 fn an_incoming_offer_reports_its_participants() {
+    let _serial = threaded_guard();
     let mut runtime = engine_or_skip!();
     let payload = serialize(&offer_for(&runtime), true);
     let lines = deliver(&mut runtime, payload);
@@ -1152,6 +1156,7 @@ fn an_incoming_offer_reports_its_participants() {
 #[test]
 #[ignore = "real threads; see the module docs"]
 fn an_unmarked_settings_blob_is_rejected() {
+    let _serial = threaded_guard();
     let mut runtime = engine_or_skip!();
 
     let caller = jid(CALLER);
@@ -1188,11 +1193,12 @@ fn an_unmarked_settings_blob_is_rejected() {
 #[test]
 #[ignore = "real threads; see the module docs"]
 fn the_caller_comes_from_the_argument_not_the_stanza() {
+    let _serial = threaded_guard();
     let mut runtime = engine_or_skip!();
     let payload = serialize(&offer_for(&runtime), true);
     let lines = deliver(&mut runtime, payload);
 
-    if runtime.engine_log_overflowed() {
+    if runtime.engine_log_overflowed().expect("overflow probe") {
         eprintln!("engine log overflowed; nothing can be concluded from absence");
         return;
     }
@@ -1269,7 +1275,7 @@ fn the_engine_starts_an_outgoing_call() {
         runtime.settle(std::time::Duration::from_secs(5));
 
         let lines = runtime.engine_log_from(mark);
-        if runtime.engine_log_overflowed() {
+        if runtime.engine_log_overflowed().expect("overflow probe") {
             eprintln!("engine log overflowed; nothing can be concluded from absence");
             return;
         }
@@ -1505,9 +1511,8 @@ fn engine_with_identity() -> Option<Runtime> {
     const ATTEMPTS: usize = 6;
 
     for _ in 0..ATTEMPTS {
-        let catalog = Catalog::discover().ok()?;
-        let entry = catalog.resolve(VOIP).ok()?;
-        let bytes = std::fs::read(&entry.path).ok()?;
+        let bytes =
+            common::capture(VOIP).unwrap_or_else(|error| panic!("loading {VOIP}: {error:#}"))?;
 
         let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
         runtime.set_thread_policy(ThreadPolicy::Spawn);
@@ -1566,7 +1571,7 @@ fn a_phone_number_peer_is_refused_because_this_build_enforces_lid() {
     runtime.settle(Duration::from_secs(5));
 
     let lines = runtime.engine_log_from(mark);
-    if runtime.engine_log_overflowed() {
+    if runtime.engine_log_overflowed().expect("overflow probe") {
         eprintln!("engine log overflowed; nothing can be concluded from absence");
         return;
     }

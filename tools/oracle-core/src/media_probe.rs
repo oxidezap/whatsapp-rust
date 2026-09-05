@@ -6,7 +6,7 @@
 //! those bytes while the callback is active and keeps the resulting records in
 //! deterministic call order.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
@@ -169,7 +169,8 @@ struct MediaManifestRecord {
 
 #[derive(Debug, Default)]
 struct ProbeState {
-    observations: Vec<MediaObservation>,
+    observations: BTreeMap<usize, MediaObservation>,
+    next_ordinal: usize,
     bytes: usize,
     error: Option<String>,
 }
@@ -208,6 +209,21 @@ impl MediaProbe {
             return;
         };
         let symbol = watch.symbol.clone();
+        let ordinal = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.error.is_some() {
+                return;
+            }
+            if state.next_ordinal == MAX_MEDIA_RECORDS {
+                state.error = Some(format!(
+                    "media callback count exceeds {MAX_MEDIA_RECORDS} records"
+                ));
+                return;
+            }
+            let ordinal = state.next_ordinal;
+            state.next_ordinal += 1;
+            ordinal
+        };
 
         let captured = (|| -> Result<MediaObservation> {
             let pointer = u32::try_from(
@@ -233,7 +249,7 @@ impl MediaProbe {
             Ok(MediaObservation {
                 stream: watch.stream,
                 symbol: symbol.clone(),
-                ordinal: 0,
+                ordinal,
                 sequence: match watch.sequence_arg {
                     Some(index) => Some(
                         *args
@@ -259,22 +275,15 @@ impl MediaProbe {
             return;
         }
         match captured {
-            Ok(mut observation) => {
-                if state.observations.len() == MAX_MEDIA_RECORDS {
-                    state.error = Some(format!(
-                        "media callback count exceeds {MAX_MEDIA_RECORDS} records"
-                    ));
-                    return;
-                }
+            Ok(observation) => {
                 if state.bytes + observation.payload.len() > MAX_MEDIA_TOTAL_BYTES {
                     state.error = Some(format!(
                         "media callback payloads exceed {MAX_MEDIA_TOTAL_BYTES} bytes"
                     ));
                     return;
                 }
-                observation.ordinal = state.observations.len();
                 state.bytes += observation.payload.len();
-                state.observations.push(observation);
+                state.observations.insert(ordinal, observation);
             }
             Err(error) => state.error = Some(format!("capture {symbol}: {error:#}")),
         }
@@ -285,10 +294,18 @@ impl MediaProbe {
         if let Some(error) = state.error.take() {
             state.observations.clear();
             state.bytes = 0;
+            state.next_ordinal = 0;
             anyhow::bail!(error);
         }
+        ensure!(
+            state.observations.len() == state.next_ordinal,
+            "media callbacks are still being captured"
+        );
         state.bytes = 0;
-        Ok(std::mem::take(&mut state.observations))
+        state.next_ordinal = 0;
+        Ok(std::mem::take(&mut state.observations)
+            .into_values()
+            .collect())
     }
 }
 

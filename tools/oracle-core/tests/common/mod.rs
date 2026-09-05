@@ -11,8 +11,15 @@
 //! up after a killed process; a port is released by the OS when the process
 //! ends, whatever killed it, so a crashed test cannot wedge every later run.
 
+// Each integration-test binary compiles this module independently. Some need
+// only capture loading while the engine suites also need the cross-process lock.
+#![allow(dead_code)]
+
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use oracle_core::Catalog;
 
 /// Chosen from the IANA dynamic range and otherwise arbitrary. Collides only
 /// with something else that picked the same number, which would show up as
@@ -47,4 +54,31 @@ pub fn engine_lock() -> EngineLock {
             }
         }
     }
+}
+
+/// Discover captures while treating only an absent implicit cache as skippable.
+pub fn catalog() -> Result<Option<Catalog>> {
+    match Catalog::discover() {
+        Ok(catalog) => Ok(Some(catalog)),
+        Err(error)
+            if std::env::var_os(oracle_core::catalog::DIR_ENV).is_none()
+                && error
+                    .to_string()
+                    .starts_with("no directory holding captured .wasm files") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Read one verified capture, or `None` only when no implicit capture cache exists.
+pub fn capture(id: &str) -> Result<Option<Vec<u8>>> {
+    let Some(catalog) = catalog()? else {
+        return Ok(None);
+    };
+    let entry = catalog.resolve(id)?;
+    std::fs::read(&entry.path)
+        .with_context(|| format!("reading capture {}", entry.path.display()))
+        .map(Some)
 }

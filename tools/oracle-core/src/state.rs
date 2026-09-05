@@ -281,6 +281,24 @@ impl HostState {
 }
 
 impl HostState {
+    pub(crate) fn ensure_memory_range(&self, ptr: u32, len: u32) -> Result<()> {
+        let end = (ptr as usize)
+            .checked_add(len as usize)
+            .ok_or_else(|| anyhow!("memory range at {ptr}+{len} overflows"))?;
+        let size = if let Some(memory) = self.memory.as_ref() {
+            memory.data().len()
+        } else {
+            self.linear
+                .map(|(_, size)| size)
+                .ok_or_else(|| anyhow!("module memory is not available to the host"))?
+        };
+        anyhow::ensure!(
+            end <= size,
+            "memory range at {ptr}+{len} is out of bounds ({size} bytes mapped)"
+        );
+        Ok(())
+    }
+
     /// Reads `len` bytes of linear memory.
     ///
     /// Concurrent guest writes are expected rather than excluded. `schedule.rs`

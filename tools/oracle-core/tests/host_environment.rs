@@ -6,7 +6,7 @@
 //! thread that never ran; stubbed exception handling turned every recoverable
 //! C++ error into an opaque wasm trap.
 
-use oracle_core::{Catalog, Runtime, Value};
+use oracle_core::{Runtime, Value};
 
 mod common;
 
@@ -19,9 +19,8 @@ fn engine_guard() -> common::EngineLock {
 }
 
 fn voip() -> Option<Runtime> {
-    let catalog = Catalog::discover().ok()?;
-    let entry = catalog.resolve(VOIP).ok()?;
-    let bytes = std::fs::read(&entry.path).ok()?;
+    let bytes =
+        common::capture(VOIP).unwrap_or_else(|error| panic!("loading {VOIP}: {error:#}"))?;
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
     runtime.run_ctors().expect("ctors");
     Some(runtime)
@@ -130,18 +129,12 @@ fn two_runs_produce_identical_traces() {
 /// module under test is allowed to see.
 #[test]
 fn wasi_filesystem_round_trips() {
-    let catalog = match Catalog::discover() {
-        Ok(catalog) => catalog,
-        Err(_) => {
-            eprintln!("skipping: no capture (set WA_WASM_DIR)");
-            return;
-        }
-    };
-    let Ok(entry) = catalog.resolve("rogm88TRRiw") else {
+    let Some(bytes) = common::capture("rogm88TRRiw")
+        .unwrap_or_else(|error| panic!("loading rogm88TRRiw: {error:#}"))
+    else {
         eprintln!("skipping: media module unavailable");
         return;
     };
-    let bytes = std::fs::read(&entry.path).expect("read");
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
 
     runtime.add_file("input.bin", vec![1, 2, 3, 4]);
@@ -155,18 +148,12 @@ fn wasi_filesystem_round_trips() {
 /// `main` expects.
 #[test]
 fn wasi_arguments_include_a_program_name() {
-    let catalog = match Catalog::discover() {
-        Ok(catalog) => catalog,
-        Err(_) => {
-            eprintln!("skipping: no capture (set WA_WASM_DIR)");
-            return;
-        }
-    };
-    let Ok(entry) = catalog.resolve("rogm88TRRiw") else {
+    let Some(bytes) = common::capture("rogm88TRRiw")
+        .unwrap_or_else(|error| panic!("loading rogm88TRRiw: {error:#}"))
+    else {
         eprintln!("skipping: media module unavailable");
         return;
     };
-    let bytes = std::fs::read(&entry.path).expect("read");
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
 
     runtime.set_args(&["check".to_owned(), "input.bin".to_owned()]);
@@ -359,6 +346,8 @@ mod wasi_fixture {
         types.ty().function([I32], [I32]);
         // 6: (i32, i32) -> i32
         types.ty().function([I32, I32], [I32]);
+        // 7: (i32, i32, i32) -> i32
+        types.ty().function([I32, I32, I32], [I32]);
 
         let mut imports = ImportSection::new();
         for (name, ty) in [
@@ -382,7 +371,7 @@ mod wasi_fixture {
         });
 
         let mut functions = FunctionSection::new();
-        for ty in [4, 5, 6, 5, 5, 5] {
+        for ty in [4, 5, 7, 5, 5, 5] {
             functions.function(ty);
         }
 
@@ -426,7 +415,7 @@ mod wasi_fixture {
             .i32_const(0)
             .local_get(0)
             .local_get(1)
-            .i32_const(0) // no O_CREAT: the file is placed by the host
+            .local_get(2)
             .i64_const(0)
             .i64_const(0)
             .i32_const(0)
@@ -530,6 +519,7 @@ fn open_fixture_file() -> (Runtime, u32) {
             &[
                 wasmtime::Val::I32(wasi_fixture::PATH as i32),
                 wasmtime::Val::I32(8),
+                wasmtime::Val::I32(0),
             ],
         )
         .expect("do_open");
@@ -592,6 +582,7 @@ fn fd_close_rejects_reserved_unknown_and_already_closed_descriptors() {
             &[
                 wasmtime::Val::I32(wasi_fixture::PATH as i32),
                 wasmtime::Val::I32(8),
+                wasmtime::Val::I32(0),
             ],
         )
         .expect("open");
@@ -629,6 +620,27 @@ fn fd_filestat_reports_the_preopened_root_as_a_directory() {
 }
 
 #[test]
+fn path_open_truncates_an_existing_file() {
+    let mut runtime = Runtime::instantiate(&wasi_fixture::module()).expect("instantiate");
+    runtime.add_file("data.bin", vec![1, 2, 3]);
+    runtime
+        .write_bytes_at(wasi_fixture::PATH, b"data.bin")
+        .expect("path");
+    let result = runtime
+        .call(
+            "do_open",
+            &[
+                wasmtime::Val::I32(wasi_fixture::PATH as i32),
+                wasmtime::Val::I32(8),
+                wasmtime::Val::I32(8),
+            ],
+        )
+        .expect("path_open truncate");
+    assert_eq!(errno_of(&result), 0);
+    assert_eq!(runtime.wasi().file("data.bin"), Some([].as_slice()));
+}
+
+#[test]
 fn c_strings_require_a_terminator_and_valid_utf8() {
     use wasm_encoder::{ExportKind, ExportSection, MemorySection, MemoryType, Module};
 
@@ -659,6 +671,56 @@ fn c_strings_require_a_terminator_and_valid_utf8() {
         .write_bytes_at(65_536 - 256, &vec![b'x'; 256])
         .expect("unterminated string");
     assert!(runtime.read_cstr(65_536 - 256).is_err());
+}
+
+#[test]
+fn random_byte_requests_reject_negative_lengths_and_bad_ranges() {
+    use wasm_encoder::{
+        CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+        ImportSection, MemorySection, MemoryType, Module, TypeSection, ValType,
+    };
+
+    let module = |length: i32, pointer: i32| {
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32, ValType::I32], []);
+        types.ty().function([], []);
+        let mut imports = ImportSection::new();
+        imports.import("env", "get_random_bytes_js", EntityType::Function(0));
+        let mut functions = FunctionSection::new();
+        functions.function(1);
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        let mut body = Function::new([]);
+        body.instructions()
+            .i32_const(length)
+            .i32_const(pointer)
+            .call(0)
+            .end();
+        let mut code = CodeSection::new();
+        code.function(&body);
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("run", ExportKind::Func, 1);
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&imports);
+        module.section(&functions);
+        module.section(&memories);
+        module.section(&exports);
+        module.section(&code);
+        module.finish()
+    };
+
+    for bytes in [module(-1, 0), module(32, 65_520)] {
+        let mut runtime = Runtime::instantiate(&bytes).unwrap();
+        assert!(runtime.call("run", &[]).is_err());
+    }
 }
 
 /// The clock id is the question, and answering all of them with the monotonic

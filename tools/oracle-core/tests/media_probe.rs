@@ -92,6 +92,7 @@ fn callback_payload_and_transport_metadata_are_captured_together() {
 #[test]
 fn malformed_or_oversized_callbacks_fail_the_probe() {
     let mut runtime = Runtime::instantiate(&fixture(i32::MAX)).unwrap();
+    assert!(runtime.take_media_observations().is_err());
     assert!(runtime.watch_media([watch().with_sequence_arg(0)]).is_err());
     runtime.watch_media([watch()]).unwrap();
     runtime.call("run", &[]).unwrap();

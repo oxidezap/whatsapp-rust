@@ -468,7 +468,7 @@ fn main() -> anyhow::Result<()> {
             runtime.refuel();
             println!("   getCallInfo -> {info:?}");
 
-            let overflowed = runtime.engine_log_overflowed();
+            let overflowed = runtime.engine_log_overflowed()?;
             let dropped = runtime
                 .call_embind("getLogRingBufferOverflowCount", &[])
                 .ok()

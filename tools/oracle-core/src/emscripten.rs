@@ -59,7 +59,10 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
         "getentropy",
         |mut caller: Caller<'_, HostState>, buf: i32, len: i32| -> i32 {
             crate::state::sync_memory(&mut caller);
-            match fill_random(&mut caller, buf as u32, len as u32) {
+            match u32::try_from(len)
+                .map_err(anyhow::Error::from)
+                .and_then(|len| fill_random(&mut caller, buf as u32, len))
+            {
                 Ok(()) => 0,
                 Err(_) => 28, // EINVAL
             }
@@ -96,9 +99,11 @@ pub fn define(store: &mut Store<HostState>, linker: &mut Linker<HostState>) -> R
     linker.func_wrap(
         "env",
         "get_random_bytes_js",
-        |mut caller: Caller<'_, HostState>, len: i32, buf: i32| {
+        |mut caller: Caller<'_, HostState>, len: i32, buf: i32| -> Result<(), wasmtime::Error> {
             crate::state::sync_memory(&mut caller);
-            let _ = fill_random(&mut caller, buf as u32, len as u32);
+            let len = u32::try_from(len)
+                .map_err(|_| wasmtime::Error::msg("negative random-byte length"))?;
+            fill_random(&mut caller, buf as u32, len).into_wasmtime()
         },
     )?;
 
@@ -857,6 +862,12 @@ fn answer_em_asm(snippet: &str) -> Result<i32, wasmtime::Error> {
 
 /// Fills guest memory with bytes from the deterministic PRNG.
 fn fill_random(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> Result<()> {
+    const MAX_RANDOM_BYTES: u32 = 16 * 1024 * 1024;
+    anyhow::ensure!(
+        len <= MAX_RANDOM_BYTES,
+        "random-byte request exceeds {MAX_RANDOM_BYTES} bytes"
+    );
+    caller.data().ensure_memory_range(ptr, len)?;
     // Recorded, because this is the host's only source of high-entropy bytes
     // and the corruption in `examples/ring_corruption.rs` looks exactly like
     // them. An earlier pass excluded this by instrumenting writes of 64 KiB or

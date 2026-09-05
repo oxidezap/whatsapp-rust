@@ -7,12 +7,14 @@
 use oracle_core::inspect::{EntryKind, Requirement};
 use oracle_core::{Catalog, Inspection, Runtime};
 
+mod common;
+
 /// The VoIP capture. Named once: see the note on the same constant in
 /// `abi_inference.rs`.
 const VOIP: &str = "JgwtTQVeWPm";
 
 fn catalog() -> Option<Catalog> {
-    Catalog::discover().ok()
+    common::catalog().unwrap_or_else(|error| panic!("loading capture catalog: {error:#}"))
 }
 
 macro_rules! skip_without_captures {

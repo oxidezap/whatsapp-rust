@@ -8,33 +8,33 @@
 //! They skip when the capture directory is absent. A skipped run is not a
 //! passing run — check for `skipping:` in the output.
 
-use oracle_core::{Catalog, Runtime, Value};
+use oracle_core::{Runtime, Value};
+
+mod common;
 
 const VOIP_MODULE: &str = "JgwtTQVeWPm";
 
 /// Loads the VoIP module with its constructors already run, or `None` when the
 /// capture is not available.
-fn voip() -> Option<Runtime> {
-    let catalog = Catalog::discover().ok()?;
-    let module = catalog.resolve(VOIP_MODULE).ok()?;
-    let bytes = std::fs::read(&module.path).ok()?;
-
-    let mut runtime = Runtime::instantiate(&bytes).expect("VoIP module should instantiate");
-    runtime
-        .run_ctors()
-        .expect("VoIP constructors should run to completion");
+fn voip() -> anyhow::Result<Option<Runtime>> {
+    let Some(bytes) = common::capture(VOIP_MODULE)? else {
+        return Ok(None);
+    };
+    let mut runtime = Runtime::instantiate(&bytes)?;
+    runtime.run_ctors()?;
     runtime.clear_calls();
-    Some(runtime)
+    Ok(Some(runtime))
 }
 
 macro_rules! voip_or_skip {
     () => {
         match voip() {
-            Some(runtime) => runtime,
-            None => {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => {
                 eprintln!("skipping: no VoIP capture (set WA_WASM_DIR)");
                 return;
             }
+            Err(error) => panic!("loading VoIP capture: {error:#}"),
         }
     };
 }
@@ -122,11 +122,10 @@ fn reports_its_sctp_ice_event_ids() {
 /// attributed to the implementation rather than to the run.
 #[test]
 fn is_deterministic_across_instances() {
-    let Some(mut first) = voip() else {
-        eprintln!("skipping: no VoIP capture (set WA_WASM_DIR)");
-        return;
-    };
-    let mut second = voip().expect("second instance");
+    let mut first = voip_or_skip!();
+    let mut second = voip()
+        .expect("load second VoIP capture")
+        .expect("capture available after first load");
 
     let probes: [(&str, Vec<Value>); 5] = [
         ("getWebP2PVirtualIpv4", vec![]),

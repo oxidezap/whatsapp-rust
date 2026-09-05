@@ -4,8 +4,9 @@
 //! section, no glue, no debug info. These tests run it against the captures
 //! where every one of those is absent.
 
-use oracle_core::Catalog;
 use oracle_core::abi::{self, Role};
+
+mod common;
 
 /// The capture every index and address below was read out of.
 ///
@@ -27,9 +28,7 @@ const VOIP: &str = "JgwtTQVeWPm";
 static BODY_LIMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn module(id: &str) -> Option<Vec<u8>> {
-    let catalog = Catalog::discover().ok()?;
-    let entry = catalog.resolve(id).ok()?;
-    std::fs::read(&entry.path).ok()
+    common::capture(id).unwrap_or_else(|error| panic!("loading {id}: {error:#}"))
 }
 
 macro_rules! module_or_skip {

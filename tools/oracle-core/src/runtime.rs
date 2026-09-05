@@ -263,7 +263,8 @@ impl Runtime {
             .shared
             .media_probe
             .get()
-            .map_or_else(|| Ok(Vec::new()), crate::media_probe::MediaProbe::take)
+            .ok_or_else(|| anyhow!("media probe is not installed"))?
+            .take()
     }
 
     /// Grows the guest's memory by `pages`, returning the new size in pages.
@@ -1357,14 +1358,15 @@ impl Runtime {
 
     /// Whether the ring has wrapped, past which an index from an earlier read
     /// no longer means anything.
-    pub fn engine_log_overflowed(&mut self) -> bool {
+    pub fn engine_log_overflowed(&mut self) -> Result<bool> {
         if self.log_ring.is_none() {
-            return false;
+            return Ok(false);
         }
-        matches!(
-            self.call_embind("getLogRingBufferOverflowCount", &[]),
-            Ok(crate::Value::Int(count)) if count > 0
-        )
+        let count = self
+            .call_embind("getLogRingBufferOverflowCount", &[])?
+            .as_uint()
+            .ok_or_else(|| anyhow!("getLogRingBufferOverflowCount returned a non-integer"))?;
+        Ok(count > 0)
     }
 
     /// Engine log lines produced after the first `mark` lines.

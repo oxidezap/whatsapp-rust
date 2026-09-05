@@ -769,7 +769,7 @@ impl<'a> Executor<'a> {
 
     /// Record a written output file for the manifest.
     fn record_output(&mut self, file: &Path, bytes: &[u8]) -> Result<()> {
-        let full = self.out_dir.join(file);
+        let full = self.output_path(file)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -781,6 +781,18 @@ impl<'a> Executor<'a> {
             sha256: sha256_hex(bytes),
         });
         Ok(())
+    }
+
+    fn output_path(&self, file: &Path) -> Result<PathBuf> {
+        anyhow::ensure!(
+            file.components().next().is_some()
+                && file
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_))),
+            "derivation output must be a normal relative path: {}",
+            file.display()
+        );
+        Ok(self.out_dir.join(file))
     }
 }
 
@@ -1087,7 +1099,7 @@ impl Step {
                 Ok(())
             }
             Step::AssertSha256 { file, sha256 } => {
-                let bytes = std::fs::read(executor.out_dir.join(file))
+                let bytes = std::fs::read(executor.output_path(file)?)
                     .with_context(|| format!("reading output {}", file.display()))?;
                 let actual = sha256_hex(&bytes);
                 if actual != *sha256 {
@@ -1417,6 +1429,16 @@ mod tests {
         assert!(executor.arg_value(&Arg::Lit(3)).expect("lit") == 3);
         assert!(executor.arg_value(&Arg::Reg("x".to_owned())).is_err());
         assert!(executor.arg_value(&Arg::Reg("$x".to_owned())).is_err());
+        assert!(executor.output_path(Path::new("fixture.bin")).is_ok());
+        for path in [
+            "",
+            ".",
+            "../fixture.bin",
+            "/fixture.bin",
+            "nested/../fixture.bin",
+        ] {
+            assert!(executor.output_path(Path::new(path)).is_err(), "{path:?}");
+        }
     }
 
     /// A `must_hold_string` the module never references fails resolution.

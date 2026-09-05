@@ -284,6 +284,8 @@ struct Layout {
     /// Number of imported functions, which is the index the first defined one
     /// takes.
     imported_funcs: u32,
+    types: Vec<wasmparser::FuncType>,
+    defined_types: Vec<u32>,
     /// Every import with the sink signature, as (function index,
     /// `module::name`), in declaration order. All of them, not the first —
     /// choosing is [`choose_sink`]'s job, and a refusal has to be able to name
@@ -311,6 +313,7 @@ fn read_layout(bytes: &[u8]) -> Result<Layout> {
     let mut types: Vec<wasmparser::FuncType> = Vec::new();
     let mut imported_funcs = 0u32;
     let mut sinks = Vec::new();
+    let mut defined_types = Vec::new();
     let mut code_section = 0..0;
     let mut bodies = Vec::new();
     let mut code_starts = Vec::new();
@@ -345,6 +348,11 @@ fn read_layout(bytes: &[u8]) -> Result<Layout> {
                     imported_funcs += 1;
                 }
             }
+            Payload::FunctionSection(section) => {
+                for index in section {
+                    defined_types.push(index.context("reading function type")?);
+                }
+            }
             Payload::CodeSectionStart { range, .. } => {
                 // `range` covers the entries; back up over the id and size so
                 // the whole section can be replaced as a unit.
@@ -369,11 +377,70 @@ fn read_layout(bytes: &[u8]) -> Result<Layout> {
 
     Ok(Layout {
         imported_funcs,
+        types,
+        defined_types,
         sinks,
         code_section,
         bodies,
         code_starts,
     })
+}
+
+fn local_type(
+    bytes: &[u8],
+    layout: &Layout,
+    ordinal: usize,
+    local: u32,
+) -> Result<wasmparser::ValType> {
+    let type_index = *layout
+        .defined_types
+        .get(ordinal)
+        .context("defined function has no type")?;
+    let function_type = layout
+        .types
+        .get(type_index as usize)
+        .with_context(|| format!("function references missing type {type_index}"))?;
+    if let Some(ty) = function_type.params().get(local as usize) {
+        return Ok(*ty);
+    }
+
+    let mut local = usize::try_from(local)?
+        .checked_sub(function_type.params().len())
+        .context("local index precedes the parameter space")?;
+    let range = layout
+        .bodies
+        .get(ordinal)
+        .context("function body missing")?;
+    let body = wasmparser::FunctionBody::new(wasmparser::BinaryReader::new(
+        &bytes[range.clone()],
+        range.start,
+    ));
+    for declaration in body.get_locals_reader().context("reading locals")? {
+        let (count, ty) = declaration.context("reading local declaration")?;
+        let count = usize::try_from(count)?;
+        if local < count {
+            return Ok(ty);
+        }
+        local -= count;
+    }
+    Err(anyhow!("function has no local at that index"))
+}
+
+fn require_local_type(
+    bytes: &[u8],
+    layout: &Layout,
+    ordinal: usize,
+    func: u32,
+    local: u32,
+    expected: wasmparser::ValType,
+) -> Result<()> {
+    let actual = local_type(bytes, layout, ordinal, local)
+        .with_context(|| format!("function {func} local {local}"))?;
+    ensure!(
+        actual == expected,
+        "function {func} local {local} is {actual}, expected {expected}"
+    );
+    Ok(())
 }
 
 /// Picks the import a marker will call, or explains why it will not pick one.
@@ -514,6 +581,14 @@ pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
 
     for &(func, local) in &plan.value_entry {
         let ordinal = body_of(func)?;
+        require_local_type(
+            bytes,
+            &layout,
+            ordinal,
+            func,
+            local,
+            wasmparser::ValType::I32,
+        )?;
         splices.push(Splice {
             at: layout.code_starts[ordinal],
             bytes: marker_bytes_local(next_id, local, sink),
@@ -529,6 +604,18 @@ pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
 
     for &(func, instruction, local, float) in &plan.value_at {
         let ordinal = body_of(func)?;
+        require_local_type(
+            bytes,
+            &layout,
+            ordinal,
+            func,
+            local,
+            if float {
+                wasmparser::ValType::F32
+            } else {
+                wasmparser::ValType::I32
+            },
+        )?;
         let start = layout.code_starts[ordinal];
         let end = layout.bodies[ordinal].end;
         let reader = wasmparser::OperatorsReader::new(wasmparser::BinaryReader::new(
@@ -600,23 +687,38 @@ pub fn instrument(bytes: &[u8], plan: &Plan) -> Result<(Vec<u8>, MarkerMap)> {
             layout.code_starts[ordinal],
         ));
 
+        let mut final_end = None;
         for item in reader.into_iter_with_offsets() {
             let (op, offset) = item.context("reading operators")?;
-            if !matches!(op, Operator::Return) {
-                continue;
+            if matches!(op, Operator::End) {
+                final_end = Some(offset);
             }
-            splices.push(Splice {
-                at: offset,
-                bytes: marker_bytes(next_id, 0, sink),
-            });
-            markers.push(Marker {
-                id: next_id,
-                kind: "return".to_owned(),
-                func,
-                detail: format!("return in func {func}"),
-            });
-            next_id += 1;
+            if matches!(op, Operator::Return) {
+                splices.push(Splice {
+                    at: offset,
+                    bytes: marker_bytes(next_id, 0, sink),
+                });
+                markers.push(Marker {
+                    id: next_id,
+                    kind: "return".to_owned(),
+                    func,
+                    detail: format!("explicit return in func {func}"),
+                });
+                next_id += 1;
+            }
         }
+        let offset = final_end.context("function body has no final end")?;
+        splices.push(Splice {
+            at: offset,
+            bytes: marker_bytes(next_id, 0, sink),
+        });
+        markers.push(Marker {
+            id: next_id,
+            kind: "return".to_owned(),
+            func,
+            detail: format!("fall-through return in func {func}"),
+        });
+        next_id += 1;
     }
 
     let rewritten = rewrite(bytes, &layout, splices, &[])?;

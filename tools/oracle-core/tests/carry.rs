@@ -5,13 +5,12 @@
 //! not do is answer confidently when it cannot: an index carried to the wrong
 //! function reads exactly like a correct one, because the reads still succeed.
 
-use oracle_core::Catalog;
 use oracle_core::carry::{Captures, Carried};
 
+mod common;
+
 fn module(id: &str) -> Option<Vec<u8>> {
-    let catalog = Catalog::discover().ok()?;
-    let entry = catalog.resolve(id).ok()?;
-    std::fs::read(&entry.path).ok()
+    common::capture(id).unwrap_or_else(|error| panic!("loading {id}: {error:#}"))
 }
 
 /// A module carried against itself: every fingerprintable function must find

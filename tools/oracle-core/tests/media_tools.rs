@@ -4,7 +4,9 @@
 //! the specification a Rust implementation has to match, so their verdicts are
 //! asserted here rather than described.
 
-use oracle_core::{Catalog, Runtime};
+use oracle_core::Runtime;
+
+mod common;
 
 /// A real 16x16 H.264 clip, generated with ffmpeg from a synthetic test
 /// pattern. Hand-built MP4s get as far as the H.264 parser and no further —
@@ -21,9 +23,7 @@ struct ToolRun {
 
 /// Runs a tool and returns everything it produced.
 fn tool_with_files(id: &str, args: &[&str], files: &[(&str, Vec<u8>)]) -> Option<ToolRun> {
-    let catalog = Catalog::discover().ok()?;
-    let entry = catalog.resolve(id).ok()?;
-    let bytes = std::fs::read(&entry.path).ok()?;
+    let bytes = common::capture(id).unwrap_or_else(|error| panic!("loading {id}: {error:#}"))?;
 
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
     runtime.set_args(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
@@ -41,9 +41,7 @@ fn tool_with_files(id: &str, args: &[&str], files: &[(&str, Vec<u8>)]) -> Option
 }
 
 fn tool(id: &str, args: &[&str], files: &[(&str, Vec<u8>)]) -> Option<(i32, String, String)> {
-    let catalog = Catalog::discover().ok()?;
-    let entry = catalog.resolve(id).ok()?;
-    let bytes = std::fs::read(&entry.path).ok()?;
+    let bytes = common::capture(id).unwrap_or_else(|error| panic!("loading {id}: {error:#}"))?;
 
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
     runtime.set_args(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());

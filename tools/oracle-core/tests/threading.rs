@@ -10,7 +10,7 @@ use std::time::Duration;
 
 mod common;
 
-use oracle_core::{Catalog, Runtime, ThreadPolicy, Value};
+use oracle_core::{Runtime, ThreadPolicy, Value};
 
 const VOIP: &str = "JgwtTQVeWPm";
 const CALLEE: &str = "15550002222@s.whatsapp.net";
@@ -37,9 +37,8 @@ fn threaded_guard() -> (std::sync::MutexGuard<'static, ()>, common::EngineLock) 
 
 /// A VoIP module initialised under the given thread policy.
 fn engine(policy: ThreadPolicy) -> Option<Runtime> {
-    let catalog = Catalog::discover().ok()?;
-    let entry = catalog.resolve(VOIP).ok()?;
-    let bytes = std::fs::read(&entry.path).ok()?;
+    let bytes =
+        common::capture(VOIP).unwrap_or_else(|error| panic!("loading {VOIP}: {error:#}"))?;
 
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
     runtime.set_thread_policy(policy);
@@ -411,9 +410,8 @@ fn no_thread_has_to_force_its_turn() {
 /// thread. Kept separate from `engine_started` because registration changes how
 /// the guest waits — see `HostState::register_main_thread`.
 fn engine_registered() -> Option<Runtime> {
-    let catalog = Catalog::discover().ok()?;
-    let entry = catalog.resolve(VOIP).ok()?;
-    let bytes = std::fs::read(&entry.path).ok()?;
+    let bytes =
+        common::capture(VOIP).unwrap_or_else(|error| panic!("loading {VOIP}: {error:#}"))?;
 
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
     runtime.set_thread_policy(ThreadPolicy::Spawn);
@@ -475,19 +473,13 @@ fn the_main_thread_queue_can_be_drained() {
 /// pretending it drained one.
 #[test]
 fn a_module_without_the_queue_reports_it() {
-    let catalog = match Catalog::discover() {
-        Ok(catalog) => catalog,
-        Err(_) => {
-            eprintln!("skipping: no capture (set WA_WASM_DIR)");
-            return;
-        }
-    };
     // mozjpeg is single-threaded: no shared memory, no proxying.
-    let Ok(entry) = catalog.resolve("php8T1oSIZM") else {
+    let Some(bytes) = common::capture("php8T1oSIZM")
+        .unwrap_or_else(|error| panic!("loading php8T1oSIZM: {error:#}"))
+    else {
         eprintln!("skipping: mozjpeg unavailable");
         return;
     };
-    let bytes = std::fs::read(&entry.path).expect("read module");
     let mut runtime = Runtime::instantiate(&bytes).expect("instantiate");
 
     assert!(

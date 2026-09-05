@@ -5,12 +5,14 @@
 //! module and compares, because a rewrite that validates and computes something
 //! else is worse than one that fails to load.
 
+use oracle_core::Runtime;
 use oracle_core::patch::{self, Edit, Plan, Replace};
-use oracle_core::{Catalog, Runtime};
 use wasm_encoder::{
     CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
     Module, TypeSection, ValType,
 };
+
+mod common;
 
 /// A module with a marker-shaped import, two leaf functions and a caller that
 /// calls each of them once and then one of them again.
@@ -194,6 +196,24 @@ fn a_call_site_that_never_runs_is_reported_as_such() {
 }
 
 #[test]
+fn fall_through_returns_are_instrumented() {
+    let plan = Plan {
+        at_returns: vec![1],
+        ..Plan::default()
+    };
+    let (rewritten, map) = patch::instrument(&sample(), &plan).unwrap();
+    let (_, calls) = run(&rewritten, 4);
+    let fired = map.fired(
+        calls
+            .iter()
+            .map(|(symbol, args)| (symbol.as_str(), args.as_slice())),
+    );
+    assert_eq!(fired.len(), 2, "caller invokes the marked function twice");
+    assert_eq!(fired[0].0.id, fired[1].0.id);
+    assert!(fired[0].0.detail.contains("fall-through"));
+}
+
+#[test]
 fn the_logging_sink_records_instrumentation_markers() {
     let original = sample_with_sink("loggingCallback_js_sync");
     let (rewritten, map) =
@@ -250,6 +270,35 @@ fn overlapping_replacements_are_rejected() {
     )
     .expect_err("overlapping replacements");
     assert!(error.to_string().contains("overlap"), "{error:#}");
+}
+
+#[test]
+fn value_markers_require_an_existing_i32_local() {
+    let mut plan = Plan::default();
+    plan.value_entry.push((1, 99));
+    let error = patch::instrument(&sample(), &plan).expect_err("missing local");
+    assert!(error.to_string().contains("local 99"), "{error:#}");
+
+    let mut types = TypeSection::new();
+    types.ty().function([ValType::I32, ValType::I32], []);
+    types.ty().function([ValType::F64], [ValType::F64]);
+    let mut imports = ImportSection::new();
+    imports.import("env", "mark", EntityType::Function(0));
+    let mut functions = FunctionSection::new();
+    functions.function(1);
+    let mut body = Function::new([]);
+    body.instructions().local_get(0).end();
+    let mut code = CodeSection::new();
+    code.function(&body);
+    let mut module = Module::new();
+    module.section(&types);
+    module.section(&imports);
+    module.section(&functions);
+    module.section(&code);
+
+    plan.value_entry[0] = (1, 0);
+    let error = patch::instrument(&module.finish(), &plan).expect_err("wrong local type");
+    assert!(error.to_string().contains("expected i32"), "{error:#}");
 }
 
 #[test]
@@ -313,17 +362,14 @@ fn a_function_that_does_not_exist_is_named_in_the_error() {
 /// else's C++ still comes up, and still says the same thing, after the rewrite.
 #[test]
 fn a_captured_module_survives_being_instrumented() {
-    let Ok(catalog) = Catalog::discover() else {
-        eprintln!("skipping: no capture directory (set WA_WASM_DIR)");
-        return;
-    };
     // The VOPRF module: small enough to rewrite and run quickly, and it exports
     // plain C functions that answer without any embind machinery.
-    let Ok(entry) = catalog.resolve("COs9e0Kj0ic") else {
+    let Some(bytes) = common::capture("COs9e0Kj0ic")
+        .unwrap_or_else(|error| panic!("loading COs9e0Kj0ic: {error:#}"))
+    else {
         eprintln!("skipping: COs9e0Kj0ic unavailable");
         return;
     };
-    let bytes = std::fs::read(&entry.path).expect("read module");
 
     // `sodiumInit`, which makes six direct calls. Not `blind` (func 183): that
     // one is the trampoline the README describes, and it reaches its callee

@@ -112,13 +112,16 @@ fn normalise(path: &str) -> String {
 }
 
 /// An `iovec`/`ciovec`: a pointer and a length, 8 bytes each.
-fn read_iovecs(state: &HostState, ptr: u32, count: u32) -> Vec<(u32, u32)> {
+fn read_iovecs(state: &HostState, ptr: u32, count: u32) -> Result<Vec<(u32, u32)>> {
     const MAX: u32 = 1024;
-
-    (0..count.min(MAX))
-        .filter_map(|index| {
-            let base = ptr + index * 8;
-            Some((state.read_u32(base).ok()?, state.read_u32(base + 4).ok()?))
+    anyhow::ensure!(count <= MAX, "iovec count exceeds {MAX}");
+    (0..count)
+        .map(|index| {
+            let base = ptr
+                .checked_add(index.checked_mul(8).context("iovec offset overflow")?)
+                .context("iovec address overflow")?;
+            let length_at = base.checked_add(4).context("iovec address overflow")?;
+            Ok((state.read_u32(base)?, state.read_u32(length_at)?))
         })
         .collect()
 }
@@ -132,12 +135,22 @@ fn write_u64(state: &HostState, ptr: u32, value: u64) -> Result<()> {
 }
 
 fn fd_write(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, out: u32) -> i32 {
-    let vectors = read_iovecs(caller.data(), iovs, count);
+    let Ok(vectors) = read_iovecs(caller.data(), iovs, count) else {
+        return EINVAL;
+    };
 
     let mut payload = Vec::new();
     for (ptr, len) in vectors {
         match caller.data().read(ptr, len) {
-            Ok(bytes) => payload.extend_from_slice(&bytes),
+            Ok(bytes) => {
+                let Some(total) = payload.len().checked_add(bytes.len()) else {
+                    return EINVAL;
+                };
+                if total > 256 * 1024 * 1024 {
+                    return EINVAL;
+                }
+                payload.extend_from_slice(&bytes);
+            }
             Err(_) => return EINVAL,
         }
     }
@@ -154,14 +167,23 @@ fn fd_write(caller: &mut Caller<'_, HostState>, fd: u32, iovs: u32, count: u32, 
             if !open.writable {
                 return EBADF;
             }
-            let (path, offset) = (open.path.clone(), open.offset as usize);
-            open.offset += written as u64;
+            let Ok(offset) = usize::try_from(open.offset) else {
+                return EINVAL;
+            };
+            let Some(end) = offset.checked_add(payload.len()) else {
+                return EINVAL;
+            };
+            let Some(next_offset) = open.offset.checked_add(u64::from(written)) else {
+                return EINVAL;
+            };
+            let path = open.path.clone();
+            open.offset = next_offset;
 
             let file = state.wasi.files.entry(path).or_default();
-            if file.len() < offset + payload.len() {
-                file.resize(offset + payload.len(), 0);
+            if file.len() < end {
+                file.resize(end, 0);
             }
-            file[offset..offset + payload.len()].copy_from_slice(&payload);
+            file[offset..end].copy_from_slice(&payload);
         }
     }
 
@@ -212,7 +234,9 @@ fn read_into(
         };
     }
 
-    let vectors = read_iovecs(caller.data(), iovs, count);
+    let Ok(vectors) = read_iovecs(caller.data(), iovs, count) else {
+        return EINVAL;
+    };
     let state = caller.data();
     let Some(open) = state.wasi.open.get(&fd) else {
         return EBADF;
@@ -221,7 +245,9 @@ fn read_into(
         return EBADF;
     };
 
-    let mut offset = at.unwrap_or(open.offset) as usize;
+    let Ok(mut offset) = usize::try_from(at.unwrap_or(open.offset)) else {
+        return EINVAL;
+    };
     let mut total = 0u32;
     for (ptr, len) in vectors {
         if offset >= contents.len() {
@@ -232,7 +258,13 @@ fn read_into(
             return EINVAL;
         }
         offset += take;
-        total += take as u32;
+        let Ok(take) = u32::try_from(take) else {
+            return EINVAL;
+        };
+        let Some(next_total) = total.checked_add(take) else {
+            return EINVAL;
+        };
+        total = next_total;
     }
 
     // A positional read leaves the cursor where it was: that is the whole
@@ -284,17 +316,11 @@ fn fd_seek(caller: &mut Caller<'_, HostState>, fd: u32, delta: i64, whence: u32,
         .wasi
         .files
         .get(&open.path)
-        .map(|file| file.len() as i64)
+        .map(|file| file.len() as u64)
         .unwrap_or(0);
-
-    // whence: 0 = set, 1 = current, 2 = end
-    let base = match whence {
-        0 => 0,
-        1 => open.offset as i64,
-        2 => size,
-        _ => return EINVAL,
+    let Some(position) = seek_position(open.offset, size, delta, whence) else {
+        return EINVAL;
     };
-    let position = (base + delta).max(0) as u64;
 
     if let Some(open) = caller.data_mut().wasi.open.get_mut(&fd) {
         open.offset = position;
@@ -305,6 +331,17 @@ fn fd_seek(caller: &mut Caller<'_, HostState>, fd: u32, delta: i64, whence: u32,
     }
 }
 
+fn seek_position(current: u64, size: u64, delta: i64, whence: u32) -> Option<u64> {
+    let base = match whence {
+        0 => 0_i128,
+        1 => i128::from(current),
+        2 => i128::from(size),
+        _ => return None,
+    };
+    let position = base.checked_add(i128::from(delta))?;
+    u64::try_from(position).ok()
+}
+
 fn path_open(
     caller: &mut Caller<'_, HostState>,
     path_ptr: u32,
@@ -312,8 +349,14 @@ fn path_open(
     oflags: u32,
     out: u32,
 ) -> i32 {
-    // oflags bit 0 is O_CREAT.
+    // WASI preview1 oflags: bit 0 is CREAT, bit 3 is TRUNC.
     const O_CREAT: u32 = 1;
+    const O_TRUNC: u32 = 8;
+    const SUPPORTED: u32 = O_CREAT | O_TRUNC;
+
+    if oflags & !SUPPORTED != 0 {
+        return EINVAL;
+    }
 
     let Ok(raw) = caller.data().read(path_ptr, path_len) else {
         return EINVAL;
@@ -325,8 +368,9 @@ fn path_open(
     // voip storage dir" and carries on — so without this the host cannot tell a
     // path it should have provided from one the guest never wanted.
     caller.data().log(format!(
-        "wasi path_open {path:?} (create={})",
-        oflags & O_CREAT != 0
+        "wasi path_open {path:?} (create={}, truncate={})",
+        oflags & O_CREAT != 0,
+        oflags & O_TRUNC != 0
     ));
 
     let state = caller.data_mut();
@@ -336,6 +380,13 @@ fn path_open(
             return ENOENT;
         }
         state.wasi.files.insert(path.clone(), Vec::new());
+    } else if oflags & O_TRUNC != 0 {
+        state
+            .wasi
+            .files
+            .get_mut(&path)
+            .expect("existence checked")
+            .clear();
     }
 
     let fd = state.wasi.allocate_fd();
@@ -635,5 +686,23 @@ fn dispatch(name: &str, caller: &mut Caller<'_, HostState>, params: &[Val]) -> i
         // Anything else is reported as unimplemented rather than as success,
         // so a module never proceeds on a call this host did not really make.
         _ => ENOSYS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iovec_tables_and_seek_positions_are_strict() {
+        let state = HostState::default();
+        assert!(read_iovecs(&state, 0, 1025).is_err());
+        assert!(read_iovecs(&state, u32::MAX, 1).is_err());
+
+        assert_eq!(seek_position(10, 20, -5, 1), Some(5));
+        assert_eq!(seek_position(10, 20, -11, 1), None);
+        assert_eq!(seek_position(10, 20, -21, 2), None);
+        assert_eq!(seek_position(10, 20, -1, 0), None);
+        assert_eq!(seek_position(10, 20, 0, 3), None);
     }
 }
